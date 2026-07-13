@@ -1211,68 +1211,12 @@ enum Pr2cTerminalSnapshotErrorV1 {
     MissingRecordIdentity(&'static str),
     #[error("terminal decision comparator duration exceeds u32")]
     ComparatorDurationOverflow,
-    #[error("terminal decision serialization duration exceeds u32")]
-    SerializationDurationOverflow,
     #[error(transparent)]
     Identity(#[from] ghost_core::metric_contracts::MetricIdentityErrorV1),
     #[error(transparent)]
     Profile(#[from] ghost_core::metric_contracts::MetricContractProfileErrorV1),
     #[error(transparent)]
     Build(#[from] crate::metric_contracts::Pr2cRecordBuildErrorV1),
-    #[error("terminal metric-contract serialization failed: {0}")]
-    Serialization(#[from] serde_json::Error),
-}
-
-fn pr2c_policy_equivalence_snapshot(
-    assessment: &GatekeeperAssessment,
-    decision: Option<&crate::components::gatekeeper::GatekeeperDecision>,
-) -> ghost_core::metric_contracts::MetricContractPolicyEquivalenceSnapshotV1 {
-    let terminal_reason = assessment
-        .terminal_reason_code
-        .map(ghost_brain::oracle::reason_code::GatekeeperReasonCode::as_log_str);
-    ghost_core::metric_contracts::MetricContractPolicyEquivalenceSnapshotV1 {
-        verdict: decision.map_or_else(
-            || "TIMEOUT_WITHOUT_POLICY_DECISION".to_string(),
-            |value| format!("{:?}", value.verdict_type),
-        ),
-        primary_reason_code: decision
-            .and_then(|value| value.reason_code)
-            .map(ghost_brain::oracle::reason_code::GatekeeperReasonCode::as_log_str)
-            .or(terminal_reason)
-            .unwrap_or_else(|| "MISSING_TYPED_REASON".to_string()),
-        ordered_reason_chain: decision
-            .map(|value| vec![value.reason_chain.clone()])
-            .unwrap_or_default(),
-        phase_pass_vector: vec![
-            assessment.phase1_passed,
-            assessment.phase2_passed,
-            assessment.phase3_passed,
-            assessment.phase4_passed,
-            assessment.phase5_passed,
-            assessment.phase6_passed,
-        ],
-        soft_points: decision.map_or(0, |value| i64::from(value.soft_points)),
-        selector_soft_score_bits: decision
-            .map_or(0, |value| u64::from(value.selector_soft_score.score)),
-        hard_fail_classification: decision
-            .and_then(|value| value.hard_fail_reason.clone())
-            .unwrap_or_else(|| "none".to_string()),
-    }
-}
-
-fn pr2c_counterfactual_delta_present(
-    snapshot: &crate::metric_contracts::Pr2bCompleteMetricContractSnapshotV1,
-) -> bool {
-    let projection = &snapshot.compact_projection;
-    projection.dev_buy.mfs_primary_v1.value != projection.dev_buy.effective_policy.value
-        || projection
-            .fee_topology_diversity_index
-            .unique_buyer_actionability_v2
-            .value
-            != projection
-                .fee_topology_diversity_index
-                .legacy_buy_tx_actionability
-                .value
 }
 
 fn build_pr2c_terminal_pair(
@@ -1314,28 +1258,27 @@ fn build_pr2c_terminal_pair(
             .ok_or(Pr2cTerminalSnapshotErrorV1::MissingRecordIdentity(
                 "join_key",
             ))?,
-        "legacy_live",
+        buy_log.decision_plane.clone().ok_or(
+            Pr2cTerminalSnapshotErrorV1::MissingRecordIdentity("decision_plane"),
+        )?,
     )?;
-    let policy = pr2c_policy_equivalence_snapshot(assessment, assessment.decision.as_ref());
+    let policy = crate::metric_contracts::pr2c_policy_equivalence_snapshot_v1(
+        assessment,
+        assessment.decision.as_ref(),
+    );
     let comparator_started = Instant::now();
     // The equivalence comparator performs a real second, pure policy
     // evaluation over the already-frozen assessment and the exact active
     // Gatekeeper config. It does not read session/live state, run IWIM or
     // execution, and cannot emit another terminal event.
-    let comparator_decision = assessment
-        .decision
-        .as_ref()
-        .map(|_| evaluate_policy_from_assessment(assessment, gatekeeper_config));
-    let comparator_policy = pr2c_policy_equivalence_snapshot(
+    let comparator_decision = evaluate_policy_from_assessment(assessment, gatekeeper_config);
+    let comparator_policy = crate::metric_contracts::pr2c_policy_equivalence_snapshot_v1(
         assessment,
-        comparator_decision
-            .as_ref()
-            .or(assessment.decision.as_ref()),
+        Some(&comparator_decision),
     );
     let comparator_elapsed_us = u32::try_from(comparator_started.elapsed().as_micros())
         .map_err(|_| Pr2cTerminalSnapshotErrorV1::ComparatorDurationOverflow)?;
     let profile = ghost_core::metric_contracts::MetricContractProfileV1::profile_a()?;
-    let counterfactual_delta_present = pr2c_counterfactual_delta_present(snapshot);
     let gatekeeper_config_hash = buy_log.config_hash.as_deref().ok_or(
         Pr2cTerminalSnapshotErrorV1::MissingRecordIdentity("gatekeeper config hash"),
     )?;
@@ -1347,38 +1290,26 @@ fn build_pr2c_terminal_pair(
             )
         })
         .transpose()?;
-    let pr2c_started = Instant::now();
-    let mut paired = crate::metric_contracts::build_pr2c_paired_record_from_validated_snapshot_v1(
-        &timed_snapshot,
-        &crate::metric_contracts::Pr2cDecisionRecordContextV1 {
-            record_identity,
-            stable_event_identity,
-            rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode::Legacy,
-            profile: &profile,
-            effective_config: &effective_config,
-            authoritative_policy: &policy,
-            comparator_policy: &comparator_policy,
-            counterfactual_delta_present,
-            comparator_elapsed_us,
-            metric_contract_serialize_us: 0,
-            metric_contract_build_and_serialize_us: 0,
-            projection_build_and_validate_us: timed_snapshot
-                .timings()
-                .projection_build_and_validate_us,
-            gatekeeper_config_hash,
-            brain_config_hash: buy_log.brain_config_hash.as_deref(),
-            writer_timestamp_ms: current_time_ms(),
-        },
-    )?;
-    let serialization_started = Instant::now();
-    serde_json::to_vec(&paired.decision_v34)?;
-    serde_json::to_vec(&paired.evidence)?;
-    paired.decision_v34.metric_contract_serialize_us =
-        u32::try_from(serialization_started.elapsed().as_micros())
-            .map_err(|_| Pr2cTerminalSnapshotErrorV1::SerializationDurationOverflow)?;
-    paired.metric_contract_build_and_serialize_us =
-        u32::try_from(pr2c_started.elapsed().as_micros())
-            .map_err(|_| Pr2cTerminalSnapshotErrorV1::SerializationDurationOverflow)?;
+    let paired =
+        crate::metric_contracts::build_pr2c_timed_paired_record_from_validated_snapshot_v1(
+            &timed_snapshot,
+            &crate::metric_contracts::Pr2cDecisionRecordContextV1 {
+                record_identity,
+                stable_event_identity,
+                rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode::Legacy,
+                profile: &profile,
+                effective_config: &effective_config,
+                authoritative_policy: &policy,
+                comparator_policy: &comparator_policy,
+                comparator_evaluable: assessment.decision.is_some(),
+                comparator_elapsed_us,
+                metric_contract_serialize_us: 0,
+                metric_contract_build_and_serialize_us: 0,
+                projection_build_and_validate_us: 0,
+                gatekeeper_config_hash,
+                brain_config_hash: buy_log.brain_config_hash.as_deref(),
+            },
+        )?;
     Ok(paired)
 }
 

@@ -716,6 +716,58 @@ impl MetricDecisionProjectionBuildContextV1<'_> {
     }
 }
 
+/// Opaque, owned proof that the immutable portion of a projection context has
+/// passed effective-config hash and profile binding validation. Runtime code
+/// creates this proof when a session context is installed, not once per
+/// terminal materialization. The dynamic source cutoff remains record-local
+/// and is still validated for every projection.
+#[derive(Debug)]
+pub struct MetricDecisionProjectionValidatedStaticContextV1 {
+    rollout_mode: MetricContractRolloutMode,
+    profile: MetricContractProfileV1,
+    effective_config: ResolvedMetricContractEffectiveConfigV1,
+    profile_hash: CanonicalHashV1,
+}
+
+impl MetricDecisionProjectionValidatedStaticContextV1 {
+    pub fn try_new(
+        rollout_mode: MetricContractRolloutMode,
+        profile: MetricContractProfileV1,
+        effective_config: ResolvedMetricContractEffectiveConfigV1,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        effective_config.validate_hash()?;
+        let profile_hash = profile.canonical_hash()?;
+        let payload = &effective_config.payload;
+        if payload.rollout_mode != rollout_mode
+            || payload.profile_id != profile.payload().profile_id
+            || payload.profile_hash != profile_hash
+        {
+            return Err(MetricContractProjectionErrorV1::ProjectionContextMismatch);
+        }
+        Ok(Self {
+            rollout_mode,
+            profile,
+            effective_config,
+            profile_hash,
+        })
+    }
+
+    #[must_use]
+    pub const fn rollout_mode(&self) -> MetricContractRolloutMode {
+        self.rollout_mode
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> &MetricContractProfileV1 {
+        &self.profile
+    }
+
+    #[must_use]
+    pub const fn effective_config(&self) -> &ResolvedMetricContractEffectiveConfigV1 {
+        &self.effective_config
+    }
+}
+
 /// Opaque proof that the exact projection context has passed effective-config,
 /// profile and cutoff validation. It lets the one-snapshot builder validate
 /// those immutable inputs once before timing the projection-only boundary.
@@ -732,6 +784,29 @@ impl<'context, 'inputs> MetricDecisionProjectionValidatedContextV1<'context, 'in
         Ok(Self {
             context,
             profile_hash,
+        })
+    }
+
+    /// Bind a record-local cutoff to an already validated immutable runtime
+    /// context. Pointer identity is intentional: callers cannot substitute an
+    /// equal-looking profile/config clone and bypass its trust-boundary
+    /// validation. Only references owned by the opaque static proof qualify.
+    pub fn try_new_with_static_context(
+        context: &'context MetricDecisionProjectionBuildContextV1<'inputs>,
+        static_context: &MetricDecisionProjectionValidatedStaticContextV1,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        if context.rollout_mode != static_context.rollout_mode
+            || !std::ptr::eq(context.profile, static_context.profile())
+            || !std::ptr::eq(context.effective_config, static_context.effective_config())
+        {
+            return Err(MetricContractProjectionErrorV1::ProjectionContextMismatch);
+        }
+        if context.source_cutoff.decision_timestamp_ms.get() == 0 {
+            return Err(MetricContractProjectionErrorV1::MissingSourceCutoff);
+        }
+        Ok(Self {
+            context,
+            profile_hash: static_context.profile_hash.clone(),
         })
     }
 

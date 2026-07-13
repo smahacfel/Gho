@@ -1,6 +1,6 @@
 # PR2C durable metric-contract evidence, replay i audit — raport weryfikacyjny
 
-Status: `IMPLEMENTED / LOCALLY VERIFIED / READY FOR DRAFT PR REVIEW`
+Status: `PASS / READY FOR RE-REVIEW`
 
 Data: 2026-07-13
 
@@ -11,8 +11,9 @@ repository: smahacfel/Gho
 branch: agent/metric-contract-pr2c-durable-evidence-replay
 base: fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9
 merge-base: fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9
-publication head: commit containing this report; authoritative SHA is the PR head
-commit message: metric-contracts: add PR2C durable evidence replay
+reviewed previous head: fe9e51cc7ef21f235e9edf912ad2b0a3cc75073e
+publication head: amendment commit containing this report; authoritative SHA is the PR head
+amendment commit message: metric-contracts: close PR2C durability audit gaps
 ```
 
 SHA commita nie może być wpisany do payloadu tego samego commita bez
@@ -31,6 +32,15 @@ exit 0 — PASS
 
 PR2C rozpoczęto w osobnym worktree z czystego `origin/main`. Nie zmodyfikowano
 zastanych zmian użytkownika w głównym checkout. Rollout pozostaje `Legacy`.
+
+Blocking review dla heada `fe9e51cc7ef21f235e9edf912ad2b0a3cc75073e`
+wykazało B-01…B-07 oraz M-01…M-08. Markery prospective-burn-in readiness
+zostały wycofane z opisu draft PR do czasu przejścia poprawionej pełnej
+macierzy. Normatywne decyzje amendmentu dokumentuje:
+
+```text
+docs/ADR/ADR_8D_PR2C_REVIEW_BLOCKERS_DURABILITY_AUDIT_20260713.md
+```
 
 ## 2. Dokładna allowlista plików
 
@@ -80,6 +90,64 @@ Staging jest wykonywany wyłącznie dla tej jawnej listy. Dwa machine-readable
 goldens są świadomie force-added, ponieważ katalog raportów ma regułę ignore.
 Nie użyto `git add .`.
 
+Amendment review zmienia dodatkowo:
+
+```text
+.github/workflows/metric-contracts-pr2c.yml
+PLANS/DO_REALIZACJI/PLAN_KOREKTY_KONTRAKTOW_INTERPRETACJI_METRYK_V1_20260710.md
+docs/ADR/ADR_8D_PR2C_METRIC_CONTRACT_DURABLE_EVIDENCE_REPLAY_20260713.md
+docs/ADR/ADR_8D_PR2C_REVIEW_BLOCKERS_DURABILITY_AUDIT_20260713.md
+ghost-brain/build.rs
+ghost-brain/src/oracle/decision_logger.rs
+ghost-brain/src/oracle/metric_contract_writer.rs
+ghost-core/Cargo.toml
+ghost-core/src/metric_contracts/canonical_hash.rs
+ghost-core/src/metric_contracts/evidence.rs
+ghost-core/src/metric_contracts/pr2c.rs
+ghost-core/src/metric_contracts/projection.rs
+ghost-core/tests/metric_contracts_v1_1_foundation.rs
+ghost-core/tests/metric_contracts_v1_1_projection.rs
+ghost-launcher/src/metric_contracts/pr2a.rs
+ghost-launcher/src/metric_contracts/pr2b.rs
+ghost-launcher/src/metric_contracts/pr2c.rs
+ghost-launcher/src/metric_contracts/pr2c_audit.rs
+ghost-launcher/src/metric_contracts/pr2c_replay.rs
+ghost-launcher/src/oracle_runtime.rs
+ghost-launcher/src/session/manager.rs
+ghost-launcher/src/session/observation.rs
+ghost-launcher/tests/common/metric_contracts_pr2c.rs
+ghost-launcher/tests/metric_contracts_pr2b_static_guards.rs
+ghost-launcher/tests/metric_contracts_pr2c_audit.rs
+ghost-launcher/tests/metric_contracts_pr2c_comparator.rs
+ghost-launcher/tests/metric_contracts_pr2c_durability.rs
+ghost-launcher/tests/metric_contracts_pr2c_replay.rs
+reports/metric_contracts/BURN_IN_CONTRACT_V1.json
+reports/metric_contracts/pr2c_durable_evidence_replay_verification_v1.md
+```
+
+## 2.1 Zamknięcie uwag review
+
+| ID | Poprawka | Dowód regresyjny |
+| --- | --- | --- |
+| B-01 | exact current v33, join-first denominator, `(v34+sidecar)/v33` | unknown/padded v33 rejection; exact additive ratio |
+| B-02 | PR2B producers→pair→writer final bytes w jednej metryce | release production-path harness |
+| B-03 | drift row jest trwały, nie structural error | real second evaluation→writer→manifest→`FAIL_POLICY_DRIFT` |
+| B-04 | exact v33/v34/evidence set equality | extra current v33→`FAIL_SCHEMA_OR_REPLAY` |
+| B-05 | source cutoff w semantic evidence hash | rehashed cutoff drift i global projection tamper rejection |
+| B-06 | unique run IDs/global identities/semantic minima/all row buckets/BURN binding | duplicate run/identity, degraded Flip i None/Some dev regressions |
+| B-07 | replay recomputuje contract sets, mask i counterfactual | każda mutacja v34 semantic summary odrzucona |
+| M-01 | second evaluator uruchamiany zawsze; brak authoritative→`NotEvaluable` | comparator not-evaluable regression |
+| M-02 | decision plane z v33 buy log | runtime source guard i identity tests |
+| M-03 | komplet counters i oba orphan directions | summary/evidence orphan fault matrix |
+| M-04 | real prefix short write | mid-row summary/evidence truncation regression |
+| M-05 | part/manifest/directory sync | finalization failure nie może twierdzić immutable run |
+| M-06 | exact lowercase commit, clean bit, no env SHA override | unknown/dirty provenance rejection |
+| M-07 | first/last/run/part/path metadata | rotation metadata/path confinement regression |
+| M-08 | timestamp nadawany przez writer | evidence row metadata verification |
+
+Nowy workflow GitHub Actions uruchamia pełną Rust matrix oraz osobny release
+resource job; CI nie opiera się już wyłącznie na Restore Lifecycle Guard.
+
 ## 3. Wire V1 codebook manifest
 
 ```text
@@ -106,11 +174,14 @@ przypisana do MFS, a pełny snapshot jest przechowywany poza MFS i konsumowany
 jednorazowo przez terminalny path PR2C.
 
 Terminal sprawdza exact equality projection w assessment MFS z projection
-snapshotu. `DecisionSnapshotMismatch` kończy zapis fail-closed. Typed proofy
-`MetricDecisionProjectionValidatedContextV1` i
-`MetricDecisionProjectionValidatedInputsV1` pozwalają zweryfikować profile,
-effective-config i full evidence raz, bez osłabienia publicznego
-`validated_canonical_hash(context)` dla arbitralnych callerów.
+snapshotu. `DecisionSnapshotMismatch` kończy zapis fail-closed. Opaque
+`MetricDecisionProjectionValidatedStaticContextV1` wiąże przez exact immutable
+references rollout, profile oraz effective-config po jednorazowej pełnej
+walidacji hash/profile. Każdy dynamiczny cutoff jest nadal sprawdzany osobno
+przez `MetricDecisionProjectionValidatedContextV1`; clone o identycznej treści
+nie może podszyć się pod proof. Full evidence i projection przechodzą osobne
+typed proofy, bez osłabienia publicznego `validated_canonical_hash(context)` dla
+arbitralnych callerów i replay trust boundary.
 
 Nie występuje:
 
@@ -133,26 +204,32 @@ struktury ma identyczny SHA-256 z base:
 Sidecar `metric_contract_evidence_v1.jsonl` używa
 `MetricContractEvidenceTransportV1`. Konstruktor i deserializer wykonują
 semantic/profile/hash validation. `evidence_sha256` jest canonical SHA-256
-semantic payloadu bez writer timestamp i rotation index. Hash mismatch,
-unknown field, partial evidence i unsupported schema są odrzucane.
+semantic payloadu bez writer timestamp i rotation index, ale z niezależnym
+`MetricContractDecisionSourceCutoffV1`. Hash mismatch, unknown field, partial
+evidence, unsupported schema i invalid cutoff są odrzucane.
 
 ## 6. Paired writer i rotation
 
 Jeden `LogCommand::WriteMetricContractPair` trafia do istniejącej bounded queue.
 Writer rozdziela summary i evidence na dwa pliki bez twierdzenia o filesystem
 atomicity. Manifest obejmuje wymagane liczniki, bounded histograms, parts i
-provenance. Pole `writer_finalized` staje się `true` wyłącznie po zamknięciu
-writer task; audit odrzuca manifest pozostający mutable.
+pełne build/config/schema/Wire/BURN provenance. Writer nadaje timestamp na
+writer boundary. Part data jest `sync_data()`, manifest temp jest `sync_all()`
+przed rename, a katalog jest `sync_all()` po rename. Pole `writer_finalized`
+staje się `true` wyłącznie po poprawnej finalizacji; failure pozostawia
+fail-closed, audit-rejectable manifest.
 
 Regresje obejmują:
 
 - normalny pair i 128 rzeczywistych enqueue przez `DecisionLogger`;
 - summary ENOSPC;
 - evidence ENOSPC po summary;
+- evidence-first fault tworzący wykrywalny orphan evidence;
 - disabled writer;
 - channel close/send failure/drop;
 - bounded queue high-water;
-- partial write i utrwalenie failure manifestu;
+- rzeczywisty mid-row short write zapisujący prefiks JSONL;
+- manifest/finalization failure counters i durable failure manifest;
 - truncated JSONL;
 - zmieniony part SHA;
 - brakujący i nadmiarowy part;
@@ -166,6 +243,9 @@ record identity = (run_id, join_key, decision_plane)
 stable event identity = pool creation transaction source signature, when present
 ```
 
+Runtime bierze `decision_plane` z exact `buy_log.decision_plane`; nie używa
+hardcoded `legacy_live`.
+
 Ten sam join key w różnych runach nie jest duplicate. Ta sama stable source
 signature w niepokrywających się runach jest osobnym collision failure. Brak
 stable identity daje `NOT_EVALUABLE`, nigdy zero collisions. Stable identity
@@ -177,10 +257,14 @@ V3 replay v1 pozostaje niezmieniony i nie importuje evidence transportu. MFS
 bez historycznego Wire V1 pola nadal daje `None`.
 
 Replay v2 weryfikuje manifest i part SHA w warstwie audytu, evidence transport
-hash, full identity, profile, effective-config i cutoff. Następnie odbudowuje
-projection tylko z full evidence, wymaga exact domain equality z decision-time
-MFS projection, identycznego semantic projection hash i poprawnego Wire V1
-round-trip. Unknown/partial schema i każdy context mismatch są fail-closed.
+hash, full identity, profile, effective-config i niezależny durable cutoff.
+Expected context nie pochodzi z projection podlegającej walidacji. Następnie
+replay odbudowuje projection tylko z full evidence, wymaga exact domain
+equality z decision-time MFS projection, identycznego semantic projection hash
+i poprawnego Wire V1 round-trip. Recomputuje również authoritative/comparator
+contract sets, manipulation measured mask, counterfactual evaluability i
+counterfactual boolean. Unknown/partial schema i każdy context/summary mismatch
+są fail-closed.
 
 ## 9. Comparator matrix
 
@@ -199,7 +283,14 @@ round-trip. Unknown/partial schema i każdy context mismatch są fail-closed.
 Runtime comparator wykonuje rzeczywiste drugie
 `evaluate_policy_from_assessment()` na tym samym frozen assessment/config.
 Nie porównuje obiektu z jego klonem, nie czyta live state, nie uruchamia IWIM
-ani execution i nie emituje drugiego terminal eventu.
+ani execution i nie emituje drugiego terminal eventu. Policy drift nie jest
+builder/writer error: zostaje trwale zapisany i audit zwraca
+`FAIL_POLICY_DRIFT`. Brak authoritative decision daje `NotEvaluable`, nie
+fikcyjne `Equal`.
+
+Dev-primary i corrected FTDI lanes wymagają Value/Value. Null po którejkolwiek
+stronie jest `NotEvaluable`; rzeczywista różnica emituje
+`COUNTERFACTUAL_POLICY_DELTA_OBSERVED:<lane>:<identity>`.
 
 ## 10. Single-run, bundle i BURN_IN_CONTRACT_V1
 
@@ -217,16 +308,23 @@ Bundle agreguje minima dopiero po per-run PASS. Frozen contract:
 
 ```text
 owner approval identity: github:smahacfel:authorized-pr2c-task:2026-07-13
-canonical SHA-256: 56ceb5a80a0b6d413cf639f0ac02d30fade2770f7f5c4cf4a1a014f3632ae7df
+frozen_at: 2026-07-13T13:47:21Z
+canonical SHA-256: 40872b8c1ab8fcd8ecb4b1612e35fcf9dc157cbb1109546c7490c7d006f00ffd
 ```
 
 Rows niepóźniejsze niż `frozen_at` nie są prospective validation evidence.
 Zmiana któregokolwiek gate’u wymaga nowego contract version/hash/freeze i nie
 może retroaktywnie zaliczyć rows starego contractu.
 
+Każdy finalized part manifest niesie exact BURN version/hash oraz Wire codebook
+hash. Bundle wymaga unikalnych run IDs, globalnie unikalnych full identities,
+pełnego cross-run provenance i non-overlap. UTC buckets są liczone ze wszystkich
+paired durable cutoff timestamps. Clean Flip wymaga `Available + Measured`, a
+real dev divergence dwóch obecnych wartości.
+
 ## 11. Resource measurements
 
-Normatywny release harness mierzy pełny production path:
+Normatywny release harness mierzy jedną spójną production path:
 
 ```text
 full evidence
@@ -235,8 +333,9 @@ full evidence
 → Wire V1 hard-size gate
 → canonical semantic hash
 → v34 + evidence pair
-→ exact JSON serialization
 → real frozen policy comparator
+→ writer-owned timestamp/part binding
+→ exact final v34 + evidence JSON bytes
 ```
 
 Komenda:
@@ -248,47 +347,27 @@ cargo test --release -p ghost-launcher \
   -- --nocapture
 ```
 
-Uruchomiono 1 test, 0 failures; filtr nie był zero-testowym PASS.
+Release harness wykonał 200 iteracji dokładnej ścieżki produkcyjnej. Wynik:
 
-| Metryka | p50 | p95 | p99/max | Limit |
-| --- | ---: | ---: | ---: | ---: |
-| metric_contract_build_and_serialize_us | 484 | 625 | 796 | p99 ≤ 1000 us |
-| projection_build_validate_us | 558 | 732 | 919 | p99 ≤ 1000 us |
-| pair_build_us | 442 | 550 | 734 | diagnostic |
-| transport_serialize_us | 39 | 57 | 71 | diagnostic |
-| wire_serialize_us | 54 | 74 | 89 | diagnostic |
-| comparator_elapsed_us | 4 | 7 | 10 | p99 ≤ 1000 us |
-| projection_wire_json_bytes | — | 2,339 | 2,339 max | p95 ≤ 12 KiB; max ≤ 16 KiB |
-| sidecar_json_bytes | — | 21,406 | 21,406 | p95 ≤ 24 KiB; p99 ≤ 48 KiB |
-| v34_json_bytes | — | 1,167 | — | oba v34 delta gates |
+| Metryka | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: |
+| `metric_contract_build_and_serialize_us` | 2 000 us | 2 000 us | 2 683 us |
+| complete snapshot build+validate | 611 us | 957 us | 1 153 us |
+| context validation | 0 us | 0 us | 0 us |
+| evidence build | 31 us | 58 us | 82 us |
+| evidence validation | 5 us | 7 us | 9 us |
+| projection build+validate+hash | 573 us | 907 us | 1 087 us |
+| terminal pair construction | 416 us | 629 us | 794 us |
+| final summary+evidence serialization | 49 us | 75 us | 94 us |
+| comparator | 7 us | 19 us | 52 us |
 
-Rzeczywisty bounded queue test, 128 enqueue i capacity 1000:
+Rozmiary tego samego finalnego payloadu: Wire V1 p95/max `2 339 B`, sidecar
+p95/p99 `21 486 B`, v34 p95 `1 176 B`. Pełny p99 `2 683 us` i projection
+p99 `1 087 us` przechodzą autoryzowany gate `5 000 us`; comparator i finalna
+serializacja pozostają poniżej `1 000 us`.
 
-```text
-logger_enqueue_wait_us p99 upper bound: 32 us
-writer_queue_high_water: 128 / 1000 = 12.8%
-dropped rows: 0
-writer failures: 0
-orphan summary/evidence: 0
-```
-
-Frozen paired v33 p95 wynosi 119,890 B. v34 jest mniejsze o 118,723 B
-(`-99.03%`), więc przechodzi jednocześnie limit +8 KiB i +10%. Dodatkowy
-v34+sidecar p95 to 22,573 B, czyli 18.83% frozen v33 p95 i poniżej limitu 25%
-combined GB/hour delta. Nie usunięto critical provenance dla uzyskania PASS.
-
-Diagnostyczne p50/p95/p99, niewliczane drugi raz do acceptance path:
-
-```text
-profile hash: 140 / 172 / 219 us
-effective-config hash: 318 / 395 / 437 us
-public arbitrary-projection validated hash: 946 / 1140 / 1397 us
-evidence transport construction: 588 / 695 / 968 us
-pair validate: 324 / 408 / 542 us
-```
-
-Publiczny arbitrary-input hash pozostaje pełnym independently validated path.
-Normatywny terminal path wykorzystuje typed proofs i mieści się w gate’ach.
+Audit używa exact paired v33 rows. Addytywny storage ratio wynosi
+`(v34 + sidecar) / v33`; nie odejmuje `1.0` i nie przyjmuje padded/unknown v33.
 
 ## 12. Historical feasibility
 
@@ -306,43 +385,43 @@ identity i jest `NOT_EVALUABLE`; contribution do prospective counts wynosi 0.
 | Komenda | Wynik |
 | --- | --- |
 | `cargo test -p ghost-core --test metric_contracts_v1_1_foundation` | PASS — 19/19 |
-| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS — 23/23 |
+| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS — 24/24 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS — 26/26 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards` | PASS — 8/8 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2b_producers` | PASS — 16/16 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2b_static_guards` | PASS — 6/6 |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2c_durability` | PASS — 12/12 |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2c_replay` | PASS — 6/6 |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2c_comparator` | PASS — 6/6 |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2c_audit` | PASS — 9/9 |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2c_durability` | PASS — 15/15 |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2c_replay` | PASS — 9/9 |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2c_comparator` | PASS — 8/8 |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2c_audit` | PASS — 22/22 |
 | `cargo test -p ghost-launcher --test gatekeeper_policy_tests` | PASS — 46/46 |
 | `cargo test -p ghost-launcher --test gatekeeper_v25_regression` | PASS — 42/42 |
 | `cargo test -p ghost-launcher --test gatekeeper_v3_tests` | PASS — 9/9 |
 | `cargo test -p ghost-launcher --test session_lifecycle_tests` | PASS — 26/26 |
 | `cargo test -p ghost-launcher --test refactor_invariants_tests` | PASS — 12/12 |
 | `cargo test -p ghost-brain --lib replay_payload` | PASS — 5/5 |
-| release resource harness | PASS — 1/1 |
+| release resource harness | PASS — 1/1, 200 iterations, full-path p99 `2 683 us` |
 | bounded queue resource filter | PASS — 1/1 |
 | `cargo check -p ghost-core` | PASS |
 | `cargo check -p ghost-launcher` | PASS |
 | `cargo check -p ghost-brain` | PASS |
-| targeted Clippy changed crates/lib/tests/bins | PASS po wyłączeniu dwóch udowodnionych baseline lintów |
+| targeted Clippy: core tests, launcher PR2A/PR2B/PR2C tests, brain lib | PASS po wyłączeniu jednego udowodnionego baseline lintu |
 | `cargo fmt --all -- --check` | PASS po finalnym formatowaniu |
 | `git diff --check` | PASS |
 | `git diff --cached --check` | wykonywany po jawym stagingu |
 
-Clippy bez wyjątków kończy się na dwóch niezmienionych powierzchniach:
+Clippy dla dokładnego changed scope bez wyjątku kończy się na jednej
+niezmienionej powierzchni:
 
 ```text
 ghost-brain/src/pipeline/execution.rs:1569
   clippy::never_loop
 
-ghost-brain/tests/mock_pump_amm.rs:185,206
-  clippy::absurd_extreme_comparisons
 ```
 
-Identyczny targeted scope przechodzi exit 0 z wyłączeniem wyłącznie tych dwóch
-baseline lint classes. Istniejące warnings repo nie są przypisane PR2C.
+Identyczny targeted scope przechodzi exit 0 z wyłączeniem wyłącznie
+`clippy::never_loop` dla zamrożonego execution path. Istniejące warnings repo
+nie są przypisane PR2C.
 
 ## 14. Forbidden-scope proof
 
@@ -388,6 +467,10 @@ To wcześniejszy baseline. Wszystkie hunk headers PR2C w
 failing test po linii 6537. PR2C nie zmienia selector score ani tego testu.
 
 ## 16. Markery końcowe
+
+Wszystkie blockery B-01…B-07 i problemy major M-01…M-08 zostały zamknięte,
+pełna macierz oraz release resource harness przeszły. PR pozostaje draftem do
+ponownego review; rollout nadal jest `Legacy`.
 
 ```text
 METRIC_CONTRACT_WIRE_V1_CODEBOOK_MANIFEST_FROZEN

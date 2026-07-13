@@ -1,6 +1,6 @@
 use super::{
-    build_pr2a_evidence_families_v1, Pr2aEvidenceBuildContextV1, Pr2aFrozenProducerInputsV1,
-    Pr2aProducerErrorV1,
+    build_pr2a_evidence_families_v1, build_pr2a_evidence_families_with_validated_static_context_v1,
+    Pr2aEvidenceBuildContextV1, Pr2aFrozenProducerInputsV1, Pr2aProducerErrorV1,
 };
 use crate::tx_intelligence::FlipV2ProducerSnapshotV1;
 use ghost_core::account_state_core::types::AccountStateReserveVelocitySnapshotV1;
@@ -16,9 +16,9 @@ use ghost_core::metric_contracts::{
     MetricContractDecisionEvidenceProjectionV1, MetricContractDecisionSourceCutoffV1,
     MetricContractId, MetricContractProfileV1, MetricContractRolloutMode,
     MetricContractsEvidenceSetV1, MetricDecisionProjectionBuildContextV1,
-    MetricDecisionProjectionValidatedContextV1, MetricEffectiveConfigKeyV1,
-    MetricEffectiveConfigValueV1, MetricEvidenceEnvelopeErrorV1, MetricEvidenceReasonV1,
-    MetricMeasurementQualityV1, MetricRolloutRoleV1, MetricSurfaceId,
+    MetricDecisionProjectionValidatedContextV1, MetricDecisionProjectionValidatedStaticContextV1,
+    MetricEffectiveConfigKeyV1, MetricEffectiveConfigValueV1, MetricEvidenceEnvelopeErrorV1,
+    MetricEvidenceReasonV1, MetricMeasurementQualityV1, MetricRolloutRoleV1, MetricSurfaceId,
     RecentBuySellEvidenceReasonV1, RecentBuySellEvidenceV1, ReserveVelocityEvidenceReasonV1,
     ReserveVelocityEvidenceV1, ReserveVelocitySourceClockV1, ReserveVelocityStatusV1,
     ResolvedMetricContractEffectiveConfigV1, MANIPULATION_DERIVED_POLICY_STAGE_V1,
@@ -380,6 +380,10 @@ pub struct Pr2bBuildContextV1<'a> {
 pub struct Pr2bCompleteMetricContractSnapshotV1 {
     pub full_evidence: MetricContractsEvidenceSetV1,
     pub compact_projection: MetricContractDecisionEvidenceProjectionV1,
+    /// Frozen independently from the compact projection so PR2C can place the
+    /// exact cutoff in the durable semantic evidence payload and replay does
+    /// not need to trust the projection under verification.
+    pub source_cutoff: MetricContractDecisionSourceCutoffV1,
 }
 
 /// Runtime-only timings captured inside the one canonical PR2B build. They
@@ -388,6 +392,9 @@ pub struct Pr2bCompleteMetricContractSnapshotV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pr2bCompleteMetricContractBuildTimingsV1 {
     pub metric_contract_build_and_validate_us: u32,
+    pub context_validation_us: u32,
+    pub evidence_build_us: u32,
+    pub evidence_validation_us: u32,
     pub projection_build_and_validate_us: u32,
 }
 
@@ -1388,6 +1395,7 @@ pub fn build_recent_buy_sell_evidence_v1(
 fn build_pr2b_complete_metric_contract_snapshot_inner_v1(
     inputs: Pr2bFrozenProducerInputsV1<'_>,
     context: &Pr2bBuildContextV1<'_>,
+    static_context: Option<&MetricDecisionProjectionValidatedStaticContextV1>,
 ) -> Result<Pr2bTimedCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
     let complete_started = Instant::now();
     let projection_context = MetricDecisionProjectionBuildContextV1 {
@@ -1396,14 +1404,33 @@ fn build_pr2b_complete_metric_contract_snapshot_inner_v1(
         effective_config: context.effective_config,
         source_cutoff: context.source_cutoff.clone(),
     };
-    let validated_projection_context =
-        MetricDecisionProjectionValidatedContextV1::try_new(&projection_context)?;
-    let pr2a_context = Pr2aEvidenceBuildContextV1 {
-        rollout_mode: context.rollout_mode,
-        profile: context.profile,
-        effective_config: context.effective_config,
+    let context_validation_started = Instant::now();
+    let validated_projection_context = match static_context {
+        Some(static_context) => {
+            MetricDecisionProjectionValidatedContextV1::try_new_with_static_context(
+                &projection_context,
+                static_context,
+            )?
+        }
+        None => MetricDecisionProjectionValidatedContextV1::try_new(&projection_context)?,
     };
-    let pr2a = build_pr2a_evidence_families_v1(inputs.pr2a, &pr2a_context)?;
+    let context_validation_us = u32::try_from(context_validation_started.elapsed().as_micros())
+        .map_err(|_| Pr2bProducerErrorV1::TimingOverflow("projection context validation"))?;
+    let evidence_build_started = Instant::now();
+    let pr2a = match static_context {
+        Some(static_context) => build_pr2a_evidence_families_with_validated_static_context_v1(
+            inputs.pr2a,
+            static_context,
+        )?,
+        None => {
+            let pr2a_context = Pr2aEvidenceBuildContextV1 {
+                rollout_mode: context.rollout_mode,
+                profile: context.profile,
+                effective_config: context.effective_config,
+            };
+            build_pr2a_evidence_families_v1(inputs.pr2a, &pr2a_context)?
+        }
+    };
     let full_evidence = MetricContractsEvidenceSetV1 {
         fee_topology_diversity_index: pr2a.fee_topology_diversity_index,
         dev_buy: pr2a.dev_buy,
@@ -1416,8 +1443,14 @@ fn build_pr2b_complete_metric_contract_snapshot_inner_v1(
         reserve_velocity: build_reserve_velocity_evidence_v1(inputs.reserve_velocity, context)?,
         recent_buy_sell: build_recent_buy_sell_evidence_v1(inputs.recent_buy_sell, context)?,
     };
+    let evidence_build_us = u32::try_from(evidence_build_started.elapsed().as_micros())
+        .map_err(|_| Pr2bProducerErrorV1::TimingOverflow("full evidence build"))?;
+    let evidence_validation_started = Instant::now();
     let validated_projection_inputs =
         validated_projection_context.validate_evidence(&full_evidence)?;
+    let evidence_validation_us =
+        u32::try_from(evidence_validation_started.elapsed().as_micros())
+            .map_err(|_| Pr2bProducerErrorV1::TimingOverflow("full evidence validation"))?;
     let projection_started = Instant::now();
     let (compact_projection, validated_projection_hash) =
         validated_projection_inputs.build_with_validated_canonical_hash()?;
@@ -1430,9 +1463,13 @@ fn build_pr2b_complete_metric_contract_snapshot_inner_v1(
         snapshot: Pr2bCompleteMetricContractSnapshotV1 {
             full_evidence,
             compact_projection,
+            source_cutoff: context.source_cutoff.clone(),
         },
         timings: Pr2bCompleteMetricContractBuildTimingsV1 {
             metric_contract_build_and_validate_us,
+            context_validation_us,
+            evidence_build_us,
+            evidence_validation_us,
             projection_build_and_validate_us,
         },
         validated_projection_hash,
@@ -1443,7 +1480,7 @@ pub fn build_pr2b_complete_metric_contract_snapshot_v1(
     inputs: Pr2bFrozenProducerInputsV1<'_>,
     context: &Pr2bBuildContextV1<'_>,
 ) -> Result<Pr2bCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
-    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context)
+    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context, None)
         .map(Pr2bTimedCompleteMetricContractSnapshotV1::into_snapshot)
 }
 
@@ -1451,7 +1488,25 @@ pub fn build_pr2b_timed_complete_metric_contract_snapshot_v1(
     inputs: Pr2bFrozenProducerInputsV1<'_>,
     context: &Pr2bBuildContextV1<'_>,
 ) -> Result<Pr2bTimedCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
-    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context)
+    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context, None)
+}
+
+/// Production/harness path for a session whose immutable projection context
+/// was validated once when installed. All producers, evidence semantics,
+/// record-local cutoff checks, compact projection validation and both hashes
+/// remain inside the timed per-decision path.
+pub fn build_pr2b_timed_complete_metric_contract_snapshot_with_validated_static_context_v1(
+    inputs: Pr2bFrozenProducerInputsV1<'_>,
+    static_context: &MetricDecisionProjectionValidatedStaticContextV1,
+    source_cutoff: MetricContractDecisionSourceCutoffV1,
+) -> Result<Pr2bTimedCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
+    let context = Pr2bBuildContextV1 {
+        rollout_mode: static_context.rollout_mode(),
+        profile: static_context.profile(),
+        effective_config: static_context.effective_config(),
+        source_cutoff,
+    };
+    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, &context, Some(static_context))
 }
 
 pub fn pr2b_key_boundary_set_is_closed() -> bool {

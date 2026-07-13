@@ -1,8 +1,12 @@
 use anyhow::{Context, Result};
 use ghost_core::metric_contracts::{
     CanonicalHashV1, MetricContractDecisionSummaryV1, MetricContractEvidenceTransportV1,
-    MetricContractPairedRecordV1, MetricEvidenceRecordIdentityV1,
-    ResolvedMetricContractEffectiveConfigV1,
+    MetricContractPairedRecordV1, MetricContractRolloutMode, MetricEvidenceRecordIdentityV1,
+    ResolvedMetricContractEffectiveConfigV1, BURN_IN_CONTRACT_V1_CANONICAL_HASH,
+    METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
+    METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1,
+    METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34, METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1,
+    METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,6 +14,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::{create_dir_all, rename, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
@@ -26,6 +31,7 @@ pub struct MetricContractPairedWriterConfigV1 {
     pub directory: PathBuf,
     pub rotation_max_bytes: u64,
     pub build_commit: String,
+    pub build_worktree_clean: bool,
     pub queue_capacity: usize,
     /// Deterministic failure hook used only by durability regression fixtures.
     /// Production construction always leaves it at `None`.
@@ -36,6 +42,12 @@ pub struct MetricContractPairedWriterConfigV1 {
 pub enum MetricContractWriterFaultInjectionV1 {
     SummaryEnospc,
     EvidenceEnospcAfterSummary,
+    /// Persist a complete evidence row first, then fail the matching summary.
+    /// This exercises and proves the otherwise rare orphan-evidence branch.
+    SummaryEnospcAfterEvidence,
+    SummaryShortWriteAfterBytes(usize),
+    EvidenceShortWriteAfterSummaryBytes(usize),
+    FinalManifestEnospc,
 }
 
 impl MetricContractPairedWriterConfigV1 {
@@ -45,6 +57,7 @@ impl MetricContractPairedWriterConfigV1 {
             directory,
             rotation_max_bytes: DEFAULT_METRIC_CONTRACT_ROTATION_MAX_BYTES,
             build_commit: build_commit.into(),
+            build_worktree_clean: true,
             queue_capacity: 1_000,
             fault_injection: None,
         }
@@ -153,6 +166,8 @@ pub struct MetricContractPairedWriterStatsSnapshotV1 {
     pub orphan_summary_total: u64,
     pub orphan_evidence_total: u64,
     pub missing_pair_total: u64,
+    pub manifest_write_failures_total: u64,
+    pub finalization_failures_total: u64,
     pub writer_queue_high_water: u64,
     pub logger_enqueue_wait_us: MetricContractLatencyHistogramSnapshotV1,
     pub metric_contract_build_and_serialize_us: MetricContractLatencyHistogramSnapshotV1,
@@ -172,6 +187,8 @@ pub struct MetricContractPairedWriterStatsV1 {
     orphan_summary_total: AtomicU64,
     orphan_evidence_total: AtomicU64,
     missing_pair_total: AtomicU64,
+    manifest_write_failures_total: AtomicU64,
+    finalization_failures_total: AtomicU64,
     writer_queue_high_water: AtomicU64,
     logger_enqueue_wait_us: MetricContractLatencyHistogramV1,
     metric_contract_build_and_serialize_us: MetricContractLatencyHistogramV1,
@@ -194,6 +211,8 @@ impl MetricContractPairedWriterStatsV1 {
             orphan_summary_total: load(&self.orphan_summary_total),
             orphan_evidence_total: load(&self.orphan_evidence_total),
             missing_pair_total: load(&self.missing_pair_total),
+            manifest_write_failures_total: load(&self.manifest_write_failures_total),
+            finalization_failures_total: load(&self.finalization_failures_total),
             writer_queue_high_water: load(&self.writer_queue_high_water),
             logger_enqueue_wait_us: self.logger_enqueue_wait_us.snapshot(),
             metric_contract_build_and_serialize_us: self
@@ -231,11 +250,20 @@ impl MetricContractPairedWriterStatsV1 {
         self.logger_enqueue_wait_us.record(value_us);
     }
 
-    fn record_pair_resources(&self, pair: &MetricContractPairedRecordV1) {
+    fn record_pair_resources(
+        &self,
+        pair: &MetricContractPairedRecordV1,
+        final_byte_materialization_us: u32,
+    ) -> Result<()> {
+        let full_path_us = pair
+            .metric_contract_build_and_serialize_us
+            .checked_add(final_byte_materialization_us)
+            .context("metric-contract full build+serialize duration overflow")?;
         self.metric_contract_build_and_serialize_us
-            .record(u64::from(pair.metric_contract_build_and_serialize_us));
+            .record(u64::from(full_path_us));
         self.projection_build_and_validate_us
             .record(u64::from(pair.projection_build_and_validate_us));
+        Ok(())
     }
 }
 
@@ -253,8 +281,17 @@ pub struct MetricContractRotatedPartManifestV1 {
     pub part_sha256: CanonicalHashV1,
     pub run_id: String,
     pub build_commit: String,
+    pub build_worktree_clean: bool,
     pub gatekeeper_config_hash: String,
-    pub brain_config_hash: Option<String>,
+    pub brain_config_hash: String,
+    pub rollout_mode: MetricContractRolloutMode,
+    pub metric_contract_schema_version: u16,
+    pub projection_wire_version: u16,
+    pub evidence_schema_version: u16,
+    pub decision_schema_version: u32,
+    pub wire_schema_manifest_blake3: String,
+    pub burn_in_contract_version: u16,
+    pub burn_in_contract_canonical_hash: CanonicalHashV1,
     pub profile_id: String,
     pub profile_hash: CanonicalHashV1,
     pub metric_contract_effective_config_hash: CanonicalHashV1,
@@ -278,7 +315,10 @@ pub struct MetricContractRotationManifestV1 {
 struct MetricContractPartProvenanceV1 {
     run_id: String,
     gatekeeper_config_hash: String,
-    brain_config_hash: Option<String>,
+    brain_config_hash: String,
+    rollout_mode: MetricContractRolloutMode,
+    metric_contract_schema_version: u16,
+    evidence_schema_version: u16,
     profile_id: String,
     profile_hash: CanonicalHashV1,
     metric_contract_effective_config_hash: CanonicalHashV1,
@@ -286,11 +326,28 @@ struct MetricContractPartProvenanceV1 {
 }
 
 impl MetricContractPartProvenanceV1 {
-    fn from_pair(pair: &MetricContractPairedRecordV1) -> Self {
-        Self {
+    fn try_from_pair(pair: &MetricContractPairedRecordV1) -> Result<Self> {
+        let brain_config_hash = pair
+            .brain_config_hash
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .context("paired writer requires a non-empty brain config hash")?;
+        if !is_exact_lower_hex(&pair.gatekeeper_config_hash, 64)
+            || !is_exact_lower_hex(brain_config_hash, 64)
+            || pair.decision_v34.metric_contract_schema_version
+                != METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1
+            || pair.decision_v34.evidence_schema_version
+                != METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1
+        {
+            anyhow::bail!("paired writer requires exact config hashes and schema provenance");
+        }
+        Ok(Self {
             run_id: pair.record_identity().run_id.clone(),
             gatekeeper_config_hash: pair.gatekeeper_config_hash.clone(),
-            brain_config_hash: pair.brain_config_hash.clone(),
+            brain_config_hash: brain_config_hash.to_string(),
+            rollout_mode: pair.decision_v34.rollout_mode,
+            metric_contract_schema_version: pair.decision_v34.metric_contract_schema_version,
+            evidence_schema_version: pair.decision_v34.evidence_schema_version,
             profile_id: pair.decision_v34.profile_id.as_str().to_string(),
             profile_hash: pair.decision_v34.profile_hash.clone(),
             metric_contract_effective_config_hash: pair
@@ -298,8 +355,15 @@ impl MetricContractPartProvenanceV1 {
                 .metric_contract_effective_config_hash
                 .clone(),
             effective_config: pair.effective_config.clone(),
-        }
+        })
     }
+}
+
+fn is_exact_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug)]
@@ -351,12 +415,12 @@ impl OpenPart {
         })
     }
 
-    async fn write_json_line<T: Serialize>(
+    async fn write_encoded_json_line(
         &mut self,
-        value: &T,
+        mut bytes: Vec<u8>,
         identity: &MetricEvidenceRecordIdentityV1,
+        fail_after_bytes: Option<usize>,
     ) -> Result<()> {
-        let mut bytes = serde_json::to_vec(value).context("serialize metric-contract row")?;
         bytes.push(b'\n');
 
         // Account for every byte accepted by the filesystem, including a
@@ -365,7 +429,13 @@ impl OpenPart {
         // pretending that the part remained unchanged.
         let mut written = 0usize;
         while written < bytes.len() {
-            let count = self.file.write(&bytes[written..]).await?;
+            if fail_after_bytes.is_some_and(|limit| written >= limit) {
+                return Err(std::io::Error::from_raw_os_error(28).into());
+            }
+            let write_end = fail_after_bytes
+                .map(|limit| limit.min(bytes.len()))
+                .unwrap_or(bytes.len());
+            let count = self.file.write(&bytes[written..write_end]).await?;
             if count == 0 {
                 return Err(std::io::Error::new(
                     ErrorKind::WriteZero,
@@ -391,13 +461,20 @@ impl OpenPart {
             .get_or_insert_with(|| identity.clone());
         self.last_record_identity = Some(identity.clone());
         self.file.flush().await?;
+        self.file.sync_data().await?;
+        Ok(())
+    }
+
+    async fn sync_data(&mut self) -> Result<()> {
+        self.file.flush().await?;
+        self.file.sync_data().await?;
         Ok(())
     }
 
     fn manifest(
         &self,
         provenance: &MetricContractPartProvenanceV1,
-        build_commit: &str,
+        config: &MetricContractPairedWriterConfigV1,
     ) -> MetricContractRotatedPartManifestV1 {
         MetricContractRotatedPartManifestV1 {
             stream: self.stream.to_string(),
@@ -416,9 +493,22 @@ impl OpenPart {
             part_sha256: CanonicalHashV1::parse(format!("{:x}", self.sha256.clone().finalize()))
                 .expect("SHA-256 always formats as 64 lowercase hexadecimal characters"),
             run_id: provenance.run_id.clone(),
-            build_commit: build_commit.to_string(),
+            build_commit: config.build_commit.clone(),
+            build_worktree_clean: config.build_worktree_clean,
             gatekeeper_config_hash: provenance.gatekeeper_config_hash.clone(),
             brain_config_hash: provenance.brain_config_hash.clone(),
+            rollout_mode: provenance.rollout_mode,
+            metric_contract_schema_version: provenance.metric_contract_schema_version,
+            projection_wire_version: METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1,
+            evidence_schema_version: provenance.evidence_schema_version,
+            decision_schema_version: METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34,
+            wire_schema_manifest_blake3: METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3
+                .to_string(),
+            burn_in_contract_version: 1,
+            burn_in_contract_canonical_hash: CanonicalHashV1::parse(
+                BURN_IN_CONTRACT_V1_CANONICAL_HASH,
+            )
+            .expect("compiled BURN_IN_CONTRACT_V1 hash is valid SHA-256"),
             profile_id: provenance.profile_id.clone(),
             profile_hash: provenance.profile_hash.clone(),
             metric_contract_effective_config_hash: provenance
@@ -508,10 +598,15 @@ impl MetricContractPairedWriterV1 {
         Ok(())
     }
 
-    pub async fn write_pair(&mut self, pair: MetricContractPairedRecordV1) -> Result<()> {
+    pub async fn write_pair(&mut self, mut pair: MetricContractPairedRecordV1) -> Result<()> {
+        // Count every command received by the writer boundary, including
+        // commands that fail structural/provenance validation before I/O.
+        self.stats
+            .paired_commands_total
+            .fetch_add(1, Ordering::Relaxed);
         pair.validate_pair()
             .context("validate paired metric-contract record")?;
-        let candidate_provenance = MetricContractPartProvenanceV1::from_pair(&pair);
+        let candidate_provenance = MetricContractPartProvenanceV1::try_from_pair(&pair)?;
         if let Some(frozen) = self.frozen_provenance.as_ref() {
             anyhow::ensure!(
                 frozen == &candidate_provenance,
@@ -521,16 +616,71 @@ impl MetricContractPairedWriterV1 {
             self.frozen_provenance = Some(candidate_provenance);
         }
         self.rotate_if_needed().await?;
-        self.stats.record_pair_resources(&pair);
-        self.stats
-            .paired_commands_total
-            .fetch_add(1, Ordering::Relaxed);
+        // The PR2B+pair timer stored in `pair` ends at terminal pair
+        // construction. This timer resumes the same production path at the
+        // writer-owned durable-byte boundary and includes timestamp/part
+        // binding, semantic transport hashing, both serde passes and the
+        // fixed-width final v34 telemetry substitution. Filesystem I/O is
+        // intentionally measured by writer/backpressure counters instead.
+        let final_bytes_started = std::time::Instant::now();
         let identity = pair.record_identity().clone();
-        let transport = MetricContractEvidenceTransportV1::try_new(
-            pair.evidence.payload.clone(),
-            pair.evidence.writer_timestamp_ms,
-            self.evidence.part_index,
-        )?;
+        let writer_timestamp_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock precedes Unix epoch")?
+                .as_millis(),
+        )
+        .context("writer timestamp does not fit u64")?;
+        // Both fields are transport-only and deliberately excluded from the
+        // semantic evidence hash. The terminal pair builder has already
+        // validated and hashed this exact payload, so rebuilding the
+        // transport with `try_new` here would run all ten family validators
+        // and JCS/SHA-256 a second time. Durable deserialization and replay
+        // still independently repeat those checks at their trust boundary.
+        pair.evidence.writer_timestamp_ms = writer_timestamp_ms;
+        pair.evidence.rotation_part_index = self.evidence.part_index;
+
+        // Evidence is serialized once with the writer-owned timestamp and
+        // rotation index. The v34 summary uses a bounded fixed-point pass so
+        // its embedded `metric_contract_serialize_us` describes the exact
+        // final summary+evidence representation that is handed to write().
+        let evidence_serialize_started = std::time::Instant::now();
+        let evidence_bytes = serde_json::to_vec(&pair.evidence)
+            .context("serialize final metric-contract evidence")?;
+        let evidence_serialize_us = u32::try_from(evidence_serialize_started.elapsed().as_micros())
+            .context("evidence serialization duration does not fit u32")?;
+        let (summary_bytes, final_serialization_us) =
+            serialize_final_summary_bytes(&mut pair.decision_v34, evidence_serialize_us)?;
+        let final_byte_materialization_us =
+            u32::try_from(final_bytes_started.elapsed().as_micros())
+                .context("final metric-contract byte materialization duration does not fit u32")?;
+        self.stats
+            .record_pair_resources(&pair, final_byte_materialization_us)?;
+        debug_assert!(final_byte_materialization_us >= final_serialization_us);
+
+        if self.config.fault_injection
+            == Some(MetricContractWriterFaultInjectionV1::SummaryEnospcAfterEvidence)
+        {
+            self.evidence
+                .write_encoded_json_line(evidence_bytes, &identity, None)
+                .await
+                .context("write metric-contract evidence before injected summary failure")?;
+            self.stats
+                .evidence_rows_written_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .summary_write_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .orphan_evidence_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .missing_pair_total
+                .fetch_add(1, Ordering::Relaxed);
+            return self
+                .return_error_after_manifest(std::io::Error::from_raw_os_error(28).into())
+                .await;
+        }
 
         if self.config.fault_injection == Some(MetricContractWriterFaultInjectionV1::SummaryEnospc)
         {
@@ -547,7 +697,16 @@ impl MetricContractPairedWriterV1 {
 
         if let Err(error) = self
             .summary
-            .write_json_line::<MetricContractDecisionSummaryV1>(&pair.decision_v34, &identity)
+            .write_encoded_json_line(
+                summary_bytes,
+                &identity,
+                match self.config.fault_injection {
+                    Some(MetricContractWriterFaultInjectionV1::SummaryShortWriteAfterBytes(
+                        bytes,
+                    )) => Some(bytes),
+                    _ => None,
+                },
+            )
             .await
         {
             self.stats
@@ -581,7 +740,22 @@ impl MetricContractPairedWriterV1 {
                 .await;
         }
 
-        if let Err(error) = self.evidence.write_json_line(&transport, &identity).await {
+        if let Err(error) = self
+            .evidence
+            .write_encoded_json_line(
+                evidence_bytes,
+                &identity,
+                match self.config.fault_injection {
+                    Some(
+                        MetricContractWriterFaultInjectionV1::EvidenceShortWriteAfterSummaryBytes(
+                            bytes,
+                        ),
+                    ) => Some(bytes),
+                    _ => None,
+                },
+            )
+            .await
+        {
             self.stats
                 .evidence_write_failures_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -606,6 +780,10 @@ impl MetricContractPairedWriterV1 {
     }
 
     async fn return_error_after_manifest(&mut self, error: anyhow::Error) -> Result<()> {
+        // Persist any accepted prefix before recording the failure manifest;
+        // the manifest must never claim bytes that were not made durable.
+        let _ = self.summary.sync_data().await;
+        let _ = self.evidence.sync_data().await;
         if let Err(manifest_error) = self.update_manifest().await {
             return Err(error.context(format!(
                 "paired write failed and failure-state manifest persistence also failed: {manifest_error:#}"
@@ -615,25 +793,42 @@ impl MetricContractPairedWriterV1 {
     }
 
     async fn update_manifest(&mut self) -> Result<()> {
+        self.summary.sync_data().await?;
+        self.evidence.sync_data().await?;
         let provenance = self
             .frozen_provenance
             .as_ref()
             .context("cannot persist metric-contract manifest without frozen provenance")?;
         upsert_part(
             &mut self.manifest.summary_parts,
-            self.summary.manifest(provenance, &self.config.build_commit),
+            self.summary.manifest(provenance, &self.config),
         );
         self.manifest.writer_stats = self.stats.snapshot();
         upsert_part(
             &mut self.manifest.evidence_parts,
-            self.evidence
-                .manifest(provenance, &self.config.build_commit),
+            self.evidence.manifest(provenance, &self.config),
         );
         self.persist_manifest().await
     }
 
     async fn persist_manifest(&mut self) -> Result<()> {
+        let result = self.persist_manifest_inner().await;
+        if result.is_err() {
+            self.stats
+                .manifest_write_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn persist_manifest_inner(&mut self) -> Result<()> {
         self.manifest.writer_stats = self.stats.snapshot();
+        if self.manifest.writer_finalized
+            && self.config.fault_injection
+                == Some(MetricContractWriterFaultInjectionV1::FinalManifestEnospc)
+        {
+            return Err(std::io::Error::from_raw_os_error(28).into());
+        }
         let bytes = serde_json::to_vec_pretty(&self.manifest)?;
         let path = self
             .config
@@ -643,19 +838,91 @@ impl MetricContractPairedWriterV1 {
         let mut file = File::create(&temp_path).await?;
         file.write_all(&bytes).await?;
         file.flush().await?;
+        file.sync_all().await?;
         drop(file);
         rename(&temp_path, &path).await?;
+        let directory = File::open(&self.config.directory).await?;
+        directory.sync_all().await?;
         Ok(())
     }
 
     pub async fn finalize(&mut self) -> Result<()> {
+        if let Err(error) = self.summary.sync_data().await {
+            self.stats
+                .finalization_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
+        if let Err(error) = self.evidence.sync_data().await {
+            self.stats
+                .finalization_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
         self.manifest.writer_finalized = true;
-        if self.frozen_provenance.is_some() {
+        let result = if self.frozen_provenance.is_some() {
             self.update_manifest().await
         } else {
             self.persist_manifest().await
+        };
+        if let Err(error) = result {
+            self.stats
+                .finalization_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            // Never leave an older manifest claiming immutable completion.
+            // A best-effort second write with `writer_finalized=false` makes a
+            // transient finalization failure durable and audit-rejectable.
+            self.manifest.writer_finalized = false;
+            let _ = self.persist_manifest().await;
+            return Err(error);
         }
+        Ok(())
     }
+}
+
+fn serialize_final_summary_bytes(
+    summary: &mut MetricContractDecisionSummaryV1,
+    evidence_serialize_us: u32,
+) -> Result<(Vec<u8>, u32)> {
+    // A self-referential duration cannot be obtained by repeatedly timing a
+    // variable-width JSON integer: scheduler jitter can make the value
+    // oscillate forever. Serialize exactly once with a fixed-width numeric
+    // telemetry slot, then replace only that slot with JSON whitespace plus
+    // the measured number. JSON whitespace before a number is lossless, the
+    // final bytes deserialize to the exact in-memory summary, and the timed
+    // serde pass has the same byte width as the persisted record.
+    const SENTINEL: u32 = u32::MAX;
+    const SENTINEL_BYTES: &[u8; 10] = b"4294967295";
+    const TELEMETRY_FIELD_WITH_SENTINEL: &[u8] = b"\"metric_contract_serialize_us\":4294967295";
+    summary.metric_contract_serialize_us = SENTINEL;
+    let started = std::time::Instant::now();
+    let mut bytes =
+        serde_json::to_vec(summary).context("serialize final metric-contract summary")?;
+    let summary_serialize_us = u32::try_from(started.elapsed().as_micros())
+        .context("summary serialization duration does not fit u32")?;
+    let combined = evidence_serialize_us
+        .checked_add(summary_serialize_us)
+        .context("combined summary/evidence serialization duration overflow")?;
+    let value = combined.to_string();
+    anyhow::ensure!(
+        value.len() <= SENTINEL_BYTES.len(),
+        "metric-contract serialization duration exceeds fixed JSON telemetry slot"
+    );
+    let position = bytes
+        .windows(TELEMETRY_FIELD_WITH_SENTINEL.len())
+        .position(|window| window == TELEMETRY_FIELD_WITH_SENTINEL)
+        .map(|field_start| field_start + TELEMETRY_FIELD_WITH_SENTINEL.len() - SENTINEL_BYTES.len())
+        .context("final v34 serialization is missing its exact telemetry sentinel field")?;
+    let slot = &mut bytes[position..position + SENTINEL_BYTES.len()];
+    slot.fill(b' ');
+    let value_start = slot.len() - value.len();
+    slot[value_start..].copy_from_slice(value.as_bytes());
+    summary.metric_contract_serialize_us = combined;
+    debug_assert_eq!(
+        serde_json::from_slice::<MetricContractDecisionSummaryV1>(&bytes).ok(),
+        Some(summary.clone())
+    );
+    Ok((bytes, combined))
 }
 
 fn upsert_part(

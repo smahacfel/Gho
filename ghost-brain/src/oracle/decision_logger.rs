@@ -3054,6 +3054,8 @@ impl DecisionLogger {
                                 config.gatekeeper_log_dir.clone(),
                                 option_env!("GIT_COMMIT").unwrap_or("unknown_build_commit"),
                             );
+                            writer_config.build_worktree_clean =
+                                option_env!("GIT_WORKTREE_CLEAN") == Some("true");
                             writer_config.queue_capacity = config.channel_buffer_size;
                             match MetricContractPairedWriterV1::open(
                                 writer_config,

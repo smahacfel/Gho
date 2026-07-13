@@ -3,7 +3,9 @@ mod common;
 
 use common::paired_fixture;
 use ghost_core::metric_contracts::{
-    CanonicalNullableV1, MetricContractDecisionProjectionWireV1, MetricContractEvidenceTransportV1,
+    CanonicalNullableV1, MetricContractDecisionEvidenceProjectionV1,
+    MetricContractDecisionProjectionWireV1, MetricContractDecisionSourceCutoffV1,
+    MetricContractEvidenceTransportV1,
 };
 use ghost_launcher::metric_contracts::{
     replay_metric_contract_record_v2, Pr2cReplayErrorV2, Pr2cReplayInputV2,
@@ -50,6 +52,60 @@ fn replay_v2_rejects_decision_time_projection_vs_rebuilt_projection_mismatch() {
 }
 
 #[test]
+fn replay_v2_rejects_global_projection_cutoff_tamper_against_durable_evidence_cutoff() {
+    fn replace_all_cutoffs(value: &mut serde_json::Value, cutoff: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object.contains_key("source_cutoff") {
+                    object.insert("source_cutoff".to_string(), cutoff.clone());
+                }
+                for child in object.values_mut() {
+                    replace_all_cutoffs(child, cutoff);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    replace_all_cutoffs(child, cutoff);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut input = replay_input();
+    let forged_cutoff = MetricContractDecisionSourceCutoffV1::try_new(99_999, Some(999)).unwrap();
+    let mut projection = serde_json::to_value(&input.decision_time_projection).unwrap();
+    replace_all_cutoffs(
+        &mut projection,
+        &serde_json::to_value(forged_cutoff).unwrap(),
+    );
+    input.decision_time_projection =
+        serde_json::from_value::<MetricContractDecisionEvidenceProjectionV1>(projection).unwrap();
+    assert!(matches!(
+        replay_metric_contract_record_v2(input),
+        Err(Pr2cReplayErrorV2::Projection(_))
+    ));
+}
+
+#[test]
+fn replay_v2_rejects_rehashed_evidence_cutoff_drift_from_decision_time_projection() {
+    let mut input = replay_input();
+    input.evidence.payload.source_cutoff =
+        MetricContractDecisionSourceCutoffV1::try_new(99_999, Some(999)).unwrap();
+    input.evidence = MetricContractEvidenceTransportV1::try_new(
+        input.evidence.payload,
+        input.evidence.writer_timestamp_ms,
+        input.evidence.rotation_part_index,
+    )
+    .unwrap();
+    input.decision_v34.evidence_sha256 = input.evidence.evidence_sha256.clone();
+    assert!(matches!(
+        replay_metric_contract_record_v2(input),
+        Err(Pr2cReplayErrorV2::Projection(_))
+    ));
+}
+
+#[test]
 fn replay_v2_rejects_profile_config_and_pair_mismatch() {
     let mut input = replay_input();
     input.decision_v34.evidence_sha256 =
@@ -69,6 +125,42 @@ fn replay_v2_rejects_unknown_projection_schema_even_with_a_valid_pair() {
     assert!(matches!(
         replay_metric_contract_record_v2(input),
         Err(Pr2cReplayErrorV2::Projection(_))
+    ));
+}
+
+#[test]
+fn replay_v2_recomputes_every_projection_derived_v34_summary_field() {
+    let mut changed_mask = replay_input();
+    changed_mask.decision_v34.measured_fields_mask ^= 1;
+    assert!(matches!(
+        replay_metric_contract_record_v2(changed_mask),
+        Err(Pr2cReplayErrorV2::SummarySemanticMismatch)
+    ));
+
+    let mut changed_authoritative = replay_input();
+    changed_authoritative
+        .decision_v34
+        .authoritative_contracts
+        .pop();
+    assert!(matches!(
+        replay_metric_contract_record_v2(changed_authoritative),
+        Err(Pr2cReplayErrorV2::SummarySemanticMismatch)
+    ));
+
+    let mut changed_comparator = replay_input();
+    changed_comparator.decision_v34.comparator_contracts.clear();
+    assert!(matches!(
+        replay_metric_contract_record_v2(changed_comparator),
+        Err(Pr2cReplayErrorV2::SummarySemanticMismatch)
+    ));
+
+    let mut changed_counterfactual = replay_input();
+    changed_counterfactual
+        .decision_v34
+        .counterfactual_delta_present ^= true;
+    assert!(matches!(
+        replay_metric_contract_record_v2(changed_counterfactual),
+        Err(Pr2cReplayErrorV2::SummarySemanticMismatch)
     ));
 }
 

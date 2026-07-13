@@ -615,6 +615,40 @@ fn canonical_hash_uses_rfc8785_key_unicode_and_number_rules() {
     for non_finite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         assert!(canonical_jcs_bytes_v1(&non_finite).is_err());
     }
+
+    // The optimized production serializer must remain byte-for-byte equal to
+    // the established RFC 8785 reference implementation. This fixture covers
+    // nested objects, UTF-16 key ordering, escaping, arrays and every numeric
+    // boundary used by metric-contract semantic payloads.
+    let differential_fixture = json!({
+        "z": [null, true, false, -0.0, 1e30, 0.000_001, 0.000_000_1],
+        "a": {"escaped": "line\nquote\"slash/", "wide": u64::MAX.to_string()},
+        "\u{fb33}": "Hebrew",
+        "\u{1f600}": "Emoji",
+        "\u{20ac}": "Euro"
+    });
+    assert_eq!(
+        canonical_jcs_bytes_v1(&differential_fixture).unwrap(),
+        serde_json_canonicalizer::to_vec(&differential_fixture).unwrap()
+    );
+
+    #[derive(Serialize)]
+    struct RawIntegerBoundaries {
+        max_u64: u64,
+        min_i64: i64,
+    }
+    let integer_boundaries = RawIntegerBoundaries {
+        max_u64: u64::MAX,
+        min_i64: i64::MIN,
+    };
+    assert_eq!(
+        canonical_jcs_bytes_v1(&integer_boundaries).unwrap(),
+        serde_json_canonicalizer::to_vec(&integer_boundaries).unwrap()
+    );
+    assert_eq!(
+        canonical_jcs_bytes_v1(&u128::MAX).unwrap(),
+        serde_json_canonicalizer::to_vec(&u128::MAX).unwrap()
+    );
 }
 
 #[test]
@@ -846,6 +880,7 @@ fn complete_transport_payload() -> MetricContractEvidenceHashPayloadV1 {
         stable_event_identity: CanonicalNullableV1::Value(
             StableEventIdentityV1::try_from_signature("yellowstone", "signature-a").unwrap(),
         ),
+        source_cutoff: MetricContractDecisionSourceCutoffV1::try_new(10_000, Some(100)).unwrap(),
         rollout_mode: MetricContractRolloutMode::Legacy,
         profile_id: foundation.metric_contract_profile,
         profile_hash: profile.canonical_hash().unwrap(),

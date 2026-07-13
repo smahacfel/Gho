@@ -27,8 +27,9 @@ use ghost_core::checkpoint::{
     TemporalMetricSource, TxSegmentSequence,
 };
 use ghost_core::metric_contracts::{
-    MetricContractDecisionSourceCutoffV1, MetricContractProfileErrorV1, MetricContractProfileV1,
-    MetricContractProjectionErrorV1, ResolvedMetricContractEffectiveConfigV1,
+    MetricContractDecisionSourceCutoffV1, MetricContractFoundationConfigV1,
+    MetricContractProfileErrorV1, MetricContractProjectionErrorV1,
+    MetricDecisionProjectionValidatedStaticContextV1, ResolvedMetricContractEffectiveConfigV1,
 };
 use ghost_core::session::types::{
     SessionDiagnostics, SessionId, SessionMetadata, SessionStatus, VerdictOutcome,
@@ -137,7 +138,7 @@ pub struct PoolObservationSession {
     pub cross_pool_velocity_config: CrossPoolVelocityConfig,
     pub funding_source_index: Arc<FundingSourceIndex>,
     pub funding_source_config: FundingSourceConfig,
-    metric_contract_effective_config: Option<Arc<ResolvedMetricContractEffectiveConfigV1>>,
+    metric_contract_static_context: Option<Arc<MetricDecisionProjectionValidatedStaticContextV1>>,
     metric_contract_funding_source_producer_config:
         Option<Arc<FundingSourceProducerConfigSnapshotV1>>,
     /// Last immutable one-producer snapshot produced for the exact MFS
@@ -224,10 +225,22 @@ impl PoolObservationSession {
             )
             .ok()
             .and_then(|effective_config| {
+                let profile = MetricContractFoundationConfigV1 {
+                    metric_contract_rollout_mode: effective_config.payload.rollout_mode,
+                    metric_contract_profile: effective_config.payload.profile_id,
+                }
+                .resolve_profile()
+                .ok()?;
+                let static_context = MetricDecisionProjectionValidatedStaticContextV1::try_new(
+                    effective_config.payload.rollout_mode,
+                    profile,
+                    effective_config,
+                )
+                .ok()?;
                 default_funding_source_config
                     .metric_contract_producer_config_snapshot(None)
                     .ok()
-                    .map(|producer_config| (Arc::new(effective_config), Arc::new(producer_config)))
+                    .map(|producer_config| (Arc::new(static_context), Arc::new(producer_config)))
             });
         let tx_intelligence =
             TxIntelligenceEngine::new(tx_intelligence_config, &candidate_snapshot, dev_wallet);
@@ -259,9 +272,9 @@ impl PoolObservationSession {
             ),
             funding_source_index: Arc::new(FundingSourceIndex::new()),
             funding_source_config: default_funding_source_config,
-            metric_contract_effective_config: local_metric_contract_context
+            metric_contract_static_context: local_metric_contract_context
                 .as_ref()
-                .map(|(effective_config, _)| Arc::clone(effective_config)),
+                .map(|(static_context, _)| Arc::clone(static_context)),
             metric_contract_funding_source_producer_config: local_metric_contract_context
                 .map(|(_, producer_config)| producer_config),
             pr2c_last_complete_metric_contract_snapshot: Mutex::new(None),
@@ -2892,8 +2905,10 @@ impl PoolObservationSession {
         materialized.session_regime_snapshot_v1 = self.materialize_rce_session_regime_snapshot();
         materialized.evidence_status = self.materialize_v3_evidence_status(&materialized);
 
-        let effective_config = self.metric_contract_effective_config.as_deref().ok_or(
-            MetricContractMaterializationErrorV1::MissingContext("effective config"),
+        let static_context = self.metric_contract_static_context.as_deref().ok_or(
+            MetricContractMaterializationErrorV1::MissingContext(
+                "validated static metric-contract context",
+            ),
         )?;
         let funding_source_producer_config = self
             .metric_contract_funding_source_producer_config
@@ -2901,7 +2916,6 @@ impl PoolObservationSession {
             .ok_or(MetricContractMaterializationErrorV1::MissingContext(
                 "FSC producer config",
             ))?;
-        let profile = MetricContractProfileV1::profile_a()?;
         let source_cutoff = MetricContractDecisionSourceCutoffV1::try_new(
             self.highest_seen_ts_ms
                 .max(self.candidate_snapshot.timestamp)
@@ -2935,7 +2949,7 @@ impl PoolObservationSession {
             .as_ref()
             .and_then(|fingerprint| fingerprint.flipper_presence_ratio);
         let complete =
-            crate::metric_contracts::build_pr2b_timed_complete_metric_contract_snapshot_v1(
+            crate::metric_contracts::build_pr2b_timed_complete_metric_contract_snapshot_with_validated_static_context_v1(
                 crate::metric_contracts::Pr2bFrozenProducerInputsV1 {
                     pr2a: crate::metric_contracts::Pr2aFrozenProducerInputsV1 {
                         ftdi: &sybil_computation.ftdi,
@@ -2952,12 +2966,8 @@ impl PoolObservationSession {
                     reserve_velocity: &reserve_velocity,
                     recent_buy_sell: &recent_buy_sell,
                 },
-                &crate::metric_contracts::Pr2bBuildContextV1 {
-                    rollout_mode: effective_config.payload.rollout_mode,
-                    profile: &profile,
-                    effective_config,
-                    source_cutoff,
-                },
+                static_context,
+                source_cutoff,
             )?;
         materialized.metric_contract_decision_projection_v1 =
             Some(complete.snapshot().compact_projection.clone());
@@ -2981,7 +2991,9 @@ impl PoolObservationSession {
     pub fn metric_contract_effective_config_for_replay(
         &self,
     ) -> Option<ResolvedMetricContractEffectiveConfigV1> {
-        self.metric_contract_effective_config.as_deref().cloned()
+        self.metric_contract_static_context
+            .as_deref()
+            .map(|context| context.effective_config().clone())
     }
 
     /// Stable pool-creation transaction identity supplied by ingest. This is
@@ -3115,9 +3127,20 @@ impl PoolObservationSession {
         &mut self,
         effective_config: Arc<ResolvedMetricContractEffectiveConfigV1>,
         funding_source_producer_config: Arc<FundingSourceProducerConfigSnapshotV1>,
-    ) {
-        self.metric_contract_effective_config = Some(effective_config);
+    ) -> Result<(), MetricContractMaterializationErrorV1> {
+        let profile = MetricContractFoundationConfigV1 {
+            metric_contract_rollout_mode: effective_config.payload.rollout_mode,
+            metric_contract_profile: effective_config.payload.profile_id,
+        }
+        .resolve_profile()?;
+        let static_context = MetricDecisionProjectionValidatedStaticContextV1::try_new(
+            effective_config.payload.rollout_mode,
+            profile,
+            effective_config.as_ref().clone(),
+        )?;
+        self.metric_contract_static_context = Some(Arc::new(static_context));
         self.metric_contract_funding_source_producer_config = Some(funding_source_producer_config);
+        Ok(())
     }
 
     pub fn mark_metric_contract_stream_gap(&mut self) {

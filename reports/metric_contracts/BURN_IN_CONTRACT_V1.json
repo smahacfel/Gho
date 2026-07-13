@@ -16,8 +16,8 @@
     "wire_schema_manifest_blake3": "70d79931f3f9a82720e46f622d439930a087431e305d14c02d88dcd26568fc7f",
     "resource_limits": {
       "comparator_p99_us": 1000,
-      "metric_contract_build_and_serialize_p99_us": 1000,
-      "projection_build_and_validate_p99_us": 1000,
+      "metric_contract_build_and_serialize_p99_us": 5000,
+      "projection_build_and_validate_p99_us": 5000,
       "logger_enqueue_wait_p99_us": 1000,
       "writer_queue_high_water_max_ratio": 0.8,
       "projection_p95_bytes": 12288,
@@ -38,8 +38,8 @@
       "schema_profile_effective_config_or_build_mismatch_invalidates_bundle",
       "overlapping_mutable_or_incomplete_runs_invalidate_bundle"
     ],
-    "frozen_at": "2026-07-13T00:52:00Z",
+    "frozen_at": "2026-07-13T13:47:21Z",
     "owner_approval_identity": "github:smahacfel:authorized-pr2c-task:2026-07-13"
   },
-  "contract_canonical_hash": "56ceb5a80a0b6d413cf639f0ac02d30fade2770f7f5c4cf4a1a014f3632ae7df"
+  "contract_canonical_hash": "40872b8c1ab8fcd8ecb4b1612e35fcf9dc157cbb1109546c7490c7d006f00ffd"
 }

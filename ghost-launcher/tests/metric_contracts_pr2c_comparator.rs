@@ -1,13 +1,16 @@
 #[path = "common/metric_contracts_pr2c.rs"]
 mod common;
 
-use common::{complete_snapshot_fixture, equal_policy};
+use common::{
+    complete_snapshot_fixture, equal_policy, TEST_BRAIN_CONFIG_HASH, TEST_GATEKEEPER_CONFIG_HASH,
+};
 use ghost_core::metric_contracts::{
-    ComparatorDeltaStatusV1, MetricContractPolicyEquivalenceSnapshotV1, MetricContractRolloutMode,
-    MetricEvidenceRecordIdentityV1,
+    CanonicalNullableV1, ComparatorDeltaStatusV1, MetricContractPolicyEquivalenceSnapshotV1,
+    MetricContractRolloutMode, MetricEvidenceRecordIdentityV1,
 };
 use ghost_launcher::metric_contracts::{
-    build_pr2c_paired_record_v1, Pr2cDecisionRecordContextV1, Pr2cRecordBuildErrorV1,
+    build_pr2c_paired_record_v1, evaluate_pr2c_counterfactual_lanes_v1,
+    Pr2cCounterfactualLaneStatusV1, Pr2cDecisionRecordContextV1,
 };
 
 #[test]
@@ -18,12 +21,12 @@ fn equivalence_comparator_reports_exact_zero_drift() {
 }
 
 #[test]
-fn decision_record_builder_fails_closed_on_any_equivalence_policy_drift() {
+fn decision_record_builder_persists_any_equivalence_policy_drift() {
     let fixture = complete_snapshot_fixture();
     let authoritative = equal_policy();
     let mut candidate = authoritative.clone();
     candidate.primary_reason_code.push_str("_DRIFT");
-    let result = build_pr2c_paired_record_v1(
+    let pair = build_pr2c_paired_record_v1(
         &fixture.complete,
         &Pr2cDecisionRecordContextV1 {
             record_identity: MetricEvidenceRecordIdentityV1::try_new(
@@ -38,21 +41,23 @@ fn decision_record_builder_fails_closed_on_any_equivalence_policy_drift() {
             effective_config: &fixture.effective,
             authoritative_policy: &authoritative,
             comparator_policy: &candidate,
-            counterfactual_delta_present: false,
+            comparator_evaluable: true,
             comparator_elapsed_us: 10,
             metric_contract_serialize_us: 20,
             metric_contract_build_and_serialize_us: 30,
             projection_build_and_validate_us: 20,
-            gatekeeper_config_hash: "gatekeeper-config-a",
-            brain_config_hash: Some("brain-config-a"),
-            writer_timestamp_ms: 20_000,
+            gatekeeper_config_hash: TEST_GATEKEEPER_CONFIG_HASH,
+            brain_config_hash: Some(TEST_BRAIN_CONFIG_HASH),
         },
-    );
-    assert!(matches!(result, Err(Pr2cRecordBuildErrorV1::PolicyDrift)));
+    )
+    .unwrap();
+    assert!(pair.decision_v34.equivalence_deltas.has_policy_drift());
+    assert!(!pair.decision_v34.equivalence_deltas.is_zero_drift());
+    pair.validate_pair().unwrap();
 }
 
 #[test]
-fn counterfactual_delta_is_diagnostic_when_equivalence_lane_has_zero_drift() {
+fn missing_counterfactual_lane_is_not_evaluable_and_never_a_delta() {
     let fixture = complete_snapshot_fixture();
     let policy = equal_policy();
     let pair = build_pr2c_paired_record_v1(
@@ -70,20 +75,79 @@ fn counterfactual_delta_is_diagnostic_when_equivalence_lane_has_zero_drift() {
             effective_config: &fixture.effective,
             authoritative_policy: &policy,
             comparator_policy: &policy,
-            counterfactual_delta_present: true,
+            comparator_evaluable: true,
             comparator_elapsed_us: 10,
             metric_contract_serialize_us: 20,
             metric_contract_build_and_serialize_us: 30,
             projection_build_and_validate_us: 20,
-            gatekeeper_config_hash: "gatekeeper-config-a",
-            brain_config_hash: Some("brain-config-a"),
-            writer_timestamp_ms: 20_000,
+            gatekeeper_config_hash: TEST_GATEKEEPER_CONFIG_HASH,
+            brain_config_hash: Some(TEST_BRAIN_CONFIG_HASH),
         },
     )
     .unwrap();
 
-    assert!(pair.decision_v34.counterfactual_delta_present);
+    assert!(!pair.decision_v34.counterfactual_delta_present);
     assert!(pair.decision_v34.equivalence_deltas.is_zero_drift());
+    let evaluation = evaluate_pr2c_counterfactual_lanes_v1(&pair.decision_time_projection);
+    assert!(evaluation.any_not_evaluable());
+}
+
+#[test]
+fn counterfactual_lane_requires_two_present_values_and_reports_real_drift() {
+    let fixture = complete_snapshot_fixture();
+    let mut projection = fixture.complete.compact_projection;
+
+    projection.dev_buy.mfs_primary_v1.value = CanonicalNullableV1::Value(0.5);
+    projection.dev_buy.effective_policy.value = CanonicalNullableV1::Null;
+    let unavailable = evaluate_pr2c_counterfactual_lanes_v1(&projection);
+    assert_eq!(
+        unavailable.dev_primary,
+        Pr2cCounterfactualLaneStatusV1::NotEvaluable
+    );
+    assert!(!unavailable.delta_present());
+
+    projection.dev_buy.effective_policy.value = CanonicalNullableV1::Value(0.75);
+    let different = evaluate_pr2c_counterfactual_lanes_v1(&projection);
+    assert_eq!(
+        different.dev_primary,
+        Pr2cCounterfactualLaneStatusV1::Different
+    );
+    assert!(different.delta_present());
+}
+
+#[test]
+fn missing_second_policy_compute_is_durable_not_evaluable_not_equal() {
+    let fixture = complete_snapshot_fixture();
+    let policy = equal_policy();
+    let pair = build_pr2c_paired_record_v1(
+        &fixture.complete,
+        &Pr2cDecisionRecordContextV1 {
+            record_identity: MetricEvidenceRecordIdentityV1::try_new(
+                "run-not-evaluable",
+                "join-not-evaluable",
+                "legacy_live",
+            )
+            .unwrap(),
+            stable_event_identity: None,
+            rollout_mode: MetricContractRolloutMode::Legacy,
+            profile: &fixture.profile,
+            effective_config: &fixture.effective,
+            authoritative_policy: &policy,
+            comparator_policy: &policy,
+            comparator_evaluable: false,
+            comparator_elapsed_us: 10,
+            metric_contract_serialize_us: 20,
+            metric_contract_build_and_serialize_us: 30,
+            projection_build_and_validate_us: 20,
+            gatekeeper_config_hash: TEST_GATEKEEPER_CONFIG_HASH,
+            brain_config_hash: Some(TEST_BRAIN_CONFIG_HASH),
+        },
+    )
+    .unwrap();
+
+    assert!(pair.decision_v34.equivalence_deltas.is_not_evaluable());
+    assert!(!pair.decision_v34.equivalence_deltas.is_zero_drift());
+    assert!(!pair.decision_v34.equivalence_deltas.has_policy_drift());
 }
 
 #[test]

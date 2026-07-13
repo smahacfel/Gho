@@ -180,12 +180,16 @@ impl SessionManager {
             self.metric_contract_effective_config.as_ref(),
             self.metric_contract_funding_source_producer_config.as_ref(),
         ) {
-            session.set_metric_contract_context(
-                Arc::clone(effective_config),
-                Arc::clone(producer_config),
-            );
+            session
+                .set_metric_contract_context(
+                    Arc::clone(effective_config),
+                    Arc::clone(producer_config),
+                )
+                .map_err(|error| SessionManagerError::MetricContractContext(error.to_string()))?;
         } else if let Some((effective_config, producer_config)) = local_metric_contract_context {
-            session.set_metric_contract_context(effective_config, producer_config);
+            session
+                .set_metric_contract_context(effective_config, producer_config)
+                .map_err(|error| SessionManagerError::MetricContractContext(error.to_string()))?;
         }
         session.set_checkpoint_interval_ms(self.config.checkpoint_interval_ms);
         let session = Arc::new(RwLock::new(session));

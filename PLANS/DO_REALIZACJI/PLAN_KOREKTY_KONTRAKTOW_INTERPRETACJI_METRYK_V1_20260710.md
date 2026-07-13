@@ -882,10 +882,19 @@ Wszystkie rotowane parts mają row/byte counts i SHA-256 w manifeście. Replay v
 
 ### 4.2 Resource acceptance
 
+**Autoryzowany amendment PR2C (2026-07-13).** Pierwotny limit 1 ms dla
+pełnego build+serialize oraz kompletnej projection build/validation okazał się
+nieadekwatny do jawnie mierzonej ścieżki obejmującej wszystkich producentów,
+pełne evidence, semantic validation, canonical hash i finalne bajty. Limit nie
+może być spełniany przez przesunięcie początku timera za producer boundary.
+Zamrożony gate wynosi 5 ms p99 dla tych dwóch pełnych zakresów. Comparator i
+bounded enqueue zachowują ostrzejszy limit 1 ms p99. Amendment nie zmienia
+schema, policy, authority ani rollout mode.
+
 ```text
 comparator_elapsed_us p99 <= 1_000 us
-metric_contract_build_and_serialize_us p99 <= 1_000 us
-metric_contract_projection_build_and_validate_us p99 <= 1_000 us
+metric_contract_build_and_serialize_us p99 <= 5_000 us
+metric_contract_projection_build_and_validate_us p99 <= 5_000 us
 logger_enqueue_wait_us p99 <= 1_000 us
 writer_queue_high_water < 80% capacity
 dropped rows = 0

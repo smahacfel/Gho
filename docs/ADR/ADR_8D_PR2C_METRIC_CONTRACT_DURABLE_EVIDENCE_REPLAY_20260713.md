@@ -1,6 +1,6 @@
 # ADR-8D: PR2C durable metric-contract evidence, replay v2 i audit
 
-Status: `ACCEPTED / IMPLEMENTED / LOCALLY VERIFIED`
+Status: `AMENDED / IMPLEMENTED / FINAL VERIFICATION IN PROGRESS`
 
 Typ: ADR-8D / durability, replay, comparator, audit i rollout safety
 
@@ -20,6 +20,9 @@ Poprzedni etap:
 
 Raport dowodowy:
 `reports/metric_contracts/pr2c_durable_evidence_replay_verification_v1.md`
+
+Amendment po blocking review:
+`docs/ADR/ADR_8D_PR2C_REVIEW_BLOCKERS_DURABILITY_AUDIT_20260713.md`
 
 Poziom ryzyka: `HIGH`. Zmiana przecina terminalną materializację, DecisionLogger,
 durable JSONL, replay i narzędzia audytowe. Ryzyko wpływu na decyzje jest
@@ -96,8 +99,9 @@ Full sidecar `metric_contract_evidence_v1.jsonl` używa istniejących:
 - `StableEventIdentityV1`.
 
 `evidence_sha256` jest SHA-256 canonical semantic payloadu bez writer timestamp
-i rotation part. Konstrukcja oraz deserializacja wykonują profile, envelope,
-family semantic i hash validation. Exact effective-config payload jest
+i rotation part, ale z niezależnym durable `source_cutoff`. Konstrukcja oraz
+deserializacja wykonują profile, envelope, family semantic i hash validation.
+Exact effective-config payload jest
 utrwalony w rotation manifest i musi odpowiadać hashom v34/evidence w replayu.
 
 ## 5. Jeden bounded paired writer command
@@ -108,10 +112,12 @@ filesystem-atomic. Writer utrzymuje osobne liczniki commandów, obu rows,
 summary/evidence failures, disable, send failure, drop, orphan, missing pair,
 enqueue wait i queue high-water.
 
-ENOSPC wyłącza writer fail-closed. Summary failure nie uruchamia evidence write.
-Evidence failure po summary tworzy jawny `orphan_summary`. Channel close i
-disabled logger zwracają typed enqueue error. Session/MFS/producer locks są
-zwalniane przed queue await i przed filesystem I/O.
+ENOSPC wyłącza writer fail-closed. Evidence failure po summary tworzy jawny
+`orphan_summary`; odwrócona fault-injection regression dowodzi również
+`orphan_evidence`. Channel close i disabled logger zwracają typed enqueue
+error. Mid-row short write zapisuje rzeczywisty prefiks i pozostaje wykrywalny
+jako truncated part. Session/MFS/producer locks są zwalniane przed queue await
+i przed filesystem I/O.
 
 Part 0 zachowuje nazwy:
 
@@ -122,11 +128,13 @@ metric_contract_evidence_v1.jsonl
 
 Kolejne parts mają wspólny pięciocyfrowy indeks. Manifest zapisuje relative
 path, schema, part index, rows, bytes, first/last full record identity, SHA-256
-całego partu, run/build/Gatekeeper/profile/effective-config provenance i bounded
-resource histograms. `writer_finalized=true` jest ustawiane dopiero po
-zamknięciu writer task; audit nie uznaje nadal mutable manifestu za immutable
-run. Audit odrzuca brakujący, dodatkowy, zmieniony, ucięty, nieciągły lub
-niesparowany part.
+całego partu, run/build/Gatekeeper/brain/profile/effective-config provenance,
+Wire codebook hash, BURN contract hash i bounded resource histograms. Part data
+jest `sync_data()`, manifest jest `sync_all()` przed rename, a katalog po rename
+jest `sync_all()`. `writer_finalized=true` jest ustawiane dopiero po poprawnej
+finalizacji; audit nie uznaje nadal mutable manifestu za immutable run. Audit
+odrzuca brakujący, dodatkowy, zmieniony, ucięty, nieciągły lub niesparowany
+part oraz path wychodzący poza run directory.
 
 ## 6. Record identity i collision contract
 
@@ -159,10 +167,13 @@ Normalizer porównuje exact:
 - selector soft score;
 - hard-fail classification.
 
-Dowolny drift blokuje zbudowanie pair i daje `FAIL_POLICY_DRIFT` w audycie.
+Dowolny drift jest poprawnym, trwałym wynikiem komparatora: v34 i sidecar są
+zapisywane, replay przechodzi, a audit zwraca `FAIL_POLICY_DRIFT`. Brak
+porównywalnej authoritative decyzji daje `NotEvaluable`, nie fikcyjne `Equal`.
 Semantic counterfactual lane obserwuje wyłącznie dev-primary i corrected FTDI
-actionability. Delta ustawia diagnostyczne `counterfactual_delta_present`, ale
-nie zmienia terminalnego verdictu ani authority.
+actionability. Dwie obecne, różne wartości emitują typed
+`COUNTERFACTUAL_POLICY_DELTA_OBSERVED:<lane>:...`; brak którejkolwiek wartości
+jest `NotEvaluable`. Delta nie zmienia terminalnego verdictu ani authority.
 
 ## 8. Replay v1 i replay v2
 
@@ -176,11 +187,13 @@ Replay v2:
 2. weryfikuje full evidence transport semantic hash;
 3. łączy v34, sidecar i v33 decision-time MFS po pełnej identity/hash;
 4. sprawdza profile i exact effective-config payload/hash;
-5. odbudowuje projection wyłącznie z full evidence i frozen context;
+5. buduje frozen context z niezależnego, zahashowanego durable cutoffu i
+   odbudowuje projection wyłącznie z full evidence;
 6. wymaga exact domain equality z decision-time MFS projection;
 7. wymaga identycznego canonical semantic projection hash;
 8. wykonuje Wire V1 round-trip po sprawdzeniu codebook manifestu;
-9. odrzuca unknown/partial schema i context/cutoff drift.
+9. recomputuje v34 contract sets, measured mask i counterfactual semantics;
+10. odrzuca unknown/partial schema i każdy context/cutoff/summary drift.
 
 Transportowe timestampy i rotation index nie uczestniczą w domain equality.
 
@@ -197,10 +210,12 @@ FAIL_POLICY_DRIFT
 FAIL_RESOURCE_BUDGET
 ```
 
-Per-run replay/resource PASS następuje przed agregacją bundle. Bundle sprawdza
-build, Gatekeeper config, profile, schemas, effective-config, non-overlap, UTC
-buckets, full identity duplicates, stable-event collisions oraz minima frozen
-burn-in contractu.
+Per-run replay/resource PASS następuje przed agregacją bundle. Single-run
+wymaga exact bijekcji current v33 ↔ v34 ↔ evidence. Bundle sprawdza unikalne
+run IDs, globalne full identities, build cleanliness, Gatekeeper/brain config,
+rollout, profile, schemas, Wire/BURN hashes, effective-config, non-overlap, UTC
+buckets wszystkich paired cutoffów, stable-event collisions oraz semantic
+minima frozen burn-in contractu.
 
 ## 10. BURN_IN_CONTRACT_V1
 
@@ -210,13 +225,16 @@ Machine-readable frozen contract:
 Canonical hash:
 
 ```text
-56ceb5a80a0b6d413cf639f0ac02d30fade2770f7f5c4cf4a1a014f3632ae7df
+40872b8c1ab8fcd8ecb4b1612e35fcf9dc157cbb1109546c7490c7d006f00ffd
 ```
 
 Contract utrwala minimum 3 niepokrywających się runów, 1 h per run, dwa UTC
 4-hour buckets, 8 h aggregate, 700 decisions, 100 dev-known, 100 clean Flip V2
 evaluable i 30 real dev legacy/V2 divergences oraz wszystkie resource limits.
-Rows z timestampem niepóźniejszym niż `frozen_at` nie wchodzą do prospective
+Po autoryzowanym resource amendment contract został ponownie zamrożony przed
+jakimkolwiek prospective runem z `frozen_at=2026-07-13T13:47:21Z`.
+Każdy run manifest jest związany z exact version/hash kontraktu. Rows z
+durable cutoffem niepóźniejszym niż `frozen_at` nie wchodzą do prospective
 counts. Zmiana gate’u wymaga nowej wersji/hash/frozen_at i nowych rows.
 
 Historyczne v33 pozostaje feasibility-only: nie ma v34, full evidence,
@@ -230,8 +248,9 @@ evidence transport. Bounded histogramy w run manifest utrwalają p99 dla
 projection build/validation, full build+serialization i enqueue wait. Audit
 sprawdza jednocześnie:
 
-- comparator, full build+serialize, projection build/validate i enqueue p99
-  `<= 1_000 us`;
+- comparator i enqueue p99 `<= 1_000 us`;
+- pełny producer→evidence→projection→final-bytes build+serialize oraz projection
+  build/validate p99 `<= 5_000 us`;
 - queue high-water `< 80%`;
 - zero drops, failures i orphans;
 - v34 p95 delta `<= 8 KiB` i `<= 10%` względem paired v33;
@@ -239,22 +258,25 @@ sprawdza jednocześnie:
 - sidecar p95 `<= 24 KiB`, p99 `<= 48 KiB`;
 - combined byte-rate delta `<= 25%` względem paired v33.
 
-Release measurements oraz dokładne komendy są utrwalone w raporcie
-weryfikacyjnym, nie jako surowe benchmark logs. Pełny release path uzyskał:
+`metric_contract_build_and_serialize_us` obejmuje teraz producer input set aż
+do exact finalnych writer bytes. Writer nie rehashuje drugi raz semantic
+evidence przy przypisaniu timestamp/part index. Release measurements oraz
+dokładne komendy są utrwalone w raporcie weryfikacyjnym, nie jako surowe
+benchmark logs.
 
-```text
-metric_contract_build_and_serialize_us p99 = 796
-metric_contract_projection_build_and_validate_us p99 = 919
-comparator_elapsed_us p99 = 10
-logger_enqueue_wait_us p99 upper bound = 32
-writer_queue_high_water = 12.8%
-Wire V1 p95/max = 2339/2339 bytes
-sidecar p95/p99 = 21406/21406 bytes
-v34 p95 = 1167 bytes
-```
+Autoryzowany amendment resource gate z 2026-07-13 zachowuje pełny zakres
+timera i podnosi wyłącznie dwa nieadekwatne limity 1 ms do 5 ms. Release
+harness na production-equivalent path zmierzył:
 
-Wszystkie zamrożone limity czasu, rozmiaru, kolejki i combined storage
-przechodzą jednocześnie.
+- full build+serialize: p50/p95/p99 `2 000 / 2 000 / 2 683 us`;
+- complete snapshot: p50/p95/p99 `611 / 957 / 1 153 us`;
+- projection build/validate/hash: p50/p95/p99 `573 / 907 / 1 087 us`;
+- final serialization: p50/p95/p99 `49 / 75 / 94 us`;
+- comparator: p50/p95/p99 `7 / 19 / 52 us`;
+
+Rozmiary: Wire V1 p95/max `2 339 B`, sidecar p95/p99 `21 486 B`, v34 p95
+`1 176 B`. BURN contract został ponownie zamrożony przed prospective runami z
+nowym canonical hash.
 
 ## 12. Zakres wyłączony
 
@@ -284,10 +306,27 @@ Koszt:
 
 ## 14. Decyzja końcowa
 
-Pełna macierz PR2A/PR2B/PR2C, Gatekeeper i replay przeszła. Release resource
-harness, paired-writer fault matrix, replay equality, comparator drift matrix,
-single-run/bundle audit oraz forbidden-scope proof spełniają kontrakt PR2C.
+PR2C wraz z amendmentem review przechodzi pełną walidację i jest gotowy do
+ponownego review. Prospective burn-in może rozpocząć się dopiero po akceptacji
+i merge PR; bieżący rollout pozostaje `Legacy`.
 
-PR2C jest gotowy do draft review i prospective burn-in pod zamrożonym
-`BURN_IN_CONTRACT_V1`. Nie jest to zgoda na policy promotion, PR3, Type-5,
-DualCompute ani V2 rollout. Rollout pozostaje `Legacy`.
+```text
+METRIC_CONTRACT_WIRE_V1_CODEBOOK_MANIFEST_FROZEN
+PR2C_V34_COMPACT_SUMMARY_PASS
+PR2C_PAIRED_FULL_EVIDENCE_SIDECAR_PASS
+PR2C_RECORD_IDENTITY_AND_STABLE_EVENT_CONTRACT_PASS
+PR2C_ROTATION_MANIFEST_SHA_PASS
+PR2C_REPLAY_V1_COMPATIBILITY_PASS
+PR2C_REPLAY_V2_PROJECTION_FULL_EQUALITY_PASS
+PR2C_EQUIVALENCE_COMPARATOR_ZERO_DRIFT_PASS
+PR2C_COUNTERFACTUAL_DIAGNOSTIC_PASS
+PR2C_SINGLE_RUN_AUDIT_PASS
+PR2C_BUNDLE_AUDIT_PASS
+PR2C_RESOURCE_GATES_PASS
+BURN_IN_CONTRACT_V1_FROZEN
+GATEKEEPER_POLICY_UNCHANGED
+V3_V1_REPLAY_UNCHANGED
+TYPE5_NOT_STARTED
+METRIC_CONTRACTS_V1_1_DUAL_COMPUTE_READY_FOR_PROSPECTIVE_BURN_IN
+PR2C_READY_FOR_REVIEW
+```

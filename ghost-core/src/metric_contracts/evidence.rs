@@ -1,9 +1,10 @@
 use super::{
     CanonicalHashErrorV1, CanonicalHashV1, CanonicalNullableV1, CanonicalU128StringV1,
-    CanonicalU64StringV1, MetricAvailabilityV1, MetricContractId, MetricContractProfileIdV1,
-    MetricContractProfileV1, MetricContractRolloutMode, MetricEvidenceEnvelopeErrorV1,
-    MetricEvidenceEnvelopeV1, MetricEvidenceReasonV1, MetricEvidenceRecordIdentityV1,
-    MetricMeasurementQualityV1, MetricSurfaceId, StableEventIdentityV1,
+    CanonicalU64StringV1, MetricAvailabilityV1, MetricContractDecisionSourceCutoffV1,
+    MetricContractId, MetricContractProfileIdV1, MetricContractProfileV1,
+    MetricContractRolloutMode, MetricEvidenceEnvelopeErrorV1, MetricEvidenceEnvelopeV1,
+    MetricEvidenceReasonV1, MetricEvidenceRecordIdentityV1, MetricMeasurementQualityV1,
+    MetricSurfaceId, StableEventIdentityV1,
 };
 use crate::checkpoint::EvidenceStatus;
 use crate::tx_intelligence::types::FscEvidenceStatus;
@@ -1386,6 +1387,10 @@ pub struct MetricContractEvidenceHashPayloadV1 {
     pub evidence_schema_version: u16,
     pub record_identity: MetricEvidenceRecordIdentityV1,
     pub stable_event_identity: CanonicalNullableV1<StableEventIdentityV1>,
+    /// Independent durable decision cutoff. Replay must use this hashed value
+    /// as the projection context instead of trusting the decision-time
+    /// projection that it is attempting to verify.
+    pub source_cutoff: MetricContractDecisionSourceCutoffV1,
     pub rollout_mode: MetricContractRolloutMode,
     pub profile_id: MetricContractProfileIdV1,
     pub profile_hash: CanonicalHashV1,
@@ -1405,6 +1410,9 @@ impl MetricContractEvidenceHashPayloadV1 {
                     self.evidence_schema_version,
                 ),
             );
+        }
+        if self.source_cutoff.decision_timestamp_ms.get() == 0 {
+            return Err(MetricContractEvidenceTransportErrorV1::InvalidSourceCutoff);
         }
         let profile = super::MetricContractFoundationConfigV1 {
             metric_contract_rollout_mode: self.rollout_mode,
@@ -1437,6 +1445,8 @@ pub enum MetricContractEvidenceTransportErrorV1 {
     ProfileHashMismatch,
     #[error("metric contract evidence SHA-256 mismatch")]
     HashMismatch,
+    #[error("metric contract evidence source cutoff is invalid")]
+    InvalidSourceCutoff,
 }
 
 /// Transport wrapper is deliberately separate from the semantic hash payload.

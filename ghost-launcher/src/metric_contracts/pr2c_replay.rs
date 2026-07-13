@@ -10,6 +10,10 @@ use ghost_core::metric_contracts::{
 };
 use thiserror::Error;
 
+use super::{
+    evaluate_pr2c_counterfactual_lanes_v1, pr2c_contract_sets_v1, Pr2cCounterfactualEvaluationV1,
+};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pr2cReplayInputV2 {
     pub decision_v34: MetricContractDecisionSummaryV1,
@@ -23,6 +27,7 @@ pub struct Pr2cReplayResultV2 {
     pub rebuilt_projection: MetricContractDecisionEvidenceProjectionV1,
     pub semantic_projection_hash: CanonicalHashV1,
     pub wire_version: u16,
+    pub counterfactual_evaluation: Pr2cCounterfactualEvaluationV1,
 }
 
 #[derive(Debug, Error)]
@@ -47,16 +52,8 @@ pub enum Pr2cReplayErrorV2 {
     ProjectionHashMismatch,
     #[error("compiled Compact JSON Wire V1 codebook differs from the frozen manifest")]
     CodebookManifestMismatch,
-}
-
-fn source_cutoff(
-    projection: &MetricContractDecisionEvidenceProjectionV1,
-) -> ghost_core::metric_contracts::MetricContractDecisionSourceCutoffV1 {
-    projection
-        .fee_topology_diversity_index
-        .legacy_value
-        .source_cutoff
-        .clone()
+    #[error("v34 compact semantic summary differs from values rebuilt from durable evidence")]
+    SummarySemanticMismatch,
 }
 
 pub fn replay_metric_contract_record_v2(
@@ -99,7 +96,7 @@ pub fn replay_metric_contract_record_v2(
         rollout_mode: input.decision_v34.rollout_mode,
         profile: &profile,
         effective_config: &input.effective_config,
-        source_cutoff: source_cutoff(&input.decision_time_projection),
+        source_cutoff: input.evidence.payload.source_cutoff.clone(),
     };
     let decision_time_hash = input
         .decision_time_projection
@@ -110,6 +107,19 @@ pub fn replay_metric_contract_record_v2(
     )?;
     if rebuilt_projection != input.decision_time_projection {
         return Err(Pr2cReplayErrorV2::ProjectionFullEvidenceMismatch);
+    }
+    let (authoritative_contracts, comparator_contracts) = pr2c_contract_sets_v1(&profile);
+    let counterfactual_evaluation = evaluate_pr2c_counterfactual_lanes_v1(&rebuilt_projection);
+    if input.decision_v34.authoritative_contracts != authoritative_contracts
+        || input.decision_v34.comparator_contracts != comparator_contracts
+        || input.decision_v34.measured_fields_mask
+            != rebuilt_projection
+                .manipulation_contradiction
+                .measured_fields_mask
+        || input.decision_v34.counterfactual_delta_present
+            != counterfactual_evaluation.delta_present()
+    {
+        return Err(Pr2cReplayErrorV2::SummarySemanticMismatch);
     }
     let rebuilt_hash = rebuilt_projection.validated_canonical_hash(&context)?;
     if rebuilt_hash != decision_time_hash {
@@ -125,5 +135,6 @@ pub fn replay_metric_contract_record_v2(
         rebuilt_projection,
         semantic_projection_hash: rebuilt_hash,
         wire_version: wire.w,
+        counterfactual_evaluation,
     })
 }

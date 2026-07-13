@@ -1,0 +1,126 @@
+name: Metric Contracts PR2C
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/metric-contracts-pr2c.yml"
+      - "ghost-core/**"
+      - "ghost-launcher/**"
+      - "ghost-brain/**"
+      - "reports/metric_contracts/**"
+      - "docs/ADR/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  correctness:
+    name: PR2A PR2B PR2C and frozen-policy matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust and protobuf compiler
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify PR2C ancestry gate
+        run: git merge-base --is-ancestor 6348896ba303e9fb6dfb6c3bf2c5f9c015bf2c8e HEAD
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Metric-contract foundation and projection
+        run: |
+          cargo test -p ghost-core --test metric_contracts_v1_1_foundation
+          cargo test -p ghost-core --test metric_contracts_v1_1_projection
+
+      - name: PR2A and PR2B producer suites
+        run: |
+          cargo test -p ghost-launcher --test metric_contracts_pr2a_producers
+          cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards
+          cargo test -p ghost-launcher --test metric_contracts_pr2b_producers
+          cargo test -p ghost-launcher --test metric_contracts_pr2b_static_guards
+
+      - name: PR2C durability replay comparator and audit
+        run: |
+          cargo test -p ghost-launcher --test metric_contracts_pr2c_durability
+          cargo test -p ghost-launcher --test metric_contracts_pr2c_replay
+          cargo test -p ghost-launcher --test metric_contracts_pr2c_comparator
+          cargo test -p ghost-launcher --test metric_contracts_pr2c_audit
+
+      - name: Frozen Gatekeeper and lifecycle regressions
+        run: |
+          cargo test -p ghost-launcher --test gatekeeper_policy_tests
+          cargo test -p ghost-launcher --test gatekeeper_v25_regression
+          cargo test -p ghost-launcher --test gatekeeper_v3_tests
+          cargo test -p ghost-launcher --test session_lifecycle_tests
+          cargo test -p ghost-launcher --test refactor_invariants_tests
+          cargo test -p ghost-brain --lib replay_payload
+
+      - name: Changed-crate checks
+        run: |
+          cargo check -p ghost-core
+          cargo check -p ghost-launcher
+          cargo check -p ghost-brain
+
+      - name: Targeted Clippy
+        run: |
+          cargo clippy -p ghost-core \
+            --test metric_contracts_v1_1_foundation \
+            --test metric_contracts_v1_1_projection \
+            --no-deps --message-format=short
+          cargo clippy -p ghost-launcher \
+            --test metric_contracts_pr2a_producers \
+            --test metric_contracts_pr2a_static_guards \
+            --test metric_contracts_pr2b_producers \
+            --test metric_contracts_pr2b_static_guards \
+            --test metric_contracts_pr2c_durability \
+            --test metric_contracts_pr2c_replay \
+            --test metric_contracts_pr2c_comparator \
+            --test metric_contracts_pr2c_audit \
+            --no-deps --message-format=short
+          # Existing frozen execution.rs baseline: clippy::never_loop at
+          # line 1569. PR2C does not modify execution policy/sender code.
+          cargo clippy -p ghost-brain --lib --no-deps --message-format=short -- \
+            -A clippy::never_loop
+
+  release-resource-gate:
+    name: PR2C release full-path resource gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust and protobuf compiler
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pr2c-release
+
+      - name: Full frozen-input to final-byte release harness
+        run: |
+          cargo test --release -p ghost-launcher \
+            --test metric_contracts_pr2c_durability \
+            pr2c_release_resource_harness_reports_full_path_percentiles \
+            -- --exact --nocapture

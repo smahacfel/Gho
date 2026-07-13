@@ -1,20 +1,28 @@
-use super::{replay_metric_contract_record_v2, Pr2cReplayInputV2};
+use super::{replay_metric_contract_record_v2, Pr2cCounterfactualLaneStatusV1, Pr2cReplayInputV2};
 use ghost_brain::oracle::{
-    MetricContractRotationManifestV1, METRIC_CONTRACT_EVIDENCE_V1_FILE,
+    GatekeeperBuyLog, MetricContractRotatedPartManifestV1, MetricContractRotationManifestV1,
+    GATEKEEPER_BUY_LOG_SCHEMA_VERSION, METRIC_CONTRACT_EVIDENCE_V1_FILE,
     METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE, METRIC_CONTRACT_SUMMARY_V34_FILE,
 };
 use ghost_core::checkpoint::MaterializedFeatureSet;
 use ghost_core::metric_contracts::{
-    BurnInContractV1, MetricAvailabilityV1, MetricContractAuditTerminalClassV1,
-    MetricContractDecisionSummaryV1, MetricContractEvidenceTransportV1,
-    MetricEvidenceRecordIdentityV1, StableEventIdentityV1,
+    BurnInContractV1, CanonicalNullableV1, MetricAvailabilityV1,
+    MetricContractAuditTerminalClassV1, MetricContractDecisionSummaryV1,
+    MetricContractEvidenceTransportV1, MetricEvidenceRecordIdentityV1, MetricMeasurementQualityV1,
+    StableEventIdentityV1, BURN_IN_CONTRACT_V1_CANONICAL_HASH,
+    METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
+    METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1,
+    METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34, METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_PROJECTION_SERIALIZED_HARD_MAX_BYTES_V1,
+    METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3, PR2C_COMPARATOR_P99_MAX_US,
+    PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US, PR2C_LOGGER_ENQUEUE_WAIT_P99_MAX_US,
+    PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US, PR2C_SERIALIZE_P99_MAX_US,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,6 +38,9 @@ pub struct Pr2cSingleRunAuditReportV1 {
     pub duplicate_record_identities: usize,
     pub missing_pairs: usize,
     pub policy_drift_rows: usize,
+    pub comparator_not_evaluable_rows: usize,
+    pub counterfactual_policy_delta_observed_rows: usize,
+    pub counterfactual_not_evaluable_rows: usize,
     pub stable_identity_unavailable_rows: usize,
     pub dev_known_decisions: usize,
     pub clean_flip_v2_evaluable: usize,
@@ -47,6 +58,10 @@ pub struct Pr2cSingleRunAuditReportV1 {
     pub v34_p95_increase_ratio: f64,
     pub combined_bytes_delta_ratio: f64,
     pub writer_queue_high_water: u64,
+    pub paired_record_identities: Vec<MetricEvidenceRecordIdentityV1>,
+    pub paired_decision_timestamps_ms: Vec<u64>,
+    pub utc_4h_buckets: Vec<u64>,
+    pub counterfactual_diagnostics: Vec<String>,
     pub reasons: Vec<String>,
 }
 
@@ -59,6 +74,8 @@ pub struct Pr2cBundleAuditReportV1 {
     pub consistent_provenance: bool,
     pub stable_event_collisions: usize,
     pub stable_identity_collision_gate_evaluable: bool,
+    pub unique_run_ids: bool,
+    pub global_duplicate_record_identities: usize,
     pub reasons: Vec<String>,
 }
 
@@ -127,17 +144,78 @@ fn percentile<T: Copy + Ord>(values: &[T], percentile: usize) -> Option<T> {
     }
     let mut values = values.to_vec();
     values.sort_unstable();
-    let rank = ((values.len() - 1) * percentile + 99) / 100;
+    let rank = ((values.len() - 1) * percentile).div_ceil(100);
     values.get(rank).copied()
 }
 
-fn resolve_manifest_part_path(run_dir: &Path, file_path: &str) -> PathBuf {
+fn resolve_manifest_part_path(
+    run_dir: &Path,
+    file_path: &str,
+) -> Result<PathBuf, Pr2cAuditErrorV1> {
     let path = Path::new(file_path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        run_dir.join(path)
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(Pr2cAuditErrorV1::PartIntegrity(format!(
+            "manifest part path must be one relative file name: {file_path}"
+        )));
     }
+    Ok(run_dir.join(path))
+}
+
+fn valid_lower_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_build_commit(value: &str) -> bool {
+    valid_lower_hex(value, 40)
+}
+
+fn validate_part_rows(
+    path: &Path,
+    part: &MetricContractRotatedPartManifestV1,
+) -> Result<(), Pr2cAuditErrorV1> {
+    let identities = match part.stream.as_str() {
+        "decision_v34" => read_jsonl::<MetricContractDecisionSummaryV1>(path)?
+            .0
+            .into_iter()
+            .map(|row| row.evidence_record_id)
+            .collect::<Vec<_>>(),
+        "full_evidence_v1" => read_jsonl::<MetricContractEvidenceTransportV1>(path)?
+            .0
+            .into_iter()
+            .map(|row| {
+                if row.rotation_part_index != part.part_index || row.writer_timestamp_ms == 0 {
+                    return Err(Pr2cAuditErrorV1::PartIntegrity(format!(
+                        "evidence writer metadata mismatch in {}",
+                        path.display()
+                    )));
+                }
+                Ok(row.payload.record_identity)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => {
+            return Err(Pr2cAuditErrorV1::PartIntegrity(format!(
+                "unknown manifest stream {}",
+                part.stream
+            )))
+        }
+    };
+    if identities.len() as u64 != part.row_count
+        || identities.first() != part.first_record_identity.as_ref()
+        || identities.last() != part.last_record_identity.as_ref()
+        || identities
+            .iter()
+            .any(|identity| identity.run_id != part.run_id)
+    {
+        return Err(Pr2cAuditErrorV1::PartIntegrity(format!(
+            "first/last/run identity metadata mismatch in {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_manifest_parts(
@@ -164,8 +242,17 @@ fn validate_manifest_parts(
             || summary.last_record_identity != evidence.last_record_identity
             || summary.run_id != evidence.run_id
             || summary.build_commit != evidence.build_commit
+            || summary.build_worktree_clean != evidence.build_worktree_clean
             || summary.gatekeeper_config_hash != evidence.gatekeeper_config_hash
             || summary.brain_config_hash != evidence.brain_config_hash
+            || summary.rollout_mode != evidence.rollout_mode
+            || summary.metric_contract_schema_version != evidence.metric_contract_schema_version
+            || summary.projection_wire_version != evidence.projection_wire_version
+            || summary.evidence_schema_version != evidence.evidence_schema_version
+            || summary.decision_schema_version != evidence.decision_schema_version
+            || summary.wire_schema_manifest_blake3 != evidence.wire_schema_manifest_blake3
+            || summary.burn_in_contract_version != evidence.burn_in_contract_version
+            || summary.burn_in_contract_canonical_hash != evidence.burn_in_contract_canonical_hash
             || summary.profile_id != evidence.profile_id
             || summary.profile_hash != evidence.profile_hash
             || summary.metric_contract_effective_config_hash
@@ -174,6 +261,26 @@ fn validate_manifest_parts(
         {
             return Err(Pr2cAuditErrorV1::PartIntegrity(
                 "summary/evidence rotated-part provenance mismatch".to_string(),
+            ));
+        }
+        if !valid_build_commit(&summary.build_commit)
+            || !summary.build_worktree_clean
+            || !valid_lower_hex(&summary.gatekeeper_config_hash, 64)
+            || !valid_lower_hex(&summary.brain_config_hash, 64)
+            || summary.metric_contract_schema_version
+                != METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1
+            || summary.projection_wire_version
+                != METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1
+            || summary.evidence_schema_version != METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1
+            || summary.decision_schema_version != METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34
+            || summary.wire_schema_manifest_blake3
+                != METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3
+            || summary.burn_in_contract_version != 1
+            || summary.burn_in_contract_canonical_hash.as_str()
+                != BURN_IN_CONTRACT_V1_CANONICAL_HASH
+        {
+            return Err(Pr2cAuditErrorV1::PartIntegrity(
+                "unknown, dirty, or incomplete run/build/schema/BURN provenance".to_string(),
             ));
         }
     }
@@ -207,7 +314,7 @@ fn validate_manifest_parts(
                     "one rotated part is declared more than once".to_string(),
                 ));
             }
-            let path = resolve_manifest_part_path(run_dir, &part.file_path);
+            let path = resolve_manifest_part_path(run_dir, &part.file_path)?;
             let bytes = read_bytes(&path)?;
             if bytes.len() as u64 != part.byte_count
                 || bytes.iter().filter(|byte| **byte == b'\n').count() as u64 != part.row_count
@@ -215,6 +322,7 @@ fn validate_manifest_parts(
             {
                 return Err(Pr2cAuditErrorV1::PartIntegrity(path.display().to_string()));
             }
+            validate_part_rows(&path, part)?;
         }
     }
     let directory = fs::read_dir(run_dir).map_err(|source| Pr2cAuditErrorV1::Read {
@@ -243,41 +351,71 @@ fn validate_manifest_parts(
 
 fn load_decision_projections(
     decision_v33_paths: &[PathBuf],
-) -> Result<
-    BTreeMap<MetricEvidenceRecordIdentityV1, (MaterializedFeatureSet, usize)>,
-    Pr2cAuditErrorV1,
-> {
+) -> Result<BTreeMap<MetricEvidenceRecordIdentityV1, CurrentDecisionBaselineV33>, Pr2cAuditErrorV1>
+{
     let mut projections = BTreeMap::new();
     for path in decision_v33_paths {
         let (rows, sizes) = read_jsonl::<serde_json::Value>(path)?;
         for (row, serialized_size) in rows.into_iter().zip(sizes) {
-            let Some(run_id) = row.get("run_id").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let Some(join_key) = row.get("join_key").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let Some(decision_plane) = row
-                .get("decision_plane")
-                .and_then(serde_json::Value::as_str)
-            else {
-                continue;
-            };
-            let Some(snapshot) = row.get("materialized_feature_snapshot") else {
-                continue;
-            };
+            let typed: GatekeeperBuyLog =
+                serde_json::from_value(row.clone()).map_err(|source| Pr2cAuditErrorV1::Json {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+            if typed.log_schema_version != GATEKEEPER_BUY_LOG_SCHEMA_VERSION
+                || serde_json::to_value(&typed).map_err(|source| Pr2cAuditErrorV1::Json {
+                    path: path.display().to_string(),
+                    source,
+                })? != row
+            {
+                return Err(Pr2cAuditErrorV1::PartIntegrity(format!(
+                    "decision baseline is not an exact current GatekeeperBuyLog v33 row: {}",
+                    path.display()
+                )));
+            }
+            let run_id = typed.run_id.as_deref().ok_or_else(|| {
+                Pr2cAuditErrorV1::PartIntegrity("current v33 row lacks run_id".to_string())
+            })?;
+            let join_key = typed.join_key.as_deref().ok_or_else(|| {
+                Pr2cAuditErrorV1::PartIntegrity("current v33 row lacks join_key".to_string())
+            })?;
+            let decision_plane = typed.decision_plane.as_deref().ok_or_else(|| {
+                Pr2cAuditErrorV1::PartIntegrity("current v33 row lacks decision_plane".to_string())
+            })?;
+            let snapshot = typed.materialized_feature_snapshot.clone().ok_or_else(|| {
+                Pr2cAuditErrorV1::PartIntegrity(
+                    "current v33 row lacks materialized_feature_snapshot".to_string(),
+                )
+            })?;
+            let gatekeeper_config_hash = typed.config_hash.clone().ok_or_else(|| {
+                Pr2cAuditErrorV1::PartIntegrity(
+                    "current v33 row lacks gatekeeper config hash".to_string(),
+                )
+            })?;
+            let brain_config_hash = typed.brain_config_hash.clone().ok_or_else(|| {
+                Pr2cAuditErrorV1::PartIntegrity(
+                    "current v33 row lacks brain config hash".to_string(),
+                )
+            })?;
             let identity =
                 MetricEvidenceRecordIdentityV1::try_new(run_id, join_key, decision_plane).map_err(
                     |_| Pr2cAuditErrorV1::PartIntegrity("invalid v33 record identity".to_string()),
                 )?;
-            let mfs = serde_json::from_value(snapshot.clone()).map_err(|source| {
-                Pr2cAuditErrorV1::Json {
+            let mfs =
+                serde_json::from_value(snapshot).map_err(|source| Pr2cAuditErrorV1::Json {
                     path: path.display().to_string(),
                     source,
-                }
-            })?;
+                })?;
             if projections
-                .insert(identity, (mfs, serialized_size))
+                .insert(
+                    identity,
+                    CurrentDecisionBaselineV33 {
+                        materialized_features: mfs,
+                        serialized_size,
+                        gatekeeper_config_hash,
+                        brain_config_hash,
+                    },
+                )
                 .is_some()
             {
                 return Err(Pr2cAuditErrorV1::PartIntegrity(
@@ -287,6 +425,14 @@ fn load_decision_projections(
         }
     }
     Ok(projections)
+}
+
+#[derive(Debug)]
+struct CurrentDecisionBaselineV33 {
+    materialized_features: MaterializedFeatureSet,
+    serialized_size: usize,
+    gatekeeper_config_hash: String,
+    brain_config_hash: String,
 }
 
 pub fn audit_pr2c_single_run_v1(
@@ -300,7 +446,7 @@ pub fn audit_pr2c_single_run_v1(
     let mut summary_sizes = Vec::new();
     for part in &manifest.summary_parts {
         let (mut rows, mut sizes) = read_jsonl::<MetricContractDecisionSummaryV1>(
-            &resolve_manifest_part_path(run_dir, &part.file_path),
+            &resolve_manifest_part_path(run_dir, &part.file_path)?,
         )?;
         summaries.append(&mut rows);
         summary_sizes.append(&mut sizes);
@@ -309,141 +455,206 @@ pub fn audit_pr2c_single_run_v1(
     let mut sidecar_sizes = Vec::new();
     for part in &manifest.evidence_parts {
         let (mut rows, mut sizes) = read_jsonl::<MetricContractEvidenceTransportV1>(
-            &resolve_manifest_part_path(run_dir, &part.file_path),
+            &resolve_manifest_part_path(run_dir, &part.file_path)?,
         )?;
         evidence_rows.append(&mut rows);
         sidecar_sizes.append(&mut sizes);
     }
     let decision_projections = load_decision_projections(decision_v33_paths)?;
-    let paired_v33_total_bytes = decision_projections
-        .values()
-        .map(|(_, bytes)| *bytes as u64)
-        .sum::<u64>();
-    let paired_v34_total_bytes = summary_sizes.iter().map(|bytes| *bytes as u64).sum::<u64>();
-    let paired_sidecar_total_bytes = sidecar_sizes.iter().map(|bytes| *bytes as u64).sum::<u64>();
-    let decision_timestamps = decision_projections
-        .values()
-        .filter_map(|(mfs, _)| {
-            mfs.metric_contract_decision_projection_v1
-                .as_ref()
-                .map(|projection| {
-                    projection
-                        .fee_topology_diversity_index
-                        .legacy_value
-                        .source_cutoff
-                        .decision_timestamp_ms
-                        .get()
-                })
-        })
-        .collect::<Vec<_>>();
-    let run_start_ms = decision_timestamps.iter().copied().min();
-    let run_end_ms = decision_timestamps.iter().copied().max();
-    let mut evidence_by_id = BTreeMap::new();
-    let dev_known_decisions = evidence_rows
-        .iter()
-        .filter(|row| {
-            row.payload
-                .contracts
-                .dev_buy
-                .tx_intel_first_observed
-                .creator_known
-        })
-        .count();
-    let clean_flip_v2_evaluable = evidence_rows
-        .iter()
-        .filter(|row| {
-            let flip = &row.payload.contracts.flip_ratio.hybrid_v2;
-            flip.envelope.availability == MetricAvailabilityV1::Available
-                && flip.eligible_buyer_count > 0
-        })
-        .count();
-    let real_dev_legacy_v2_divergences = evidence_rows
-        .iter()
-        .filter(|row| {
-            let dev = &row.payload.contracts.dev_buy;
-            dev.tx_intel_first_observed.amount_sol != dev.mfs_primary_v1.amount_sol
-        })
-        .count();
     let mut duplicate_record_identities = 0usize;
-    for evidence in evidence_rows {
-        if evidence_by_id
-            .insert(evidence.payload.record_identity.clone(), evidence)
+    let mut summaries_by_id = BTreeMap::new();
+    for (summary, size) in summaries.into_iter().zip(summary_sizes) {
+        if summaries_by_id
+            .insert(summary.evidence_record_id.clone(), (summary, size))
             .is_some()
         {
             duplicate_record_identities += 1;
         }
     }
-    let mut summary_ids = BTreeSet::new();
+    let mut evidence_by_id = BTreeMap::new();
+    for (evidence, size) in evidence_rows.into_iter().zip(sidecar_sizes) {
+        if evidence_by_id
+            .insert(evidence.payload.record_identity.clone(), (evidence, size))
+            .is_some()
+        {
+            duplicate_record_identities += 1;
+        }
+    }
+    let summary_ids = summaries_by_id.keys().cloned().collect::<BTreeSet<_>>();
+    let evidence_ids = evidence_by_id.keys().cloned().collect::<BTreeSet<_>>();
+    let v33_ids = decision_projections
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut all_ids = summary_ids.clone();
+    all_ids.extend(evidence_ids.iter().cloned());
+    all_ids.extend(v33_ids.iter().cloned());
+    let paired_ids = summary_ids
+        .intersection(&evidence_ids)
+        .filter(|identity| v33_ids.contains(*identity))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let missing_pairs = all_ids.len().saturating_sub(paired_ids.len());
     let evidence_row_count = evidence_by_id.len();
     let mut replayed_rows = 0usize;
-    let mut missing_pairs = 0usize;
     let mut policy_drift_rows = 0usize;
+    let mut comparator_not_evaluable_rows = 0usize;
+    let mut counterfactual_policy_delta_observed_rows = 0usize;
+    let mut counterfactual_not_evaluable_rows = 0usize;
     let mut stable_identity_unavailable_rows = 0usize;
+    let mut dev_known_decisions = 0usize;
+    let mut clean_flip_v2_evaluable = 0usize;
+    let mut real_dev_legacy_v2_divergences = 0usize;
     let mut wire_sizes = Vec::new();
+    let mut paired_sidecar_sizes = Vec::new();
     let mut comparator_times = Vec::new();
     let mut serialize_times = Vec::new();
     let mut v34_increase_bytes = Vec::new();
     let mut v34_increase_ratios = Vec::new();
     let mut reasons = Vec::new();
+    let mut counterfactual_diagnostics = Vec::new();
+    let mut paired_record_identities = Vec::new();
+    let mut paired_decision_timestamps_ms = Vec::new();
+    let mut paired_v33_total_bytes = 0u64;
+    let mut paired_v34_total_bytes = 0u64;
+    let mut paired_sidecar_total_bytes = 0u64;
     let effective_config = manifest
         .summary_parts
         .first()
         .map(|part| part.effective_config.clone());
-    for (summary, summary_size) in summaries.into_iter().zip(summary_sizes) {
-        if !summary_ids.insert(summary.evidence_record_id.clone()) {
-            duplicate_record_identities += 1;
-            continue;
-        }
-        comparator_times.push(summary.comparator_elapsed_us);
-        serialize_times.push(summary.metric_contract_serialize_us);
-        if !summary.equivalence_deltas.is_zero_drift() {
-            policy_drift_rows += 1;
-        }
-        let Some(evidence) = evidence_by_id.remove(&summary.evidence_record_id) else {
-            missing_pairs += 1;
-            continue;
-        };
-        if evidence.payload.stable_event_identity.is_null() {
-            stable_identity_unavailable_rows += 1;
-        }
-        let Some((mfs, v33_size)) = decision_projections.get(&summary.evidence_record_id) else {
-            missing_pairs += 1;
+    for identity in &paired_ids {
+        let (summary, summary_size) = summaries_by_id
+            .get(identity)
+            .expect("paired identity exists in summary map");
+        let (evidence, sidecar_size) = evidence_by_id
+            .get(identity)
+            .expect("paired identity exists in evidence map");
+        let baseline = decision_projections
+            .get(identity)
+            .expect("paired identity exists in v33 map");
+        let Some(part_provenance) = manifest.summary_parts.first() else {
+            reasons.push("manifest lacks summary part provenance".to_string());
             continue;
         };
-        let increase = i64::try_from(summary_size).unwrap_or(i64::MAX)
-            - i64::try_from(*v33_size).unwrap_or(i64::MAX);
-        v34_increase_bytes.push(increase);
-        v34_increase_ratios.push(summary_size as f64 / *v33_size as f64 - 1.0);
-        let Some(projection) = mfs.metric_contract_decision_projection_v1.clone() else {
-            return Err(Pr2cAuditErrorV1::MissingDecisionProjection(
-                summary.evidence_record_id,
+        if baseline.gatekeeper_config_hash != part_provenance.gatekeeper_config_hash
+            || baseline.brain_config_hash != part_provenance.brain_config_hash
+        {
+            reasons.push(format!(
+                "v33/run-manifest config provenance mismatch for {identity:?}"
             ));
-        };
-        wire_sizes.push(
-            projection
-                .authoritative_serialized_size_bytes()
-                .map_err(|error| Pr2cAuditErrorV1::PartIntegrity(error.to_string()))?,
-        );
-        let Some(effective_config) = effective_config.clone() else {
-            missing_pairs += 1;
+            continue;
+        }
+        let Some(projection) = baseline
+            .materialized_features
+            .metric_contract_decision_projection_v1
+            .clone()
+        else {
+            reasons.push(format!("missing decision-time projection for {identity:?}"));
             continue;
         };
-        if let Err(error) = replay_metric_contract_record_v2(Pr2cReplayInputV2 {
-            decision_v34: summary,
-            evidence,
+        let Some(effective_config) = effective_config.clone() else {
+            reasons.push("manifest lacks effective config".to_string());
+            continue;
+        };
+        let wire_size = projection
+            .authoritative_serialized_size_bytes()
+            .map_err(|error| Pr2cAuditErrorV1::PartIntegrity(error.to_string()))?;
+        match replay_metric_contract_record_v2(Pr2cReplayInputV2 {
+            decision_v34: summary.clone(),
+            evidence: evidence.clone(),
             decision_time_projection: projection,
             effective_config,
         }) {
-            reasons.push(error.to_string());
-        } else {
-            replayed_rows += 1;
+            Err(error) => reasons.push(error.to_string()),
+            Ok(replay) => {
+                paired_v33_total_bytes =
+                    paired_v33_total_bytes.saturating_add(baseline.serialized_size as u64);
+                paired_v34_total_bytes =
+                    paired_v34_total_bytes.saturating_add(*summary_size as u64);
+                paired_sidecar_total_bytes =
+                    paired_sidecar_total_bytes.saturating_add(*sidecar_size as u64);
+                paired_sidecar_sizes.push(*sidecar_size);
+                comparator_times.push(summary.comparator_elapsed_us);
+                serialize_times.push(summary.metric_contract_serialize_us);
+                wire_sizes.push(wire_size);
+                if summary.equivalence_deltas.has_policy_drift() {
+                    policy_drift_rows += 1;
+                }
+                if summary.equivalence_deltas.is_not_evaluable() {
+                    comparator_not_evaluable_rows += 1;
+                }
+                if evidence.payload.stable_event_identity.is_null() {
+                    stable_identity_unavailable_rows += 1;
+                }
+                let increase = i64::try_from(*summary_size).unwrap_or(i64::MAX);
+                v34_increase_bytes.push(increase);
+                v34_increase_ratios.push(*summary_size as f64 / baseline.serialized_size as f64);
+                replayed_rows += 1;
+                paired_record_identities.push(identity.clone());
+                paired_decision_timestamps_ms
+                    .push(evidence.payload.source_cutoff.decision_timestamp_ms.get());
+                if evidence
+                    .payload
+                    .contracts
+                    .dev_buy
+                    .tx_intel_first_observed
+                    .creator_known
+                {
+                    dev_known_decisions += 1;
+                }
+                let flip = &evidence.payload.contracts.flip_ratio.hybrid_v2;
+                if flip.envelope.availability == MetricAvailabilityV1::Available
+                    && flip.envelope.measurement_quality == MetricMeasurementQualityV1::Measured
+                    && flip.eligible_buyer_count > 0
+                {
+                    clean_flip_v2_evaluable += 1;
+                }
+                let dev = &evidence.payload.contracts.dev_buy;
+                if matches!(
+                    (&dev.tx_intel_first_observed.amount_sol, &dev.mfs_primary_v1.amount_sol),
+                    (CanonicalNullableV1::Value(legacy), CanonicalNullableV1::Value(v2))
+                        if legacy.to_bits() != v2.to_bits()
+                ) {
+                    real_dev_legacy_v2_divergences += 1;
+                }
+                if replay.counterfactual_evaluation.any_not_evaluable() {
+                    counterfactual_not_evaluable_rows += 1;
+                }
+                if replay.counterfactual_evaluation.delta_present() {
+                    counterfactual_policy_delta_observed_rows += 1;
+                }
+                for (lane, status) in [
+                    ("dev_primary", replay.counterfactual_evaluation.dev_primary),
+                    (
+                        "corrected_ftdi_actionability",
+                        replay
+                            .counterfactual_evaluation
+                            .corrected_ftdi_actionability,
+                    ),
+                ] {
+                    if status == Pr2cCounterfactualLaneStatusV1::Different {
+                        counterfactual_diagnostics.push(format!(
+                            "COUNTERFACTUAL_POLICY_DELTA_OBSERVED:{lane}:{}:{}:{}",
+                            identity.run_id, identity.join_key, identity.decision_plane
+                        ));
+                    }
+                }
+            }
         }
     }
-    missing_pairs += evidence_by_id.len();
+    paired_decision_timestamps_ms.sort_unstable();
+    let run_start_ms = paired_decision_timestamps_ms.first().copied();
+    let run_end_ms = paired_decision_timestamps_ms.last().copied();
+    let utc_4h_buckets = paired_decision_timestamps_ms
+        .iter()
+        .map(|timestamp| timestamp / 14_400_000)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let projection_wire_p95_bytes = percentile(&wire_sizes, 95).unwrap_or_default();
     let projection_wire_max_bytes = wire_sizes.iter().copied().max().unwrap_or_default();
-    let sidecar_p95_bytes = percentile(&sidecar_sizes, 95).unwrap_or_default();
-    let sidecar_p99_bytes = percentile(&sidecar_sizes, 99).unwrap_or_default();
+    let sidecar_p95_bytes = percentile(&paired_sidecar_sizes, 95).unwrap_or_default();
+    let sidecar_p99_bytes = percentile(&paired_sidecar_sizes, 99).unwrap_or_default();
     let comparator_p99_us = percentile(&comparator_times, 99).unwrap_or_default();
     let metric_contract_serialize_p99_us = percentile(&serialize_times, 99).unwrap_or_default();
     let metric_contract_build_and_serialize_p99_us = manifest
@@ -466,7 +677,7 @@ pub fn audit_pr2c_single_run_v1(
     let v34_p95_increase_ratio = if v34_increase_ratios.is_empty() {
         0.0
     } else {
-        v34_increase_ratios[((v34_increase_ratios.len() - 1) * 95 + 99) / 100]
+        v34_increase_ratios[((v34_increase_ratios.len() - 1) * 95).div_ceil(100)]
     };
     let queue_high_water_ratio = if manifest.writer_queue_capacity == 0 {
         1.0
@@ -476,15 +687,16 @@ pub fn audit_pr2c_single_run_v1(
     let combined_bytes_delta_ratio = if paired_v33_total_bytes == 0 {
         f64::INFINITY
     } else {
-        (paired_v34_total_bytes.saturating_add(paired_sidecar_total_bytes) as f64
-            / paired_v33_total_bytes as f64)
-            - 1.0
+        paired_v34_total_bytes.saturating_add(paired_sidecar_total_bytes) as f64
+            / paired_v33_total_bytes as f64
     };
-    let resource_failure = comparator_p99_us > 1_000
-        || metric_contract_serialize_p99_us > 1_000
-        || metric_contract_build_and_serialize_p99_us > 1_000
-        || projection_build_and_validate_p99_us > 1_000
-        || logger_enqueue_wait_p99_us > 1_000
+    let resource_failure = comparator_p99_us > PR2C_COMPARATOR_P99_MAX_US
+        || metric_contract_serialize_p99_us > PR2C_SERIALIZE_P99_MAX_US
+        || metric_contract_build_and_serialize_p99_us
+            > u64::from(PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US)
+        || projection_build_and_validate_p99_us
+            > u64::from(PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US)
+        || logger_enqueue_wait_p99_us > u64::from(PR2C_LOGGER_ENQUEUE_WAIT_P99_MAX_US)
         || projection_wire_p95_bytes > 12 * 1024
         || projection_wire_max_bytes > METRIC_CONTRACT_PROJECTION_SERIALIZED_HARD_MAX_BYTES_V1
         || sidecar_p95_bytes > 24 * 1024
@@ -500,18 +712,23 @@ pub fn audit_pr2c_single_run_v1(
         || manifest.writer_stats.queue_send_failures_total > 0
         || manifest.writer_stats.missing_pair_total > 0
         || manifest.writer_stats.orphan_summary_total > 0
-        || manifest.writer_stats.orphan_evidence_total > 0;
+        || manifest.writer_stats.orphan_evidence_total > 0
+        || manifest.writer_stats.manifest_write_failures_total > 0
+        || manifest.writer_stats.finalization_failures_total > 0;
     let schema_failure = duplicate_record_identities > 0
         || missing_pairs > 0
         || !reasons.is_empty()
-        || replayed_rows != summary_ids.len();
+        || replayed_rows != paired_ids.len()
+        || manifest.writer_stats.paired_commands_total != summary_ids.len() as u64
+        || summary_ids != evidence_ids
+        || summary_ids != v33_ids;
     let terminal_class = if schema_failure {
         MetricContractAuditTerminalClassV1::FailSchemaOrReplay
     } else if policy_drift_rows > 0 {
         MetricContractAuditTerminalClassV1::FailPolicyDrift
     } else if resource_failure {
         MetricContractAuditTerminalClassV1::FailResourceBudget
-    } else if stable_identity_unavailable_rows > 0 {
+    } else if stable_identity_unavailable_rows > 0 || comparator_not_evaluable_rows > 0 {
         MetricContractAuditTerminalClassV1::NotEvaluable
     } else {
         MetricContractAuditTerminalClassV1::PassCutoverReady
@@ -531,6 +748,9 @@ pub fn audit_pr2c_single_run_v1(
         duplicate_record_identities,
         missing_pairs,
         policy_drift_rows,
+        comparator_not_evaluable_rows,
+        counterfactual_policy_delta_observed_rows,
+        counterfactual_not_evaluable_rows,
         stable_identity_unavailable_rows,
         dev_known_decisions,
         clean_flip_v2_evaluable,
@@ -548,6 +768,10 @@ pub fn audit_pr2c_single_run_v1(
         v34_p95_increase_ratio,
         combined_bytes_delta_ratio,
         writer_queue_high_water: manifest.writer_stats.writer_queue_high_water,
+        paired_record_identities,
+        paired_decision_timestamps_ms,
+        utc_4h_buckets,
+        counterfactual_diagnostics,
         reasons,
     })
 }
@@ -558,11 +782,27 @@ pub fn audit_pr2c_bundle_v1(
     let mut reports = Vec::new();
     let mut provenance = BTreeSet::new();
     let mut stable_identities = BTreeMap::<String, String>::new();
+    let mut run_ids = BTreeSet::new();
+    let mut unique_run_ids = true;
+    let mut global_record_identities = BTreeSet::new();
+    let mut global_duplicate_record_identities = 0usize;
     let mut intervals = Vec::new();
     let mut stable_event_collisions = 0usize;
     let mut stable_identity_collision_gate_evaluable = true;
     for (run_dir, decision_paths) in runs {
         let report = audit_pr2c_single_run_v1(run_dir, decision_paths)?;
+        if !report
+            .run_id
+            .as_ref()
+            .is_some_and(|run_id| run_ids.insert(run_id.clone()))
+        {
+            unique_run_ids = false;
+        }
+        for identity in &report.paired_record_identities {
+            if !global_record_identities.insert(identity.clone()) {
+                global_duplicate_record_identities += 1;
+            }
+        }
         if report.stable_identity_unavailable_rows > 0 {
             stable_identity_collision_gate_evaluable = false;
         }
@@ -572,19 +812,36 @@ pub fn audit_pr2c_bundle_v1(
         let manifest: MetricContractRotationManifestV1 =
             read_json(&run_dir.join(METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE))?;
         if let Some(part) = manifest.summary_parts.first() {
-            provenance.insert((
-                part.build_commit.clone(),
-                part.schema.clone(),
-                part.gatekeeper_config_hash.clone(),
-                part.profile_id.clone(),
-                part.profile_hash.clone(),
-                part.metric_contract_effective_config_hash.clone(),
-                part.effective_config.payload.schema_version,
-            ));
+            provenance.insert(
+                serde_json::to_string(&serde_json::json!({
+                    "build_commit": part.build_commit,
+                    "build_worktree_clean": part.build_worktree_clean,
+                    "schema": part.schema,
+                    "gatekeeper_config_hash": part.gatekeeper_config_hash,
+                    "brain_config_hash": part.brain_config_hash,
+                    "rollout_mode": part.rollout_mode,
+                    "metric_contract_schema_version": part.metric_contract_schema_version,
+                    "projection_wire_version": part.projection_wire_version,
+                    "evidence_schema_version": part.evidence_schema_version,
+                    "decision_schema_version": part.decision_schema_version,
+                    "wire_schema_manifest_blake3": part.wire_schema_manifest_blake3,
+                    "burn_in_contract_version": part.burn_in_contract_version,
+                    "burn_in_contract_canonical_hash": part.burn_in_contract_canonical_hash,
+                    "profile_id": part.profile_id,
+                    "profile_hash": part.profile_hash,
+                    "metric_contract_effective_config_hash":
+                        part.metric_contract_effective_config_hash,
+                    "effective_config_schema_version": part.effective_config.payload.schema_version,
+                }))
+                .map_err(|source| Pr2cAuditErrorV1::Json {
+                    path: run_dir.display().to_string(),
+                    source,
+                })?,
+            );
         }
         for part in &manifest.evidence_parts {
             let (rows, _) = read_jsonl::<MetricContractEvidenceTransportV1>(
-                &resolve_manifest_part_path(run_dir, &part.file_path),
+                &resolve_manifest_part_path(run_dir, &part.file_path)?,
             )?;
             for row in rows {
                 if let ghost_core::metric_contracts::CanonicalNullableV1::Value(identity) =
@@ -621,9 +878,20 @@ pub fn audit_pr2c_bundle_v1(
     if !non_overlapping_runs {
         reasons.push("run time ranges overlap".to_string());
     }
+    if !unique_run_ids {
+        reasons.push("bundle contains duplicate or missing run_id".to_string());
+    }
+    if global_duplicate_record_identities > 0 {
+        reasons.push("bundle contains duplicate full record identity".to_string());
+    }
     let terminal_class = if reports.iter().any(|report| {
         report.terminal_class == MetricContractAuditTerminalClassV1::FailSchemaOrReplay
-    }) {
+    }) || !consistent_provenance
+        || stable_event_collisions > 0
+        || !non_overlapping_runs
+        || !unique_run_ids
+        || global_duplicate_record_identities > 0
+    {
         MetricContractAuditTerminalClassV1::FailSchemaOrReplay
     } else if reports
         .iter()
@@ -634,8 +902,6 @@ pub fn audit_pr2c_bundle_v1(
         report.terminal_class == MetricContractAuditTerminalClassV1::FailResourceBudget
     }) {
         MetricContractAuditTerminalClassV1::FailResourceBudget
-    } else if !consistent_provenance || stable_event_collisions > 0 || !non_overlapping_runs {
-        MetricContractAuditTerminalClassV1::FailSchemaOrReplay
     } else if !stable_identity_collision_gate_evaluable
         || reports
             .iter()
@@ -652,6 +918,8 @@ pub fn audit_pr2c_bundle_v1(
         consistent_provenance,
         stable_event_collisions,
         stable_identity_collision_gate_evaluable,
+        unique_run_ids,
+        global_duplicate_record_identities,
         reasons,
     })
 }
@@ -663,6 +931,25 @@ pub fn audit_pr2c_bundle_against_burn_in_contract_v1(
     contract
         .validate_hash()
         .map_err(|error| Pr2cAuditErrorV1::PartIntegrity(error.to_string()))?;
+    for (run_dir, _) in runs {
+        let manifest: MetricContractRotationManifestV1 =
+            read_json(&run_dir.join(METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE))?;
+        if manifest
+            .summary_parts
+            .iter()
+            .chain(&manifest.evidence_parts)
+            .any(|part| {
+                part.burn_in_contract_version != contract.payload.burn_in_contract_version
+                    || part.burn_in_contract_canonical_hash != contract.contract_canonical_hash
+                    || part.wire_schema_manifest_blake3
+                        != contract.payload.wire_schema_manifest_blake3
+            })
+        {
+            return Err(Pr2cAuditErrorV1::PartIntegrity(
+                "run manifest is not bound to the supplied BURN_IN_CONTRACT_V1".to_string(),
+            ));
+        }
+    }
     let mut report = audit_pr2c_bundle_v1(runs)?;
     let payload = &contract.payload;
     let frozen_at_ms = chrono::DateTime::parse_from_rfc3339(&payload.frozen_at)
@@ -672,16 +959,24 @@ pub fn audit_pr2c_bundle_against_burn_in_contract_v1(
             )
         })?
         .timestamp_millis();
-    let aggregate_duration_ms = report
-        .run_reports
-        .iter()
-        .filter_map(|run| Some(run.run_end_ms?.checked_sub(run.run_start_ms?)?))
-        .sum::<u64>();
+    let aggregate_duration_ms = report.run_reports.iter().try_fold(0u64, |total, run| {
+        let duration = run
+            .run_start_ms
+            .zip(run.run_end_ms)
+            .and_then(|(start, end)| end.checked_sub(start))
+            .ok_or_else(|| {
+                Pr2cAuditErrorV1::PartIntegrity("run has no valid paired duration".to_string())
+            })?;
+        total.checked_add(duration).ok_or_else(|| {
+            Pr2cAuditErrorV1::PartIntegrity("aggregate run duration overflow".to_string())
+        })
+    })?;
     let decisions = report
         .run_reports
         .iter()
-        .map(|run| run.summary_rows as u64)
-        .sum::<u64>();
+        .flat_map(|run| run.paired_record_identities.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
     let dev_known = report
         .run_reports
         .iter()
@@ -700,7 +995,7 @@ pub fn audit_pr2c_bundle_against_burn_in_contract_v1(
     let buckets = report
         .run_reports
         .iter()
-        .filter_map(|run| run.run_start_ms.map(|start| start / 14_400_000))
+        .flat_map(|run| run.utc_4h_buckets.iter().copied())
         .collect::<BTreeSet<_>>()
         .len();
     let each_run_duration_pass = report.run_reports.iter().all(|run| {
@@ -712,12 +1007,22 @@ pub fn audit_pr2c_bundle_against_burn_in_contract_v1(
     let prospective_rows_only = u64::try_from(frozen_at_ms)
         .ok()
         .is_some_and(|frozen_at_ms| {
-            report
-                .run_reports
-                .iter()
-                .all(|run| run.run_start_ms.is_some_and(|start| start > frozen_at_ms))
+            report.run_reports.iter().all(|run| {
+                !run.paired_decision_timestamps_ms.is_empty()
+                    && run
+                        .paired_decision_timestamps_ms
+                        .iter()
+                        .all(|timestamp| *timestamp > frozen_at_ms)
+            })
         });
-    let minima_pass = report.run_reports.len() >= usize::from(payload.minimum_non_overlapping_runs)
+    let every_run_passed_before_aggregation = report
+        .run_reports
+        .iter()
+        .all(|run| run.terminal_class == MetricContractAuditTerminalClassV1::PassCutoverReady);
+    let minima_pass = every_run_passed_before_aggregation
+        && report.unique_run_ids
+        && report.global_duplicate_record_identities == 0
+        && report.run_reports.len() >= usize::from(payload.minimum_non_overlapping_runs)
         && each_run_duration_pass
         && buckets >= usize::from(payload.minimum_utc_4h_buckets)
         && aggregate_duration_ms >= payload.minimum_aggregate_duration_ms

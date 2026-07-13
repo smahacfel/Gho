@@ -14,8 +14,13 @@ pub const METRIC_CONTRACT_WIRE_V1_TUPLE_TABLE_COUNT: usize = 18;
 pub const METRIC_CONTRACT_WIRE_V1_MAPPING_TABLE_COUNT: usize = 28;
 pub const METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3: &str =
     "70d79931f3f9a82720e46f622d439930a087431e305d14c02d88dcd26568fc7f";
+pub const PR2C_COMPARATOR_P99_MAX_US: u32 = 1_000;
+pub const PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US: u32 = 5_000;
+pub const PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US: u32 = 5_000;
+pub const PR2C_SERIALIZE_P99_MAX_US: u32 = 1_000;
+pub const PR2C_LOGGER_ENQUEUE_WAIT_P99_MAX_US: u32 = 1_000;
 pub const BURN_IN_CONTRACT_V1_CANONICAL_HASH: &str =
-    "56ceb5a80a0b6d413cf639f0ac02d30fade2770f7f5c4cf4a1a014f3632ae7df";
+    "40872b8c1ab8fcd8ecb4b1612e35fcf9dc157cbb1109546c7490c7d006f00ffd";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +177,21 @@ impl MetricContractPolicyEquivalenceSnapshotV1 {
             ),
         }
     }
+
+    /// A missing authoritative or comparator evaluation is durable evidence
+    /// of non-evaluability, never proof of equality and never policy drift.
+    #[must_use]
+    pub const fn not_evaluable_comparison() -> MetricContractComparatorSummaryV1 {
+        MetricContractComparatorSummaryV1 {
+            verdict: ComparatorDeltaStatusV1::NotEvaluable,
+            primary_reason_code: ComparatorDeltaStatusV1::NotEvaluable,
+            ordered_reason_chain: ComparatorDeltaStatusV1::NotEvaluable,
+            phase_pass_vector: ComparatorDeltaStatusV1::NotEvaluable,
+            soft_points: ComparatorDeltaStatusV1::NotEvaluable,
+            selector_soft_score: ComparatorDeltaStatusV1::NotEvaluable,
+            hard_fail_classification: ComparatorDeltaStatusV1::NotEvaluable,
+        }
+    }
 }
 
 impl MetricContractComparatorSummaryV1 {
@@ -188,6 +208,36 @@ impl MetricContractComparatorSummaryV1 {
         ]
         .into_iter()
         .all(|status| status == ComparatorDeltaStatusV1::Equal)
+    }
+
+    #[must_use]
+    pub fn has_policy_drift(&self) -> bool {
+        [
+            self.verdict,
+            self.primary_reason_code,
+            self.ordered_reason_chain,
+            self.phase_pass_vector,
+            self.soft_points,
+            self.selector_soft_score,
+            self.hard_fail_classification,
+        ]
+        .into_iter()
+        .any(|status| status == ComparatorDeltaStatusV1::Different)
+    }
+
+    #[must_use]
+    pub fn is_not_evaluable(&self) -> bool {
+        [
+            self.verdict,
+            self.primary_reason_code,
+            self.ordered_reason_chain,
+            self.phase_pass_vector,
+            self.soft_points,
+            self.selector_soft_score,
+            self.hard_fail_classification,
+        ]
+        .into_iter()
+        .any(|status| status == ComparatorDeltaStatusV1::NotEvaluable)
     }
 }
 
@@ -219,8 +269,6 @@ pub enum MetricContractPairErrorV1 {
     EvidenceSchemaMismatch,
     #[error("v34/evidence profile or effective-config provenance mismatch")]
     ProvenanceMismatch,
-    #[error("v34 equivalence comparator contains policy drift")]
-    PolicyDrift,
 }
 
 impl MetricContractPairedRecordV1 {
@@ -266,9 +314,6 @@ impl MetricContractPairedRecordV1 {
             || self.gatekeeper_config_hash.trim().is_empty()
         {
             return Err(MetricContractPairErrorV1::ProvenanceMismatch);
-        }
-        if !self.decision_v34.equivalence_deltas.is_zero_drift() {
-            return Err(MetricContractPairErrorV1::PolicyDrift);
         }
         Ok(())
     }
@@ -367,13 +412,15 @@ impl BurnInContractV1 {
             || payload.decision_schema_version != super::METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34
             || payload.wire_schema_manifest_blake3
                 != METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3
-            || payload.resource_limits.comparator_p99_us != 1_000
+            || payload.resource_limits.comparator_p99_us != PR2C_COMPARATOR_P99_MAX_US
             || payload
                 .resource_limits
                 .metric_contract_build_and_serialize_p99_us
-                != 1_000
-            || payload.resource_limits.projection_build_and_validate_p99_us != 1_000
-            || payload.resource_limits.logger_enqueue_wait_p99_us != 1_000
+                != PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US
+            || payload.resource_limits.projection_build_and_validate_p99_us
+                != PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US
+            || payload.resource_limits.logger_enqueue_wait_p99_us
+                != PR2C_LOGGER_ENQUEUE_WAIT_P99_MAX_US
             || payload.resource_limits.writer_queue_high_water_max_ratio != 0.8
             || payload.resource_limits.projection_p95_bytes != 12 * 1_024
             || payload.resource_limits.projection_hard_max_bytes != 16 * 1_024

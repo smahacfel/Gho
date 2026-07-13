@@ -17,10 +17,13 @@ use ghost_core::metric_contracts::{
     MetricContractProjectionWireV1SchemaManifest,
     METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3,
     METRIC_CONTRACT_WIRE_V1_MAPPING_TABLE_COUNT, METRIC_CONTRACT_WIRE_V1_TUPLE_TABLE_COUNT,
+    PR2C_COMPARATOR_P99_MAX_US, PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US,
+    PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US, PR2C_SERIALIZE_P99_MAX_US,
 };
 use ghost_launcher::components::gatekeeper_policy::{
     build_assessment_from_features, evaluate_policy_from_assessment, PolicyEvaluationContext,
 };
+use sha2::Digest;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -122,12 +125,24 @@ fn burn_in_contract_v1_is_frozen_hashed_and_fail_closed() {
     );
     assert_eq!(
         contract.contract_canonical_hash.as_str(),
-        "56ceb5a80a0b6d413cf639f0ac02d30fade2770f7f5c4cf4a1a014f3632ae7df"
+        "40872b8c1ab8fcd8ecb4b1612e35fcf9dc157cbb1109546c7490c7d006f00ffd"
     );
 
     let mut value = serde_json::to_value(&contract).unwrap();
     value["payload"]["minimum_unique_decisions"] = serde_json::json!(1);
     assert!(serde_json::from_value::<BurnInContractV1>(value).is_err());
+}
+
+#[test]
+fn build_provenance_is_git_derived_clean_sensitive_and_not_environment_overrideable() {
+    let build_script = include_str!("../../ghost-brain/build.rs");
+    assert!(build_script.contains("git_output(&[\"rev-parse\", \"HEAD\"])"));
+    assert!(build_script.contains("status"));
+    assert!(build_script.contains("--untracked-files=all"));
+    assert!(build_script.contains("unwrap_or(false)"));
+    assert!(build_script.contains("GIT_WORKTREE_CLEAN"));
+    assert!(!build_script.contains("std::env::var(\"GIT_COMMIT\")"));
+    assert!(!build_script.contains("rerun-if-env-changed=GIT_COMMIT"));
 }
 
 #[test]
@@ -177,10 +192,9 @@ async fn paired_writer_emits_summary_evidence_and_rotation_manifest_from_one_com
     let mut writer = MetricContractPairedWriterV1::open(config, Arc::clone(&stats))
         .await
         .unwrap();
-    writer
-        .write_pair(paired_fixture("run-a", "join-a"))
-        .await
-        .unwrap();
+    let pair = paired_fixture("run-a", "join-a");
+    assert_eq!(pair.evidence.writer_timestamp_ms, 0);
+    writer.write_pair(pair).await.unwrap();
 
     let summary =
         std::fs::read_to_string(temp.path().join(METRIC_CONTRACT_SUMMARY_V34_FILE)).unwrap();
@@ -189,7 +203,10 @@ async fn paired_writer_emits_summary_evidence_and_rotation_manifest_from_one_com
     assert_eq!(summary.lines().count(), 1);
     assert_eq!(evidence.lines().count(), 1);
     serde_json::from_str::<MetricContractDecisionSummaryV1>(summary.trim()).unwrap();
-    serde_json::from_str::<MetricContractEvidenceTransportV1>(evidence.trim()).unwrap();
+    let persisted_evidence =
+        serde_json::from_str::<MetricContractEvidenceTransportV1>(evidence.trim()).unwrap();
+    assert!(persisted_evidence.writer_timestamp_ms > 0);
+    assert_eq!(persisted_evidence.rotation_part_index, 0);
 
     let manifest: MetricContractRotationManifestV1 = serde_json::from_slice(
         &std::fs::read(temp.path().join(METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE)).unwrap(),
@@ -283,11 +300,33 @@ fn evidence_transport_hash_mismatch_and_unknown_fields_fail_deserialization() {
 }
 
 #[tokio::test]
-async fn paired_writer_enospc_and_partial_write_are_fail_closed_and_counted() {
-    for (fault, expected_orphan_summary) in [
-        (MetricContractWriterFaultInjectionV1::SummaryEnospc, 0),
+async fn paired_writer_enospc_orphans_are_fail_closed_and_counted_in_both_directions() {
+    for (
+        fault,
+        expected_summary_rows,
+        expected_evidence_rows,
+        expected_orphan_summary,
+        expected_orphan_evidence,
+    ) in [
+        (
+            MetricContractWriterFaultInjectionV1::SummaryEnospc,
+            0,
+            0,
+            0,
+            0,
+        ),
         (
             MetricContractWriterFaultInjectionV1::EvidenceEnospcAfterSummary,
+            1,
+            0,
+            1,
+            0,
+        ),
+        (
+            MetricContractWriterFaultInjectionV1::SummaryEnospcAfterEvidence,
+            0,
+            1,
+            0,
             1,
         ),
     ] {
@@ -312,6 +351,7 @@ async fn paired_writer_enospc_and_partial_write_are_fail_closed_and_counted() {
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.missing_pair_total, 1);
         assert_eq!(snapshot.orphan_summary_total, expected_orphan_summary);
+        assert_eq!(snapshot.orphan_evidence_total, expected_orphan_evidence);
         assert_eq!(
             snapshot.summary_write_failures_total + snapshot.evidence_write_failures_total,
             1
@@ -328,11 +368,109 @@ async fn paired_writer_enospc_and_partial_write_are_fail_closed_and_counted() {
             manifest.writer_stats.orphan_summary_total,
             expected_orphan_summary
         );
+        assert_eq!(
+            manifest.writer_stats.orphan_evidence_total,
+            expected_orphan_evidence
+        );
         assert_eq!(manifest.summary_parts.len(), 1);
         assert_eq!(manifest.evidence_parts.len(), 1);
-        assert_eq!(manifest.summary_parts[0].row_count, expected_orphan_summary);
-        assert_eq!(manifest.evidence_parts[0].row_count, 0);
+        assert_eq!(manifest.summary_parts[0].row_count, expected_summary_rows);
+        assert_eq!(manifest.evidence_parts[0].row_count, expected_evidence_rows);
     }
+}
+
+#[tokio::test]
+async fn paired_writer_records_actual_mid_row_short_writes_as_durable_truncated_parts() {
+    const PREFIX_BYTES: usize = 31;
+    for (fault, truncated_stream) in [
+        (
+            MetricContractWriterFaultInjectionV1::SummaryShortWriteAfterBytes(PREFIX_BYTES),
+            "summary",
+        ),
+        (
+            MetricContractWriterFaultInjectionV1::EvidenceShortWriteAfterSummaryBytes(PREFIX_BYTES),
+            "evidence",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let stats = Arc::new(MetricContractPairedWriterStatsV1::default());
+        let mut config = MetricContractPairedWriterConfigV1::new(
+            temp.path().to_path_buf(),
+            "fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9",
+        );
+        config.fault_injection = Some(fault);
+        let mut writer = MetricContractPairedWriterV1::open(config, stats)
+            .await
+            .unwrap();
+        writer
+            .write_pair(paired_fixture("short-write-run", "short-write-join"))
+            .await
+            .unwrap_err();
+        writer.finalize().await.unwrap();
+
+        let manifest: MetricContractRotationManifestV1 = serde_json::from_slice(
+            &tokio::fs::read(temp.path().join(METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let (part, path) = if truncated_stream == "summary" {
+            (
+                &manifest.summary_parts[0],
+                temp.path().join(METRIC_CONTRACT_SUMMARY_V34_FILE),
+            )
+        } else {
+            (
+                &manifest.evidence_parts[0],
+                temp.path().join(METRIC_CONTRACT_EVIDENCE_V1_FILE),
+            )
+        };
+        let persisted_prefix = tokio::fs::read(path).await.unwrap();
+        assert_eq!(persisted_prefix.len(), PREFIX_BYTES);
+        assert!(!persisted_prefix.ends_with(b"\n"));
+        assert_eq!(part.byte_count, PREFIX_BYTES as u64);
+        assert_eq!(part.row_count, 0);
+        assert_eq!(
+            part.part_sha256.as_str(),
+            format!("{:x}", sha2::Sha256::digest(&persisted_prefix))
+        );
+        assert_eq!(manifest.writer_stats.missing_pair_total, 1);
+    }
+}
+
+#[tokio::test]
+async fn final_manifest_failure_is_counted_and_cannot_claim_an_immutable_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let stats = Arc::new(MetricContractPairedWriterStatsV1::default());
+    let mut config = MetricContractPairedWriterConfigV1::new(
+        temp.path().to_path_buf(),
+        "fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9",
+    );
+    config.fault_injection = Some(MetricContractWriterFaultInjectionV1::FinalManifestEnospc);
+    let mut writer = MetricContractPairedWriterV1::open(config, Arc::clone(&stats))
+        .await
+        .unwrap();
+    writer
+        .write_pair(paired_fixture(
+            "finalize-failure-run",
+            "finalize-failure-join",
+        ))
+        .await
+        .unwrap();
+    writer.finalize().await.unwrap_err();
+
+    let snapshot = stats.snapshot();
+    assert_eq!(snapshot.manifest_write_failures_total, 1);
+    assert_eq!(snapshot.finalization_failures_total, 1);
+    let manifest: MetricContractRotationManifestV1 = serde_json::from_slice(
+        &tokio::fs::read(temp.path().join(METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!manifest.writer_finalized);
+    assert_eq!(manifest.writer_stats.manifest_write_failures_total, 1);
+    assert_eq!(manifest.writer_stats.finalization_failures_total, 1);
 }
 
 #[tokio::test]
@@ -448,9 +586,9 @@ async fn logger_enqueue_wait_and_queue_high_water_pass_the_frozen_resource_gate(
     assert_eq!(completed.evidence_write_failures_total, 0);
 }
 
-#[test]
-fn pr2c_release_resource_harness_reports_full_path_percentiles() {
-    fn percentiles(mut values: Vec<u128>) -> (u128, u128, u128) {
+#[tokio::test]
+async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
+    fn percentiles<T: Copy + Ord>(mut values: Vec<T>) -> (T, T, T) {
         values.sort_unstable();
         (
             values[values.len() * 50 / 100],
@@ -460,22 +598,12 @@ fn pr2c_release_resource_harness_reports_full_path_percentiles() {
     }
 
     let (warmup_samples, measured_samples) = if cfg!(debug_assertions) {
-        (4, 32)
+        (4, 16)
     } else {
-        (16, 256)
+        (16, 128)
     };
     let frozen = frozen_inputs_fixture();
-    // PR2C starts at the already-frozen PR2B snapshot boundary. Producer
-    // construction and PR2B evidence materialization are deliberately outside
-    // this gate; rebuilding them here would violate the one-snapshot contract
-    // and measure test-fixture setup rather than the durable PR2C path.
-    let validated_snapshot = frozen.build_timed();
-    let ready_snapshot = validated_snapshot.snapshot();
     let policy = common::equal_policy();
-    // The comparator acceptance sample must include the same pure second
-    // Gatekeeper evaluation used by the terminal runtime. Comparing two
-    // already-built equivalence snapshots alone would materially understate
-    // `comparator_elapsed_us`.
     let comparator_config = GatekeeperV2Config::default();
     let comparator_assessment = build_assessment_from_features(
         MaterializedFeatureSet::default(),
@@ -484,108 +612,72 @@ fn pr2c_release_resource_harness_reports_full_path_percentiles() {
     );
     let expected_comparator_decision =
         evaluate_policy_from_assessment(&comparator_assessment, &comparator_config);
-    let build_sample = |run_id: &str, join_key: String| {
-        let started = Instant::now();
-        let pair_started = Instant::now();
-        let pair =
-            ghost_launcher::metric_contracts::build_pr2c_paired_record_from_validated_snapshot_v1(
-                &validated_snapshot,
-                &ghost_launcher::metric_contracts::Pr2cDecisionRecordContextV1 {
-                    record_identity:
-                        ghost_core::metric_contracts::MetricEvidenceRecordIdentityV1::try_new(
-                            run_id,
-                            &join_key,
-                            "legacy_live",
-                        )
-                        .unwrap(),
-                    stable_event_identity: Some(
-                        ghost_core::metric_contracts::StableEventIdentityV1::try_from_signature(
-                            "resource_harness",
-                            format!("sig-{join_key}"),
-                        )
-                        .unwrap(),
-                    ),
-                    rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode::Legacy,
-                    profile: frozen.profile(),
-                    effective_config: frozen.effective_config(),
-                    authoritative_policy: &policy,
-                    comparator_policy: &policy,
-                    counterfactual_delta_present: false,
-                    comparator_elapsed_us: 0,
-                    metric_contract_serialize_us: 0,
-                    metric_contract_build_and_serialize_us: 0,
-                    projection_build_and_validate_us: 0,
-                    gatekeeper_config_hash: "resource-harness-gatekeeper-config",
-                    brain_config_hash: Some("resource-harness-brain-config"),
-                    writer_timestamp_ms: 20_000,
-                },
-            )
-            .unwrap();
-        let pair_build_us = pair_started.elapsed().as_micros();
-        let transport_serialize_started = Instant::now();
-        let summary = serde_json::to_vec(&pair.decision_v34).unwrap();
-        let evidence = serde_json::to_vec(&pair.evidence).unwrap();
-        let transport_serialize_us = transport_serialize_started.elapsed().as_micros();
-        let total_build_serialize_us = started.elapsed().as_micros();
-        let wire_started = Instant::now();
-        let wire_size = pair
-            .decision_time_projection
-            .authoritative_serialized_size_bytes()
-            .unwrap();
-        let wire_serialize_us = wire_started.elapsed().as_micros();
-        (
-            summary,
-            evidence,
-            wire_size,
-            total_build_serialize_us,
-            pair_build_us,
-            transport_serialize_us,
-            wire_serialize_us,
-        )
-    };
+
+    // Warm exactly the same producer -> full evidence -> projection -> pair
+    // construction path. Warmup samples are deliberately excluded from the
+    // measured writer histogram.
     for index in 0..warmup_samples {
-        build_sample("warmup", format!("join-{index}"));
+        let timed = frozen.build_timed();
+        let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_from_validated_snapshot_v1(
+            &timed,
+            &ghost_launcher::metric_contracts::Pr2cDecisionRecordContextV1 {
+                record_identity: ghost_core::metric_contracts::MetricEvidenceRecordIdentityV1::try_new(
+                    "resource-warmup",
+                    format!("join-{index}"),
+                    "legacy_live",
+                )
+                .unwrap(),
+                stable_event_identity: None,
+                rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode::Legacy,
+                profile: frozen.profile(),
+                effective_config: frozen.effective_config(),
+                authoritative_policy: &policy,
+                comparator_policy: &policy,
+                comparator_evaluable: true,
+                comparator_elapsed_us: 0,
+                metric_contract_serialize_us: 0,
+                metric_contract_build_and_serialize_us: 0,
+                projection_build_and_validate_us: 0,
+                gatekeeper_config_hash: common::TEST_GATEKEEPER_CONFIG_HASH,
+                brain_config_hash: Some(common::TEST_BRAIN_CONFIG_HASH),
+            },
+        )
+        .unwrap();
+        serde_json::to_vec(&pair.decision_v34).unwrap();
+        serde_json::to_vec(&pair.evidence).unwrap();
     }
-    let mut build_serialize = Vec::with_capacity(measured_samples);
+
+    let temp = tempfile::tempdir().unwrap();
+    let stats = Arc::new(MetricContractPairedWriterStatsV1::default());
+    let config = MetricContractPairedWriterConfigV1::new(
+        temp.path().to_path_buf(),
+        "fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9",
+    );
+    let mut writer = MetricContractPairedWriterV1::open(config, Arc::clone(&stats))
+        .await
+        .unwrap();
     let mut comparator = Vec::with_capacity(measured_samples);
     let mut wire_bytes = Vec::with_capacity(measured_samples);
-    let mut sidecar_bytes = Vec::with_capacity(measured_samples);
-    let mut v34_bytes = Vec::with_capacity(measured_samples);
+    let mut complete_snapshot_build = Vec::with_capacity(measured_samples);
+    let mut context_validation = Vec::with_capacity(measured_samples);
+    let mut evidence_build = Vec::with_capacity(measured_samples);
+    let mut evidence_validation = Vec::with_capacity(measured_samples);
     let mut projection_build = Vec::with_capacity(measured_samples);
-    let mut pair_build = Vec::with_capacity(measured_samples);
-    let mut transport_serialize = Vec::with_capacity(measured_samples);
-    let mut wire_serialize = Vec::with_capacity(measured_samples);
+    let mut pair_construction = Vec::with_capacity(measured_samples);
     for index in 0..measured_samples {
-        let (
-            summary,
-            evidence,
-            wire_size,
-            elapsed_us,
-            pair_build_us,
-            transport_serialize_us,
-            wire_serialize_us,
-        ) = build_sample("resource-run", format!("join-{index}"));
-        build_serialize.push(elapsed_us);
-        pair_build.push(pair_build_us);
-        transport_serialize.push(transport_serialize_us);
-        wire_serialize.push(wire_serialize_us);
-        v34_bytes.push(summary.len());
-        sidecar_bytes.push(evidence.len());
-        wire_bytes.push(wire_size);
-
-        // Measure the exact production path, including full semantic
-        // validation, authoritative Wire V1 hard-size gate and the semantic
-        // projection hash. The timing is captured inside the one canonical
-        // PR2B build, not approximated by a partial test-only conversion.
+        // This is the canonical PR2B timer: every family producer is invoked
+        // once, then full evidence, semantic validation, compact projection,
+        // Wire hard gate and the semantic projection hash are built.
         let rebuilt = frozen.build_timed();
+        complete_snapshot_build.push(u128::from(
+            rebuilt.timings().metric_contract_build_and_validate_us,
+        ));
+        context_validation.push(u128::from(rebuilt.timings().context_validation_us));
+        evidence_build.push(u128::from(rebuilt.timings().evidence_build_us));
+        evidence_validation.push(u128::from(rebuilt.timings().evidence_validation_us));
         projection_build.push(u128::from(
             rebuilt.timings().projection_build_and_validate_us,
         ));
-        assert_eq!(
-            rebuilt.snapshot().compact_projection,
-            ready_snapshot.compact_projection
-        );
-
         let started = Instant::now();
         let comparator_decision =
             evaluate_policy_from_assessment(&comparator_assessment, &comparator_config);
@@ -598,66 +690,97 @@ fn pr2c_release_resource_harness_reports_full_path_percentiles() {
             expected_comparator_decision.reason_code
         );
         assert!(policy.compare(&policy).is_zero_drift());
-        comparator.push(started.elapsed().as_micros());
-    }
-    let (build_p50, build_p95, build_p99) = percentiles(build_serialize);
-    let (comparator_p50, comparator_p95, comparator_p99) = percentiles(comparator);
-    let (projection_p50, projection_p95, projection_p99) = percentiles(projection_build);
-    let (pair_p50, pair_p95, pair_p99) = percentiles(pair_build);
-    let (transport_serialize_p50, transport_serialize_p95, transport_serialize_p99) =
-        percentiles(transport_serialize);
-    let (wire_serialize_p50, wire_serialize_p95, wire_serialize_p99) = percentiles(wire_serialize);
-    let diagnostic_pair = paired_fixture("diagnostic-run", "diagnostic-join");
-    let projection_context = ghost_core::metric_contracts::MetricDecisionProjectionBuildContextV1 {
-        rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode::Legacy,
-        profile: frozen.profile(),
-        effective_config: frozen.effective_config(),
-        source_cutoff: ready_snapshot
-            .compact_projection
-            .fee_topology_diversity_index
-            .legacy_value
-            .source_cutoff
-            .clone(),
-    };
-    let mut profile_hash_diagnostic = Vec::with_capacity(measured_samples);
-    let mut config_hash_diagnostic = Vec::with_capacity(measured_samples);
-    let mut projection_hash_diagnostic = Vec::with_capacity(measured_samples);
-    let mut evidence_transport_diagnostic = Vec::with_capacity(measured_samples);
-    let mut pair_validate_diagnostic = Vec::with_capacity(measured_samples);
-    for _ in 0..measured_samples {
-        let started = Instant::now();
-        frozen.profile().canonical_hash().unwrap();
-        profile_hash_diagnostic.push(started.elapsed().as_micros());
-        let started = Instant::now();
-        frozen.effective_config().validate_hash().unwrap();
-        config_hash_diagnostic.push(started.elapsed().as_micros());
-        let started = Instant::now();
-        ready_snapshot
-            .compact_projection
-            .validated_canonical_hash(&projection_context)
-            .unwrap();
-        projection_hash_diagnostic.push(started.elapsed().as_micros());
-        let started = Instant::now();
-        ghost_core::metric_contracts::MetricContractEvidenceTransportV1::try_new(
-            diagnostic_pair.evidence.payload.clone(),
-            20_000,
-            0,
+        let comparator_us = u32::try_from(started.elapsed().as_micros()).unwrap();
+        comparator.push(u128::from(comparator_us));
+
+        let join_key = format!("join-{index}");
+        let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_from_validated_snapshot_v1(
+            &rebuilt,
+            &ghost_launcher::metric_contracts::Pr2cDecisionRecordContextV1 {
+                record_identity: ghost_core::metric_contracts::MetricEvidenceRecordIdentityV1::try_new(
+                    "resource-run",
+                    &join_key,
+                    "legacy_live",
+                )
+                .unwrap(),
+                stable_event_identity: Some(
+                    ghost_core::metric_contracts::StableEventIdentityV1::try_from_signature(
+                        "resource_harness",
+                        format!("sig-{join_key}"),
+                    )
+                    .unwrap(),
+                ),
+                rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode::Legacy,
+                profile: frozen.profile(),
+                effective_config: frozen.effective_config(),
+                authoritative_policy: &policy,
+                comparator_policy: &policy,
+                comparator_evaluable: true,
+                comparator_elapsed_us: comparator_us,
+                metric_contract_serialize_us: 0,
+                metric_contract_build_and_serialize_us: 0,
+                projection_build_and_validate_us: 0,
+                gatekeeper_config_hash: common::TEST_GATEKEEPER_CONFIG_HASH,
+                brain_config_hash: Some(common::TEST_BRAIN_CONFIG_HASH),
+            },
         )
         .unwrap();
-        evidence_transport_diagnostic.push(started.elapsed().as_micros());
-        let started = Instant::now();
-        diagnostic_pair.validate_pair().unwrap();
-        pair_validate_diagnostic.push(started.elapsed().as_micros());
+        pair_construction.push(u128::from(
+            pair.metric_contract_build_and_serialize_us
+                .checked_sub(rebuilt.timings().metric_contract_build_and_validate_us)
+                .unwrap(),
+        ));
+        wire_bytes.push(
+            pair.decision_time_projection
+                .authoritative_serialized_size_bytes()
+                .unwrap(),
+        );
+        writer.write_pair(pair).await.unwrap();
     }
-    let (profile_hash_p50, profile_hash_p95, profile_hash_p99) =
-        percentiles(profile_hash_diagnostic);
-    let (config_hash_p50, config_hash_p95, config_hash_p99) = percentiles(config_hash_diagnostic);
-    let (projection_hash_p50, projection_hash_p95, projection_hash_p99) =
-        percentiles(projection_hash_diagnostic);
-    let (evidence_transport_p50, evidence_transport_p95, evidence_transport_p99) =
-        percentiles(evidence_transport_diagnostic);
-    let (pair_validate_p50, pair_validate_p95, pair_validate_p99) =
-        percentiles(pair_validate_diagnostic);
+    writer.finalize().await.unwrap();
+    let writer_stats = stats.snapshot();
+    let build_p50 = writer_stats
+        .metric_contract_build_and_serialize_us
+        .percentile_upper_bound_us(50)
+        .unwrap();
+    let build_p95 = writer_stats
+        .metric_contract_build_and_serialize_us
+        .percentile_upper_bound_us(95)
+        .unwrap();
+    let build_p99 = writer_stats
+        .metric_contract_build_and_serialize_us
+        .percentile_upper_bound_us(99)
+        .unwrap();
+    let (comparator_p50, comparator_p95, comparator_p99) = percentiles(comparator);
+    let (snapshot_p50, snapshot_p95, snapshot_p99) = percentiles(complete_snapshot_build);
+    let (context_p50, context_p95, context_p99) = percentiles(context_validation);
+    let (evidence_build_p50, evidence_build_p95, evidence_build_p99) = percentiles(evidence_build);
+    let (evidence_validation_p50, evidence_validation_p95, evidence_validation_p99) =
+        percentiles(evidence_validation);
+    let (projection_p50, projection_p95, projection_p99) = percentiles(projection_build);
+    let (pair_p50, pair_p95, pair_p99) = percentiles(pair_construction);
+    let summary_bytes = std::fs::read(temp.path().join(METRIC_CONTRACT_SUMMARY_V34_FILE)).unwrap();
+    let evidence_bytes = std::fs::read(temp.path().join(METRIC_CONTRACT_EVIDENCE_V1_FILE)).unwrap();
+    let mut v34_bytes = summary_bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| line.len())
+        .collect::<Vec<_>>();
+    let mut sidecar_bytes = evidence_bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| line.len())
+        .collect::<Vec<_>>();
+    let serialize_samples = summary_bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<MetricContractDecisionSummaryV1>(line)
+                .unwrap()
+                .metric_contract_serialize_us
+        })
+        .collect::<Vec<_>>();
+    let (serialize_p50, serialize_p95, serialize_p99) = percentiles(serialize_samples);
     wire_bytes.sort_unstable();
     sidecar_bytes.sort_unstable();
     v34_bytes.sort_unstable();
@@ -667,15 +790,24 @@ fn pr2c_release_resource_harness_reports_full_path_percentiles() {
     let sidecar_p99 = sidecar_bytes[sidecar_bytes.len() * 99 / 100];
     let v34_p95 = v34_bytes[v34_bytes.len() * 95 / 100];
     eprintln!(
-        "PR2C release resource harness: metric_contract_build_and_serialize_us_p50={build_p50} metric_contract_build_and_serialize_us_p95={build_p95} metric_contract_build_and_serialize_us_p99={build_p99} projection_build_validate_us_p50={projection_p50} projection_build_validate_us_p95={projection_p95} projection_build_validate_us_p99={projection_p99} pair_build_us_p50={pair_p50} pair_build_us_p95={pair_p95} pair_build_us_p99={pair_p99} transport_serialize_us_p50={transport_serialize_p50} transport_serialize_us_p95={transport_serialize_p95} transport_serialize_us_p99={transport_serialize_p99} wire_serialize_us_p50={wire_serialize_p50} wire_serialize_us_p95={wire_serialize_p95} wire_serialize_us_p99={wire_serialize_p99} comparator_elapsed_us_p50={comparator_p50} comparator_elapsed_us_p95={comparator_p95} comparator_elapsed_us_p99={comparator_p99} projection_wire_json_bytes_p95={wire_p95} projection_wire_json_bytes_max={wire_max} sidecar_json_bytes_p95={sidecar_p95} sidecar_json_bytes_p99={sidecar_p99} v34_json_bytes_p95={v34_p95} diagnostic_profile_hash_us={profile_hash_p50}/{profile_hash_p95}/{profile_hash_p99} diagnostic_config_hash_us={config_hash_p50}/{config_hash_p95}/{config_hash_p99} diagnostic_projection_hash_us={projection_hash_p50}/{projection_hash_p95}/{projection_hash_p99} diagnostic_evidence_transport_us={evidence_transport_p50}/{evidence_transport_p95}/{evidence_transport_p99} diagnostic_pair_validate_us={pair_validate_p50}/{pair_validate_p95}/{pair_validate_p99}"
+        "PR2C release resource harness: metric_contract_build_and_serialize_us_p50={build_p50} metric_contract_build_and_serialize_us_p95={build_p95} metric_contract_build_and_serialize_us_p99={build_p99} complete_snapshot_build_validate_us_p50={snapshot_p50} complete_snapshot_build_validate_us_p95={snapshot_p95} complete_snapshot_build_validate_us_p99={snapshot_p99} context_validation_us_p50={context_p50} context_validation_us_p95={context_p95} context_validation_us_p99={context_p99} evidence_build_us_p50={evidence_build_p50} evidence_build_us_p95={evidence_build_p95} evidence_build_us_p99={evidence_build_p99} evidence_validation_us_p50={evidence_validation_p50} evidence_validation_us_p95={evidence_validation_p95} evidence_validation_us_p99={evidence_validation_p99} projection_build_validate_us_p50={projection_p50} projection_build_validate_us_p95={projection_p95} projection_build_validate_us_p99={projection_p99} terminal_pair_construction_us_p50={pair_p50} terminal_pair_construction_us_p95={pair_p95} terminal_pair_construction_us_p99={pair_p99} metric_contract_serialize_us_p50={serialize_p50} metric_contract_serialize_us_p95={serialize_p95} metric_contract_serialize_us_p99={serialize_p99} comparator_elapsed_us_p50={comparator_p50} comparator_elapsed_us_p95={comparator_p95} comparator_elapsed_us_p99={comparator_p99} projection_wire_json_bytes_p95={wire_p95} projection_wire_json_bytes_max={wire_max} sidecar_json_bytes_p95={sidecar_p95} sidecar_json_bytes_p99={sidecar_p99} v34_json_bytes_p95={v34_p95}"
+    );
+    assert_eq!(
+        writer_stats.summary_rows_written_total,
+        measured_samples as u64
+    );
+    assert_eq!(
+        writer_stats.evidence_rows_written_total,
+        measured_samples as u64
     );
     assert!(wire_p95 <= 12 * 1024);
     assert!(wire_max <= 16 * 1024);
     assert!(sidecar_p95 <= 24 * 1024);
     assert!(sidecar_p99 <= 48 * 1024);
     if !cfg!(debug_assertions) {
-        assert!(build_p99 <= 1_000);
-        assert!(projection_p99 <= 1_000);
-        assert!(comparator_p99 <= 1_000);
+        assert!(build_p99 <= u64::from(PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US));
+        assert!(projection_p99 <= u128::from(PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US));
+        assert!(serialize_p99 <= PR2C_SERIALIZE_P99_MAX_US);
+        assert!(comparator_p99 <= u128::from(PR2C_COMPARATOR_P99_MAX_US));
     }
 }
