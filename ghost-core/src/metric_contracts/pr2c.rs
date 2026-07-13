@@ -18,9 +18,13 @@ pub const PR2C_COMPARATOR_P99_MAX_US: u32 = 1_000;
 pub const PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US: u32 = 5_000;
 pub const PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US: u32 = 5_000;
 pub const PR2C_LOGGER_ENQUEUE_WAIT_P99_MAX_US: u32 = 1_000;
-pub const BURN_IN_CONTRACT_VERSION_V2: u16 = 2;
-pub const BURN_IN_CONTRACT_V2_CANONICAL_HASH: &str =
-    "3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20";
+pub const METRIC_CONTRACT_LATENCY_HISTOGRAM_CODEBOOK_VERSION_V2: u16 = 2;
+pub const METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V2: [u32; 18] = [
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_000, 2_000, 2_500, 3_000, 3_500, 4_000, 4_500, 5_000,
+];
+pub const BURN_IN_CONTRACT_VERSION_V3: u16 = 3;
+pub const BURN_IN_CONTRACT_V3_CANONICAL_HASH: &str =
+    "fe363f6730ac8ce554b79f0044de90eba1d9583e4e701ccf84071c0d3e352e57";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -411,6 +415,8 @@ pub enum MetricContractCutoverScopeV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BurnInResourceLimitsV1 {
+    pub latency_histogram_codebook_version: u16,
+    pub latency_histogram_bucket_upper_bounds_us: Vec<u32>,
     pub comparator_p99_us: u32,
     pub metric_contract_build_and_serialize_p99_us: u32,
     pub projection_build_and_validate_p99_us: u32,
@@ -463,15 +469,15 @@ pub struct BurnInContractV1 {
 pub enum BurnInContractErrorV1 {
     #[error(transparent)]
     Hash(#[from] super::CanonicalHashErrorV1),
-    #[error("BURN_IN_CONTRACT_V2 canonical hash mismatch")]
+    #[error("BURN_IN_CONTRACT_V3 canonical hash mismatch")]
     HashMismatch,
-    #[error("BURN_IN_CONTRACT_V2 contains an invalid frozen gate")]
+    #[error("BURN_IN_CONTRACT_V3 contains an invalid frozen gate")]
     InvalidGate,
 }
 
 impl BurnInContractV1 {
     pub fn try_new(payload: BurnInContractPayloadV1) -> Result<Self, BurnInContractErrorV1> {
-        if payload.burn_in_contract_version != BURN_IN_CONTRACT_VERSION_V2
+        if payload.burn_in_contract_version != BURN_IN_CONTRACT_VERSION_V3
             || payload.minimum_non_overlapping_runs < 3
             || payload.minimum_run_duration_ms < 3_600_000
             || payload.minimum_utc_4h_buckets < 2
@@ -486,6 +492,12 @@ impl BurnInContractV1 {
             || payload.decision_schema_version != super::METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34
             || payload.wire_schema_manifest_blake3
                 != METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3
+            || payload.resource_limits.latency_histogram_codebook_version
+                != METRIC_CONTRACT_LATENCY_HISTOGRAM_CODEBOOK_VERSION_V2
+            || payload
+                .resource_limits
+                .latency_histogram_bucket_upper_bounds_us
+                != METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V2
             || payload.resource_limits.comparator_p99_us != PR2C_COMPARATOR_P99_MAX_US
             || payload
                 .resource_limits
@@ -511,7 +523,7 @@ impl BurnInContractV1 {
             return Err(BurnInContractErrorV1::InvalidGate);
         }
         let contract_canonical_hash = CanonicalHashV1::digest(&payload)?;
-        if contract_canonical_hash.as_str() != BURN_IN_CONTRACT_V2_CANONICAL_HASH {
+        if contract_canonical_hash.as_str() != BURN_IN_CONTRACT_V3_CANONICAL_HASH {
             return Err(BurnInContractErrorV1::InvalidGate);
         }
         Ok(Self {

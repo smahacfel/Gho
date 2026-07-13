@@ -1,10 +1,15 @@
 # ADR-8D: PR2C — durable equivalence replay i integralność resource/BURN
 
-Status: `IMPLEMENTED / FULL VALIDATION PASS / READY FOR RE-REVIEW`
+Status: `IMPLEMENTED / SUPERSEDED BEFORE BURN-IN BY THIRD REVIEW AMENDMENT`
 
 Typ: ADR-8D / second review amendment / durability / replay / resource metrology
 
 Data: 2026-07-13
+
+Supersession: finite p99 codebook, canonical pre-pair routing i produkcyjny
+DecisionLogger release path są normatywnie opisane w
+`ADR_8D_PR2C_RUNTIME_ROUTING_PRODUCTION_RESOURCE_P99_20260713.md`. Żaden
+prospective row nie został związany z opisanym niżej `BURN_IN_CONTRACT_V2`.
 
 Repo: `smahacfel/Gho`
 
@@ -214,10 +219,11 @@ histogramu, ale nie mylą debugowej szybkości współdzielonego runnera z
 acceptance. Jedynym dowodem wydajności pozostaje osobny release harness, który
 nie normalizuje telemetryki i mierzy realny ciągły zegar.
 
-Pełny histogram jest konserwatywny: overflow bucket powyżej 2 ms zwraca
-observed `max_us` dla p50/p95/p99. Wynik `3 545 us` nadal pozostaje poniżej
-frozen limitu `5 000 us`. Standalone serialization jest diagnostyką; jej koszt
-wchodzi do tego samego ciągłego full-path gate.
+Poniższy historyczny V2 histogram miał overflow bucket powyżej 2 ms i zwracał
+observed `max_us` dla p50/p95/p99. Trzecie review odrzuciło tę reprezentację
+jako implementację semantyki p99 przy gate 5 ms oraz direct-writer harness jako
+dowód ścieżki produkcyjnej. Wynik `3 545 us` nie jest używany przez bieżący
+V3 acceptance. Standalone serialization pozostaje diagnostyką podetapu.
 
 Pełne suites PR2A/PR2B/PR2C, frozen Gatekeeper/lifecycle matrix, replay v1,
 checks, targeted Clippy, formatting oraz diff checks przeszły. Markery

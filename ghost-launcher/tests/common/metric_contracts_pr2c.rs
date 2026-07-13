@@ -10,7 +10,8 @@ use ghost_core::checkpoint::{
 };
 use ghost_core::metric_contracts::*;
 use ghost_launcher::components::gatekeeper::{
-    GatekeeperBuffer, GatekeeperDevPrimaryCompatibilitySnapshotV1, GatekeeperVerdict,
+    GatekeeperAssessment, GatekeeperBuffer, GatekeeperDevPrimaryCompatibilitySnapshotV1,
+    GatekeeperVerdict,
 };
 use ghost_launcher::components::gatekeeper_policy::{
     build_assessment_from_features, PolicyEvaluationContext,
@@ -55,6 +56,12 @@ pub struct Pr2cFrozenInputsFixture {
     effective: ResolvedMetricContractEffectiveConfigV1,
     static_context: MetricDecisionProjectionValidatedStaticContextV1,
     source_cutoff: MetricContractDecisionSourceCutoffV1,
+}
+
+pub struct CurrentV33UnroutedFixture {
+    pub log: ghost_brain::oracle::GatekeeperBuyLog,
+    pub assessment: GatekeeperAssessment,
+    pub config: GatekeeperV2Config,
 }
 
 impl Pr2cFrozenInputsFixture {
@@ -663,15 +670,18 @@ pub fn mfs_with_projection(pair: &MetricContractPairedRecordV1) -> MaterializedF
     }
 }
 
-pub fn current_v33_log(
-    pair: &MetricContractPairedRecordV1,
-) -> ghost_brain::oracle::GatekeeperBuyLog {
+pub fn current_v33_unrouted_fixture(
+    projection: &MetricContractDecisionEvidenceProjectionV1,
+) -> CurrentV33UnroutedFixture {
     // A current v33 decision row normally carries the same bounded decision
     // series both in its top-level replay vectors and in the materialized MFS
     // snapshot. Populate the configured 128-sample bound instead of using an
     // arbitrary padding field as the storage denominator.
     const SAMPLE_COUNT: usize = 128;
-    let mut features = mfs_with_projection(pair);
+    let mut features = MaterializedFeatureSet {
+        metric_contract_decision_projection_v1: Some(projection.clone()),
+        ..MaterializedFeatureSet::default()
+    };
     let ts_offsets_ms = (0..SAMPLE_COUNT)
         .map(|index| i64::try_from(index).unwrap() * 79)
         .collect::<Vec<_>>();
@@ -734,12 +744,6 @@ pub fn current_v33_log(
     log.decision_eval_snapshots = temporal_assessment
         .to_buy_log(&solana_sdk::pubkey::Pubkey::new_unique(), &config)
         .decision_eval_snapshots;
-    let identity = pair.record_identity();
-    log.run_id = Some(identity.run_id.clone());
-    log.join_key = Some(identity.join_key.clone());
-    log.decision_plane = Some(identity.decision_plane.clone());
-    log.config_hash = Some(pair.gatekeeper_config_hash.clone());
-    log.brain_config_hash = pair.brain_config_hash.clone();
     let v3_config = GatekeeperV3Config {
         shadow_emit_enabled: true,
         replay_payload_enabled: true,
@@ -811,5 +815,28 @@ pub fn current_v33_log(
     ));
     log.materialized_feature_snapshot = Some(snapshot.clone());
     log.v3_materialized_feature_snapshot = Some(snapshot);
+    CurrentV33UnroutedFixture {
+        log,
+        assessment,
+        config,
+    }
+}
+
+pub fn current_v33_unrouted_log(
+    pair: &MetricContractPairedRecordV1,
+) -> ghost_brain::oracle::GatekeeperBuyLog {
+    current_v33_unrouted_fixture(&pair.decision_time_projection).log
+}
+
+pub fn current_v33_log(
+    pair: &MetricContractPairedRecordV1,
+) -> ghost_brain::oracle::GatekeeperBuyLog {
+    let mut log = current_v33_unrouted_log(pair);
+    let identity = pair.record_identity();
+    log.run_id = Some(identity.run_id.clone());
+    log.join_key = Some(identity.join_key.clone());
+    log.decision_plane = Some(identity.decision_plane.clone());
+    log.config_hash = Some(pair.gatekeeper_config_hash.clone());
+    log.brain_config_hash = pair.brain_config_hash.clone();
     log
 }

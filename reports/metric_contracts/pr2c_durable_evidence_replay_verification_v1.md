@@ -1,6 +1,6 @@
 # PR2C durable metric-contract evidence, replay i audit — raport weryfikacyjny
 
-Status: `SECOND REVIEW AMENDMENT / FULL VALIDATION PASS / READY FOR RE-REVIEW`
+Status: `THIRD REVIEW AMENDMENT / IMPLEMENTED / FULL VALIDATION IN PROGRESS`
 
 Data: 2026-07-13
 
@@ -13,8 +13,9 @@ base: fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9
 merge-base: fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9
 first reviewed head: fe9e51cc7ef21f235e9edf912ad2b0a3cc75073e
 second reviewed head: 20c2a509ca624cf9074e0867cbcb86014a54afdf
+third reviewed head: 261964d751c4356d14f6ad06df6e729524597bba
 publication head: amendment commit containing this report; authoritative SHA is the PR head
-amendment commit message: metric-contracts: close remaining PR2C replay and resource gaps
+amendment commit message: metric-contracts: close PR2C runtime routing and resource gaps
 ```
 
 SHA commita nie może być wpisany do payloadu tego samego commita bez
@@ -42,6 +43,8 @@ macierzy. Normatywne decyzje amendmentu dokumentuje:
 ```text
 docs/ADR/ADR_8D_PR2C_REVIEW_BLOCKERS_DURABILITY_AUDIT_20260713.md
 docs/ADR/ADR_8D_PR2C_SECOND_REVIEW_DURABLE_EQUIVALENCE_RESOURCE_INTEGRITY_20260713.md
+docs/ADR/ADR_8D_PR2C_RUNTIME_ROUTING_PRODUCTION_RESOURCE_P99_20260713.md
+docs/ADR/ADR_8D_PR2C_RUNTIME_ROUTING_PRODUCTION_RESOURCE_P99_20260713.md
 ```
 
 ## 2. Dokładna allowlista plików całego PR względem base
@@ -85,6 +88,7 @@ ghost-launcher/tests/metric_contracts_pr2c_durability.rs
 ghost-launcher/tests/metric_contracts_pr2c_replay.rs
 ghost-launcher/tests/refactor_invariants_tests.rs
 reports/metric_contracts/BURN_IN_CONTRACT_V2.json
+reports/metric_contracts/BURN_IN_CONTRACT_V3.json
 reports/metric_contracts/historical_feasibility_post_pr2c_v1.md
 reports/metric_contracts/metric_contract_wire_v1_schema_manifest.json
 reports/metric_contracts/pr2c_durable_evidence_replay_verification_v1.md
@@ -118,6 +122,19 @@ Nie użyto `git add .`.
 Drugie review domknęło dodatkowo durable equivalence snapshots, closed
 histogram validation, typed `cutover_scope`, jednoznaczne BURN V2 versioning i
 zgodność plan/kod dla UTC bucketów oraz cross-run `brain_config_hash`.
+
+Trzecie review ujawniło trzy integracyjne luki pozostające poza wcześniejszymi
+fixture'ami:
+
+| ID | Poprawka | Dowód regresyjny |
+| --- | --- | --- |
+| T-01 | `DecisionLogger` wykonuje canonical routing raz przed pair builderem; typed context zasila pair, a exact routed rows zasila v33 | real `assessment.to_buy_log()` z routing `None` → logger route → v33+pair → finalized manifest → single-run audit |
+| T-02 | release harness używa realnego `DecisionLogger`, bounded queue i production ordering v33 → pair | 200 release samples od first producer call do writer final bytes odczytanych z finalized manifestu |
+| T-03 | histogram ma finite bounds przez `5_000 us`; p99 nie jest overflow max | `999 × 3_000 us + 1 × 20_000 us` daje p99 `3_000 us`, max `20_000 us` |
+
+Zmiana frozen histogram codebooku jest wersjonowana jako
+`BURN_IN_CONTRACT_V3`; V2 pozostaje superseded pre-run artifactem. Żaden
+prospective row nie został utworzony pod V1 ani V2.
 
 Nowy workflow GitHub Actions uruchamia pełną Rust matrix oraz osobny release
 resource job; correctness job instaluje jawnie wymagany przez static guards
@@ -213,6 +230,14 @@ histogram ma frozen bounds, checked bucket sum, `sample_count ==
 paired_commands_total` i spójne `max_us`/overflow; zmanipulowana lub brakująca
 próbka nie może przejść resource gate.
 
+Przed pair construction `DecisionLogger::route_gatekeeper_buy_decision()`
+wykonuje istniejące plane expansion oraz hydration dokładnie raz. Prywatny
+`RoutedGatekeeperDecisionV1` udostępnia immutable legacy-live
+`Pr2cRoutedDecisionContextV1` i read-only plane rows. Pair builder przyjmuje ten
+typed context zamiast niezhydratowanego `GatekeeperBuyLog`; dokładnie ten sam
+routed object trafia potem jako v33 command przed paired commandem. Graceful
+shutdown potwierdza `oneshot` dopiero po finalizacji i sync manifestu.
+
 Regresje obejmują:
 
 - normalny pair i 128 rzeczywistych enqueue przez `DecisionLogger`;
@@ -237,8 +262,10 @@ record identity = (run_id, join_key, decision_plane)
 stable event identity = pool creation transaction source signature, when present
 ```
 
-Runtime bierze `decision_plane` z exact `buy_log.decision_plane`; nie używa
-hardcoded `legacy_live`.
+Runtime nie bierze `decision_plane` z surowego `buy_log`. Wybiera exact
+`legacy_live` row dopiero z canonical routed outputu `DecisionLogger`, z tego
+samego obiektu, który zasila durable v33. Nie wpisuje plane przed expansion i
+nie używa osobnego hardcoded identity w pair builderze.
 
 Ten sam join key w różnych runach nie jest duplicate. Ta sama stable source
 signature w niepokrywających się runach jest osobnym collision failure. Brak
@@ -289,7 +316,7 @@ Dev-primary i corrected FTDI lanes wymagają Value/Value. Null po którejkolwiek
 stronie jest `NotEvaluable`; rzeczywista różnica emituje
 `COUNTERFACTUAL_POLICY_DELTA_OBSERVED:<lane>:<identity>`.
 
-## 10. Single-run, bundle i BURN_IN_CONTRACT_V2
+## 10. Single-run, bundle i BURN_IN_CONTRACT_V3
 
 CLI terminal classes:
 
@@ -304,10 +331,11 @@ FAIL_RESOURCE_BUDGET
 Bundle agreguje minima dopiero po per-run PASS. Obowiązujący frozen contract:
 
 ```text
-burn_in_contract_version: 2
-owner approval identity: github:smahacfel:authorized-pr2c-5ms-amendment:2026-07-13
-frozen_at: 2026-07-13T17:53:14Z
-canonical SHA-256: 3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20
+burn_in_contract_version: 3
+latency_histogram_codebook_version: 2
+owner approval identity: github:smahacfel:authorized-pr2c-5ms-p99-codebook-amendment:2026-07-13
+frozen_at: 2026-07-13T21:30:25Z
+canonical SHA-256: fe363f6730ac8ce554b79f0044de90eba1d9583e4e701ccf84071c0d3e352e57
 ```
 
 Rows niepóźniejsze niż `frozen_at` nie są prospective validation evidence.
@@ -315,9 +343,10 @@ Zmiana któregokolwiek gate’u wymaga nowego contract version/hash/freeze i nie
 może retroaktywnie zaliczyć rows starego contractu.
 
 Wcześniejszy payload V1 z limitem 1 ms był pre-run draftem i nigdy nie
-identyfikował prospective runu. Został wycofany, a autoryzowana zmiana limitów
-pełnego build+serialize i projection z 1 ms do 5 ms jest jawnie wersjonowana
-jako V2.
+identyfikował prospective runu. V2 jawnie wersjonował zmianę limitów pełnego
+build+serialize i projection z 1 ms do 5 ms. Po wykryciu, że jego histogram
+kończył finite bounds na 2 ms, V3 przed pierwszym prospective row zamroził
+finite bucket `5_000 us`. Żaden V1/V2 row nie kwalifikuje się do V3.
 
 Każdy finalized part manifest niesie exact BURN version/hash oraz Wire codebook
 hash. Bundle wymaga unikalnych run IDs, globalnie unikalnych full identities,
@@ -330,15 +359,16 @@ real dev divergence dwóch obecnych wartości.
 Normatywny release harness mierzy jedną spójną production path:
 
 ```text
-full evidence
-→ projection build
-→ wszystkie family/root semantic validations
-→ Wire V1 hard-size gate
-→ canonical semantic hash
-→ v34 + evidence pair
+first canonical producer call
+→ full evidence i projection build/validation/hash
 → real frozen policy comparator
+→ DecisionLogger canonical routing
+→ bounded queue: routed v33 command
+→ bounded queue: paired command
+→ exact v33 plane write
 → writer-owned timestamp/part binding
 → exact final v34 + evidence JSON bytes
+→ histogram sample w finalized manifest
 ```
 
 Komenda:
@@ -350,31 +380,12 @@ cargo test --release -p ghost-launcher \
   -- --exact --nocapture
 ```
 
-Release harness wykonał 16 warmup i 200 mierzonych iteracji dokładnej ścieżki
-produkcyjnej. Wynik:
-
-| Metryka | p50 | p95 | p99 |
-| --- | ---: | ---: | ---: |
-| `metric_contract_build_and_serialize_us` | 3 545 us | 3 545 us | 3 545 us |
-| complete snapshot build+validate | 1 558 us | 1 963 us | 2 267 us |
-| context validation | 0 us | 0 us | 0 us |
-| evidence build | 25 us | 42 us | 51 us |
-| evidence validation | 4 us | 5 us | 7 us |
-| projection build+validate+hash | 476 us | 669 us | 733 us |
-| terminal pair construction | 373 us | 509 us | 630 us |
-| final summary+evidence serialization | 43 us | 67 us | 79 us |
-| comparator | 5 us | 8 us | 21 us |
-
-Rozmiary tego samego finalnego payloadu: Wire V1 p95/max `2 339 B`, sidecar
-p95/p99 `22 180 B`, v34 p95 `1 176 B`. Pełny p99/max `3 545 us` i projection
-p99 `733 us` przechodzą autoryzowany gate `5 000 us`; comparator pozostaje
-poniżej `1 000 us`. `metric_contract_serialize_us` pozostaje trwałą diagnostyką
-podetapu (`79 us` p99); acceptance obejmuje go w jednym ciągłym full-path gate,
-bez nakładania drugiego progu na ten sam koszt.
-
-Frozen histogram ma konserwatywny overflow bucket powyżej `2 000 us`, dlatego
-dla pełnej ścieżki p50/p95/p99 raportują zaobserwowane `max_us=3 545` zamiast
-zaniżać percentyle. Jest to fail-closed wobec limitu `5 000 us`.
+Harness wykonuje 16 warmup i 200 mierzonych iteracji w release. Nie dopisuje
+sztucznego enqueue sample i nie wywołuje paired writera bezpośrednio. P99 jest
+odczytywane z V3 finalized manifestu, którego finite codebook zawiera bucket
+`5_000 us`; rzadki overflow zachowuje osobne `max_us` i nie zmienia p99 w
+hard-max. Wyniki liczbowe zostaną wpisane po czystym, committed release runie.
+Historyczny wynik V2 `3 545 us` nie jest używany jako aktualny acceptance proof.
 
 Audit używa exact paired v33 rows. Addytywny storage ratio wynosi
 `(v34 + sidecar) / v33`; nie odejmuje `1.0` i nie przyjmuje padded/unknown v33.
@@ -391,6 +402,10 @@ Historyczne v33 nie ma paired artifacts, exact effective-config ani stable
 identity i jest `NOT_EVALUABLE`; contribution do prospective counts wynosi 0.
 
 ## 13. Pełna macierz testów
+
+Poniższa tabela jest wynikiem poprzedniego heada i zostanie zastąpiona
+wynikami trzeciego amendmentu po czystym commicie. Nie stanowi jeszcze dowodu
+V3 readiness.
 
 | Komenda | Wynik |
 | --- | --- |
@@ -478,15 +493,15 @@ failing test po linii 6537. PR2C nie zmienia selector score ani tego testu.
 
 ## 16. Markery końcowe
 
-Wszystkie blockery B-01…B-07 i problemy major M-01…M-08 zostały zamknięte,
-pełna macierz oraz release resource harness przeszły. PR pozostaje draftem do
-ponownego review; rollout nadal jest `Legacy`.
+Trzeci amendment jest zaimplementowany, lecz markery E2E/resource/readiness są
+wycofane do czasu przejścia czystego terminalnego E2E, produkcyjnego release
+harnessu i pełnej macierzy. PR pozostaje draftem; rollout nadal jest `Legacy`.
 
 ```text
 METRIC_CONTRACT_WIRE_V1_CODEBOOK_MANIFEST_FROZEN
 PR2C_V34_COMPACT_SUMMARY_PASS
-PR2C_PAIRED_FULL_EVIDENCE_SIDECAR_PASS
-PR2C_RECORD_IDENTITY_AND_STABLE_EVENT_CONTRACT_PASS
+PR2C_PAIRED_FULL_EVIDENCE_SIDECAR_VALIDATION_PENDING
+PR2C_RECORD_IDENTITY_AND_STABLE_EVENT_CONTRACT_VALIDATION_PENDING
 PR2C_ROTATION_MANIFEST_SHA_PASS
 PR2C_REPLAY_V1_COMPATIBILITY_PASS
 PR2C_REPLAY_V2_PROJECTION_FULL_EQUALITY_PASS
@@ -494,11 +509,10 @@ PR2C_EQUIVALENCE_COMPARATOR_ZERO_DRIFT_PASS
 PR2C_COUNTERFACTUAL_DIAGNOSTIC_PASS
 PR2C_SINGLE_RUN_AUDIT_PASS
 PR2C_BUNDLE_AUDIT_PASS
-PR2C_RESOURCE_GATES_PASS
-BURN_IN_CONTRACT_V2_FROZEN
+PR2C_RESOURCE_GATES_VALIDATION_PENDING
+BURN_IN_CONTRACT_V3_VALIDATION_PENDING
 GATEKEEPER_POLICY_UNCHANGED
 V3_V1_REPLAY_UNCHANGED
 TYPE5_NOT_STARTED
-METRIC_CONTRACTS_V1_1_DUAL_COMPUTE_READY_FOR_PROSPECTIVE_BURN_IN
-PR2C_READY_FOR_REVIEW
+PR2C_THIRD_REVIEW_VALIDATION_PENDING
 ```

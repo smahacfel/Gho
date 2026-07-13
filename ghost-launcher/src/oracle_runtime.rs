@@ -1178,7 +1178,7 @@ fn current_time_ns() -> u128 {
 
 fn spawn_gatekeeper_decision_logs(
     ctx: &Arc<PoolObservationContext>,
-    buy_log: ghost_brain::oracle::GatekeeperBuyLog,
+    routed_buy_log: ghost_brain::oracle::RoutedGatekeeperDecisionV1,
     coordination_snapshot: FrozenCoordinationDecisionSnapshot,
     metric_contract_pair: Option<ghost_core::metric_contracts::MetricContractPairedRecordV1>,
 ) {
@@ -1188,7 +1188,7 @@ fn spawn_gatekeeper_decision_logs(
     );
     let dl = ctx.decision_logger.clone();
     tokio::spawn(async move {
-        dl.log_gatekeeper_buy_decision(buy_log).await;
+        dl.log_routed_gatekeeper_buy_decision(routed_buy_log).await;
         if let Some(metric_contract_pair) = metric_contract_pair {
             if let Err(error) = dl.log_metric_contract_pair(metric_contract_pair).await {
                 error!("PR2C paired metric-contract enqueue failed closed: {error}");
@@ -1207,10 +1207,10 @@ enum Pr2cTerminalSnapshotErrorV1 {
     MissingEffectiveConfig,
     #[error("terminal MFS projection does not match the consumed full-evidence snapshot")]
     DecisionSnapshotMismatch,
-    #[error("terminal decision identity field {0} is missing")]
-    MissingRecordIdentity(&'static str),
     #[error("terminal decision comparator duration exceeds u32")]
     ComparatorDurationOverflow,
+    #[error(transparent)]
+    Routing(#[from] ghost_brain::oracle::Pr2cRoutingContextErrorV1),
     #[error(transparent)]
     Identity(#[from] ghost_core::metric_contracts::MetricIdentityErrorV1),
     #[error(transparent)]
@@ -1222,7 +1222,7 @@ enum Pr2cTerminalSnapshotErrorV1 {
 fn build_pr2c_terminal_pair(
     session: &SharedSession,
     assessment: &GatekeeperAssessment,
-    buy_log: &ghost_brain::oracle::GatekeeperBuyLog,
+    routed_context: &ghost_brain::oracle::Pr2cRoutedDecisionContextV1,
     gatekeeper_config: &GatekeeperV2Config,
 ) -> Result<ghost_core::metric_contracts::MetricContractPairedRecordV1, Pr2cTerminalSnapshotErrorV1>
 {
@@ -1247,21 +1247,6 @@ fn build_pr2c_terminal_pair(
     {
         return Err(Pr2cTerminalSnapshotErrorV1::DecisionSnapshotMismatch);
     }
-    let record_identity = ghost_core::metric_contracts::MetricEvidenceRecordIdentityV1::try_new(
-        buy_log
-            .run_id
-            .clone()
-            .ok_or(Pr2cTerminalSnapshotErrorV1::MissingRecordIdentity("run_id"))?,
-        buy_log
-            .join_key
-            .clone()
-            .ok_or(Pr2cTerminalSnapshotErrorV1::MissingRecordIdentity(
-                "join_key",
-            ))?,
-        buy_log.decision_plane.clone().ok_or(
-            Pr2cTerminalSnapshotErrorV1::MissingRecordIdentity("decision_plane"),
-        )?,
-    )?;
     let policy = crate::metric_contracts::pr2c_policy_equivalence_snapshot_v1(
         assessment,
         assessment.decision.as_ref(),
@@ -1279,9 +1264,6 @@ fn build_pr2c_terminal_pair(
     let comparator_elapsed_us = u32::try_from(comparator_started.elapsed().as_micros())
         .map_err(|_| Pr2cTerminalSnapshotErrorV1::ComparatorDurationOverflow)?;
     let profile = ghost_core::metric_contracts::MetricContractProfileV1::profile_a()?;
-    let gatekeeper_config_hash = buy_log.config_hash.as_deref().ok_or(
-        Pr2cTerminalSnapshotErrorV1::MissingRecordIdentity("gatekeeper config hash"),
-    )?;
     let stable_event_identity = stable_event_signature
         .map(|signature| {
             ghost_core::metric_contracts::StableEventIdentityV1::try_from_signature(
@@ -1294,7 +1276,7 @@ fn build_pr2c_terminal_pair(
         crate::metric_contracts::build_pr2c_timed_paired_record_from_validated_snapshot_v1(
             &timed_snapshot,
             &crate::metric_contracts::Pr2cDecisionRecordContextV1 {
-                record_identity,
+                record_identity: routed_context.record_identity().clone(),
                 stable_event_identity,
                 rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode::Legacy,
                 profile: &profile,
@@ -1306,11 +1288,39 @@ fn build_pr2c_terminal_pair(
                 metric_contract_serialize_us: 0,
                 metric_contract_build_and_serialize_us: 0,
                 projection_build_and_validate_us: 0,
-                gatekeeper_config_hash,
-                brain_config_hash: buy_log.brain_config_hash.as_deref(),
+                gatekeeper_config_hash: routed_context.gatekeeper_config_hash().as_str(),
+                brain_config_hash: Some(routed_context.brain_config_hash().as_str()),
             },
         )?;
     Ok(paired)
+}
+
+fn route_gatekeeper_decision_and_build_pr2c_pair(
+    ctx: &PoolObservationContext,
+    session: &SharedSession,
+    assessment: &GatekeeperAssessment,
+    buy_log: ghost_brain::oracle::GatekeeperBuyLog,
+) -> (
+    ghost_brain::oracle::RoutedGatekeeperDecisionV1,
+    Option<ghost_core::metric_contracts::MetricContractPairedRecordV1>,
+) {
+    // DecisionLogger owns plane expansion and routing provenance. Route once,
+    // derive the PR2C identity from the routed legacy-live row, and enqueue
+    // these exact same routed rows after the pair has been constructed.
+    let routed_buy_log = ctx.decision_logger.route_gatekeeper_buy_decision(buy_log);
+    let metric_contract_pair = routed_buy_log
+        .pr2c_legacy_live_context()
+        .map_err(Pr2cTerminalSnapshotErrorV1::from)
+        .and_then(|routed_context| {
+            build_pr2c_terminal_pair(session, assessment, &routed_context, &ctx.gatekeeper_config)
+        })
+        .map_err(|error| {
+            ::metrics::counter!("metric_contract_pair_build_failures_total", 1);
+            error!("PR2C terminal pair build failed closed: {error}");
+        })
+        .ok();
+
+    (routed_buy_log, metric_contract_pair)
 }
 
 fn freeze_coordination_decision_snapshot_for_runtime(
@@ -24041,20 +24051,16 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                let metric_contract_pair = build_pr2c_terminal_pair(
-                    &session,
-                    &assessment,
-                    &buy_log,
-                    &ctx.gatekeeper_config,
-                )
-                .map_err(|error| {
-                    ::metrics::counter!("metric_contract_pair_build_failures_total", 1);
-                    error!("PR2C terminal pair build failed closed: {error}");
-                })
-                .ok();
+                let (routed_buy_log, metric_contract_pair) =
+                    route_gatekeeper_decision_and_build_pr2c_pair(
+                        ctx.as_ref(),
+                        &session,
+                        &assessment,
+                        buy_log,
+                    );
                 spawn_gatekeeper_decision_logs(
                     &ctx,
-                    buy_log,
+                    routed_buy_log,
                     coordination_snapshot,
                     metric_contract_pair,
                 );
@@ -24175,20 +24181,16 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                let metric_contract_pair = build_pr2c_terminal_pair(
-                    &session,
-                    &assessment,
-                    &buy_log,
-                    &ctx.gatekeeper_config,
-                )
-                .map_err(|error| {
-                    ::metrics::counter!("metric_contract_pair_build_failures_total", 1);
-                    error!("PR2C terminal pair build failed closed: {error}");
-                })
-                .ok();
+                let (routed_buy_log, metric_contract_pair) =
+                    route_gatekeeper_decision_and_build_pr2c_pair(
+                        ctx.as_ref(),
+                        &session,
+                        &assessment,
+                        buy_log,
+                    );
                 spawn_gatekeeper_decision_logs(
                     &ctx,
-                    buy_log,
+                    routed_buy_log,
                     coordination_snapshot,
                     metric_contract_pair,
                 );
@@ -24387,20 +24389,16 @@ async fn pool_observation_task(
                                 base_mint_pubkey,
                             )
                             .await;
-                        let metric_contract_pair = build_pr2c_terminal_pair(
-                            &session,
-                            &assessment,
-                            &buy_log,
-                            &ctx.gatekeeper_config,
-                        )
-                        .map_err(|error| {
-                            ::metrics::counter!("metric_contract_pair_build_failures_total", 1);
-                            error!("PR2C terminal pair build failed closed: {error}");
-                        })
-                        .ok();
+                        let (routed_buy_log, metric_contract_pair) =
+                            route_gatekeeper_decision_and_build_pr2c_pair(
+                                ctx.as_ref(),
+                                &session,
+                                &assessment,
+                                buy_log,
+                            );
                         spawn_gatekeeper_decision_logs(
                             &ctx,
-                            buy_log,
+                            routed_buy_log,
                             coordination_snapshot,
                             metric_contract_pair,
                         );
@@ -24620,20 +24618,16 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                let metric_contract_pair = build_pr2c_terminal_pair(
-                    &session,
-                    &assessment,
-                    &buy_log,
-                    &ctx.gatekeeper_config,
-                )
-                .map_err(|error| {
-                    ::metrics::counter!("metric_contract_pair_build_failures_total", 1);
-                    error!("PR2C terminal pair build failed closed: {error}");
-                })
-                .ok();
+                let (routed_buy_log, metric_contract_pair) =
+                    route_gatekeeper_decision_and_build_pr2c_pair(
+                        ctx.as_ref(),
+                        &session,
+                        &assessment,
+                        buy_log,
+                    );
                 spawn_gatekeeper_decision_logs(
                     &ctx,
-                    buy_log,
+                    routed_buy_log,
                     coordination_snapshot,
                     metric_contract_pair,
                 );

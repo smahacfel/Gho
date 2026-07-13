@@ -126,7 +126,7 @@ jobs:
         with:
           shared-key: pr2c-release-portable-x86-64-v1
 
-      - name: Full frozen-input to final-byte release harness
+      - name: Full production DecisionLogger path to final-byte release harness
         run: |
           exact_test_count=$(cargo test --release -p ghost-launcher \
             --test metric_contracts_pr2c_durability \

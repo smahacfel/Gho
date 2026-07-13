@@ -883,6 +883,15 @@ Decision summary i sidecar row są przekazywane jednym logicznym commandem do
 bounded queue. Zapis do dwóch plików nie jest udawany jako atomowy; orphan/missing
 pair dyskwalifikuje run. Send/writer/ENOSPC/missing-pair mają osobne liczniki.
 
+Canonical routing identity jest materializowane przed budową paira, ale nadal
+pozostaje własnością `DecisionLogger`. Surowy wynik
+`GatekeeperAssessment::to_buy_log()` nie musi zawierać `run_id`,
+`decision_plane`, `config_hash` ani `brain_config_hash`. Logger wykonuje plane
+expansion i hydration dokładnie raz, zwraca immutable typed routed context dla
+`legacy_live`, a dokładnie ten sam routed v33 row jest później wysyłany przed
+pairem. Pair builder nie odczytuje niezhydratowanych pól surowego v33 i nie
+mutuje go wcześniej w sposób wyłączający pozostałe plane'y.
+
 Wszystkie rotowane parts mają row/byte counts i SHA-256 w manifeście. Replay v2
 łączy sidecar po identity/hash. Replay v1 pozostaje zgodny ze starym payloadem.
 
@@ -905,15 +914,46 @@ timer zaczyna się bezpośrednio przed pierwszym canonical producer call, jest
 przenoszony przez frozen snapshot, rzeczywistą drugą ewaluację comparatora i
 terminal pair construction, a kończy się dopiero po utworzeniu dokładnych
 finalnych bajtów v34 oraz evidence przez writera. Nie sumuje niezależnych
-timerów i nie pomija przerw między boundary. Comparator i bounded enqueue
-zachowują ostrzejszy limit 1 ms p99. Amendment nie zmienia schema, policy,
-authority ani rollout mode.
+timerów i nie pomija przerw między boundary. W production path obejmuje więc
+także admission do rzeczywistej bounded kolejki, scheduler delay i wcześniejszy
+command v33 wraz z jego I/O; sample kończy się po utworzeniu finalnych bajtów
+bieżącego v34/evidence, przed ich własnym write. Release harness ma obowiązek
+używać tego samego `DecisionLogger`, kolejki i kolejności commandów v33 → pair,
+a wynik odczytuje z finalized manifestu. Comparator i bounded enqueue zachowują
+ostrzejszy limit 1 ms p99. Amendment nie zmienia schema, policy, authority ani
+rollout mode.
 
 Wcześniejszy payload nazwany `BURN_IN_CONTRACT_V1`, zawierający draft limitu
-1 ms, nigdy nie stał się kontraktem obowiązującym dla prospective runu. Zmiana
-gate'u jest mimo tego wersjonowana fail-closed: obowiązujący artifact to
-`BURN_IN_CONTRACT_V2`, ma nowy `frozen_at` i canonical hash, a żaden run związany
-z V1 nie kwalifikuje się do V2.
+1 ms, nigdy nie stał się kontraktem obowiązującym dla prospective runu. V2
+zamroził autoryzowaną wartość 5 ms, lecz jego histogram kończył finite codebook
+na 2 ms, przez co overflow zwracał `max_us` zamiast rozstrzygać p99 przy 5 ms.
+Przed pierwszym prospective row zmiana codebooku została wersjonowana
+fail-closed jako obowiązujący `BURN_IN_CONTRACT_V3`, z nowym `frozen_at` i
+canonical hash. V1 ani V2 nie mogą identyfikować runu V3.
+
+Frozen latency histogram codebook V2 ma finite bounds:
+
+```text
+1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
+1_000, 2_000, 2_500, 3_000, 3_500, 4_000, 4_500, 5_000 us,
+następnie overflow
+```
+
+P99 przypadające w finite bucket zwraca jego upper bound. `max_us` pozostaje
+osobną obserwacją; pojedynczy rzadki overflow nie zamienia p99 gate w hard-max.
+Manifest i audit wymagają exact codebook version/bounds, bucket sum, sample
+count oraz spójnego overflow/max.
+
+Obowiązujący pre-run freeze:
+
+```text
+artifact = reports/metric_contracts/BURN_IN_CONTRACT_V3.json
+burn_in_contract_version = 3
+latency_histogram_codebook_version = 2
+frozen_at = 2026-07-13T21:30:25Z
+canonical SHA-256 = fe363f6730ac8ce554b79f0044de90eba1d9583e4e701ccf84071c0d3e352e57
+owner approval = github:smahacfel:authorized-pr2c-5ms-p99-codebook-amendment:2026-07-13
+```
 
 ```text
 comparator_elapsed_us p99 <= 1_000 us
@@ -1068,8 +1108,8 @@ candidate, no live reads, no unbounded state, no saturating order concealment.
 - single-run i bundle audit CLI;
 - manifests/rotation/SHA/resource telemetry;
 - historical feasibility po istnieniu referencyjnych V2 producerów;
-- zamrożenie `BURN_IN_CONTRACT_V2` przed prospektywnymi runami; V1 pozostaje
-  wyłącznie superseded pre-run draftem.
+- zamrożenie `BURN_IN_CONTRACT_V3` przed prospektywnymi runami; V1 i V2
+  pozostają wyłącznie superseded pre-run artifacts.
 
 Comparator używa tego samego frozen MFS/config. Nie czyta live state, nie trzyma
 locka przez await, nie emituje drugiego terminal eventu, nie uruchamia IWIM ani
@@ -1151,7 +1191,7 @@ Procedura:
 1. Historical dataset otrzymuje `FEASIBILITY_ONLY` i manifest SHA.
 2. Audit generuje exact minima oraz uzasadnienie.
 3. Właściciel planu jawnie zatwierdza bieżącą wersję `BURN_IN_CONTRACT`; dla
-   niniejszego gate'u jest to `BURN_IN_CONTRACT_V2`.
+   niniejszego gate'u i finite p99 codebooku jest to `BURN_IN_CONTRACT_V3`.
 4. Contract otrzymuje version/hash/`frozen_at`.
 5. Do bundle kwalifikują się tylko decyzje po `frozen_at`.
 6. Feasibility rows nigdy nie zwiększają validation counts.

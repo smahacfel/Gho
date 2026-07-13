@@ -615,7 +615,7 @@ async fn audit_rejects_incomplete_or_reinterpreted_resource_histograms() {
             "bucket-sum" => histogram.bucket_counts[0] += 1,
             "max" => histogram.max_us = 0,
             "missing-sample" => {
-                histogram.bucket_counts = [0; 13];
+                histogram.bucket_counts = [0; 19];
                 histogram.sample_count = 0;
                 histogram.max_us = 0;
             }
@@ -684,9 +684,9 @@ async fn audit_rejects_mutually_consistent_part_one_with_different_run_provenanc
 }
 
 #[tokio::test]
-async fn public_burn_v2_audit_enforces_run_bucket_and_prospective_minima() {
+async fn public_burn_v3_audit_enforces_run_bucket_and_prospective_minima() {
     let contract: BurnInContractV1 = serde_json::from_str(include_str!(
-        "../../reports/metric_contracts/BURN_IN_CONTRACT_V2.json"
+        "../../reports/metric_contracts/BURN_IN_CONTRACT_V3.json"
     ))
     .unwrap();
     let (run, v33) = write_run("run-a", "join-a").await;
@@ -719,9 +719,9 @@ async fn public_burn_v2_audit_enforces_run_bucket_and_prospective_minima() {
 }
 
 #[tokio::test]
-async fn public_burn_v2_audit_rejects_gate_hash_change_binding() {
+async fn public_burn_v3_audit_rejects_gate_hash_change_binding() {
     let contract: BurnInContractV1 = serde_json::from_str(include_str!(
-        "../../reports/metric_contracts/BURN_IN_CONTRACT_V2.json"
+        "../../reports/metric_contracts/BURN_IN_CONTRACT_V3.json"
     ))
     .unwrap();
     let (run, v33) = write_run("burn-binding-run", "burn-binding-join").await;

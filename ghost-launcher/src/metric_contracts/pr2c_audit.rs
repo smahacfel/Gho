@@ -10,7 +10,7 @@ use ghost_core::metric_contracts::{
     MetricContractAuditTerminalClassV1, MetricContractCutoverScopeV1,
     MetricContractDecisionSummaryV1, MetricContractEvidenceTransportV1,
     MetricEvidenceRecordIdentityV1, MetricMeasurementQualityV1, StableEventIdentityV1,
-    BURN_IN_CONTRACT_V2_CANONICAL_HASH, BURN_IN_CONTRACT_VERSION_V2,
+    BURN_IN_CONTRACT_V3_CANONICAL_HASH, BURN_IN_CONTRACT_VERSION_V3,
     METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1,
     METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34, METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1,
@@ -341,9 +341,9 @@ fn validate_manifest_parts(
             || summary.decision_schema_version != METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34
             || summary.wire_schema_manifest_blake3
                 != METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3
-            || summary.burn_in_contract_version != BURN_IN_CONTRACT_VERSION_V2
+            || summary.burn_in_contract_version != BURN_IN_CONTRACT_VERSION_V3
             || summary.burn_in_contract_canonical_hash.as_str()
-                != BURN_IN_CONTRACT_V2_CANONICAL_HASH
+                != BURN_IN_CONTRACT_V3_CANONICAL_HASH
         {
             return Err(Pr2cAuditErrorV1::PartIntegrity(
                 "unknown, dirty, or incomplete run/build/schema/BURN provenance".to_string(),
@@ -1041,7 +1041,7 @@ pub fn audit_pr2c_bundle_against_burn_in_contract_v2(
             })
         {
             return Err(Pr2cAuditErrorV1::PartIntegrity(
-                "run manifest is not bound to the supplied BURN_IN_CONTRACT_V2".to_string(),
+                "run manifest is not bound to the supplied BURN_IN_CONTRACT_V3".to_string(),
             ));
         }
     }
@@ -1050,7 +1050,7 @@ pub fn audit_pr2c_bundle_against_burn_in_contract_v2(
     let frozen_at_ms = chrono::DateTime::parse_from_rfc3339(&payload.frozen_at)
         .map_err(|_| {
             Pr2cAuditErrorV1::PartIntegrity(
-                "BURN_IN_CONTRACT_V2 frozen_at is not RFC3339".to_string(),
+                "BURN_IN_CONTRACT_V3 frozen_at is not RFC3339".to_string(),
             )
         })?
         .timestamp_millis();
@@ -1137,51 +1137,51 @@ pub fn audit_pr2c_bundle_against_burn_in_contract_v2(
         if !enough_runs {
             report
                 .reasons
-                .push("BURN_IN_CONTRACT_V2 minimum non-overlapping run count not met".to_string());
+                .push("BURN_IN_CONTRACT_V3 minimum non-overlapping run count not met".to_string());
         }
         if !each_run_duration_pass {
             report
                 .reasons
-                .push("BURN_IN_CONTRACT_V2 minimum per-run duration not met".to_string());
+                .push("BURN_IN_CONTRACT_V3 minimum per-run duration not met".to_string());
         }
         if !enough_buckets {
             report.reasons.push(
-                "BURN_IN_CONTRACT_V2 minimum paired-decision UTC bucket count not met".to_string(),
+                "BURN_IN_CONTRACT_V3 minimum paired-decision UTC bucket count not met".to_string(),
             );
         }
         if !enough_aggregate_duration {
             report
                 .reasons
-                .push("BURN_IN_CONTRACT_V2 minimum aggregate duration not met".to_string());
+                .push("BURN_IN_CONTRACT_V3 minimum aggregate duration not met".to_string());
         }
         if !enough_decisions {
             report
                 .reasons
-                .push("BURN_IN_CONTRACT_V2 minimum unique decisions not met".to_string());
+                .push("BURN_IN_CONTRACT_V3 minimum unique decisions not met".to_string());
         }
         if !enough_dev_known {
             report
                 .reasons
-                .push("BURN_IN_CONTRACT_V2 minimum dev-known decisions not met".to_string());
+                .push("BURN_IN_CONTRACT_V3 minimum dev-known decisions not met".to_string());
         }
         if !enough_flip_evaluable {
             report
                 .reasons
-                .push("BURN_IN_CONTRACT_V2 minimum clean Flip V2 evidence not met".to_string());
+                .push("BURN_IN_CONTRACT_V3 minimum clean Flip V2 evidence not met".to_string());
         }
         if !enough_dev_divergences {
             report.reasons.push(
-                "BURN_IN_CONTRACT_V2 minimum real dev divergence evidence not met".to_string(),
+                "BURN_IN_CONTRACT_V3 minimum real dev divergence evidence not met".to_string(),
             );
         }
         if !prospective_rows_only {
             report
                 .reasons
-                .push("BURN_IN_CONTRACT_V2 contains a row at or before frozen_at".to_string());
+                .push("BURN_IN_CONTRACT_V3 contains a row at or before frozen_at".to_string());
         }
         if !every_run_passed_before_aggregation {
             report.reasons.push(
-                "BURN_IN_CONTRACT_V2 requires every run to pass before aggregation".to_string(),
+                "BURN_IN_CONTRACT_V3 requires every run to pass before aggregation".to_string(),
             );
         }
         if report.terminal_class == MetricContractAuditTerminalClassV1::PassCutoverReady {

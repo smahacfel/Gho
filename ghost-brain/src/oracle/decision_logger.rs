@@ -43,7 +43,9 @@ use super::metric_contract_writer::{
 use anyhow::{Context, Result};
 use ghost_core::features::coordination::CoordinationRiskEvidenceUnit;
 use ghost_core::health::RuntimeHealth;
-use ghost_core::metric_contracts::MetricContractPairedRecordV1;
+use ghost_core::metric_contracts::{
+    CanonicalHashV1, MetricContractPairedRecordV1, MetricEvidenceRecordIdentityV1,
+};
 use ghost_core::tx_intelligence::types::{FscV2Evidence, FundingSourceDiagnostics};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -53,7 +55,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::fs::{create_dir_all, OpenOptions};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 /// Maximum number of ab_record_id entries held in the dedup cache.
@@ -2782,6 +2784,138 @@ pub struct DecisionLoggerConfig {
     pub enabled: bool,
 }
 
+/// Immutable routing provenance owned by `DecisionLogger`.
+///
+/// Runtime callers may ask the logger to route a raw terminal v33 before
+/// constructing PR2C evidence, but they do not reproduce this algorithm or
+/// mutate `decision_plane` on the raw record. The exact same routed rows are
+/// subsequently handed back to the logger task for durable v33 emission.
+#[derive(Debug, Clone)]
+struct DecisionLoggerRoutingContextV1 {
+    gatekeeper_rollout_profile: String,
+    gatekeeper_config_hash: String,
+    gatekeeper_run_id: Option<String>,
+    gatekeeper_session_id: Option<String>,
+    brain_config_path: Option<String>,
+    brain_config_hash: Option<String>,
+}
+
+impl From<&DecisionLoggerConfig> for DecisionLoggerRoutingContextV1 {
+    fn from(config: &DecisionLoggerConfig) -> Self {
+        Self {
+            gatekeeper_rollout_profile: config.gatekeeper_rollout_profile.clone(),
+            gatekeeper_config_hash: config.gatekeeper_config_hash.clone(),
+            gatekeeper_run_id: config.gatekeeper_run_id.clone(),
+            gatekeeper_session_id: config.gatekeeper_session_id.clone(),
+            brain_config_path: config.brain_config_path.clone(),
+            brain_config_hash: config.brain_config_hash.clone(),
+        }
+    }
+}
+
+/// Typed canonical identity/provenance selected from the routed legacy-live
+/// v33 row. This is the only DecisionLogger-owned input accepted by the PR2C
+/// terminal pair builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pr2cRoutedDecisionContextV1 {
+    record_identity: MetricEvidenceRecordIdentityV1,
+    gatekeeper_config_hash: CanonicalHashV1,
+    brain_config_hash: CanonicalHashV1,
+}
+
+impl Pr2cRoutedDecisionContextV1 {
+    #[must_use]
+    pub fn record_identity(&self) -> &MetricEvidenceRecordIdentityV1 {
+        &self.record_identity
+    }
+
+    #[must_use]
+    pub fn gatekeeper_config_hash(&self) -> &CanonicalHashV1 {
+        &self.gatekeeper_config_hash
+    }
+
+    #[must_use]
+    pub fn brain_config_hash(&self) -> &CanonicalHashV1 {
+        &self.brain_config_hash
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum Pr2cRoutingContextErrorV1 {
+    #[error("routed Gatekeeper decision is missing the legacy_live plane")]
+    MissingLegacyLivePlane,
+    #[error("routed Gatekeeper decision field {0} is missing")]
+    MissingField(&'static str),
+    #[error("routed Gatekeeper decision has an invalid record identity")]
+    InvalidRecordIdentity,
+    #[error("routed Gatekeeper decision hash {0} is invalid")]
+    InvalidHash(&'static str),
+}
+
+/// Deterministic output of DecisionLogger's canonical plane expansion and
+/// routing hydration. Fields stay private so callers cannot rewrite one plane
+/// after deriving the PR2C identity from another.
+#[derive(Debug, Clone)]
+pub struct RoutedGatekeeperDecisionV1 {
+    plane_logs: Vec<GatekeeperBuyLog>,
+}
+
+impl RoutedGatekeeperDecisionV1 {
+    #[must_use]
+    pub fn plane_logs(&self) -> &[GatekeeperBuyLog] {
+        &self.plane_logs
+    }
+
+    pub fn pr2c_legacy_live_context(
+        &self,
+    ) -> std::result::Result<Pr2cRoutedDecisionContextV1, Pr2cRoutingContextErrorV1> {
+        let legacy = self
+            .plane_logs
+            .iter()
+            .find(|log| log.decision_plane.as_deref() == Some(DECISION_PLANE_LEGACY_LIVE))
+            .ok_or(Pr2cRoutingContextErrorV1::MissingLegacyLivePlane)?;
+        let run_id = legacy
+            .run_id
+            .as_deref()
+            .ok_or(Pr2cRoutingContextErrorV1::MissingField("run_id"))?;
+        let join_key = legacy
+            .join_key
+            .as_deref()
+            .ok_or(Pr2cRoutingContextErrorV1::MissingField("join_key"))?;
+        let decision_plane = legacy
+            .decision_plane
+            .as_deref()
+            .ok_or(Pr2cRoutingContextErrorV1::MissingField("decision_plane"))?;
+        let record_identity =
+            MetricEvidenceRecordIdentityV1::try_new(run_id, join_key, decision_plane)
+                .map_err(|_| Pr2cRoutingContextErrorV1::InvalidRecordIdentity)?;
+        let gatekeeper_config_hash = CanonicalHashV1::parse(
+            legacy
+                .config_hash
+                .as_deref()
+                .ok_or(Pr2cRoutingContextErrorV1::MissingField("config_hash"))?,
+        )
+        .map_err(|_| Pr2cRoutingContextErrorV1::InvalidHash("config_hash"))?;
+        let brain_config_hash = CanonicalHashV1::parse(
+            legacy
+                .brain_config_hash
+                .as_deref()
+                .ok_or(Pr2cRoutingContextErrorV1::MissingField("brain_config_hash"))?,
+        )
+        .map_err(|_| Pr2cRoutingContextErrorV1::InvalidHash("brain_config_hash"))?;
+
+        Ok(Pr2cRoutedDecisionContextV1 {
+            record_identity,
+            gatekeeper_config_hash,
+            brain_config_hash,
+        })
+    }
+
+    fn into_plane_logs(self) -> Vec<GatekeeperBuyLog> {
+        self.plane_logs
+    }
+}
+
 impl Default for DecisionLoggerConfig {
     fn default() -> Self {
         Self {
@@ -2803,16 +2937,17 @@ impl Default for DecisionLoggerConfig {
 pub struct DecisionLogger {
     tx: mpsc::Sender<LogCommand>,
     metric_contract_stats: Arc<MetricContractPairedWriterStatsV1>,
+    routing: DecisionLoggerRoutingContextV1,
     enabled: bool,
 }
 
 enum LogCommand {
     Write(OracleDecisionLog),
     WriteCyclic(CyclicEngineLog),
-    WriteGatekeeperBuy(GatekeeperBuyLog),
+    WriteGatekeeperBuy(RoutedGatekeeperDecisionV1),
     WriteMetricContractPair(MetricContractPairedRecordV1),
     WriteCoordinationRiskEvidence(CoordinationRiskEvidenceUnit),
-    Shutdown,
+    Shutdown(oneshot::Sender<()>),
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -2839,12 +2974,14 @@ impl DecisionLogger {
         health: Option<Arc<RuntimeHealth>>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<LogCommand>(config.channel_buffer_size);
+        let routing = DecisionLoggerRoutingContextV1::from(&config);
 
         if !config.enabled {
             info!("DecisionLogger: disabled by configuration");
             return Self {
                 tx,
                 metric_contract_stats: Arc::new(MetricContractPairedWriterStatsV1::default()),
+                routing,
                 enabled: false,
             };
         }
@@ -2891,6 +3028,7 @@ impl DecisionLogger {
             // ── A/B dedup guard: TTL+size-bounded cache ──────────────────────
             let mut dedup_map: HashMap<String, ()> = HashMap::new();
             let mut dedup_queue: VecDeque<(Instant, String)> = VecDeque::new();
+            let mut shutdown_ack = None;
 
             while let Some(cmd) = rx.recv().await {
                 match cmd {
@@ -2932,13 +3070,11 @@ impl DecisionLogger {
                             );
                         }
                     }
-                    LogCommand::WriteGatekeeperBuy(log) => {
+                    LogCommand::WriteGatekeeperBuy(routed) => {
                         if logging_disabled_due_to_enospc {
                             continue;
                         }
-                        for mut plane_log in expand_gatekeeper_plane_logs(log) {
-                            hydrate_gatekeeper_routing_fields(&mut plane_log, &config);
-
+                        for plane_log in routed.into_plane_logs() {
                             if plane_log.log_schema_version >= 19 && plane_log.reason_code.is_none()
                             {
                                 warn!(
@@ -3113,8 +3249,9 @@ impl DecisionLogger {
                             );
                         }
                     }
-                    LogCommand::Shutdown => {
+                    LogCommand::Shutdown(ack) => {
                         info!("DecisionLogger: shutting down");
+                        shutdown_ack = Some(ack);
                         break;
                     }
                 }
@@ -3124,11 +3261,15 @@ impl DecisionLogger {
                     error!("DecisionLogger: final metric-contract manifest flush failed: {error}");
                 }
             }
+            if let Some(ack) = shutdown_ack {
+                let _ = ack.send(());
+            }
         });
 
         Self {
             tx,
             metric_contract_stats,
+            routing,
             enabled: true,
         }
     }
@@ -3189,7 +3330,26 @@ impl DecisionLogger {
 
     /// Log a Gatekeeper V2 Buy decision
     pub async fn log_gatekeeper_buy_decision(&self, log: GatekeeperBuyLog) {
-        if let Err(e) = self.tx.send(LogCommand::WriteGatekeeperBuy(log)).await {
+        let routed = self.route_gatekeeper_buy_decision(log);
+        self.log_routed_gatekeeper_buy_decision(routed).await;
+    }
+
+    /// Apply DecisionLogger's canonical plane expansion and provenance
+    /// hydration without enqueueing or filesystem I/O. PR2C uses the returned
+    /// legacy-live context before consuming its frozen terminal snapshot.
+    #[must_use]
+    pub fn route_gatekeeper_buy_decision(
+        &self,
+        log: GatekeeperBuyLog,
+    ) -> RoutedGatekeeperDecisionV1 {
+        route_gatekeeper_plane_logs(log, &self.routing)
+    }
+
+    /// Enqueue a decision that was already routed by this logger. This keeps
+    /// the exact routed rows used to derive PR2C identity intact and preserves
+    /// the production v33-before-pair command order.
+    pub async fn log_routed_gatekeeper_buy_decision(&self, routed: RoutedGatekeeperDecisionV1) {
+        if let Err(e) = self.tx.send(LogCommand::WriteGatekeeperBuy(routed)).await {
             warn!("Failed to send gatekeeper buy log command: {}", e);
         }
     }
@@ -3246,11 +3406,19 @@ impl DecisionLogger {
 
     /// Shutdown the logger gracefully
     pub async fn shutdown(&self) {
-        let _ = self.tx.send(LogCommand::Shutdown).await;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self.tx.send(LogCommand::Shutdown(ack_tx)).await.is_ok() {
+            // The writer sends this acknowledgement only after paired-stream
+            // finalization, manifest sync and directory sync have completed.
+            let _ = ack_rx.await;
+        }
     }
 }
 
-fn hydrate_gatekeeper_routing_fields(log: &mut GatekeeperBuyLog, config: &DecisionLoggerConfig) {
+fn hydrate_gatekeeper_routing_fields(
+    log: &mut GatekeeperBuyLog,
+    config: &DecisionLoggerRoutingContextV1,
+) {
     if log.rollout_profile.is_none() {
         log.rollout_profile = Some(config.gatekeeper_rollout_profile.clone());
     }
@@ -3269,6 +3437,17 @@ fn hydrate_gatekeeper_routing_fields(log: &mut GatekeeperBuyLog, config: &Decisi
     if log.brain_config_hash.is_none() {
         log.brain_config_hash = config.brain_config_hash.clone();
     }
+}
+
+fn route_gatekeeper_plane_logs(
+    log: GatekeeperBuyLog,
+    routing: &DecisionLoggerRoutingContextV1,
+) -> RoutedGatekeeperDecisionV1 {
+    let mut plane_logs = expand_gatekeeper_plane_logs(log);
+    for plane_log in &mut plane_logs {
+        hydrate_gatekeeper_routing_fields(plane_log, routing);
+    }
+    RoutedGatekeeperDecisionV1 { plane_logs }
 }
 
 fn hydrate_coordination_risk_routing_fields(

@@ -2,11 +2,15 @@ use anyhow::{Context, Result};
 use ghost_core::metric_contracts::{
     CanonicalHashV1, MetricContractDecisionSummaryV1, MetricContractPairedRecordV1,
     MetricContractRolloutMode, MetricEvidenceRecordIdentityV1,
-    ResolvedMetricContractEffectiveConfigV1, BURN_IN_CONTRACT_V2_CANONICAL_HASH,
-    BURN_IN_CONTRACT_VERSION_V2, METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
+    ResolvedMetricContractEffectiveConfigV1, BURN_IN_CONTRACT_V3_CANONICAL_HASH,
+    BURN_IN_CONTRACT_VERSION_V3, METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1,
     METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34, METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3,
+};
+pub use ghost_core::metric_contracts::{
+    METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V2,
+    METRIC_CONTRACT_LATENCY_HISTOGRAM_CODEBOOK_VERSION_V2,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,9 +27,6 @@ pub const METRIC_CONTRACT_EVIDENCE_V1_FILE: &str = "metric_contract_evidence_v1.
 pub const METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE: &str =
     "metric_contract_rotation_manifest_v1.json";
 pub const DEFAULT_METRIC_CONTRACT_ROTATION_MAX_BYTES: u64 = 64 * 1024 * 1024;
-pub const METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1: [u32; 12] =
-    [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_000, 2_000];
-
 #[derive(Debug, Clone)]
 pub struct MetricContractPairedWriterConfigV1 {
     pub directory: PathBuf,
@@ -70,9 +71,9 @@ impl MetricContractPairedWriterConfigV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricContractLatencyHistogramSnapshotV1 {
-    pub bucket_upper_bounds_us: [u32; 12],
+    pub bucket_upper_bounds_us: [u32; 18],
     /// One count per upper bound plus a final overflow bucket.
-    pub bucket_counts: [u64; 13],
+    pub bucket_counts: [u64; 19],
     pub sample_count: u64,
     pub max_us: u64,
 }
@@ -98,8 +99,8 @@ pub enum MetricContractLatencyHistogramErrorV1 {
 impl Default for MetricContractLatencyHistogramSnapshotV1 {
     fn default() -> Self {
         Self {
-            bucket_upper_bounds_us: METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1,
-            bucket_counts: [0; 13],
+            bucket_upper_bounds_us: METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V2,
+            bucket_counts: [0; 19],
             sample_count: 0,
             max_us: 0,
         }
@@ -111,7 +112,7 @@ impl MetricContractLatencyHistogramSnapshotV1 {
         &self,
         expected_sample_count: u64,
     ) -> std::result::Result<(), MetricContractLatencyHistogramErrorV1> {
-        if self.bucket_upper_bounds_us != METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1 {
+        if self.bucket_upper_bounds_us != METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V2 {
             return Err(MetricContractLatencyHistogramErrorV1::BucketCodebookMismatch);
         }
         let bucket_sum = self.bucket_counts.iter().try_fold(0u64, |sum, count| {
@@ -186,7 +187,7 @@ impl MetricContractLatencyHistogramSnapshotV1 {
 
 #[derive(Debug)]
 struct MetricContractLatencyHistogramV1 {
-    bucket_counts: [AtomicU64; 13],
+    bucket_counts: [AtomicU64; 19],
     sample_count: AtomicU64,
     max_us: AtomicU64,
 }
@@ -203,10 +204,10 @@ impl Default for MetricContractLatencyHistogramV1 {
 
 impl MetricContractLatencyHistogramV1 {
     fn record(&self, value_us: u64) {
-        let bucket = METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1
+        let bucket = METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V2
             .iter()
             .position(|upper| value_us <= u64::from(*upper))
-            .unwrap_or(METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1.len());
+            .unwrap_or(METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V2.len());
         self.bucket_counts[bucket].fetch_add(1, Ordering::Relaxed);
         self.sample_count.fetch_add(1, Ordering::Relaxed);
         self.max_us.fetch_max(value_us, Ordering::Relaxed);
@@ -214,7 +215,7 @@ impl MetricContractLatencyHistogramV1 {
 
     fn snapshot(&self) -> MetricContractLatencyHistogramSnapshotV1 {
         MetricContractLatencyHistogramSnapshotV1 {
-            bucket_upper_bounds_us: METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1,
+            bucket_upper_bounds_us: METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V2,
             bucket_counts: std::array::from_fn(|index| {
                 self.bucket_counts[index].load(Ordering::Relaxed)
             }),
@@ -571,11 +572,11 @@ impl OpenPart {
             decision_schema_version: METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34,
             wire_schema_manifest_blake3: METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3
                 .to_string(),
-            burn_in_contract_version: BURN_IN_CONTRACT_VERSION_V2,
+            burn_in_contract_version: BURN_IN_CONTRACT_VERSION_V3,
             burn_in_contract_canonical_hash: CanonicalHashV1::parse(
-                BURN_IN_CONTRACT_V2_CANONICAL_HASH,
+                BURN_IN_CONTRACT_V3_CANONICAL_HASH,
             )
-            .expect("compiled BURN_IN_CONTRACT_V2 hash is valid SHA-256"),
+            .expect("compiled BURN_IN_CONTRACT_V3 hash is valid SHA-256"),
             profile_id: provenance.profile_id.clone(),
             profile_hash: provenance.profile_hash.clone(),
             metric_contract_effective_config_hash: provenance
@@ -688,8 +689,9 @@ impl MetricContractPairedWriterV1 {
         // writer samples that exact clock only after timestamp/part binding,
         // semantic transport hashing, both serde passes and the fixed-width
         // final v34 telemetry substitution. This includes all gaps between
-        // producer, comparator and writer boundaries. Filesystem I/O remains
-        // represented by writer/backpressure counters instead.
+        // producer, comparator and writer boundaries, bounded-queue admission,
+        // scheduler delay and the preceding v33 command's filesystem I/O. The
+        // current pair's own write happens after its exact final bytes exist.
         let final_bytes_started = std::time::Instant::now();
         let identity = pair.record_identity().clone();
         let writer_timestamp_ms = u64::try_from(

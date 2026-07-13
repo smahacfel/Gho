@@ -95,13 +95,15 @@ historical validation count contribution   = 0
 
 ## 5. Freeze i zasada anty-post-hoc
 
-`BURN_IN_CONTRACT_V2.json` zachowuje początkowe minima planu: 3 runy, 1 h/run,
+`BURN_IN_CONTRACT_V3.json` zachowuje początkowe minima planu: 3 runy, 1 h/run,
 2 UTC buckets, 8 h aggregate, 700 decisions, 100 dev-known, 100 clean Flip V2
 evaluable i 30 real dev divergences. Historyczny wynik nie obniżył żadnego
-progu. V2 wersjonuje autoryzowaną przed-runową zmianę resource limitu z 1 ms
-do 5 ms; wcześniejszy payload V1 był draftem i nie identyfikuje żadnego runu.
-Prospective row musi powstać po nowym `frozen_at` i przejść pełny per-run audit
-przed bundle aggregation.
+progu. V2 wersjonował autoryzowaną przed-runową zmianę resource limitu z 1 ms
+do 5 ms. V3, również przed pierwszym prospective row, zamraża finite histogram
+codebook kończący się bucketem `5_000 us`, aby p99 nie było utożsamiane z
+overflow `max_us`. V1 i V2 są superseded pre-run artifacts i nie identyfikują
+runu V3. Prospective row musi powstać po nowym V3 `frozen_at` i przejść pełny
+per-run audit przed bundle aggregation.
 
 ## 6. Werdykt
 
