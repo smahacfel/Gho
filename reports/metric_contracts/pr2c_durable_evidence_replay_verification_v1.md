@@ -122,6 +122,11 @@ zgodność plan/kod dla UTC bucketów oraz cross-run `brain_config_hash`.
 Nowy workflow GitHub Actions uruchamia pełną Rust matrix oraz osobny release
 resource job; correctness job instaluje jawnie wymagany przez static guards
 `ripgrep`, a CI nie opiera się już wyłącznie na Restore Lifecycle Guard.
+Workflow jawnie ustawia portable `RUSTFLAGS=-C target-cpu=x86-64` i osobne
+portable cache keys. Pierwsza próba dla amendmentu zatrzymała się przed
+testami na `rustc SIGILL`, ponieważ repozytoryjny deweloperski
+`target-cpu=native` dopuścił odtworzenie cached proc-macro dylib z innego
+wariantu GitHub-hosted CPU; nie był to wynik żadnego testu PR2C.
 
 ## 3. Wire V1 codebook manifest
 

@@ -18,6 +18,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The repository's local developer profile uses `target-cpu=native`.
+  # GitHub-hosted cache entries can move between heterogeneous x86_64 hosts,
+  # so cached proc-macro dylibs compiled for one host may SIGILL on another.
+  # CI and its resource baseline therefore use one explicit portable target.
+  RUSTFLAGS: "-C target-cpu=x86-64"
 
 jobs:
   correctness:
@@ -37,6 +42,8 @@ jobs:
           sudo apt-get install -y protobuf-compiler ripgrep
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pr2c-correctness-portable-x86-64-v1
 
       - name: Verify PR2C ancestry gate
         run: git merge-base --is-ancestor 6348896ba303e9fb6dfb6c3bf2c5f9c015bf2c8e HEAD
@@ -117,7 +124,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: pr2c-release
+          shared-key: pr2c-release-portable-x86-64-v1
 
       - name: Full frozen-input to final-byte release harness
         run: |

@@ -198,6 +198,15 @@ sidecar p95/p99 = 22180/22180 B
 v34 p95 = 1176 B
 ```
 
+Pierwszy workflow amendmentu ujawnił niezależny problem przenośności cache:
+repozytoryjne `.cargo/config.toml` ustawia deweloperskie
+`target-cpu=native`, a GitHub-hosted cache może zostać odtworzony na innym
+wariancie x86_64. Oba joby zatrzymały się przed testami na `rustc SIGILL` przy
+ładowaniu cached proc-macro dylib. Workflow PR2C zamraża dlatego CI/resource
+baseline na `RUSTFLAGS=-C target-cpu=x86-64` i używa nowych, rozdzielonych
+portable cache keys. Nie zmienia to profilu ani zachowania runtime; usuwa
+niedeterministyczne powiązanie wyniku CI z CPU poprzedniego runnera.
+
 Pełny histogram jest konserwatywny: overflow bucket powyżej 2 ms zwraca
 observed `max_us` dla p50/p95/p99. Wynik `3 545 us` nadal pozostaje poniżej
 frozen limitu `5 000 us`. Standalone serialization jest diagnostyką; jej koszt
