@@ -127,6 +127,10 @@ portable cache keys. Pierwsza próba dla amendmentu zatrzymała się przed
 testami na `rustc SIGILL`, ponieważ repozytoryjny deweloperski
 `target-cpu=native` dopuścił odtworzenie cached proc-macro dylib z innego
 wariantu GitHub-hosted CPU; nie był to wynik żadnego testu PR2C.
+Semantyczne audit fixtures normalizują wyłącznie swoją debugową próbkę do
+poprawnego, deterministycznego histogramu; testy histogram mutation nadal
+odrzucają każdą zmianę codebook/count/sum/max. Resource PASS pochodzi wyłącznie
+z osobnego release harnessu z realnym continuous clockiem.
 
 ## 3. Wire V1 codebook manifest
 

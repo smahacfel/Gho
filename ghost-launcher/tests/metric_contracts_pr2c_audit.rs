@@ -10,8 +10,9 @@ use common::{
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_brain::oracle::reason_code::GatekeeperReasonCode;
 use ghost_brain::oracle::{
-    MetricContractPairedWriterConfigV1, MetricContractPairedWriterStatsV1,
-    MetricContractPairedWriterV1,
+    MetricContractLatencyHistogramSnapshotV1, MetricContractPairedWriterConfigV1,
+    MetricContractPairedWriterStatsV1, MetricContractPairedWriterV1,
+    MetricContractRotationManifestV1, METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE,
 };
 use ghost_core::metric_contracts::{
     BurnInContractV1, MetricContractAuditTerminalClassV1, MetricContractCutoverScopeV1,
@@ -33,6 +34,33 @@ fn write_current_v33(
 ) {
     let row = current_v33_log(pair);
     std::fs::write(path, format!("{}\n", serde_json::to_string(&row).unwrap())).unwrap();
+}
+
+fn normalize_semantic_audit_fixture_histograms(run_dir: &std::path::Path) {
+    // These tests exercise replay, joins, provenance, bundle minima and the
+    // audit's histogram-integrity rules in the unoptimized test profile. They
+    // must not turn debug JSON serialization speed on a shared CI runner into
+    // a resource-acceptance assertion. Give the semantic fixture one closed,
+    // internally consistent sample per paired command; the dedicated release
+    // harness below the durability suite remains the sole performance proof
+    // and uses the real continuous producer-to-final-byte clock.
+    let path = run_dir.join(METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE);
+    let mut manifest: MetricContractRotationManifestV1 =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let sample_count = manifest.writer_stats.paired_commands_total;
+    let deterministic = || {
+        let mut histogram = MetricContractLatencyHistogramSnapshotV1::default();
+        histogram.sample_count = sample_count;
+        if sample_count > 0 {
+            histogram.bucket_counts[1] = sample_count;
+            histogram.max_us = 2;
+        }
+        histogram
+    };
+    manifest.writer_stats.logger_enqueue_wait_us = deterministic();
+    manifest.writer_stats.metric_contract_build_and_serialize_us = deterministic();
+    manifest.writer_stats.projection_build_and_validate_us = deterministic();
+    std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 }
 
 async fn write_run(run_id: &str, join_key: &str) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -65,6 +93,7 @@ async fn write_pair_run(
     pair.metric_contract_full_path_started = std::time::Instant::now();
     writer.write_pair(pair.clone()).await.unwrap();
     writer.finalize().await.unwrap();
+    normalize_semantic_audit_fixture_histograms(temp.path());
     let v33_path = temp.path().join("gatekeeper_v2_decisions.jsonl");
     write_current_v33(&v33_path, &pair);
     (temp, v33_path)

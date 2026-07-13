@@ -207,6 +207,13 @@ baseline na `RUSTFLAGS=-C target-cpu=x86-64` i używa nowych, rozdzielonych
 portable cache keys. Nie zmienia to profilu ani zachowania runtime; usuwa
 niedeterministyczne powiązanie wyniku CI z CPU poprzedniego runnera.
 
+Semantyczne testy single-run/bundle audit działają w nieoptymalizowanym profilu
+i używają deterministycznego, poprawnego histogramu fixture. Dzięki temu
+sprawdzają schema/replay/provenance/minima oraz wszystkie mutacje integralności
+histogramu, ale nie mylą debugowej szybkości współdzielonego runnera z
+acceptance. Jedynym dowodem wydajności pozostaje osobny release harness, który
+nie normalizuje telemetryki i mierzy realny ciągły zegar.
+
 Pełny histogram jest konserwatywny: overflow bucket powyżej 2 ms zwraca
 observed `max_us` dla p50/p95/p99. Wynik `3 545 us` nadal pozostaje poniżej
 frozen limitu `5 000 us`. Standalone serialization jest diagnostyką; jej koszt
