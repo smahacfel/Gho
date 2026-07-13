@@ -14,7 +14,7 @@ use ghost_launcher::components::gatekeeper::{
     GatekeeperVerdict,
 };
 use ghost_launcher::components::gatekeeper_policy::{
-    build_assessment_from_features, PolicyEvaluationContext,
+    build_assessment_from_features, evaluate_policy_from_assessment, PolicyEvaluationContext,
 };
 use ghost_launcher::components::gatekeeper_v3::{
     evaluate_v3_from_features, v3_actionability_payload, v3_component_scores_payload,
@@ -719,11 +719,17 @@ pub fn current_v33_unrouted_fixture(
     config.v25.emit_shadow_decisions = true;
     config.dow.enabled = true;
     config.dow.early_entry_enabled = true;
-    let assessment = build_assessment_from_features(
+    let mut assessment = build_assessment_from_features(
         features.clone(),
         &config,
         PolicyEvaluationContext::default(),
     );
+    // A real terminal Gatekeeper assessment carries the authoritative policy
+    // decision before `to_buy_log()`. Keep routing/provenance fields untouched
+    // (`None`) so PR2C still proves that DecisionLogger owns their hydration.
+    let authoritative_decision = evaluate_policy_from_assessment(&assessment, &config);
+    assessment.hard_reject_reason = authoritative_decision.hard_fail_reason.clone();
+    assessment.decision = Some(authoritative_decision);
     let mut log = assessment.to_buy_log(&solana_sdk::pubkey::Pubkey::new_unique(), &config);
     let mut temporal_buffer =
         GatekeeperBuffer::new(solana_sdk::pubkey::Pubkey::new_unique(), &config);
