@@ -1,0 +1,1701 @@
+{
+  "wire_version": 1,
+  "tuple_layouts": [
+    {
+      "name": "wire_object",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "w: wire_schema_version"
+        },
+        {
+          "position": 1,
+          "domain_field": "d: projection_root"
+        }
+      ]
+    },
+    {
+      "name": "root",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "schema_version"
+        },
+        {
+          "position": 1,
+          "domain_field": "rollout_mode"
+        },
+        {
+          "position": 2,
+          "domain_field": "profile_id"
+        },
+        {
+          "position": 3,
+          "domain_field": "profile_hash"
+        },
+        {
+          "position": 4,
+          "domain_field": "metric_contract_effective_config_hash"
+        },
+        {
+          "position": 5,
+          "domain_field": "fee_topology_diversity_index"
+        },
+        {
+          "position": 6,
+          "domain_field": "dev_buy"
+        },
+        {
+          "position": 7,
+          "domain_field": "same_ms_tx_ratio"
+        },
+        {
+          "position": 8,
+          "domain_field": "top3_signer_volume_ratio"
+        },
+        {
+          "position": 9,
+          "domain_field": "flip_ratio"
+        },
+        {
+          "position": 10,
+          "domain_field": "funding_source_concentration"
+        },
+        {
+          "position": 11,
+          "domain_field": "fsc_evidence_status"
+        },
+        {
+          "position": 12,
+          "domain_field": "manipulation_contradiction"
+        },
+        {
+          "position": 13,
+          "domain_field": "reserve_velocity"
+        },
+        {
+          "position": 14,
+          "domain_field": "recent_buy_sell"
+        }
+      ]
+    },
+    {
+      "name": "family.ftdi",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "legacy_value"
+        },
+        {
+          "position": 1,
+          "domain_field": "value_v1"
+        },
+        {
+          "position": 2,
+          "domain_field": "unique_topology_count"
+        },
+        {
+          "position": 3,
+          "domain_field": "unique_buyer_sample_count"
+        },
+        {
+          "position": 4,
+          "domain_field": "buy_transaction_sample_count"
+        },
+        {
+          "position": 5,
+          "domain_field": "legacy_buy_tx_actionability"
+        },
+        {
+          "position": 6,
+          "domain_field": "unique_buyer_actionability_v2"
+        }
+      ]
+    },
+    {
+      "name": "family.dev_buy",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "tx_intel_first_observed"
+        },
+        {
+          "position": 1,
+          "domain_field": "mfs_first_observed"
+        },
+        {
+          "position": 2,
+          "domain_field": "mfs_primary_v1"
+        },
+        {
+          "position": 3,
+          "domain_field": "effective_policy"
+        },
+        {
+          "position": 4,
+          "domain_field": "creator_known"
+        },
+        {
+          "position": 5,
+          "domain_field": "create_signature_matched"
+        },
+        {
+          "position": 6,
+          "domain_field": "primary_selection_mode"
+        },
+        {
+          "position": 7,
+          "domain_field": "primary_eligible_buy_count"
+        }
+      ]
+    },
+    {
+      "name": "family.timing",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "legacy_exact"
+        },
+        {
+          "position": 1,
+          "domain_field": "exact_v1"
+        },
+        {
+          "position": 2,
+          "domain_field": "cluster_lt_50ms"
+        },
+        {
+          "position": 3,
+          "domain_field": "recent_exact"
+        }
+      ]
+    },
+    {
+      "name": "family.top3",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "preferred"
+        },
+        {
+          "position": 1,
+          "domain_field": "compatibility_alias"
+        },
+        {
+          "position": 2,
+          "domain_field": "effective"
+        },
+        {
+          "position": 3,
+          "domain_field": "preferred_alias_bitwise_equal"
+        },
+        {
+          "position": 4,
+          "domain_field": "used_compatibility_fallback"
+        }
+      ]
+    },
+    {
+      "name": "family.flip",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "legacy_slot_gap_ratio"
+        },
+        {
+          "position": 1,
+          "domain_field": "hybrid_v2_ratio"
+        },
+        {
+          "position": 2,
+          "domain_field": "eligible_buyer_count"
+        },
+        {
+          "position": 3,
+          "domain_field": "flipper_count"
+        },
+        {
+          "position": 4,
+          "domain_field": "wall_clock_window_ms"
+        },
+        {
+          "position": 5,
+          "domain_field": "max_slot_gap"
+        },
+        {
+          "position": 6,
+          "domain_field": "dump_ratio"
+        }
+      ]
+    },
+    {
+      "name": "family.funding",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "legacy_source"
+        },
+        {
+          "position": 1,
+          "domain_field": "legacy_v1"
+        },
+        {
+          "position": 2,
+          "domain_field": "distinct_known_source_count"
+        },
+        {
+          "position": 3,
+          "domain_field": "known_source_sample_count"
+        },
+        {
+          "position": 4,
+          "domain_field": "fsc_v2"
+        },
+        {
+          "position": 5,
+          "domain_field": "known_coverage"
+        },
+        {
+          "position": 6,
+          "domain_field": "non_neutral_known_coverage"
+        },
+        {
+          "position": 7,
+          "domain_field": "known_buyer_count"
+        },
+        {
+          "position": 8,
+          "domain_field": "total_buyer_count"
+        }
+      ]
+    },
+    {
+      "name": "family.fsc_status",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "compatibility_status"
+        },
+        {
+          "position": 1,
+          "domain_field": "legacy_scalar_present"
+        },
+        {
+          "position": 2,
+          "domain_field": "legacy_feature_status"
+        },
+        {
+          "position": 3,
+          "domain_field": "fsc_v2_status"
+        },
+        {
+          "position": 4,
+          "domain_field": "fsc_v2_coverage"
+        }
+      ]
+    },
+    {
+      "name": "family.manipulation",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "legacy_numeric_envelope"
+        },
+        {
+          "position": 1,
+          "domain_field": "numeric_v2_envelope"
+        },
+        {
+          "position": 2,
+          "domain_field": "measured_fields_mask"
+        },
+        {
+          "position": 3,
+          "domain_field": "same_ms_tx_ratio"
+        },
+        {
+          "position": 4,
+          "domain_field": "bundle_suspicion_ratio"
+        },
+        {
+          "position": 5,
+          "domain_field": "top3_signer_volume_ratio"
+        },
+        {
+          "position": 6,
+          "domain_field": "hhi"
+        },
+        {
+          "position": 7,
+          "domain_field": "max_tx_per_signer"
+        },
+        {
+          "position": 8,
+          "domain_field": "dev_volume_ratio"
+        },
+        {
+          "position": 9,
+          "domain_field": "contradiction_score"
+        },
+        {
+          "position": 10,
+          "domain_field": "legacy_high_recorded_mask"
+        },
+        {
+          "position": 11,
+          "domain_field": "legacy_high_true_mask"
+        },
+        {
+          "position": 12,
+          "domain_field": "derived_high_evaluable_mask"
+        },
+        {
+          "position": 13,
+          "domain_field": "derived_high_true_mask"
+        }
+      ]
+    },
+    {
+      "name": "family.reserve",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "legacy_velocity"
+        },
+        {
+          "position": 1,
+          "domain_field": "velocity_v1"
+        },
+        {
+          "position": 2,
+          "domain_field": "previous_real_sol_reserves_lamports"
+        },
+        {
+          "position": 3,
+          "domain_field": "current_real_sol_reserves_lamports"
+        },
+        {
+          "position": 4,
+          "domain_field": "interval_ms"
+        },
+        {
+          "position": 5,
+          "domain_field": "accepted_update_count"
+        },
+        {
+          "position": 6,
+          "domain_field": "source_clock"
+        },
+        {
+          "position": 7,
+          "domain_field": "status"
+        }
+      ]
+    },
+    {
+      "name": "family.recent",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "legacy_scalar"
+        },
+        {
+          "position": 1,
+          "domain_field": "v1_envelope"
+        },
+        {
+          "position": 2,
+          "domain_field": "window_ms"
+        },
+        {
+          "position": 3,
+          "domain_field": "buy_count"
+        },
+        {
+          "position": 4,
+          "domain_field": "sell_count"
+        },
+        {
+          "position": 5,
+          "domain_field": "transaction_count"
+        },
+        {
+          "position": 6,
+          "domain_field": "buy_to_sell_ratio"
+        },
+        {
+          "position": 7,
+          "domain_field": "buy_share"
+        }
+      ]
+    },
+    {
+      "name": "common.envelope",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "contract_id"
+        },
+        {
+          "position": 1,
+          "domain_field": "contract_version"
+        },
+        {
+          "position": 2,
+          "domain_field": "surface_id"
+        },
+        {
+          "position": 3,
+          "domain_field": "authority_class"
+        },
+        {
+          "position": 4,
+          "domain_field": "rollout_role"
+        },
+        {
+          "position": 5,
+          "domain_field": "availability"
+        },
+        {
+          "position": 6,
+          "domain_field": "measurement_quality"
+        },
+        {
+          "position": 7,
+          "domain_field": "policy_actionable"
+        },
+        {
+          "position": 8,
+          "domain_field": "reasons"
+        }
+      ]
+    },
+    {
+      "name": "common.surface",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "envelope"
+        },
+        {
+          "position": 1,
+          "domain_field": "value"
+        },
+        {
+          "position": 2,
+          "domain_field": "producer_id"
+        },
+        {
+          "position": 3,
+          "domain_field": "producer_schema_version"
+        },
+        {
+          "position": 4,
+          "domain_field": "source_cutoff"
+        }
+      ]
+    },
+    {
+      "name": "common.field",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "value"
+        },
+        {
+          "position": 1,
+          "domain_field": "availability"
+        },
+        {
+          "position": 2,
+          "domain_field": "measurement_quality"
+        },
+        {
+          "position": 3,
+          "domain_field": "reasons"
+        }
+      ]
+    },
+    {
+      "name": "common.cutoff",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "decision_timestamp_ms"
+        },
+        {
+          "position": 1,
+          "domain_field": "decision_slot"
+        }
+      ]
+    },
+    {
+      "name": "common.reason_summary",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "codes"
+        },
+        {
+          "position": 1,
+          "domain_field": "omitted_count"
+        }
+      ]
+    },
+    {
+      "name": "common.ratio",
+      "entries": [
+        {
+          "position": 0,
+          "domain_field": "surface"
+        },
+        {
+          "position": 1,
+          "domain_field": "numerator"
+        },
+        {
+          "position": 2,
+          "domain_field": "denominator"
+        },
+        {
+          "position": 3,
+          "domain_field": "population"
+        },
+        {
+          "position": 4,
+          "domain_field": "window_ms"
+        }
+      ]
+    }
+  ],
+  "mapping_tables": [
+    {
+      "name": "contract_id",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "fee_topology_diversity_index"
+        },
+        {
+          "code": 1,
+          "domain_value": "dev_buy"
+        },
+        {
+          "code": 2,
+          "domain_value": "same_ms_tx_ratio"
+        },
+        {
+          "code": 3,
+          "domain_value": "top3_signer_volume_ratio"
+        },
+        {
+          "code": 4,
+          "domain_value": "flip_ratio"
+        },
+        {
+          "code": 5,
+          "domain_value": "funding_source_concentration"
+        },
+        {
+          "code": 6,
+          "domain_value": "fsc_evidence_status"
+        },
+        {
+          "code": 7,
+          "domain_value": "manipulation_contradiction"
+        },
+        {
+          "code": 8,
+          "domain_value": "reserve_velocity"
+        },
+        {
+          "code": 9,
+          "domain_value": "recent_buy_sell"
+        }
+      ]
+    },
+    {
+      "name": "surface_id",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "tx_intel_fee_topology_diversity_legacy"
+        },
+        {
+          "code": 1,
+          "domain_value": "ftdi_value_evidence_v1"
+        },
+        {
+          "code": 2,
+          "domain_value": "ftdi_legacy_buy_tx_actionability"
+        },
+        {
+          "code": 3,
+          "domain_value": "ftdi_unique_buyer_actionability_v2"
+        },
+        {
+          "code": 4,
+          "domain_value": "coordination_fee_topology_hhi_export_v1"
+        },
+        {
+          "code": 5,
+          "domain_value": "tx_intel_dev_first_observed_buy_sol"
+        },
+        {
+          "code": 6,
+          "domain_value": "gatekeeper_buffer_dev_primary_buy_sol"
+        },
+        {
+          "code": 7,
+          "domain_value": "mfs_dev_first_observed_buy_sol"
+        },
+        {
+          "code": 8,
+          "domain_value": "mfs_dev_primary_buy_sol_v1"
+        },
+        {
+          "code": 9,
+          "domain_value": "effective_policy_dev_buy_sol"
+        },
+        {
+          "code": 10,
+          "domain_value": "tx_intel_same_ms_collision_ratio_exact"
+        },
+        {
+          "code": 11,
+          "domain_value": "tx_timing_exact_same_ms_evidence_v1"
+        },
+        {
+          "code": 12,
+          "domain_value": "tx_intel_bundle_cluster_ratio_lt50_ms"
+        },
+        {
+          "code": 13,
+          "domain_value": "rce_same_ms_collision_ratio_recent_exact"
+        },
+        {
+          "code": 14,
+          "domain_value": "tx_intel_top3_signer_volume_ratio_preferred"
+        },
+        {
+          "code": 15,
+          "domain_value": "tx_intel_top3_volume_pct_compatibility_alias"
+        },
+        {
+          "code": 16,
+          "domain_value": "tx_intel_top3_effective_selector"
+        },
+        {
+          "code": 17,
+          "domain_value": "early_fingerprint_flip_ratio_legacy_slot_gap"
+        },
+        {
+          "code": 18,
+          "domain_value": "flip_ratio_hybrid_evidence_v2"
+        },
+        {
+          "code": 19,
+          "domain_value": "tx_intel_funding_source_concentration_legacy"
+        },
+        {
+          "code": 20,
+          "domain_value": "funding_source_concentration_legacy_evidence_v1"
+        },
+        {
+          "code": 21,
+          "domain_value": "funding_source_v2_readiness_evidence"
+        },
+        {
+          "code": 22,
+          "domain_value": "materialized_fsc_status_compatibility"
+        },
+        {
+          "code": 23,
+          "domain_value": "coordination_funding_source_hhi_export_v1"
+        },
+        {
+          "code": 24,
+          "domain_value": "mfs_manipulation_numeric_legacy_defaults"
+        },
+        {
+          "code": 25,
+          "domain_value": "manipulation_numeric_evidence_v2"
+        },
+        {
+          "code": 26,
+          "domain_value": "mfs_manipulation_high_flags_legacy_defaults"
+        },
+        {
+          "code": 27,
+          "domain_value": "policy_derived_manipulation_high_flags_v2"
+        },
+        {
+          "code": 28,
+          "domain_value": "account_state_reserve_velocity_scalar_legacy"
+        },
+        {
+          "code": 29,
+          "domain_value": "reserve_velocity_evidence_v1"
+        },
+        {
+          "code": 30,
+          "domain_value": "rce_buy_sell_ratio_recent_legacy"
+        },
+        {
+          "code": 31,
+          "domain_value": "recent_buy_sell_evidence_v1"
+        }
+      ]
+    },
+    {
+      "name": "rollout_mode",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "legacy"
+        },
+        {
+          "code": 1,
+          "domain_value": "dual_compute"
+        },
+        {
+          "code": 2,
+          "domain_value": "v2"
+        }
+      ]
+    },
+    {
+      "name": "profile_id",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "metric_contracts_v1_1_profile_a"
+        }
+      ]
+    },
+    {
+      "name": "authority_class",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "authoritative"
+        },
+        {
+          "code": 1,
+          "domain_value": "equivalent_cutover"
+        },
+        {
+          "code": 2,
+          "domain_value": "compatibility"
+        },
+        {
+          "code": 3,
+          "domain_value": "counterfactual"
+        },
+        {
+          "code": 4,
+          "domain_value": "evidence_only"
+        },
+        {
+          "code": 5,
+          "domain_value": "logging_only"
+        },
+        {
+          "code": 6,
+          "domain_value": "export_only"
+        }
+      ]
+    },
+    {
+      "name": "rollout_role",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "policy_authoritative"
+        },
+        {
+          "code": 1,
+          "domain_value": "policy_comparator"
+        },
+        {
+          "code": 2,
+          "domain_value": "non_policy"
+        }
+      ]
+    },
+    {
+      "name": "availability",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "available"
+        },
+        {
+          "code": 1,
+          "domain_value": "unavailable"
+        },
+        {
+          "code": 2,
+          "domain_value": "not_configured"
+        },
+        {
+          "code": 3,
+          "domain_value": "not_recorded_legacy_schema"
+        }
+      ]
+    },
+    {
+      "name": "measurement_quality",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "measured"
+        },
+        {
+          "code": 1,
+          "domain_value": "degraded"
+        },
+        {
+          "code": 2,
+          "domain_value": "insufficient"
+        },
+        {
+          "code": 3,
+          "domain_value": "stale"
+        },
+        {
+          "code": 4,
+          "domain_value": "fallback"
+        },
+        {
+          "code": 5,
+          "domain_value": "legacy_default"
+        },
+        {
+          "code": 6,
+          "domain_value": "not_applicable"
+        }
+      ]
+    },
+    {
+      "name": "producer_id",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "fee_topology_diversity_producer"
+        },
+        {
+          "code": 1,
+          "domain_value": "tx_intelligence_engine"
+        },
+        {
+          "code": 2,
+          "domain_value": "tx_intel_effective_top3_selector"
+        },
+        {
+          "code": 3,
+          "domain_value": "tx_intelligence_fingerprint_aggregator"
+        },
+        {
+          "code": 4,
+          "domain_value": "funding_source_index"
+        },
+        {
+          "code": 5,
+          "domain_value": "materialized_fsc_status_adapter"
+        },
+        {
+          "code": 6,
+          "domain_value": "manipulation_evidence_adapter"
+        },
+        {
+          "code": 7,
+          "domain_value": "manipulation_policy_derivation"
+        },
+        {
+          "code": 8,
+          "domain_value": "account_state_core"
+        },
+        {
+          "code": 9,
+          "domain_value": "recent_buy_sell_window_producer"
+        }
+      ]
+    },
+    {
+      "name": "dev_selection_mode",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "legacy_first_observed"
+        },
+        {
+          "code": 1,
+          "domain_value": "create_signature_match"
+        },
+        {
+          "code": 2,
+          "domain_value": "earliest_eligible_creator_buy"
+        },
+        {
+          "code": 3,
+          "domain_value": "no_eligible_buy"
+        }
+      ]
+    },
+    {
+      "name": "timing_population",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "accepted_transactions"
+        },
+        {
+          "code": 1,
+          "domain_value": "successful_transactions"
+        }
+      ]
+    },
+    {
+      "name": "evidence_status",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "clean"
+        },
+        {
+          "code": 1,
+          "domain_value": "degraded"
+        },
+        {
+          "code": 2,
+          "domain_value": "unavailable"
+        },
+        {
+          "code": 3,
+          "domain_value": "insufficient_sample"
+        },
+        {
+          "code": 4,
+          "domain_value": "stale"
+        },
+        {
+          "code": 5,
+          "domain_value": "fallback"
+        },
+        {
+          "code": 6,
+          "domain_value": "shadow_only"
+        },
+        {
+          "code": 7,
+          "domain_value": "not_configured"
+        }
+      ]
+    },
+    {
+      "name": "fsc_status",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "clean"
+        },
+        {
+          "code": 1,
+          "domain_value": "degraded"
+        },
+        {
+          "code": 2,
+          "domain_value": "unavailable"
+        }
+      ]
+    },
+    {
+      "name": "reserve_source_clock",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "receive_time"
+        }
+      ]
+    },
+    {
+      "name": "reserve_status",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "first_update"
+        },
+        {
+          "code": 1,
+          "domain_value": "measured"
+        },
+        {
+          "code": 2,
+          "domain_value": "zero_delta_time"
+        },
+        {
+          "code": 3,
+          "domain_value": "bootstrap_fallback"
+        },
+        {
+          "code": 4,
+          "domain_value": "unavailable"
+        }
+      ]
+    },
+    {
+      "name": "reason_family",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "legacy_status"
+        },
+        {
+          "code": 1,
+          "domain_value": "legacy_degraded"
+        },
+        {
+          "code": 2,
+          "domain_value": "legacy_unavailable"
+        },
+        {
+          "code": 3,
+          "domain_value": "ftdi"
+        },
+        {
+          "code": 4,
+          "domain_value": "dev_buy"
+        },
+        {
+          "code": 5,
+          "domain_value": "tx_timing"
+        },
+        {
+          "code": 6,
+          "domain_value": "top3"
+        },
+        {
+          "code": 7,
+          "domain_value": "flip"
+        },
+        {
+          "code": 8,
+          "domain_value": "funding_source"
+        },
+        {
+          "code": 9,
+          "domain_value": "manipulation"
+        },
+        {
+          "code": 10,
+          "domain_value": "reserve_velocity"
+        },
+        {
+          "code": 11,
+          "domain_value": "recent_buy_sell"
+        },
+        {
+          "code": 12,
+          "domain_value": "unmapped_legacy_string"
+        }
+      ]
+    },
+    {
+      "name": "reason.legacy_status",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "degraded"
+        },
+        {
+          "code": 1,
+          "domain_value": "unavailable"
+        },
+        {
+          "code": 2,
+          "domain_value": "insufficient_sample"
+        },
+        {
+          "code": 3,
+          "domain_value": "stale"
+        },
+        {
+          "code": 4,
+          "domain_value": "fallback"
+        },
+        {
+          "code": 5,
+          "domain_value": "shadow_only"
+        },
+        {
+          "code": 6,
+          "domain_value": "not_configured"
+        },
+        {
+          "code": 7,
+          "domain_value": "carried_forward"
+        },
+        {
+          "code": 8,
+          "domain_value": "not_allowed"
+        },
+        {
+          "code": 9,
+          "domain_value": "unavailable_source"
+        },
+        {
+          "code": 10,
+          "domain_value": "clean_with_legacy_reasons"
+        }
+      ]
+    },
+    {
+      "name": "reason.legacy_degraded",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "segment_sequence_partial"
+        },
+        {
+          "code": 1,
+          "domain_value": "segment_signer_coverage_partial"
+        },
+        {
+          "code": 2,
+          "domain_value": "tx_intel_low_sample"
+        },
+        {
+          "code": 3,
+          "domain_value": "account_state_fallback"
+        },
+        {
+          "code": 4,
+          "domain_value": "checkpoint_history_sparse"
+        },
+        {
+          "code": 5,
+          "domain_value": "curve_evidence_partial"
+        },
+        {
+          "code": 6,
+          "domain_value": "sybil_evidence_partial"
+        },
+        {
+          "code": 7,
+          "domain_value": "alpha_evidence_partial"
+        },
+        {
+          "code": 8,
+          "domain_value": "manipulation_evidence_partial"
+        },
+        {
+          "code": 9,
+          "domain_value": "identity_evidence_fallback"
+        },
+        {
+          "code": 10,
+          "domain_value": "trajectory_evidence_sparse"
+        },
+        {
+          "code": 11,
+          "domain_value": "pdd_sequence_partial"
+        },
+        {
+          "code": 12,
+          "domain_value": "cpv_evidence_partial"
+        },
+        {
+          "code": 13,
+          "domain_value": "fsc_evidence_partial"
+        },
+        {
+          "code": 14,
+          "domain_value": "organic_broadening_insufficient"
+        },
+        {
+          "code": 15,
+          "domain_value": "manipulation_contradiction_partial"
+        },
+        {
+          "code": 16,
+          "domain_value": "decision_time_series_price_partial"
+        },
+        {
+          "code": 17,
+          "domain_value": "decision_time_series_truncated"
+        },
+        {
+          "code": 18,
+          "domain_value": "evidence_stale"
+        }
+      ]
+    },
+    {
+      "name": "reason.legacy_unavailable",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "not_materialized"
+        },
+        {
+          "code": 1,
+          "domain_value": "identity_missing"
+        },
+        {
+          "code": 2,
+          "domain_value": "segment_sequence_missing"
+        },
+        {
+          "code": 3,
+          "domain_value": "segment_signer_data_missing"
+        },
+        {
+          "code": 4,
+          "domain_value": "tx_intel_missing"
+        },
+        {
+          "code": 5,
+          "domain_value": "account_state_missing"
+        },
+        {
+          "code": 6,
+          "domain_value": "checkpoint_history_missing"
+        },
+        {
+          "code": 7,
+          "domain_value": "curve_data_missing"
+        },
+        {
+          "code": 8,
+          "domain_value": "trajectory_missing"
+        },
+        {
+          "code": 9,
+          "domain_value": "pdd_sequence_missing"
+        },
+        {
+          "code": 10,
+          "domain_value": "sybil_metrics_missing"
+        },
+        {
+          "code": 11,
+          "domain_value": "alpha_fingerprint_missing"
+        },
+        {
+          "code": 12,
+          "domain_value": "cpv_metrics_missing"
+        },
+        {
+          "code": 13,
+          "domain_value": "fsc_metrics_missing"
+        },
+        {
+          "code": 14,
+          "domain_value": "organic_broadening_missing"
+        },
+        {
+          "code": 15,
+          "domain_value": "manipulation_contradiction_missing"
+        },
+        {
+          "code": 16,
+          "domain_value": "execution_not_run"
+        },
+        {
+          "code": 17,
+          "domain_value": "not_configured"
+        }
+      ]
+    },
+    {
+      "name": "reason.ftdi",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "insufficient_buy_transactions"
+        },
+        {
+          "code": 1,
+          "domain_value": "insufficient_unique_buyers"
+        },
+        {
+          "code": 2,
+          "domain_value": "raw_fee_topology_unavailable"
+        },
+        {
+          "code": 3,
+          "domain_value": "legacy_buy_transaction_actionability_gate"
+        },
+        {
+          "code": 4,
+          "domain_value": "unique_buyer_actionability_counterfactual"
+        },
+        {
+          "code": 5,
+          "domain_value": "coordination_hhi_export_only"
+        }
+      ]
+    },
+    {
+      "name": "reason.dev_buy",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "creator_unknown"
+        },
+        {
+          "code": 1,
+          "domain_value": "no_eligible_buy"
+        },
+        {
+          "code": 2,
+          "domain_value": "create_signature_unavailable"
+        },
+        {
+          "code": 3,
+          "domain_value": "create_signature_not_matched"
+        },
+        {
+          "code": 4,
+          "domain_value": "failed_transaction_excluded"
+        },
+        {
+          "code": 5,
+          "domain_value": "duplicate_excluded"
+        },
+        {
+          "code": 6,
+          "domain_value": "dust_excluded"
+        },
+        {
+          "code": 7,
+          "domain_value": "legacy_first_observed_includes_accepted_failed"
+        },
+        {
+          "code": 8,
+          "domain_value": "primary_buy_counterfactual"
+        },
+        {
+          "code": 9,
+          "domain_value": "candidate_history_truncated"
+        },
+        {
+          "code": 10,
+          "domain_value": "compatibility_primary_includes_accepted_failed"
+        }
+      ]
+    },
+    {
+      "name": "reason.tx_timing",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "insufficient_transactions"
+        },
+        {
+          "code": 1,
+          "domain_value": "timestamp_unavailable"
+        },
+        {
+          "code": 2,
+          "domain_value": "ordering_identity_unavailable"
+        },
+        {
+          "code": 3,
+          "domain_value": "source_window_truncated"
+        },
+        {
+          "code": 4,
+          "domain_value": "exact_same_millisecond"
+        },
+        {
+          "code": 5,
+          "domain_value": "cluster_below_fifty_milliseconds"
+        },
+        {
+          "code": 6,
+          "domain_value": "recent_window"
+        },
+        {
+          "code": 7,
+          "domain_value": "legacy_transaction_count_denominator"
+        }
+      ]
+    },
+    {
+      "name": "reason.top3",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "preferred_field_unavailable"
+        },
+        {
+          "code": 1,
+          "domain_value": "compatibility_alias_fallback"
+        },
+        {
+          "code": 2,
+          "domain_value": "preferred_alias_mismatch"
+        }
+      ]
+    },
+    {
+      "name": "reason.flip",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "no_eligible_buyers"
+        },
+        {
+          "code": 1,
+          "domain_value": "no_anchor"
+        },
+        {
+          "code": 2,
+          "domain_value": "missing_stable_identity"
+        },
+        {
+          "code": 3,
+          "domain_value": "missing_stable_order"
+        },
+        {
+          "code": 4,
+          "domain_value": "missing_resolved_owner"
+        },
+        {
+          "code": 5,
+          "domain_value": "duplicate_event"
+        },
+        {
+          "code": 6,
+          "domain_value": "identity_order_conflict"
+        },
+        {
+          "code": 7,
+          "domain_value": "duplicate_order_conflict"
+        },
+        {
+          "code": 8,
+          "domain_value": "failed_transaction_excluded"
+        },
+        {
+          "code": 9,
+          "domain_value": "dust_excluded"
+        },
+        {
+          "code": 10,
+          "domain_value": "wallet_cap_reached"
+        },
+        {
+          "code": 11,
+          "domain_value": "reconnect_gap"
+        },
+        {
+          "code": 12,
+          "domain_value": "out_of_order_event"
+        },
+        {
+          "code": 13,
+          "domain_value": "arithmetic_overflow"
+        },
+        {
+          "code": 14,
+          "domain_value": "closed_non_flipper"
+        },
+        {
+          "code": 15,
+          "domain_value": "legacy_slot_gap_only"
+        }
+      ]
+    },
+    {
+      "name": "reason.funding_source",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "funding_lane_unavailable"
+        },
+        {
+          "code": 1,
+          "domain_value": "rolling_state_unavailable"
+        },
+        {
+          "code": 2,
+          "domain_value": "index_cold"
+        },
+        {
+          "code": 3,
+          "domain_value": "no_buyer_cohort"
+        },
+        {
+          "code": 4,
+          "domain_value": "insufficient_known_sources"
+        },
+        {
+          "code": 5,
+          "domain_value": "insufficient_non_neutral_support"
+        },
+        {
+          "code": 6,
+          "domain_value": "low_coverage"
+        },
+        {
+          "code": 7,
+          "domain_value": "neutral_only"
+        },
+        {
+          "code": 8,
+          "domain_value": "buyer_identity_unavailable"
+        },
+        {
+          "code": 9,
+          "domain_value": "buy_timestamp_unavailable"
+        },
+        {
+          "code": 10,
+          "domain_value": "no_retained_recipient_history"
+        },
+        {
+          "code": 11,
+          "domain_value": "lookback_window_exhausted"
+        },
+        {
+          "code": 12,
+          "domain_value": "no_prebuy_transfer_in_window"
+        },
+        {
+          "code": 13,
+          "domain_value": "same_slot_ordering_unavailable"
+        },
+        {
+          "code": 14,
+          "domain_value": "low_attribution_confidence"
+        },
+        {
+          "code": 15,
+          "domain_value": "absolute_attribution_too_small"
+        },
+        {
+          "code": 16,
+          "domain_value": "relative_funding_too_small"
+        },
+        {
+          "code": 17,
+          "domain_value": "per_recipient_history_overflow"
+        },
+        {
+          "code": 18,
+          "domain_value": "global_recipient_evicted"
+        },
+        {
+          "code": 19,
+          "domain_value": "legacy_scalar_presence_only"
+        }
+      ]
+    },
+    {
+      "name": "reason.manipulation",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "raw_field_absent"
+        },
+        {
+          "code": 1,
+          "domain_value": "legacy_default_zero"
+        },
+        {
+          "code": 2,
+          "domain_value": "legacy_default_false"
+        },
+        {
+          "code": 3,
+          "domain_value": "threshold_not_configured"
+        },
+        {
+          "code": 4,
+          "domain_value": "derived_in_policy"
+        },
+        {
+          "code": 5,
+          "domain_value": "momentum_without_broadening"
+        },
+        {
+          "code": 6,
+          "domain_value": "volume_spike_without_new_signers"
+        },
+        {
+          "code": 7,
+          "domain_value": "high_buy_pressure_with_high_top3"
+        },
+        {
+          "code": 8,
+          "domain_value": "fixed_size_or_ramping_pattern"
+        },
+        {
+          "code": 9,
+          "domain_value": "timing_bundle_concentration"
+        },
+        {
+          "code": 10,
+          "domain_value": "early_top3_concentration"
+        }
+      ]
+    },
+    {
+      "name": "reason.reserve_velocity",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "bootstrap_first_update"
+        },
+        {
+          "code": 1,
+          "domain_value": "zero_delta_time"
+        },
+        {
+          "code": 2,
+          "domain_value": "fallback_state"
+        },
+        {
+          "code": 3,
+          "domain_value": "source_unavailable"
+        },
+        {
+          "code": 4,
+          "domain_value": "measured_zero"
+        }
+      ]
+    },
+    {
+      "name": "reason.recent_buy_sell",
+      "entries": [
+        {
+          "code": 0,
+          "domain_value": "empty_window"
+        },
+        {
+          "code": 1,
+          "domain_value": "sell_count_zero"
+        },
+        {
+          "code": 2,
+          "domain_value": "zero_denominator"
+        },
+        {
+          "code": 3,
+          "domain_value": "failed_transaction_excluded"
+        },
+        {
+          "code": 4,
+          "domain_value": "legacy_sell_zero_returns_buy_count"
+        },
+        {
+          "code": 5,
+          "domain_value": "logging_only"
+        }
+      ]
+    }
+  ]
+}

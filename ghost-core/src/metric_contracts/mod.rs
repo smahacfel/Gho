@@ -10,6 +10,7 @@ mod canonical_hash;
 mod effective_config;
 mod evidence;
 mod identity;
+mod pr2c;
 mod projection;
 mod projection_wire;
 mod registry;
@@ -28,6 +29,7 @@ pub use effective_config::{
 };
 pub use evidence::*;
 pub use identity::*;
+pub use pr2c::*;
 pub use projection::*;
 pub use projection_wire::*;
 pub use registry::*;

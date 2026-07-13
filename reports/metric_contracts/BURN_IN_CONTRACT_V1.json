@@ -1,0 +1,45 @@
+{
+  "payload": {
+    "burn_in_contract_version": 1,
+    "minimum_non_overlapping_runs": 3,
+    "minimum_run_duration_ms": 3600000,
+    "minimum_utc_4h_buckets": 2,
+    "minimum_aggregate_duration_ms": 28800000,
+    "minimum_unique_decisions": 700,
+    "minimum_dev_known_decisions": 100,
+    "minimum_clean_flip_v2_evaluable": 100,
+    "minimum_real_dev_legacy_v2_divergences": 30,
+    "metric_contract_schema_version": 1,
+    "projection_wire_version": 1,
+    "evidence_schema_version": 1,
+    "decision_schema_version": 34,
+    "wire_schema_manifest_blake3": "70d79931f3f9a82720e46f622d439930a087431e305d14c02d88dcd26568fc7f",
+    "resource_limits": {
+      "comparator_p99_us": 1000,
+      "metric_contract_build_and_serialize_p99_us": 1000,
+      "projection_build_and_validate_p99_us": 1000,
+      "logger_enqueue_wait_p99_us": 1000,
+      "writer_queue_high_water_max_ratio": 0.8,
+      "projection_p95_bytes": 12288,
+      "projection_hard_max_bytes": 16384,
+      "sidecar_p95_bytes": 24576,
+      "sidecar_p99_bytes": 49152,
+      "combined_gb_per_hour_delta_max_ratio": 0.25,
+      "v34_p95_increase_max_bytes": 8192,
+      "v34_p95_increase_max_ratio": 0.1
+    },
+    "require_zero_policy_drift": true,
+    "require_zero_dropped_rows": true,
+    "require_zero_writer_failures": true,
+    "require_zero_orphans": true,
+    "invalidation_rules": [
+      "any_gate_change_after_frozen_at_requires_new_contract_version_hash_and_runs",
+      "rows_at_or_before_frozen_at_are_not_prospective_validation_evidence",
+      "schema_profile_effective_config_or_build_mismatch_invalidates_bundle",
+      "overlapping_mutable_or_incomplete_runs_invalidate_bundle"
+    ],
+    "frozen_at": "2026-07-13T00:52:00Z",
+    "owner_approval_identity": "github:smahacfel:authorized-pr2c-task:2026-07-13"
+  },
+  "contract_canonical_hash": "56ceb5a80a0b6d413cf639f0ac02d30fade2770f7f5c4cf4a1a014f3632ae7df"
+}

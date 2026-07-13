@@ -79,7 +79,7 @@ fn active_top3_consumers_use_the_single_effective_selector() {
 }
 
 #[test]
-fn metric_contract_pr1_keeps_v33_and_v3_v1_emission_frozen() {
+fn metric_contract_pr2c_keeps_v33_and_v3_v1_frozen_while_adding_separate_v34_stream() {
     assert_eq!(
         ghost_brain::oracle::GATEKEEPER_BUY_LOG_SCHEMA_VERSION,
         ghost_core::metric_contracts::LEGACY_GATEKEEPER_DECISION_SCHEMA_VERSION_V33
@@ -92,15 +92,19 @@ fn metric_contract_pr1_keeps_v33_and_v3_v1_emission_frozen() {
     let decision_logger = include_str!("../../ghost-brain/src/oracle/decision_logger.rs");
     assert!(decision_logger.contains("pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 33;"));
     assert!(
-        !decision_logger.contains("MetricContractDecisionSummaryV1"),
-        "PR1 must not attach the reserved v34 summary to DecisionLogger"
+        decision_logger.contains("WriteMetricContractPair(MetricContractPairedRecordV1)"),
+        "PR2C must route v34 and evidence as one additive logical command"
     );
+    let writer = include_str!("../../ghost-brain/src/oracle/metric_contract_writer.rs");
+    assert!(writer.contains("metric_contract_decisions_v34.jsonl"));
+    assert!(writer.contains("metric_contract_evidence_v1.jsonl"));
+    assert!(!decision_logger.contains("log_schema_version: 34"));
 
     let replay = include_str!("../src/bin/v3_replay.rs");
     assert!(replay.contains("const SUPPORTED_REPLAY_PAYLOAD_SCHEMA_VERSION: u64 = 1;"));
     assert!(
         !replay.contains("MetricContractEvidenceTransportV1"),
-        "PR1 must not activate replay v2 or metric evidence joins"
+        "frozen V3 replay v1 must not absorb replay v2 or metric evidence joins"
     );
 }
 

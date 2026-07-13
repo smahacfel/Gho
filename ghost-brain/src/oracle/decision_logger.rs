@@ -36,15 +36,21 @@
 //! }
 //! ```
 
+use super::metric_contract_writer::{
+    MetricContractPairedWriterConfigV1, MetricContractPairedWriterStatsSnapshotV1,
+    MetricContractPairedWriterStatsV1, MetricContractPairedWriterV1,
+};
 use anyhow::{Context, Result};
 use ghost_core::features::coordination::CoordinationRiskEvidenceUnit;
 use ghost_core::health::RuntimeHealth;
+use ghost_core::metric_contracts::MetricContractPairedRecordV1;
 use ghost_core::tx_intelligence::types::{FscV2Evidence, FundingSourceDiagnostics};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tokio::fs::{create_dir_all, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -2796,14 +2802,25 @@ impl Default for DecisionLoggerConfig {
 /// Async decision logger for Oracle Brain
 pub struct DecisionLogger {
     tx: mpsc::Sender<LogCommand>,
+    metric_contract_stats: Arc<MetricContractPairedWriterStatsV1>,
+    enabled: bool,
 }
 
 enum LogCommand {
     Write(OracleDecisionLog),
     WriteCyclic(CyclicEngineLog),
     WriteGatekeeperBuy(GatekeeperBuyLog),
+    WriteMetricContractPair(MetricContractPairedRecordV1),
     WriteCoordinationRiskEvidence(CoordinationRiskEvidenceUnit),
     Shutdown,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum MetricContractEnqueueErrorV1 {
+    #[error("metric-contract paired writer is disabled")]
+    WriterDisabled,
+    #[error("metric-contract paired writer queue is closed")]
+    ChannelClosed,
 }
 
 impl DecisionLogger {
@@ -2825,12 +2842,21 @@ impl DecisionLogger {
 
         if !config.enabled {
             info!("DecisionLogger: disabled by configuration");
-            return Self { tx };
+            return Self {
+                tx,
+                metric_contract_stats: Arc::new(MetricContractPairedWriterStatsV1::default()),
+                enabled: false,
+            };
         }
+
+        let metric_contract_stats = Arc::new(MetricContractPairedWriterStatsV1::default());
+        let writer_stats = Arc::clone(&metric_contract_stats);
 
         // Spawn async writer task
         tokio::spawn(async move {
             let mut logging_disabled_due_to_enospc = false;
+            let mut metric_contract_writer: Option<MetricContractPairedWriterV1> = None;
+            let mut metric_contract_writer_disabled = false;
             if let Err(e) = create_dir_all(&config.log_dir).await {
                 if is_no_space_error(std::iter::once(&e as &(dyn std::error::Error + 'static))) {
                     logging_disabled_due_to_enospc = true;
@@ -3018,6 +3044,50 @@ impl DecisionLogger {
                             }
                         }
                     }
+                    LogCommand::WriteMetricContractPair(pair) => {
+                        if logging_disabled_due_to_enospc || metric_contract_writer_disabled {
+                            writer_stats.record_disabled();
+                            continue;
+                        }
+                        if metric_contract_writer.is_none() {
+                            let mut writer_config = MetricContractPairedWriterConfigV1::new(
+                                config.gatekeeper_log_dir.clone(),
+                                option_env!("GIT_COMMIT").unwrap_or("unknown_build_commit"),
+                            );
+                            writer_config.queue_capacity = config.channel_buffer_size;
+                            match MetricContractPairedWriterV1::open(
+                                writer_config,
+                                Arc::clone(&writer_stats),
+                            )
+                            .await
+                            {
+                                Ok(writer) => metric_contract_writer = Some(writer),
+                                Err(error) => {
+                                    metric_contract_writer_disabled = true;
+                                    if is_no_space_error(error.chain()) {
+                                        logging_disabled_due_to_enospc = true;
+                                    }
+                                    writer_stats.record_disabled();
+                                    error!(
+                                        "DecisionLogger: failed to initialize paired metric-contract writer: {error}"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(writer) = metric_contract_writer.as_mut() {
+                            if let Err(error) = writer.write_pair(pair).await {
+                                metric_contract_writer_disabled = true;
+                                writer_stats.record_writer_disabled_event();
+                                if is_no_space_error(error.chain()) {
+                                    logging_disabled_due_to_enospc = true;
+                                }
+                                error!(
+                                    "DecisionLogger: paired metric-contract write failed: {error}"
+                                );
+                            }
+                        }
+                    }
                     LogCommand::WriteCoordinationRiskEvidence(mut unit) => {
                         if logging_disabled_due_to_enospc {
                             continue;
@@ -3047,9 +3117,18 @@ impl DecisionLogger {
                     }
                 }
             }
+            if let Some(writer) = metric_contract_writer.as_mut() {
+                if let Err(error) = writer.finalize().await {
+                    error!("DecisionLogger: final metric-contract manifest flush failed: {error}");
+                }
+            }
         });
 
-        Self { tx }
+        Self {
+            tx,
+            metric_contract_stats,
+            enabled: true,
+        }
     }
 
     /// Log a decision (fire-and-forget)
@@ -3111,6 +3190,39 @@ impl DecisionLogger {
         if let Err(e) = self.tx.send(LogCommand::WriteGatekeeperBuy(log)).await {
             warn!("Failed to send gatekeeper buy log command: {}", e);
         }
+    }
+
+    /// Enqueue the compact v34 summary and its full evidence sidecar as one
+    /// bounded logical command. The writer exposes partial filesystem writes
+    /// through separate orphan/failure counters; it never claims two-file
+    /// filesystem atomicity.
+    pub async fn log_metric_contract_pair(
+        &self,
+        pair: MetricContractPairedRecordV1,
+    ) -> std::result::Result<(), MetricContractEnqueueErrorV1> {
+        if !self.enabled {
+            self.metric_contract_stats.record_disabled();
+            return Err(MetricContractEnqueueErrorV1::WriterDisabled);
+        }
+        let started = Instant::now();
+        let permit = self.tx.reserve().await.map_err(|_| {
+            self.metric_contract_stats.record_send_failure();
+            MetricContractEnqueueErrorV1::ChannelClosed
+        })?;
+        let queue_depth = self.tx.max_capacity().saturating_sub(self.tx.capacity());
+        self.metric_contract_stats.record_queue_depth(queue_depth);
+        permit.send(LogCommand::WriteMetricContractPair(pair));
+        let enqueue_wait_us = u64::try_from(started.elapsed().as_micros())
+            .expect("a process-local queue wait cannot span u64::MAX microseconds");
+        self.metric_contract_stats
+            .record_enqueue_wait_us(enqueue_wait_us);
+        ::metrics::histogram!("logger_enqueue_wait_us", enqueue_wait_us as f64);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn metric_contract_writer_stats(&self) -> MetricContractPairedWriterStatsSnapshotV1 {
+        self.metric_contract_stats.snapshot()
     }
 
     /// Log additive Phase 0.6 coordination-risk evidence.

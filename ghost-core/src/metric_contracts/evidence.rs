@@ -1516,13 +1516,17 @@ pub enum ComparatorDeltaStatusV1 {
 #[serde(deny_unknown_fields)]
 pub struct MetricContractComparatorSummaryV1 {
     pub verdict: ComparatorDeltaStatusV1,
-    pub reason: ComparatorDeltaStatusV1,
-    pub phase: ComparatorDeltaStatusV1,
+    pub primary_reason_code: ComparatorDeltaStatusV1,
+    pub ordered_reason_chain: ComparatorDeltaStatusV1,
+    pub phase_pass_vector: ComparatorDeltaStatusV1,
     pub soft_points: ComparatorDeltaStatusV1,
+    pub selector_soft_score: ComparatorDeltaStatusV1,
+    pub hard_fail_classification: ComparatorDeltaStatusV1,
 }
 
-/// Additive compact-v34 type reserved for PR2C. PR1 defines and round-trips the
-/// schema but does not insert it into `GatekeeperBuyLog` or change v33 emission.
+/// Additive compact-v34 summary emitted by PR2C into its own paired stream.
+/// It is intentionally not inserted into `GatekeeperBuyLog`; v33 emission and
+/// historical parsing remain frozen and independent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricContractDecisionSummaryV1 {
