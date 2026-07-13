@@ -146,7 +146,8 @@ reports/metric_contracts/pr2c_durable_evidence_replay_verification_v1.md
 | M-08 | timestamp nadawany przez writer | evidence row metadata verification |
 
 Nowy workflow GitHub Actions uruchamia pełną Rust matrix oraz osobny release
-resource job; CI nie opiera się już wyłącznie na Restore Lifecycle Guard.
+resource job; correctness job instaluje jawnie wymagany przez static guards
+`ripgrep`, a CI nie opiera się już wyłącznie na Restore Lifecycle Guard.
 
 ## 3. Wire V1 codebook manifest
 

@@ -168,7 +168,9 @@ clean result po zmianie kodu.
 Dodany workflow `.github/workflows/metric-contracts-pr2c.yml` uruchamia pełne
 PR2A/PR2B/PR2C suites, frozen Gatekeeper/lifecycle regressions, checks,
 targeted Clippy oraz osobny release full-path resource harness. Workflow nie
-uruchamia runtime live/shadow ani external RPC.
+uruchamia runtime live/shadow ani external RPC. Correctness job instaluje
+jawnie `ripgrep`, ponieważ zamrożone PR2A/PR2B static guards używają `rg` i nie
+mogą zależeć od przypadkowego obrazu runnera.
 
 ## 5. Wyniki resource gate
 
