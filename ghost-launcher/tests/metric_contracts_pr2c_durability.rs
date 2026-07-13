@@ -1046,14 +1046,32 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
         logger.log_routed_gatekeeper_buy_decision(routed).await;
         logger.log_metric_contract_pair(pair).await.unwrap();
         let expected_rows = u64::try_from(index + 1).unwrap();
+        let manifest_path = temp.path().join(METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if logger
-                    .metric_contract_writer_stats()
-                    .evidence_rows_written_total
-                    >= expected_rows
-                {
-                    break;
+                // `evidence_rows_written_total` advances before the writer's
+                // per-pair sync and atomic manifest replacement. Starting the
+                // next sample at that point would charge it for the previous
+                // sample's durability tail and manufacture queue backlog that
+                // this isolated release baseline is not intended to model.
+                // Wait for the production manifest to contain the exact full-
+                // path sample; the measured sample itself still crosses the
+                // real bounded queue, preceding v33 command/I/O and final-byte
+                // materialization. Queue-pressure behavior has a separate
+                // bounded-channel regression and remains visible in burn-in.
+                if let Ok(bytes) = std::fs::read(&manifest_path) {
+                    if let Ok(manifest) =
+                        serde_json::from_slice::<MetricContractRotationManifestV1>(&bytes)
+                    {
+                        if manifest
+                            .writer_stats
+                            .metric_contract_build_and_serialize_us
+                            .sample_count
+                            >= expected_rows
+                        {
+                            break;
+                        }
+                    }
                 }
                 tokio::task::yield_now().await;
             }
