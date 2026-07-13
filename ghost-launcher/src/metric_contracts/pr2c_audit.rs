@@ -7,16 +7,17 @@ use ghost_brain::oracle::{
 use ghost_core::checkpoint::MaterializedFeatureSet;
 use ghost_core::metric_contracts::{
     BurnInContractV1, CanonicalNullableV1, MetricAvailabilityV1,
-    MetricContractAuditTerminalClassV1, MetricContractDecisionSummaryV1,
-    MetricContractEvidenceTransportV1, MetricEvidenceRecordIdentityV1, MetricMeasurementQualityV1,
-    StableEventIdentityV1, BURN_IN_CONTRACT_V1_CANONICAL_HASH,
+    MetricContractAuditTerminalClassV1, MetricContractCutoverScopeV1,
+    MetricContractDecisionSummaryV1, MetricContractEvidenceTransportV1,
+    MetricEvidenceRecordIdentityV1, MetricMeasurementQualityV1, StableEventIdentityV1,
+    BURN_IN_CONTRACT_V2_CANONICAL_HASH, BURN_IN_CONTRACT_VERSION_V2,
     METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1,
     METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34, METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_PROJECTION_SERIALIZED_HARD_MAX_BYTES_V1,
     METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3, PR2C_COMPARATOR_P99_MAX_US,
     PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US, PR2C_LOGGER_ENQUEUE_WAIT_P99_MAX_US,
-    PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US, PR2C_SERIALIZE_P99_MAX_US,
+    PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +30,7 @@ use thiserror::Error;
 #[serde(deny_unknown_fields)]
 pub struct Pr2cSingleRunAuditReportV1 {
     pub terminal_class: MetricContractAuditTerminalClassV1,
+    pub cutover_scope: MetricContractCutoverScopeV1,
     pub run_id: Option<String>,
     pub run_start_ms: Option<u64>,
     pub run_end_ms: Option<u64>,
@@ -69,6 +71,7 @@ pub struct Pr2cSingleRunAuditReportV1 {
 #[serde(deny_unknown_fields)]
 pub struct Pr2cBundleAuditReportV1 {
     pub terminal_class: MetricContractAuditTerminalClassV1,
+    pub cutover_scope: MetricContractCutoverScopeV1,
     pub run_reports: Vec<Pr2cSingleRunAuditReportV1>,
     pub non_overlapping_runs: bool,
     pub consistent_provenance: bool,
@@ -218,6 +221,53 @@ fn validate_part_rows(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct FrozenRunProvenanceV1 {
+    run_id: String,
+    build_commit: String,
+    build_worktree_clean: bool,
+    gatekeeper_config_hash: String,
+    brain_config_hash: String,
+    rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode,
+    metric_contract_schema_version: u16,
+    projection_wire_version: u16,
+    evidence_schema_version: u16,
+    decision_schema_version: u32,
+    wire_schema_manifest_blake3: String,
+    burn_in_contract_version: u16,
+    burn_in_contract_canonical_hash: ghost_core::metric_contracts::CanonicalHashV1,
+    profile_id: String,
+    profile_hash: ghost_core::metric_contracts::CanonicalHashV1,
+    metric_contract_effective_config_hash: ghost_core::metric_contracts::CanonicalHashV1,
+    effective_config: ghost_core::metric_contracts::ResolvedMetricContractEffectiveConfigV1,
+}
+
+impl From<&MetricContractRotatedPartManifestV1> for FrozenRunProvenanceV1 {
+    fn from(part: &MetricContractRotatedPartManifestV1) -> Self {
+        Self {
+            run_id: part.run_id.clone(),
+            build_commit: part.build_commit.clone(),
+            build_worktree_clean: part.build_worktree_clean,
+            gatekeeper_config_hash: part.gatekeeper_config_hash.clone(),
+            brain_config_hash: part.brain_config_hash.clone(),
+            rollout_mode: part.rollout_mode,
+            metric_contract_schema_version: part.metric_contract_schema_version,
+            projection_wire_version: part.projection_wire_version,
+            evidence_schema_version: part.evidence_schema_version,
+            decision_schema_version: part.decision_schema_version,
+            wire_schema_manifest_blake3: part.wire_schema_manifest_blake3.clone(),
+            burn_in_contract_version: part.burn_in_contract_version,
+            burn_in_contract_canonical_hash: part.burn_in_contract_canonical_hash.clone(),
+            profile_id: part.profile_id.clone(),
+            profile_hash: part.profile_hash.clone(),
+            metric_contract_effective_config_hash: part
+                .metric_contract_effective_config_hash
+                .clone(),
+            effective_config: part.effective_config.clone(),
+        }
+    }
+}
+
 fn validate_manifest_parts(
     run_dir: &Path,
     manifest: &MetricContractRotationManifestV1,
@@ -231,6 +281,15 @@ fn validate_manifest_parts(
             "unsupported or incomplete rotation manifest".to_string(),
         ));
     }
+    let frozen_run_provenance = manifest
+        .summary_parts
+        .first()
+        .map(FrozenRunProvenanceV1::from)
+        .ok_or_else(|| {
+            Pr2cAuditErrorV1::PartIntegrity(
+                "rotation manifest has no provenance anchor".to_string(),
+            )
+        })?;
     for (summary, evidence) in manifest.summary_parts.iter().zip(&manifest.evidence_parts) {
         if summary.stream != "decision_v34"
             || summary.schema != "metric_contract_decision_v34"
@@ -263,6 +322,13 @@ fn validate_manifest_parts(
                 "summary/evidence rotated-part provenance mismatch".to_string(),
             ));
         }
+        if FrozenRunProvenanceV1::from(summary) != frozen_run_provenance
+            || FrozenRunProvenanceV1::from(evidence) != frozen_run_provenance
+        {
+            return Err(Pr2cAuditErrorV1::PartIntegrity(
+                "rotated parts do not share one frozen run provenance".to_string(),
+            ));
+        }
         if !valid_build_commit(&summary.build_commit)
             || !summary.build_worktree_clean
             || !valid_lower_hex(&summary.gatekeeper_config_hash, 64)
@@ -275,9 +341,9 @@ fn validate_manifest_parts(
             || summary.decision_schema_version != METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34
             || summary.wire_schema_manifest_blake3
                 != METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3
-            || summary.burn_in_contract_version != 1
+            || summary.burn_in_contract_version != BURN_IN_CONTRACT_VERSION_V2
             || summary.burn_in_contract_canonical_hash.as_str()
-                != BURN_IN_CONTRACT_V1_CANONICAL_HASH
+                != BURN_IN_CONTRACT_V2_CANONICAL_HASH
         {
             return Err(Pr2cAuditErrorV1::PartIntegrity(
                 "unknown, dirty, or incomplete run/build/schema/BURN provenance".to_string(),
@@ -300,6 +366,27 @@ fn validate_manifest_parts(
         return Err(Pr2cAuditErrorV1::PartIntegrity(
             "writer counters disagree with rotated-part row counts".to_string(),
         ));
+    }
+    let expected_samples = manifest.writer_stats.paired_commands_total;
+    for (name, histogram) in [
+        (
+            "logger_enqueue_wait_us",
+            &manifest.writer_stats.logger_enqueue_wait_us,
+        ),
+        (
+            "metric_contract_build_and_serialize_us",
+            &manifest.writer_stats.metric_contract_build_and_serialize_us,
+        ),
+        (
+            "projection_build_and_validate_us",
+            &manifest.writer_stats.projection_build_and_validate_us,
+        ),
+    ] {
+        histogram.validate(expected_samples).map_err(|error| {
+            Pr2cAuditErrorV1::PartIntegrity(format!(
+                "invalid or incomplete {name} histogram: {error}"
+            ))
+        })?;
     }
     let mut declared_file_names = BTreeSet::new();
     for parts in [&manifest.summary_parts, &manifest.evidence_parts] {
@@ -690,8 +777,11 @@ pub fn audit_pr2c_single_run_v1(
         paired_v34_total_bytes.saturating_add(paired_sidecar_total_bytes) as f64
             / paired_v33_total_bytes as f64
     };
+    // `metric_contract_serialize_us` remains durable diagnostic telemetry.
+    // The frozen BURN contract gates the continuous first-producer-to-final-
+    // bytes measurement instead of imposing a second, overlapping threshold
+    // on one implementation sub-step.
     let resource_failure = comparator_p99_us > PR2C_COMPARATOR_P99_MAX_US
-        || metric_contract_serialize_p99_us > PR2C_SERIALIZE_P99_MAX_US
         || metric_contract_build_and_serialize_p99_us
             > u64::from(PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US)
         || projection_build_and_validate_p99_us
@@ -739,6 +829,7 @@ pub fn audit_pr2c_single_run_v1(
         .map(|part| part.run_id.clone());
     Ok(Pr2cSingleRunAuditReportV1 {
         terminal_class,
+        cutover_scope: MetricContractCutoverScopeV1::MetricContractsV1_1ProfileAEquivalenceOnly,
         run_id,
         run_start_ms,
         run_end_ms,
@@ -818,7 +909,10 @@ pub fn audit_pr2c_bundle_v1(
                     "build_worktree_clean": part.build_worktree_clean,
                     "schema": part.schema,
                     "gatekeeper_config_hash": part.gatekeeper_config_hash,
-                    "brain_config_hash": part.brain_config_hash,
+                    // Brain config remains durable provenance and is frozen
+                    // within each run, but it is not an exact cross-run
+                    // equivalence gate. Gatekeeper/profile/effective-config
+                    // provenance below remains exact across the bundle.
                     "rollout_mode": part.rollout_mode,
                     "metric_contract_schema_version": part.metric_contract_schema_version,
                     "projection_wire_version": part.projection_wire_version,
@@ -913,6 +1007,7 @@ pub fn audit_pr2c_bundle_v1(
     };
     Ok(Pr2cBundleAuditReportV1 {
         terminal_class,
+        cutover_scope: MetricContractCutoverScopeV1::MetricContractsV1_1ProfileAEquivalenceOnly,
         run_reports: reports,
         non_overlapping_runs,
         consistent_provenance,
@@ -924,7 +1019,7 @@ pub fn audit_pr2c_bundle_v1(
     })
 }
 
-pub fn audit_pr2c_bundle_against_burn_in_contract_v1(
+pub fn audit_pr2c_bundle_against_burn_in_contract_v2(
     runs: &[(PathBuf, Vec<PathBuf>)],
     contract: &BurnInContractV1,
 ) -> Result<Pr2cBundleAuditReportV1, Pr2cAuditErrorV1> {
@@ -946,7 +1041,7 @@ pub fn audit_pr2c_bundle_against_burn_in_contract_v1(
             })
         {
             return Err(Pr2cAuditErrorV1::PartIntegrity(
-                "run manifest is not bound to the supplied BURN_IN_CONTRACT_V1".to_string(),
+                "run manifest is not bound to the supplied BURN_IN_CONTRACT_V2".to_string(),
             ));
         }
     }
@@ -955,7 +1050,7 @@ pub fn audit_pr2c_bundle_against_burn_in_contract_v1(
     let frozen_at_ms = chrono::DateTime::parse_from_rfc3339(&payload.frozen_at)
         .map_err(|_| {
             Pr2cAuditErrorV1::PartIntegrity(
-                "BURN_IN_CONTRACT_V1 frozen_at is not RFC3339".to_string(),
+                "BURN_IN_CONTRACT_V2 frozen_at is not RFC3339".to_string(),
             )
         })?
         .timestamp_millis();
@@ -1019,22 +1114,76 @@ pub fn audit_pr2c_bundle_against_burn_in_contract_v1(
         .run_reports
         .iter()
         .all(|run| run.terminal_class == MetricContractAuditTerminalClassV1::PassCutoverReady);
+    let enough_runs = report.run_reports.len() >= usize::from(payload.minimum_non_overlapping_runs);
+    let enough_buckets = buckets >= usize::from(payload.minimum_utc_4h_buckets);
+    let enough_aggregate_duration = aggregate_duration_ms >= payload.minimum_aggregate_duration_ms;
+    let enough_decisions = decisions >= payload.minimum_unique_decisions;
+    let enough_dev_known = dev_known >= payload.minimum_dev_known_decisions;
+    let enough_flip_evaluable = flip_evaluable >= payload.minimum_clean_flip_v2_evaluable;
+    let enough_dev_divergences = dev_divergences >= payload.minimum_real_dev_legacy_v2_divergences;
     let minima_pass = every_run_passed_before_aggregation
         && report.unique_run_ids
         && report.global_duplicate_record_identities == 0
-        && report.run_reports.len() >= usize::from(payload.minimum_non_overlapping_runs)
+        && enough_runs
         && each_run_duration_pass
-        && buckets >= usize::from(payload.minimum_utc_4h_buckets)
-        && aggregate_duration_ms >= payload.minimum_aggregate_duration_ms
-        && decisions >= payload.minimum_unique_decisions
-        && dev_known >= payload.minimum_dev_known_decisions
-        && flip_evaluable >= payload.minimum_clean_flip_v2_evaluable
-        && dev_divergences >= payload.minimum_real_dev_legacy_v2_divergences
+        && enough_buckets
+        && enough_aggregate_duration
+        && enough_decisions
+        && enough_dev_known
+        && enough_flip_evaluable
+        && enough_dev_divergences
         && prospective_rows_only;
     if !minima_pass {
-        report
-            .reasons
-            .push("BURN_IN_CONTRACT_V1 prospective minima not met".to_string());
+        if !enough_runs {
+            report
+                .reasons
+                .push("BURN_IN_CONTRACT_V2 minimum non-overlapping run count not met".to_string());
+        }
+        if !each_run_duration_pass {
+            report
+                .reasons
+                .push("BURN_IN_CONTRACT_V2 minimum per-run duration not met".to_string());
+        }
+        if !enough_buckets {
+            report.reasons.push(
+                "BURN_IN_CONTRACT_V2 minimum paired-decision UTC bucket count not met".to_string(),
+            );
+        }
+        if !enough_aggregate_duration {
+            report
+                .reasons
+                .push("BURN_IN_CONTRACT_V2 minimum aggregate duration not met".to_string());
+        }
+        if !enough_decisions {
+            report
+                .reasons
+                .push("BURN_IN_CONTRACT_V2 minimum unique decisions not met".to_string());
+        }
+        if !enough_dev_known {
+            report
+                .reasons
+                .push("BURN_IN_CONTRACT_V2 minimum dev-known decisions not met".to_string());
+        }
+        if !enough_flip_evaluable {
+            report
+                .reasons
+                .push("BURN_IN_CONTRACT_V2 minimum clean Flip V2 evidence not met".to_string());
+        }
+        if !enough_dev_divergences {
+            report.reasons.push(
+                "BURN_IN_CONTRACT_V2 minimum real dev divergence evidence not met".to_string(),
+            );
+        }
+        if !prospective_rows_only {
+            report
+                .reasons
+                .push("BURN_IN_CONTRACT_V2 contains a row at or before frozen_at".to_string());
+        }
+        if !every_run_passed_before_aggregation {
+            report.reasons.push(
+                "BURN_IN_CONTRACT_V2 requires every run to pass before aggregation".to_string(),
+            );
+        }
         if report.terminal_class == MetricContractAuditTerminalClassV1::PassCutoverReady {
             report.terminal_class = MetricContractAuditTerminalClassV1::NotEvaluable;
         }

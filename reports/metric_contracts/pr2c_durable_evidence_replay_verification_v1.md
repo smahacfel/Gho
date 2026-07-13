@@ -1,6 +1,6 @@
 # PR2C durable metric-contract evidence, replay i audit — raport weryfikacyjny
 
-Status: `PASS / READY FOR RE-REVIEW`
+Status: `SECOND REVIEW AMENDMENT / FULL VALIDATION PASS / READY FOR RE-REVIEW`
 
 Data: 2026-07-13
 
@@ -11,9 +11,10 @@ repository: smahacfel/Gho
 branch: agent/metric-contract-pr2c-durable-evidence-replay
 base: fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9
 merge-base: fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9
-reviewed previous head: fe9e51cc7ef21f235e9edf912ad2b0a3cc75073e
+first reviewed head: fe9e51cc7ef21f235e9edf912ad2b0a3cc75073e
+second reviewed head: 20c2a509ca624cf9074e0867cbcb86014a54afdf
 publication head: amendment commit containing this report; authoritative SHA is the PR head
-amendment commit message: metric-contracts: close PR2C durability audit gaps
+amendment commit message: metric-contracts: close remaining PR2C replay and resource gaps
 ```
 
 SHA commita nie może być wpisany do payloadu tego samego commita bez
@@ -40,73 +41,34 @@ macierzy. Normatywne decyzje amendmentu dokumentuje:
 
 ```text
 docs/ADR/ADR_8D_PR2C_REVIEW_BLOCKERS_DURABILITY_AUDIT_20260713.md
+docs/ADR/ADR_8D_PR2C_SECOND_REVIEW_DURABLE_EQUIVALENCE_RESOURCE_INTEGRITY_20260713.md
 ```
 
-## 2. Dokładna allowlista plików
-
-Zmodyfikowane:
-
-```text
-ghost-brain/Cargo.toml
-ghost-brain/src/oracle/decision_logger.rs
-ghost-brain/src/oracle/mod.rs
-ghost-core/Cargo.toml
-ghost-core/src/metric_contracts/effective_config.rs
-ghost-core/src/metric_contracts/evidence.rs
-ghost-core/src/metric_contracts/mod.rs
-ghost-core/src/metric_contracts/projection.rs
-ghost-launcher/Cargo.toml
-ghost-launcher/src/metric_contracts/mod.rs
-ghost-launcher/src/metric_contracts/pr2b.rs
-ghost-launcher/src/oracle_runtime.rs
-ghost-launcher/src/session/observation.rs
-ghost-launcher/tests/metric_contracts_pr2b_static_guards.rs
-ghost-launcher/tests/refactor_invariants_tests.rs
-```
-
-Nowe:
-
-```text
-docs/ADR/ADR_8D_PR2C_METRIC_CONTRACT_DURABLE_EVIDENCE_REPLAY_20260713.md
-ghost-brain/build.rs
-ghost-brain/src/oracle/metric_contract_writer.rs
-ghost-core/src/metric_contracts/pr2c.rs
-ghost-launcher/src/bin/metric_contract_audit.rs
-ghost-launcher/src/metric_contracts/pr2c.rs
-ghost-launcher/src/metric_contracts/pr2c_audit.rs
-ghost-launcher/src/metric_contracts/pr2c_replay.rs
-ghost-launcher/tests/common/metric_contracts_pr2c.rs
-ghost-launcher/tests/metric_contracts_pr2c_audit.rs
-ghost-launcher/tests/metric_contracts_pr2c_comparator.rs
-ghost-launcher/tests/metric_contracts_pr2c_durability.rs
-ghost-launcher/tests/metric_contracts_pr2c_replay.rs
-reports/metric_contracts/BURN_IN_CONTRACT_V1.json
-reports/metric_contracts/historical_feasibility_post_pr2c_v1.md
-reports/metric_contracts/metric_contract_wire_v1_schema_manifest.json
-reports/metric_contracts/pr2c_durable_evidence_replay_verification_v1.md
-```
-
-Staging jest wykonywany wyłącznie dla tej jawnej listy. Dwa machine-readable
-goldens są świadomie force-added, ponieważ katalog raportów ma regułę ignore.
-Nie użyto `git add .`.
-
-Amendment review zmienia dodatkowo:
+## 2. Dokładna allowlista plików całego PR względem base
 
 ```text
 .github/workflows/metric-contracts-pr2c.yml
 PLANS/DO_REALIZACJI/PLAN_KOREKTY_KONTRAKTOW_INTERPRETACJI_METRYK_V1_20260710.md
 docs/ADR/ADR_8D_PR2C_METRIC_CONTRACT_DURABLE_EVIDENCE_REPLAY_20260713.md
 docs/ADR/ADR_8D_PR2C_REVIEW_BLOCKERS_DURABILITY_AUDIT_20260713.md
+docs/ADR/ADR_8D_PR2C_SECOND_REVIEW_DURABLE_EQUIVALENCE_RESOURCE_INTEGRITY_20260713.md
+ghost-brain/Cargo.toml
 ghost-brain/build.rs
 ghost-brain/src/oracle/decision_logger.rs
 ghost-brain/src/oracle/metric_contract_writer.rs
+ghost-brain/src/oracle/mod.rs
 ghost-core/Cargo.toml
 ghost-core/src/metric_contracts/canonical_hash.rs
+ghost-core/src/metric_contracts/effective_config.rs
 ghost-core/src/metric_contracts/evidence.rs
+ghost-core/src/metric_contracts/mod.rs
 ghost-core/src/metric_contracts/pr2c.rs
 ghost-core/src/metric_contracts/projection.rs
 ghost-core/tests/metric_contracts_v1_1_foundation.rs
 ghost-core/tests/metric_contracts_v1_1_projection.rs
+ghost-launcher/Cargo.toml
+ghost-launcher/src/bin/metric_contract_audit.rs
+ghost-launcher/src/metric_contracts/mod.rs
 ghost-launcher/src/metric_contracts/pr2a.rs
 ghost-launcher/src/metric_contracts/pr2b.rs
 ghost-launcher/src/metric_contracts/pr2c.rs
@@ -121,20 +83,28 @@ ghost-launcher/tests/metric_contracts_pr2c_audit.rs
 ghost-launcher/tests/metric_contracts_pr2c_comparator.rs
 ghost-launcher/tests/metric_contracts_pr2c_durability.rs
 ghost-launcher/tests/metric_contracts_pr2c_replay.rs
-reports/metric_contracts/BURN_IN_CONTRACT_V1.json
+ghost-launcher/tests/refactor_invariants_tests.rs
+reports/metric_contracts/BURN_IN_CONTRACT_V2.json
+reports/metric_contracts/historical_feasibility_post_pr2c_v1.md
+reports/metric_contracts/metric_contract_wire_v1_schema_manifest.json
 reports/metric_contracts/pr2c_durable_evidence_replay_verification_v1.md
 ```
+
+Staging jest wykonywany wyłącznie dla tej jawnej listy oraz usunięcia
+nieautorytatywnego draftu `BURN_IN_CONTRACT_V1.json`. Dwa machine-readable
+goldens są świadomie force-added, ponieważ katalog raportów ma regułę ignore.
+Nie użyto `git add .`.
 
 ## 2.1 Zamknięcie uwag review
 
 | ID | Poprawka | Dowód regresyjny |
 | --- | --- | --- |
 | B-01 | exact current v33, join-first denominator, `(v34+sidecar)/v33` | unknown/padded v33 rejection; exact additive ratio |
-| B-02 | PR2B producers→pair→writer final bytes w jednej metryce | release production-path harness |
+| B-02 | jeden `Instant` od pierwszego canonical producer call do writer final bytes | intentional inter-boundary delay regression + release production-path harness |
 | B-03 | drift row jest trwały, nie structural error | real second evaluation→writer→manifest→`FAIL_POLICY_DRIFT` |
 | B-04 | exact v33/v34/evidence set equality | extra current v33→`FAIL_SCHEMA_OR_REPLAY` |
 | B-05 | source cutoff w semantic evidence hash | rehashed cutoff drift i global projection tamper rejection |
-| B-06 | unique run IDs/global identities/semantic minima/all row buckets/BURN binding | duplicate run/identity, degraded Flip i None/Some dev regressions |
+| B-06 | unique run IDs/global identities/semantic minima/all-row buckets/BURN V2 binding | direct public BURN minima/gate-change regressions |
 | B-07 | replay recomputuje contract sets, mask i counterfactual | każda mutacja v34 semantic summary odrzucona |
 | M-01 | second evaluator uruchamiany zawsze; brak authoritative→`NotEvaluable` | comparator not-evaluable regression |
 | M-02 | decision plane z v33 buy log | runtime source guard i identity tests |
@@ -142,8 +112,12 @@ reports/metric_contracts/pr2c_durable_evidence_replay_verification_v1.md
 | M-04 | real prefix short write | mid-row summary/evidence truncation regression |
 | M-05 | part/manifest/directory sync | finalization failure nie może twierdzić immutable run |
 | M-06 | exact lowercase commit, clean bit, no env SHA override | unknown/dirty provenance rejection |
-| M-07 | first/last/run/part/path metadata | rotation metadata/path confinement regression |
+| M-07 | first/last/run/part/path metadata i cross-part frozen provenance | two-part mutually-consistent provenance-B rejection |
 | M-08 | timestamp nadawany przez writer | evidence row metadata verification |
+
+Drugie review domknęło dodatkowo durable equivalence snapshots, closed
+histogram validation, typed `cutover_scope`, jednoznaczne BURN V2 versioning i
+zgodność plan/kod dla UTC bucketów oraz cross-run `brain_config_hash`.
 
 Nowy workflow GitHub Actions uruchamia pełną Rust matrix oraz osobny release
 resource job; correctness job instaluje jawnie wymagany przez static guards
@@ -209,6 +183,11 @@ semantic payloadu bez writer timestamp i rotation index, ale z niezależnym
 `MetricContractDecisionSourceCutoffV1`. Hash mismatch, unknown field, partial
 evidence, unsupported schema i invalid cutoff są odrzucane.
 
+Ten sam hash obejmuje `MetricContractPolicyEquivalenceEvidenceV1`: policy
+version, Gatekeeper config hash, comparator evaluability oraz authoritative i
+comparator normalized policy snapshots. Replay wylicza z nich deltas ponownie;
+zmiana v34 `Different → Equal` bez zmiany evidence jest odrzucana.
+
 ## 6. Paired writer i rotation
 
 Jeden `LogCommand::WriteMetricContractPair` trafia do istniejącej bounded queue.
@@ -219,6 +198,11 @@ writer boundary. Part data jest `sync_data()`, manifest temp jest `sync_all()`
 przed rename, a katalog jest `sync_all()` po rename. Pole `writer_finalized`
 staje się `true` wyłącznie po poprawnej finalizacji; failure pozostawia
 fail-closed, audit-rejectable manifest.
+
+Audit wymaga jednego exact provenance dla wszystkich rotowanych partów. Każdy
+histogram ma frozen bounds, checked bucket sum, `sample_count ==
+paired_commands_total` i spójne `max_us`/overflow; zmanipulowana lub brakująca
+próbka nie może przejść resource gate.
 
 Regresje obejmują:
 
@@ -267,6 +251,9 @@ contract sets, manipulation measured mask, counterfactual evaluability i
 counterfactual boolean. Unknown/partial schema i każdy context/summary mismatch
 są fail-closed.
 
+Replay recomputuje także exact `equivalence_deltas` z zahashowanych durable
+policy snapshots i sprawdza policy version oraz Gatekeeper config hash.
+
 ## 9. Comparator matrix
 
 | Lane | Exact porównanie | Drift |
@@ -293,7 +280,7 @@ Dev-primary i corrected FTDI lanes wymagają Value/Value. Null po którejkolwiek
 stronie jest `NotEvaluable`; rzeczywista różnica emituje
 `COUNTERFACTUAL_POLICY_DELTA_OBSERVED:<lane>:<identity>`.
 
-## 10. Single-run, bundle i BURN_IN_CONTRACT_V1
+## 10. Single-run, bundle i BURN_IN_CONTRACT_V2
 
 CLI terminal classes:
 
@@ -305,17 +292,23 @@ FAIL_POLICY_DRIFT
 FAIL_RESOURCE_BUDGET
 ```
 
-Bundle agreguje minima dopiero po per-run PASS. Frozen contract:
+Bundle agreguje minima dopiero po per-run PASS. Obowiązujący frozen contract:
 
 ```text
-owner approval identity: github:smahacfel:authorized-pr2c-task:2026-07-13
-frozen_at: 2026-07-13T13:47:21Z
-canonical SHA-256: 40872b8c1ab8fcd8ecb4b1612e35fcf9dc157cbb1109546c7490c7d006f00ffd
+burn_in_contract_version: 2
+owner approval identity: github:smahacfel:authorized-pr2c-5ms-amendment:2026-07-13
+frozen_at: 2026-07-13T17:53:14Z
+canonical SHA-256: 3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20
 ```
 
 Rows niepóźniejsze niż `frozen_at` nie są prospective validation evidence.
 Zmiana któregokolwiek gate’u wymaga nowego contract version/hash/freeze i nie
 może retroaktywnie zaliczyć rows starego contractu.
+
+Wcześniejszy payload V1 z limitem 1 ms był pre-run draftem i nigdy nie
+identyfikował prospective runu. Został wycofany, a autoryzowana zmiana limitów
+pełnego build+serialize i projection z 1 ms do 5 ms jest jawnie wersjonowana
+jako V2.
 
 Każdy finalized part manifest niesie exact BURN version/hash oraz Wire codebook
 hash. Bundle wymaga unikalnych run IDs, globalnie unikalnych full identities,
@@ -345,27 +338,34 @@ Komenda:
 cargo test --release -p ghost-launcher \
   --test metric_contracts_pr2c_durability \
   pr2c_release_resource_harness_reports_full_path_percentiles \
-  -- --nocapture
+  -- --exact --nocapture
 ```
 
-Release harness wykonał 200 iteracji dokładnej ścieżki produkcyjnej. Wynik:
+Release harness wykonał 16 warmup i 200 mierzonych iteracji dokładnej ścieżki
+produkcyjnej. Wynik:
 
 | Metryka | p50 | p95 | p99 |
 | --- | ---: | ---: | ---: |
-| `metric_contract_build_and_serialize_us` | 2 000 us | 2 000 us | 2 683 us |
-| complete snapshot build+validate | 611 us | 957 us | 1 153 us |
+| `metric_contract_build_and_serialize_us` | 3 545 us | 3 545 us | 3 545 us |
+| complete snapshot build+validate | 1 558 us | 1 963 us | 2 267 us |
 | context validation | 0 us | 0 us | 0 us |
-| evidence build | 31 us | 58 us | 82 us |
-| evidence validation | 5 us | 7 us | 9 us |
-| projection build+validate+hash | 573 us | 907 us | 1 087 us |
-| terminal pair construction | 416 us | 629 us | 794 us |
-| final summary+evidence serialization | 49 us | 75 us | 94 us |
-| comparator | 7 us | 19 us | 52 us |
+| evidence build | 25 us | 42 us | 51 us |
+| evidence validation | 4 us | 5 us | 7 us |
+| projection build+validate+hash | 476 us | 669 us | 733 us |
+| terminal pair construction | 373 us | 509 us | 630 us |
+| final summary+evidence serialization | 43 us | 67 us | 79 us |
+| comparator | 5 us | 8 us | 21 us |
 
 Rozmiary tego samego finalnego payloadu: Wire V1 p95/max `2 339 B`, sidecar
-p95/p99 `21 486 B`, v34 p95 `1 176 B`. Pełny p99 `2 683 us` i projection
-p99 `1 087 us` przechodzą autoryzowany gate `5 000 us`; comparator i finalna
-serializacja pozostają poniżej `1 000 us`.
+p95/p99 `22 180 B`, v34 p95 `1 176 B`. Pełny p99/max `3 545 us` i projection
+p99 `733 us` przechodzą autoryzowany gate `5 000 us`; comparator pozostaje
+poniżej `1 000 us`. `metric_contract_serialize_us` pozostaje trwałą diagnostyką
+podetapu (`79 us` p99); acceptance obejmuje go w jednym ciągłym full-path gate,
+bez nakładania drugiego progu na ten sam koszt.
+
+Frozen histogram ma konserwatywny overflow bucket powyżej `2 000 us`, dlatego
+dla pełnej ścieżki p50/p95/p99 raportują zaobserwowane `max_us=3 545` zamiast
+zaniżać percentyle. Jest to fail-closed wobec limitu `5 000 us`.
 
 Audit używa exact paired v33 rows. Addytywny storage ratio wynosi
 `(v34 + sidecar) / v33`; nie odejmuje `1.0` i nie przyjmuje padded/unknown v33.
@@ -391,17 +391,17 @@ identity i jest `NOT_EVALUABLE`; contribution do prospective counts wynosi 0.
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards` | PASS — 8/8 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2b_producers` | PASS — 16/16 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2b_static_guards` | PASS — 6/6 |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2c_durability` | PASS — 15/15 |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2c_replay` | PASS — 9/9 |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2c_durability` | PASS — 17/17 |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2c_replay` | PASS — 10/10 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2c_comparator` | PASS — 8/8 |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2c_audit` | PASS — 22/22 |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2c_audit` | PASS — 26/26 |
 | `cargo test -p ghost-launcher --test gatekeeper_policy_tests` | PASS — 46/46 |
 | `cargo test -p ghost-launcher --test gatekeeper_v25_regression` | PASS — 42/42 |
 | `cargo test -p ghost-launcher --test gatekeeper_v3_tests` | PASS — 9/9 |
 | `cargo test -p ghost-launcher --test session_lifecycle_tests` | PASS — 26/26 |
 | `cargo test -p ghost-launcher --test refactor_invariants_tests` | PASS — 12/12 |
 | `cargo test -p ghost-brain --lib replay_payload` | PASS — 5/5 |
-| release resource harness | PASS — 1/1, 200 iterations, full-path p99 `2 683 us` |
+| release resource harness | PASS — 1/1, 16 warmup + 200 measured, full-path p99/max `3 545 us` |
 | bounded queue resource filter | PASS — 1/1 |
 | `cargo check -p ghost-core` | PASS |
 | `cargo check -p ghost-launcher` | PASS |
@@ -409,7 +409,7 @@ identity i jest `NOT_EVALUABLE`; contribution do prospective counts wynosi 0.
 | targeted Clippy: core tests, launcher PR2A/PR2B/PR2C tests, brain lib | PASS po wyłączeniu jednego udowodnionego baseline lintu |
 | `cargo fmt --all -- --check` | PASS po finalnym formatowaniu |
 | `git diff --check` | PASS |
-| `git diff --cached --check` | wykonywany po jawym stagingu |
+| `git diff --cached --check` | PASS po jawnym stagingu |
 
 Clippy dla dokładnego changed scope bez wyjątku kończy się na jednej
 niezmienionej powierzchni:
@@ -486,7 +486,7 @@ PR2C_COUNTERFACTUAL_DIAGNOSTIC_PASS
 PR2C_SINGLE_RUN_AUDIT_PASS
 PR2C_BUNDLE_AUDIT_PASS
 PR2C_RESOURCE_GATES_PASS
-BURN_IN_CONTRACT_V1_FROZEN
+BURN_IN_CONTRACT_V2_FROZEN
 GATEKEEPER_POLICY_UNCHANGED
 V3_V1_REPLAY_UNCHANGED
 TYPE5_NOT_STARTED

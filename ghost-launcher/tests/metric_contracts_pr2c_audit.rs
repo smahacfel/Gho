@@ -13,12 +13,15 @@ use ghost_brain::oracle::{
     MetricContractPairedWriterConfigV1, MetricContractPairedWriterStatsV1,
     MetricContractPairedWriterV1,
 };
-use ghost_core::metric_contracts::MetricContractAuditTerminalClassV1;
+use ghost_core::metric_contracts::{
+    BurnInContractV1, MetricContractAuditTerminalClassV1, MetricContractCutoverScopeV1,
+};
 use ghost_launcher::components::gatekeeper_policy::{
     build_assessment_from_features, evaluate_policy_from_assessment, PolicyEvaluationContext,
 };
 use ghost_launcher::metric_contracts::{
-    audit_pr2c_bundle_v1, audit_pr2c_single_run_v1, pr2c_policy_equivalence_snapshot_v1,
+    audit_pr2c_bundle_against_burn_in_contract_v2, audit_pr2c_bundle_v1, audit_pr2c_single_run_v1,
+    pr2c_policy_equivalence_snapshot_v1,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -38,18 +41,28 @@ async fn write_run(run_id: &str, join_key: &str) -> (tempfile::TempDir, std::pat
 }
 
 async fn write_pair_run(
-    pair: ghost_core::metric_contracts::MetricContractPairedRecordV1,
+    mut pair: ghost_core::metric_contracts::MetricContractPairedRecordV1,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let stats = Arc::new(MetricContractPairedWriterStatsV1::default());
     stats.record_enqueue_wait_us(1);
-    let config = MetricContractPairedWriterConfigV1::new(
+    let mut config = MetricContractPairedWriterConfigV1::new(
         temp.path().to_path_buf(),
         "fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9",
     );
+    // The public constructor deliberately fails closed. Audit fixtures model
+    // the production DecisionLogger boundary, which supplies an attested
+    // clean-tree bit from build-time Git provenance.
+    config.build_worktree_clean = true;
     let mut writer = MetricContractPairedWriterV1::open(config, stats)
         .await
         .unwrap();
+    // These audit fixtures receive a prebuilt pair and therefore cannot
+    // preserve a meaningful producer-start clock across fixture setup. Start
+    // their synthetic one-record resource sample at the writer boundary. The
+    // dedicated durability harness separately proves the real continuous
+    // producer -> pair -> writer clock.
+    pair.metric_contract_full_path_started = std::time::Instant::now();
     writer.write_pair(pair.clone()).await.unwrap();
     writer.finalize().await.unwrap();
     let v33_path = temp.path().join("gatekeeper_v2_decisions.jsonl");
@@ -80,6 +93,14 @@ async fn single_run_audit_verifies_manifest_pair_projection_replay_and_resources
         "{report:#?}"
     );
     assert_eq!(report.replayed_rows, 1);
+    assert_eq!(
+        report.cutover_scope,
+        MetricContractCutoverScopeV1::MetricContractsV1_1ProfileAEquivalenceOnly
+    );
+    assert_eq!(
+        serde_json::to_value(&report).unwrap()["cutover_scope"],
+        Value::String("metric_contracts_v1_1_profile_a_equivalence_only".to_string())
+    );
     assert_eq!(report.missing_pairs, 0);
     assert_eq!(report.policy_drift_rows, 0);
     assert!((report.combined_bytes_delta_ratio - expected_additive_delta).abs() < f64::EPSILON);
@@ -541,15 +562,179 @@ async fn audit_validates_rotation_row_metadata_and_confines_part_paths_to_run_di
 }
 
 #[tokio::test]
+async fn audit_rejects_incomplete_or_reinterpreted_resource_histograms() {
+    for mutation in [
+        "bounds",
+        "sample-count",
+        "bucket-sum",
+        "max",
+        "missing-sample",
+    ] {
+        let (run, v33) = write_run("histogram-run", mutation).await;
+        let manifest_path = run
+            .path()
+            .join(ghost_brain::oracle::METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE);
+        let mut manifest: ghost_brain::oracle::MetricContractRotationManifestV1 =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let histogram = &mut manifest.writer_stats.metric_contract_build_and_serialize_us;
+        match mutation {
+            "bounds" => histogram.bucket_upper_bounds_us[0] = 3,
+            "sample-count" => {
+                histogram.sample_count += 1;
+                histogram.bucket_counts[0] += 1;
+            }
+            "bucket-sum" => histogram.bucket_counts[0] += 1,
+            "max" => histogram.max_us = 0,
+            "missing-sample" => {
+                histogram.bucket_counts = [0; 13];
+                histogram.sample_count = 0;
+                histogram.max_us = 0;
+            }
+            _ => unreachable!(),
+        }
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            audit_pr2c_single_run_v1(run.path(), &[v33]).is_err(),
+            "audit accepted mutated {mutation} histogram"
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit_rejects_mutually_consistent_part_one_with_different_run_provenance() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = paired_fixture("two-part-run", "join-a");
+    let second = paired_fixture("two-part-run", "join-b");
+    let stats = Arc::new(MetricContractPairedWriterStatsV1::default());
+    stats.record_enqueue_wait_us(1);
+    stats.record_enqueue_wait_us(1);
+    let mut config = MetricContractPairedWriterConfigV1::new(
+        temp.path().to_path_buf(),
+        "fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9",
+    );
+    config.build_worktree_clean = true;
+    config.rotation_max_bytes = 1;
+    let mut writer = MetricContractPairedWriterV1::open(config, stats)
+        .await
+        .unwrap();
+    writer.write_pair(first.clone()).await.unwrap();
+    writer.write_pair(second.clone()).await.unwrap();
+    writer.finalize().await.unwrap();
+
+    let v33 = temp.path().join("gatekeeper_v2_decisions.jsonl");
+    std::fs::write(
+        &v33,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&current_v33_log(&first)).unwrap(),
+            serde_json::to_string(&current_v33_log(&second)).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let manifest_path = temp
+        .path()
+        .join(ghost_brain::oracle::METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE);
+    let mut manifest: ghost_brain::oracle::MetricContractRotationManifestV1 =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest.summary_parts.len(), 2);
+    let different_valid_commit = "a".repeat(40);
+    manifest.summary_parts[1].build_commit = different_valid_commit.clone();
+    manifest.evidence_parts[1].build_commit = different_valid_commit;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    assert!(audit_pr2c_single_run_v1(temp.path(), &[v33]).is_err());
+}
+
+#[tokio::test]
+async fn public_burn_v2_audit_enforces_run_bucket_and_prospective_minima() {
+    let contract: BurnInContractV1 = serde_json::from_str(include_str!(
+        "../../reports/metric_contracts/BURN_IN_CONTRACT_V2.json"
+    ))
+    .unwrap();
+    let (run, v33) = write_run("run-a", "join-a").await;
+    let report = audit_pr2c_bundle_against_burn_in_contract_v2(
+        &[(run.path().to_path_buf(), vec![v33])],
+        &contract,
+    )
+    .unwrap();
+    assert_eq!(
+        report.cutover_scope,
+        MetricContractCutoverScopeV1::MetricContractsV1_1ProfileAEquivalenceOnly
+    );
+    assert_eq!(
+        report.terminal_class,
+        MetricContractAuditTerminalClassV1::NotEvaluable
+    );
+    for expected in [
+        "minimum non-overlapping run count not met",
+        "minimum paired-decision UTC bucket count not met",
+        "contains a row at or before frozen_at",
+    ] {
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains(expected)),
+            "missing typed BURN V2 failure {expected}: {report:#?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn public_burn_v2_audit_rejects_gate_hash_change_binding() {
+    let contract: BurnInContractV1 = serde_json::from_str(include_str!(
+        "../../reports/metric_contracts/BURN_IN_CONTRACT_V2.json"
+    ))
+    .unwrap();
+    let (run, v33) = write_run("burn-binding-run", "burn-binding-join").await;
+    let manifest_path = run
+        .path()
+        .join(ghost_brain::oracle::METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE);
+    let mut manifest: ghost_brain::oracle::MetricContractRotationManifestV1 =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let changed_hash =
+        ghost_core::metric_contracts::CanonicalHashV1::parse("0".repeat(64)).unwrap();
+    for part in manifest
+        .summary_parts
+        .iter_mut()
+        .chain(manifest.evidence_parts.iter_mut())
+    {
+        part.burn_in_contract_canonical_hash = changed_hash.clone();
+    }
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    assert!(audit_pr2c_bundle_against_burn_in_contract_v2(
+        &[(run.path().to_path_buf(), vec![v33])],
+        &contract,
+    )
+    .is_err());
+}
+
+#[tokio::test]
 async fn duplicate_full_record_identity_is_rejected_within_one_run() {
     let temp = tempfile::tempdir().unwrap();
     let pair = paired_fixture("run-a", "join-a");
     let stats = Arc::new(MetricContractPairedWriterStatsV1::default());
     stats.record_enqueue_wait_us(1);
-    let config = MetricContractPairedWriterConfigV1::new(
+    stats.record_enqueue_wait_us(1);
+    let mut config = MetricContractPairedWriterConfigV1::new(
         temp.path().to_path_buf(),
         "fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9",
     );
+    config.build_worktree_clean = true;
     let mut writer = MetricContractPairedWriterV1::open(config, stats)
         .await
         .unwrap();

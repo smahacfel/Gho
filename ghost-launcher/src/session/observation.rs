@@ -2783,6 +2783,11 @@ impl PoolObservationSession {
             materialized.checkpoint_features.bonding_progress = fallback_bonding_progress;
         }
 
+        // Normative PR2C full-path timer: start before the first canonical
+        // metric-contract producer and carry the same start proof through the
+        // one frozen snapshot. Pair construction later adds the real second
+        // policy evaluation and the writer adds final-byte serialization.
+        let metric_contract_full_path_started = Instant::now();
         let fingerprint_metrics = self.fingerprint_metrics();
         if let Some(fingerprint) = fingerprint_metrics.as_ref() {
             materialized.alpha_fingerprint = AlphaFingerprintFeatures {
@@ -2949,7 +2954,7 @@ impl PoolObservationSession {
             .as_ref()
             .and_then(|fingerprint| fingerprint.flipper_presence_ratio);
         let complete =
-            crate::metric_contracts::build_pr2b_timed_complete_metric_contract_snapshot_with_validated_static_context_v1(
+            crate::metric_contracts::build_pr2b_timed_complete_metric_contract_snapshot_from_producer_start_with_validated_static_context_v1(
                 crate::metric_contracts::Pr2bFrozenProducerInputsV1 {
                     pr2a: crate::metric_contracts::Pr2aFrozenProducerInputsV1 {
                         ftdi: &sybil_computation.ftdi,
@@ -2968,6 +2973,7 @@ impl PoolObservationSession {
                 },
                 static_context,
                 source_cutoff,
+                metric_contract_full_path_started,
             )?;
         materialized.metric_contract_decision_projection_v1 =
             Some(complete.snapshot().compact_projection.clone());

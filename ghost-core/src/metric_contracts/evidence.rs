@@ -1,10 +1,10 @@
 use super::{
     CanonicalHashErrorV1, CanonicalHashV1, CanonicalNullableV1, CanonicalU128StringV1,
     CanonicalU64StringV1, MetricAvailabilityV1, MetricContractDecisionSourceCutoffV1,
-    MetricContractId, MetricContractProfileIdV1, MetricContractProfileV1,
-    MetricContractRolloutMode, MetricEvidenceEnvelopeErrorV1, MetricEvidenceEnvelopeV1,
-    MetricEvidenceReasonV1, MetricEvidenceRecordIdentityV1, MetricMeasurementQualityV1,
-    MetricSurfaceId, StableEventIdentityV1,
+    MetricContractId, MetricContractPolicyEquivalenceEvidenceV1, MetricContractProfileIdV1,
+    MetricContractProfileV1, MetricContractRolloutMode, MetricEvidenceEnvelopeErrorV1,
+    MetricEvidenceEnvelopeV1, MetricEvidenceReasonV1, MetricEvidenceRecordIdentityV1,
+    MetricMeasurementQualityV1, MetricSurfaceId, StableEventIdentityV1,
 };
 use crate::checkpoint::EvidenceStatus;
 use crate::tx_intelligence::types::FscEvidenceStatus;
@@ -1395,6 +1395,10 @@ pub struct MetricContractEvidenceHashPayloadV1 {
     pub profile_id: MetricContractProfileIdV1,
     pub profile_hash: CanonicalHashV1,
     pub metric_contract_effective_config_hash: CanonicalHashV1,
+    /// Durable normalized policy inputs.  Replay derives the compact-v34
+    /// equivalence delta vector from this content-addressed evidence instead
+    /// of trusting the summary row.
+    pub policy_equivalence: MetricContractPolicyEquivalenceEvidenceV1,
     pub contracts: MetricContractsEvidenceSetV1,
 }
 
@@ -1414,6 +1418,9 @@ impl MetricContractEvidenceHashPayloadV1 {
         if self.source_cutoff.decision_timestamp_ms.get() == 0 {
             return Err(MetricContractEvidenceTransportErrorV1::InvalidSourceCutoff);
         }
+        self.policy_equivalence
+            .validate()
+            .map_err(|_| MetricContractEvidenceTransportErrorV1::PolicyEquivalenceInvariant)?;
         let profile = super::MetricContractFoundationConfigV1 {
             metric_contract_rollout_mode: self.rollout_mode,
             metric_contract_profile: self.profile_id,
@@ -1447,6 +1454,8 @@ pub enum MetricContractEvidenceTransportErrorV1 {
     HashMismatch,
     #[error("metric contract evidence source cutoff is invalid")]
     InvalidSourceCutoff,
+    #[error("metric contract evidence contains invalid policy-equivalence snapshots")]
+    PolicyEquivalenceInvariant,
 }
 
 /// Transport wrapper is deliberately separate from the semantic hash payload.

@@ -566,14 +566,17 @@ wyłącznie jawnie nazwanymi diagnostykami i nie wpływają na PASS. Kompresja n
 jest częścią gate'u.
 
 ```text
-metric_contract_projection_build_and_validate_us p99 <= 1_000 us
+metric_contract_projection_build_and_validate_us p99 <= 5_000 us
 metric_contract_projection_serialized_bytes p95 <= 12 KiB
 metric_contract_projection_serialized_bytes hard max <= 16 KiB
 projection build failures = 0
 projection/full-snapshot parity failures = 0
 ```
 
-Build/validation time wchodzi także do istniejącego
+Limit `5_000 us` jest wartością obowiązującą po autoryzowanym amendmencie PR2C
+z 2026-07-13 i zastępuje historyczny draft `1_000 us`; w tym planie nie
+obowiązuje równoległy limit 1 ms dla tej samej metryki. Build/validation time
+wchodzi także do istniejącego
 `metric_contract_build_and_serialize_us`; limity nie sumują osobnych budżetów.
 Przekroczenie hard max lub utrata detail przez próbę zmieszczenia pełnego
 sidecara daje `FAIL_RESOURCE_BUDGET`, nie silent truncation. Wyjątkiem są tylko
@@ -870,8 +873,11 @@ chyba że odrębny, zahashowany partition contract formalnie dowodzi rozłączno
 źródeł i przedziałów.
 
 Sidecar zawiera wszystkie 10 typed contracts, profile/config/schema versions,
-authoritative result, equivalence candidate, semantic counterfactual i payload
-SHA-256 liczony przez `CanonicalHashV1`.
+authoritative normalized policy snapshot, comparator normalized policy snapshot,
+comparator evaluability, policy version, Gatekeeper config hash, semantic
+counterfactual i payload SHA-256 liczony przez `CanonicalHashV1`. Replay
+recomputuje exact `equivalence_deltas` z tych zahashowanych snapshotów i wymaga
+ich równości z compact v34; SHA partu nie zastępuje tego semantic cross-checku.
 
 Decision summary i sidecar row są przekazywane jednym logicznym commandem do
 bounded queue. Zapis do dwóch plików nie jest udawany jako atomowy; orphan/missing
@@ -880,16 +886,34 @@ pair dyskwalifikuje run. Send/writer/ENOSPC/missing-pair mają osobne liczniki.
 Wszystkie rotowane parts mają row/byte counts i SHA-256 w manifeście. Replay v2
 łączy sidecar po identity/hash. Replay v1 pozostaje zgodny ze starym payloadem.
 
+Każdy part jednego runu musi mieć dokładnie jedno frozen provenance (build/clean
+bit, config hashes, rollout, schemas, Wire manifest, BURN binding, profile i
+effective config). Histogramy resource są integralną częścią manifestu:
+obowiązuje frozen bucket codebook, suma bucketów równa `sample_count`, liczba
+próbek równa liczbie zaakceptowanych paired commands oraz spójne `max_us` i
+overflow semantics.
+
 ### 4.2 Resource acceptance
 
-**Autoryzowany amendment PR2C (2026-07-13).** Pierwotny limit 1 ms dla
+**Autoryzowany amendment PR2C (2026-07-13; supersedes §2.6.5).** Pierwotny limit 1 ms dla
 pełnego build+serialize oraz kompletnej projection build/validation okazał się
 nieadekwatny do jawnie mierzonej ścieżki obejmującej wszystkich producentów,
 pełne evidence, semantic validation, canonical hash i finalne bajty. Limit nie
 może być spełniany przez przesunięcie początku timera za producer boundary.
-Zamrożony gate wynosi 5 ms p99 dla tych dwóch pełnych zakresów. Comparator i
-bounded enqueue zachowują ostrzejszy limit 1 ms p99. Amendment nie zmienia
-schema, policy, authority ani rollout mode.
+Zamrożony gate wynosi 5 ms p99 dla tych dwóch pełnych zakresów. Jeden monotonic
+timer zaczyna się bezpośrednio przed pierwszym canonical producer call, jest
+przenoszony przez frozen snapshot, rzeczywistą drugą ewaluację comparatora i
+terminal pair construction, a kończy się dopiero po utworzeniu dokładnych
+finalnych bajtów v34 oraz evidence przez writera. Nie sumuje niezależnych
+timerów i nie pomija przerw między boundary. Comparator i bounded enqueue
+zachowują ostrzejszy limit 1 ms p99. Amendment nie zmienia schema, policy,
+authority ani rollout mode.
+
+Wcześniejszy payload nazwany `BURN_IN_CONTRACT_V1`, zawierający draft limitu
+1 ms, nigdy nie stał się kontraktem obowiązującym dla prospective runu. Zmiana
+gate'u jest mimo tego wersjonowana fail-closed: obowiązujący artifact to
+`BURN_IN_CONTRACT_V2`, ma nowy `frozen_at` i canonical hash, a żaden run związany
+z V1 nie kwalifikuje się do V2.
 
 ```text
 comparator_elapsed_us p99 <= 1_000 us
@@ -901,6 +925,12 @@ dropped rows = 0
 writer failures = 0
 orphan summaries/evidence = 0
 ```
+
+`metric_contract_serialize_us` pozostaje trwałą diagnostyką podetapu v34.
+Nie ma osobnego, nakładającego się progu acceptance: exact final serialization
+jest już objęta jednym ciągłym
+`metric_contract_build_and_serialize_us <= 5_000 us` od pierwszego canonical
+producer call do finalnych bajtów.
 
 Rozmiar:
 
@@ -1038,7 +1068,8 @@ candidate, no live reads, no unbounded state, no saturating order concealment.
 - single-run i bundle audit CLI;
 - manifests/rotation/SHA/resource telemetry;
 - historical feasibility po istnieniu referencyjnych V2 producerów;
-- zamrożenie `BURN_IN_CONTRACT_V1` przed prospektywnymi runami.
+- zamrożenie `BURN_IN_CONTRACT_V2` przed prospektywnymi runami; V1 pozostaje
+  wyłącznie superseded pre-run draftem.
 
 Comparator używa tego samego frozen MFS/config. Nie czyta live state, nie trzyma
 locka przez await, nie emituje drugiego terminal eventu, nie uruchamia IWIM ani
@@ -1056,11 +1087,15 @@ Burn-in startuje dopiero po zamrożeniu contractu. Niezmienna struktura:
 
 - co najmniej 3 immutable, niepokrywające się runy;
 - każdy run minimum 1 h;
-- co najmniej dwa `utc_4h_bucket = floor(run_start_ms / 14_400_000)`;
+- co najmniej dwa `utc_4h_bucket = floor(paired_decision_timestamp_ms /
+  14_400_000)` wyprowadzone z całego zbioru poprawnie sparowanych decision rows,
+  nie tylko z początku runu;
 - ten sam build commit, profile ID/hash, metric schema, Gatekeeper config hash
   oraz `metric_contract_effective_config_hash`;
 - `brain_config_hash` jest zachowany dla provenance, ale jego pełna równość nie
   jest wymagana, jeśli effective hash i pozostałe bundle hashes są identyczne;
+- `brain_config_hash` musi być frozen i identyczny we wszystkich partach jednego
+  runu; wyjątek dotyczy wyłącznie porównania różnych runów w bundle;
 - każdy run osobno przechodzi full replay/schema/hash/resource gates;
 - minima agregowane dopiero po per-run PASS;
 - duplicate record identity `(run_id, join_key, decision_plane)` w runie lub
@@ -1115,7 +1150,8 @@ Procedura:
 
 1. Historical dataset otrzymuje `FEASIBILITY_ONLY` i manifest SHA.
 2. Audit generuje exact minima oraz uzasadnienie.
-3. Właściciel planu jawnie zatwierdza `BURN_IN_CONTRACT_V1`.
+3. Właściciel planu jawnie zatwierdza bieżącą wersję `BURN_IN_CONTRACT`; dla
+   niniejszego gate'u jest to `BURN_IN_CONTRACT_V2`.
 4. Contract otrzymuje version/hash/`frozen_at`.
 5. Do bundle kwalifikują się tylko decyzje po `frozen_at`.
 6. Feasibility rows nigdy nie zwiększają validation counts.

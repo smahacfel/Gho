@@ -114,7 +114,7 @@ fn terminal_snapshot_has_exactly_one_canonical_producer_call_per_family() {
         "self.metric_contract_recent_buy_sell_snapshot()?",
         ".flip_v2_snapshot(decision_timestamp_ms, decision_slot)",
         ".metric_contract_reserve_velocity_snapshot(&self.base_mint)",
-        "build_pr2b_timed_complete_metric_contract_snapshot_with_validated_static_context_v1(",
+        "build_pr2b_timed_complete_metric_contract_snapshot_from_producer_start_with_validated_static_context_v1(",
     ] {
         assert_eq!(body.matches(needle).count(), 1, "producer call {needle}");
     }
@@ -128,6 +128,14 @@ fn terminal_snapshot_has_exactly_one_canonical_producer_call_per_family() {
             .count(),
         0,
         "terminal production must use the exact prevalidated immutable context boundary"
+    );
+    assert_eq!(
+        body.matches(
+            "build_pr2b_timed_complete_metric_contract_snapshot_with_validated_static_context_v1(",
+        )
+        .count(),
+        0,
+        "terminal production must not move the full-path timer behind canonical producers"
     );
 }
 

@@ -24,6 +24,9 @@ Raport dowodowy:
 Amendment po blocking review:
 `docs/ADR/ADR_8D_PR2C_REVIEW_BLOCKERS_DURABILITY_AUDIT_20260713.md`
 
+Amendment po drugim review:
+`docs/ADR/ADR_8D_PR2C_SECOND_REVIEW_DURABLE_EQUIVALENCE_RESOURCE_INTEGRITY_20260713.md`
+
 Poziom ryzyka: `HIGH`. Zmiana przecina terminalną materializację, DecisionLogger,
 durable JSONL, replay i narzędzia audytowe. Ryzyko wpływu na decyzje jest
 ograniczone przez rollout `Legacy`, niezmienione authority Profile A, osobny
@@ -78,8 +81,11 @@ wywołania PR2B, którego projection została atomowo przypisana do MFS. Termina
 logger konsumuje snapshot raz. Nie czyta ponownie transakcji, indeksów, zegara
 producenta ani live owner state; nie rekonstruuje full evidence z projection.
 
-Runtime-only timing jest przechowywany obok, a nie wewnątrz snapshotu. Dzięki
-temu losowe czasy wykonania nie wpływają na equality, serde ani semantic hash.
+Runtime-only monotonic start jest przechowywany obok, a nie wewnątrz semantic
+snapshotu. Powstaje bezpośrednio przed pierwszym canonical producer call i jest
+przenoszony aż do writer-owned final bytes. Dzięki temu przerwy między
+materializacją, comparatorem i writerem nie znikają z pomiaru, a losowe czasy
+wykonania nadal nie wpływają na equality, serde ani semantic hash.
 
 Stable underlying-event identity pochodzi wyłącznie z source signature
 pool-creation transaction, gdy ingest ją dostarcza. Nie jest wyprowadzana z
@@ -101,6 +107,9 @@ Full sidecar `metric_contract_evidence_v1.jsonl` używa istniejących:
 `evidence_sha256` jest SHA-256 canonical semantic payloadu bez writer timestamp
 i rotation part, ale z niezależnym durable `source_cutoff`. Konstrukcja oraz
 deserializacja wykonują profile, envelope, family semantic i hash validation.
+Payload utrwala również authoritative/comparator normalized policy snapshots,
+comparator evaluability, policy version i Gatekeeper config hash. Replay
+recomputuje z nich exact `equivalence_deltas` zamiast ufać v34.
 Exact effective-config payload jest
 utrwalony w rotation manifest i musi odpowiadać hashom v34/evidence w replayu.
 
@@ -136,6 +145,10 @@ finalizacji; audit nie uznaje nadal mutable manifestu za immutable run. Audit
 odrzuca brakujący, dodatkowy, zmieniony, ucięty, nieciągły lub niesparowany
 part oraz path wychodzący poza run directory.
 
+Part 0 zamraża run provenance; każdy kolejny summary/evidence part musi być mu
+exact równy. Histogramy wymagają frozen bucket codebooku, checked sumy bucketów,
+jednej próbki na paired command oraz spójnego `max_us`/overflow.
+
 ## 6. Record identity i collision contract
 
 Duplicate record identity oznacza wyłącznie identyczne:
@@ -170,6 +183,8 @@ Normalizer porównuje exact:
 Dowolny drift jest poprawnym, trwałym wynikiem komparatora: v34 i sidecar są
 zapisywane, replay przechodzi, a audit zwraca `FAIL_POLICY_DRIFT`. Brak
 porównywalnej authoritative decyzji daje `NotEvaluable`, nie fikcyjne `Equal`.
+Replay wymaga exact równości v34 deltas z deltami ponownie wyliczonymi z
+zahashowanych durable policy snapshots.
 Semantic counterfactual lane obserwuje wyłącznie dev-primary i corrected FTDI
 actionability. Dwie obecne, różne wartości emitują typed
 `COUNTERFACTUAL_POLICY_DELTA_OBSERVED:<lane>:...`; brak którejkolwiek wartości
@@ -192,8 +207,9 @@ Replay v2:
 6. wymaga exact domain equality z decision-time MFS projection;
 7. wymaga identycznego canonical semantic projection hash;
 8. wykonuje Wire V1 round-trip po sprawdzeniu codebook manifestu;
-9. recomputuje v34 contract sets, measured mask i counterfactual semantics;
-10. odrzuca unknown/partial schema i każdy context/cutoff/summary drift.
+9. recomputuje equivalence deltas z durable policy snapshots;
+10. recomputuje v34 contract sets, measured mask i counterfactual semantics;
+11. odrzuca unknown/partial schema i każdy context/cutoff/summary drift.
 
 Transportowe timestampy i rotation index nie uczestniczą w domain equality.
 
@@ -212,27 +228,31 @@ FAIL_RESOURCE_BUDGET
 
 Per-run replay/resource PASS następuje przed agregacją bundle. Single-run
 wymaga exact bijekcji current v33 ↔ v34 ↔ evidence. Bundle sprawdza unikalne
-run IDs, globalne full identities, build cleanliness, Gatekeeper/brain config,
+run IDs, globalne full identities, build cleanliness, Gatekeeper config,
 rollout, profile, schemas, Wire/BURN hashes, effective-config, non-overlap, UTC
 buckets wszystkich paired cutoffów, stable-event collisions oraz semantic
-minima frozen burn-in contractu.
+minima frozen burn-in contractu. `brain_config_hash` jest frozen w obrębie
+jednego runu, lecz provenance-only pomiędzy runami. Każdy raport zawiera typed
+`cutover_scope = metric_contracts_v1_1_profile_a_equivalence_only`.
 
-## 10. BURN_IN_CONTRACT_V1
+## 10. BURN_IN_CONTRACT_V2
 
 Machine-readable frozen contract:
-`reports/metric_contracts/BURN_IN_CONTRACT_V1.json`
+`reports/metric_contracts/BURN_IN_CONTRACT_V2.json`
 
 Canonical hash:
 
 ```text
-40872b8c1ab8fcd8ecb4b1612e35fcf9dc157cbb1109546c7490c7d006f00ffd
+3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20
 ```
 
 Contract utrwala minimum 3 niepokrywających się runów, 1 h per run, dwa UTC
 4-hour buckets, 8 h aggregate, 700 decisions, 100 dev-known, 100 clean Flip V2
 evaluable i 30 real dev legacy/V2 divergences oraz wszystkie resource limits.
 Po autoryzowanym resource amendment contract został ponownie zamrożony przed
-jakimkolwiek prospective runem z `frozen_at=2026-07-13T13:47:21Z`.
+jakimkolwiek prospective runem z `burn_in_contract_version=2` i
+`frozen_at=2026-07-13T17:53:14Z`. Wcześniejszy V1 z limitem 1 ms był wyłącznie
+pre-run draftem i nie może identyfikować żadnego prospective row.
 Każdy run manifest jest związany z exact version/hash kontraktu. Rows z
 durable cutoffem niepóźniejszym niż `frozen_at` nie wchodzą do prospective
 counts. Zmiana gate’u wymaga nowej wersji/hash/frozen_at i nowych rows.
@@ -265,16 +285,18 @@ dokładne komendy są utrwalone w raporcie weryfikacyjnym, nie jako surowe
 benchmark logs.
 
 Autoryzowany amendment resource gate z 2026-07-13 zachowuje pełny zakres
-timera i podnosi wyłącznie dwa nieadekwatne limity 1 ms do 5 ms. Release
+timera i podnosi dwa nieadekwatne limity 1 ms do 5 ms. Standalone
+`metric_contract_serialize_us` pozostaje diagnostyką podetapu; jego koszt jest
+już objęty ciągłym full-path gate. Release
 harness na production-equivalent path zmierzył:
 
-- full build+serialize: p50/p95/p99 `2 000 / 2 000 / 2 683 us`;
-- complete snapshot: p50/p95/p99 `611 / 957 / 1 153 us`;
-- projection build/validate/hash: p50/p95/p99 `573 / 907 / 1 087 us`;
-- final serialization: p50/p95/p99 `49 / 75 / 94 us`;
-- comparator: p50/p95/p99 `7 / 19 / 52 us`;
+- full build+serialize: p50/p95/p99/max `3 545 / 3 545 / 3 545 / 3 545 us`;
+- complete snapshot: p50/p95/p99 `1 558 / 1 963 / 2 267 us`;
+- projection build/validate/hash: p50/p95/p99 `476 / 669 / 733 us`;
+- final serialization diagnostic: p50/p95/p99 `43 / 67 / 79 us`;
+- comparator: p50/p95/p99 `5 / 8 / 21 us`;
 
-Rozmiary: Wire V1 p95/max `2 339 B`, sidecar p95/p99 `21 486 B`, v34 p95
+Rozmiary: Wire V1 p95/max `2 339 B`, sidecar p95/p99 `22 180 B`, v34 p95
 `1 176 B`. BURN contract został ponownie zamrożony przed prospective runami z
 nowym canonical hash.
 
@@ -323,7 +345,7 @@ PR2C_COUNTERFACTUAL_DIAGNOSTIC_PASS
 PR2C_SINGLE_RUN_AUDIT_PASS
 PR2C_BUNDLE_AUDIT_PASS
 PR2C_RESOURCE_GATES_PASS
-BURN_IN_CONTRACT_V1_FROZEN
+BURN_IN_CONTRACT_V2_FROZEN
 GATEKEEPER_POLICY_UNCHANGED
 V3_V1_REPLAY_UNCHANGED
 TYPE5_NOT_STARTED

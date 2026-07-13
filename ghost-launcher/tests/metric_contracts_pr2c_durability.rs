@@ -5,11 +5,12 @@ use common::{frozen_inputs_fixture, paired_fixture};
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_brain::oracle::decision_logger::MetricContractEnqueueErrorV1;
 use ghost_brain::oracle::{
-    DecisionLogger, DecisionLoggerConfig, MetricContractPairedWriterConfigV1,
+    DecisionLogger, DecisionLoggerConfig, MetricContractLatencyHistogramErrorV1,
+    MetricContractLatencyHistogramSnapshotV1, MetricContractPairedWriterConfigV1,
     MetricContractPairedWriterStatsV1, MetricContractPairedWriterV1,
     MetricContractRotationManifestV1, MetricContractWriterFaultInjectionV1,
-    METRIC_CONTRACT_EVIDENCE_V1_FILE, METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE,
-    METRIC_CONTRACT_SUMMARY_V34_FILE,
+    METRIC_CONTRACT_EVIDENCE_V1_FILE, METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1,
+    METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE, METRIC_CONTRACT_SUMMARY_V34_FILE,
 };
 use ghost_core::checkpoint::MaterializedFeatureSet;
 use ghost_core::metric_contracts::{
@@ -18,7 +19,7 @@ use ghost_core::metric_contracts::{
     METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3,
     METRIC_CONTRACT_WIRE_V1_MAPPING_TABLE_COUNT, METRIC_CONTRACT_WIRE_V1_TUPLE_TABLE_COUNT,
     PR2C_COMPARATOR_P99_MAX_US, PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US,
-    PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US, PR2C_SERIALIZE_P99_MAX_US,
+    PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US,
 };
 use ghost_launcher::components::gatekeeper_policy::{
     build_assessment_from_features, evaluate_policy_from_assessment, PolicyEvaluationContext,
@@ -110,27 +111,74 @@ fn one_pass_projection_hash_proof_matches_the_public_validated_hash_contract() {
 }
 
 #[test]
-fn burn_in_contract_v1_is_frozen_hashed_and_fail_closed() {
+fn burn_in_contract_v2_is_frozen_hashed_and_fail_closed() {
     let contract: BurnInContractV1 = serde_json::from_str(include_str!(
-        "../../reports/metric_contracts/BURN_IN_CONTRACT_V1.json"
+        "../../reports/metric_contracts/BURN_IN_CONTRACT_V2.json"
     ))
     .unwrap();
     contract.validate_hash().unwrap();
     assert_eq!(contract.payload.minimum_non_overlapping_runs, 3);
+    assert_eq!(contract.payload.burn_in_contract_version, 2);
     assert_eq!(contract.payload.minimum_run_duration_ms, 3_600_000);
     assert_eq!(contract.payload.minimum_utc_4h_buckets, 2);
     assert_eq!(
         contract.payload.owner_approval_identity,
-        "github:smahacfel:authorized-pr2c-task:2026-07-13"
+        "github:smahacfel:authorized-pr2c-5ms-amendment:2026-07-13"
     );
     assert_eq!(
         contract.contract_canonical_hash.as_str(),
-        "40872b8c1ab8fcd8ecb4b1612e35fcf9dc157cbb1109546c7490c7d006f00ffd"
+        "3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20"
     );
 
     let mut value = serde_json::to_value(&contract).unwrap();
     value["payload"]["minimum_unique_decisions"] = serde_json::json!(1);
     assert!(serde_json::from_value::<BurnInContractV1>(value).is_err());
+}
+
+#[test]
+fn resource_histogram_validation_is_closed_over_codebook_counts_samples_and_max() {
+    let valid = MetricContractLatencyHistogramSnapshotV1 {
+        bucket_upper_bounds_us: METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1,
+        bucket_counts: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        sample_count: 1,
+        max_us: 1,
+    };
+    valid.validate(1).unwrap();
+
+    let mut wrong_bounds = valid.clone();
+    wrong_bounds.bucket_upper_bounds_us[0] = 3;
+    assert_eq!(
+        wrong_bounds.validate(1),
+        Err(MetricContractLatencyHistogramErrorV1::BucketCodebookMismatch)
+    );
+
+    let mut wrong_bucket_sum = valid.clone();
+    wrong_bucket_sum.bucket_counts[0] = 2;
+    assert_eq!(
+        wrong_bucket_sum.validate(1),
+        Err(MetricContractLatencyHistogramErrorV1::BucketSumMismatch)
+    );
+
+    let mut wrong_sample_count = valid.clone();
+    wrong_sample_count.sample_count = 2;
+    wrong_sample_count.bucket_counts[0] = 2;
+    assert_eq!(
+        wrong_sample_count.validate(1),
+        Err(MetricContractLatencyHistogramErrorV1::SampleCountMismatch)
+    );
+
+    let mut wrong_max = valid.clone();
+    wrong_max.max_us = 3_000;
+    assert_eq!(
+        wrong_max.validate(1),
+        Err(MetricContractLatencyHistogramErrorV1::MaxBucketMismatch)
+    );
+
+    let missing_sample = MetricContractLatencyHistogramSnapshotV1::default();
+    assert_eq!(
+        missing_sample.validate(1),
+        Err(MetricContractLatencyHistogramErrorV1::SampleCountMismatch)
+    );
 }
 
 #[test]
@@ -261,6 +309,62 @@ async fn paired_writer_rotates_both_streams_with_one_contiguous_part_index() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+}
+
+#[tokio::test]
+async fn full_path_timer_is_continuous_across_snapshot_pair_and_writer_boundaries() {
+    let full_path_started = Instant::now();
+    let frozen = frozen_inputs_fixture();
+    let timed = frozen.build_timed_from(full_path_started);
+    let policy = common::equal_policy();
+    let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_from_validated_snapshot_v1(
+        &timed,
+        &ghost_launcher::metric_contracts::Pr2cDecisionRecordContextV1 {
+            record_identity: ghost_core::metric_contracts::MetricEvidenceRecordIdentityV1::try_new(
+                "continuous-timer-run",
+                "continuous-timer-join",
+                "legacy_live",
+            )
+            .unwrap(),
+            stable_event_identity: None,
+            rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode::Legacy,
+            profile: frozen.profile(),
+            effective_config: frozen.effective_config(),
+            authoritative_policy: &policy,
+            comparator_policy: &policy,
+            comparator_evaluable: true,
+            comparator_elapsed_us: 0,
+            metric_contract_serialize_us: 0,
+            metric_contract_build_and_serialize_us: 0,
+            projection_build_and_validate_us: 0,
+            gatekeeper_config_hash: common::TEST_GATEKEEPER_CONFIG_HASH,
+            brain_config_hash: Some(common::TEST_BRAIN_CONFIG_HASH),
+        },
+    )
+    .unwrap();
+    let at_pair_boundary_us = pair.metric_contract_build_and_serialize_us;
+
+    // A segmented-sum implementation would omit this gap. The writer must
+    // observe it through the single carried monotonic origin.
+    tokio::time::sleep(std::time::Duration::from_millis(6)).await;
+    let temp = tempfile::tempdir().unwrap();
+    let stats = Arc::new(MetricContractPairedWriterStatsV1::default());
+    stats.record_enqueue_wait_us(0);
+    let mut config = MetricContractPairedWriterConfigV1::new(
+        temp.path().to_path_buf(),
+        "fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9",
+    );
+    config.build_worktree_clean = true;
+    let mut writer = MetricContractPairedWriterV1::open(config, Arc::clone(&stats))
+        .await
+        .unwrap();
+    writer.write_pair(pair).await.unwrap();
+    writer.finalize().await.unwrap();
+
+    let measured = stats.snapshot().metric_contract_build_and_serialize_us;
+    assert_eq!(measured.sample_count, 1);
+    assert!(measured.max_us >= 6_000, "{measured:#?}");
+    assert!(measured.max_us > u64::from(at_pair_boundary_us));
 }
 
 #[test]
@@ -600,9 +704,8 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
     let (warmup_samples, measured_samples) = if cfg!(debug_assertions) {
         (4, 16)
     } else {
-        (16, 128)
+        (16, 200)
     };
-    let frozen = frozen_inputs_fixture();
     let policy = common::equal_policy();
     let comparator_config = GatekeeperV2Config::default();
     let comparator_assessment = build_assessment_from_features(
@@ -617,7 +720,9 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
     // construction path. Warmup samples are deliberately excluded from the
     // measured writer histogram.
     for index in 0..warmup_samples {
-        let timed = frozen.build_timed();
+        let full_path_started = Instant::now();
+        let frozen = frozen_inputs_fixture();
+        let timed = frozen.build_timed_from(full_path_started);
         let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_from_validated_snapshot_v1(
             &timed,
             &ghost_launcher::metric_contracts::Pr2cDecisionRecordContextV1 {
@@ -649,10 +754,11 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
 
     let temp = tempfile::tempdir().unwrap();
     let stats = Arc::new(MetricContractPairedWriterStatsV1::default());
-    let config = MetricContractPairedWriterConfigV1::new(
+    let mut config = MetricContractPairedWriterConfigV1::new(
         temp.path().to_path_buf(),
         "fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9",
     );
+    config.build_worktree_clean = true;
     let mut writer = MetricContractPairedWriterV1::open(config, Arc::clone(&stats))
         .await
         .unwrap();
@@ -665,10 +771,13 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
     let mut projection_build = Vec::with_capacity(measured_samples);
     let mut pair_construction = Vec::with_capacity(measured_samples);
     for index in 0..measured_samples {
-        // This is the canonical PR2B timer: every family producer is invoked
-        // once, then full evidence, semantic validation, compact projection,
-        // Wire hard gate and the semantic projection hash are built.
-        let rebuilt = frozen.build_timed();
+        // The timer begins before the fixture invokes the canonical family
+        // producers, then crosses the full evidence/projection build. The
+        // paired sample below additionally includes the real comparator and
+        // writer-owned final-byte serialization.
+        let full_path_started = Instant::now();
+        let frozen = frozen_inputs_fixture();
+        let rebuilt = frozen.build_timed_from(full_path_started);
         complete_snapshot_build.push(u128::from(
             rebuilt.timings().metric_contract_build_and_validate_us,
         ));
@@ -727,7 +836,13 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
         .unwrap();
         pair_construction.push(u128::from(
             pair.metric_contract_build_and_serialize_us
-                .checked_sub(rebuilt.timings().metric_contract_build_and_validate_us)
+                .checked_sub(
+                    rebuilt
+                        .timings()
+                        .metric_contract_build_and_validate_us
+                        .checked_add(comparator_us)
+                        .unwrap(),
+                )
                 .unwrap(),
         ));
         wire_bytes.push(
@@ -735,10 +850,27 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
                 .authoritative_serialized_size_bytes()
                 .unwrap(),
         );
+        // The direct harness bypasses DecisionLogger's bounded channel. Add
+        // exactly one zero-wait enqueue sample for each accepted command so
+        // the finalized manifest still satisfies the production histogram
+        // completeness invariant.
+        stats.record_enqueue_wait_us(0);
         writer.write_pair(pair).await.unwrap();
     }
     writer.finalize().await.unwrap();
     let writer_stats = stats.snapshot();
+    writer_stats
+        .logger_enqueue_wait_us
+        .validate(measured_samples as u64)
+        .unwrap();
+    writer_stats
+        .metric_contract_build_and_serialize_us
+        .validate(measured_samples as u64)
+        .unwrap();
+    writer_stats
+        .projection_build_and_validate_us
+        .validate(measured_samples as u64)
+        .unwrap();
     let build_p50 = writer_stats
         .metric_contract_build_and_serialize_us
         .percentile_upper_bound_us(50)
@@ -807,7 +939,9 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
     if !cfg!(debug_assertions) {
         assert!(build_p99 <= u64::from(PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US));
         assert!(projection_p99 <= u128::from(PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US));
-        assert!(serialize_p99 <= PR2C_SERIALIZE_P99_MAX_US);
+        // Standalone serialization stays visible as a diagnostic sub-step.
+        // Acceptance is enforced by the continuous first-producer-to-final-
+        // bytes timer, so there is no overlapping standalone serialize gate.
         assert!(comparator_p99 <= u128::from(PR2C_COMPARATOR_P99_MAX_US));
     }
 }

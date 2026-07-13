@@ -1,6 +1,6 @@
 {
   "payload": {
-    "burn_in_contract_version": 1,
+    "burn_in_contract_version": 2,
     "minimum_non_overlapping_runs": 3,
     "minimum_run_duration_ms": 3600000,
     "minimum_utc_4h_buckets": 2,
@@ -36,10 +36,11 @@
       "any_gate_change_after_frozen_at_requires_new_contract_version_hash_and_runs",
       "rows_at_or_before_frozen_at_are_not_prospective_validation_evidence",
       "schema_profile_effective_config_or_build_mismatch_invalidates_bundle",
-      "overlapping_mutable_or_incomplete_runs_invalidate_bundle"
+      "overlapping_mutable_or_incomplete_runs_invalidate_bundle",
+      "the_earlier_version_1_draft_was_never_authoritative_and_cannot_identify_any_prospective_row"
     ],
-    "frozen_at": "2026-07-13T13:47:21Z",
-    "owner_approval_identity": "github:smahacfel:authorized-pr2c-task:2026-07-13"
+    "frozen_at": "2026-07-13T17:53:14Z",
+    "owner_approval_identity": "github:smahacfel:authorized-pr2c-5ms-amendment:2026-07-13"
   },
-  "contract_canonical_hash": "40872b8c1ab8fcd8ecb4b1612e35fcf9dc157cbb1109546c7490c7d006f00ffd"
+  "contract_canonical_hash": "3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20"
 }

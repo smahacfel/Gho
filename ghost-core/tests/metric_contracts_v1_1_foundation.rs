@@ -887,6 +887,32 @@ fn complete_transport_payload() -> MetricContractEvidenceHashPayloadV1 {
         metric_contract_effective_config_hash: resolved_config
             .metric_contract_effective_config_hash
             .clone(),
+        policy_equivalence: MetricContractPolicyEquivalenceEvidenceV1 {
+            policy_version: "v2.5".to_string(),
+            gatekeeper_config_hash: CanonicalHashV1::parse(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+            comparator_evaluable: true,
+            authoritative: MetricContractPolicyEquivalenceSnapshotV1 {
+                verdict: "Reject".to_string(),
+                primary_reason_code: "TEST_REASON".to_string(),
+                ordered_reason_chain: vec!["TEST_REASON".to_string()],
+                phase_pass_vector: vec![false; 6],
+                soft_points: 0,
+                selector_soft_score_bits: 0,
+                hard_fail_classification: "none".to_string(),
+            },
+            comparator: MetricContractPolicyEquivalenceSnapshotV1 {
+                verdict: "Reject".to_string(),
+                primary_reason_code: "TEST_REASON".to_string(),
+                ordered_reason_chain: vec!["TEST_REASON".to_string()],
+                phase_pass_vector: vec![false; 6],
+                soft_points: 0,
+                selector_soft_score_bits: 0,
+                hard_fail_classification: "none".to_string(),
+            },
+        },
         contracts: complete_contract_evidence(),
     }
 }

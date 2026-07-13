@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use ghost_core::metric_contracts::MetricContractAuditTerminalClassV1;
 use ghost_launcher::metric_contracts::{
-    audit_pr2c_bundle_against_burn_in_contract_v1, audit_pr2c_single_run_v1,
+    audit_pr2c_bundle_against_burn_in_contract_v2, audit_pr2c_single_run_v1,
 };
 use std::path::PathBuf;
 
@@ -82,10 +82,10 @@ fn main() {
             });
             let contract: ghost_core::metric_contracts::BurnInContractV1 =
                 serde_json::from_slice(&contract_bytes).unwrap_or_else(|error| {
-                    eprintln!("invalid BURN_IN_CONTRACT_V1: {error}");
+                    eprintln!("invalid BURN_IN_CONTRACT_V2: {error}");
                     std::process::exit(3);
                 });
-            audit_pr2c_bundle_against_burn_in_contract_v1(&runs, &contract).and_then(|report| {
+            audit_pr2c_bundle_against_burn_in_contract_v2(&runs, &contract).and_then(|report| {
                 let class = report.terminal_class;
                 serde_json::to_string_pretty(&report)
                     .map(|json| (class, json))

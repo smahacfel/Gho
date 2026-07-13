@@ -92,6 +92,12 @@ pub fn replay_metric_contract_record_v2(
     {
         return Err(Pr2cReplayErrorV2::ProvenanceMismatch);
     }
+    let policy_equivalence = &input.evidence.payload.policy_equivalence;
+    if policy_equivalence.policy_version != ghost_brain::oracle::GATEKEEPER_VERSION
+        || input.decision_v34.equivalence_deltas != policy_equivalence.recompute_deltas()
+    {
+        return Err(Pr2cReplayErrorV2::SummarySemanticMismatch);
+    }
     let context = MetricDecisionProjectionBuildContextV1 {
         rollout_mode: input.decision_v34.rollout_mode,
         profile: &profile,

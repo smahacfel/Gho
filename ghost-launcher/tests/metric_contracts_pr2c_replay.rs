@@ -1,7 +1,7 @@
 #[path = "common/metric_contracts_pr2c.rs"]
 mod common;
 
-use common::paired_fixture;
+use common::{equal_policy, paired_fixture, paired_fixture_with_comparator};
 use ghost_core::metric_contracts::{
     CanonicalNullableV1, MetricContractDecisionEvidenceProjectionV1,
     MetricContractDecisionProjectionWireV1, MetricContractDecisionSourceCutoffV1,
@@ -160,6 +160,39 @@ fn replay_v2_recomputes_every_projection_derived_v34_summary_field() {
         .counterfactual_delta_present ^= true;
     assert!(matches!(
         replay_metric_contract_record_v2(changed_counterfactual),
+        Err(Pr2cReplayErrorV2::SummarySemanticMismatch)
+    ));
+}
+
+#[test]
+fn replay_v2_rejects_equivalence_delta_tamper_against_hashed_policy_snapshots() {
+    let mut comparator = equal_policy();
+    comparator.primary_reason_code.push_str("_DRIFT");
+    let pair = paired_fixture_with_comparator(
+        "run-policy-evidence",
+        "join-policy-evidence",
+        &comparator,
+        true,
+    );
+    assert!(pair.decision_v34.equivalence_deltas.has_policy_drift());
+    assert!(pair
+        .evidence
+        .payload
+        .policy_equivalence
+        .recompute_deltas()
+        .has_policy_drift());
+
+    let equal = equal_policy();
+    let mut input = Pr2cReplayInputV2 {
+        decision_v34: pair.decision_v34,
+        evidence: pair.evidence,
+        decision_time_projection: pair.decision_time_projection,
+        effective_config: pair.effective_config,
+    };
+    input.decision_v34.equivalence_deltas = equal.compare(&equal);
+
+    assert!(matches!(
+        replay_metric_contract_record_v2(input),
         Err(Pr2cReplayErrorV2::SummarySemanticMismatch)
     ));
 }

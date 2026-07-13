@@ -11,6 +11,7 @@ on:
       - "ghost-brain/**"
       - "reports/metric_contracts/**"
       - "docs/ADR/**"
+      - "PLANS/**"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -120,6 +121,10 @@ jobs:
 
       - name: Full frozen-input to final-byte release harness
         run: |
+          exact_test_count=$(cargo test --release -p ghost-launcher \
+            --test metric_contracts_pr2c_durability \
+            -- --list | awk '$1 == "pr2c_release_resource_harness_reports_full_path_percentiles:" && $2 == "test" { count += 1 } END { print count + 0 }')
+          test "$exact_test_count" -eq 1
           cargo test --release -p ghost-launcher \
             --test metric_contracts_pr2c_durability \
             pr2c_release_resource_harness_reports_full_path_percentiles \

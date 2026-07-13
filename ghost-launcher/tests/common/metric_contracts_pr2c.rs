@@ -82,6 +82,34 @@ impl Pr2cFrozenInputsFixture {
         .unwrap()
     }
 
+    pub fn build_timed_from(
+        &self,
+        full_path_started: std::time::Instant,
+    ) -> Pr2bTimedCompleteMetricContractSnapshotV1 {
+        build_pr2b_timed_complete_metric_contract_snapshot_from_producer_start_with_validated_static_context_v1(
+            Pr2bFrozenProducerInputsV1 {
+                pr2a: Pr2aFrozenProducerInputsV1 {
+                    ftdi: &self.ftdi,
+                    tx_intelligence: &self.tx_snapshot,
+                    gatekeeper_dev_primary: &self.gatekeeper_dev,
+                    recent_exact_timing: &self.recent_exact,
+                    fsc: &self.fsc,
+                    funding_source_config: &self.funding,
+                    funding_source_producer_config: &self.funding_producer_config,
+                },
+                legacy_flip_ratio: None,
+                flip_v2: &self.flip,
+                manipulation: &self.manipulation,
+                reserve_velocity: &self.reserve,
+                recent_buy_sell: &self.recent,
+            },
+            &self.static_context,
+            self.source_cutoff.clone(),
+            full_path_started,
+        )
+        .unwrap()
+    }
+
     pub fn profile(&self) -> &MetricContractProfileV1 {
         &self.profile
     }

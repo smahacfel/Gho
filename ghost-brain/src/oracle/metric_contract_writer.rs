@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use ghost_core::metric_contracts::{
-    CanonicalHashV1, MetricContractDecisionSummaryV1, MetricContractEvidenceTransportV1,
-    MetricContractPairedRecordV1, MetricContractRolloutMode, MetricEvidenceRecordIdentityV1,
-    ResolvedMetricContractEffectiveConfigV1, BURN_IN_CONTRACT_V1_CANONICAL_HASH,
-    METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
+    CanonicalHashV1, MetricContractDecisionSummaryV1, MetricContractPairedRecordV1,
+    MetricContractRolloutMode, MetricEvidenceRecordIdentityV1,
+    ResolvedMetricContractEffectiveConfigV1, BURN_IN_CONTRACT_V2_CANONICAL_HASH,
+    BURN_IN_CONTRACT_VERSION_V2, METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1,
     METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34, METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3,
@@ -57,7 +57,10 @@ impl MetricContractPairedWriterConfigV1 {
             directory,
             rotation_max_bytes: DEFAULT_METRIC_CONTRACT_ROTATION_MAX_BYTES,
             build_commit: build_commit.into(),
-            build_worktree_clean: true,
+            // A public caller has not supplied a trustworthy clean-tree
+            // attestation. Production DecisionLogger replaces this with its
+            // compile-time Git provenance; all other callers fail closed.
+            build_worktree_clean: false,
             queue_capacity: 1_000,
             fault_injection: None,
         }
@@ -74,6 +77,24 @@ pub struct MetricContractLatencyHistogramSnapshotV1 {
     pub max_us: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MetricContractLatencyHistogramErrorV1 {
+    #[error("latency histogram uses an unknown bucket codebook")]
+    BucketCodebookMismatch,
+    #[error("latency histogram bucket sum overflow")]
+    BucketSumOverflow,
+    #[error("latency histogram bucket sum does not equal sample_count")]
+    BucketSumMismatch,
+    #[error("latency histogram sample_count does not equal paired command count")]
+    SampleCountMismatch,
+    #[error("empty latency histogram has non-zero max or buckets")]
+    EmptyHistogramMismatch,
+    #[error("latency histogram max is inconsistent with populated buckets")]
+    MaxBucketMismatch,
+    #[error("latency histogram overflow bucket is inconsistent with max")]
+    OverflowBucketMismatch,
+}
+
 impl Default for MetricContractLatencyHistogramSnapshotV1 {
     fn default() -> Self {
         Self {
@@ -86,6 +107,57 @@ impl Default for MetricContractLatencyHistogramSnapshotV1 {
 }
 
 impl MetricContractLatencyHistogramSnapshotV1 {
+    pub fn validate(
+        &self,
+        expected_sample_count: u64,
+    ) -> std::result::Result<(), MetricContractLatencyHistogramErrorV1> {
+        if self.bucket_upper_bounds_us != METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1 {
+            return Err(MetricContractLatencyHistogramErrorV1::BucketCodebookMismatch);
+        }
+        let bucket_sum = self.bucket_counts.iter().try_fold(0u64, |sum, count| {
+            sum.checked_add(*count)
+                .ok_or(MetricContractLatencyHistogramErrorV1::BucketSumOverflow)
+        })?;
+        if bucket_sum != self.sample_count {
+            return Err(MetricContractLatencyHistogramErrorV1::BucketSumMismatch);
+        }
+        if self.sample_count != expected_sample_count {
+            return Err(MetricContractLatencyHistogramErrorV1::SampleCountMismatch);
+        }
+        if self.sample_count == 0 {
+            return if self.max_us == 0 && self.bucket_counts.iter().all(|count| *count == 0) {
+                Ok(())
+            } else {
+                Err(MetricContractLatencyHistogramErrorV1::EmptyHistogramMismatch)
+            };
+        }
+
+        let overflow_index = self.bucket_upper_bounds_us.len();
+        let max_bucket = self
+            .bucket_upper_bounds_us
+            .iter()
+            .position(|upper| self.max_us <= u64::from(*upper))
+            .unwrap_or(overflow_index);
+        if self.bucket_counts[max_bucket] == 0
+            || self.bucket_counts[(max_bucket + 1)..]
+                .iter()
+                .any(|count| *count != 0)
+        {
+            return Err(MetricContractLatencyHistogramErrorV1::MaxBucketMismatch);
+        }
+        let overflow_count = self.bucket_counts[overflow_index];
+        let last_bound = u64::from(
+            *self
+                .bucket_upper_bounds_us
+                .last()
+                .expect("frozen histogram codebook is non-empty"),
+        );
+        if (overflow_count > 0) != (self.max_us > last_bound) {
+            return Err(MetricContractLatencyHistogramErrorV1::OverflowBucketMismatch);
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn percentile_upper_bound_us(&self, percentile: u32) -> Option<u64> {
         if self.sample_count == 0 || !(1..=100).contains(&percentile) {
@@ -250,17 +322,12 @@ impl MetricContractPairedWriterStatsV1 {
         self.logger_enqueue_wait_us.record(value_us);
     }
 
-    fn record_pair_resources(
-        &self,
-        pair: &MetricContractPairedRecordV1,
-        final_byte_materialization_us: u32,
-    ) -> Result<()> {
-        let full_path_us = pair
-            .metric_contract_build_and_serialize_us
-            .checked_add(final_byte_materialization_us)
-            .context("metric-contract full build+serialize duration overflow")?;
+    fn record_pair_resources(&self, pair: &MetricContractPairedRecordV1) -> Result<()> {
+        let full_path_us =
+            u64::try_from(pair.metric_contract_full_path_started.elapsed().as_micros())
+                .context("metric-contract full build+serialize duration does not fit u64")?;
         self.metric_contract_build_and_serialize_us
-            .record(u64::from(full_path_us));
+            .record(full_path_us);
         self.projection_build_and_validate_us
             .record(u64::from(pair.projection_build_and_validate_us));
         Ok(())
@@ -504,11 +571,11 @@ impl OpenPart {
             decision_schema_version: METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34,
             wire_schema_manifest_blake3: METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3
                 .to_string(),
-            burn_in_contract_version: 1,
+            burn_in_contract_version: BURN_IN_CONTRACT_VERSION_V2,
             burn_in_contract_canonical_hash: CanonicalHashV1::parse(
-                BURN_IN_CONTRACT_V1_CANONICAL_HASH,
+                BURN_IN_CONTRACT_V2_CANONICAL_HASH,
             )
-            .expect("compiled BURN_IN_CONTRACT_V1 hash is valid SHA-256"),
+            .expect("compiled BURN_IN_CONTRACT_V2 hash is valid SHA-256"),
             profile_id: provenance.profile_id.clone(),
             profile_hash: provenance.profile_hash.clone(),
             metric_contract_effective_config_hash: provenance
@@ -616,12 +683,13 @@ impl MetricContractPairedWriterV1 {
             self.frozen_provenance = Some(candidate_provenance);
         }
         self.rotate_if_needed().await?;
-        // The PR2B+pair timer stored in `pair` ends at terminal pair
-        // construction. This timer resumes the same production path at the
-        // writer-owned durable-byte boundary and includes timestamp/part
-        // binding, semantic transport hashing, both serde passes and the
-        // fixed-width final v34 telemetry substitution. Filesystem I/O is
-        // intentionally measured by writer/backpressure counters instead.
+        // One monotonic timer was captured before the first canonical
+        // producer call and travelled with the frozen snapshot and pair. The
+        // writer samples that exact clock only after timestamp/part binding,
+        // semantic transport hashing, both serde passes and the fixed-width
+        // final v34 telemetry substitution. This includes all gaps between
+        // producer, comparator and writer boundaries. Filesystem I/O remains
+        // represented by writer/backpressure counters instead.
         let final_bytes_started = std::time::Instant::now();
         let identity = pair.record_identity().clone();
         let writer_timestamp_ms = u64::try_from(
@@ -654,8 +722,7 @@ impl MetricContractPairedWriterV1 {
         let final_byte_materialization_us =
             u32::try_from(final_bytes_started.elapsed().as_micros())
                 .context("final metric-contract byte materialization duration does not fit u32")?;
-        self.stats
-            .record_pair_resources(&pair, final_byte_materialization_us)?;
+        self.stats.record_pair_resources(&pair)?;
         debug_assert!(final_byte_materialization_us >= final_serialization_us);
 
         if self.config.fault_injection

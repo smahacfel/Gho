@@ -17,10 +17,10 @@ pub const METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3: &str =
 pub const PR2C_COMPARATOR_P99_MAX_US: u32 = 1_000;
 pub const PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US: u32 = 5_000;
 pub const PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US: u32 = 5_000;
-pub const PR2C_SERIALIZE_P99_MAX_US: u32 = 1_000;
 pub const PR2C_LOGGER_ENQUEUE_WAIT_P99_MAX_US: u32 = 1_000;
-pub const BURN_IN_CONTRACT_V1_CANONICAL_HASH: &str =
-    "40872b8c1ab8fcd8ecb4b1612e35fcf9dc157cbb1109546c7490c7d006f00ffd";
+pub const BURN_IN_CONTRACT_VERSION_V2: u16 = 2;
+pub const BURN_IN_CONTRACT_V2_CANONICAL_HASH: &str =
+    "3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +148,51 @@ pub struct MetricContractPolicyEquivalenceSnapshotV1 {
     pub hard_fail_classification: String,
 }
 
+/// Durable, content-addressed input for the PR2C policy-equivalence lane.
+///
+/// The compact v34 row stores only the derived delta vector.  These two
+/// normalized snapshots and their exact policy/config provenance live in the
+/// semantic evidence hash so replay can independently derive that vector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricContractPolicyEquivalenceEvidenceV1 {
+    pub policy_version: String,
+    pub gatekeeper_config_hash: CanonicalHashV1,
+    pub comparator_evaluable: bool,
+    pub authoritative: MetricContractPolicyEquivalenceSnapshotV1,
+    pub comparator: MetricContractPolicyEquivalenceSnapshotV1,
+}
+
+impl MetricContractPolicyEquivalenceEvidenceV1 {
+    pub fn validate(&self) -> Result<(), MetricContractPairErrorV1> {
+        fn valid_snapshot(snapshot: &MetricContractPolicyEquivalenceSnapshotV1) -> bool {
+            !snapshot.verdict.trim().is_empty()
+                && !snapshot.primary_reason_code.trim().is_empty()
+                && !snapshot.hard_fail_classification.trim().is_empty()
+                && snapshot.phase_pass_vector.len() == 6
+                && snapshot.ordered_reason_chain.len() <= 32
+        }
+
+        if self.policy_version.trim().is_empty()
+            || self.policy_version.len() > 64
+            || !valid_snapshot(&self.authoritative)
+            || !valid_snapshot(&self.comparator)
+        {
+            return Err(MetricContractPairErrorV1::PolicyEvidenceInvariant);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn recompute_deltas(&self) -> MetricContractComparatorSummaryV1 {
+        if self.comparator_evaluable {
+            self.authoritative.compare(&self.comparator)
+        } else {
+            MetricContractPolicyEquivalenceSnapshotV1::not_evaluable_comparison()
+        }
+    }
+}
+
 impl MetricContractPolicyEquivalenceSnapshotV1 {
     #[must_use]
     pub fn compare(&self, candidate: &Self) -> MetricContractComparatorSummaryV1 {
@@ -252,6 +297,10 @@ pub struct MetricContractPairedRecordV1 {
     /// manifest and never enter v34, the evidence hash or projection hash.
     pub metric_contract_build_and_serialize_us: u32,
     pub projection_build_and_validate_us: u32,
+    /// Monotonic origin captured before the first canonical producer call.
+    /// The paired writer reads this only after constructing the exact final
+    /// v34/evidence bytes. It is not durable semantic or transport data.
+    pub metric_contract_full_path_started: std::time::Instant,
     pub gatekeeper_config_hash: String,
     pub brain_config_hash: Option<String>,
     /// In-memory/run-manifest replay context. This is never copied into the
@@ -269,6 +318,10 @@ pub enum MetricContractPairErrorV1 {
     EvidenceSchemaMismatch,
     #[error("v34/evidence profile or effective-config provenance mismatch")]
     ProvenanceMismatch,
+    #[error("durable policy-equivalence evidence is invalid")]
+    PolicyEvidenceInvariant,
+    #[error("v34 equivalence deltas do not match durable policy snapshots")]
+    EquivalenceDeltaMismatch,
 }
 
 impl MetricContractPairedRecordV1 {
@@ -311,9 +364,24 @@ impl MetricContractPairedRecordV1 {
         if (revalidate_effective_config_hash && self.effective_config.validate_hash().is_err())
             || self.effective_config.metric_contract_effective_config_hash
                 != self.decision_v34.metric_contract_effective_config_hash
-            || self.gatekeeper_config_hash.trim().is_empty()
+            || CanonicalHashV1::parse(&self.gatekeeper_config_hash)
+                .ok()
+                .as_ref()
+                != Some(
+                    &self
+                        .evidence
+                        .payload
+                        .policy_equivalence
+                        .gatekeeper_config_hash,
+                )
         {
             return Err(MetricContractPairErrorV1::ProvenanceMismatch);
+        }
+        self.evidence.payload.policy_equivalence.validate()?;
+        if self.decision_v34.equivalence_deltas
+            != self.evidence.payload.policy_equivalence.recompute_deltas()
+        {
+            return Err(MetricContractPairErrorV1::EquivalenceDeltaMismatch);
         }
         Ok(())
     }
@@ -332,6 +400,12 @@ pub enum MetricContractAuditTerminalClassV1 {
     FailSchemaOrReplay,
     FailPolicyDrift,
     FailResourceBudget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetricContractCutoverScopeV1 {
+    #[serde(rename = "metric_contracts_v1_1_profile_a_equivalence_only")]
+    MetricContractsV1_1ProfileAEquivalenceOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -389,15 +463,15 @@ pub struct BurnInContractV1 {
 pub enum BurnInContractErrorV1 {
     #[error(transparent)]
     Hash(#[from] super::CanonicalHashErrorV1),
-    #[error("BURN_IN_CONTRACT_V1 canonical hash mismatch")]
+    #[error("BURN_IN_CONTRACT_V2 canonical hash mismatch")]
     HashMismatch,
-    #[error("BURN_IN_CONTRACT_V1 contains an invalid frozen gate")]
+    #[error("BURN_IN_CONTRACT_V2 contains an invalid frozen gate")]
     InvalidGate,
 }
 
 impl BurnInContractV1 {
     pub fn try_new(payload: BurnInContractPayloadV1) -> Result<Self, BurnInContractErrorV1> {
-        if payload.burn_in_contract_version == 0
+        if payload.burn_in_contract_version != BURN_IN_CONTRACT_VERSION_V2
             || payload.minimum_non_overlapping_runs < 3
             || payload.minimum_run_duration_ms < 3_600_000
             || payload.minimum_utc_4h_buckets < 2
@@ -437,7 +511,7 @@ impl BurnInContractV1 {
             return Err(BurnInContractErrorV1::InvalidGate);
         }
         let contract_canonical_hash = CanonicalHashV1::digest(&payload)?;
-        if contract_canonical_hash.as_str() != BURN_IN_CONTRACT_V1_CANONICAL_HASH {
+        if contract_canonical_hash.as_str() != BURN_IN_CONTRACT_V2_CANONICAL_HASH {
             return Err(BurnInContractErrorV1::InvalidGate);
         }
         Ok(Self {

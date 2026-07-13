@@ -403,6 +403,11 @@ pub struct Pr2bTimedCompleteMetricContractSnapshotV1 {
     snapshot: Pr2bCompleteMetricContractSnapshotV1,
     timings: Pr2bCompleteMetricContractBuildTimingsV1,
     validated_projection_hash: CanonicalHashV1,
+    /// One monotonic clock origin captured immediately before the first
+    /// canonical producer call. PR2C carries it through comparator, pair
+    /// construction and writer-owned final serialization so the resource
+    /// sample cannot omit gaps between those stages.
+    full_path_started: Instant,
 }
 
 impl Pr2bTimedCompleteMetricContractSnapshotV1 {
@@ -422,6 +427,11 @@ impl Pr2bTimedCompleteMetricContractSnapshotV1 {
     #[must_use]
     pub fn validated_projection_hash(&self) -> &CanonicalHashV1 {
         &self.validated_projection_hash
+    }
+
+    #[must_use]
+    pub const fn full_path_started(&self) -> Instant {
+        self.full_path_started
     }
 
     #[must_use]
@@ -1396,8 +1406,8 @@ fn build_pr2b_complete_metric_contract_snapshot_inner_v1(
     inputs: Pr2bFrozenProducerInputsV1<'_>,
     context: &Pr2bBuildContextV1<'_>,
     static_context: Option<&MetricDecisionProjectionValidatedStaticContextV1>,
+    complete_started: Instant,
 ) -> Result<Pr2bTimedCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
-    let complete_started = Instant::now();
     let projection_context = MetricDecisionProjectionBuildContextV1 {
         rollout_mode: context.rollout_mode,
         profile: context.profile,
@@ -1473,6 +1483,7 @@ fn build_pr2b_complete_metric_contract_snapshot_inner_v1(
             projection_build_and_validate_us,
         },
         validated_projection_hash,
+        full_path_started: complete_started,
     })
 }
 
@@ -1480,7 +1491,7 @@ pub fn build_pr2b_complete_metric_contract_snapshot_v1(
     inputs: Pr2bFrozenProducerInputsV1<'_>,
     context: &Pr2bBuildContextV1<'_>,
 ) -> Result<Pr2bCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
-    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context, None)
+    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context, None, Instant::now())
         .map(Pr2bTimedCompleteMetricContractSnapshotV1::into_snapshot)
 }
 
@@ -1488,7 +1499,7 @@ pub fn build_pr2b_timed_complete_metric_contract_snapshot_v1(
     inputs: Pr2bFrozenProducerInputsV1<'_>,
     context: &Pr2bBuildContextV1<'_>,
 ) -> Result<Pr2bTimedCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
-    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context, None)
+    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context, None, Instant::now())
 }
 
 /// Production/harness path for a session whose immutable projection context
@@ -1506,7 +1517,36 @@ pub fn build_pr2b_timed_complete_metric_contract_snapshot_with_validated_static_
         effective_config: static_context.effective_config(),
         source_cutoff,
     };
-    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, &context, Some(static_context))
+    build_pr2b_complete_metric_contract_snapshot_inner_v1(
+        inputs,
+        &context,
+        Some(static_context),
+        Instant::now(),
+    )
+}
+
+/// Production and release-harness entry point whose timer starts before the
+/// first canonical family producer. The caller must create `full_path_started`
+/// immediately before that call and must pass the resulting frozen inputs
+/// without restarting or replacing any producer.
+pub fn build_pr2b_timed_complete_metric_contract_snapshot_from_producer_start_with_validated_static_context_v1(
+    inputs: Pr2bFrozenProducerInputsV1<'_>,
+    static_context: &MetricDecisionProjectionValidatedStaticContextV1,
+    source_cutoff: MetricContractDecisionSourceCutoffV1,
+    full_path_started: Instant,
+) -> Result<Pr2bTimedCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
+    let context = Pr2bBuildContextV1 {
+        rollout_mode: static_context.rollout_mode(),
+        profile: static_context.profile(),
+        effective_config: static_context.effective_config(),
+        source_cutoff,
+    };
+    build_pr2b_complete_metric_contract_snapshot_inner_v1(
+        inputs,
+        &context,
+        Some(static_context),
+        full_path_started,
+    )
 }
 
 pub fn pr2b_key_boundary_set_is_closed() -> bool {

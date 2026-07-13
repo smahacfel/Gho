@@ -4,8 +4,8 @@ use ghost_core::metric_contracts::{
     CanonicalHashV1, CanonicalNullableV1, MetricContractDecisionSummaryV1,
     MetricContractEvidenceHashPayloadV1, MetricContractEvidenceTransportErrorV1,
     MetricContractEvidenceTransportV1, MetricContractId, MetricContractPairedRecordV1,
-    MetricContractPolicyEquivalenceSnapshotV1, MetricContractProfileV1,
-    MetricContractProjectionErrorV1, MetricContractRolloutMode,
+    MetricContractPolicyEquivalenceEvidenceV1, MetricContractPolicyEquivalenceSnapshotV1,
+    MetricContractProfileV1, MetricContractProjectionErrorV1, MetricContractRolloutMode,
     MetricDecisionProjectionBuildContextV1, MetricEvidenceRecordIdentityV1, MetricRolloutRoleV1,
     ResolvedMetricContractEffectiveConfigV1, StableEventIdentityV1,
     METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34, METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1,
@@ -207,7 +207,7 @@ pub fn build_pr2c_paired_record_v1(
     snapshot: &Pr2bCompleteMetricContractSnapshotV1,
     context: &Pr2cDecisionRecordContextV1<'_>,
 ) -> Result<MetricContractPairedRecordV1, Pr2cRecordBuildErrorV1> {
-    build_pr2c_paired_record_inner_v1(snapshot, None, context)
+    build_pr2c_paired_record_inner_v1(snapshot, None, None, context)
 }
 
 /// Runtime fast path from the opaque validated PR2B snapshot proof. Replay
@@ -220,15 +220,16 @@ pub fn build_pr2c_paired_record_from_validated_snapshot_v1(
     build_pr2c_paired_record_inner_v1(
         validated.snapshot(),
         Some(validated.validated_projection_hash()),
+        Some(validated.full_path_started()),
         context,
     )
 }
 
 /// Production timing boundary shared by OracleRuntime and the release
-/// harness. The resulting sample starts at PR2B's frozen producer input set,
-/// includes all producers/evidence/projection validation, and adds terminal
-/// pair construction. The paired writer adds serialization of the exact final
-/// v34/evidence bytes before recording the histogram sample.
+/// harness. The resulting sample starts before the first canonical producer,
+/// includes evidence/projection validation, the real second policy evaluation
+/// and terminal pair construction. The paired writer adds serialization of
+/// the exact final v34/evidence bytes before recording the histogram sample.
 pub fn build_pr2c_timed_paired_record_from_validated_snapshot_v1(
     validated: &Pr2bTimedCompleteMetricContractSnapshotV1,
     context: &Pr2cDecisionRecordContextV1<'_>,
@@ -240,6 +241,8 @@ pub fn build_pr2c_timed_paired_record_from_validated_snapshot_v1(
     pair.metric_contract_build_and_serialize_us = validated
         .timings()
         .metric_contract_build_and_validate_us
+        .checked_add(context.comparator_elapsed_us)
+        .ok_or(Pr2cRecordBuildErrorV1::DurationOverflow)?
         .checked_add(pair_construction_us)
         .ok_or(Pr2cRecordBuildErrorV1::DurationOverflow)?;
     pair.projection_build_and_validate_us = validated.timings().projection_build_and_validate_us;
@@ -249,6 +252,7 @@ pub fn build_pr2c_timed_paired_record_from_validated_snapshot_v1(
 fn build_pr2c_paired_record_inner_v1(
     snapshot: &Pr2bCompleteMetricContractSnapshotV1,
     prevalidated_projection_hash: Option<&CanonicalHashV1>,
+    full_path_started: Option<std::time::Instant>,
     context: &Pr2cDecisionRecordContextV1<'_>,
 ) -> Result<MetricContractPairedRecordV1, Pr2cRecordBuildErrorV1> {
     let profile_hash = match prevalidated_projection_hash {
@@ -286,13 +290,18 @@ fn build_pr2c_paired_record_inner_v1(
         return Err(Pr2cRecordBuildErrorV1::ContextMismatch);
     }
 
-    let deltas = if context.comparator_evaluable {
-        context
-            .authoritative_policy
-            .compare(context.comparator_policy)
-    } else {
-        MetricContractPolicyEquivalenceSnapshotV1::not_evaluable_comparison()
+    let policy_equivalence = MetricContractPolicyEquivalenceEvidenceV1 {
+        policy_version: ghost_brain::oracle::GATEKEEPER_VERSION.to_string(),
+        gatekeeper_config_hash: CanonicalHashV1::parse(context.gatekeeper_config_hash)
+            .map_err(|_| Pr2cRecordBuildErrorV1::ContextMismatch)?,
+        comparator_evaluable: context.comparator_evaluable,
+        authoritative: context.authoritative_policy.clone(),
+        comparator: context.comparator_policy.clone(),
     };
+    policy_equivalence
+        .validate()
+        .map_err(|_| Pr2cRecordBuildErrorV1::ContextMismatch)?;
+    let deltas = policy_equivalence.recompute_deltas();
     let stable_event_identity = context
         .stable_event_identity
         .clone()
@@ -310,6 +319,7 @@ fn build_pr2c_paired_record_inner_v1(
             .effective_config
             .metric_contract_effective_config_hash
             .clone(),
+        policy_equivalence,
         contracts: snapshot.full_evidence.clone(),
     };
     let evidence = if prevalidated_projection_hash.is_some() {
@@ -361,6 +371,8 @@ fn build_pr2c_paired_record_inner_v1(
         stable_event_identity: context.stable_event_identity.clone(),
         metric_contract_build_and_serialize_us: context.metric_contract_build_and_serialize_us,
         projection_build_and_validate_us: context.projection_build_and_validate_us,
+        metric_contract_full_path_started: full_path_started
+            .unwrap_or_else(std::time::Instant::now),
         gatekeeper_config_hash: context.gatekeeper_config_hash.to_string(),
         brain_config_hash: context.brain_config_hash.map(str::to_string),
         effective_config: context.effective_config.clone(),
