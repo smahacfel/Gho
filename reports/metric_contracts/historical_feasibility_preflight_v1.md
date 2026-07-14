@@ -282,5 +282,5 @@ PROVENANCE_AND_REPRODUCIBILITY_PASS
 
 Ten wynik jest pozytywnym zakończeniem PR0, ponieważ brakujące wymiary zostały
 oznaczone zgodnie z planem, a nie uzupełnione zgadywaniem. Nie jest to
-`PASS_CUTOVER_READY`, `NOT_EVALUABLE` prospective bundle ani zgoda na policy
+`PASS_EVIDENCE_CONSISTENT`, `NOT_EVALUABLE` prospective bundle ani zgoda na policy
 promotion.

@@ -27,8 +27,9 @@ use ghost_core::checkpoint::{
     TemporalMetricSource, TxSegmentSequence,
 };
 use ghost_core::metric_contracts::{
-    MetricContractDecisionSourceCutoffV1, MetricContractProfileErrorV1, MetricContractProfileV1,
-    MetricContractProjectionErrorV1, ResolvedMetricContractEffectiveConfigV1,
+    MetricContractDecisionSourceCutoffV1, MetricContractFoundationConfigV1,
+    MetricContractProfileErrorV1, MetricContractProjectionErrorV1,
+    ResolvedMetricContractEffectiveConfigV1,
 };
 use ghost_core::session::types::{
     SessionDiagnostics, SessionId, SessionMetadata, SessionStatus, VerdictOutcome,
@@ -36,7 +37,7 @@ use ghost_core::session::types::{
 use ghost_core::shadow_ledger::TxKey;
 use ghost_core::tx_intelligence::types::{RiskFlag, TxIntelFeatures};
 use ghost_core::{CurveFreshnessState, LAMPORTS_PER_SOL};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use seer::early_fingerprint::EarlyFingerprintMetrics;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -140,6 +141,11 @@ pub struct PoolObservationSession {
     metric_contract_effective_config: Option<Arc<ResolvedMetricContractEffectiveConfigV1>>,
     metric_contract_funding_source_producer_config:
         Option<Arc<FundingSourceProducerConfigSnapshotV1>>,
+    /// Last immutable one-producer snapshot produced for the exact MFS
+    /// materialization. It is consumed once by the terminal PR2C logging
+    /// boundary and is never serialized as part of MaterializedFeatureSet.
+    pr2c_last_complete_metric_contract_snapshot:
+        Option<Mutex<Option<crate::metric_contracts::Pr2bTimedCompleteMetricContractSnapshotV1>>>,
     temporal_carry_forward_config: TemporalCarryForwardRuntimeConfig,
     decision_time_series_tx_capacity: usize,
     decision_time_series_retention_policy: DecisionTimeSeriesRetentionPolicy,
@@ -259,6 +265,7 @@ impl PoolObservationSession {
                 .map(|(effective_config, _)| Arc::clone(effective_config)),
             metric_contract_funding_source_producer_config: local_metric_contract_context
                 .map(|(_, producer_config)| producer_config),
+            pr2c_last_complete_metric_contract_snapshot: None,
             temporal_carry_forward_config:
                 TemporalCarryForwardRuntimeConfig::from_gatekeeper_config(gatekeeper_config),
             decision_time_series_tx_capacity,
@@ -2764,6 +2771,13 @@ impl PoolObservationSession {
             materialized.checkpoint_features.bonding_progress = fallback_bonding_progress;
         }
 
+        // PR2C diagnostics are strictly opt-in. OFF retains the ordinary
+        // untimed PR2B materialization path; ON captures the monotonic origin
+        // before the first canonical producer and retains the full snapshot.
+        let metric_contract_full_path_started = self
+            .pr2c_last_complete_metric_contract_snapshot
+            .as_ref()
+            .map(|_| Instant::now());
         let fingerprint_metrics = self.fingerprint_metrics();
         if let Some(fingerprint) = fingerprint_metrics.as_ref() {
             materialized.alpha_fingerprint = AlphaFingerprintFeatures {
@@ -2887,15 +2901,21 @@ impl PoolObservationSession {
         materialized.evidence_status = self.materialize_v3_evidence_status(&materialized);
 
         let effective_config = self.metric_contract_effective_config.as_deref().ok_or(
-            MetricContractMaterializationErrorV1::MissingContext("effective config"),
+            MetricContractMaterializationErrorV1::MissingContext(
+                "metric-contract effective config",
+            ),
         )?;
+        let profile = MetricContractFoundationConfigV1 {
+            metric_contract_rollout_mode: effective_config.payload.rollout_mode,
+            metric_contract_profile: effective_config.payload.profile_id,
+        }
+        .resolve_profile()?;
         let funding_source_producer_config = self
             .metric_contract_funding_source_producer_config
             .as_deref()
             .ok_or(MetricContractMaterializationErrorV1::MissingContext(
                 "FSC producer config",
             ))?;
-        let profile = MetricContractProfileV1::profile_a()?;
         let source_cutoff = MetricContractDecisionSourceCutoffV1::try_new(
             self.highest_seen_ts_ms
                 .max(self.candidate_snapshot.timestamp)
@@ -2928,33 +2948,97 @@ impl PoolObservationSession {
         let legacy_flip_ratio = fingerprint_metrics
             .as_ref()
             .and_then(|fingerprint| fingerprint.flipper_presence_ratio);
-        let complete = crate::metric_contracts::build_pr2b_complete_metric_contract_snapshot_v1(
-            crate::metric_contracts::Pr2bFrozenProducerInputsV1 {
-                pr2a: crate::metric_contracts::Pr2aFrozenProducerInputsV1 {
-                    ftdi: &sybil_computation.ftdi,
-                    tx_intelligence: &tx_intelligence,
-                    gatekeeper_dev_primary: &gatekeeper_dev_primary,
-                    recent_exact_timing: &recent_exact_timing,
-                    fsc: &fsc,
-                    funding_source_config: &self.funding_source_config,
-                    funding_source_producer_config,
-                },
-                legacy_flip_ratio,
-                flip_v2: &flip_v2,
-                manipulation: &manipulation_frozen,
-                reserve_velocity: &reserve_velocity,
-                recent_buy_sell: &recent_buy_sell,
+        let build_context = crate::metric_contracts::Pr2bBuildContextV1 {
+            rollout_mode: effective_config.payload.rollout_mode,
+            profile: &profile,
+            effective_config,
+            source_cutoff,
+        };
+        let frozen_inputs = crate::metric_contracts::Pr2bFrozenProducerInputsV1 {
+            pr2a: crate::metric_contracts::Pr2aFrozenProducerInputsV1 {
+                ftdi: &sybil_computation.ftdi,
+                tx_intelligence: &tx_intelligence,
+                gatekeeper_dev_primary: &gatekeeper_dev_primary,
+                recent_exact_timing: &recent_exact_timing,
+                fsc: &fsc,
+                funding_source_config: &self.funding_source_config,
+                funding_source_producer_config,
             },
-            &crate::metric_contracts::Pr2bBuildContextV1 {
-                rollout_mode: effective_config.payload.rollout_mode,
-                profile: &profile,
-                effective_config,
-                source_cutoff,
-            },
-        )?;
-        materialized.metric_contract_decision_projection_v1 = Some(complete.compact_projection);
+            legacy_flip_ratio,
+            flip_v2: &flip_v2,
+            manipulation: &manipulation_frozen,
+            reserve_velocity: &reserve_velocity,
+            recent_buy_sell: &recent_buy_sell,
+        };
+        if let (Some(pr2c_snapshot), Some(full_path_started)) = (
+            self.pr2c_last_complete_metric_contract_snapshot.as_ref(),
+            metric_contract_full_path_started,
+        ) {
+            let complete = crate::metric_contracts::build_pr2b_timed_complete_metric_contract_snapshot_from_started_v1(
+                frozen_inputs,
+                &build_context,
+                full_path_started,
+            )?;
+            materialized.metric_contract_decision_projection_v1 =
+                Some(complete.snapshot().compact_projection.clone());
+            *pr2c_snapshot.lock() = Some(complete);
+        } else {
+            let complete =
+                crate::metric_contracts::build_pr2b_complete_metric_contract_snapshot_v1(
+                    frozen_inputs,
+                    &build_context,
+                )?;
+            materialized.metric_contract_decision_projection_v1 = Some(complete.compact_projection);
+        }
 
         Ok(materialized)
+    }
+
+    /// Consume the exact full-evidence/projection pair created by the most
+    /// recent successful materialization. No producer or live-state read is
+    /// performed here.
+    pub fn take_pr2c_complete_metric_contract_snapshot(
+        &self,
+    ) -> Option<crate::metric_contracts::Pr2bTimedCompleteMetricContractSnapshotV1> {
+        self.pr2c_last_complete_metric_contract_snapshot
+            .as_ref()?
+            .lock()
+            .take()
+    }
+
+    /// Enable or disable retention of the full PR2C terminal snapshot.
+    /// Compact projection materialization is unaffected. When disabled there
+    /// is no per-session PR2C mutex and full evidence is dropped immediately
+    /// after the compact projection has been produced.
+    pub fn set_pr2c_snapshot_capture_enabled(&mut self, enabled: bool) {
+        if enabled {
+            if self.pr2c_last_complete_metric_contract_snapshot.is_none() {
+                self.pr2c_last_complete_metric_contract_snapshot = Some(Mutex::new(None));
+            }
+        } else {
+            self.pr2c_last_complete_metric_contract_snapshot = None;
+        }
+    }
+
+    #[must_use]
+    pub fn pr2c_snapshot_capture_enabled(&self) -> bool {
+        self.pr2c_last_complete_metric_contract_snapshot.is_some()
+    }
+
+    #[must_use]
+    pub fn metric_contract_effective_config_for_replay(
+        &self,
+    ) -> Option<ResolvedMetricContractEffectiveConfigV1> {
+        self.metric_contract_effective_config.as_deref().cloned()
+    }
+
+    /// Stable pool-creation transaction identity supplied by ingest. This is
+    /// independent of the decision join key and is therefore suitable for
+    /// cross-run underlying-event collision checks when present.
+    #[must_use]
+    pub fn metric_contract_stable_event_signature(&self) -> Option<String> {
+        (!self.candidate_snapshot.signature.trim().is_empty())
+            .then(|| self.candidate_snapshot.signature.clone())
     }
 
     /// Compatibility facade for existing callers. Active terminal runtime
@@ -3079,9 +3163,13 @@ impl PoolObservationSession {
         &mut self,
         effective_config: Arc<ResolvedMetricContractEffectiveConfigV1>,
         funding_source_producer_config: Arc<FundingSourceProducerConfigSnapshotV1>,
-    ) {
+    ) -> Result<(), MetricContractMaterializationErrorV1> {
+        effective_config
+            .validate_hash()
+            .map_err(MetricContractProjectionErrorV1::from)?;
         self.metric_contract_effective_config = Some(effective_config);
         self.metric_contract_funding_source_producer_config = Some(funding_source_producer_config);
+        Ok(())
     }
 
     pub fn mark_metric_contract_stream_gap(&mut self) {

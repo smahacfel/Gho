@@ -307,6 +307,26 @@ impl MetricContractDecisionEvidenceProjectionV1 {
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<CanonicalHashV1, MetricContractProjectionErrorV1> {
         self.validate_context(context)?;
+        self.canonical_hash_after_semantic_validation()
+    }
+
+    /// Build the projection and its hash through one validated path without
+    /// repeating the same root/family validation a second time. This is used
+    /// by the one-snapshot materialization boundary; callers that already
+    /// hold an arbitrary projection must continue to use
+    /// `validated_canonical_hash()`.
+    pub fn try_from_evidence_with_validated_canonical_hash(
+        evidence: &MetricContractsEvidenceSetV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<(Self, CanonicalHashV1), MetricContractProjectionErrorV1> {
+        let projection = Self::try_from_evidence(evidence, context)?;
+        let hash = projection.canonical_hash_after_semantic_validation()?;
+        Ok((projection, hash))
+    }
+
+    fn canonical_hash_after_semantic_validation(
+        &self,
+    ) -> Result<CanonicalHashV1, MetricContractProjectionErrorV1> {
         let serialized_bytes = self.authoritative_serialized_size_bytes()?;
         ::metrics::histogram!(
             "metric_contract_projection_serialized_bytes",
@@ -693,6 +713,79 @@ impl MetricDecisionProjectionBuildContextV1<'_> {
             return Err(MetricContractProjectionErrorV1::MissingSourceCutoff);
         }
         Ok(profile_hash)
+    }
+}
+
+/// Opaque proof that the exact projection context has passed effective-config,
+/// profile and cutoff validation. It lets the one-snapshot builder validate
+/// those immutable inputs once before timing the projection-only boundary.
+pub struct MetricDecisionProjectionValidatedContextV1<'context, 'inputs> {
+    context: &'context MetricDecisionProjectionBuildContextV1<'inputs>,
+    profile_hash: CanonicalHashV1,
+}
+
+impl<'context, 'inputs> MetricDecisionProjectionValidatedContextV1<'context, 'inputs> {
+    pub fn try_new(
+        context: &'context MetricDecisionProjectionBuildContextV1<'inputs>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        let profile_hash = context.validate_and_profile_hash()?;
+        Ok(Self {
+            context,
+            profile_hash,
+        })
+    }
+
+    pub fn validate_evidence<'evidence>(
+        self,
+        evidence: &'evidence MetricContractsEvidenceSetV1,
+    ) -> Result<
+        MetricDecisionProjectionValidatedInputsV1<'evidence, 'context, 'inputs>,
+        MetricContractProjectionErrorV1,
+    > {
+        evidence.validate_semantics()?;
+        evidence.validate_for_profile(self.context.profile, self.context.rollout_mode)?;
+        Ok(MetricDecisionProjectionValidatedInputsV1 {
+            evidence,
+            context: self.context,
+            profile_hash: self.profile_hash,
+        })
+    }
+}
+
+/// Opaque proof that both the projection context and the exact full evidence
+/// set were validated together. No constructor can synthesize this proof from
+/// unchecked inputs.
+pub struct MetricDecisionProjectionValidatedInputsV1<'evidence, 'context, 'inputs> {
+    evidence: &'evidence MetricContractsEvidenceSetV1,
+    context: &'context MetricDecisionProjectionBuildContextV1<'inputs>,
+    profile_hash: CanonicalHashV1,
+}
+
+impl MetricDecisionProjectionValidatedInputsV1<'_, '_, '_> {
+    pub fn build_with_validated_canonical_hash(
+        self,
+    ) -> Result<
+        (MetricContractDecisionEvidenceProjectionV1, CanonicalHashV1),
+        MetricContractProjectionErrorV1,
+    > {
+        let projection =
+            MetricContractDecisionEvidenceProjectionV1::try_from_evidence_with_validated_inputs(
+                self.evidence,
+                self.context,
+                &self.profile_hash,
+            )?;
+        let hash = projection.canonical_hash_after_semantic_validation()?;
+        Ok((projection, hash))
+    }
+
+    pub fn build(
+        self,
+    ) -> Result<MetricContractDecisionEvidenceProjectionV1, MetricContractProjectionErrorV1> {
+        MetricContractDecisionEvidenceProjectionV1::try_from_evidence_with_validated_inputs(
+            self.evidence,
+            self.context,
+            &self.profile_hash,
+        )
     }
 }
 
@@ -2780,8 +2873,16 @@ impl MetricContractDecisionEvidenceProjectionV1 {
         evidence: &MetricContractsEvidenceSetV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<Self, MetricContractProjectionErrorV1> {
-        let profile_hash = context.validate_and_profile_hash()?;
-        evidence.validate_semantics()?;
+        MetricDecisionProjectionValidatedContextV1::try_new(context)?
+            .validate_evidence(evidence)?
+            .build()
+    }
+
+    fn try_from_evidence_with_validated_inputs(
+        evidence: &MetricContractsEvidenceSetV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+        profile_hash: &CanonicalHashV1,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
         let projection = Self {
             schema_version: METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
             rollout_mode: context.rollout_mode,
@@ -2840,7 +2941,7 @@ impl MetricContractDecisionEvidenceProjectionV1 {
                     context,
                 )?,
         };
-        projection.validate_context_with_validated_context(context, &profile_hash)?;
+        projection.validate_context_with_validated_context(context, profile_hash)?;
         Ok(projection)
     }
 }

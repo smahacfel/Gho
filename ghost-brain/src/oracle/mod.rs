@@ -21,6 +21,7 @@ pub mod engine;
 pub mod followup_scoring;
 pub mod hyper_oracle;
 pub mod hyper_prediction;
+pub mod metric_contract_writer;
 pub mod outcome_tracker;
 pub mod predator_strategy;
 pub mod profiler;
@@ -122,9 +123,12 @@ pub use tx_metrics::TransactionMetrics;
 // Re-export Decision Logger types
 pub use decision_logger::{
     CorrectionReason, DecisionLogger, DecisionLoggerConfig, DecisionType, FollowupScore,
-    GatekeeperBuyLog, GatekeeperGateTraceEntry, InitialComponents, OracleDecisionLog, VetoType,
-    DEFAULT_DECISION_LOG_DIR, GATEKEEPER_BUY_LOG_SCHEMA_VERSION, GATEKEEPER_VERSION,
+    GatekeeperBuyLog, GatekeeperGateTraceEntry, InitialComponents, OracleDecisionLog,
+    Pr2cRoutedDecisionContextV1, Pr2cRoutingContextErrorV1, VetoType, DEFAULT_DECISION_LOG_DIR,
+    GATEKEEPER_BUY_LOG_SCHEMA_VERSION, GATEKEEPER_DECISIONS_JSONL, GATEKEEPER_VERSION,
+    LEGACY_GATEKEEPER_VERSION,
 };
+pub use metric_contract_writer::*;
 
 // Re-export WindowSpec types (A/B Boundary Equalization)
 pub use window_spec::{

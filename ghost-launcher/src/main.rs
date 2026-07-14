@@ -1965,6 +1965,9 @@ async fn main() -> Result<()> {
         Some(Arc::new(metric_contract_effective_config));
     oracle_runtime_config.metric_contract_funding_source_producer_config =
         Some(Arc::new(metric_contract_funding_source_producer_config));
+    oracle_runtime_config.metric_contract_pr2c_enabled = ghost_brain_config
+        .as_ref()
+        .is_some_and(|brain| brain.metric_contract_pr2c_enabled);
     oracle_runtime_config.p37_shadow_probe = config.p37_shadow_probe.clone();
     oracle_runtime_config.selector = config.selector.clone();
     oracle_runtime_config.run_id = (!config.p37_shadow_probe.run_id.trim().is_empty())
@@ -2355,7 +2358,7 @@ async fn main() -> Result<()> {
         // This ensures Oracle is ready to receive events before Seer starts sending
         if let Err(e) = oracle_ready_tx.send(()) {
             error!("❌ Failed to signal Oracle Runtime readiness: {:?}", e);
-            return;
+            return Ok(());
         }
 
         info!("🟢 Oracle Runtime ready - subscribed to event bus, entering main loop");
@@ -2384,7 +2387,7 @@ async fn main() -> Result<()> {
             oracle_authoritative_funding_stream_rx,
             Some(oracle_shutdown_rx),
         )
-        .await;
+        .await
     });
 
     // ========================================
@@ -2681,9 +2684,16 @@ async fn main() -> Result<()> {
         }
         oracle_result = &mut oracle_handle => {
             match oracle_result {
-                Ok(()) => {
+                Ok(Ok(())) => {
                     error!(
                         "Oracle Runtime task stopped before shutdown signal; exiting with code {} to avoid silent decision stall",
+                        EXIT_ORACLE_RUNTIME_STOPPED
+                    );
+                }
+                Ok(Err(err)) => {
+                    error!(
+                        error = %err,
+                        "Oracle Runtime failed before shutdown signal; exiting with code {} to avoid silent decision stall",
                         EXIT_ORACLE_RUNTIME_STOPPED
                     );
                 }
@@ -2710,16 +2720,25 @@ async fn main() -> Result<()> {
     }
 
     info!("Waiting for Oracle Runtime to shut down...");
-    if let Err(e) = oracle_handle.await {
-        error!("Oracle Runtime shutdown error: {}", e);
-    } else {
-        info!("Oracle Runtime shut down successfully");
-    }
+    let oracle_shutdown_failed = match oracle_handle.await {
+        Ok(Ok(())) => {
+            info!("Oracle Runtime shut down successfully");
+            false
+        }
+        Ok(Err(error)) => {
+            error!(error = %error, "Oracle Runtime component shutdown failed");
+            true
+        }
+        Err(error) => {
+            error!(error = %error, "Oracle Runtime task join failed during shutdown");
+            true
+        }
+    };
 
     // Wait for all components to shut down. The timeout is a shutdown-only
     // circuit breaker: a stuck diagnostics task must not keep the launcher
     // alive indefinitely after global shutdown has been requested.
-    let mut component_shutdown_failures = 0usize;
+    let mut component_shutdown_failures = usize::from(oracle_shutdown_failed);
     for (name, handle) in handles {
         info!("Waiting for {} to shut down...", name);
         let abort_handle = handle.abort_handle();

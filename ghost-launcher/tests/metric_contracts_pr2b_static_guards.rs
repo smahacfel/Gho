@@ -114,7 +114,7 @@ fn terminal_snapshot_has_exactly_one_canonical_producer_call_per_family() {
         "self.metric_contract_recent_buy_sell_snapshot()?",
         ".flip_v2_snapshot(decision_timestamp_ms, decision_slot)",
         ".metric_contract_reserve_velocity_snapshot(&self.base_mint)",
-        "build_pr2b_complete_metric_contract_snapshot_v1(",
+        "build_pr2b_timed_complete_metric_contract_snapshot_from_started_v1(",
     ] {
         assert_eq!(body.matches(needle).count(), 1, "producer call {needle}");
     }
@@ -122,6 +122,12 @@ fn terminal_snapshot_has_exactly_one_canonical_producer_call_per_family() {
         body.matches("let fsc = self.funding_source_index.compute_for_transactions(")
             .count(),
         1
+    );
+    assert_eq!(
+        body.matches("MetricDecisionProjectionValidatedStaticContextV1")
+            .count(),
+        0,
+        "terminal production must not use benchmark-only static validation proofs"
     );
 }
 

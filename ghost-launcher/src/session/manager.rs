@@ -12,7 +12,7 @@ use ghost_core::session::types::{SessionId, VerdictOutcome};
 use parking_lot::{Mutex, RwLock};
 use seer::early_fingerprint::EarlyFingerprintConfig;
 use solana_sdk::pubkey::Pubkey;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub const DEFAULT_MAX_SESSIONS: usize = 10_000;
@@ -66,6 +66,7 @@ pub struct SessionManager {
     metric_contract_effective_config: Option<Arc<ResolvedMetricContractEffectiveConfigV1>>,
     metric_contract_funding_source_producer_config:
         Option<Arc<crate::tx_intelligence::FundingSourceProducerConfigSnapshotV1>>,
+    pr2c_snapshot_capture_enabled: AtomicBool,
     lifecycle_lock: Mutex<()>,
 }
 
@@ -101,6 +102,7 @@ impl SessionManager {
             funding_source_index: Arc::new(FundingSourceIndex::new()),
             metric_contract_effective_config,
             metric_contract_funding_source_producer_config,
+            pr2c_snapshot_capture_enabled: AtomicBool::new(false),
             lifecycle_lock: Mutex::new(()),
         }
     }
@@ -180,17 +182,40 @@ impl SessionManager {
             self.metric_contract_effective_config.as_ref(),
             self.metric_contract_funding_source_producer_config.as_ref(),
         ) {
-            session.set_metric_contract_context(
-                Arc::clone(effective_config),
-                Arc::clone(producer_config),
-            );
+            session
+                .set_metric_contract_context(
+                    Arc::clone(effective_config),
+                    Arc::clone(producer_config),
+                )
+                .map_err(|error| SessionManagerError::MetricContractContext(error.to_string()))?;
         } else if let Some((effective_config, producer_config)) = local_metric_contract_context {
-            session.set_metric_contract_context(effective_config, producer_config);
+            session
+                .set_metric_contract_context(effective_config, producer_config)
+                .map_err(|error| SessionManagerError::MetricContractContext(error.to_string()))?;
         }
+        session.set_pr2c_snapshot_capture_enabled(
+            self.pr2c_snapshot_capture_enabled.load(Ordering::Acquire),
+        );
         session.set_checkpoint_interval_ms(self.config.checkpoint_interval_ms);
         let session = Arc::new(RwLock::new(session));
         self.sessions.insert(request.pool_amm_id, session);
         Ok(session_id)
+    }
+
+    /// Atomically controls retention of the full PR2C terminal snapshot for
+    /// existing and future sessions. The default is disabled, so ordinary
+    /// Legacy/live sessions allocate no PR2C snapshot mutex and retain no full
+    /// evidence after compact projection materialization.
+    pub fn set_pr2c_snapshot_capture_enabled(&self, enabled: bool) {
+        let _lifecycle_guard = self.lifecycle_lock.lock();
+        self.pr2c_snapshot_capture_enabled
+            .store(enabled, Ordering::Release);
+        for session in &self.sessions {
+            session
+                .value()
+                .write()
+                .set_pr2c_snapshot_capture_enabled(enabled);
+        }
     }
 
     #[must_use]

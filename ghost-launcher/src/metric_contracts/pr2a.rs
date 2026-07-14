@@ -162,6 +162,23 @@ impl Pr2aEvidenceBuildContextV1<'_> {
     }
 }
 
+/// Opaque local proof that the immutable profile/effective-config context was
+/// hash-validated once for this producer build. Individual public family
+/// builders create their own proof; the complete PR2A boundary shares one
+/// proof across all six families and all envelopes.
+struct ValidatedPr2aEvidenceBuildContextV1<'context, 'inputs> {
+    context: &'context Pr2aEvidenceBuildContextV1<'inputs>,
+}
+
+impl<'context, 'inputs> ValidatedPr2aEvidenceBuildContextV1<'context, 'inputs> {
+    fn try_new(
+        context: &'context Pr2aEvidenceBuildContextV1<'inputs>,
+    ) -> Result<Self, Pr2aProducerErrorV1> {
+        context.validate()?;
+        Ok(Self { context })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Pr2aProducerErrorV1 {
     #[error(transparent)]
@@ -216,7 +233,6 @@ fn envelope(
     policy_actionable: bool,
     reasons: Vec<MetricEvidenceReasonV1>,
 ) -> Result<CanonicalMetricEnvelopeV1, Pr2aProducerErrorV1> {
-    context.validate()?;
     reasons_unique(&reasons)?;
     let assignment = context.profile.entry_for(surface_id).ok_or(
         MetricEvidenceEnvelopeErrorV1::SurfaceMissingFromProfile(surface_id),
@@ -828,31 +844,41 @@ pub fn build_pr2a_evidence_families_v1(
     inputs: Pr2aFrozenProducerInputsV1<'_>,
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<Pr2aParitySensitiveEvidenceFamiliesV1, Pr2aProducerErrorV1> {
-    context.validate()?;
+    let validated = ValidatedPr2aEvidenceBuildContextV1::try_new(context)?;
+    build_pr2a_evidence_families_with_validated_context_v1(inputs, &validated)
+}
+
+fn build_pr2a_evidence_families_with_validated_context_v1(
+    inputs: Pr2aFrozenProducerInputsV1<'_>,
+    validated: &ValidatedPr2aEvidenceBuildContextV1<'_, '_>,
+) -> Result<Pr2aParitySensitiveEvidenceFamiliesV1, Pr2aProducerErrorV1> {
     Ok(Pr2aParitySensitiveEvidenceFamiliesV1 {
-        fee_topology_diversity_index: build_ftdi_evidence_v1(inputs.ftdi, context)?,
-        dev_buy: build_dev_buy_evidence_v1(
+        fee_topology_diversity_index: build_ftdi_evidence_v1_validated(inputs.ftdi, validated)?,
+        dev_buy: build_dev_buy_evidence_v1_validated(
             inputs.tx_intelligence,
             inputs.gatekeeper_dev_primary,
-            context,
+            validated,
         )?,
-        same_ms_tx_ratio: build_tx_timing_evidence_v1(
+        same_ms_tx_ratio: build_tx_timing_evidence_v1_validated(
             inputs.tx_intelligence,
             inputs.recent_exact_timing,
-            context,
+            validated,
         )?,
-        top3_signer_volume_ratio: build_top3_evidence_v1(inputs.tx_intelligence, context)?,
-        funding_source_concentration: build_funding_evidence_v1(
+        top3_signer_volume_ratio: build_top3_evidence_v1_validated(
+            inputs.tx_intelligence,
+            validated,
+        )?,
+        funding_source_concentration: build_funding_evidence_v1_validated(
             inputs.fsc,
             inputs.funding_source_config,
             inputs.funding_source_producer_config,
-            context,
+            validated,
         )?,
-        fsc_evidence_status: build_fsc_status_evidence_v1(
+        fsc_evidence_status: build_fsc_status_evidence_v1_validated(
             inputs.fsc,
             inputs.funding_source_config,
             inputs.funding_source_producer_config,
-            context,
+            validated,
         )?,
     })
 }
@@ -861,6 +887,15 @@ pub fn build_ftdi_evidence_v1(
     computation: &FtdiComputation,
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<FtdiEvidenceV1, Pr2aProducerErrorV1> {
+    let validated = ValidatedPr2aEvidenceBuildContextV1::try_new(context)?;
+    build_ftdi_evidence_v1_validated(computation, &validated)
+}
+
+fn build_ftdi_evidence_v1_validated(
+    computation: &FtdiComputation,
+    validated: &ValidatedPr2aEvidenceBuildContextV1<'_, '_>,
+) -> Result<FtdiEvidenceV1, Pr2aProducerErrorV1> {
+    let context = validated.context;
     validate_ftdi_producer_config(context)?;
     if computation.unique_topology_count > computation.signer_sample_count {
         return Err(Pr2aProducerErrorV1::ProducerInvariant("ftdi.counts"));
@@ -1251,6 +1286,16 @@ pub fn build_dev_buy_evidence_v1(
     gatekeeper: &GatekeeperDevPrimaryCompatibilitySnapshotV1,
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<DevBuyContractEvidenceV1, Pr2aProducerErrorV1> {
+    let validated = ValidatedPr2aEvidenceBuildContextV1::try_new(context)?;
+    build_dev_buy_evidence_v1_validated(tx, gatekeeper, &validated)
+}
+
+fn build_dev_buy_evidence_v1_validated(
+    tx: &TxIntelligenceMetricContractSnapshotV1,
+    gatekeeper: &GatekeeperDevPrimaryCompatibilitySnapshotV1,
+    validated: &ValidatedPr2aEvidenceBuildContextV1<'_, '_>,
+) -> Result<DevBuyContractEvidenceV1, Pr2aProducerErrorV1> {
+    let context = validated.context;
     validate_dev_producer_config(tx, context)?;
     let tx_first = dev_evidence_from_snapshot(
         &tx.dev_first_observed,
@@ -1400,6 +1445,16 @@ pub fn build_tx_timing_evidence_v1(
     recent_exact: &TxTimingProducerSnapshotV1,
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<TxTimingEvidenceV1, Pr2aProducerErrorV1> {
+    let validated = ValidatedPr2aEvidenceBuildContextV1::try_new(context)?;
+    build_tx_timing_evidence_v1_validated(tx, recent_exact, &validated)
+}
+
+fn build_tx_timing_evidence_v1_validated(
+    tx: &TxIntelligenceMetricContractSnapshotV1,
+    recent_exact: &TxTimingProducerSnapshotV1,
+    validated: &ValidatedPr2aEvidenceBuildContextV1<'_, '_>,
+) -> Result<TxTimingEvidenceV1, Pr2aProducerErrorV1> {
+    let context = validated.context;
     validate_tx_intelligence_snapshot_config(tx, context)?;
     validate_recent_timing_snapshot_config(recent_exact, context)?;
     Ok(TxTimingEvidenceV1 {
@@ -1463,6 +1518,15 @@ pub fn build_top3_evidence_v1(
     tx: &TxIntelligenceMetricContractSnapshotV1,
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<Top3SignerVolumeEvidenceV1, Pr2aProducerErrorV1> {
+    let validated = ValidatedPr2aEvidenceBuildContextV1::try_new(context)?;
+    build_top3_evidence_v1_validated(tx, &validated)
+}
+
+fn build_top3_evidence_v1_validated(
+    tx: &TxIntelligenceMetricContractSnapshotV1,
+    validated: &ValidatedPr2aEvidenceBuildContextV1<'_, '_>,
+) -> Result<Top3SignerVolumeEvidenceV1, Pr2aProducerErrorV1> {
+    let context = validated.context;
     validate_top3_producer_config(tx, context)?;
     finite_ratio(tx.top3.preferred_ratio, "top3.preferred")?;
     finite_ratio(tx.top3.compatibility_alias_ratio, "top3.alias")?;
@@ -1663,6 +1727,17 @@ pub fn build_funding_evidence_v1(
     producer_config: &FundingSourceProducerConfigSnapshotV1,
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<FundingSourceContractEvidenceV1, Pr2aProducerErrorV1> {
+    let validated = ValidatedPr2aEvidenceBuildContextV1::try_new(context)?;
+    build_funding_evidence_v1_validated(computation, config, producer_config, &validated)
+}
+
+fn build_funding_evidence_v1_validated(
+    computation: &FscComputation,
+    config: &FundingSourceConfig,
+    producer_config: &FundingSourceProducerConfigSnapshotV1,
+    validated: &ValidatedPr2aEvidenceBuildContextV1<'_, '_>,
+) -> Result<FundingSourceContractEvidenceV1, Pr2aProducerErrorV1> {
+    let context = validated.context;
     validate_funding_producer_config(config, producer_config, context)?;
     validate_fsc_computation_provenance(computation, config, producer_config)?;
     validate_fsc_computation_semantics(computation, context)?;
@@ -1811,6 +1886,17 @@ pub fn build_fsc_status_evidence_v1(
     producer_config: &FundingSourceProducerConfigSnapshotV1,
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<FscStatusEvidenceV1, Pr2aProducerErrorV1> {
+    let validated = ValidatedPr2aEvidenceBuildContextV1::try_new(context)?;
+    build_fsc_status_evidence_v1_validated(computation, config, producer_config, &validated)
+}
+
+fn build_fsc_status_evidence_v1_validated(
+    computation: &FscComputation,
+    config: &FundingSourceConfig,
+    producer_config: &FundingSourceProducerConfigSnapshotV1,
+    validated: &ValidatedPr2aEvidenceBuildContextV1<'_, '_>,
+) -> Result<FscStatusEvidenceV1, Pr2aProducerErrorV1> {
+    let context = validated.context;
     validate_funding_producer_config(config, producer_config, context)?;
     validate_fsc_computation_provenance(computation, config, producer_config)?;
     validate_fsc_computation_semantics(computation, context)?;

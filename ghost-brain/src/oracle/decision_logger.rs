@@ -36,22 +36,34 @@
 //! }
 //! ```
 
+use super::metric_contract_writer::{
+    MetricContractPairedWriterConfigV1, MetricContractPairedWriterStatsSnapshotV1,
+    MetricContractPairedWriterStatsV1, MetricContractPairedWriterV1,
+    MetricContractWriterFaultInjectionV1,
+};
 use anyhow::{Context, Result};
 use ghost_core::features::coordination::CoordinationRiskEvidenceUnit;
 use ghost_core::health::RuntimeHealth;
+use ghost_core::metric_contracts::{
+    CanonicalHashV1, MetricContractPairedRecordV1, MetricEvidenceRecordIdentityV1,
+};
 use ghost_core::tx_intelligence::types::{FscV2Evidence, FundingSourceDiagnostics};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tokio::fs::{create_dir_all, OpenOptions};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 /// Maximum number of ab_record_id entries held in the dedup cache.
 const DEDUP_MAX_CAPACITY: usize = 100_000;
+const DECISION_LOGGER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// TTL for dedup cache entries (20 minutes). After this period the entry is
 /// eligible for eviction, so a legitimately-retried write (very unlikely but
 /// theoretically possible for pool IDs that reappear after a restart) would
@@ -2772,8 +2784,115 @@ pub struct DecisionLoggerConfig {
     pub brain_config_hash: Option<String>,
     /// Channel buffer size
     pub channel_buffer_size: usize,
+    /// Enable the isolated PR2C queue and paired writer. This is deliberately
+    /// independent from the existing v33 logger queue and defaults to false.
+    pub metric_contract_pr2c_enabled: bool,
     /// Enable logging
     pub enabled: bool,
+}
+
+/// Immutable routing provenance owned by `DecisionLogger`.
+///
+/// When PR2C is enabled, runtime callers may ask the logger for a lightweight
+/// legacy-live identity before constructing evidence. The raw terminal v33 is
+/// never expanded or cloned by the caller; canonical plane routing remains in
+/// the unchanged v33 worker.
+#[derive(Debug, Clone)]
+struct DecisionLoggerRoutingContextV1 {
+    gatekeeper_config_hash: String,
+    gatekeeper_run_id: Option<String>,
+    brain_config_hash: Option<String>,
+}
+
+impl From<&DecisionLoggerConfig> for DecisionLoggerRoutingContextV1 {
+    fn from(config: &DecisionLoggerConfig) -> Self {
+        Self {
+            gatekeeper_config_hash: config.gatekeeper_config_hash.clone(),
+            gatekeeper_run_id: config.gatekeeper_run_id.clone(),
+            brain_config_hash: config.brain_config_hash.clone(),
+        }
+    }
+}
+
+/// Typed canonical identity/provenance selected from the routed legacy-live
+/// v33 row. This is the only DecisionLogger-owned input accepted by the PR2C
+/// terminal pair builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pr2cRoutedDecisionContextV1 {
+    record_identity: MetricEvidenceRecordIdentityV1,
+    gatekeeper_config_hash: CanonicalHashV1,
+    brain_config_hash: CanonicalHashV1,
+}
+
+impl Pr2cRoutedDecisionContextV1 {
+    #[must_use]
+    pub fn record_identity(&self) -> &MetricEvidenceRecordIdentityV1 {
+        &self.record_identity
+    }
+
+    #[must_use]
+    pub fn gatekeeper_config_hash(&self) -> &CanonicalHashV1 {
+        &self.gatekeeper_config_hash
+    }
+
+    #[must_use]
+    pub fn brain_config_hash(&self) -> &CanonicalHashV1 {
+        &self.brain_config_hash
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum Pr2cRoutingContextErrorV1 {
+    #[error("routed Gatekeeper decision is missing the legacy_live plane")]
+    MissingLegacyLivePlane,
+    #[error("routed Gatekeeper decision field {0} is missing")]
+    MissingField(&'static str),
+    #[error("routed Gatekeeper decision has an invalid record identity")]
+    InvalidRecordIdentity,
+    #[error("routed Gatekeeper decision hash {0} is invalid")]
+    InvalidHash(&'static str),
+}
+
+impl DecisionLoggerRoutingContextV1 {
+    fn pr2c_legacy_live_context(
+        &self,
+        log: &GatekeeperBuyLog,
+    ) -> std::result::Result<Pr2cRoutedDecisionContextV1, Pr2cRoutingContextErrorV1> {
+        if !raw_gatekeeper_log_emits_legacy_live(log) {
+            return Err(Pr2cRoutingContextErrorV1::MissingLegacyLivePlane);
+        }
+        let run_id = log
+            .run_id
+            .as_deref()
+            .or(self.gatekeeper_run_id.as_deref())
+            .ok_or(Pr2cRoutingContextErrorV1::MissingField("run_id"))?;
+        let join_key = log
+            .join_key
+            .as_deref()
+            .ok_or(Pr2cRoutingContextErrorV1::MissingField("join_key"))?;
+        let record_identity =
+            MetricEvidenceRecordIdentityV1::try_new(run_id, join_key, DECISION_PLANE_LEGACY_LIVE)
+                .map_err(|_| Pr2cRoutingContextErrorV1::InvalidRecordIdentity)?;
+        let gatekeeper_config_hash = CanonicalHashV1::parse(
+            log.config_hash
+                .as_deref()
+                .unwrap_or(self.gatekeeper_config_hash.as_str()),
+        )
+        .map_err(|_| Pr2cRoutingContextErrorV1::InvalidHash("config_hash"))?;
+        let brain_config_hash = CanonicalHashV1::parse(
+            log.brain_config_hash
+                .as_deref()
+                .or(self.brain_config_hash.as_deref())
+                .ok_or(Pr2cRoutingContextErrorV1::MissingField("brain_config_hash"))?,
+        )
+        .map_err(|_| Pr2cRoutingContextErrorV1::InvalidHash("brain_config_hash"))?;
+
+        Ok(Pr2cRoutedDecisionContextV1 {
+            record_identity,
+            gatekeeper_config_hash,
+            brain_config_hash,
+        })
+    }
 }
 
 impl Default for DecisionLoggerConfig {
@@ -2788,6 +2907,7 @@ impl Default for DecisionLoggerConfig {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 1000,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         }
     }
@@ -2796,6 +2916,12 @@ impl Default for DecisionLoggerConfig {
 /// Async decision logger for Oracle Brain
 pub struct DecisionLogger {
     tx: mpsc::Sender<LogCommand>,
+    metric_contract_tx: Option<mpsc::Sender<MetricContractLogCommand>>,
+    metric_contract_stats: Arc<MetricContractPairedWriterStatsV1>,
+    routing: Option<DecisionLoggerRoutingContextV1>,
+    v33_writer_task: TokioMutex<Option<JoinHandle<()>>>,
+    metric_contract_writer_task: TokioMutex<Option<JoinHandle<()>>>,
+    enabled: bool,
 }
 
 enum LogCommand {
@@ -2803,7 +2929,134 @@ enum LogCommand {
     WriteCyclic(CyclicEngineLog),
     WriteGatekeeperBuy(GatekeeperBuyLog),
     WriteCoordinationRiskEvidence(CoordinationRiskEvidenceUnit),
-    Shutdown,
+    Shutdown(oneshot::Sender<()>),
+}
+
+enum MetricContractLogCommand {
+    WritePair(MetricContractPairedRecordV1),
+    Shutdown(oneshot::Sender<std::result::Result<(), DecisionLoggerShutdownErrorV1>>),
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum MetricContractEnqueueErrorV1 {
+    #[error("metric-contract paired writer is disabled")]
+    WriterDisabled,
+    #[error("metric-contract paired writer queue is full")]
+    QueueFull,
+    #[error("metric-contract paired writer queue is closed")]
+    ChannelClosed,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionLoggerShutdownErrorV1 {
+    #[error("DecisionLogger shutdown channel closed before acknowledgement: {0}")]
+    ChannelClosed(&'static str),
+    #[error("DecisionLogger shutdown exceeded its bounded timeout: {0}")]
+    Timeout(&'static str),
+    #[error("DecisionLogger writer task failed while joining: {0}")]
+    TaskJoin(&'static str),
+    #[error("DecisionLogger PR2C durable writer failed: {0}")]
+    Pr2cWriter(&'static str),
+}
+
+async fn run_metric_contract_writer_task(
+    config: DecisionLoggerConfig,
+    mut rx: mpsc::Receiver<MetricContractLogCommand>,
+    writer_stats: Arc<MetricContractPairedWriterStatsV1>,
+    fault_injection: Option<MetricContractWriterFaultInjectionV1>,
+) {
+    let mut writer: Option<MetricContractPairedWriterV1> = None;
+    let mut writer_disabled = false;
+    let mut shutdown_ack = None;
+    let mut shutdown_result = Ok(());
+
+    info!(
+        directory = ?config.gatekeeper_log_dir,
+        queue_capacity = config.channel_buffer_size,
+        "DecisionLogger: isolated PR2C paired writer started"
+    );
+
+    while let Some(command) = rx.recv().await {
+        match command {
+            MetricContractLogCommand::WritePair(pair) => {
+                if writer_disabled {
+                    writer_stats.record_disabled();
+                    continue;
+                }
+                if writer.is_none() {
+                    let mut writer_config = MetricContractPairedWriterConfigV1::new(
+                        config.gatekeeper_log_dir.clone(),
+                        option_env!("GIT_COMMIT").unwrap_or("unknown_build_commit"),
+                    );
+                    writer_config.build_worktree_clean =
+                        option_env!("GIT_WORKTREE_CLEAN") == Some("true");
+                    writer_config.queue_capacity = config.channel_buffer_size;
+                    writer_config.fault_injection = fault_injection;
+                    match MetricContractPairedWriterV1::open(
+                        writer_config,
+                        Arc::clone(&writer_stats),
+                    )
+                    .await
+                    {
+                        Ok(opened) => writer = Some(opened),
+                        Err(error) => {
+                            writer_disabled = true;
+                            writer_stats.record_disabled();
+                            shutdown_result = Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+                                "writer initialization",
+                            ));
+                            error!(
+                                "DecisionLogger: isolated PR2C writer initialization failed: {error}"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                if let Some(writer) = writer.as_mut() {
+                    if let Err(error) = writer.write_pair(pair).await {
+                        writer_disabled = true;
+                        writer_stats.record_writer_disabled_event();
+                        shutdown_result = Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+                            "paired row write",
+                        ));
+                        error!("DecisionLogger: isolated PR2C pair write failed: {error}");
+                    }
+                }
+            }
+            MetricContractLogCommand::Shutdown(ack) => {
+                if shutdown_ack.is_none() {
+                    // Stop new admissions, then keep receiving until every
+                    // command for which try_send/send already returned Ok has
+                    // been drained. Nothing accepted before close can remain
+                    // stranded behind the shutdown marker.
+                    rx.close();
+                    shutdown_ack = Some(ack);
+                } else {
+                    let _ = ack.send(Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+                        "duplicate shutdown marker",
+                    )));
+                }
+            }
+        }
+    }
+
+    if let Some(writer) = writer.as_mut() {
+        if let Err(error) = writer.finalize().await {
+            writer_stats.record_writer_disabled_event();
+            shutdown_result = Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+                "manifest finalization or completion proof",
+            ));
+            error!("DecisionLogger: final isolated PR2C manifest flush failed: {error}");
+        }
+    }
+    if writer_stats.snapshot().evidence_run_invalid && shutdown_result.is_ok() {
+        shutdown_result = Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+            "evidence run invalid",
+        ));
+    }
+    if let Some(ack) = shutdown_ack {
+        let _ = ack.send(shutdown_result);
+    }
 }
 
 impl DecisionLogger {
@@ -2821,15 +3074,63 @@ impl DecisionLogger {
         config: DecisionLoggerConfig,
         health: Option<Arc<RuntimeHealth>>,
     ) -> Self {
+        Self::new_with_health_and_metric_contract_fault(config, health, None)
+    }
+
+    /// Deterministic durability-fault constructor for integration tests. The
+    /// production constructors always pass `None`.
+    #[doc(hidden)]
+    pub fn new_with_metric_contract_writer_fault_injection_for_test(
+        config: DecisionLoggerConfig,
+        fault_injection: MetricContractWriterFaultInjectionV1,
+    ) -> Self {
+        Self::new_with_health_and_metric_contract_fault(config, None, Some(fault_injection))
+    }
+
+    fn new_with_health_and_metric_contract_fault(
+        config: DecisionLoggerConfig,
+        health: Option<Arc<RuntimeHealth>>,
+        metric_contract_fault_injection: Option<MetricContractWriterFaultInjectionV1>,
+    ) -> Self {
         let (tx, mut rx) = mpsc::channel::<LogCommand>(config.channel_buffer_size);
+        let routing = config
+            .metric_contract_pr2c_enabled
+            .then(|| DecisionLoggerRoutingContextV1::from(&config));
 
         if !config.enabled {
             info!("DecisionLogger: disabled by configuration");
-            return Self { tx };
+            return Self {
+                tx,
+                metric_contract_tx: None,
+                metric_contract_stats: Arc::new(MetricContractPairedWriterStatsV1::default()),
+                routing,
+                v33_writer_task: TokioMutex::new(None),
+                metric_contract_writer_task: TokioMutex::new(None),
+                enabled: false,
+            };
         }
 
-        // Spawn async writer task
-        tokio::spawn(async move {
+        let metric_contract_stats = Arc::new(MetricContractPairedWriterStatsV1::default());
+        let (metric_contract_tx, metric_contract_writer_task) =
+            if config.metric_contract_pr2c_enabled {
+                let (metric_contract_tx, metric_contract_rx) =
+                    mpsc::channel::<MetricContractLogCommand>(config.channel_buffer_size);
+                let task = tokio::spawn(run_metric_contract_writer_task(
+                    config.clone(),
+                    metric_contract_rx,
+                    Arc::clone(&metric_contract_stats),
+                    metric_contract_fault_injection,
+                ));
+                (Some(metric_contract_tx), Some(task))
+            } else {
+                info!("DecisionLogger: isolated PR2C durable writer disabled");
+                (None, None)
+            };
+
+        // Existing v33/legacy writer task. PR2C is intentionally absent from
+        // this command type and task so its filesystem latency cannot cause
+        // head-of-line blocking for established decision logs.
+        let v33_writer_task = tokio::spawn(async move {
             let mut logging_disabled_due_to_enospc = false;
             if let Err(e) = create_dir_all(&config.log_dir).await {
                 if is_no_space_error(std::iter::once(&e as &(dyn std::error::Error + 'static))) {
@@ -2865,6 +3166,7 @@ impl DecisionLogger {
             // ── A/B dedup guard: TTL+size-bounded cache ──────────────────────
             let mut dedup_map: HashMap<String, ()> = HashMap::new();
             let mut dedup_queue: VecDeque<(Instant, String)> = VecDeque::new();
+            let mut shutdown_ack = None;
 
             while let Some(cmd) = rx.recv().await {
                 match cmd {
@@ -2912,7 +3214,6 @@ impl DecisionLogger {
                         }
                         for mut plane_log in expand_gatekeeper_plane_logs(log) {
                             hydrate_gatekeeper_routing_fields(&mut plane_log, &config);
-
                             if plane_log.log_schema_version >= 19 && plane_log.reason_code.is_none()
                             {
                                 warn!(
@@ -3041,15 +3342,34 @@ impl DecisionLogger {
                             );
                         }
                     }
-                    LogCommand::Shutdown => {
+                    LogCommand::Shutdown(ack) => {
                         info!("DecisionLogger: shutting down");
-                        break;
+                        if shutdown_ack.is_none() {
+                            // Preserve the legacy queue's accepted-command
+                            // guarantee too: close admission and drain every
+                            // command already queued behind the marker.
+                            rx.close();
+                            shutdown_ack = Some(ack);
+                        } else {
+                            let _ = ack.send(());
+                        }
                     }
                 }
             }
+            if let Some(ack) = shutdown_ack {
+                let _ = ack.send(());
+            }
         });
 
-        Self { tx }
+        Self {
+            tx,
+            metric_contract_tx,
+            metric_contract_stats,
+            routing,
+            v33_writer_task: TokioMutex::new(Some(v33_writer_task)),
+            metric_contract_writer_task: TokioMutex::new(metric_contract_writer_task),
+            enabled: true,
+        }
     }
 
     /// Log a decision (fire-and-forget)
@@ -3113,6 +3433,76 @@ impl DecisionLogger {
         }
     }
 
+    /// Derive only the lightweight legacy-live routing identity needed by
+    /// PR2C. The raw v33 remains untouched and is expanded/hydrated solely by
+    /// the existing background v33 worker.
+    pub fn pr2c_legacy_live_context(
+        &self,
+        log: &GatekeeperBuyLog,
+    ) -> std::result::Result<Pr2cRoutedDecisionContextV1, Pr2cRoutingContextErrorV1> {
+        self.routing
+            .as_ref()
+            .ok_or(Pr2cRoutingContextErrorV1::MissingField(
+                "PR2C routing context",
+            ))?
+            .pr2c_legacy_live_context(log)
+    }
+
+    /// Try to enqueue the compact v34 summary and full evidence sidecar on the
+    /// isolated PR2C queue. This call never waits for queue capacity and can
+    /// therefore never transfer PR2C backpressure to Gatekeeper or v33.
+    pub fn log_metric_contract_pair(
+        &self,
+        pair: MetricContractPairedRecordV1,
+    ) -> std::result::Result<(), MetricContractEnqueueErrorV1> {
+        if !self.enabled || self.metric_contract_tx.is_none() {
+            return Err(MetricContractEnqueueErrorV1::WriterDisabled);
+        }
+        let Some(tx) = self.metric_contract_tx.as_ref() else {
+            return Err(MetricContractEnqueueErrorV1::WriterDisabled);
+        };
+        let started = Instant::now();
+        match tx.try_send(MetricContractLogCommand::WritePair(pair)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metric_contract_stats.record_queue_full();
+                ::metrics::counter!("metric_contract_pr2c_queue_full_total", 1);
+                return Err(MetricContractEnqueueErrorV1::QueueFull);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metric_contract_stats.record_queue_closed();
+                ::metrics::counter!("metric_contract_pr2c_queue_closed_total", 1);
+                return Err(MetricContractEnqueueErrorV1::ChannelClosed);
+            }
+        }
+        let queue_depth = tx.max_capacity().saturating_sub(tx.capacity());
+        self.metric_contract_stats.record_queue_depth(queue_depth);
+        let enqueue_wait_us = u64::try_from(started.elapsed().as_micros())
+            .expect("a process-local try_send cannot span u64::MAX microseconds");
+        self.metric_contract_stats
+            .record_enqueue_wait_us(enqueue_wait_us);
+        ::metrics::histogram!("logger_enqueue_wait_us", enqueue_wait_us as f64);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn metric_contract_pr2c_enabled(&self) -> bool {
+        self.enabled && self.metric_contract_tx.is_some()
+    }
+
+    #[must_use]
+    pub fn metric_contract_writer_stats(&self) -> MetricContractPairedWriterStatsSnapshotV1 {
+        self.metric_contract_stats.snapshot()
+    }
+
+    /// Mark an enabled PR2C evidence run invalid when the runtime cannot
+    /// finish all terminal producers before closing the isolated writer.
+    pub fn record_metric_contract_terminal_shutdown_failure(&self) {
+        if self.metric_contract_tx.is_some() {
+            self.metric_contract_stats.record_finalization_failure();
+        }
+    }
+
     /// Log additive Phase 0.6 coordination-risk evidence.
     ///
     /// This sidecar is export-only. It is routed independently from the
@@ -3130,9 +3520,122 @@ impl DecisionLogger {
         }
     }
 
-    /// Shutdown the logger gracefully
-    pub async fn shutdown(&self) {
-        let _ = self.tx.send(LogCommand::Shutdown).await;
+    /// Shut down both isolated writers with a bounded wait. A timeout marks
+    /// the PR2C run invalid and aborts any task that did not acknowledge; it
+    /// can never leave a caller waiting forever on filesystem finalization.
+    pub async fn shutdown(&self) -> std::result::Result<(), DecisionLoggerShutdownErrorV1> {
+        self.shutdown_with_timeout(DECISION_LOGGER_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    pub async fn shutdown_with_timeout(
+        &self,
+        shutdown_timeout: Duration,
+    ) -> std::result::Result<(), DecisionLoggerShutdownErrorV1> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let handshake = async {
+            let (v33_ack_tx, v33_ack_rx) = oneshot::channel();
+            self.tx
+                .send(LogCommand::Shutdown(v33_ack_tx))
+                .await
+                .map_err(|_| DecisionLoggerShutdownErrorV1::ChannelClosed("v33 command"))?;
+
+            let metric_contract_ack = if let Some(tx) = self.metric_contract_tx.as_ref() {
+                let (ack_tx, ack_rx) = oneshot::channel();
+                tx.send(MetricContractLogCommand::Shutdown(ack_tx))
+                    .await
+                    .map_err(|_| DecisionLoggerShutdownErrorV1::ChannelClosed("PR2C command"))?;
+                Some(ack_rx)
+            } else {
+                None
+            };
+
+            v33_ack_rx
+                .await
+                .map_err(|_| DecisionLoggerShutdownErrorV1::ChannelClosed("v33 ack"))?;
+            let metric_contract_result = if let Some(ack_rx) = metric_contract_ack {
+                ack_rx
+                    .await
+                    .map_err(|_| DecisionLoggerShutdownErrorV1::ChannelClosed("PR2C ack"))?
+            } else {
+                Ok(())
+            };
+            Ok(metric_contract_result)
+        };
+        let metric_contract_result = match timeout(shutdown_timeout, handshake).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                if self.metric_contract_tx.is_some() {
+                    self.metric_contract_stats.record_finalization_failure();
+                }
+                self.abort_writer_tasks().await;
+                return Err(error);
+            }
+            Err(_) => {
+                if self.metric_contract_tx.is_some() {
+                    self.metric_contract_stats.record_finalization_failure();
+                }
+                self.abort_writer_tasks().await;
+                return Err(DecisionLoggerShutdownErrorV1::Timeout(
+                    "writer acknowledgement",
+                ));
+            }
+        };
+
+        let v33_join_result = self
+            .join_writer_task(&self.v33_writer_task, "v33 writer", shutdown_timeout, false)
+            .await;
+        let metric_contract_join_result = self
+            .join_writer_task(
+                &self.metric_contract_writer_task,
+                "PR2C writer",
+                shutdown_timeout,
+                true,
+            )
+            .await;
+        v33_join_result?;
+        metric_contract_join_result?;
+        metric_contract_result
+    }
+
+    async fn join_writer_task(
+        &self,
+        slot: &TokioMutex<Option<JoinHandle<()>>>,
+        label: &'static str,
+        shutdown_timeout: Duration,
+        invalidates_pr2c: bool,
+    ) -> std::result::Result<(), DecisionLoggerShutdownErrorV1> {
+        let Some(mut task) = slot.lock().await.take() else {
+            return Ok(());
+        };
+        match timeout(shutdown_timeout, &mut task).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                if invalidates_pr2c {
+                    self.metric_contract_stats.record_finalization_failure();
+                }
+                Err(DecisionLoggerShutdownErrorV1::TaskJoin(label))
+            }
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                if invalidates_pr2c {
+                    self.metric_contract_stats.record_finalization_failure();
+                }
+                Err(DecisionLoggerShutdownErrorV1::Timeout(label))
+            }
+        }
+    }
+
+    async fn abort_writer_tasks(&self) {
+        for slot in [&self.v33_writer_task, &self.metric_contract_writer_task] {
+            if let Some(task) = slot.lock().await.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
     }
 }
 
@@ -3202,6 +3705,27 @@ fn v25_shadow_verdict_type_or_terminal_fallback(log: &GatekeeperBuyLog) -> Optio
             verdict.starts_with("TIMEOUT").then(|| verdict.to_string())
         })
     })
+}
+
+fn raw_gatekeeper_log_emits_legacy_live(log: &GatekeeperBuyLog) -> bool {
+    match log.decision_plane.as_deref() {
+        Some(DECISION_PLANE_LEGACY_LIVE) => return true,
+        Some(_) => return false,
+        None => {}
+    }
+
+    let has_legacy_plane = log.legacy_live_reason_chain.is_some()
+        || log.decision_reason.is_some()
+        || log.legacy_live_verdict_buy.is_some()
+        || log.decision_verdict_buy.is_some()
+        || log.legacy_live_verdict_type.is_some()
+        || log.verdict_type.is_some();
+    let has_shadow_plane = log.v25_shadow_verdict_type.is_some()
+        || log.v25_shadow_reason_chain.is_some()
+        || log.v25_shadow_confidence.is_some()
+        || log.v25_shadow_observation_stage.is_some();
+
+    has_legacy_plane || !has_shadow_plane
 }
 
 fn expand_gatekeeper_plane_logs(log: GatekeeperBuyLog) -> Vec<GatekeeperBuyLog> {
@@ -4389,6 +4913,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
 
@@ -5035,6 +5560,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -5093,7 +5619,7 @@ mod tests {
         );
 
         // Shutdown the logger
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     /// Create a mock GatekeeperBuyLog for testing.
@@ -6100,6 +6626,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         }
     }
@@ -6178,7 +6705,7 @@ mod tests {
         assert_eq!(row["send_path_changed"], false);
         assert_eq!(row["score_contract_hash"].as_str().unwrap().len(), 64);
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6240,7 +6767,7 @@ mod tests {
         assert!(verdict_types.contains(&"REJECT_CORE_FAIL"));
         assert!(verdict_types.contains(&"TIMEOUT_PHASE1"));
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6266,7 +6793,7 @@ mod tests {
         assert_eq!(boundaries["changes_execution"], false);
         assert_eq!(boundaries["send_path_changed"], false);
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6311,7 +6838,7 @@ mod tests {
         );
         assert_eq!(sidecar_rows[0]["changes_gatekeeper_decision"], false);
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6361,7 +6888,7 @@ mod tests {
         assert_eq!(sidecar_rows[0]["changes_execution"], false);
         assert_eq!(sidecar_rows[0]["send_path_changed"], false);
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6418,7 +6945,7 @@ mod tests {
             0
         );
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6452,7 +6979,7 @@ mod tests {
             .iter()
             .any(|value| value.as_str() == Some("gk_vector_price_return")));
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6492,7 +7019,7 @@ mod tests {
             .iter()
             .any(|value| value.as_str() == Some("gk_concentration_missing")));
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6543,7 +7070,7 @@ mod tests {
             .iter()
             .any(|value| value.as_str() == Some("gk_bonding_progress_pct")));
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6561,6 +7088,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -6614,7 +7142,7 @@ mod tests {
             lines2.len()
         );
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6632,6 +7160,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -6767,7 +7296,7 @@ mod tests {
         assert_eq!(pass_in_decisions["dev_sold_within_3s"], false);
         assert_eq!(pass_in_decisions["dev_sold_within_5s"], true);
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6784,6 +7313,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -6875,7 +7405,7 @@ mod tests {
         );
         assert_eq!(shadow_record["legacy_live_verdict_type"], "BUY");
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6892,6 +7422,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -6957,7 +7488,7 @@ mod tests {
             "TIMEOUT_PHASE1_INSUFFICIENT: tx=1/3 signers=1/2 buys=1/2"
         );
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[test]
@@ -7063,6 +7594,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -7106,7 +7638,7 @@ mod tests {
             GatekeeperReasonCode::BuyNormal.as_log_str()
         );
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -7123,6 +7655,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -7180,7 +7713,7 @@ mod tests {
             GatekeeperReasonCode::BuyNormal.as_log_str()
         );
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     /// Every JSONL record must include verdict_type — even when upstream
@@ -7201,6 +7734,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -7269,7 +7803,7 @@ mod tests {
             }
         }
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -7286,6 +7820,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -7341,6 +7876,46 @@ mod tests {
             .is_none());
         assert!(parsed["features"].get("interaction_penalty").is_none());
 
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_is_bounded_and_invalidates_pr2c_run() {
+        let config = DecisionLoggerConfig::default();
+        let routing = DecisionLoggerRoutingContextV1::from(&config);
+        let (tx, rx) = mpsc::channel(1);
+        let (metric_contract_tx, metric_contract_rx) = mpsc::channel(1);
+        let v33_writer_task = tokio::spawn(async move {
+            let _rx = rx;
+            std::future::pending::<()>().await;
+        });
+        let metric_contract_writer_task = tokio::spawn(async move {
+            let _rx = metric_contract_rx;
+            std::future::pending::<()>().await;
+        });
+        let stats = Arc::new(MetricContractPairedWriterStatsV1::default());
+        let logger = DecisionLogger {
+            tx,
+            metric_contract_tx: Some(metric_contract_tx),
+            metric_contract_stats: Arc::clone(&stats),
+            routing: Some(routing),
+            v33_writer_task: TokioMutex::new(Some(v33_writer_task)),
+            metric_contract_writer_task: TokioMutex::new(Some(metric_contract_writer_task)),
+            enabled: true,
+        };
+
+        let started = Instant::now();
+        assert_eq!(
+            logger
+                .shutdown_with_timeout(Duration::from_millis(10))
+                .await,
+            Err(DecisionLoggerShutdownErrorV1::Timeout(
+                "writer acknowledgement"
+            ))
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(stats.snapshot().evidence_run_invalid);
+        assert!(logger.v33_writer_task.lock().await.is_none());
+        assert!(logger.metric_contract_writer_task.lock().await.is_none());
     }
 }

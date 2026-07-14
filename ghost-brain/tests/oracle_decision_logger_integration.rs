@@ -37,6 +37,7 @@ async fn test_oracle_decision_logger_complete_flow() {
         log_dir: temp_dir.path().to_path_buf(),
         gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
+        metric_contract_pr2c_enabled: false,
         enabled: true,
         ..DecisionLoggerConfig::default()
     };
@@ -284,6 +285,7 @@ async fn test_veto_scenario() {
         log_dir: temp_dir.path().to_path_buf(),
         gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
+        metric_contract_pr2c_enabled: false,
         enabled: true,
         ..DecisionLoggerConfig::default()
     };
@@ -369,6 +371,7 @@ async fn test_guardian_abort_scenario() {
         log_dir: temp_dir.path().to_path_buf(),
         gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
+        metric_contract_pr2c_enabled: false,
         enabled: true,
         ..DecisionLoggerConfig::default()
     };
@@ -452,6 +455,7 @@ async fn test_multiple_candidates_concurrent() {
         log_dir: temp_dir.path().to_path_buf(),
         gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
+        metric_contract_pr2c_enabled: false,
         enabled: true,
         ..DecisionLoggerConfig::default()
     };

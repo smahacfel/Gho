@@ -1,6 +1,7 @@
 use super::{
     CanonicalHashErrorV1, CanonicalHashV1, CanonicalNullableV1, CanonicalU128StringV1,
-    CanonicalU64StringV1, MetricAvailabilityV1, MetricContractId, MetricContractProfileIdV1,
+    CanonicalU64StringV1, MetricAvailabilityV1, MetricContractDecisionSourceCutoffV1,
+    MetricContractId, MetricContractPolicyEquivalenceEvidenceV1, MetricContractProfileIdV1,
     MetricContractProfileV1, MetricContractRolloutMode, MetricEvidenceEnvelopeErrorV1,
     MetricEvidenceEnvelopeV1, MetricEvidenceReasonV1, MetricEvidenceRecordIdentityV1,
     MetricMeasurementQualityV1, MetricSurfaceId, StableEventIdentityV1,
@@ -1386,10 +1387,18 @@ pub struct MetricContractEvidenceHashPayloadV1 {
     pub evidence_schema_version: u16,
     pub record_identity: MetricEvidenceRecordIdentityV1,
     pub stable_event_identity: CanonicalNullableV1<StableEventIdentityV1>,
+    /// Independent durable decision cutoff. Replay must use this hashed value
+    /// as the projection context instead of trusting the decision-time
+    /// projection that it is attempting to verify.
+    pub source_cutoff: MetricContractDecisionSourceCutoffV1,
     pub rollout_mode: MetricContractRolloutMode,
     pub profile_id: MetricContractProfileIdV1,
     pub profile_hash: CanonicalHashV1,
     pub metric_contract_effective_config_hash: CanonicalHashV1,
+    /// Durable normalized policy inputs.  Replay derives the compact-v34
+    /// equivalence delta vector from this content-addressed evidence instead
+    /// of trusting the summary row.
+    pub policy_equivalence: MetricContractPolicyEquivalenceEvidenceV1,
     pub contracts: MetricContractsEvidenceSetV1,
 }
 
@@ -1406,6 +1415,12 @@ impl MetricContractEvidenceHashPayloadV1 {
                 ),
             );
         }
+        if self.source_cutoff.decision_timestamp_ms.get() == 0 {
+            return Err(MetricContractEvidenceTransportErrorV1::InvalidSourceCutoff);
+        }
+        self.policy_equivalence
+            .validate()
+            .map_err(|_| MetricContractEvidenceTransportErrorV1::PolicyEquivalenceInvariant)?;
         let profile = super::MetricContractFoundationConfigV1 {
             metric_contract_rollout_mode: self.rollout_mode,
             metric_contract_profile: self.profile_id,
@@ -1437,6 +1452,10 @@ pub enum MetricContractEvidenceTransportErrorV1 {
     ProfileHashMismatch,
     #[error("metric contract evidence SHA-256 mismatch")]
     HashMismatch,
+    #[error("metric contract evidence source cutoff is invalid")]
+    InvalidSourceCutoff,
+    #[error("metric contract evidence contains invalid policy-equivalence snapshots")]
+    PolicyEquivalenceInvariant,
 }
 
 /// Transport wrapper is deliberately separate from the semantic hash payload.
@@ -1516,13 +1535,17 @@ pub enum ComparatorDeltaStatusV1 {
 #[serde(deny_unknown_fields)]
 pub struct MetricContractComparatorSummaryV1 {
     pub verdict: ComparatorDeltaStatusV1,
-    pub reason: ComparatorDeltaStatusV1,
-    pub phase: ComparatorDeltaStatusV1,
+    pub primary_reason_code: ComparatorDeltaStatusV1,
+    pub ordered_reason_chain: ComparatorDeltaStatusV1,
+    pub phase_pass_vector: ComparatorDeltaStatusV1,
     pub soft_points: ComparatorDeltaStatusV1,
+    pub selector_soft_score: ComparatorDeltaStatusV1,
+    pub hard_fail_classification: ComparatorDeltaStatusV1,
 }
 
-/// Additive compact-v34 type reserved for PR2C. PR1 defines and round-trips the
-/// schema but does not insert it into `GatekeeperBuyLog` or change v33 emission.
+/// Additive compact-v34 summary emitted by PR2C into its own paired stream.
+/// It is intentionally not inserted into `GatekeeperBuyLog`; v33 emission and
+/// historical parsing remain frozen and independent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricContractDecisionSummaryV1 {
