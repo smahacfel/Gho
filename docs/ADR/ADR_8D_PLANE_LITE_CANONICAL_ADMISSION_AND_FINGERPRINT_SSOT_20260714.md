@@ -1,6 +1,6 @@
 # ADR-8D: Plane-Lite — kanoniczne admission i jeden właściciel fingerprintu
 
-Status: `IMPLEMENTED / LOCAL VALIDATION PASSED / CI PENDING`
+Status: `IMPLEMENTED / LOCAL VALIDATION PASSED / CI GATED BY PR #66`
 
 Typ: ADR-8D / Decision Plane / aktywny prebuy runtime
 
@@ -92,6 +92,13 @@ metryki, ale nie może po cichu wyzerować wcześniejszego evidence. Przepełnie
 historii blokuje częściowy rebuild, zachowuje kompletny bieżący agregator i
 jest jawnie raportowane jako `FINGERPRINT_REPLAY_HISTORY_TRUNCATED`.
 
+Jakość źródła (`fingerprint_degraded` i dokładny `fingerprint_reason`) jest
+przenoszona do `AlphaFingerprintFeatures` w `MaterializedFeatureSet`.
+Kompletność pól liczbowych nie może podnieść zdegradowanego fingerprintu do
+`evidence_status.alpha = Clean`. Alpha-dependent manipulation evidence również
+dziedziczy degradację, a legacy PR2B flip ratio jest pomijane dla
+zdegradowanego źródła.
+
 Szczegóły review fixu i jego red/green proof opisuje
 `ADR_8D_PLANE_LITE_FINGERPRINT_ANCHOR_LIFECYCLE_FIX_20260714.md`.
 
@@ -105,7 +112,8 @@ Ta implementacja nie zmienia i nie ogranicza rozwoju Decision Plane:
 - Type-5 ani planu jego późniejszej integracji z V3;
 - selectora;
 - IWIM — pozostaje całkowicie nietknięty zgodnie z przyjętym zakresem;
-- `MaterializedFeatureSet` i jego schema;
+- istniejące pola i semantyka `MaterializedFeatureSet`; schema otrzymała
+  wyłącznie addytywne, `#[serde(default)]` pola jakości fingerprintu;
 - DecisionLogger i replay schema;
 - configu oraz defaults;
 - postbuy, shadow execution, live execution i execution handoff.
@@ -130,13 +138,18 @@ authority ani rozbudowanego systemu scope IDs.
   wieloeventowego fixture po wprowadzeniu wcześniejszego admission;
 - `ghost-launcher/tests/refactor_invariants_tests.rs` — guard trzech
   terminalnych odczytów session-owned fingerprintu.
+- `ghost-core/src/checkpoint/types.rs` — addytywna jakość fingerprintu w MFS;
+- `ghost-launcher/src/components/gatekeeper_v3.rs` — jakość fingerprintu w
+  deterministycznym V3 snapshot hash;
+- `ghost-core/tests/feature_builder_tests.rs` — kompatybilność historycznych
+  MFS bez nowych pól jakości.
 
 ## 7. Weryfikacja
 
 Zaliczone:
 
 - `cargo test -p ghost-launcher --test session_lifecycle_tests -- --nocapture`
-  — `32/32`;
+  — `33/33`;
 - `cargo test -p ghost-launcher --lib tx_intelligence::engine::tests -- --nocapture`
   — `7/7`;
 - `cargo test -p ghost-launcher --test gatekeeper_policy_tests` — `46/46`;

@@ -1321,6 +1321,7 @@ fn feature_snapshot_alpha_fingerprint_can_fail_phase4_without_post_attach() {
         early_top3_buy_volume_pct_3s: Some(0.72),
         fixed_size_buy_ratio: None,
         flipper_presence_ratio: None,
+        ..AlphaFingerprintFeatures::default()
     };
 
     let assessment = build_assessment_from_features(

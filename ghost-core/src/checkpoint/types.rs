@@ -114,6 +114,13 @@ pub struct AlphaFingerprintFeatures {
     pub early_top3_buy_volume_pct_3s: Option<f64>,
     pub fixed_size_buy_ratio: Option<f64>,
     pub flipper_presence_ratio: Option<f64>,
+    /// Source-level quality emitted by the canonical fingerprint owner. Numeric field
+    /// completeness must never upgrade a degraded source to clean evidence.
+    #[serde(default)]
+    pub fingerprint_degraded: bool,
+    /// Exact source diagnostic retained for replay/audit across the MFS boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

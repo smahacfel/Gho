@@ -1564,6 +1564,134 @@ fn fingerprint_evidence_survives_late_identity_anchor_and_terminal_variants() {
 }
 
 #[test]
+fn truncated_fingerprint_quality_survives_materialization_and_blocks_v3_actionability() {
+    use ghost_brain::config::GatekeeperV3Config;
+    use ghost_core::metric_contracts::{
+        CanonicalNullableV1, MetricAvailabilityV1, MetricMeasurementQualityV1,
+    };
+    use ghost_core::session::types::SessionId;
+    use ghost_launcher::components::gatekeeper_v3::v3_actionability_payload;
+    use ghost_launcher::session::PoolObservationSession;
+    use ghost_launcher::tx_intelligence::TxIntelligenceConfig;
+
+    let pool_id = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let bonding_curve = Pubkey::new_unique();
+    let dev_wallet = Pubkey::new_unique();
+    let mut candidate = test_candidate(pool_id, base_mint, bonding_curve);
+    candidate.timestamp = 70_000;
+    // The initially observed slot is intentionally stale. The real slot arrives after the
+    // bounded fingerprint replay history has truncated.
+    candidate.slot = Some(2);
+
+    let gatekeeper_config = GatekeeperV2Config::default();
+    let fingerprint_config = EarlyFingerprintConfig::default();
+    let mut tx_intelligence_config =
+        TxIntelligenceConfig::from_gatekeeper_config(&gatekeeper_config, fingerprint_config);
+    tx_intelligence_config.tx_key_capacity = 1;
+    let mut session = PoolObservationSession::new(
+        SessionId(1),
+        pool_id,
+        base_mint,
+        bonding_curve,
+        Some(dev_wallet),
+        candidate,
+        70_000,
+        80_000,
+        &gatekeeper_config,
+        tx_intelligence_config,
+    );
+
+    for index in 0..10_u32 {
+        let signer = Pubkey::new_unique();
+        let mut tx = (*fingerprint_eligible_tx(
+            pool_id,
+            solana_sdk::signature::Signature::new_unique()
+                .to_string()
+                .as_str(),
+            70_100 + u64::from(index) * 10,
+        ))
+        .clone();
+        tx.event_ordinal = Some(index);
+        tx.signer = signer.to_string();
+        tx.slot = Some(1);
+        tx.owner_token_deltas = vec![TokenDelta {
+            owner: signer.to_string(),
+            delta_raw: 2_000_000_000_000,
+            decimals: 6,
+        }];
+        tx.signer_pre_balance_lamports = Some(1_000_000_000 + u64::from(index));
+        tx.cu_price_micro_lamports = Some(10);
+        tx.compute_unit_limit = Some(200_000);
+        tx.compute_units_consumed = Some(100_000);
+        tx.inner_ix_count = Some(2);
+        tx.cpi_depth = Some(2);
+        tx.ata_create_count = Some(0);
+        tx.jito_tip_detected = Some(false);
+        let _ = session.ingest_transaction(Arc::new(tx));
+    }
+
+    session.update_tx_intelligence_pool_identity_and_fingerprint_anchor(
+        Some(dev_wallet),
+        Some("late-create-signature"),
+        Some(1),
+        Some(70_000),
+    );
+
+    let fingerprint = session
+        .fingerprint_metrics()
+        .expect("fingerprint metrics must remain available after truncated rebuild");
+    assert!(fingerprint.fingerprint_degraded);
+    assert!(fingerprint
+        .fingerprint_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("FINGERPRINT_REPLAY_HISTORY_TRUNCATED")));
+    assert!(fingerprint.flipper_presence_ratio.is_some());
+
+    let features = session
+        .try_materialize_features()
+        .expect("degraded fingerprint must still materialize deterministically");
+    assert!(features.alpha_fingerprint.fingerprint_degraded);
+    assert!(features
+        .alpha_fingerprint
+        .fingerprint_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("FINGERPRINT_REPLAY_HISTORY_TRUNCATED")));
+    assert_eq!(
+        features.evidence_status.alpha.status,
+        EvidenceStatus::Degraded,
+        "source degradation must override numeric alpha-field completeness"
+    );
+    assert_ne!(
+        features.manipulation_contradictions.status,
+        EvidenceStatus::Clean,
+        "alpha-dependent manipulation evidence cannot be clean"
+    );
+
+    let actionability = v3_actionability_payload(&features, &GatekeeperV3Config::default(), false);
+    assert_eq!(actionability["groups"]["alpha"]["status"], "Degraded");
+    assert_ne!(
+        actionability["groups"]["alpha"]["actionability"],
+        "actionable"
+    );
+
+    let projection = features
+        .metric_contract_decision_projection_v1
+        .as_ref()
+        .expect("current materialization must emit the PR2B projection");
+    let legacy_flip = &projection.flip_ratio.legacy_slot_gap_ratio;
+    assert_eq!(legacy_flip.value, CanonicalNullableV1::Null);
+    assert_eq!(
+        legacy_flip.envelope.availability,
+        MetricAvailabilityV1::Unavailable
+    );
+    assert_eq!(
+        legacy_flip.envelope.measurement_quality,
+        MetricMeasurementQualityV1::NotApplicable
+    );
+}
+
+#[test]
 fn duplicate_dust_is_counted_once_and_never_becomes_trade_or_fingerprint_evidence() {
     let manager = SessionManager::default();
     let pool_id = Pubkey::new_unique();

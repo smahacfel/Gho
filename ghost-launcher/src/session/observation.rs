@@ -767,6 +767,7 @@ impl PoolObservationSession {
             EvidenceStatus::Unavailable
         } else if organic.status != EvidenceStatus::Clean
             || !sybil.degraded_reasons.is_empty()
+            || alpha.fingerprint_degraded
             || alpha.fixed_size_buy_ratio.is_none()
             || alpha.early_top3_buy_volume_pct_3s.is_none()
         {
@@ -1039,12 +1040,14 @@ impl PoolObservationSession {
         .into_iter()
         .filter(|available| *available)
         .count();
-        let alpha = if alpha_available_count == 9 {
-            evidence_clean()
-        } else if alpha_available_count > 0 {
-            evidence_degraded(vec![EvidenceDegradedReason::AlphaEvidencePartial])
-        } else {
+        let alpha = if alpha_available_count == 0 {
             evidence_unavailable(vec![EvidenceUnavailableReason::AlphaFingerprintMissing])
+        } else if materialized.alpha_fingerprint.fingerprint_degraded {
+            evidence_degraded(vec![EvidenceDegradedReason::AlphaEvidencePartial])
+        } else if alpha_available_count == 9 {
+            evidence_clean()
+        } else {
+            evidence_degraded(vec![EvidenceDegradedReason::AlphaEvidencePartial])
         };
 
         let manipulation = if materialized.tx_intel_features.tx_count > 0 {
@@ -2848,6 +2851,8 @@ impl PoolObservationSession {
                 early_top3_buy_volume_pct_3s: fingerprint.early_top3_buy_volume_pct_3s,
                 fixed_size_buy_ratio: fingerprint.fixed_size_buy_ratio,
                 flipper_presence_ratio: fingerprint.flipper_presence_ratio,
+                fingerprint_degraded: fingerprint.fingerprint_degraded,
+                fingerprint_reason: fingerprint.fingerprint_reason.clone(),
             };
         }
 
@@ -3004,6 +3009,7 @@ impl PoolObservationSession {
             .metric_contract_reserve_velocity_snapshot(&self.base_mint);
         let legacy_flip_ratio = fingerprint_metrics
             .as_ref()
+            .filter(|fingerprint| !fingerprint.fingerprint_degraded)
             .and_then(|fingerprint| fingerprint.flipper_presence_ratio);
         let build_context = crate::metric_contracts::Pr2bBuildContextV1 {
             rollout_mode: effective_config.payload.rollout_mode,

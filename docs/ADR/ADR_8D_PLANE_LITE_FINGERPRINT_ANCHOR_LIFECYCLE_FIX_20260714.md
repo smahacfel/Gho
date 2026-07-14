@@ -1,6 +1,6 @@
 # ADR-8D: Plane-Lite — zachowanie fingerprint evidence po późnym anchorze
 
-Status: `IMPLEMENTED / LOCAL VALIDATION PASSED / CI PENDING`
+Status: `IMPLEMENTED / LOCAL VALIDATION PASSED / CI GATED BY PR #66`
 
 Typ: ADR-8D / Decision Plane / review fix / aktywny prebuy runtime
 
@@ -81,6 +81,12 @@ fingerprint staje się jawnie degraded z reason:
 
 `FINGERPRINT_REPLAY_HISTORY_TRUNCATED`
 
+Follow-up review wykazał, że pierwsza wersja zachowywała tę jakość jedynie w
+`EarlyFingerprintMetrics`. Addytywna poprawka opisana w
+`ADR_8D_PLANE_LITE_FINGERPRINT_QUALITY_PROPAGATION_20260714.md` przenosi flagę
+i dokładny reason do MFS oraz blokuje prezentowanie tych wartości V3/PR2B jako
+clean evidence.
+
 Flaga pominiętego rebuilda jest monotoniczna dla życia sesji. System nie
 przedstawia częściowego replayu jako pełnego SSOT; w tym skrajnym przypadku
 zachowuje pełny stan według poprzedniego anchora zamiast zastosować późne
@@ -135,7 +141,8 @@ Porównanie diagnostyczne przed korektą fixture: czysty base `4/4`, current hea
 
 ## 8. Niezmienione kontrakty
 
-- `MaterializedFeatureSet` i feature formulas;
+- formuły wartości fingerprintu; `MaterializedFeatureSet` otrzymał później
+  addytywne pola jakości źródła z bezpiecznymi defaultami;
 - Gatekeeper V2/V2.5/V3 policy, verdicts, thresholds i reason codes;
 - selector, Type-5 oraz IWIM;
 - config i serde schema;
@@ -156,7 +163,7 @@ Końcowa walidacja lokalna:
 - `cargo test -p ghost-launcher --lib tx_intelligence::engine::tests -- --nocapture`
   — `7/7`;
 - `cargo test -p ghost-launcher --test session_lifecycle_tests -- --nocapture`
-  — `32/32`;
+  — `33/33`;
 - `cargo test -p ghost-launcher --test gatekeeper_policy_tests` — `46/46`;
 - `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers -- --nocapture`
   — `26/26`;
@@ -173,9 +180,10 @@ terminalnych wariantów `BUY`/`REJECT`/`TIMEOUT`, a także jawny kontrakt
 timestamp drift. Test modułu silnika potwierdza, że overflow nie uruchamia
 częściowego replayu i emituje degraded reason przy próbie rebuilda.
 
-PR pozostaje draftem do czasu zakończenia pełnego wymaganego CI. Znane,
-niezależne baseline'y nie są przedstawiane jako regresje ani maskowane
-zmianami poza zakresem.
+Wymagane CI dla headu `356cf4212495e41bb42dacb40138159b9421fa8d`
+zakończyło się sukcesem. Każdy follow-up head nadal podlega tym samym bramkom
+PR #66. PR pozostaje draftem do ponownego review. Znane, niezależne baseline'y
+nie są przedstawiane jako regresje ani maskowane zmianami poza zakresem.
 
 ## 10. Rollback
 
