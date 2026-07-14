@@ -238,7 +238,6 @@ impl TxIntelligenceEngine {
 
     pub fn on_transaction(&mut self, tx: &PoolTransaction) {
         self.flip_v2.on_transaction(tx);
-        self.ingest_fingerprint(tx);
 
         let tx_key = tx_key_for(tx);
         if let Some(ref tx_key) = tx_key {
@@ -254,6 +253,13 @@ impl TxIntelligenceEngine {
 
         if let Some(tx_key) = tx_key.clone() {
             self.track_tx_key(tx_key);
+        }
+
+        // The canonical fingerprint universe contains unique, successful, non-dust events only.
+        // Failed attempts remain part of the V2-compatible TxIntelligence counters below, but
+        // they cannot become positive/organic fingerprint evidence.
+        if tx.success {
+            self.ingest_fingerprint(tx);
         }
 
         let event_ts_ms = tx_epoch_like_event_ts_ms(tx);

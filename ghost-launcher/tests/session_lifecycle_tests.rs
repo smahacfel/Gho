@@ -83,6 +83,17 @@ fn test_tx(pool_id: Pubkey, signature: &str, timestamp_ms: u64) -> Arc<PoolTrans
     })
 }
 
+fn fingerprint_eligible_tx(
+    pool_id: Pubkey,
+    signature: &str,
+    timestamp_ms: u64,
+) -> Arc<PoolTransaction> {
+    let mut tx = (*test_tx(pool_id, signature, timestamp_ms)).clone();
+    tx.semantic.slot_quality = ghost_core::SlotQuality::Present;
+    tx.token_amount_units = Some(2_000_000_000_000);
+    Arc::new(tx)
+}
+
 fn ftdi_tx(
     pool_id: Pubkey,
     signer: Pubkey,
@@ -1347,18 +1358,213 @@ fn session_dedup_does_not_double_count_duplicates() {
         Pubkey::new_unique(),
         2_000,
     );
-    let tx = test_tx(pool_id, "sig-dup", 2_010);
+    let tx = fingerprint_eligible_tx(pool_id, "sig-dup", 2_010);
 
-    {
+    let (fingerprint_before_duplicate, fingerprint_after_duplicate) = {
         let mut guard = session.write();
+        guard.update_tx_intelligence_fingerprint_anchor(Some(1), Some(2_000), None);
         let _ = guard.ingest_transaction(tx.clone());
+        let before = guard
+            .fingerprint_metrics()
+            .and_then(|metrics| metrics.block0_sniped_supply_pct)
+            .expect("first admitted event should populate the canonical fingerprint");
         let _ = guard.ingest_transaction(tx);
-    }
+        let after = guard
+            .fingerprint_metrics()
+            .and_then(|metrics| metrics.block0_sniped_supply_pct)
+            .expect("duplicate must leave the canonical fingerprint available");
+        (before, after)
+    };
 
     let guard = session.read();
     assert_eq!(guard.diagnostics.total_tx_seen, 1);
     assert_eq!(guard.tx_buffer.len(), 1);
     assert_eq!(guard.tx_keys_seen.len(), 1);
+    assert_eq!(guard.tx_intel_features.tx_count, 1);
+    assert_eq!(guard.tx_intel_features.buy_count, 1);
+    assert_eq!(
+        fingerprint_before_duplicate, fingerprint_after_duplicate,
+        "duplicate must not re-enter the canonical fingerprint reducer"
+    );
+}
+
+#[test]
+fn session_admission_keeps_same_signature_with_different_event_ordinals_distinct() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let session = open_session(
+        &manager,
+        pool_id,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        3_000,
+    );
+    let signature = solana_sdk::signature::Signature::new_unique().to_string();
+    let first = test_tx(pool_id, signature.as_str(), 3_010);
+    let mut second = (*first).clone();
+    second.event_ordinal = Some(1);
+    second.signer = Pubkey::new_unique().to_string();
+
+    {
+        let mut guard = session.write();
+        let _ = guard.ingest_transaction(first);
+        let _ = guard.ingest_transaction(Arc::new(second));
+    }
+
+    let guard = session.read();
+    assert_eq!(guard.tx_keys_seen.len(), 2);
+    assert_eq!(guard.diagnostics.total_tx_seen, 2);
+    assert_eq!(guard.tx_buffer.len(), 2);
+    assert_eq!(guard.tx_intel_features.tx_count, 2);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 2);
+}
+
+#[test]
+fn duplicate_dust_is_counted_once_and_never_becomes_trade_or_fingerprint_evidence() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let session = open_session(
+        &manager,
+        pool_id,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        4_000,
+    );
+    let mut dust = (*fingerprint_eligible_tx(pool_id, "sig-dust", 4_010)).clone();
+    dust.volume_sol = 0.001;
+    dust.sol_amount_lamports = Some(1_000_000);
+    let dust = Arc::new(dust);
+
+    let flip_snapshot = {
+        let mut guard = session.write();
+        guard.update_tx_intelligence_fingerprint_anchor(Some(1), Some(4_000), None);
+        let _ = guard.ingest_transaction(dust.clone());
+        let _ = guard.ingest_transaction(dust);
+        guard.tx_intelligence.flip_v2_snapshot(4_050, Some(1))
+    };
+
+    let guard = session.read();
+    assert_eq!(guard.tx_keys_seen.len(), 1);
+    assert_eq!(guard.diagnostics.total_tx_seen, 0);
+    assert!(guard.tx_buffer.is_empty());
+    assert_eq!(guard.tx_intel_features.dust_tx_count, 1);
+    assert_eq!(guard.tx_intel_features.tx_count, 0);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 0);
+    assert_eq!(
+        guard
+            .fingerprint_metrics()
+            .and_then(|metrics| metrics.sell_buy_ratio),
+        None
+    );
+    assert_eq!(flip_snapshot.eligible_buyer_count, 0);
+    assert!(flip_snapshot
+        .reasons
+        .contains(&ghost_core::metric_contracts::FlipEvidenceReasonV1::DustExcluded));
+}
+
+#[test]
+fn failed_non_dust_preserves_v2_attempt_counts_but_not_positive_evidence() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let session = open_session(
+        &manager,
+        pool_id,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        5_000,
+    );
+    let mut failed = (*fingerprint_eligible_tx(pool_id, "sig-failed", 5_010)).clone();
+    failed.success = false;
+
+    let (flip_snapshot, materialized) = {
+        let mut guard = session.write();
+        guard.update_tx_intelligence_fingerprint_anchor(Some(1), Some(5_000), None);
+        let _ = guard.ingest_transaction(Arc::new(failed));
+        (
+            guard.tx_intelligence.flip_v2_snapshot(5_050, Some(1)),
+            guard.materialize_features(),
+        )
+    };
+
+    let guard = session.read();
+    assert_eq!(guard.diagnostics.total_tx_seen, 1);
+    assert_eq!(guard.tx_buffer.len(), 1);
+    assert_eq!(guard.tx_intel_features.tx_count, 1);
+    assert_eq!(guard.tx_intel_features.buy_count, 1);
+    assert_eq!(guard.tx_intel_features.failed_tx_count, 1);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 1);
+    assert_eq!(
+        guard
+            .fingerprint_metrics()
+            .and_then(|metrics| metrics.sell_buy_ratio),
+        None
+    );
+    assert_eq!(materialized.sybil_resistance.buy_sample_count, 0);
+    assert_eq!(materialized.sybil_resistance.signer_sample_count, 0);
+    assert_eq!(flip_snapshot.eligible_buyer_count, 0);
+    assert!(flip_snapshot
+        .reasons
+        .contains(&ghost_core::metric_contracts::FlipEvidenceReasonV1::FailedTransactionExcluded));
+}
+
+#[test]
+fn decided_and_closed_sessions_ignore_late_transactions_without_mutation() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let session = open_session(
+        &manager,
+        pool_id,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        6_000,
+    );
+
+    let baseline = {
+        let mut guard = session.write();
+        guard.update_tx_intelligence_fingerprint_anchor(Some(1), Some(6_000), None);
+        let _ = guard.ingest_transaction(fingerprint_eligible_tx(
+            pool_id,
+            "sig-before-terminal",
+            6_010,
+        ));
+        guard.apply_verdict(VerdictOutcome::Pass {
+            reason: "terminal".to_string(),
+        });
+        (
+            guard.diagnostics.clone(),
+            guard.tx_keys_seen.len(),
+            guard.tx_buffer.len(),
+            guard.tx_intel_features.clone(),
+            guard.gatekeeper_buffer().total_tx_count(),
+            guard
+                .fingerprint_metrics()
+                .and_then(|metrics| metrics.sell_buy_ratio),
+        )
+    };
+
+    {
+        let mut guard = session.write();
+        let mut late = (*fingerprint_eligible_tx(pool_id, "sig-after-decided", 6_020)).clone();
+        late.is_buy = false;
+        let _ = guard.ingest_transaction(Arc::new(late));
+        guard.close();
+        let mut later = (*fingerprint_eligible_tx(pool_id, "sig-after-closed", 6_030)).clone();
+        later.is_buy = false;
+        let _ = guard.ingest_transaction(Arc::new(later));
+    }
+
+    let guard = session.read();
+    assert_eq!(guard.diagnostics, baseline.0);
+    assert_eq!(guard.tx_keys_seen.len(), baseline.1);
+    assert_eq!(guard.tx_buffer.len(), baseline.2);
+    assert_eq!(guard.tx_intel_features, baseline.3);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), baseline.4);
+    assert_eq!(
+        guard
+            .fingerprint_metrics()
+            .and_then(|metrics| metrics.sell_buy_ratio),
+        baseline.5
+    );
 }
 
 #[test]
