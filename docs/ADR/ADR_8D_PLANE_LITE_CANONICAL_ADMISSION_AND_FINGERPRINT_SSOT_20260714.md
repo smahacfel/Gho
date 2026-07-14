@@ -125,7 +125,11 @@ authority ani rozbudowanego systemu scope IDs.
   pool identity/anchora do właściciela sesyjnego;
 - `ghost-launcher/tests/session_lifecycle_tests.rs` — kontrakty duplicate,
   ordinal/timestamp identity, dust, failed, late-after-terminal oraz zachowanie
-  fingerprint evidence po późnej aktualizacji metadanych.
+  fingerprint evidence po późnej aktualizacji metadanych;
+- `ghost-launcher/tests/gatekeeper_policy_tests.rs` — jawna time provenance
+  wieloeventowego fixture po wprowadzeniu wcześniejszego admission;
+- `ghost-launcher/tests/refactor_invariants_tests.rs` — guard trzech
+  terminalnych odczytów session-owned fingerprintu.
 
 ## 7. Weryfikacja
 
@@ -135,12 +139,15 @@ Zaliczone:
   — `32/32`;
 - `cargo test -p ghost-launcher --lib tx_intelligence::engine::tests -- --nocapture`
   — `7/7`;
+- `cargo test -p ghost-launcher --test gatekeeper_policy_tests` — `46/46`;
 - `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers -- --nocapture`
   — `26/26`;
 - `cargo test -p ghost-launcher --test gatekeeper_v25_regression`
   — `42/42`;
 - `cargo test -p ghost-launcher --test gatekeeper_v3_tests`
-  — `9/9`.
+  — `9/9`;
+- `cargo test -p ghost-launcher --test refactor_invariants_tests` — `12/12`;
+- `cargo test -p ghost-brain --lib replay_payload` — `5/5`;
 - `cargo check -p ghost-launcher` — PASS;
 - `cargo fmt --all -- --check` — PASS;
 - `git diff --check` — PASS.
@@ -156,13 +163,15 @@ Rozpoznane baseline'y, odtworzone albo istniejące przed zmianą:
   bazowy `test_full_pipeline_reject` kończy proces stack overflow; ten sam wynik
   odtworzono na czystym worktree z base SHA.
 
-Baseline'ów nie maskowano zmianami fixture'ów ani polityki poza zakresem
-Plane-Lite.
+Żadnego z wymienionych baseline'ów nie maskowano. Jedyna korekta fixture'a
+dotyczyła jawnego `EventTimeMetadata` w zielonej na base suite
+`gatekeeper_policy_tests`; nie zmieniono jej danych ekonomicznych, oczekiwanego
+verdictu ani Gatekeeper policy.
 
 ## 8. Rollback i następny krok
 
-Rollback jest atomowy: revert zmian w czterech plikach runtime/test oraz tego
-ADR. Nie ma migracji danych, configu ani schema.
+Rollback jest atomowy na poziomie commitów Plane-Lite i review fixów. Nie ma
+migracji danych, configu ani schema.
 
 Po akceptacji Plane-Lite następnym niezależnym krokiem może być odchudzona
 integracja Type-5 z V3: zachować V2.5/V3 jako rozwijane challengery, dostarczyć

@@ -96,7 +96,28 @@ Kontrakt został nazwany komentarzem przy admission i osobnym testem. Ewentualna
 zmiana identity musi być oddzielną migracją obejmującą wszystkie konsumenty
 `TxKey`; nie została ukryta w review fixie fingerprintu.
 
-## 6. Zakres zmian
+## 6. CI follow-up: jawny czas fixture i aktualny static guard
+
+Pierwszy run CI po review fixie ujawnił dwa stare test contracts, które nadal
+opisywały stan sprzed Plane-Lite:
+
+1. `curve_tx()` w `gatekeeper_policy_tests` tworzył pięć zdarzeń z
+   `EventTimeMetadata::default()`, nieważnymi testowymi signature i tym samym
+   ordinalem. Base przechodził dzięki przypadkowemu rozdzieleniu wall-clock
+   fallbacków podczas późniejszego ingestu; wcześniejsze canonical admission
+   ujawniło kolizję. Fixture otrzymał jawny `ingress_wall_ts_ms` równy swojemu
+   istniejącemu testowemu timestampowi. Runtime time semantics i Gatekeeper
+   policy pozostały bez zmian.
+2. `refactor_invariants_tests` nadal szukał starego przypisania
+   `early_fingerprint = Some(...)`. Guard został zaostrzony do dokładnie trzech
+   przypisań z `session.read().fingerprint_metrics()` i nadal sprawdza, że
+   znajdują się wyłącznie w ramionach `REJECT`, `TIMEOUT` i `BUY`.
+
+Porównanie diagnostyczne przed korektą fixture: czysty base `4/4`, current head
+`2/4` dla filtra `feature_policy_`. Po jawnej provenance pełne
+`gatekeeper_policy_tests` przechodzi `46/46`.
+
+## 7. Zakres zmian
 
 - `ghost-launcher/src/tx_intelligence/engine.rs` — bounded retained events,
   deterministic rebuild/replay, atomic late metadata update i degraded reason;
@@ -106,9 +127,13 @@ zmiana identity musi być oddzielną migracją obejmującą wszystkie konsumenty
   późnego `NewPoolDetected`;
 - `ghost-launcher/tests/session_lifecycle_tests.rs` — late-anchor lifecycle dla
   `BUY`/`REJECT`/`TIMEOUT`, duplicate stability i timestamp-drift contract;
+- `ghost-launcher/tests/gatekeeper_policy_tests.rs` — jawny ingress-wall time
+  dla fixture'ów, które rzeczywiście testują wieloeventową policy;
+- `ghost-launcher/tests/refactor_invariants_tests.rs` — static guard wymaga
+  dokładnie trzech terminalnych odczytów session-owned fingerprintu;
 - ADR Plane-Lite — korekta opisu lifecycle fingerprintu.
 
-## 7. Niezmienione kontrakty
+## 8. Niezmienione kontrakty
 
 - `MaterializedFeatureSet` i feature formulas;
 - Gatekeeper V2/V2.5/V3 policy, verdicts, thresholds i reason codes;
@@ -118,7 +143,7 @@ zmiana identity musi być oddzielną migracją obejmującą wszystkie konsumenty
 - shadow/live separation, execution i postbuy;
 - existing `TxKey` identity semantics.
 
-## 8. Weryfikacja i warunki akceptacji
+## 9. Weryfikacja i warunki akceptacji
 
 Red/green proof:
 
@@ -132,10 +157,13 @@ Końcowa walidacja lokalna:
   — `7/7`;
 - `cargo test -p ghost-launcher --test session_lifecycle_tests -- --nocapture`
   — `32/32`;
+- `cargo test -p ghost-launcher --test gatekeeper_policy_tests` — `46/46`;
 - `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers -- --nocapture`
   — `26/26`;
 - `cargo test -p ghost-launcher --test gatekeeper_v25_regression` — `42/42`;
 - `cargo test -p ghost-launcher --test gatekeeper_v3_tests` — `9/9`;
+- `cargo test -p ghost-launcher --test refactor_invariants_tests` — `12/12`;
+- `cargo test -p ghost-brain --lib replay_payload` — `5/5`;
 - `cargo check -p ghost-launcher` — PASS;
 - `cargo fmt --all -- --check` — PASS;
 - `git diff --check` — PASS.
@@ -149,7 +177,7 @@ PR pozostaje draftem do czasu zakończenia pełnego wymaganego CI. Znane,
 niezależne baseline'y nie są przedstawiane jako regresje ani maskowane
 zmianami poza zakresem.
 
-## 9. Rollback
+## 10. Rollback
 
 Rollback to revert follow-up commita. Nie ma migracji danych, configu ani
 schema. Revert przywraca destrukcyjny rebuild i dlatego jest dopuszczalny tylko

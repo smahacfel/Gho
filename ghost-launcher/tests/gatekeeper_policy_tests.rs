@@ -870,7 +870,7 @@ fn curve_tx(
         is_dev_buy: false,
         dev_buy_lamports: 0,
         arrival_ts_ms: timestamp_ms,
-        event_time: ghost_core::EventTimeMetadata::default(),
+        event_time: ghost_core::EventTimeMetadata::new(None, Some(timestamp_ms), None),
         mpcf_payload: vec![],
         mpcf_payload_missing_reason: RawBytesMissingReason::Unknown,
         v_tokens_in_bonding_curve: Some(v_tokens),
