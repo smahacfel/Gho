@@ -4,7 +4,9 @@ mod common;
 use common::{
     current_v33_unrouted_fixture, current_v33_unrouted_log, frozen_inputs_fixture, paired_fixture,
 };
-use ghost_brain::oracle::decision_logger::MetricContractEnqueueErrorV1;
+use ghost_brain::oracle::decision_logger::{
+    DecisionLoggerShutdownErrorV1, MetricContractEnqueueErrorV1,
+};
 use ghost_brain::oracle::{
     DecisionLogger, DecisionLoggerConfig, MetricContractLatencyHistogramErrorV1,
     MetricContractLatencyHistogramSnapshotV1, MetricContractPairedWriterConfigV1,
@@ -350,18 +352,18 @@ fn runtime_terminal_source_keeps_raw_v33_and_builds_pr2c_only_after_the_off_gate
         .expect("pair builder consumes only the typed routed context");
     assert!(disabled_gate < context && context < build);
 
-    let spawn_start = source
-        .find("fn spawn_gatekeeper_decision_logs(")
+    let writer_start = source
+        .find("async fn write_gatekeeper_decision_logs(")
         .expect("terminal logger helper exists");
-    let spawn = &source[spawn_start
-        ..source[spawn_start..]
+    let writer = &source[writer_start
+        ..source[writer_start..]
             .find("\n#[derive(Debug, Error)]")
-            .map(|offset| spawn_start + offset)
+            .map(|offset| writer_start + offset)
             .expect("terminal logger helper has a bounded source region")];
-    let v33 = spawn
+    let v33 = writer
         .find("log_gatekeeper_buy_decision(buy_log)")
         .expect("the unchanged raw v33 payload is enqueued");
-    let pair = spawn
+    let pair = writer
         .find("log_metric_contract_pair(metric_contract_pair)")
         .expect("pair is enqueued after v33");
     assert!(v33 < pair);
@@ -815,6 +817,81 @@ async fn post_rename_directory_sync_failure_cannot_leave_a_valid_completion_proo
 }
 
 #[tokio::test]
+async fn finalization_failure_propagates_through_decision_logger_shutdown() {
+    let temp = tempfile::tempdir().unwrap();
+    let logger = DecisionLogger::new_with_metric_contract_writer_fault_injection_for_test(
+        DecisionLoggerConfig {
+            log_dir: temp.path().to_path_buf(),
+            gatekeeper_log_dir: temp.path().to_path_buf(),
+            gatekeeper_rollout_profile: "profile-a".to_string(),
+            gatekeeper_config_hash: common::TEST_GATEKEEPER_CONFIG_HASH.to_string(),
+            gatekeeper_run_id: Some("shutdown-finalize-run".to_string()),
+            gatekeeper_session_id: Some("shutdown-finalize-session".to_string()),
+            brain_config_path: Some("ghost-brain/config/ghost_brain_config.toml".to_string()),
+            brain_config_hash: Some(common::TEST_BRAIN_CONFIG_HASH.to_string()),
+            channel_buffer_size: 4,
+            metric_contract_pr2c_enabled: true,
+            enabled: true,
+        },
+        MetricContractWriterFaultInjectionV1::FinalManifestDirectorySync,
+    );
+    logger
+        .log_metric_contract_pair(paired_fixture(
+            "shutdown-finalize-run",
+            "shutdown-finalize-join",
+        ))
+        .unwrap();
+
+    assert_eq!(
+        logger.shutdown().await,
+        Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+            "manifest finalization or completion proof"
+        ))
+    );
+    assert!(logger.metric_contract_writer_stats().evidence_run_invalid);
+    assert!(!temp
+        .path()
+        .join(METRIC_CONTRACT_COMPLETION_PROOF_V1_FILE)
+        .exists());
+}
+
+#[tokio::test]
+async fn accepted_pairs_are_drained_before_shutdown_and_post_close_enqueue_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let logger = DecisionLogger::new(DecisionLoggerConfig {
+        log_dir: temp.path().to_path_buf(),
+        gatekeeper_log_dir: temp.path().to_path_buf(),
+        gatekeeper_rollout_profile: "profile-a".to_string(),
+        gatekeeper_config_hash: common::TEST_GATEKEEPER_CONFIG_HASH.to_string(),
+        gatekeeper_run_id: Some("shutdown-drain-run".to_string()),
+        gatekeeper_session_id: Some("shutdown-drain-session".to_string()),
+        brain_config_path: Some("ghost-brain/config/ghost_brain_config.toml".to_string()),
+        brain_config_hash: Some(common::TEST_BRAIN_CONFIG_HASH.to_string()),
+        channel_buffer_size: 8,
+        metric_contract_pr2c_enabled: true,
+        enabled: true,
+    });
+    for join_key in ["shutdown-drain-a", "shutdown-drain-b"] {
+        logger
+            .log_metric_contract_pair(paired_fixture("shutdown-drain-run", join_key))
+            .unwrap();
+    }
+
+    logger.shutdown().await.unwrap();
+
+    let evidence =
+        std::fs::read_to_string(temp.path().join(METRIC_CONTRACT_EVIDENCE_V1_FILE)).unwrap();
+    assert_eq!(evidence.lines().count(), 2);
+    assert_eq!(
+        logger.log_metric_contract_pair(paired_fixture(
+            "shutdown-drain-run",
+            "shutdown-drain-after-close",
+        )),
+        Err(MetricContractEnqueueErrorV1::ChannelClosed)
+    );
+}
+
+#[tokio::test]
 async fn pr2c_disabled_preserves_exact_v33_bytes_and_opens_no_pr2c_artifacts() {
     let temp = tempfile::tempdir().unwrap();
     let pair = paired_fixture("disabled-run", "disabled-join");
@@ -919,7 +996,12 @@ async fn saturated_pr2c_queue_is_non_blocking_keeps_v33_writable_and_invalidates
     // v33 uses a different queue and worker, so it remains writable while the
     // PR2C branch is saturated.
     logger.log_gatekeeper_buy_decision(raw).await;
-    logger.shutdown().await.unwrap();
+    assert_eq!(
+        logger.shutdown().await,
+        Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+            "evidence run invalid"
+        ))
+    );
 
     let v33_path = temp
         .path()

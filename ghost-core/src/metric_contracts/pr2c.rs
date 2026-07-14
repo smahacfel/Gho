@@ -372,7 +372,7 @@ impl MetricContractPairedRecordV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MetricContractAuditTerminalClassV1 {
-    PassCutoverReady,
+    PassEvidenceConsistent,
     NotEvaluable,
     FailSchemaOrReplay,
     FailPolicyDrift,
@@ -380,7 +380,7 @@ pub enum MetricContractAuditTerminalClassV1 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetricContractCutoverScopeV1 {
+pub enum MetricContractEquivalenceScopeV1 {
     #[serde(rename = "metric_contracts_v1_1_profile_a_equivalence_only")]
     MetricContractsV1_1ProfileAEquivalenceOnly,
 }

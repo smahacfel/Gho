@@ -2771,11 +2771,13 @@ impl PoolObservationSession {
             materialized.checkpoint_features.bonding_progress = fallback_bonding_progress;
         }
 
-        // Normative PR2C full-path timer: start before the first canonical
-        // metric-contract producer and carry the same start proof through the
-        // one frozen snapshot. Pair construction later adds the real second
-        // policy evaluation and the writer adds final-byte serialization.
-        let metric_contract_full_path_started = Instant::now();
+        // PR2C diagnostics are strictly opt-in. OFF retains the ordinary
+        // untimed PR2B materialization path; ON captures the monotonic origin
+        // before the first canonical producer and retains the full snapshot.
+        let metric_contract_full_path_started = self
+            .pr2c_last_complete_metric_contract_snapshot
+            .as_ref()
+            .map(|_| Instant::now());
         let fingerprint_metrics = self.fingerprint_metrics();
         if let Some(fingerprint) = fingerprint_metrics.as_ref() {
             materialized.alpha_fingerprint = AlphaFingerprintFeatures {
@@ -2952,31 +2954,41 @@ impl PoolObservationSession {
             effective_config,
             source_cutoff,
         };
-        let complete =
-            crate::metric_contracts::build_pr2b_timed_complete_metric_contract_snapshot_from_started_v1(
-                crate::metric_contracts::Pr2bFrozenProducerInputsV1 {
-                    pr2a: crate::metric_contracts::Pr2aFrozenProducerInputsV1 {
-                        ftdi: &sybil_computation.ftdi,
-                        tx_intelligence: &tx_intelligence,
-                        gatekeeper_dev_primary: &gatekeeper_dev_primary,
-                        recent_exact_timing: &recent_exact_timing,
-                        fsc: &fsc,
-                        funding_source_config: &self.funding_source_config,
-                        funding_source_producer_config,
-                    },
-                    legacy_flip_ratio,
-                    flip_v2: &flip_v2,
-                    manipulation: &manipulation_frozen,
-                    reserve_velocity: &reserve_velocity,
-                    recent_buy_sell: &recent_buy_sell,
-                },
+        let frozen_inputs = crate::metric_contracts::Pr2bFrozenProducerInputsV1 {
+            pr2a: crate::metric_contracts::Pr2aFrozenProducerInputsV1 {
+                ftdi: &sybil_computation.ftdi,
+                tx_intelligence: &tx_intelligence,
+                gatekeeper_dev_primary: &gatekeeper_dev_primary,
+                recent_exact_timing: &recent_exact_timing,
+                fsc: &fsc,
+                funding_source_config: &self.funding_source_config,
+                funding_source_producer_config,
+            },
+            legacy_flip_ratio,
+            flip_v2: &flip_v2,
+            manipulation: &manipulation_frozen,
+            reserve_velocity: &reserve_velocity,
+            recent_buy_sell: &recent_buy_sell,
+        };
+        if let (Some(pr2c_snapshot), Some(full_path_started)) = (
+            self.pr2c_last_complete_metric_contract_snapshot.as_ref(),
+            metric_contract_full_path_started,
+        ) {
+            let complete = crate::metric_contracts::build_pr2b_timed_complete_metric_contract_snapshot_from_started_v1(
+                frozen_inputs,
                 &build_context,
-                metric_contract_full_path_started,
+                full_path_started,
             )?;
-        materialized.metric_contract_decision_projection_v1 =
-            Some(complete.snapshot().compact_projection.clone());
-        if let Some(pr2c_snapshot) = self.pr2c_last_complete_metric_contract_snapshot.as_ref() {
+            materialized.metric_contract_decision_projection_v1 =
+                Some(complete.snapshot().compact_projection.clone());
             *pr2c_snapshot.lock() = Some(complete);
+        } else {
+            let complete =
+                crate::metric_contracts::build_pr2b_complete_metric_contract_snapshot_v1(
+                    frozen_inputs,
+                    &build_context,
+                )?;
+            materialized.metric_contract_decision_projection_v1 = Some(complete.compact_projection);
         }
 
         Ok(materialized)

@@ -16,7 +16,7 @@ use ghost_brain::oracle::{
     METRIC_CONTRACT_COMPLETION_PROOF_V1_FILE, METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE,
 };
 use ghost_core::metric_contracts::{
-    CanonicalHashV1, MetricContractAuditTerminalClassV1, MetricContractCutoverScopeV1,
+    CanonicalHashV1, MetricContractAuditTerminalClassV1, MetricContractEquivalenceScopeV1,
 };
 use ghost_launcher::components::gatekeeper_policy::{
     build_assessment_from_features, evaluate_policy_from_assessment, PolicyEvaluationContext,
@@ -129,18 +129,27 @@ async fn single_run_audit_verifies_manifest_pair_projection_replay_and_resources
     let report = audit_pr2c_single_run_v1(run.path(), &[v33]).unwrap();
     assert_eq!(
         report.terminal_class,
-        MetricContractAuditTerminalClassV1::PassCutoverReady,
+        MetricContractAuditTerminalClassV1::PassEvidenceConsistent,
         "{report:#?}"
     );
     assert_eq!(report.replayed_rows, 1);
     assert_eq!(
-        report.cutover_scope,
-        MetricContractCutoverScopeV1::MetricContractsV1_1ProfileAEquivalenceOnly
+        report.equivalence_scope,
+        MetricContractEquivalenceScopeV1::MetricContractsV1_1ProfileAEquivalenceOnly
+    );
+    let report_json = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        report_json["terminal_class"],
+        Value::String("PASS_EVIDENCE_CONSISTENT".to_string())
     );
     assert_eq!(
-        serde_json::to_value(&report).unwrap()["cutover_scope"],
+        report_json["equivalence_scope"],
         Value::String("metric_contracts_v1_1_profile_a_equivalence_only".to_string())
     );
+    assert!(report_json.get("cutover_scope").is_none());
+    assert!(!serde_json::to_string(&report_json)
+        .unwrap()
+        .contains("CUTOVER_READY"));
     assert_eq!(report.missing_pairs, 0);
     assert_eq!(report.policy_drift_rows, 0);
     assert!((report.combined_bytes_delta_ratio - expected_additive_delta).abs() < f64::EPSILON);
@@ -422,7 +431,7 @@ async fn missing_stable_identity_is_not_evaluable_never_zero_collisions() {
     assert_eq!(report.stable_identity_unavailable_rows, 1);
     assert_ne!(
         report.terminal_class,
-        MetricContractAuditTerminalClassV1::PassCutoverReady,
+        MetricContractAuditTerminalClassV1::PassEvidenceConsistent,
         "missing stable identity must never become a clean collision PASS: {report:#?}"
     );
     let bundle = audit_pr2c_bundle_v1(&[(run.path().to_path_buf(), vec![v33])]).unwrap();

@@ -1176,7 +1176,7 @@ fn current_time_ns() -> u128 {
         .as_nanos()
 }
 
-fn spawn_gatekeeper_decision_logs(
+async fn write_gatekeeper_decision_logs(
     ctx: &Arc<PoolObservationContext>,
     buy_log: ghost_brain::oracle::GatekeeperBuyLog,
     coordination_snapshot: FrozenCoordinationDecisionSnapshot,
@@ -1186,20 +1186,25 @@ fn spawn_gatekeeper_decision_logs(
         coordination_snapshot,
         &CoordinationRiskConfig::default(),
     );
-    let dl = ctx.decision_logger.clone();
-    tokio::spawn(async move {
-        // Preserve the established v33 command payload and worker-owned plane
-        // expansion/hydration. PR2C never changes this queue path, including
-        // when the opt-in switch is enabled.
-        dl.log_gatekeeper_buy_decision(buy_log).await;
-        if let Some(metric_contract_pair) = metric_contract_pair {
-            if let Err(error) = dl.log_metric_contract_pair(metric_contract_pair) {
-                error!("PR2C paired metric-contract enqueue failed closed: {error}");
-            }
+    // Preserve the established v33 command payload and worker-owned plane
+    // expansion/hydration. PR2C never changes this queue path, including when
+    // the opt-in switch is enabled. The per-pool terminal producer awaits
+    // admission of these final commands, allowing runtime shutdown to await
+    // the producer before it closes either logger receiver.
+    ctx.decision_logger
+        .log_gatekeeper_buy_decision(buy_log)
+        .await;
+    if let Some(metric_contract_pair) = metric_contract_pair {
+        if let Err(error) = ctx
+            .decision_logger
+            .log_metric_contract_pair(metric_contract_pair)
+        {
+            error!("PR2C paired metric-contract enqueue failed closed: {error}");
         }
-        dl.log_coordination_risk_evidence(coordination_evidence)
-            .await;
-    });
+    }
+    ctx.decision_logger
+        .log_coordination_risk_evidence(coordination_evidence)
+        .await;
 }
 
 #[derive(Debug, Error)]
@@ -17246,13 +17251,24 @@ fn cutover_feature_driven_terminal_verdict(
 struct PoolTaskHandle {
     /// Channel to send transactions to the per-pool task.
     tx: tokio::sync::mpsc::Sender<PoolObservationMsg>,
-    /// Handle to abort the task if needed (retained for future graceful shutdown).
-    _abort_handle: tokio::task::AbortHandle,
+    /// Join handle retained so controlled runtime shutdown can stop admissions,
+    /// close the producer channel and await the final terminal log enqueue.
+    join_handle: tokio::task::JoinHandle<()>,
     /// Number of transaction messages successfully enqueued for this pool.
     ///
     /// Used to classify the pool as *hot* (≥ [`HOT_POOL_TX_THRESHOLD`]) so
     /// backpressure retries can be tuned for high-volume pools.
     tx_enqueued: u64,
+}
+
+#[derive(Debug, Error)]
+pub enum OracleRuntimeShutdownErrorV1 {
+    #[error("OracleRuntime terminal producer shutdown exceeded its bounded timeout")]
+    TerminalProducerTimeout,
+    #[error("OracleRuntime terminal producer task failed while joining")]
+    TerminalProducerJoin,
+    #[error(transparent)]
+    DecisionLogger(#[from] ghost_brain::oracle::decision_logger::DecisionLoggerShutdownErrorV1),
 }
 
 impl PoolTaskHandle {
@@ -24069,12 +24085,13 @@ async fn pool_observation_task(
                     .await;
                 let (buy_log, metric_contract_pair) =
                     build_pr2c_pair_if_enabled(ctx.as_ref(), &session, &assessment, buy_log);
-                spawn_gatekeeper_decision_logs(
+                write_gatekeeper_decision_logs(
                     &ctx,
                     buy_log,
                     coordination_snapshot,
                     metric_contract_pair,
-                );
+                )
+                .await;
                 if let Some(ref emitter) = ctx.event_emitter {
                     emit_gatekeeper_decision_event(emitter, &pool_id, "REJECT", &assessment);
                     if let Some(ref h) = ctx.health {
@@ -24194,12 +24211,13 @@ async fn pool_observation_task(
                     .await;
                 let (buy_log, metric_contract_pair) =
                     build_pr2c_pair_if_enabled(ctx.as_ref(), &session, &assessment, buy_log);
-                spawn_gatekeeper_decision_logs(
+                write_gatekeeper_decision_logs(
                     &ctx,
                     buy_log,
                     coordination_snapshot,
                     metric_contract_pair,
-                );
+                )
+                .await;
                 if let Some(ref emitter) = ctx.event_emitter {
                     emit_gatekeeper_decision_event(emitter, &pool_id, "TIMEOUT", &assessment);
                     if let Some(ref h) = ctx.health {
@@ -24401,12 +24419,13 @@ async fn pool_observation_task(
                             &assessment,
                             buy_log,
                         );
-                        spawn_gatekeeper_decision_logs(
+                        write_gatekeeper_decision_logs(
                             &ctx,
                             buy_log,
                             coordination_snapshot,
                             metric_contract_pair,
-                        );
+                        )
+                        .await;
                         if let Some(ref emitter) = ctx.event_emitter {
                             emit_gatekeeper_decision_event(
                                 emitter,
@@ -24625,12 +24644,13 @@ async fn pool_observation_task(
                     .await;
                 let (buy_log, metric_contract_pair) =
                     build_pr2c_pair_if_enabled(ctx.as_ref(), &session, &assessment, buy_log);
-                spawn_gatekeeper_decision_logs(
+                write_gatekeeper_decision_logs(
                     &ctx,
                     buy_log,
                     coordination_snapshot,
                     metric_contract_pair,
-                );
+                )
+                .await;
                 spawn_coverage_audit_for_closed_window(
                     ctx.clone(),
                     pool_id,
@@ -24819,7 +24839,7 @@ pub async fn start_oracle_runtime_task(
     health: Option<Arc<ghost_core::health::RuntimeHealth>>,
     canonical_account_update_relay_enabled: bool,
     authoritative_funding_stream_available: bool,
-) {
+) -> Result<(), OracleRuntimeShutdownErrorV1> {
     let shadow_defaults = ghost_brain::config::ExecutionShadowConfig::default();
     start_oracle_runtime_task_with_funding_availability(
         event_rx,
@@ -24849,7 +24869,7 @@ pub async fn start_oracle_runtime_task(
         None,
         None,
     )
-    .await;
+    .await
 }
 
 pub async fn start_oracle_runtime_task_with_funding_availability(
@@ -24875,7 +24895,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     authoritative_funding_coverage_gate_enabled: bool,
     mut authoritative_funding_stream_availability_rx: Option<watch::Receiver<bool>>,
     mut shutdown_rx: Option<broadcast::Receiver<()>>,
-) {
+) -> Result<(), OracleRuntimeShutdownErrorV1> {
     info!(
         "🔮 RUSZA WATEK Oracle Runtime (OKNO: {}ms, execution_mode: {:?}, dry_run: {}, iwim_veto: {})",
         analysis_window_ms,
@@ -25360,7 +25380,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                             pool_id,
                                             PoolTaskHandle {
                                                 tx: task_tx,
-                                                _abort_handle: join_handle.abort_handle(),
+                                                join_handle,
                                                 tx_enqueued: 0,
                                             },
                                         );
@@ -25601,7 +25621,15 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
             }
 
             Some(result) = result_rx.recv() => {
-                pool_task_handles.remove(&result.pool_id);
+                if let Some(handle) = pool_task_handles.remove(&result.pool_id) {
+                    if let Err(error) = handle.join_handle.await {
+                        warn!(
+                            pool = %result.pool_id,
+                            error = %error,
+                            "completed pool observation task failed while joining"
+                        );
+                    }
+                }
                 if should_cleanup_pool_after_observation(&result) {
                     rejected_pools.insert(result.pool_id);
                     if let Some(mint) = result.base_mint {
@@ -25631,6 +25659,47 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         }
     } // loop
 
+    // No new terminal producers can be admitted after the router loop exits.
+    // Closing every per-pool sender forces a final evaluation on its frozen
+    // snapshot; awaiting the retained tasks ensures their v33/PR2C enqueue
+    // work has completed before either logger receiver is closed.
+    const TERMINAL_PRODUCER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+    let mut terminal_producer_tasks = Vec::with_capacity(pool_task_handles.len());
+    for (_, handle) in pool_task_handles.drain() {
+        let PoolTaskHandle {
+            tx,
+            join_handle,
+            tx_enqueued: _,
+        } = handle;
+        drop(tx);
+        terminal_producer_tasks.push(join_handle);
+    }
+    let terminal_producer_abort_handles = terminal_producer_tasks
+        .iter()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect::<Vec<_>>();
+    let terminal_producer_result =
+        match tokio::time::timeout(TERMINAL_PRODUCER_SHUTDOWN_TIMEOUT, async move {
+            for task in terminal_producer_tasks {
+                task.await
+                    .map_err(|_| OracleRuntimeShutdownErrorV1::TerminalProducerJoin)?;
+            }
+            Ok(())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                for abort_handle in terminal_producer_abort_handles {
+                    abort_handle.abort();
+                }
+                Err(OracleRuntimeShutdownErrorV1::TerminalProducerTimeout)
+            }
+        };
+    if terminal_producer_result.is_err() {
+        decision_logger.record_metric_contract_terminal_shutdown_failure();
+    }
+
     let _ = reconciliation_health_stop_tx.send(true);
 
     const RECONCILIATION_HEALTH_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
@@ -25659,6 +25728,13 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         reconciliation_health_handle.abort();
         let _ = reconciliation_health_handle.await;
     }
+
+    // The bounded logger shutdown drains v33 and the isolated PR2C queue,
+    // finalizes the manifest/completion proof and propagates any failure to
+    // the runtime task and therefore the launcher's component status.
+    decision_logger.shutdown().await?;
+    terminal_producer_result?;
+    Ok(())
 }
 
 fn map_amm_program_string_to_pubkey(
@@ -45439,9 +45515,7 @@ mod tests {
         let (sender, _rx) = tokio::sync::mpsc::channel(POOL_TASK_CHANNEL_CAPACITY);
         let mut handle = PoolTaskHandle {
             tx: sender,
-            _abort_handle: tokio::runtime::Handle::current()
-                .spawn(async {})
-                .abort_handle(),
+            join_handle: tokio::runtime::Handle::current().spawn(async {}),
             tx_enqueued: 0,
         };
 
@@ -45481,9 +45555,7 @@ mod tests {
         let (sender, mut rx) = tokio::sync::mpsc::channel(burst_size + 16);
         let mut handle = PoolTaskHandle {
             tx: sender,
-            _abort_handle: tokio::runtime::Handle::current()
-                .spawn(async {})
-                .abort_handle(),
+            join_handle: tokio::runtime::Handle::current().spawn(async {}),
             tx_enqueued: 0,
         };
 
@@ -45827,9 +45899,7 @@ mod tests {
         let (sender, _rx) = tokio::sync::mpsc::channel::<PoolObservationMsg>(16);
         let mut handle = PoolTaskHandle {
             tx: sender,
-            _abort_handle: tokio::runtime::Handle::current()
-                .spawn(async {})
-                .abort_handle(),
+            join_handle: tokio::runtime::Handle::current().spawn(async {}),
             tx_enqueued: HOT_POOL_TX_THRESHOLD - 1,
         };
         assert!(
@@ -47707,7 +47777,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), task_handle)
             .await
             .expect("OracleRuntime should stop after shutdown signal")
-            .expect("OracleRuntime task should not panic");
+            .expect("OracleRuntime task should not panic")
+            .expect("OracleRuntime should finalize DecisionLogger cleanly");
     }
 
     #[tokio::test]

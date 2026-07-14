@@ -33,7 +33,7 @@ enum Command {
 
 fn exit_code(class: MetricContractAuditTerminalClassV1) -> i32 {
     match class {
-        MetricContractAuditTerminalClassV1::PassCutoverReady => 0,
+        MetricContractAuditTerminalClassV1::PassEvidenceConsistent => 0,
         MetricContractAuditTerminalClassV1::NotEvaluable => 2,
         MetricContractAuditTerminalClassV1::FailSchemaOrReplay => 3,
         MetricContractAuditTerminalClassV1::FailPolicyDrift => 4,

@@ -47,7 +47,7 @@ wąska mimo poprawnej podstawowej implementacji:
 5. plan jednocześnie zawierał limity 1 ms i 5 ms, a dwa różne payloady były
    określane jako `BURN_IN_CONTRACT_V1`;
 6. semantyka UTC bucketów i `brain_config_hash` różniła się między kodem a
-   planem, a raport PASS nie miał typed `cutover_scope`.
+   planem, a raport PASS nie miał typed scope dla equivalence lane.
 
 ## 2. Historyczna decyzja timera — wycofana
 
@@ -138,17 +138,18 @@ UTC buckets są wyprowadzane ze wszystkich poprawnie sparowanych
 `paired_decision_timestamp_ms`, a nie wyłącznie z początku runu. Każdy run musi
 przejść przed agregacją.
 
-## 7. Typed cutover scope i CI
+## 7. Typed equivalence scope i CI
 
 Raporty single-run i bundle zawierają zamknięty enum:
 
 ```text
-cutover_scope = metric_contracts_v1_1_profile_a_equivalence_only
+equivalence_scope = metric_contracts_v1_1_profile_a_equivalence_only
 ```
 
 Pole jest obecne także wtedy, gdy wynik jest fail/not-evaluable, dzięki czemu
-consumer nie rekonstruuje scope z tekstu terminal class. `PASS_CUTOVER_READY`
-jest dozwolony wyłącznie w tym scope.
+consumer nie rekonstruuje scope z tekstu terminal class.
+`PASS_EVIDENCE_CONSISTENT` potwierdza wyłącznie evidence/replay/integrity w tym
+scope; nie oznacza gotowości do cutoveru ani prospective burn-in.
 
 Workflow PR2C reaguje również na `PLANS/**`. Release job najpierw listuje testy
 i wymaga dokładnie jednego exact match dla harnessu, więc filtr uruchamiający
@@ -219,6 +220,13 @@ checks, targeted Clippy, formatting oraz diff checks były dowodem tego etapu.
 - referencyjny `serde_json_canonicalizer`, bez własnego JCS i fixed-width JSON
   mutation;
 - bounded shutdown i niezależny completion proof po directory sync;
+- shutdown acknowledgement przenosi rzeczywisty wynik initialize/write/finalize,
+  a invalid evidence run nie może zakończyć się czystym sukcesem;
+- produkcyjny OracleRuntime awaituje terminalnych producentów oraz finalizację
+  DecisionLoggera; obie kolejki zamykają admission i drenują przyjęte komendy;
+- sukces audytu to `PASS_EVIDENCE_CONSISTENT` z `equivalence_scope`, bez
+  machine-readable cutover authority;
+- OFF używa untimed PR2B buildera i przenosi compact projection bez clone;
 - `BURN_IN_CONTRACT_V2` oraz burn-specific audit entry point usunięte;
 - latency p50/p95/p99/max jest diagnostyką, nie acceptance gate'em;
 - prospective burn-in i PR3 pozostają nieautoryzowane/nieuruchomione.

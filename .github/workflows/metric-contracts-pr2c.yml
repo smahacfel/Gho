@@ -76,6 +76,8 @@ jobs:
           cargo test -p ghost-launcher --lib pr2c_durable_evidence_is_opt_in_and_shadow_only
           cargo test -p ghost-brain --lib shutdown_timeout_is_bounded_and_invalidates_pr2c_run
           cargo test -p ghost-brain --test oracle_decision_logger_integration
+          cargo test -p ghost-launcher --test oracle_event_bus_integration \
+            production_runtime_shutdown_finalizes_pr2c_completion_proof -- --exact
 
       - name: Frozen Gatekeeper and lifecycle regressions
         run: |

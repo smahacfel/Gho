@@ -8,6 +8,9 @@
 //!
 //! This simulates the production flow without requiring actual blockchain connections.
 
+#[path = "common/metric_contracts_pr2c.rs"]
+mod metric_contracts_pr2c_common;
+
 use ghost_brain::config::{GatekeeperV2Config, GatekeeperV3Config, IwimVetoGateConfig};
 use ghost_brain::oracle::hyper_prediction::HyperPredictionOracle;
 use ghost_brain::oracle::SnapshotEngine;
@@ -20,6 +23,7 @@ use ghost_launcher::events::{
 };
 use ghost_launcher::oracle_runtime::{
     start_oracle_runtime_task, start_oracle_runtime_task_with_funding_availability, OracleRuntime,
+    OracleRuntimeConfig,
 };
 use ghost_launcher::session::observation::SharedSession;
 use seer::types::RawBytesMissingReason;
@@ -28,6 +32,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::sleep;
+
+use ghost_brain::oracle::{
+    METRIC_CONTRACT_COMPLETION_PROOF_V1_FILE, METRIC_CONTRACT_EVIDENCE_V1_FILE,
+    METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE, METRIC_CONTRACT_SUMMARY_V34_FILE,
+};
 
 // Default program IDs for testing
 const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -218,7 +227,7 @@ async fn spawn_runtime_for_fsc_with_optional_signal(
         if let Some(authoritative_funding_stream_availability_rx) =
             authoritative_funding_stream_availability_rx
         {
-            start_oracle_runtime_task_with_funding_availability(
+            let _ = start_oracle_runtime_task_with_funding_availability(
                 oracle_rx,
                 oracle_runtime_clone,
                 snapshot_engine_clone,
@@ -244,7 +253,7 @@ async fn spawn_runtime_for_fsc_with_optional_signal(
             )
             .await;
         } else {
-            start_oracle_runtime_task(
+            let _ = start_oracle_runtime_task(
                 oracle_rx,
                 oracle_runtime_clone,
                 snapshot_engine_clone,
@@ -283,6 +292,133 @@ async fn wait_for_session(
     })
     .await
     .expect("pool observation session should open")
+}
+
+#[test]
+fn production_runtime_shutdown_finalizes_pr2c_completion_proof() {
+    std::thread::Builder::new()
+        .name("pr2c-production-shutdown-proof".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("PR2C production shutdown test runtime")
+                .block_on(production_runtime_shutdown_finalizes_pr2c_completion_proof_async());
+        })
+        .expect("spawn PR2C production shutdown proof thread")
+        .join()
+        .expect("PR2C production shutdown proof thread must not panic");
+}
+
+async fn production_runtime_shutdown_finalizes_pr2c_completion_proof_async() {
+    let temp = tempfile::tempdir().unwrap();
+    let frozen = metric_contracts_pr2c_common::frozen_inputs_fixture();
+    let mut runtime_config = OracleRuntimeConfig::default();
+    runtime_config.funding_source_config = frozen.funding_source_config();
+    runtime_config.metric_contract_effective_config =
+        Some(Arc::new(frozen.effective_config().clone()));
+    runtime_config.metric_contract_funding_source_producer_config =
+        Some(Arc::new(frozen.funding_source_producer_config()));
+    runtime_config.metric_contract_pr2c_enabled = true;
+    runtime_config.run_id = Some("production-shutdown-proof-run".to_string());
+    runtime_config.session_id = Some("production-shutdown-proof-session".to_string());
+    runtime_config.brain_config_path =
+        Some("ghost-brain/config/ghost_brain_config.toml".to_string());
+    runtime_config.brain_config_hash =
+        Some(metric_contracts_pr2c_common::TEST_BRAIN_CONFIG_HASH.to_string());
+
+    let oracle_runtime = Arc::new(OracleRuntime::new_with_config(
+        Arc::new(HyperPredictionOracle::default()),
+        PUMP_PROGRAM_ID.to_string(),
+        BONK_PROGRAM_ID.to_string(),
+        Arc::new(ShadowLedger::new()),
+        None,
+        None,
+        Arc::new(ghost_core::shadow_ledger::LivePipeline::new()),
+        runtime_config,
+    ));
+    let snapshot_engine = Arc::new(SnapshotEngine::new(128, 200));
+    let (event_tx, event_rx) = create_event_bus();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let decision_dir = temp.path().join("decisions");
+    let mut gatekeeper_config = GatekeeperV2Config::default();
+    gatekeeper_config.max_wait_time_ms = 250;
+    gatekeeper_config.curve_wait_ms = 0;
+
+    let runtime_task = tokio::spawn(start_oracle_runtime_task_with_funding_availability(
+        event_rx,
+        Arc::clone(&oracle_runtime),
+        snapshot_engine,
+        event_tx.clone(),
+        None,
+        250,
+        gatekeeper_config,
+        GatekeeperV3Config::default(),
+        IwimVetoGateConfig::default(),
+        ExecutionMode::Shadow,
+        true,
+        decision_dir.display().to_string(),
+        temp.path()
+            .join("shadow_entries.jsonl")
+            .display()
+            .to_string(),
+        None,
+        None,
+        temp.path().join("events").display().to_string(),
+        None,
+        false,
+        false,
+        false,
+        None,
+        Some(shutdown_rx),
+    ));
+
+    let pool = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let creator = Pubkey::new_unique();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    event_tx
+        .send(GhostEvent::new_pool_detected(detected_pool(
+            pool, mint, creator, now_ms,
+        )))
+        .unwrap();
+    event_tx
+        .send(GhostEvent::pool_transaction(fsc_buy_tx(
+            pool,
+            Pubkey::new_unique(),
+            "production-shutdown-proof-buy",
+            now_ms + 1,
+            12_346,
+            false,
+            0.000_001,
+        )))
+        .unwrap();
+    wait_for_session(&oracle_runtime, pool).await;
+
+    shutdown_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), runtime_task)
+        .await
+        .expect("production OracleRuntime shutdown must be bounded")
+        .expect("OracleRuntime task must not panic")
+        .expect("DecisionLogger finalization must propagate as a clean runtime shutdown");
+
+    for file_name in [
+        METRIC_CONTRACT_SUMMARY_V34_FILE,
+        METRIC_CONTRACT_EVIDENCE_V1_FILE,
+        METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE,
+        METRIC_CONTRACT_COMPLETION_PROOF_V1_FILE,
+    ] {
+        assert!(
+            decision_dir.join(file_name).exists(),
+            "production shutdown did not finalize {file_name}"
+        );
+    }
 }
 
 async fn wait_for_total_tx_seen(session: &SharedSession, expected: u64) {
@@ -328,7 +464,7 @@ async fn test_oracle_event_bus_integration_complete_flow() {
     gatekeeper_config.curve_wait_ms = 200;
 
     tokio::spawn(async move {
-        start_oracle_runtime_task(
+        let _ = start_oracle_runtime_task(
             oracle_rx,
             oracle_runtime_clone,
             snapshot_engine_clone,
@@ -512,7 +648,7 @@ async fn test_oracle_event_bus_multiple_pools() {
     let analysis_window_ms = 300; // Short window for testing
 
     tokio::spawn(async move {
-        start_oracle_runtime_task(
+        let _ = start_oracle_runtime_task(
             oracle_rx,
             oracle_runtime_clone,
             snapshot_engine_clone,
@@ -664,7 +800,7 @@ async fn test_oracle_event_bus_raw_tx_preservation() {
     let event_tx_clone = event_tx.clone();
 
     tokio::spawn(async move {
-        start_oracle_runtime_task(
+        let _ = start_oracle_runtime_task(
             oracle_rx,
             oracle_runtime_clone,
             snapshot_engine_clone,

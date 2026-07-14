@@ -219,7 +219,7 @@ Jeden binary `metric-contract-audit` ma tryby `single-run` i `bundle` oraz
 terminalne klasy:
 
 ```text
-PASS_CUTOVER_READY
+PASS_EVIDENCE_CONSISTENT
 NOT_EVALUABLE
 FAIL_SCHEMA_OR_REPLAY
 FAIL_POLICY_DRIFT
@@ -233,7 +233,9 @@ rollout, profile, schemas, Wire hash, effective-config, non-overlap, UTC
 buckets wszystkich paired cutoffów oraz stable-event collisions.
 `brain_config_hash` jest frozen w obrębie
 jednego runu, lecz provenance-only pomiędzy runami. Każdy raport zawiera typed
-`cutover_scope = metric_contracts_v1_1_profile_a_equivalence_only`.
+`equivalence_scope = metric_contracts_v1_1_profile_a_equivalence_only`.
+Sukces oznacza wyłącznie spójność evidence/replay/comparator/integrity i nie
+nadaje authority do cutoveru ani prospective burn-in.
 
 ## 10. Status BURN contractu
 
@@ -317,8 +319,12 @@ V3_V1_REPLAY_UNCHANGED
 TYPE5_NOT_STARTED
 DURABLE_EVIDENCE_READY
 REPLAY_AND_COMPARATOR_READY
-RUNTIME_ISOLATION_PASS
-LEGACY_AND_LIVE_BEHAVIOR_UNCHANGED
+RUNTIME_QUEUE_ISOLATION
+LEGACY_V33_DATA_PATH_UNCHANGED
+OFF_ZERO_RETAINED_EVIDENCE
+SHUTDOWN_FAILURE_PROPAGATION
+PRODUCTION_SHUTDOWN_INTEGRATION
+NO_FALSE_CUTOVER_AUTHORITY
 PROSPECTIVE_BURN_IN_NOT_AUTHORIZED
 PR3_NOT_STARTED
 ```

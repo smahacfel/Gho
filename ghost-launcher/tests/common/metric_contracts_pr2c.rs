@@ -134,6 +134,14 @@ impl Pr2cFrozenInputsFixture {
         &self.effective
     }
 
+    pub fn funding_source_config(&self) -> FundingSourceConfig {
+        self.funding.clone()
+    }
+
+    pub fn funding_source_producer_config(&self) -> FundingSourceProducerConfigSnapshotV1 {
+        self.funding_producer_config.clone()
+    }
+
     pub fn with_dev_counterfactual(mut self, legacy_amount: f64, primary_amount: f64) -> Self {
         self.tx_snapshot.dev_first_observed = DevBuyProducerSnapshotV1 {
             amount_sol: Some(legacy_amount),

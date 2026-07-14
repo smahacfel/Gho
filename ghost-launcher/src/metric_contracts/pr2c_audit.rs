@@ -8,7 +8,7 @@ use ghost_brain::oracle::{
 use ghost_core::checkpoint::MaterializedFeatureSet;
 use ghost_core::metric_contracts::{
     CanonicalNullableV1, MetricAvailabilityV1, MetricContractAuditTerminalClassV1,
-    MetricContractCutoverScopeV1, MetricContractDecisionSummaryV1,
+    MetricContractDecisionSummaryV1, MetricContractEquivalenceScopeV1,
     MetricContractEvidenceTransportV1, MetricEvidenceRecordIdentityV1, MetricMeasurementQualityV1,
     StableEventIdentityV1, METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1,
@@ -27,7 +27,7 @@ use thiserror::Error;
 #[serde(deny_unknown_fields)]
 pub struct Pr2cSingleRunAuditReportV1 {
     pub terminal_class: MetricContractAuditTerminalClassV1,
-    pub cutover_scope: MetricContractCutoverScopeV1,
+    pub equivalence_scope: MetricContractEquivalenceScopeV1,
     pub run_id: Option<String>,
     pub run_start_ms: Option<u64>,
     pub run_end_ms: Option<u64>,
@@ -68,7 +68,7 @@ pub struct Pr2cSingleRunAuditReportV1 {
 #[serde(deny_unknown_fields)]
 pub struct Pr2cBundleAuditReportV1 {
     pub terminal_class: MetricContractAuditTerminalClassV1,
-    pub cutover_scope: MetricContractCutoverScopeV1,
+    pub equivalence_scope: MetricContractEquivalenceScopeV1,
     pub run_reports: Vec<Pr2cSingleRunAuditReportV1>,
     pub non_overlapping_runs: bool,
     pub consistent_provenance: bool,
@@ -821,7 +821,7 @@ pub fn audit_pr2c_single_run_v1(
     } else if stable_identity_unavailable_rows > 0 || comparator_not_evaluable_rows > 0 {
         MetricContractAuditTerminalClassV1::NotEvaluable
     } else {
-        MetricContractAuditTerminalClassV1::PassCutoverReady
+        MetricContractAuditTerminalClassV1::PassEvidenceConsistent
     };
     let run_id = manifest
         .summary_parts
@@ -829,7 +829,8 @@ pub fn audit_pr2c_single_run_v1(
         .map(|part| part.run_id.clone());
     Ok(Pr2cSingleRunAuditReportV1 {
         terminal_class,
-        cutover_scope: MetricContractCutoverScopeV1::MetricContractsV1_1ProfileAEquivalenceOnly,
+        equivalence_scope:
+            MetricContractEquivalenceScopeV1::MetricContractsV1_1ProfileAEquivalenceOnly,
         run_id,
         run_start_ms,
         run_end_ms,
@@ -1001,11 +1002,12 @@ pub fn audit_pr2c_bundle_v1(
     {
         MetricContractAuditTerminalClassV1::NotEvaluable
     } else {
-        MetricContractAuditTerminalClassV1::PassCutoverReady
+        MetricContractAuditTerminalClassV1::PassEvidenceConsistent
     };
     Ok(Pr2cBundleAuditReportV1 {
         terminal_class,
-        cutover_scope: MetricContractCutoverScopeV1::MetricContractsV1_1ProfileAEquivalenceOnly,
+        equivalence_scope:
+            MetricContractEquivalenceScopeV1::MetricContractsV1_1ProfileAEquivalenceOnly,
         run_reports: reports,
         non_overlapping_runs,
         consistent_provenance,

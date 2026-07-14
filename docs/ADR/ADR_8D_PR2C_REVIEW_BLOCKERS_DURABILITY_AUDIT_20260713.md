@@ -188,7 +188,12 @@ uruchamia runtime live/shadow ani external RPC. Correctness job instaluje
 jawnie `ripgrep`, ponieważ zamrożone PR2A/PR2B static guards używają `rg` i nie
 mogą zależeć od przypadkowego obrazu runnera.
 
-## 5. Wyniki resource gate
+## 5. HISTORICAL / SUPERSEDED — NIEOBOWIĄZUJĄCY resource gate
+
+Wyniki i progi w tej sekcji są wyłącznie zapisem historycznego etapu review.
+Nie stanowią merge gate'u, BURN contractu ani prospective/cutover authority.
+Obowiązujący finalny kontrakt pozostawia latency jako diagnostykę oraz wymaga
+izolacji kolejki, kompletności durable evidence i jawnego fail-closed runu.
 
 Po usunięciu wielokrotnej walidacji niezmiennego profile/effective-config z
 per-decision hot path release harness na tej samej funkcji co materializacja
@@ -210,11 +215,10 @@ snapshotu. Publiczne i replayowe trust boundaries zachowują pełną walidację.
 - sidecar p95/p99: `22 180 / 22 180 B`;
 - v34 p95: `1 176 B`.
 
-Autoryzowany amendment z 2026-07-13 podniósł pełny build+serialize i projection
-build/validate z 1 ms do 5 ms p99. Comparator i logger enqueue pozostają
-ograniczone do 1 ms. Final serialization jest diagnostycznym podetapem
-objętym ciągłym full-path gate, a nie drugim nakładającym się gate. Timer nie
-został skrócony ani przesunięty za producer boundary.
+Historyczny amendment z 2026-07-13 podnosił pełny build+serialize i projection
+build/validate z 1 ms do 5 ms p99. Cały ten latency gate został następnie
+wycofany przed zebraniem prospective rows; poniższe wartości nie są obecnie
+egzekwowanym kontraktem.
 
 ## 6. Zakres zamrożony
 
@@ -273,8 +277,12 @@ V3_V1_REPLAY_UNCHANGED
 TYPE5_NOT_STARTED
 DURABLE_EVIDENCE_READY
 REPLAY_AND_COMPARATOR_READY
-RUNTIME_ISOLATION_PASS
-LEGACY_AND_LIVE_BEHAVIOR_UNCHANGED
+RUNTIME_QUEUE_ISOLATION
+LEGACY_V33_DATA_PATH_UNCHANGED
+OFF_ZERO_RETAINED_EVIDENCE
+SHUTDOWN_FAILURE_PROPAGATION
+PRODUCTION_SHUTDOWN_INTEGRATION
+NO_FALSE_CUTOVER_AUTHORITY
 PROSPECTIVE_BURN_IN_NOT_AUTHORIZED
 PR3_NOT_STARTED
 ```

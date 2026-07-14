@@ -97,7 +97,11 @@ Plan utrwala następujące rozstrzygnięcia:
 - recent buy/sell otrzymuje raw counts, optional ratio oraz bounded buy share,
   lecz pozostaje logging-only.
 
-## 4. Gate przed cutoverem
+## 4. Historyczny gate przed cutoverem — nieobowiązujący
+
+Ta sekcja dokumentuje wycofany etap V1 i nie nadaje authority bieżącemu PR2C.
+Bieżący audit może potwierdzić wyłącznie spójność evidence/replay/equivalence;
+prospective burn-in ani cutover nie są autoryzowane.
 
 Przyjęto fail-closed warunek: pełny dostępny replay oraz jednocześnie co najmniej:
 
@@ -119,7 +123,7 @@ drift verdict/primary reason/phase vector/soft points oraz comparator
 Dozwolone klasy audytu:
 
 ```text
-PASS_CUTOVER_READY
+PASS_EVIDENCE_CONSISTENT
 NOT_EVALUABLE
 FAIL_SCHEMA_OR_REPLAY
 FAIL_POLICY_DRIFT

@@ -1,6 +1,6 @@
 # PR2C durable metric-contract evidence, replay i audit — raport weryfikacyjny
 
-Status: `FINALIZATION AMENDMENT IMPLEMENTED / LOCAL VALIDATION PASS`
+Status: `FINAL CORRECTION IMPLEMENTED / VALIDATION RECORDED ON FINAL PR HEAD`
 
 Data: 2026-07-14
 
@@ -11,10 +11,10 @@ PR: #65 — PR2C: add durable metric-contract evidence, replay and audit
 branch: agent/metric-contract-pr2c-durable-evidence-replay
 base: fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9
 merge-base: fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9
-ostatni zdalny head przed finalnym review: 218e1ecacbd3fa6ccd0c2f209f8db171f7f254ae
-lokalny head wejściowy finalizacji: 218e1ecacbd3fa6ccd0c2f209f8db171f7f254ae
-publication head: commit zawierający ten raport; authoritative SHA = head PR
-rekomendowany commit message: metric-contracts: isolate PR2C durable evidence runtime
+ostatni zdalny head przed ostatnią korektą: 343c2f6dc1629d4995485e02728cf3eeb6b30731
+lokalny head wejściowy ostatniej korekty: 343c2f6dc1629d4995485e02728cf3eeb6b30731
+publication head: commit zawierający ten raport; authoritative SHA = head PR #65
+commit message: metric-contracts: finalize PR2C shutdown semantics
 ```
 
 PR pozostaje draftem. Nie rozpoczęto PR3 ani Type-5 T1. Prospective burn-in
@@ -36,6 +36,7 @@ PLANS/DO_REALIZACJI/PLAN_KOREKTY_KONTRAKTOW_INTERPRETACJI_METRYK_V1_20260710.md
 docs/ADR/ADR_8D_PR2C_METRIC_CONTRACT_DURABLE_EVIDENCE_REPLAY_20260713.md
 docs/ADR/ADR_8D_PR2C_REVIEW_BLOCKERS_DURABILITY_AUDIT_20260713.md
 docs/ADR/ADR_8D_PR2C_SECOND_REVIEW_DURABLE_EQUIVALENCE_RESOURCE_INTEGRITY_20260713.md
+docs/ADR/ADR_8D_PLAN_KOREKTY_KONTRAKTOW_INTERPRETACJI_METRYK_V1_20260710.md
 ghost-brain/Cargo.toml
 ghost-brain/build.rs
 ghost-brain/examples/oracle_decision_dry_run.rs
@@ -70,45 +71,37 @@ ghost-launcher/tests/metric_contracts_pr2c_audit.rs
 ghost-launcher/tests/metric_contracts_pr2c_comparator.rs
 ghost-launcher/tests/metric_contracts_pr2c_durability.rs
 ghost-launcher/tests/metric_contracts_pr2c_replay.rs
+ghost-launcher/tests/oracle_event_bus_integration.rs
 ghost-launcher/tests/refactor_invariants_tests.rs
 reports/metric_contracts/historical_feasibility_post_pr2c_v1.md
+reports/metric_contracts/historical_feasibility_preflight_v1.md
 reports/metric_contracts/metric_contract_wire_v1_schema_manifest.json
 reports/metric_contracts/pr2c_durable_evidence_replay_verification_v1.md
 ```
 
-Finalny amendment względem wejściowego heada
-`218e1ecacbd3fa6ccd0c2f209f8db171f7f254ae` jest ograniczony do:
+Ostatnia korekta względem wejściowego heada
+`343c2f6dc1629d4995485e02728cf3eeb6b30731` jest ograniczona do:
 
 ```text
 .github/workflows/metric-contracts-pr2c.yml
 PLANS/DO_REALIZACJI/PLAN_KOREKTY_KONTRAKTOW_INTERPRETACJI_METRYK_V1_20260710.md
+docs/ADR/ADR_8D_PLAN_KOREKTY_KONTRAKTOW_INTERPRETACJI_METRYK_V1_20260710.md
 docs/ADR/ADR_8D_PR2C_METRIC_CONTRACT_DURABLE_EVIDENCE_REPLAY_20260713.md
 docs/ADR/ADR_8D_PR2C_REVIEW_BLOCKERS_DURABILITY_AUDIT_20260713.md
 docs/ADR/ADR_8D_PR2C_SECOND_REVIEW_DURABLE_EQUIVALENCE_RESOURCE_INTEGRITY_20260713.md
 ghost-brain/src/oracle/decision_logger.rs
-ghost-brain/src/oracle/metric_contract_writer.rs
-ghost-brain/src/oracle/mod.rs
-ghost-core/Cargo.toml
-ghost-core/src/metric_contracts/canonical_hash.rs
-ghost-core/src/metric_contracts/effective_config.rs
 ghost-core/src/metric_contracts/pr2c.rs
-ghost-core/src/metric_contracts/projection.rs
-ghost-core/tests/metric_contracts_v1_1_projection.rs
 ghost-launcher/src/bin/metric_contract_audit.rs
-ghost-launcher/src/metric_contracts/pr2a.rs
+ghost-launcher/src/main.rs
 ghost-launcher/src/metric_contracts/pr2b.rs
-ghost-launcher/src/metric_contracts/pr2c.rs
 ghost-launcher/src/metric_contracts/pr2c_audit.rs
 ghost-launcher/src/oracle_runtime.rs
-ghost-launcher/src/session/manager.rs
 ghost-launcher/src/session/observation.rs
 ghost-launcher/tests/common/metric_contracts_pr2c.rs
-ghost-launcher/tests/metric_contracts_pr2b_producers.rs
-ghost-launcher/tests/metric_contracts_pr2b_static_guards.rs
 ghost-launcher/tests/metric_contracts_pr2c_audit.rs
 ghost-launcher/tests/metric_contracts_pr2c_durability.rs
-reports/metric_contracts/BURN_IN_CONTRACT_V2.json (deleted)
-reports/metric_contracts/historical_feasibility_post_pr2c_v1.md
+ghost-launcher/tests/oracle_event_bus_integration.rs
+reports/metric_contracts/historical_feasibility_preflight_v1.md
 reports/metric_contracts/pr2c_durable_evidence_replay_verification_v1.md
 ```
 
@@ -172,6 +165,8 @@ Przy OFF:
 - nie jest wywoływany PR2C pair builder;
 - pełny PR2C snapshot nie jest zatrzymywany w stanie sesji po zbudowaniu
   wymaganej compact MFS projection;
+- materializacja używa zwykłego untimed PR2B buildera i przenosi compact
+  projection do MFS bez klonowania;
 - nie istnieje PR2C sender/receiver ani writer task;
 - nie ma PR2C enqueue;
 - nie są otwierane pliki v34, evidence ani manifest;
@@ -219,6 +214,12 @@ Zachowano bez redukcji:
 - counterfactual diagnostics dla dev-primary i corrected FTDI;
 - writer fault/orphan/truncation detection i fsync/finalization semantics;
 - bounded shutdown z przechowywanymi task handles;
+- `DecisionLogger::shutdown()` zwraca typed błąd dla initialization/write,
+  invalid-run, manifest/directory-sync i completion-proof failure;
+- produkcyjny `OracleRuntime` zamyka admission, awaituje terminalnych
+  producentów, drenuje v33/PR2C i propaguje wynik finalizacji do launchera;
+- po markerze shutdown receiver jest zamykany i drenuje każdą komendę, dla
+  której enqueue wcześniej zwrócił sukces;
 - niezależny completion proof wiążący exact finalized manifest hash dopiero po
   udanym rename i directory sync;
 - single-run audit i opcjonalny offline bundle audit;
@@ -319,14 +320,16 @@ orphanach i truncation.
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards` | PASS — 8/8 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2b_producers` | PASS — 16/16 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2b_static_guards` | PASS — 6/6 |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2c_durability` | PASS — 23/23 |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2c_durability` | PASS — 25/25 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2c_replay` | PASS — 10/10 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2c_comparator` | PASS — 8/8 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2c_audit` | PASS — 24/24 |
-| disabled-mode exact v33 bytes / no artifacts | PASS — część durability 23/23 |
-| real terminal routing E2E | PASS — część durability 23/23 |
-| isolated queue saturation/closed | PASS — część durability 23/23 |
-| 128-row queue high-water / zero failures | PASS — część durability 23/23 |
+| disabled-mode exact v33 bytes / no artifacts | PASS — część durability 25/25 |
+| real terminal routing E2E | PASS — część durability 25/25 |
+| isolated queue saturation/closed | PASS — część durability 25/25 |
+| 128-row queue high-water / zero failures | PASS — część durability 25/25 |
+| final manifest directory-sync failure propagates through `DecisionLogger::shutdown()` | PASS — część durability 25/25 |
+| accepted pairs are drained before shutdown; enqueue after receiver close is rejected | PASS — część durability 25/25 |
 | `cargo test -p ghost-brain --lib metric_contract_pr2c_switch_is_backward_compatible_and_opt_in` | PASS — 1/1 |
 | `cargo test -p ghost-launcher --lib pr2c_durable_evidence_is_opt_in_and_shadow_only` | PASS — 1/1 |
 | `cargo test -p ghost-launcher --test gatekeeper_policy_tests` | PASS — 46/46 |
@@ -335,13 +338,14 @@ orphanach i truncation.
 | `cargo test -p ghost-launcher --test session_lifecycle_tests` | PASS — 26/26 |
 | `cargo test -p ghost-launcher --test refactor_invariants_tests` | PASS — 12/12 |
 | `cargo test -p ghost-brain --lib replay_payload` | PASS — 5/5 |
-| `cargo test -p ghost-brain --lib decision_logger_shutdown_is_bounded_and_invalidates_pr2c_run` | PASS — 1/1 |
+| `cargo test -p ghost-brain --lib shutdown_timeout_is_bounded_and_invalidates_pr2c_run` | PASS — 1/1 |
 | `cargo check -p ghost-core` | PASS |
 | `cargo check -p ghost-launcher` | PASS |
 | `cargo check -p ghost-brain` | PASS |
 | targeted Clippy: core/launcher/brain | PASS — exit 0; istniejące warnings zachowane |
 | `cargo check -p ghost-brain --examples` | PASS |
 | `cargo test -p ghost-brain --test oracle_decision_logger_integration` | PASS — 4/4 |
+| `cargo test -p ghost-launcher --test oracle_event_bus_integration production_runtime_shutdown_finalizes_pr2c_completion_proof -- --exact` | PASS — 1/1 |
 | release durable latency diagnostic | PASS — 1/1; 16 warmup + 200 measured; wynik diagnostyczny, nie gate |
 | `cargo fmt --all -- --check` | PASS |
 | `git diff --check` | PASS |
@@ -389,17 +393,24 @@ spoza PR2C; selector score i jego owner nie zostały zmienione.
 
 ## 12. Status końcowy
 
-Lokalna implementacja i pełna walidacja finalnej dyrektywy przeszły. Raport
-jest gotowy do publikacji w jednym finalnym commicie i jednym końcowym CI.
-PR nadal pozostaje draftem, a prospective burn-in nie jest autoryzowany.
+Raport należy do ostatniego commita korekty PR #65. Dokładny publication SHA,
+wynik jednego końcowego CI oraz stan PR są zapisane przy tym samym headzie w
+GitHub i w opisie PR; raport nie zapowiada kolejnego commita ani kolejnego
+cyklu amendmentu. Prospective burn-in nie jest autoryzowany.
 
 Markery finalnej dyrektywy:
 
 ```text
 DURABLE_EVIDENCE_READY
 REPLAY_AND_COMPARATOR_READY
-RUNTIME_ISOLATION_PASS
-LEGACY_AND_LIVE_BEHAVIOR_UNCHANGED
+RUNTIME_QUEUE_ISOLATION
+LEGACY_V33_DATA_PATH_UNCHANGED
+OFF_ZERO_RETAINED_EVIDENCE
+SHUTDOWN_FAILURE_PROPAGATION
+PRODUCTION_SHUTDOWN_INTEGRATION
+NO_FALSE_CUTOVER_AUTHORITY
 PROSPECTIVE_BURN_IN_NOT_AUTHORIZED
 PR3_NOT_STARTED
+TYPE5_NOT_STARTED
+PR2C_READY_FOR_MERGE
 ```

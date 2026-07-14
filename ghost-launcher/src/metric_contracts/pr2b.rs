@@ -1402,23 +1402,41 @@ pub fn build_recent_buy_sell_evidence_v1(
     })
 }
 
+struct Pr2bCompleteMetricContractBuildResultV1 {
+    snapshot: Pr2bCompleteMetricContractSnapshotV1,
+    timings: Option<Pr2bCompleteMetricContractBuildTimingsV1>,
+    validated_projection_hash: CanonicalHashV1,
+}
+
+fn optional_elapsed_us(
+    started: Option<Instant>,
+    field: &'static str,
+) -> Result<u32, Pr2bProducerErrorV1> {
+    match started {
+        Some(started) => u32::try_from(started.elapsed().as_micros())
+            .map_err(|_| Pr2bProducerErrorV1::TimingOverflow(field)),
+        None => Ok(0),
+    }
+}
+
 fn build_pr2b_complete_metric_contract_snapshot_inner_v1(
     inputs: Pr2bFrozenProducerInputsV1<'_>,
     context: &Pr2bBuildContextV1<'_>,
-    complete_started: Instant,
-) -> Result<Pr2bTimedCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
+    complete_started: Option<Instant>,
+) -> Result<Pr2bCompleteMetricContractBuildResultV1, Pr2bProducerErrorV1> {
+    let collect_timings = complete_started.is_some();
     let projection_context = MetricDecisionProjectionBuildContextV1 {
         rollout_mode: context.rollout_mode,
         profile: context.profile,
         effective_config: context.effective_config,
         source_cutoff: context.source_cutoff.clone(),
     };
-    let context_validation_started = Instant::now();
+    let context_validation_started = collect_timings.then(Instant::now);
     let validated_projection_context =
         MetricDecisionProjectionValidatedContextV1::try_new(&projection_context)?;
-    let context_validation_us = u32::try_from(context_validation_started.elapsed().as_micros())
-        .map_err(|_| Pr2bProducerErrorV1::TimingOverflow("projection context validation"))?;
-    let evidence_build_started = Instant::now();
+    let context_validation_us =
+        optional_elapsed_us(context_validation_started, "projection context validation")?;
+    let evidence_build_started = collect_timings.then(Instant::now);
     let pr2a_context = Pr2aEvidenceBuildContextV1 {
         rollout_mode: context.rollout_mode,
         profile: context.profile,
@@ -1437,37 +1455,32 @@ fn build_pr2b_complete_metric_contract_snapshot_inner_v1(
         reserve_velocity: build_reserve_velocity_evidence_v1(inputs.reserve_velocity, context)?,
         recent_buy_sell: build_recent_buy_sell_evidence_v1(inputs.recent_buy_sell, context)?,
     };
-    let evidence_build_us = u32::try_from(evidence_build_started.elapsed().as_micros())
-        .map_err(|_| Pr2bProducerErrorV1::TimingOverflow("full evidence build"))?;
-    let evidence_validation_started = Instant::now();
+    let evidence_build_us = optional_elapsed_us(evidence_build_started, "full evidence build")?;
+    let evidence_validation_started = collect_timings.then(Instant::now);
     let validated_projection_inputs =
         validated_projection_context.validate_evidence(&full_evidence)?;
     let evidence_validation_us =
-        u32::try_from(evidence_validation_started.elapsed().as_micros())
-            .map_err(|_| Pr2bProducerErrorV1::TimingOverflow("full evidence validation"))?;
-    let projection_started = Instant::now();
+        optional_elapsed_us(evidence_validation_started, "full evidence validation")?;
+    let projection_started = collect_timings.then(Instant::now);
     let (compact_projection, validated_projection_hash) =
         validated_projection_inputs.build_with_validated_canonical_hash()?;
-    let projection_build_and_validate_us = u32::try_from(projection_started.elapsed().as_micros())
-        .map_err(|_| Pr2bProducerErrorV1::TimingOverflow("projection"))?;
+    let projection_build_and_validate_us = optional_elapsed_us(projection_started, "projection")?;
     let metric_contract_build_and_validate_us =
-        u32::try_from(complete_started.elapsed().as_micros())
-            .map_err(|_| Pr2bProducerErrorV1::TimingOverflow("complete snapshot"))?;
-    Ok(Pr2bTimedCompleteMetricContractSnapshotV1 {
+        optional_elapsed_us(complete_started, "complete snapshot")?;
+    Ok(Pr2bCompleteMetricContractBuildResultV1 {
         snapshot: Pr2bCompleteMetricContractSnapshotV1 {
             full_evidence,
             compact_projection,
             source_cutoff: context.source_cutoff.clone(),
         },
-        timings: Pr2bCompleteMetricContractBuildTimingsV1 {
+        timings: collect_timings.then_some(Pr2bCompleteMetricContractBuildTimingsV1 {
             metric_contract_build_and_validate_us,
             context_validation_us,
             evidence_build_us,
             evidence_validation_us,
             projection_build_and_validate_us,
-        },
+        }),
         validated_projection_hash,
-        full_path_started: complete_started,
     })
 }
 
@@ -1475,15 +1488,19 @@ pub fn build_pr2b_complete_metric_contract_snapshot_v1(
     inputs: Pr2bFrozenProducerInputsV1<'_>,
     context: &Pr2bBuildContextV1<'_>,
 ) -> Result<Pr2bCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
-    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context, Instant::now())
-        .map(Pr2bTimedCompleteMetricContractSnapshotV1::into_snapshot)
+    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context, None)
+        .map(|result| result.snapshot)
 }
 
 pub fn build_pr2b_timed_complete_metric_contract_snapshot_v1(
     inputs: Pr2bFrozenProducerInputsV1<'_>,
     context: &Pr2bBuildContextV1<'_>,
 ) -> Result<Pr2bTimedCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
-    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context, Instant::now())
+    build_pr2b_timed_complete_metric_contract_snapshot_from_started_v1(
+        inputs,
+        context,
+        Instant::now(),
+    )
 }
 
 /// Diagnostic timing entry point whose caller-owned monotonic origin may be
@@ -1495,7 +1512,19 @@ pub fn build_pr2b_timed_complete_metric_contract_snapshot_from_started_v1(
     context: &Pr2bBuildContextV1<'_>,
     full_path_started: Instant,
 ) -> Result<Pr2bTimedCompleteMetricContractSnapshotV1, Pr2bProducerErrorV1> {
-    build_pr2b_complete_metric_contract_snapshot_inner_v1(inputs, context, full_path_started)
+    let result = build_pr2b_complete_metric_contract_snapshot_inner_v1(
+        inputs,
+        context,
+        Some(full_path_started),
+    )?;
+    Ok(Pr2bTimedCompleteMetricContractSnapshotV1 {
+        snapshot: result.snapshot,
+        timings: result
+            .timings
+            .expect("timed PR2B build always requests timing collection"),
+        validated_projection_hash: result.validated_projection_hash,
+        full_path_started,
+    })
 }
 
 pub fn pr2b_key_boundary_set_is_closed() -> bool {

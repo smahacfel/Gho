@@ -1190,18 +1190,21 @@ jeśli pozostanie po feasibility, jest coverage minimum, nie proof equivalence.
 Terminalne klasy:
 
 ```text
-PASS_CUTOVER_READY
+PASS_EVIDENCE_CONSISTENT
 NOT_EVALUABLE
 FAIL_SCHEMA_OR_REPLAY
 FAIL_POLICY_DRIFT
 FAIL_RESOURCE_BUDGET
 ```
 
-PASS zawsze ma:
+Sukces evidence/replay/integrity zawsze ma:
 
 ```text
-cutover_scope = metric_contracts_v1_1_profile_a_equivalence_only
+equivalence_scope = metric_contracts_v1_1_profile_a_equivalence_only
 ```
+
+`PASS_EVIDENCE_CONSISTENT` nie nadaje authority do cutoveru, prospective
+burn-in ani policy promotion. PR2C nie zawiera aktywnego BURN contractu.
 
 `COUNTERFACTUAL_POLICY_DELTA_OBSERVED` jest diagnostyką, nie FAIL, jeśli authority
 i equivalence lane pozostają niezmienione.

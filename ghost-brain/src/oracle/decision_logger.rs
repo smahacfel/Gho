@@ -39,6 +39,7 @@
 use super::metric_contract_writer::{
     MetricContractPairedWriterConfigV1, MetricContractPairedWriterStatsSnapshotV1,
     MetricContractPairedWriterStatsV1, MetricContractPairedWriterV1,
+    MetricContractWriterFaultInjectionV1,
 };
 use anyhow::{Context, Result};
 use ghost_core::features::coordination::CoordinationRiskEvidenceUnit;
@@ -2933,7 +2934,7 @@ enum LogCommand {
 
 enum MetricContractLogCommand {
     WritePair(MetricContractPairedRecordV1),
-    Shutdown(oneshot::Sender<()>),
+    Shutdown(oneshot::Sender<std::result::Result<(), DecisionLoggerShutdownErrorV1>>),
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -2954,16 +2955,20 @@ pub enum DecisionLoggerShutdownErrorV1 {
     Timeout(&'static str),
     #[error("DecisionLogger writer task failed while joining: {0}")]
     TaskJoin(&'static str),
+    #[error("DecisionLogger PR2C durable writer failed: {0}")]
+    Pr2cWriter(&'static str),
 }
 
 async fn run_metric_contract_writer_task(
     config: DecisionLoggerConfig,
     mut rx: mpsc::Receiver<MetricContractLogCommand>,
     writer_stats: Arc<MetricContractPairedWriterStatsV1>,
+    fault_injection: Option<MetricContractWriterFaultInjectionV1>,
 ) {
     let mut writer: Option<MetricContractPairedWriterV1> = None;
     let mut writer_disabled = false;
     let mut shutdown_ack = None;
+    let mut shutdown_result = Ok(());
 
     info!(
         directory = ?config.gatekeeper_log_dir,
@@ -2986,6 +2991,7 @@ async fn run_metric_contract_writer_task(
                     writer_config.build_worktree_clean =
                         option_env!("GIT_WORKTREE_CLEAN") == Some("true");
                     writer_config.queue_capacity = config.channel_buffer_size;
+                    writer_config.fault_injection = fault_injection;
                     match MetricContractPairedWriterV1::open(
                         writer_config,
                         Arc::clone(&writer_stats),
@@ -2996,6 +3002,9 @@ async fn run_metric_contract_writer_task(
                         Err(error) => {
                             writer_disabled = true;
                             writer_stats.record_disabled();
+                            shutdown_result = Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+                                "writer initialization",
+                            ));
                             error!(
                                 "DecisionLogger: isolated PR2C writer initialization failed: {error}"
                             );
@@ -3007,13 +3016,26 @@ async fn run_metric_contract_writer_task(
                     if let Err(error) = writer.write_pair(pair).await {
                         writer_disabled = true;
                         writer_stats.record_writer_disabled_event();
+                        shutdown_result = Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+                            "paired row write",
+                        ));
                         error!("DecisionLogger: isolated PR2C pair write failed: {error}");
                     }
                 }
             }
             MetricContractLogCommand::Shutdown(ack) => {
-                shutdown_ack = Some(ack);
-                break;
+                if shutdown_ack.is_none() {
+                    // Stop new admissions, then keep receiving until every
+                    // command for which try_send/send already returned Ok has
+                    // been drained. Nothing accepted before close can remain
+                    // stranded behind the shutdown marker.
+                    rx.close();
+                    shutdown_ack = Some(ack);
+                } else {
+                    let _ = ack.send(Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+                        "duplicate shutdown marker",
+                    )));
+                }
             }
         }
     }
@@ -3021,11 +3043,19 @@ async fn run_metric_contract_writer_task(
     if let Some(writer) = writer.as_mut() {
         if let Err(error) = writer.finalize().await {
             writer_stats.record_writer_disabled_event();
+            shutdown_result = Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+                "manifest finalization or completion proof",
+            ));
             error!("DecisionLogger: final isolated PR2C manifest flush failed: {error}");
         }
     }
+    if writer_stats.snapshot().evidence_run_invalid && shutdown_result.is_ok() {
+        shutdown_result = Err(DecisionLoggerShutdownErrorV1::Pr2cWriter(
+            "evidence run invalid",
+        ));
+    }
     if let Some(ack) = shutdown_ack {
-        let _ = ack.send(());
+        let _ = ack.send(shutdown_result);
     }
 }
 
@@ -3043,6 +3073,24 @@ impl DecisionLogger {
     pub fn new_with_health(
         config: DecisionLoggerConfig,
         health: Option<Arc<RuntimeHealth>>,
+    ) -> Self {
+        Self::new_with_health_and_metric_contract_fault(config, health, None)
+    }
+
+    /// Deterministic durability-fault constructor for integration tests. The
+    /// production constructors always pass `None`.
+    #[doc(hidden)]
+    pub fn new_with_metric_contract_writer_fault_injection_for_test(
+        config: DecisionLoggerConfig,
+        fault_injection: MetricContractWriterFaultInjectionV1,
+    ) -> Self {
+        Self::new_with_health_and_metric_contract_fault(config, None, Some(fault_injection))
+    }
+
+    fn new_with_health_and_metric_contract_fault(
+        config: DecisionLoggerConfig,
+        health: Option<Arc<RuntimeHealth>>,
+        metric_contract_fault_injection: Option<MetricContractWriterFaultInjectionV1>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<LogCommand>(config.channel_buffer_size);
         let routing = config
@@ -3071,6 +3119,7 @@ impl DecisionLogger {
                     config.clone(),
                     metric_contract_rx,
                     Arc::clone(&metric_contract_stats),
+                    metric_contract_fault_injection,
                 ));
                 (Some(metric_contract_tx), Some(task))
             } else {
@@ -3295,8 +3344,15 @@ impl DecisionLogger {
                     }
                     LogCommand::Shutdown(ack) => {
                         info!("DecisionLogger: shutting down");
-                        shutdown_ack = Some(ack);
-                        break;
+                        if shutdown_ack.is_none() {
+                            // Preserve the legacy queue's accepted-command
+                            // guarantee too: close admission and drain every
+                            // command already queued behind the marker.
+                            rx.close();
+                            shutdown_ack = Some(ack);
+                        } else {
+                            let _ = ack.send(());
+                        }
                     }
                 }
             }
@@ -3439,6 +3495,14 @@ impl DecisionLogger {
         self.metric_contract_stats.snapshot()
     }
 
+    /// Mark an enabled PR2C evidence run invalid when the runtime cannot
+    /// finish all terminal producers before closing the isolated writer.
+    pub fn record_metric_contract_terminal_shutdown_failure(&self) {
+        if self.metric_contract_tx.is_some() {
+            self.metric_contract_stats.record_finalization_failure();
+        }
+    }
+
     /// Log additive Phase 0.6 coordination-risk evidence.
     ///
     /// This sidecar is export-only. It is routed independently from the
@@ -3491,15 +3555,17 @@ impl DecisionLogger {
             v33_ack_rx
                 .await
                 .map_err(|_| DecisionLoggerShutdownErrorV1::ChannelClosed("v33 ack"))?;
-            if let Some(ack_rx) = metric_contract_ack {
+            let metric_contract_result = if let Some(ack_rx) = metric_contract_ack {
                 ack_rx
                     .await
-                    .map_err(|_| DecisionLoggerShutdownErrorV1::ChannelClosed("PR2C ack"))?;
-            }
-            Ok(())
+                    .map_err(|_| DecisionLoggerShutdownErrorV1::ChannelClosed("PR2C ack"))?
+            } else {
+                Ok(())
+            };
+            Ok(metric_contract_result)
         };
-        match timeout(shutdown_timeout, handshake).await {
-            Ok(Ok(())) => {}
+        let metric_contract_result = match timeout(shutdown_timeout, handshake).await {
+            Ok(Ok(result)) => result,
             Ok(Err(error)) => {
                 if self.metric_contract_tx.is_some() {
                     self.metric_contract_stats.record_finalization_failure();
@@ -3516,17 +3582,22 @@ impl DecisionLogger {
                     "writer acknowledgement",
                 ));
             }
-        }
+        };
 
-        self.join_writer_task(&self.v33_writer_task, "v33 writer", shutdown_timeout, false)
-            .await?;
-        self.join_writer_task(
-            &self.metric_contract_writer_task,
-            "PR2C writer",
-            shutdown_timeout,
-            true,
-        )
-        .await
+        let v33_join_result = self
+            .join_writer_task(&self.v33_writer_task, "v33 writer", shutdown_timeout, false)
+            .await;
+        let metric_contract_join_result = self
+            .join_writer_task(
+                &self.metric_contract_writer_task,
+                "PR2C writer",
+                shutdown_timeout,
+                true,
+            )
+            .await;
+        v33_join_result?;
+        metric_contract_join_result?;
+        metric_contract_result
     }
 
     async fn join_writer_task(
