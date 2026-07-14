@@ -10,7 +10,7 @@ use ghost_core::{CurveFinality, CurveFreshnessState};
 use ghost_launcher::events::{FundingTransferObserved, PoolTransaction, RawBytesMissingReason};
 use ghost_launcher::session::{OpenSessionRequest, SessionConfig, SessionManager};
 use ghost_launcher::tx_intelligence::FundingSourceConfig;
-use seer::early_fingerprint::EarlyFingerprintConfig;
+use seer::early_fingerprint::{EarlyFingerprintConfig, TokenDelta};
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1417,6 +1417,150 @@ fn session_admission_keeps_same_signature_with_different_event_ordinals_distinct
     assert_eq!(guard.tx_buffer.len(), 2);
     assert_eq!(guard.tx_intel_features.tx_count, 2);
     assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 2);
+}
+
+#[test]
+fn session_admission_preserves_tx_key_timestamp_drift_semantics() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let session = open_session(
+        &manager,
+        pool_id,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        3_500,
+    );
+    let signature = solana_sdk::signature::Signature::new_unique().to_string();
+    let first = test_tx(pool_id, signature.as_str(), 3_510);
+    let mut timestamp_drift = (*first).clone();
+    timestamp_drift.timestamp_ms = 3_511;
+    timestamp_drift.event_time = ghost_core::EventTimeMetadata::new(None, Some(3_511), None);
+    timestamp_drift.arrival_ts_ms = 3_511;
+
+    {
+        let mut guard = session.write();
+        let _ = guard.ingest_transaction(first);
+        let _ = guard.ingest_transaction(Arc::new(timestamp_drift));
+    }
+
+    let guard = session.read();
+    assert_eq!(
+        guard.tx_keys_seen.len(),
+        2,
+        "TxKey intentionally treats normalized event timestamp as identity/order state"
+    );
+    assert_eq!(guard.diagnostics.total_tx_seen, 2);
+    assert_eq!(guard.tx_intel_features.tx_count, 2);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 2);
+}
+
+#[test]
+fn fingerprint_evidence_survives_late_identity_anchor_and_terminal_variants() {
+    let dev_wallet = Pubkey::new_unique();
+    let mut terminal_fingerprints = Vec::new();
+
+    for (index, verdict) in [
+        VerdictOutcome::Pass {
+            reason: "buy".to_string(),
+        },
+        VerdictOutcome::Fail {
+            reason: "reject".to_string(),
+        },
+        VerdictOutcome::Timeout {
+            reason: "timeout".to_string(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let manager = SessionManager::default();
+        let pool_id = Pubkey::new_unique();
+        let session = open_session(
+            &manager,
+            pool_id,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            7_000,
+        );
+        let buy_signature = format!("late-anchor-buy-{index}");
+        let sell_signature = format!("late-anchor-sell-{index}");
+        let mut buy = (*fingerprint_eligible_tx(pool_id, buy_signature.as_str(), 7_010)).clone();
+        buy.signer = dev_wallet.to_string();
+        buy.owner_token_deltas = vec![TokenDelta {
+            owner: dev_wallet.to_string(),
+            delta_raw: 2_000_000_000_000,
+            decimals: 6,
+        }];
+        let buy = Arc::new(buy);
+
+        let mut sell = (*fingerprint_eligible_tx(pool_id, sell_signature.as_str(), 7_020)).clone();
+        sell.event_ordinal = Some(1);
+        sell.signer = dev_wallet.to_string();
+        sell.is_buy = false;
+        sell.owner_token_deltas = vec![TokenDelta {
+            owner: dev_wallet.to_string(),
+            delta_raw: -1_000_000_000_000,
+            decimals: 6,
+        }];
+
+        let terminal_fingerprint = {
+            let mut guard = session.write();
+            let _ = guard.ingest_transaction(buy.clone());
+            let _ = guard.ingest_transaction(Arc::new(sell));
+            let before_late_metadata = guard
+                .fingerprint_metrics()
+                .expect("eligible events should populate fingerprint before metadata");
+            assert_eq!(before_late_metadata.sell_buy_ratio, Some(1.0));
+            assert_eq!(before_late_metadata.dev_paperhand_latency_ms, None);
+
+            guard.update_tx_intelligence_pool_identity_and_fingerprint_anchor(
+                Some(dev_wallet),
+                Some("late-create-signature"),
+                Some(1),
+                Some(7_000),
+            );
+
+            let after_late_metadata = guard
+                .fingerprint_metrics()
+                .expect("late metadata must not erase admitted fingerprint evidence");
+            assert_eq!(after_late_metadata.sell_buy_ratio, Some(1.0));
+            assert!(
+                after_late_metadata
+                    .block0_sniped_supply_pct
+                    .is_some_and(|value| value > 0.0),
+                "rebuild must replay the pre-anchor BUY against the real creation slot"
+            );
+            assert_eq!(after_late_metadata.dev_paperhand_latency_ms, Some(20));
+            assert_eq!(after_late_metadata.dev_sold_within_3s, Some(true));
+
+            let stable_before_duplicate = serde_json::to_value(&after_late_metadata)
+                .expect("fingerprint must serialize for equality assertion");
+            let _ = guard.ingest_transaction(buy);
+            assert_eq!(
+                serde_json::to_value(
+                    guard
+                        .fingerprint_metrics()
+                        .expect("duplicate must leave fingerprint available")
+                )
+                .expect("fingerprint must serialize after duplicate"),
+                stable_before_duplicate,
+                "duplicate after late metadata must not change fingerprint evidence"
+            );
+
+            guard.apply_verdict(verdict);
+            serde_json::to_value(
+                guard
+                    .fingerprint_metrics()
+                    .expect("terminal session must expose the preserved fingerprint"),
+            )
+            .expect("terminal fingerprint must serialize")
+        };
+        terminal_fingerprints.push(terminal_fingerprint);
+    }
+
+    assert!(terminal_fingerprints
+        .windows(2)
+        .all(|pair| pair[0] == pair[1]));
 }
 
 #[test]

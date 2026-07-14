@@ -25,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 const PUMPFUN_TOKEN_DECIMALS: u8 = 6;
 const GENESIS_TOKEN_RESERVES_RAW: u128 = 1_073_000_000_000_000;
+const FINGERPRINT_REPLAY_HISTORY_TRUNCATED_REASON: &str = "FINGERPRINT_REPLAY_HISTORY_TRUNCATED";
 pub(crate) const BUNDLE_CLUSTER_THRESHOLD_MS: u64 = 50;
 
 #[derive(Debug, Clone, Default)]
@@ -136,6 +137,9 @@ pub struct TxIntelligenceEngine {
     timing_fallback_timestamp_count: u64,
     timing_fallback_ordering_count: u64,
     fingerprint_agg: Option<FingerprintAggregator>,
+    fingerprint_replay_events: VecDeque<FingerprintTxEvent>,
+    fingerprint_replay_history_truncated: bool,
+    fingerprint_rebuild_skipped_due_to_truncated_history: bool,
     fingerprint_slot: Option<u64>,
     fingerprint_t0_ms: u64,
     flip_v2: FlipV2StateMachineV1,
@@ -178,6 +182,9 @@ impl TxIntelligenceEngine {
             timing_fallback_timestamp_count: 0,
             timing_fallback_ordering_count: 0,
             fingerprint_agg: None,
+            fingerprint_replay_events: VecDeque::new(),
+            fingerprint_replay_history_truncated: false,
+            fingerprint_rebuild_skipped_due_to_truncated_history: false,
             fingerprint_slot: candidate_snapshot.slot,
             fingerprint_t0_ms: candidate_snapshot.timestamp,
             flip_v2,
@@ -233,6 +240,30 @@ impl TxIntelligenceEngine {
             self.dev_wallet = Some(dev_wallet.to_string());
             self.refresh_dev_metrics_from_signer_stats();
         }
+        self.rebuild_fingerprint_aggregator();
+    }
+
+    /// Atomically apply late pool identity and fingerprint anchor metadata.
+    ///
+    /// When replay history is complete, the rebuild replays every retained
+    /// fingerprint-eligible event. If bounded history was truncated, the current complete
+    /// aggregate is preserved and exposed as degraded instead of being replaced by a partial
+    /// replay. In either case, metadata arriving after tx-first ingestion cannot silently erase
+    /// earlier evidence or leave identity and anchor in two separate rebuild states.
+    pub fn update_pool_identity_and_fingerprint_anchor(
+        &mut self,
+        dev_wallet: Option<Pubkey>,
+        create_signature: Option<&str>,
+        slot: Option<u64>,
+        timestamp_ms: Option<u64>,
+    ) {
+        self.dev_wallet = dev_wallet.map(|value| value.to_string());
+        self.pool_create_signature = create_signature.and_then(non_blank);
+        self.fingerprint_slot = slot.or(self.fingerprint_slot);
+        if let Some(timestamp_ms) = timestamp_ms {
+            self.fingerprint_t0_ms = timestamp_ms;
+        }
+        self.refresh_dev_metrics_from_signer_stats();
         self.rebuild_fingerprint_aggregator();
     }
 
@@ -465,9 +496,28 @@ impl TxIntelligenceEngine {
 
     #[must_use]
     pub fn fingerprint_metrics(&self) -> Option<EarlyFingerprintMetrics> {
-        self.fingerprint_agg
-            .as_ref()
-            .map(FingerprintAggregator::finalize)
+        self.fingerprint_agg.as_ref().map(|aggregator| {
+            let mut metrics = aggregator.finalize();
+            if self.fingerprint_rebuild_skipped_due_to_truncated_history {
+                metrics.fingerprint_degraded = true;
+                match metrics.fingerprint_reason.as_mut() {
+                    Some(reasons)
+                        if !reasons.split(',').any(|reason| {
+                            reason == FINGERPRINT_REPLAY_HISTORY_TRUNCATED_REASON
+                        }) =>
+                    {
+                        reasons.push(',');
+                        reasons.push_str(FINGERPRINT_REPLAY_HISTORY_TRUNCATED_REASON);
+                    }
+                    None => {
+                        metrics.fingerprint_reason =
+                            Some(FINGERPRINT_REPLAY_HISTORY_TRUNCATED_REASON.to_string());
+                    }
+                    Some(_) => {}
+                }
+            }
+            metrics
+        })
     }
 
     #[must_use]
@@ -905,14 +955,23 @@ impl TxIntelligenceEngine {
     }
 
     fn ingest_fingerprint(&mut self, tx: &PoolTransaction) {
-        let Some(ref mut fingerprint_agg) = self.fingerprint_agg else {
-            return;
-        };
         let Some(event) = pool_tx_to_fingerprint_event(tx) else {
             return;
         };
-        if fingerprint_agg.in_window(&event) {
-            fingerprint_agg.ingest(&event);
+        if let Some(ref mut fingerprint_agg) = self.fingerprint_agg {
+            if fingerprint_agg.in_window(&event) {
+                fingerprint_agg.ingest(&event);
+            }
+        }
+        self.retain_fingerprint_replay_event(event);
+    }
+
+    fn retain_fingerprint_replay_event(&mut self, event: FingerprintTxEvent) {
+        self.fingerprint_replay_events.push_back(event);
+        let capacity = self.config.tx_key_capacity.max(1);
+        while self.fingerprint_replay_events.len() > capacity {
+            self.fingerprint_replay_events.pop_front();
+            self.fingerprint_replay_history_truncated = true;
         }
     }
 
@@ -940,7 +999,15 @@ impl TxIntelligenceEngine {
     }
 
     fn rebuild_fingerprint_aggregator(&mut self) {
-        self.fingerprint_agg = Some(FingerprintAggregator::new(
+        if self.fingerprint_replay_history_truncated {
+            // A partial replay would silently replace a complete current aggregate with metrics
+            // computed from only the retained suffix. Preserve the current evidence and expose
+            // that late metadata could not be applied safely instead.
+            self.fingerprint_rebuild_skipped_due_to_truncated_history = true;
+            return;
+        }
+
+        let mut rebuilt = FingerprintAggregator::new(
             self.config.fingerprint.clone(),
             self.fingerprint_slot.unwrap_or(u64::MAX),
             self.fingerprint_slot.is_some(),
@@ -948,7 +1015,13 @@ impl TxIntelligenceEngine {
             self.fingerprint_slot.map(|_| GENESIS_TOKEN_RESERVES_RAW),
             PUMPFUN_TOKEN_DECIMALS,
             self.dev_wallet.clone(),
-        ));
+        );
+        for event in &self.fingerprint_replay_events {
+            if rebuilt.in_window(event) {
+                rebuilt.ingest(event);
+            }
+        }
+        self.fingerprint_agg = Some(rebuilt);
     }
 
     fn recompute_timing_state(&mut self) {
@@ -1318,5 +1391,59 @@ mod tests {
 
         assert_eq!(engine.fingerprint_t0_ms, 1_000);
         assert_eq!(engine.fingerprint_slot, Some(7));
+    }
+
+    #[test]
+    fn fingerprint_replay_history_overflow_remains_explicit_after_rebuild() {
+        let mut candidate = EnhancedCandidate::default();
+        candidate.timestamp = 1_000;
+        candidate.slot = Some(7);
+
+        let mut config = TxIntelligenceConfig::default();
+        config.tx_key_capacity = 1;
+        let mut engine = TxIntelligenceEngine::new(config, &candidate, None);
+
+        let mut first = make_tx();
+        first.slot = Some(7);
+        first.signature = "fingerprint-replay-first".to_string();
+        first.timestamp_ms = 1_010;
+        first.event_time = ghost_core::EventTimeMetadata::new(None, Some(1_010), None);
+
+        let mut second = make_tx();
+        second.slot = Some(7);
+        second.event_ordinal = Some(1);
+        second.signature = "fingerprint-replay-second".to_string();
+        second.timestamp_ms = 1_020;
+        second.event_time = ghost_core::EventTimeMetadata::new(None, Some(1_020), None);
+
+        engine.on_transaction(&first);
+        engine.on_transaction(&second);
+
+        assert_eq!(engine.fingerprint_replay_events.len(), 1);
+        assert!(engine.fingerprint_replay_history_truncated);
+        let before_rebuild = engine.fingerprint_metrics().expect("fingerprint metrics");
+        assert!(!before_rebuild
+            .fingerprint_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(FINGERPRINT_REPLAY_HISTORY_TRUNCATED_REASON)));
+
+        engine.update_pool_identity_and_fingerprint_anchor(
+            Some(Pubkey::new_unique()),
+            Some("late-create-signature"),
+            Some(7),
+            Some(1_000),
+        );
+
+        let after_rebuild = engine.fingerprint_metrics().expect("fingerprint metrics");
+        assert!(after_rebuild.fingerprint_degraded);
+        assert_eq!(after_rebuild.sell_buy_ratio, before_rebuild.sell_buy_ratio);
+        assert_eq!(
+            after_rebuild.block0_sniped_supply_pct,
+            before_rebuild.block0_sniped_supply_pct
+        );
+        assert!(after_rebuild
+            .fingerprint_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(FINGERPRINT_REPLAY_HISTORY_TRUNCATED_REASON)));
     }
 }

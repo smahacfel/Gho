@@ -23728,15 +23728,11 @@ async fn pool_observation_task(
 
                             if let Ok(dev_wallet) = Pubkey::try_from(pd.creator.as_str()) {
                                 let mut session = session.write();
-                                session.dev_wallet = Some(dev_wallet);
-                                session.update_tx_intelligence_dev_identity(
+                                session.update_tx_intelligence_pool_identity_and_fingerprint_anchor(
                                     Some(dev_wallet),
                                     Some(pd.signature.as_str()),
-                                );
-                                session.update_tx_intelligence_fingerprint_anchor(
                                     pd.slot,
                                     detected_pool_epoch_like_ts_ms(&pd),
-                                    Some(dev_wallet),
                                 );
                                 if let Some(curve_t0) = detected_pool_epoch_like_ts_ms(&pd) {
                                     session

@@ -1,6 +1,6 @@
 # ADR-8D: Plane-Lite — kanoniczne admission i jeden właściciel fingerprintu
 
-Status: `IMPLEMENTED / READY_FOR_REVIEW`
+Status: `IMPLEMENTED / LOCAL VALIDATION PASSED / CI PENDING`
 
 Typ: ADR-8D / Decision Plane / aktywny prebuy runtime
 
@@ -83,8 +83,17 @@ PoolObservationSession
 
 Terminalne warianty `BUY`, `REJECT` i `TIMEOUT` ustawiają
 `assessment.early_fingerprint` przez `session.fingerprint_metrics()`.
-Aktualizacja anchora po późnym `NewPoolDetected` nadal przebiega przez istniejący
-`update_tx_intelligence_fingerprint_anchor()`.
+
+Późny `NewPoolDetected` aktualizuje dev identity i anchor jednym wywołaniem
+sesyjnego właściciela. Rebuild agregatora deterministycznie odtwarza wcześniej
+przyjęte, successful, non-dust i fingerprint-convertible eventy z bounded
+historii. Dzięki temu późna korekta creation slot/t0/deva może przeliczyć
+metryki, ale nie może po cichu wyzerować wcześniejszego evidence. Przepełnienie
+historii blokuje częściowy rebuild, zachowuje kompletny bieżący agregator i
+jest jawnie raportowane jako `FINGERPRINT_REPLAY_HISTORY_TRUNCATED`.
+
+Szczegóły review fixu i jego red/green proof opisuje
+`ADR_8D_PLANE_LITE_FINGERPRINT_ANCHOR_LIFECYCLE_FIX_20260714.md`.
 
 ## 5. Celowo niezmieniony zakres
 
@@ -109,24 +118,32 @@ authority ani rozbudowanego systemu scope IDs.
 - `ghost-launcher/src/session/observation.rs` — pierwsza sesyjna bramka
   admission, dedup i terminal no-op;
 - `ghost-launcher/src/tx_intelligence/engine.rs` — fingerprint dopiero po
-  lokalnej walidacji unique/non-dust oraz tylko dla successful;
-- `ghost-launcher/src/oracle_runtime.rs` — usunięcie drugiego agregatora i
-  terminalny odczyt fingerprintu z sesji;
+  lokalnej walidacji unique/non-dust oraz tylko dla successful, bounded replay
+  przy zmianie anchora/deva;
+- `ghost-launcher/src/oracle_runtime.rs` — usunięcie drugiego agregatora,
+  terminalny odczyt fingerprintu z sesji oraz atomowe przekazanie późnego
+  pool identity/anchora do właściciela sesyjnego;
 - `ghost-launcher/tests/session_lifecycle_tests.rs` — kontrakty duplicate,
-  ordinal identity, dust, failed i late-after-terminal.
+  ordinal/timestamp identity, dust, failed, late-after-terminal oraz zachowanie
+  fingerprint evidence po późnej aktualizacji metadanych.
 
 ## 7. Weryfikacja
 
 Zaliczone:
 
 - `cargo test -p ghost-launcher --test session_lifecycle_tests -- --nocapture`
-  — `30/30`;
+  — `32/32`;
+- `cargo test -p ghost-launcher --lib tx_intelligence::engine::tests -- --nocapture`
+  — `7/7`;
 - `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers -- --nocapture`
   — `26/26`;
 - `cargo test -p ghost-launcher --test gatekeeper_v25_regression`
   — `42/42`;
 - `cargo test -p ghost-launcher --test gatekeeper_v3_tests`
   — `9/9`.
+- `cargo check -p ghost-launcher` — PASS;
+- `cargo fmt --all -- --check` — PASS;
+- `git diff --check` — PASS.
 
 Rozpoznane baseline'y, odtworzone albo istniejące przed zmianą:
 

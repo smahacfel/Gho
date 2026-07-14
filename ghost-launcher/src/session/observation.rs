@@ -311,6 +311,10 @@ impl PoolObservationSession {
             return SessionTransactionAdmission::Terminal;
         }
 
+        // Admission intentionally inherits the existing TxKey contract: normalized event time is
+        // part of equality/order. Therefore the same signature and ordinal with a different
+        // normalized timestamp remains a distinct event unless that global TxKey contract is
+        // changed in a separate migration.
         let Some(tx_key) = GatekeeperBuffer::tx_key_for(tx) else {
             // Preserve the existing fallback behavior for an event that cannot be keyed. The
             // downstream reducers retain their own defensive validation for this degraded case.
@@ -3193,6 +3197,24 @@ impl PoolObservationSession {
         }
         self.tx_intelligence
             .update_fingerprint_anchor(slot, timestamp_ms, self.dev_wallet);
+        self.refresh_tx_intelligence_snapshot();
+    }
+
+    pub fn update_tx_intelligence_pool_identity_and_fingerprint_anchor(
+        &mut self,
+        dev_wallet: Option<Pubkey>,
+        create_signature: Option<&str>,
+        slot: Option<u64>,
+        timestamp_ms: Option<u64>,
+    ) {
+        self.dev_wallet = dev_wallet;
+        self.tx_intelligence
+            .update_pool_identity_and_fingerprint_anchor(
+                dev_wallet,
+                create_signature,
+                slot,
+                timestamp_ms,
+            );
         self.refresh_tx_intelligence_snapshot();
     }
 
