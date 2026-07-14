@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use ghost_core::metric_contracts::{
     CanonicalHashV1, MetricContractDecisionSummaryV1, MetricContractPairedRecordV1,
     MetricContractRolloutMode, MetricEvidenceRecordIdentityV1,
-    ResolvedMetricContractEffectiveConfigV1, BURN_IN_CONTRACT_V2_CANONICAL_HASH,
-    BURN_IN_CONTRACT_VERSION_V2, METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
+    ResolvedMetricContractEffectiveConfigV1, METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1,
     METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34, METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3,
@@ -22,6 +21,8 @@ pub const METRIC_CONTRACT_SUMMARY_V34_FILE: &str = "metric_contract_decisions_v3
 pub const METRIC_CONTRACT_EVIDENCE_V1_FILE: &str = "metric_contract_evidence_v1.jsonl";
 pub const METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE: &str =
     "metric_contract_rotation_manifest_v1.json";
+pub const METRIC_CONTRACT_COMPLETION_PROOF_V1_FILE: &str =
+    "metric_contract_completion_proof_v1.json";
 pub const DEFAULT_METRIC_CONTRACT_ROTATION_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1: [u32; 12] =
     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_000, 2_000];
@@ -47,6 +48,9 @@ pub enum MetricContractWriterFaultInjectionV1 {
     SummaryShortWriteAfterBytes(usize),
     EvidenceShortWriteAfterSummaryBytes(usize),
     FinalManifestEnospc,
+    /// Fail after the finalized manifest rename but before its directory sync.
+    /// No completion proof may be emitted on this path.
+    FinalManifestDirectorySync,
 }
 
 impl MetricContractPairedWriterConfigV1 {
@@ -361,6 +365,11 @@ impl MetricContractPairedWriterStatsV1 {
         self.writer_disabled_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_finalization_failure(&self) {
+        self.finalization_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_enqueue_wait_us(&self, value_us: u64) {
         self.logger_enqueue_wait_us.record(value_us);
     }
@@ -400,8 +409,6 @@ pub struct MetricContractRotatedPartManifestV1 {
     pub evidence_schema_version: u16,
     pub decision_schema_version: u32,
     pub wire_schema_manifest_blake3: String,
-    pub burn_in_contract_version: u16,
-    pub burn_in_contract_canonical_hash: CanonicalHashV1,
     pub profile_id: String,
     pub profile_hash: CanonicalHashV1,
     pub metric_contract_effective_config_hash: CanonicalHashV1,
@@ -419,6 +426,13 @@ pub struct MetricContractRotationManifestV1 {
     pub evidence_parts: Vec<MetricContractRotatedPartManifestV1>,
     pub writer_stats: MetricContractPairedWriterStatsSnapshotV1,
     pub writer_queue_capacity: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricContractCompletionProofV1 {
+    pub proof_schema_version: u16,
+    pub manifest_sha256: CanonicalHashV1,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -614,11 +628,6 @@ impl OpenPart {
             decision_schema_version: METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34,
             wire_schema_manifest_blake3: METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3
                 .to_string(),
-            burn_in_contract_version: BURN_IN_CONTRACT_VERSION_V2,
-            burn_in_contract_canonical_hash: CanonicalHashV1::parse(
-                BURN_IN_CONTRACT_V2_CANONICAL_HASH,
-            )
-            .expect("compiled BURN_IN_CONTRACT_V2 hash is valid SHA-256"),
             profile_id: provenance.profile_id.clone(),
             profile_hash: provenance.profile_hash.clone(),
             metric_contract_effective_config_hash: provenance
@@ -729,8 +738,8 @@ impl MetricContractPairedWriterV1 {
         // One monotonic timer was captured before the first canonical
         // producer call and travelled with the frozen snapshot and pair. The
         // writer samples that exact clock only after timestamp/part binding,
-        // semantic transport hashing, both serde passes and the fixed-width
-        // final v34 telemetry substitution. This diagnostic includes gaps
+        // semantic transport hashing and final serde materialization. This
+        // diagnostic includes gaps
         // between producer, comparator and the isolated PR2C queue/worker.
         // It is not a merge gate and never includes or delays the v33 worker.
         // The current pair's own write happens after its exact final bytes exist.
@@ -753,9 +762,10 @@ impl MetricContractPairedWriterV1 {
         pair.evidence.rotation_part_index = self.evidence.part_index;
 
         // Evidence is serialized once with the writer-owned timestamp and
-        // rotation index. The v34 summary uses a bounded fixed-point pass so
-        // its embedded `metric_contract_serialize_us` describes the exact
-        // final summary+evidence representation that is handed to write().
+        // rotation index. The v34 telemetry is a diagnostic duration measured
+        // with the ordinary serde implementation; it is not a merge or burn-in
+        // acceptance gate. The continuous full-path clock below remains the
+        // measurement that ends after the exact persisted bytes exist.
         let evidence_serialize_started = std::time::Instant::now();
         let evidence_bytes = serde_json::to_vec(&pair.evidence)
             .context("serialize final metric-contract evidence")?;
@@ -952,6 +962,43 @@ impl MetricContractPairedWriterV1 {
         file.sync_all().await?;
         drop(file);
         rename(&temp_path, &path).await?;
+        if self.manifest.writer_finalized
+            && self.config.fault_injection
+                == Some(MetricContractWriterFaultInjectionV1::FinalManifestDirectorySync)
+        {
+            return Err(std::io::Error::from_raw_os_error(5).into());
+        }
+        let directory = File::open(&self.config.directory).await?;
+        directory.sync_all().await?;
+        Ok(())
+    }
+
+    async fn persist_completion_proof(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.manifest.writer_finalized,
+            "completion proof requires a finalized manifest"
+        );
+        let manifest_bytes = serde_json::to_vec_pretty(&self.manifest)?;
+        let proof = MetricContractCompletionProofV1 {
+            proof_schema_version: 1,
+            manifest_sha256: CanonicalHashV1::parse(format!(
+                "{:x}",
+                Sha256::digest(&manifest_bytes)
+            ))
+            .expect("SHA-256 always formats as 64 lowercase hexadecimal characters"),
+        };
+        let path = self
+            .config
+            .directory
+            .join(METRIC_CONTRACT_COMPLETION_PROOF_V1_FILE);
+        let temp_path = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(&proof)?;
+        let mut file = File::create(&temp_path).await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        rename(&temp_path, &path).await?;
         let directory = File::open(&self.config.directory).await?;
         directory.sync_all().await?;
         Ok(())
@@ -971,10 +1018,14 @@ impl MetricContractPairedWriterV1 {
             return Err(error);
         }
         self.manifest.writer_finalized = true;
-        let result = if self.frozen_provenance.is_some() {
+        let manifest_result = if self.frozen_provenance.is_some() {
             self.update_manifest().await
         } else {
             self.persist_manifest().await
+        };
+        let result = match manifest_result {
+            Ok(()) => self.persist_completion_proof().await,
+            Err(error) => Err(error),
         };
         if let Err(error) = result {
             self.stats
@@ -995,44 +1046,22 @@ fn serialize_final_summary_bytes(
     summary: &mut MetricContractDecisionSummaryV1,
     evidence_serialize_us: u32,
 ) -> Result<(Vec<u8>, u32)> {
-    // A self-referential duration cannot be obtained by repeatedly timing a
-    // variable-width JSON integer: scheduler jitter can make the value
-    // oscillate forever. Serialize exactly once with a fixed-width numeric
-    // telemetry slot, then replace only that slot with JSON whitespace plus
-    // the measured number. JSON whitespace before a number is lossless, the
-    // final bytes deserialize to the exact in-memory summary, and the timed
-    // serde pass has the same byte width as the persisted record.
-    const SENTINEL: u32 = u32::MAX;
-    const SENTINEL_BYTES: &[u8; 10] = b"4294967295";
-    const TELEMETRY_FIELD_WITH_SENTINEL: &[u8] = b"\"metric_contract_serialize_us\":4294967295";
-    summary.metric_contract_serialize_us = SENTINEL;
+    // Keep the serializer deliberately ordinary. The first pass measures the
+    // same typed summary with a zero diagnostic field; the second pass emits
+    // the final record after that diagnostic has been populated. Avoiding a
+    // self-referential exact duration is preferable to maintaining a custom
+    // fixed-width JSON mutation path now that latency is diagnostic only.
+    summary.metric_contract_serialize_us = 0;
     let started = std::time::Instant::now();
-    let mut bytes =
-        serde_json::to_vec(summary).context("serialize final metric-contract summary")?;
+    let _diagnostic_bytes =
+        serde_json::to_vec(summary).context("serialize metric-contract summary diagnostic pass")?;
     let summary_serialize_us = u32::try_from(started.elapsed().as_micros())
         .context("summary serialization duration does not fit u32")?;
     let combined = evidence_serialize_us
         .checked_add(summary_serialize_us)
         .context("combined summary/evidence serialization duration overflow")?;
-    let value = combined.to_string();
-    anyhow::ensure!(
-        value.len() <= SENTINEL_BYTES.len(),
-        "metric-contract serialization duration exceeds fixed JSON telemetry slot"
-    );
-    let position = bytes
-        .windows(TELEMETRY_FIELD_WITH_SENTINEL.len())
-        .position(|window| window == TELEMETRY_FIELD_WITH_SENTINEL)
-        .map(|field_start| field_start + TELEMETRY_FIELD_WITH_SENTINEL.len() - SENTINEL_BYTES.len())
-        .context("final v34 serialization is missing its exact telemetry sentinel field")?;
-    let slot = &mut bytes[position..position + SENTINEL_BYTES.len()];
-    slot.fill(b' ');
-    let value_start = slot.len() - value.len();
-    slot[value_start..].copy_from_slice(value.as_bytes());
     summary.metric_contract_serialize_us = combined;
-    debug_assert_eq!(
-        serde_json::from_slice::<MetricContractDecisionSummaryV1>(&bytes).ok(),
-        Some(summary.clone())
-    );
+    let bytes = serde_json::to_vec(summary).context("serialize final metric-contract summary")?;
     Ok((bytes, combined))
 }
 

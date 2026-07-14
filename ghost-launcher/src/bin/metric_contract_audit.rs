@@ -1,8 +1,6 @@
 use clap::{Parser, Subcommand};
 use ghost_core::metric_contracts::MetricContractAuditTerminalClassV1;
-use ghost_launcher::metric_contracts::{
-    audit_pr2c_bundle_against_burn_in_contract_v2, audit_pr2c_single_run_v1,
-};
+use ghost_launcher::metric_contracts::{audit_pr2c_bundle_v1, audit_pr2c_single_run_v1};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -30,8 +28,6 @@ enum Command {
         /// One v33 decision JSONL per run-dir, in the same order.
         #[arg(long, required = true)]
         decision_v33: Vec<PathBuf>,
-        #[arg(long)]
-        burn_in_contract: PathBuf,
     },
 }
 
@@ -65,7 +61,6 @@ fn main() {
         Command::Bundle {
             run_dir,
             decision_v33,
-            burn_in_contract,
         } => {
             if run_dir.len() != decision_v33.len() {
                 eprintln!("bundle requires exactly one --decision-v33 per --run-dir");
@@ -76,16 +71,10 @@ fn main() {
                 .zip(decision_v33)
                 .map(|(run_dir, decision)| (run_dir, vec![decision]))
                 .collect::<Vec<_>>();
-            let contract_bytes = std::fs::read(&burn_in_contract).unwrap_or_else(|error| {
-                eprintln!("cannot read {}: {error}", burn_in_contract.display());
-                std::process::exit(3);
-            });
-            let contract: ghost_core::metric_contracts::BurnInContractV1 =
-                serde_json::from_slice(&contract_bytes).unwrap_or_else(|error| {
-                    eprintln!("invalid BURN_IN_CONTRACT_V2: {error}");
-                    std::process::exit(3);
-                });
-            audit_pr2c_bundle_against_burn_in_contract_v2(&runs, &contract).and_then(|report| {
+            // This is an offline consistency bundle only. BURN_IN_CONTRACT_V2
+            // was withdrawn before any prospective row; the CLI deliberately
+            // exposes no prospective burn-in acceptance entry point.
+            audit_pr2c_bundle_v1(&runs).and_then(|report| {
                 let class = report.terminal_class;
                 serde_json::to_string_pretty(&report)
                     .map(|json| (class, json))

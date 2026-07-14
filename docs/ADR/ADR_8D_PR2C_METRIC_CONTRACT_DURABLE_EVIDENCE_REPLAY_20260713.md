@@ -138,7 +138,7 @@ metric_contract_evidence_v1.jsonl
 Kolejne parts mają wspólny pięciocyfrowy indeks. Manifest zapisuje relative
 path, schema, part index, rows, bytes, first/last full record identity, SHA-256
 całego partu, run/build/Gatekeeper/brain/profile/effective-config provenance,
-Wire codebook hash, BURN contract hash i bounded resource histograms. Part data
+Wire codebook hash i bounded resource histograms. Part data
 jest `sync_data()`, manifest jest `sync_all()` przed rename, a katalog po rename
 jest `sync_all()`. `writer_finalized=true` jest ustawiane dopiero po poprawnej
 finalizacji; audit nie uznaje nadal mutable manifestu za immutable run. Audit
@@ -229,76 +229,44 @@ FAIL_RESOURCE_BUDGET
 Per-run replay/resource PASS następuje przed agregacją bundle. Single-run
 wymaga exact bijekcji current v33 ↔ v34 ↔ evidence. Bundle sprawdza unikalne
 run IDs, globalne full identities, build cleanliness, Gatekeeper config,
-rollout, profile, schemas, Wire/BURN hashes, effective-config, non-overlap, UTC
-buckets wszystkich paired cutoffów, stable-event collisions oraz semantic
-minima frozen burn-in contractu. `brain_config_hash` jest frozen w obrębie
+rollout, profile, schemas, Wire hash, effective-config, non-overlap, UTC
+buckets wszystkich paired cutoffów oraz stable-event collisions.
+`brain_config_hash` jest frozen w obrębie
 jednego runu, lecz provenance-only pomiędzy runami. Każdy raport zawiera typed
 `cutover_scope = metric_contracts_v1_1_profile_a_equivalence_only`.
 
-## 10. BURN_IN_CONTRACT_V2
+## 10. Status BURN contractu
 
-Machine-readable frozen contract:
-`reports/metric_contracts/BURN_IN_CONTRACT_V2.json`
-
-Canonical hash:
-
-```text
-3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20
-```
-
-Contract utrwala minimum 3 niepokrywających się runów, 1 h per run, dwa UTC
-4-hour buckets, 8 h aggregate, 700 decisions, 100 dev-known, 100 clean Flip V2
-evaluable i 30 real dev legacy/V2 divergences oraz wszystkie resource limits.
-Po autoryzowanym resource amendment contract został ponownie zamrożony przed
-jakimkolwiek prospective runem z `burn_in_contract_version=2` i
-`frozen_at=2026-07-13T17:53:14Z`. Wcześniejszy V1 z limitem 1 ms był wyłącznie
-pre-run draftem i nie może identyfikować żadnego prospective row.
-Każdy run manifest jest związany z exact version/hash kontraktu. Rows z
-durable cutoffem niepóźniejszym niż `frozen_at` nie wchodzą do prospective
-counts. Zmiana gate’u wymaga nowej wersji/hash/frozen_at i nowych rows.
+Finalizacyjny amendment z 2026-07-14 wycofuje `BURN_IN_CONTRACT_V2` oraz jego
+publiczny audit entry point przed zebraniem jakiegokolwiek prospective row.
+V1 i V2 są historycznymi pre-run draftami, nie aktywnymi kontraktami. PR2C nie
+autoryzuje prospective burn-in; przyszły contract wymaga osobnej decyzji
+właściciela i nie może dziedziczyć rows z tych draftów.
 
 Historyczne v33 pozostaje feasibility-only: nie ma v34, full evidence,
 effective-config hash, stable identity ani rotation manifestu, więc replay v2
 odrzuca je zamiast rekonstruować V2 evidence z legacy scalarów.
 
-## 11. Resource contract
+## 11. Resource contract po finalizacji
 
 Normatywne rozmiary są liczone na nieskompresowanym JSON: Wire V1, v34 i full
-evidence transport. Bounded histogramy w run manifest utrwalają p99 dla
-projection build/validation, full build+serialization i enqueue wait. Audit
+evidence transport. Latency całej durable ścieżki jest raportowana
+diagnostycznie jako p50/p95/p99/max, bez merge lub burn-in threshold. Audit
 sprawdza jednocześnie:
 
-- comparator i enqueue p99 `<= 1_000 us`;
-- pełny producer→evidence→projection→final-bytes build+serialize oraz projection
-  build/validate p99 `<= 5_000 us`;
-- queue high-water `< 80%`;
-- zero drops, failures i orphans;
+- osobną bounded PR2C queue i nieblokujący `try_send`;
+- queue high-water `< 80%` dla prawidłowego evidence runu;
+- zero drops, send failures, writer failures, orphanów i truncated rows;
 - v34 p95 delta `<= 8 KiB` i `<= 10%` względem paired v33;
 - Wire V1 p95 `<= 12 KiB`, max `<= 16 KiB`;
 - sidecar p95 `<= 24 KiB`, p99 `<= 48 KiB`;
 - combined byte-rate delta `<= 25%` względem paired v33.
 
-`metric_contract_build_and_serialize_us` obejmuje teraz producer input set aż
-do exact finalnych writer bytes. Writer nie rehashuje drugi raz semantic
-evidence przy przypisaniu timestamp/part index. Release measurements oraz
-dokładne komendy są utrwalone w raporcie weryfikacyjnym, nie jako surowe
-benchmark logs.
-
-Autoryzowany amendment resource gate z 2026-07-13 zachowuje pełny zakres
-timera i podnosi dwa nieadekwatne limity 1 ms do 5 ms. Standalone
-`metric_contract_serialize_us` pozostaje diagnostyką podetapu; jego koszt jest
-już objęty ciągłym full-path gate. Release
-harness na production-equivalent path zmierzył:
-
-- full build+serialize: p50/p95/p99/max `3 545 / 3 545 / 3 545 / 3 545 us`;
-- complete snapshot: p50/p95/p99 `1 558 / 1 963 / 2 267 us`;
-- projection build/validate/hash: p50/p95/p99 `476 / 669 / 733 us`;
-- final serialization diagnostic: p50/p95/p99 `43 / 67 / 79 us`;
-- comparator: p50/p95/p99 `5 / 8 / 21 us`;
-
-Rozmiary: Wire V1 p95/max `2 339 B`, sidecar p95/p99 `22 180 B`, v34 p95
-`1 176 B`. BURN contract został ponownie zamrożony przed prospective runami z
-nowym canonical hash.
+`metric_contract_build_and_serialize_us`, projection, comparator, enqueue oraz
+serialization histograms pozostają integralnymi diagnostykami. Nie mogą
+nadawać runowi prospective/cutover authority. Własny JCS serializer i
+fixed-width JSON telemetry substitution usunięto; canonical hashing ponownie
+używa referencyjnego `serde_json_canonicalizer`.
 
 ## 12. Zakres wyłączony
 
@@ -317,7 +285,7 @@ Pozytywne:
 - evidence/projection/v34/replay mają jedną immutable source identity;
 - corruption, truncation, mismatch i policy drift są fail-closed i audytowalne;
 - v33 i V3 replay v1 zachowują historyczną kompatybilność;
-- prospective burn-in ma zamrożone, machine-readable gates.
+- prospective burn-in pozostaje jawnie nieautoryzowany.
 
 Koszt:
 
@@ -328,9 +296,9 @@ Koszt:
 
 ## 14. Decyzja końcowa
 
-PR2C wraz z amendmentem review przechodzi pełną walidację i jest gotowy do
-ponownego review. Prospective burn-in może rozpocząć się dopiero po akceptacji
-i merge PR; bieżący rollout pozostaje `Legacy`.
+PR2C pozostaje domyślnie OFF i może być świadomie włączony wyłącznie dla
+dedykowanych shadow evidence runs. Merge nie autoryzuje prospective burn-in;
+bieżący rollout pozostaje `Legacy`.
 
 ```text
 METRIC_CONTRACT_WIRE_V1_CODEBOOK_MANIFEST_FROZEN
@@ -344,11 +312,13 @@ PR2C_EQUIVALENCE_COMPARATOR_ZERO_DRIFT_PASS
 PR2C_COUNTERFACTUAL_DIAGNOSTIC_PASS
 PR2C_SINGLE_RUN_AUDIT_PASS
 PR2C_BUNDLE_AUDIT_PASS
-PR2C_RESOURCE_GATES_PASS
-BURN_IN_CONTRACT_V2_FROZEN
 GATEKEEPER_POLICY_UNCHANGED
 V3_V1_REPLAY_UNCHANGED
 TYPE5_NOT_STARTED
-METRIC_CONTRACTS_V1_1_DUAL_COMPUTE_READY_FOR_PROSPECTIVE_BURN_IN
-PR2C_READY_FOR_REVIEW
+DURABLE_EVIDENCE_READY
+REPLAY_AND_COMPARATOR_READY
+RUNTIME_ISOLATION_PASS
+LEGACY_AND_LIVE_BEHAVIOR_UNCHANGED
+PROSPECTIVE_BURN_IN_NOT_AUTHORIZED
+PR3_NOT_STARTED
 ```

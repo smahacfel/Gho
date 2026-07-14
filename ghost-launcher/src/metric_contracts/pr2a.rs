@@ -12,9 +12,9 @@ use ghost_core::metric_contracts::{
     FundingSourceEvidenceReasonV1, FundingSourceLegacyMeasurementV1, MetricAuthorityClass,
     MetricAvailabilityV1, MetricContractEffectiveConfigErrorV1, MetricContractId,
     MetricContractProfileV1, MetricContractProjectionErrorV1, MetricContractRolloutMode,
-    MetricDecisionProjectionBuildContextV1, MetricDecisionProjectionValidatedStaticContextV1,
-    MetricEffectiveConfigKeyV1, MetricEffectiveConfigValueV1, MetricEvidenceEnvelopeErrorV1,
-    MetricEvidenceReasonV1, MetricMeasurementQualityV1, MetricRolloutRoleV1, MetricSurfaceId,
+    MetricDecisionProjectionBuildContextV1, MetricEffectiveConfigKeyV1,
+    MetricEffectiveConfigValueV1, MetricEvidenceEnvelopeErrorV1, MetricEvidenceReasonV1,
+    MetricMeasurementQualityV1, MetricRolloutRoleV1, MetricSurfaceId,
     ResolvedMetricContractEffectiveConfigV1, Top3EvidenceReasonV1, Top3SignerVolumeEvidenceV1,
     TxTimingEvidenceReasonV1, TxTimingEvidenceV1, TxTimingMeasurementEvidenceV1,
     TxTimingPopulationV1, TxTimingSourceV1,
@@ -845,23 +845,6 @@ pub fn build_pr2a_evidence_families_v1(
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<Pr2aParitySensitiveEvidenceFamiliesV1, Pr2aProducerErrorV1> {
     let validated = ValidatedPr2aEvidenceBuildContextV1::try_new(context)?;
-    build_pr2a_evidence_families_with_validated_context_v1(inputs, &validated)
-}
-
-/// Runtime-only entry point for a session context whose immutable profile and
-/// effective config were already validated when installed. This does not
-/// weaken the public raw builder: arbitrary callers still use
-/// `build_pr2a_evidence_families_v1` and pay full trust-boundary validation.
-pub(crate) fn build_pr2a_evidence_families_with_validated_static_context_v1(
-    inputs: Pr2aFrozenProducerInputsV1<'_>,
-    static_context: &MetricDecisionProjectionValidatedStaticContextV1,
-) -> Result<Pr2aParitySensitiveEvidenceFamiliesV1, Pr2aProducerErrorV1> {
-    let context = Pr2aEvidenceBuildContextV1 {
-        rollout_mode: static_context.rollout_mode(),
-        profile: static_context.profile(),
-        effective_config: static_context.effective_config(),
-    };
-    let validated = ValidatedPr2aEvidenceBuildContextV1 { context: &context };
     build_pr2a_evidence_families_with_validated_context_v1(inputs, &validated)
 }
 

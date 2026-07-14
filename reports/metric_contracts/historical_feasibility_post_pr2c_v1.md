@@ -93,15 +93,14 @@ historical PR2C full replay                 = NOT_EVALUABLE
 historical validation count contribution   = 0
 ```
 
-## 5. Freeze i zasada anty-post-hoc
+## 5. Brak aktywnego freeze i zasada anty-post-hoc
 
-`BURN_IN_CONTRACT_V2.json` zachowuje początkowe minima planu: 3 runy, 1 h/run,
-2 UTC buckets, 8 h aggregate, 700 decisions, 100 dev-known, 100 clean Flip V2
-evaluable i 30 real dev divergences. Historyczny wynik nie obniżył żadnego
-progu. V2 wersjonuje autoryzowaną przed-runową zmianę resource limitu z 1 ms
-do 5 ms; wcześniejszy payload V1 był draftem i nie identyfikuje żadnego runu.
-Prospective row musi powstać po nowym `frozen_at` i przejść pełny per-run audit
-przed bundle aggregation.
+Finalizacyjna decyzja PR2C z 2026-07-14 wycofała pre-run drafty
+`BURN_IN_CONTRACT_V1/V2`, ich latency thresholds i burn-specific audit entry
+point przed powstaniem jakiegokolwiek prospective row. Historyczne dane nie
+obniżyły żadnego progu i nie mogą zostać później zaliczone do nowego contractu.
+Ewentualny prospective contract wymaga osobnej decyzji właściciela, nowej
+wersji/hash/`frozen_at` i całkowicie nowych rows.
 
 ## 6. Werdykt
 
@@ -109,5 +108,6 @@ przed bundle aggregation.
 HISTORICAL_FEASIBILITY_SCALE_CONFIRMED
 HISTORICAL_V33_REPLAY_V2_NOT_EVALUABLE
 HISTORICAL_ROWS_EXCLUDED_FROM_PROSPECTIVE_COUNTS
-BURN_IN_THRESHOLDS_NOT_LOWERED_POST_HOC
+NO_ACTIVE_BURN_IN_CONTRACT
+PROSPECTIVE_BURN_IN_NOT_AUTHORIZED
 ```

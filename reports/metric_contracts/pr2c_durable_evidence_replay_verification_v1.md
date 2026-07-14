@@ -1,8 +1,8 @@
 # PR2C durable metric-contract evidence, replay i audit — raport weryfikacyjny
 
-Status: `FINAL ISOLATION DIRECTIVE IMPLEMENTED / LOCAL FULL VALIDATION PASS`
+Status: `FINALIZATION AMENDMENT IMPLEMENTED / LOCAL VALIDATION PASS`
 
-Data: 2026-07-13
+Data: 2026-07-14
 
 ## 1. Git i zakres
 
@@ -11,8 +11,8 @@ PR: #65 — PR2C: add durable metric-contract evidence, replay and audit
 branch: agent/metric-contract-pr2c-durable-evidence-replay
 base: fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9
 merge-base: fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9
-ostatni zdalny head przed finalną dyrektywą: 261964d751c4356d14f6ad06df6e729524597bba
-lokalny head wejściowy finalizacji: aa2035d333113632bcb7bf17f3a31bcbcf0bee20
+ostatni zdalny head przed finalnym review: 218e1ecacbd3fa6ccd0c2f209f8db171f7f254ae
+lokalny head wejściowy finalizacji: 218e1ecacbd3fa6ccd0c2f209f8db171f7f254ae
 publication head: commit zawierający ten raport; authoritative SHA = head PR
 rekomendowany commit message: metric-contracts: isolate PR2C durable evidence runtime
 ```
@@ -46,14 +46,11 @@ ghost-brain/src/oracle/metric_contract_writer.rs
 ghost-brain/src/oracle/mod.rs
 ghost-brain/tests/oracle_decision_logger_integration.rs
 ghost-core/Cargo.toml
-ghost-core/src/metric_contracts/canonical_hash.rs
-ghost-core/src/metric_contracts/effective_config.rs
 ghost-core/src/metric_contracts/evidence.rs
 ghost-core/src/metric_contracts/mod.rs
 ghost-core/src/metric_contracts/pr2c.rs
 ghost-core/src/metric_contracts/projection.rs
 ghost-core/tests/metric_contracts_v1_1_foundation.rs
-ghost-core/tests/metric_contracts_v1_1_projection.rs
 ghost-launcher/Cargo.toml
 ghost-launcher/src/bin/metric_contract_audit.rs
 ghost-launcher/src/main.rs
@@ -67,50 +64,66 @@ ghost-launcher/src/oracle_runtime.rs
 ghost-launcher/src/session/manager.rs
 ghost-launcher/src/session/observation.rs
 ghost-launcher/tests/common/metric_contracts_pr2c.rs
+ghost-launcher/tests/metric_contracts_pr2b_producers.rs
 ghost-launcher/tests/metric_contracts_pr2b_static_guards.rs
 ghost-launcher/tests/metric_contracts_pr2c_audit.rs
 ghost-launcher/tests/metric_contracts_pr2c_comparator.rs
 ghost-launcher/tests/metric_contracts_pr2c_durability.rs
 ghost-launcher/tests/metric_contracts_pr2c_replay.rs
 ghost-launcher/tests/refactor_invariants_tests.rs
-reports/metric_contracts/BURN_IN_CONTRACT_V2.json
 reports/metric_contracts/historical_feasibility_post_pr2c_v1.md
 reports/metric_contracts/metric_contract_wire_v1_schema_manifest.json
 reports/metric_contracts/pr2c_durable_evidence_replay_verification_v1.md
 ```
 
-Finalny amendment względem zdalnego heada `261964d7...` jest ograniczony do:
+Finalny amendment względem wejściowego heada
+`218e1ecacbd3fa6ccd0c2f209f8db171f7f254ae` jest ograniczony do:
 
 ```text
 .github/workflows/metric-contracts-pr2c.yml
-ghost-brain/examples/oracle_decision_dry_run.rs
-ghost-brain/src/config/ghost_brain_config.rs
+PLANS/DO_REALIZACJI/PLAN_KOREKTY_KONTRAKTOW_INTERPRETACJI_METRYK_V1_20260710.md
+docs/ADR/ADR_8D_PR2C_METRIC_CONTRACT_DURABLE_EVIDENCE_REPLAY_20260713.md
+docs/ADR/ADR_8D_PR2C_REVIEW_BLOCKERS_DURABILITY_AUDIT_20260713.md
+docs/ADR/ADR_8D_PR2C_SECOND_REVIEW_DURABLE_EQUIVALENCE_RESOURCE_INTEGRITY_20260713.md
 ghost-brain/src/oracle/decision_logger.rs
-ghost-brain/src/oracle/followup_scoring.rs
 ghost-brain/src/oracle/metric_contract_writer.rs
 ghost-brain/src/oracle/mod.rs
-ghost-brain/tests/oracle_decision_logger_integration.rs
-ghost-launcher/src/main.rs
+ghost-core/Cargo.toml
+ghost-core/src/metric_contracts/canonical_hash.rs
+ghost-core/src/metric_contracts/effective_config.rs
+ghost-core/src/metric_contracts/pr2c.rs
+ghost-core/src/metric_contracts/projection.rs
+ghost-core/tests/metric_contracts_v1_1_projection.rs
+ghost-launcher/src/bin/metric_contract_audit.rs
+ghost-launcher/src/metric_contracts/pr2a.rs
+ghost-launcher/src/metric_contracts/pr2b.rs
+ghost-launcher/src/metric_contracts/pr2c.rs
 ghost-launcher/src/metric_contracts/pr2c_audit.rs
 ghost-launcher/src/oracle_runtime.rs
+ghost-launcher/src/session/manager.rs
+ghost-launcher/src/session/observation.rs
 ghost-launcher/tests/common/metric_contracts_pr2c.rs
-ghost-launcher/tests/metric_contracts_pr2c_comparator.rs
+ghost-launcher/tests/metric_contracts_pr2b_producers.rs
+ghost-launcher/tests/metric_contracts_pr2b_static_guards.rs
+ghost-launcher/tests/metric_contracts_pr2c_audit.rs
 ghost-launcher/tests/metric_contracts_pr2c_durability.rs
-ghost-launcher/tests/refactor_invariants_tests.rs
+reports/metric_contracts/BURN_IN_CONTRACT_V2.json (deleted)
+reports/metric_contracts/historical_feasibility_post_pr2c_v1.md
 reports/metric_contracts/pr2c_durable_evidence_replay_verification_v1.md
 ```
 
-Nie utworzono nowego planu, ADR-u ani amendment frameworku. Zmiany lokalne z
-commitów `c1f28f4` (cache uchwytów v33) i `aa2035d` (izolacja próbek starego
-benchmarku) zostały wycofane. BURN V3 i histogram codebook V2 nie należą do
-publikowanego diffu; zachowany BURN V2 nie autoryzuje prospective runu po tej
-finalizacji.
+Nie utworzono nowego planu, ADR-u ani amendment frameworku. Cache uchwytów v33,
+izolacja próbek starego latency gate'u, własny JCS serializer, fixed-width JSON
+telemetry substitution i validated-static shortcuty zostały wycofane. BURN V3
+nie powstał; BURN V2 artifact oraz burn-specific audit entry point usunięto
+przed jakimkolwiek prospective row.
 
 ## 3. Finalna architektura runtime
 
 ```text
 Gatekeeper / terminal decision
-  └─ istniejący DecisionLogger v33 queue/task → v33 JSONL
+  └─ raw GatekeeperBuyLog → istniejący DecisionLogger v33 queue/task
+     └─ istniejący worker: plane expansion + hydration → v33 JSONL
 
 PR2C switch == true AND execution mode == Shadow
   └─ second compute + pair builder
@@ -157,19 +170,21 @@ Przy OFF:
 
 - nie jest uruchamiany drugi policy compute;
 - nie jest wywoływany PR2C pair builder;
-- frozen PR2C snapshot nie jest konsumowany przez terminal pair path;
+- pełny PR2C snapshot nie jest zatrzymywany w stanie sesji po zbudowaniu
+  wymaganej compact MFS projection;
 - nie istnieje PR2C sender/receiver ani writer task;
 - nie ma PR2C enqueue;
 - nie są otwierane pliki v34, evidence ani manifest;
 - próba bezpośredniego pair enqueue zwraca `WriterDisabled` bez zmiany stats;
-- exact serde bytes routed v33 dla `legacy_live` i `v25_shadow` są zgodne z
-  dotychczasową serializacją.
+- raw payload i typ komendy v33 pozostają `GatekeeperBuyLog`; plane expansion,
+  hydration i serde odbywają się w tym samym workerze co na base.
 
 ## 5. Routing i identity
 
 Zachowano typed routing poprawiony w poprzednim amendmentcie. Canonical plane
 expansion/hydration pozostaje własnością DecisionLoggera. Pair przy ON pobiera
-typed `Pr2cRoutedDecisionContextV1` z legacy-live row, obejmujący:
+lekki typed `Pr2cRoutedDecisionContextV1` wyprowadzony z raw logu i tego samego
+logger-owned provenance, które później hydratuje canonical legacy-live row:
 
 ```text
 (run_id, join_key, decision_plane)
@@ -203,6 +218,9 @@ Zachowano bez redukcji:
 - persisted policy drift klasyfikowany jako `FAIL_POLICY_DRIFT`;
 - counterfactual diagnostics dla dev-primary i corrected FTDI;
 - writer fault/orphan/truncation detection i fsync/finalization semantics;
+- bounded shutdown z przechowywanymi task handles;
+- niezależny completion proof wiążący exact finalized manifest hash dopiero po
+  udanym rename i directory sync;
 - single-run audit i opcjonalny offline bundle audit;
 - replay v1 i historyczny brak projection jako `None`.
 
@@ -264,42 +282,51 @@ Nie dopisuje sztucznego enqueue sample. Workflow job jest nazwany
 `release-resource-diagnostic`, nie resource gate. Histogram V1 pozostaje
 diagnostyką; nie rozszerzono go wyłącznie po to, by spełniał dawny próg.
 
-Finalny lokalny release diagnostic wykonał `16` warmup i `200` measured
-samples. Histogram V1 umieszcza pełną ścieżkę powyżej `2 000 us` w bounded
-overflow i dlatego konserwatywnie raportuje observed `max_us` jako
-p50/p95/p99; te wartości nie są merge gate'em:
+Wartości poniżej pochodzą z release diagnostic uruchomionego na finalnym
+lokalnym kodzie; końcowy workflow powtarza tę samą komendę na opublikowanym
+headzie. Nie mogą zmienić merge verdictu ani autoryzować prospective burn-in.
 
-| Diagnostyka release | p50 | p95 | p99 | max |
+Finalny lokalny diagnostic (`16` warmup + `200` measured) zwrócił:
+
+| Metryka diagnostyczna | p50 | p95 | p99 | max |
 | --- | ---: | ---: | ---: | ---: |
-| pełny durable path | 14 594 us | 14 594 us | 14 594 us | 14 594 us |
-| complete snapshot build+validate | 1 478 us | 1 896 us | 2 490 us | n/a |
-| projection build+validate | 453 us | 575 us | 752 us | n/a |
-| pair construction | 381 us | 507 us | 638 us | n/a |
-| final serde substep | 45 us | 65 us | 80 us | n/a |
-| comparator | 34 us | 83 us | 95 us | n/a |
+| pełna durable ścieżka | 18 434 us | 18 434 us | 18 434 us | 18 434 us |
+| complete snapshot | 2 098 us | 2 610 us | 3 574 us | — |
+| context validation | 484 us | 633 us | 817 us | — |
+| evidence build | 505 us | 663 us | 905 us | — |
+| evidence validation | 5 us | 7 us | 17 us | — |
+| projection build + validate | 555 us | 693 us | 986 us | — |
+| pair construction | 2 105 us | 2 934 us | 3 480 us | — |
+| serialize diagnostic | 48 us | 80 us | 92 us | — |
+| comparator | 43 us | 60 us | 67 us | — |
 
-Rozmiary: Wire V1 p95/max `2 339 B`, sidecar p95/p99 `22 242 B`, v34 p95
-`1 177 B`. Oddzielny 128-row queue diagnostic dał `try_send` p99 `32 us` i
-high-water `128/1000 = 12.8%`, przy zerowych drops/failures/orphans.
+Wspólny overflow bucket histogramu V1 powoduje, że dla pełnej durable ścieżki
+p50/p95/p99 są raportowane jako `max_us`; jest to jawna diagnostyka, a nie
+estymator ani gate. Rozmiary: Wire V1 p95/max `2 339 B`, sidecar p95/p99
+`22 242 B`, v34 p95 `1 169 B`.
+
+Izolowany test kolejki zmierzył `try_send p99 = 16 us` oraz high-water
+`128/1000 = 12,8%`, przy zerowych drops, send failures, writer failures,
+orphanach i truncation.
 
 ## 9. Test matrix finalnego amendmentu
 
 | Komenda / regresja | Wynik |
 | --- | --- |
 | `cargo test -p ghost-core --test metric_contracts_v1_1_foundation` | PASS — 19/19 |
-| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS — 24/24 |
+| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS — 23/23 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS — 26/26 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards` | PASS — 8/8 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2b_producers` | PASS — 16/16 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2b_static_guards` | PASS — 6/6 |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2c_durability` | PASS — 21/21 |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2c_durability` | PASS — 23/23 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2c_replay` | PASS — 10/10 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2c_comparator` | PASS — 8/8 |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2c_audit` | PASS — 26/26 |
-| disabled-mode exact v33 bytes / no artifacts | PASS — część durability 21/21 |
-| real terminal routing E2E | PASS — część durability 21/21 |
-| isolated queue saturation/closed | PASS — część durability 21/21 |
-| 128-row queue high-water / zero failures | PASS — część durability 21/21 |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2c_audit` | PASS — 24/24 |
+| disabled-mode exact v33 bytes / no artifacts | PASS — część durability 23/23 |
+| real terminal routing E2E | PASS — część durability 23/23 |
+| isolated queue saturation/closed | PASS — część durability 23/23 |
+| 128-row queue high-water / zero failures | PASS — część durability 23/23 |
 | `cargo test -p ghost-brain --lib metric_contract_pr2c_switch_is_backward_compatible_and_opt_in` | PASS — 1/1 |
 | `cargo test -p ghost-launcher --lib pr2c_durable_evidence_is_opt_in_and_shadow_only` | PASS — 1/1 |
 | `cargo test -p ghost-launcher --test gatekeeper_policy_tests` | PASS — 46/46 |
@@ -308,6 +335,7 @@ high-water `128/1000 = 12.8%`, przy zerowych drops/failures/orphans.
 | `cargo test -p ghost-launcher --test session_lifecycle_tests` | PASS — 26/26 |
 | `cargo test -p ghost-launcher --test refactor_invariants_tests` | PASS — 12/12 |
 | `cargo test -p ghost-brain --lib replay_payload` | PASS — 5/5 |
+| `cargo test -p ghost-brain --lib decision_logger_shutdown_is_bounded_and_invalidates_pr2c_run` | PASS — 1/1 |
 | `cargo check -p ghost-core` | PASS |
 | `cargo check -p ghost-launcher` | PASS |
 | `cargo check -p ghost-brain` | PASS |
@@ -361,8 +389,8 @@ spoza PR2C; selector score i jego owner nie zostały zmienione.
 
 ## 12. Status końcowy
 
-Lokalna implementacja i pełna walidacja finalnej dyrektywy przeszły. Do
-publikacji pozostają commit, push, jedno CI i końcowy review zdalnego heada.
+Lokalna implementacja i pełna walidacja finalnej dyrektywy przeszły. Raport
+jest gotowy do publikacji w jednym finalnym commicie i jednym końcowym CI.
 PR nadal pozostaje draftem, a prospective burn-in nie jest autoryzowany.
 
 Markery finalnej dyrektywy:

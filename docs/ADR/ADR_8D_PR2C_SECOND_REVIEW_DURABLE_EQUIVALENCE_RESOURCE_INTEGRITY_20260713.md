@@ -1,6 +1,6 @@
 # ADR-8D: PR2C — durable equivalence replay i integralność resource/BURN
 
-Status: `IMPLEMENTED / FULL VALIDATION PASS / READY FOR RE-REVIEW`
+Status: `SUPERSEDED BY 2026-07-14 FINALIZATION / HISTORICAL IMPLEMENTATION RECORD`
 
 Typ: ADR-8D / second review amendment / durability / replay / resource metrology
 
@@ -26,6 +26,11 @@ Poziom ryzyka: `HIGH`. Amendment dotyka monotonicznego pomiaru terminalnej
 i prospective BURN audit. Nie zmienia aktywnej Gatekeeper policy, authority
 Profile A, terminalnego verdictu ani rollout mode `Legacy`.
 
+Uwaga normatywna: decyzje tego dokumentu o limitach 1/5 ms,
+`BURN_IN_CONTRACT_V2` i prospective readiness zostały wycofane przed
+jakimkolwiek prospective row. Finalny PR2C raportuje latency wyłącznie
+diagnostycznie, jest default OFF i nie autoryzuje burn-inu.
+
 ## 1. Problem
 
 Drugie blocking review wykazało, że część wcześniejszych dowodów była zbyt
@@ -44,17 +49,11 @@ wąska mimo poprawnej podstawowej implementacji:
 6. semantyka UTC bucketów i `brain_config_hash` różniła się między kodem a
    planem, a raport PASS nie miał typed `cutover_scope`.
 
-## 2. Decyzja: jeden ciągły timer i limit 5 ms
+## 2. Historyczna decyzja timera — wycofana
 
-Autoryzowana decyzja właściciela planu podnosi dwa limity:
-
-```text
-metric_contract_build_and_serialize_us p99 <= 5_000 us
-metric_contract_projection_build_and_validate_us p99 <= 5_000 us
-```
-
-Historyczny draft `1_000 us` dla tych samych metryk jest jednoznacznie
-zastąpiony; comparator i bounded enqueue nadal mają limit `1_000 us`.
+Ten etap wprowadził jeden ciągły timer i tymczasowy latency gate. Finalizacja
+2026-07-14 zachowuje timer wyłącznie jako diagnostykę p50/p95/p99/max i usuwa
+wszystkie latency thresholds z merge/burn-in acceptance.
 
 Normatywna granica pełnego pomiaru jest teraz realizowana przez jeden
 `std::time::Instant`:
@@ -120,7 +119,6 @@ exact równy temu anchorowi w zakresie:
 - Gatekeeper i brain config hashes;
 - rollout i wszystkie schema versions;
 - Wire V1 manifest hash;
-- BURN version/hash;
 - profile ID/hash;
 - effective-config payload/hash.
 
@@ -129,22 +127,12 @@ Wzajemnie zgodny summary/evidence part 1 z innym provenance jest odrzucany.
 między różnymi runami bundle; cross-run equivalence używa Gatekeeper, profile i
 effective-config hashes.
 
-## 6. BURN_IN_CONTRACT_V2 i semantyka bundle
+## 6. BURN contract — wycofany
 
-Wcześniejszy payload V1 z limitem 1 ms był draftem i nie identyfikuje żadnego
-prospective row. Autoryzowana zmiana gate'u jest mimo braku rozpoczętych runów
-wersjonowana jako:
-
-```text
-artifact: reports/metric_contracts/BURN_IN_CONTRACT_V2.json
-burn_in_contract_version: 2
-frozen_at: 2026-07-13T17:53:14Z
-canonical SHA-256: 3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20
-```
-
-Manifest każdego partu musi być związany z tym exact version/hash. Publiczny
-bundle audit ma regresje dla: mniej niż 3 runy, mniej niż 2 buckety, row nie
-późniejszy niż `frozen_at` i zmieniony BURN hash.
+Pre-run drafty V1/V2 nie identyfikują żadnego prospective row. Artifact V2,
+jego manifest binding oraz burn-specific public audit entry point zostały
+usunięte. Bundle pozostaje opcjonalnym offline consistency narzędziem i nie
+nadaje prospective authority.
 
 UTC buckets są wyprowadzane ze wszystkich poprawnie sparowanych
 `paired_decision_timestamp_ms`, a nie wyłącznie z początku runu. Każdy run musi
@@ -214,13 +202,23 @@ histogramu, ale nie mylą debugowej szybkości współdzielonego runnera z
 acceptance. Jedynym dowodem wydajności pozostaje osobny release harness, który
 nie normalizuje telemetryki i mierzy realny ciągły zegar.
 
-Pełny histogram jest konserwatywny: overflow bucket powyżej 2 ms zwraca
-observed `max_us` dla p50/p95/p99. Wynik `3 545 us` nadal pozostaje poniżej
-frozen limitu `5 000 us`. Standalone serialization jest diagnostyką; jej koszt
-wchodzi do tego samego ciągłego full-path gate.
+Powyższe wyniki pozostają historycznymi diagnostykami. Nie są merge gate'em,
+nie wiążą aktywnego BURN contractu i nie nadają prospective authority.
 
 Pełne suites PR2A/PR2B/PR2C, frozen Gatekeeper/lifecycle matrix, replay v1,
-checks, targeted Clippy, formatting oraz diff checks przeszły. Markery
-prospective-burn-in readiness mogą zostać przywrócone dla ponownego review;
-PR pozostaje draftem, rollout pozostaje `Legacy`, a rozpoczęcie faktycznego
-prospective runu nadal wymaga akceptacji review.
+checks, targeted Clippy, formatting oraz diff checks były dowodem tego etapu.
+
+## 10. Finalizacyjny amendment 2026-07-14
+
+- osobna bounded queue i osobny PR2C writer task;
+- synchroniczny, nieblokujący `try_send`;
+- config switch default `false`, efektywnie wyłączony poza dedykowanym shadow;
+- raw v33 payload, plane expansion i hydration pozostają na historycznej
+  ścieżce v33;
+- full PR2C snapshot jest zatrzymywany wyłącznie przy efektywnym ON;
+- referencyjny `serde_json_canonicalizer`, bez własnego JCS i fixed-width JSON
+  mutation;
+- bounded shutdown i niezależny completion proof po directory sync;
+- `BURN_IN_CONTRACT_V2` oraz burn-specific audit entry point usunięte;
+- latency p50/p95/p99/max jest diagnostyką, nie acceptance gate'em;
+- prospective burn-in i PR3 pozostają nieautoryzowane/nieuruchomione.

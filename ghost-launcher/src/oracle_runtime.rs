@@ -1178,7 +1178,7 @@ fn current_time_ns() -> u128 {
 
 fn spawn_gatekeeper_decision_logs(
     ctx: &Arc<PoolObservationContext>,
-    routed_buy_log: ghost_brain::oracle::RoutedGatekeeperDecisionV1,
+    buy_log: ghost_brain::oracle::GatekeeperBuyLog,
     coordination_snapshot: FrozenCoordinationDecisionSnapshot,
     metric_contract_pair: Option<ghost_core::metric_contracts::MetricContractPairedRecordV1>,
 ) {
@@ -1188,7 +1188,10 @@ fn spawn_gatekeeper_decision_logs(
     );
     let dl = ctx.decision_logger.clone();
     tokio::spawn(async move {
-        dl.log_routed_gatekeeper_buy_decision(routed_buy_log).await;
+        // Preserve the established v33 command payload and worker-owned plane
+        // expansion/hydration. PR2C never changes this queue path, including
+        // when the opt-in switch is enabled.
+        dl.log_gatekeeper_buy_decision(buy_log).await;
         if let Some(metric_contract_pair) = metric_contract_pair {
             if let Err(error) = dl.log_metric_contract_pair(metric_contract_pair) {
                 error!("PR2C paired metric-contract enqueue failed closed: {error}");
@@ -1272,47 +1275,46 @@ fn build_pr2c_terminal_pair(
             )
         })
         .transpose()?;
-    let paired =
-        crate::metric_contracts::build_pr2c_timed_paired_record_from_validated_snapshot_v1(
-            &timed_snapshot,
-            &crate::metric_contracts::Pr2cDecisionRecordContextV1 {
-                record_identity: routed_context.record_identity().clone(),
-                stable_event_identity,
-                rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode::Legacy,
-                profile: &profile,
-                effective_config: &effective_config,
-                authoritative_policy: &policy,
-                comparator_policy: &comparator_policy,
-                comparator_evaluable: assessment.decision.is_some(),
-                comparator_elapsed_us,
-                metric_contract_serialize_us: 0,
-                metric_contract_build_and_serialize_us: 0,
-                projection_build_and_validate_us: 0,
-                gatekeeper_config_hash: routed_context.gatekeeper_config_hash().as_str(),
-                brain_config_hash: Some(routed_context.brain_config_hash().as_str()),
-            },
-        )?;
+    let paired = crate::metric_contracts::build_pr2c_timed_paired_record_v1(
+        &timed_snapshot,
+        &crate::metric_contracts::Pr2cDecisionRecordContextV1 {
+            record_identity: routed_context.record_identity().clone(),
+            stable_event_identity,
+            rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode::Legacy,
+            profile: &profile,
+            effective_config: &effective_config,
+            authoritative_policy: &policy,
+            comparator_policy: &comparator_policy,
+            comparator_evaluable: assessment.decision.is_some(),
+            comparator_elapsed_us,
+            metric_contract_serialize_us: 0,
+            metric_contract_build_and_serialize_us: 0,
+            projection_build_and_validate_us: 0,
+            gatekeeper_config_hash: routed_context.gatekeeper_config_hash().as_str(),
+            brain_config_hash: Some(routed_context.brain_config_hash().as_str()),
+        },
+    )?;
     Ok(paired)
 }
 
-fn route_gatekeeper_decision_and_build_pr2c_pair(
+fn build_pr2c_pair_if_enabled(
     ctx: &PoolObservationContext,
     session: &SharedSession,
     assessment: &GatekeeperAssessment,
     buy_log: ghost_brain::oracle::GatekeeperBuyLog,
 ) -> (
-    ghost_brain::oracle::RoutedGatekeeperDecisionV1,
+    ghost_brain::oracle::GatekeeperBuyLog,
     Option<ghost_core::metric_contracts::MetricContractPairedRecordV1>,
 ) {
-    // DecisionLogger owns plane expansion and routing provenance. Route once,
-    // derive the PR2C identity from the routed legacy-live row, and enqueue
-    // these exact same routed rows after the pair has been constructed.
-    let routed_buy_log = ctx.decision_logger.route_gatekeeper_buy_decision(buy_log);
     if !ctx.decision_logger.metric_contract_pr2c_enabled() {
-        return (routed_buy_log, None);
+        return (buy_log, None);
     }
-    let metric_contract_pair = routed_buy_log
-        .pr2c_legacy_live_context()
+    // Derive only the typed identity/provenance needed by PR2C. The raw v33
+    // remains untouched; its canonical expansion and hydration still happen
+    // in the original DecisionLogger worker after enqueue.
+    let metric_contract_pair = ctx
+        .decision_logger
+        .pr2c_legacy_live_context(&buy_log)
         .map_err(Pr2cTerminalSnapshotErrorV1::from)
         .and_then(|routed_context| {
             build_pr2c_terminal_pair(session, assessment, &routed_context, &ctx.gatekeeper_config)
@@ -1323,7 +1325,7 @@ fn route_gatekeeper_decision_and_build_pr2c_pair(
         })
         .ok();
 
-    (routed_buy_log, metric_contract_pair)
+    (buy_log, metric_contract_pair)
 }
 
 fn freeze_coordination_decision_snapshot_for_runtime(
@@ -24065,16 +24067,11 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                let (routed_buy_log, metric_contract_pair) =
-                    route_gatekeeper_decision_and_build_pr2c_pair(
-                        ctx.as_ref(),
-                        &session,
-                        &assessment,
-                        buy_log,
-                    );
+                let (buy_log, metric_contract_pair) =
+                    build_pr2c_pair_if_enabled(ctx.as_ref(), &session, &assessment, buy_log);
                 spawn_gatekeeper_decision_logs(
                     &ctx,
-                    routed_buy_log,
+                    buy_log,
                     coordination_snapshot,
                     metric_contract_pair,
                 );
@@ -24195,16 +24192,11 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                let (routed_buy_log, metric_contract_pair) =
-                    route_gatekeeper_decision_and_build_pr2c_pair(
-                        ctx.as_ref(),
-                        &session,
-                        &assessment,
-                        buy_log,
-                    );
+                let (buy_log, metric_contract_pair) =
+                    build_pr2c_pair_if_enabled(ctx.as_ref(), &session, &assessment, buy_log);
                 spawn_gatekeeper_decision_logs(
                     &ctx,
-                    routed_buy_log,
+                    buy_log,
                     coordination_snapshot,
                     metric_contract_pair,
                 );
@@ -24403,16 +24395,15 @@ async fn pool_observation_task(
                                 base_mint_pubkey,
                             )
                             .await;
-                        let (routed_buy_log, metric_contract_pair) =
-                            route_gatekeeper_decision_and_build_pr2c_pair(
-                                ctx.as_ref(),
-                                &session,
-                                &assessment,
-                                buy_log,
-                            );
+                        let (buy_log, metric_contract_pair) = build_pr2c_pair_if_enabled(
+                            ctx.as_ref(),
+                            &session,
+                            &assessment,
+                            buy_log,
+                        );
                         spawn_gatekeeper_decision_logs(
                             &ctx,
-                            routed_buy_log,
+                            buy_log,
                             coordination_snapshot,
                             metric_contract_pair,
                         );
@@ -24632,16 +24623,11 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                let (routed_buy_log, metric_contract_pair) =
-                    route_gatekeeper_decision_and_build_pr2c_pair(
-                        ctx.as_ref(),
-                        &session,
-                        &assessment,
-                        buy_log,
-                    );
+                let (buy_log, metric_contract_pair) =
+                    build_pr2c_pair_if_enabled(ctx.as_ref(), &session, &assessment, buy_log);
                 spawn_gatekeeper_decision_logs(
                     &ctx,
-                    routed_buy_log,
+                    buy_log,
                     coordination_snapshot,
                     metric_contract_pair,
                 );
@@ -24938,6 +24924,9 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
             "PR2C durable evidence requested outside dedicated shadow mode; forcing it OFF"
         );
     }
+    oracle_runtime
+        .session_manager()
+        .set_pr2c_snapshot_capture_enabled(pr2c_enabled);
     decision_logger_config.metric_contract_pr2c_enabled = pr2c_enabled;
     let gatekeeper_rollout_profile = decision_logger_config.gatekeeper_rollout_profile.clone();
 

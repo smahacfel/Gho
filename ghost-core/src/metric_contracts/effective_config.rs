@@ -525,58 +525,8 @@ impl ResolvedMetricContractEffectiveConfigV1 {
     }
 
     pub fn validate_hash(&self) -> Result<(), MetricContractEffectiveConfigErrorV1> {
-        // Resolved configs are emitted in the exact registry-key order. Keep
-        // the original normalization fallback for a publicly reordered
-        // payload, but avoid cloning, BTreeSet allocation and sorting on the
-        // terminal hot path when the canonical order is already present.
-        let entries_are_canonical = self.payload.entries.len()
-            == METRIC_EFFECTIVE_CONFIG_KEYS_V1.len()
-            && self
-                .payload
-                .entries
-                .iter()
-                .zip(METRIC_EFFECTIVE_CONFIG_KEYS_V1.iter())
-                .all(|(entry, expected)| entry.key == *expected);
-        if !entries_are_canonical {
-            let validated = Self::try_from_payload(self.payload.clone())?;
-            if validated.metric_contract_effective_config_hash
-                != self.metric_contract_effective_config_hash
-            {
-                return Err(MetricContractEffectiveConfigErrorV1::HashMismatch);
-            }
-            return Ok(());
-        }
-        if self.payload.registry_id != METRIC_CONTRACT_REGISTRY_ID_V1_1 {
-            return Err(MetricContractEffectiveConfigErrorV1::UnknownRegistry(
-                self.payload.registry_id.clone(),
-            ));
-        }
-        if self.payload.schema_version != METRIC_CONTRACT_SCHEMA_VERSION_V1 {
-            return Err(MetricContractEffectiveConfigErrorV1::UnsupportedSchema(
-                self.payload.schema_version,
-            ));
-        }
-        for entry in &self.payload.entries {
-            let expected_kind = entry.key.value_kind();
-            let actual_kind = entry.value.kind();
-            if expected_kind != actual_kind {
-                return Err(MetricContractEffectiveConfigErrorV1::WrongValueKind {
-                    key: entry.key,
-                    expected: expected_kind,
-                    actual: actual_kind,
-                });
-            }
-            entry.value.validate()?;
-        }
-        let selected_profile = MetricContractFoundationConfigV1 {
-            metric_contract_rollout_mode: self.payload.rollout_mode,
-            metric_contract_profile: self.payload.profile_id,
-        }
-        .resolve_profile()?;
-        if selected_profile.canonical_hash()? != self.payload.profile_hash {
-            return Err(MetricContractEffectiveConfigErrorV1::ProfileHashMismatch);
-        }
-        if metric_contract_effective_config_hash(&self.payload)?
+        let validated = Self::try_from_payload(self.payload.clone())?;
+        if validated.metric_contract_effective_config_hash
             != self.metric_contract_effective_config_hash
         {
             return Err(MetricContractEffectiveConfigErrorV1::HashMismatch);

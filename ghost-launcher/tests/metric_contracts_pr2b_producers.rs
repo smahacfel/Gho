@@ -723,7 +723,18 @@ fn current_materialized_projection() -> (
         })
         .unwrap();
     let session = manager.get_session(&pool).unwrap();
-    let materialized = session.read().try_materialize_features().unwrap();
+    let session = session.read();
+    assert!(
+        !session.pr2c_snapshot_capture_enabled(),
+        "PR2C retention must be OFF by default"
+    );
+    let materialized = session.try_materialize_features().unwrap();
+    assert!(
+        session
+            .take_pr2c_complete_metric_contract_snapshot()
+            .is_none(),
+        "OFF mode must not retain the full evidence snapshot"
+    );
     (materialized, profile, effective)
 }
 

@@ -14,13 +14,6 @@ pub const METRIC_CONTRACT_WIRE_V1_TUPLE_TABLE_COUNT: usize = 18;
 pub const METRIC_CONTRACT_WIRE_V1_MAPPING_TABLE_COUNT: usize = 28;
 pub const METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3: &str =
     "70d79931f3f9a82720e46f622d439930a087431e305d14c02d88dcd26568fc7f";
-pub const PR2C_COMPARATOR_P99_MAX_US: u32 = 1_000;
-pub const PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US: u32 = 5_000;
-pub const PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US: u32 = 5_000;
-pub const PR2C_LOGGER_ENQUEUE_WAIT_P99_MAX_US: u32 = 1_000;
-pub const BURN_IN_CONTRACT_VERSION_V2: u16 = 2;
-pub const BURN_IN_CONTRACT_V2_CANONICAL_HASH: &str =
-    "3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -326,22 +319,6 @@ pub enum MetricContractPairErrorV1 {
 
 impl MetricContractPairedRecordV1 {
     pub fn validate_pair(&self) -> Result<(), MetricContractPairErrorV1> {
-        self.validate_pair_common(true)
-    }
-
-    /// Structural paired-record validation for a caller holding a typed proof
-    /// that the exact effective config was already hash-validated. Durable
-    /// deserialization and replay must continue to call `validate_pair()`.
-    pub fn validate_pair_with_prevalidated_effective_config(
-        &self,
-    ) -> Result<(), MetricContractPairErrorV1> {
-        self.validate_pair_common(false)
-    }
-
-    fn validate_pair_common(
-        &self,
-        revalidate_effective_config_hash: bool,
-    ) -> Result<(), MetricContractPairErrorV1> {
         if self.decision_v34.evidence_record_id != self.evidence.payload.record_identity {
             return Err(MetricContractPairErrorV1::RecordIdentityMismatch);
         }
@@ -361,7 +338,7 @@ impl MetricContractPairedRecordV1 {
         {
             return Err(MetricContractPairErrorV1::ProvenanceMismatch);
         }
-        if (revalidate_effective_config_hash && self.effective_config.validate_hash().is_err())
+        if self.effective_config.validate_hash().is_err()
             || self.effective_config.metric_contract_effective_config_hash
                 != self.decision_v34.metric_contract_effective_config_hash
             || CanonicalHashV1::parse(&self.gatekeeper_config_hash)
@@ -406,148 +383,4 @@ pub enum MetricContractAuditTerminalClassV1 {
 pub enum MetricContractCutoverScopeV1 {
     #[serde(rename = "metric_contracts_v1_1_profile_a_equivalence_only")]
     MetricContractsV1_1ProfileAEquivalenceOnly,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BurnInResourceLimitsV1 {
-    pub comparator_p99_us: u32,
-    pub metric_contract_build_and_serialize_p99_us: u32,
-    pub projection_build_and_validate_p99_us: u32,
-    pub logger_enqueue_wait_p99_us: u32,
-    pub writer_queue_high_water_max_ratio: f64,
-    pub projection_p95_bytes: u32,
-    pub projection_hard_max_bytes: u32,
-    pub sidecar_p95_bytes: u32,
-    pub sidecar_p99_bytes: u32,
-    pub combined_gb_per_hour_delta_max_ratio: f64,
-    pub v34_p95_increase_max_bytes: u32,
-    pub v34_p95_increase_max_ratio: f64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BurnInContractPayloadV1 {
-    pub burn_in_contract_version: u16,
-    pub minimum_non_overlapping_runs: u16,
-    pub minimum_run_duration_ms: u64,
-    pub minimum_utc_4h_buckets: u16,
-    pub minimum_aggregate_duration_ms: u64,
-    pub minimum_unique_decisions: u64,
-    pub minimum_dev_known_decisions: u64,
-    pub minimum_clean_flip_v2_evaluable: u64,
-    pub minimum_real_dev_legacy_v2_divergences: u64,
-    pub metric_contract_schema_version: u16,
-    pub projection_wire_version: u16,
-    pub evidence_schema_version: u16,
-    pub decision_schema_version: u32,
-    pub wire_schema_manifest_blake3: String,
-    pub resource_limits: BurnInResourceLimitsV1,
-    pub require_zero_policy_drift: bool,
-    pub require_zero_dropped_rows: bool,
-    pub require_zero_writer_failures: bool,
-    pub require_zero_orphans: bool,
-    pub invalidation_rules: Vec<String>,
-    pub frozen_at: String,
-    pub owner_approval_identity: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BurnInContractV1 {
-    pub payload: BurnInContractPayloadV1,
-    pub contract_canonical_hash: CanonicalHashV1,
-}
-
-#[derive(Debug, Error)]
-pub enum BurnInContractErrorV1 {
-    #[error(transparent)]
-    Hash(#[from] super::CanonicalHashErrorV1),
-    #[error("BURN_IN_CONTRACT_V2 canonical hash mismatch")]
-    HashMismatch,
-    #[error("BURN_IN_CONTRACT_V2 contains an invalid frozen gate")]
-    InvalidGate,
-}
-
-impl BurnInContractV1 {
-    pub fn try_new(payload: BurnInContractPayloadV1) -> Result<Self, BurnInContractErrorV1> {
-        if payload.burn_in_contract_version != BURN_IN_CONTRACT_VERSION_V2
-            || payload.minimum_non_overlapping_runs < 3
-            || payload.minimum_run_duration_ms < 3_600_000
-            || payload.minimum_utc_4h_buckets < 2
-            || payload.frozen_at.trim().is_empty()
-            || payload.owner_approval_identity.trim().is_empty()
-            || payload.wire_schema_manifest_blake3.len() != 64
-            || payload.metric_contract_schema_version
-                != super::METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1
-            || payload.projection_wire_version
-                != super::METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1
-            || payload.evidence_schema_version != super::METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1
-            || payload.decision_schema_version != super::METRIC_CONTRACT_DECISION_SCHEMA_VERSION_V34
-            || payload.wire_schema_manifest_blake3
-                != METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3
-            || payload.resource_limits.comparator_p99_us != PR2C_COMPARATOR_P99_MAX_US
-            || payload
-                .resource_limits
-                .metric_contract_build_and_serialize_p99_us
-                != PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US
-            || payload.resource_limits.projection_build_and_validate_p99_us
-                != PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US
-            || payload.resource_limits.logger_enqueue_wait_p99_us
-                != PR2C_LOGGER_ENQUEUE_WAIT_P99_MAX_US
-            || payload.resource_limits.writer_queue_high_water_max_ratio != 0.8
-            || payload.resource_limits.projection_p95_bytes != 12 * 1_024
-            || payload.resource_limits.projection_hard_max_bytes != 16 * 1_024
-            || payload.resource_limits.sidecar_p95_bytes != 24 * 1_024
-            || payload.resource_limits.sidecar_p99_bytes != 48 * 1_024
-            || payload.resource_limits.combined_gb_per_hour_delta_max_ratio != 0.25
-            || payload.resource_limits.v34_p95_increase_max_bytes != 8 * 1_024
-            || payload.resource_limits.v34_p95_increase_max_ratio != 0.10
-            || !payload.require_zero_policy_drift
-            || !payload.require_zero_dropped_rows
-            || !payload.require_zero_writer_failures
-            || !payload.require_zero_orphans
-        {
-            return Err(BurnInContractErrorV1::InvalidGate);
-        }
-        let contract_canonical_hash = CanonicalHashV1::digest(&payload)?;
-        if contract_canonical_hash.as_str() != BURN_IN_CONTRACT_V2_CANONICAL_HASH {
-            return Err(BurnInContractErrorV1::InvalidGate);
-        }
-        Ok(Self {
-            payload,
-            contract_canonical_hash,
-        })
-    }
-
-    pub fn validate_hash(&self) -> Result<(), BurnInContractErrorV1> {
-        let rebuilt = Self::try_new(self.payload.clone())?;
-        if rebuilt.contract_canonical_hash != self.contract_canonical_hash {
-            return Err(BurnInContractErrorV1::HashMismatch);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawBurnInContractV1 {
-    payload: BurnInContractPayloadV1,
-    contract_canonical_hash: CanonicalHashV1,
-}
-
-impl<'de> Deserialize<'de> for BurnInContractV1 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = RawBurnInContractV1::deserialize(deserializer)?;
-        let contract = Self::try_new(raw.payload).map_err(serde::de::Error::custom)?;
-        if contract.contract_canonical_hash != raw.contract_canonical_hash {
-            return Err(serde::de::Error::custom(
-                BurnInContractErrorV1::HashMismatch,
-            ));
-        }
-        Ok(contract)
-    }
 }

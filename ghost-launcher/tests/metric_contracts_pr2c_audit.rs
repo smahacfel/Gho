@@ -10,19 +10,19 @@ use common::{
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_brain::oracle::reason_code::GatekeeperReasonCode;
 use ghost_brain::oracle::{
-    MetricContractLatencyHistogramSnapshotV1, MetricContractPairedWriterConfigV1,
-    MetricContractPairedWriterStatsV1, MetricContractPairedWriterV1,
-    MetricContractRotationManifestV1, METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE,
+    MetricContractCompletionProofV1, MetricContractLatencyHistogramSnapshotV1,
+    MetricContractPairedWriterConfigV1, MetricContractPairedWriterStatsV1,
+    MetricContractPairedWriterV1, MetricContractRotationManifestV1,
+    METRIC_CONTRACT_COMPLETION_PROOF_V1_FILE, METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE,
 };
 use ghost_core::metric_contracts::{
-    BurnInContractV1, MetricContractAuditTerminalClassV1, MetricContractCutoverScopeV1,
+    CanonicalHashV1, MetricContractAuditTerminalClassV1, MetricContractCutoverScopeV1,
 };
 use ghost_launcher::components::gatekeeper_policy::{
     build_assessment_from_features, evaluate_policy_from_assessment, PolicyEvaluationContext,
 };
 use ghost_launcher::metric_contracts::{
-    audit_pr2c_bundle_against_burn_in_contract_v2, audit_pr2c_bundle_v1, audit_pr2c_single_run_v1,
-    pr2c_policy_equivalence_snapshot_v1,
+    audit_pr2c_bundle_v1, audit_pr2c_single_run_v1, pr2c_policy_equivalence_snapshot_v1,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -60,7 +60,18 @@ fn normalize_semantic_audit_fixture_histograms(run_dir: &std::path::Path) {
     manifest.writer_stats.logger_enqueue_wait_us = deterministic();
     manifest.writer_stats.metric_contract_build_and_serialize_us = deterministic();
     manifest.writer_stats.projection_build_and_validate_us = deterministic();
-    std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    std::fs::write(&path, &manifest_bytes).unwrap();
+    let proof = MetricContractCompletionProofV1 {
+        proof_schema_version: 1,
+        manifest_sha256: CanonicalHashV1::parse(format!("{:x}", Sha256::digest(&manifest_bytes)))
+            .unwrap(),
+    };
+    std::fs::write(
+        run_dir.join(METRIC_CONTRACT_COMPLETION_PROOF_V1_FILE),
+        serde_json::to_vec_pretty(&proof).unwrap(),
+    )
+    .unwrap();
 }
 
 async fn write_run(run_id: &str, join_key: &str) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -452,8 +463,8 @@ async fn audit_rejects_modified_sha_missing_and_undeclared_rotated_parts() {
 }
 
 #[tokio::test]
-async fn audit_rejects_unknown_or_dirty_build_and_missing_burn_binding() {
-    for mutation in ["unknown-build", "dirty-build", "burn-mismatch"] {
+async fn audit_rejects_unknown_or_dirty_build() {
+    for mutation in ["unknown-build", "dirty-build"] {
         let (run, v33) = write_run("provenance-run", mutation).await;
         let manifest_path = run
             .path()
@@ -468,11 +479,6 @@ async fn audit_rejects_unknown_or_dirty_build_and_missing_burn_binding() {
             match mutation {
                 "unknown-build" => part.build_commit = "unknown_build_commit".to_string(),
                 "dirty-build" => part.build_worktree_clean = false,
-                "burn-mismatch" => {
-                    part.burn_in_contract_canonical_hash =
-                        ghost_core::metric_contracts::CanonicalHashV1::parse("0".repeat(64))
-                            .unwrap();
-                }
                 _ => unreachable!(),
             }
         }
@@ -681,75 +687,6 @@ async fn audit_rejects_mutually_consistent_part_one_with_different_run_provenanc
     .unwrap();
 
     assert!(audit_pr2c_single_run_v1(temp.path(), &[v33]).is_err());
-}
-
-#[tokio::test]
-async fn public_burn_v2_audit_enforces_run_bucket_and_prospective_minima() {
-    let contract: BurnInContractV1 = serde_json::from_str(include_str!(
-        "../../reports/metric_contracts/BURN_IN_CONTRACT_V2.json"
-    ))
-    .unwrap();
-    let (run, v33) = write_run("run-a", "join-a").await;
-    let report = audit_pr2c_bundle_against_burn_in_contract_v2(
-        &[(run.path().to_path_buf(), vec![v33])],
-        &contract,
-    )
-    .unwrap();
-    assert_eq!(
-        report.cutover_scope,
-        MetricContractCutoverScopeV1::MetricContractsV1_1ProfileAEquivalenceOnly
-    );
-    assert_eq!(
-        report.terminal_class,
-        MetricContractAuditTerminalClassV1::NotEvaluable
-    );
-    for expected in [
-        "minimum non-overlapping run count not met",
-        "minimum paired-decision UTC bucket count not met",
-        "contains a row at or before frozen_at",
-    ] {
-        assert!(
-            report
-                .reasons
-                .iter()
-                .any(|reason| reason.contains(expected)),
-            "missing typed BURN V2 failure {expected}: {report:#?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn public_burn_v2_audit_rejects_gate_hash_change_binding() {
-    let contract: BurnInContractV1 = serde_json::from_str(include_str!(
-        "../../reports/metric_contracts/BURN_IN_CONTRACT_V2.json"
-    ))
-    .unwrap();
-    let (run, v33) = write_run("burn-binding-run", "burn-binding-join").await;
-    let manifest_path = run
-        .path()
-        .join(ghost_brain::oracle::METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE);
-    let mut manifest: ghost_brain::oracle::MetricContractRotationManifestV1 =
-        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-    let changed_hash =
-        ghost_core::metric_contracts::CanonicalHashV1::parse("0".repeat(64)).unwrap();
-    for part in manifest
-        .summary_parts
-        .iter_mut()
-        .chain(manifest.evidence_parts.iter_mut())
-    {
-        part.burn_in_contract_canonical_hash = changed_hash.clone();
-    }
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
-
-    assert!(audit_pr2c_bundle_against_burn_in_contract_v2(
-        &[(run.path().to_path_buf(), vec![v33])],
-        &contract,
-    )
-    .is_err());
 }
 
 #[tokio::test]

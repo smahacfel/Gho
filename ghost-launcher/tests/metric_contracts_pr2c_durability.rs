@@ -11,11 +11,12 @@ use ghost_brain::oracle::{
     MetricContractPairedWriterStatsV1, MetricContractPairedWriterV1,
     MetricContractRotationManifestV1, MetricContractWriterFaultInjectionV1,
     GATEKEEPER_DECISIONS_JSONL, GATEKEEPER_VERSION, LEGACY_GATEKEEPER_VERSION,
-    METRIC_CONTRACT_EVIDENCE_V1_FILE, METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1,
-    METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE, METRIC_CONTRACT_SUMMARY_V34_FILE,
+    METRIC_CONTRACT_COMPLETION_PROOF_V1_FILE, METRIC_CONTRACT_EVIDENCE_V1_FILE,
+    METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1, METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE,
+    METRIC_CONTRACT_SUMMARY_V34_FILE,
 };
 use ghost_core::metric_contracts::{
-    BurnInContractV1, MetricContractAuditTerminalClassV1, MetricContractDecisionSummaryV1,
+    MetricContractAuditTerminalClassV1, MetricContractDecisionSummaryV1,
     MetricContractEvidenceTransportV1, MetricContractProjectionWireV1SchemaManifest,
     METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3,
     METRIC_CONTRACT_WIRE_V1_MAPPING_TABLE_COUNT, METRIC_CONTRACT_WIRE_V1_TUPLE_TABLE_COUNT,
@@ -111,28 +112,31 @@ fn one_pass_projection_hash_proof_matches_the_public_validated_hash_contract() {
 }
 
 #[test]
-fn burn_in_contract_v2_is_frozen_hashed_and_fail_closed() {
-    let contract: BurnInContractV1 = serde_json::from_str(include_str!(
-        "../../reports/metric_contracts/BURN_IN_CONTRACT_V2.json"
-    ))
-    .unwrap();
-    contract.validate_hash().unwrap();
-    assert_eq!(contract.payload.minimum_non_overlapping_runs, 3);
-    assert_eq!(contract.payload.burn_in_contract_version, 2);
-    assert_eq!(contract.payload.minimum_run_duration_ms, 3_600_000);
-    assert_eq!(contract.payload.minimum_utc_4h_buckets, 2);
-    assert_eq!(
-        contract.payload.owner_approval_identity,
-        "github:smahacfel:authorized-pr2c-5ms-amendment:2026-07-13"
-    );
-    assert_eq!(
-        contract.contract_canonical_hash.as_str(),
-        "3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20"
-    );
+fn prospective_burn_in_contract_v2_is_withdrawn() {
+    let core = include_str!("../../ghost-core/src/metric_contracts/pr2c.rs");
+    let audit = include_str!("../src/metric_contracts/pr2c_audit.rs");
+    assert!(!core.contains("BURN_IN_CONTRACT_V2_CANONICAL_HASH"));
+    assert!(!core.contains("BurnInContractV1"));
+    assert!(!audit.contains("audit_pr2c_bundle_against_burn_in_contract_v2"));
+    assert!(!std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../reports/metric_contracts/BURN_IN_CONTRACT_V2.json")
+        .exists());
+}
 
-    let mut value = serde_json::to_value(&contract).unwrap();
-    value["payload"]["minimum_unique_decisions"] = serde_json::json!(1);
-    assert!(serde_json::from_value::<BurnInContractV1>(value).is_err());
+#[test]
+fn canonical_hash_uses_the_reference_jcs_implementation_without_benchmark_shortcuts() {
+    let source = include_str!("../../ghost-core/src/metric_contracts/canonical_hash.rs");
+    let cargo = include_str!("../../ghost-core/Cargo.toml");
+    assert!(source.contains("serde_json_canonicalizer::to_vec(payload)"));
+    assert!(!source.contains("CanonicalJcsSerializerV1"));
+    assert!(!source.contains("ryu_js"));
+    assert!(!cargo
+        .lines()
+        .any(|line| line.trim_start().starts_with("ryu-js")));
+
+    let writer = include_str!("../../ghost-brain/src/oracle/metric_contract_writer.rs");
+    assert!(!writer.contains("TELEMETRY_FIELD_WITH_SENTINEL"));
+    assert!(!writer.contains("SENTINEL_BYTES"));
 }
 
 #[test]
@@ -215,17 +219,7 @@ async fn unrouted_terminal_v33_uses_one_logger_route_for_v33_pair_and_single_run
         metric_contract_pr2c_enabled: true,
         enabled: true,
     });
-    let routed = logger.route_gatekeeper_buy_decision(terminal.log);
-    assert_eq!(routed.plane_logs().len(), 2);
-    assert!(routed
-        .plane_logs()
-        .iter()
-        .any(|log| log.decision_plane.as_deref() == Some("legacy_live")));
-    assert!(routed
-        .plane_logs()
-        .iter()
-        .any(|log| log.decision_plane.as_deref() == Some("v25_shadow")));
-    let routed_context = routed.pr2c_legacy_live_context().unwrap();
+    let routed_context = logger.pr2c_legacy_live_context(&terminal.log).unwrap();
     assert_eq!(
         routed_context.record_identity().run_id,
         "terminal-route-run"
@@ -247,7 +241,7 @@ async fn unrouted_terminal_v33_uses_one_logger_route_for_v33_pair_and_single_run
         evaluate_policy_from_assessment(&terminal.assessment, &terminal.config);
     let comparator =
         pr2c_policy_equivalence_snapshot_v1(&terminal.assessment, Some(&comparator_decision));
-    let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_from_validated_snapshot_v1(
+    let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_v1(
         &timed,
         &ghost_launcher::metric_contracts::Pr2cDecisionRecordContextV1 {
             record_identity: routed_context.record_identity().clone(),
@@ -268,9 +262,9 @@ async fn unrouted_terminal_v33_uses_one_logger_route_for_v33_pair_and_single_run
     )
     .unwrap();
 
-    logger.log_routed_gatekeeper_buy_decision(routed).await;
+    logger.log_gatekeeper_buy_decision(terminal.log).await;
     logger.log_metric_contract_pair(pair).unwrap();
-    logger.shutdown().await;
+    logger.shutdown().await.unwrap();
 
     let legacy_v33_path = temp
         .path()
@@ -328,36 +322,33 @@ async fn unrouted_terminal_v33_uses_one_logger_route_for_v33_pair_and_single_run
     } else {
         let error = audit.unwrap_err().to_string();
         assert!(
-            error.contains("unknown, dirty, or incomplete run/build/schema/BURN provenance"),
+            error.contains("unknown, dirty, or incomplete run/build/schema provenance"),
             "dirty build provenance must fail closed with the exact provenance error: {error}"
         );
     }
 }
 
 #[test]
-fn runtime_terminal_source_routes_before_pair_build_and_reuses_the_routed_rows() {
+fn runtime_terminal_source_keeps_raw_v33_and_builds_pr2c_only_after_the_off_gate() {
     let source = include_str!("../src/oracle_runtime.rs");
     let helper_start = source
-        .find("fn route_gatekeeper_decision_and_build_pr2c_pair(")
-        .expect("runtime owns one canonical route-and-build helper");
+        .find("fn build_pr2c_pair_if_enabled(")
+        .expect("runtime owns one opt-in pair helper");
     let helper = &source[helper_start
         ..source[helper_start..]
             .find("\nfn freeze_coordination_decision_snapshot_for_runtime(")
             .map(|offset| helper_start + offset)
-            .expect("route-and-build helper has a bounded source region")];
-    let route = helper
-        .find("route_gatekeeper_buy_decision(buy_log)")
-        .expect("DecisionLogger routes the raw terminal v33");
+            .expect("pair helper has a bounded source region")];
     let disabled_gate = helper
         .find("if !ctx.decision_logger.metric_contract_pr2c_enabled()")
         .expect("PR2C OFF exits before context extraction and second compute");
     let context = helper
-        .find("pr2c_legacy_live_context()")
-        .expect("pair identity comes from the routed legacy-live row");
+        .find("pr2c_legacy_live_context(&buy_log)")
+        .expect("pair identity comes from lightweight logger-owned provenance");
     let build = helper
         .find("build_pr2c_terminal_pair(session, assessment, &routed_context")
         .expect("pair builder consumes only the typed routed context");
-    assert!(route < disabled_gate && disabled_gate < context && context < build);
+    assert!(disabled_gate < context && context < build);
 
     let spawn_start = source
         .find("fn spawn_gatekeeper_decision_logs(")
@@ -368,12 +359,17 @@ fn runtime_terminal_source_routes_before_pair_build_and_reuses_the_routed_rows()
             .map(|offset| spawn_start + offset)
             .expect("terminal logger helper has a bounded source region")];
     let v33 = spawn
-        .find("log_routed_gatekeeper_buy_decision(routed_buy_log)")
-        .expect("exact routed rows are enqueued as v33");
+        .find("log_gatekeeper_buy_decision(buy_log)")
+        .expect("the unchanged raw v33 payload is enqueued");
     let pair = spawn
         .find("log_metric_contract_pair(metric_contract_pair)")
         .expect("pair is enqueued after v33");
     assert!(v33 < pair);
+
+    let logger = include_str!("../../ghost-brain/src/oracle/decision_logger.rs");
+    assert!(logger.contains("WriteGatekeeperBuy(GatekeeperBuyLog)"));
+    assert!(logger.contains("for mut plane_log in expand_gatekeeper_plane_logs(log)"));
+    assert!(!logger.contains("struct RoutedGatekeeperDecisionV1"));
 }
 
 #[test]
@@ -512,7 +508,7 @@ async fn full_path_timer_is_continuous_across_snapshot_pair_and_writer_boundarie
     let frozen = frozen_inputs_fixture();
     let timed = frozen.build_timed_from(full_path_started);
     let policy = common::equal_policy();
-    let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_from_validated_snapshot_v1(
+    let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_v1(
         &timed,
         &ghost_launcher::metric_contracts::Pr2cDecisionRecordContextV1 {
             record_identity: ghost_core::metric_contracts::MetricEvidenceRecordIdentityV1::try_new(
@@ -773,6 +769,52 @@ async fn final_manifest_failure_is_counted_and_cannot_claim_an_immutable_run() {
 }
 
 #[tokio::test]
+async fn post_rename_directory_sync_failure_cannot_leave_a_valid_completion_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    let pair = paired_fixture("post-rename-failure-run", "post-rename-failure-join");
+    let stats = Arc::new(MetricContractPairedWriterStatsV1::default());
+    let mut config = MetricContractPairedWriterConfigV1::new(
+        temp.path().to_path_buf(),
+        "fc87f288651ebd1b5ec8eb7f6660e85f8fd294d9",
+    );
+    config.build_worktree_clean = true;
+    config.fault_injection = Some(MetricContractWriterFaultInjectionV1::FinalManifestDirectorySync);
+    let mut writer = MetricContractPairedWriterV1::open(config, Arc::clone(&stats))
+        .await
+        .unwrap();
+    writer.write_pair(pair.clone()).await.unwrap();
+    writer.finalize().await.unwrap_err();
+
+    assert!(stats.snapshot().evidence_run_invalid);
+    assert!(!temp
+        .path()
+        .join(METRIC_CONTRACT_COMPLETION_PROOF_V1_FILE)
+        .exists());
+    let manifest_path = temp.path().join(METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE);
+    let mut manifest: MetricContractRotationManifestV1 =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    // Even if the pre-sync rename left a true manifest visible and recovery
+    // also failed, the independent completion proof is absent and audit must
+    // reject the run.
+    manifest.writer_finalized = true;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let v33 = temp.path().join("gatekeeper_v2_decisions.jsonl");
+    std::fs::write(
+        &v33,
+        format!(
+            "{}\n",
+            serde_json::to_string(&common::current_v33_log(&pair)).unwrap()
+        ),
+    )
+    .unwrap();
+    assert!(audit_pr2c_single_run_v1(temp.path(), &[v33]).is_err());
+}
+
+#[tokio::test]
 async fn pr2c_disabled_preserves_exact_v33_bytes_and_opens_no_pr2c_artifacts() {
     let temp = tempfile::tempdir().unwrap();
     let pair = paired_fixture("disabled-run", "disabled-join");
@@ -795,22 +837,17 @@ async fn pr2c_disabled_preserves_exact_v33_bytes_and_opens_no_pr2c_artifacts() {
     raw.join_key = Some("disabled-join".to_string());
     raw.v25_shadow_verdict_type = Some("REJECT_LOW_TRAJECTORY".to_string());
     raw.v25_shadow_reason_chain = Some("shadow-only regression".to_string());
-    let routed = logger.route_gatekeeper_buy_decision(raw);
-    let expected_plane_logs = routed.plane_logs().to_vec();
-    logger.log_routed_gatekeeper_buy_decision(routed).await;
+    logger.log_gatekeeper_buy_decision(raw).await;
     assert_eq!(
         logger.log_metric_contract_pair(pair),
         Err(MetricContractEnqueueErrorV1::WriterDisabled)
     );
-    logger.shutdown().await;
+    logger.shutdown().await.unwrap();
 
-    for expected in expected_plane_logs {
-        let plane = expected.decision_plane.as_deref().unwrap();
-        let version = if plane == "legacy_live" {
-            LEGACY_GATEKEEPER_VERSION
-        } else {
-            GATEKEEPER_VERSION
-        };
+    for (plane, version) in [
+        ("legacy_live", LEGACY_GATEKEEPER_VERSION),
+        ("v25_shadow", GATEKEEPER_VERSION),
+    ] {
         let path = temp
             .path()
             .join("profile-a")
@@ -818,13 +855,26 @@ async fn pr2c_disabled_preserves_exact_v33_bytes_and_opens_no_pr2c_artifacts() {
             .join(plane)
             .join(common::TEST_GATEKEEPER_CONFIG_HASH)
             .join(GATEKEEPER_DECISIONS_JSONL);
-        let expected_bytes = format!("{}\n", serde_json::to_string(&expected).unwrap());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), expected_bytes);
+        let bytes = std::fs::read_to_string(path).unwrap();
+        let logged: ghost_brain::oracle::GatekeeperBuyLog =
+            serde_json::from_str(bytes.trim_end()).unwrap();
+        assert_eq!(logged.decision_plane.as_deref(), Some(plane));
+        assert_eq!(logged.run_id.as_deref(), Some("disabled-run"));
+        assert_eq!(logged.join_key.as_deref(), Some("disabled-join"));
+        assert_eq!(
+            logged.config_hash.as_deref(),
+            Some(common::TEST_GATEKEEPER_CONFIG_HASH)
+        );
+        assert_eq!(
+            logged.brain_config_hash.as_deref(),
+            Some(common::TEST_BRAIN_CONFIG_HASH)
+        );
     }
     for file_name in [
         METRIC_CONTRACT_SUMMARY_V34_FILE,
         METRIC_CONTRACT_EVIDENCE_V1_FILE,
         METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE,
+        METRIC_CONTRACT_COMPLETION_PROOF_V1_FILE,
     ] {
         assert!(!temp.path().join(file_name).exists());
     }
@@ -854,7 +904,6 @@ async fn saturated_pr2c_queue_is_non_blocking_keeps_v33_writable_and_invalidates
 
     let mut raw = current_v33_unrouted_log(&pair);
     raw.join_key = Some("saturation-join".to_string());
-    let routed = logger.route_gatekeeper_buy_decision(raw);
 
     // A current-thread runtime cannot schedule the spawned PR2C worker until
     // this task yields. The first synchronous try_send therefore fills the
@@ -869,8 +918,8 @@ async fn saturated_pr2c_queue_is_non_blocking_keeps_v33_writable_and_invalidates
 
     // v33 uses a different queue and worker, so it remains writable while the
     // PR2C branch is saturated.
-    logger.log_routed_gatekeeper_buy_decision(routed).await;
-    logger.shutdown().await;
+    logger.log_gatekeeper_buy_decision(raw).await;
+    logger.shutdown().await.unwrap();
 
     let v33_path = temp
         .path()
@@ -907,7 +956,7 @@ async fn saturated_pr2c_queue_is_non_blocking_keeps_v33_writable_and_invalidates
     } else {
         let error = audit.unwrap_err().to_string();
         assert!(
-            error.contains("unknown, dirty, or incomplete run/build/schema/BURN provenance"),
+            error.contains("unknown, dirty, or incomplete run/build/schema provenance"),
             "dirty build provenance must fail closed with the exact provenance error: {error}"
         );
     }
@@ -924,7 +973,7 @@ async fn closed_pr2c_queue_returns_typed_error_and_marks_in_memory_run_invalid()
         enabled: true,
         ..DecisionLoggerConfig::default()
     });
-    logger.shutdown().await;
+    logger.shutdown().await.unwrap();
 
     assert_eq!(
         logger.log_metric_contract_pair(paired_fixture("closed-run", "closed-join")),
@@ -966,7 +1015,7 @@ async fn logger_try_send_and_queue_high_water_are_recorded_without_drops() {
     );
     assert!(enqueued.writer_queue_high_water < (QUEUE_CAPACITY as u64 * 8 / 10));
 
-    logger.shutdown().await;
+    logger.shutdown().await.unwrap();
     for _ in 0..1_000 {
         if logger
             .metric_contract_writer_stats()
@@ -1027,15 +1076,16 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
         let full_path_started = Instant::now();
         let frozen = frozen_inputs_fixture();
         let timed = frozen.build_timed_from(full_path_started);
-        let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_from_validated_snapshot_v1(
+        let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_v1(
             &timed,
             &ghost_launcher::metric_contracts::Pr2cDecisionRecordContextV1 {
-                record_identity: ghost_core::metric_contracts::MetricEvidenceRecordIdentityV1::try_new(
-                    "resource-warmup",
-                    format!("join-{index}"),
-                    "legacy_live",
-                )
-                .unwrap(),
+                record_identity:
+                    ghost_core::metric_contracts::MetricEvidenceRecordIdentityV1::try_new(
+                        "resource-warmup",
+                        format!("join-{index}"),
+                        "legacy_live",
+                    )
+                    .unwrap(),
                 stable_event_identity: None,
                 rollout_mode: ghost_core::metric_contracts::MetricContractRolloutMode::Legacy,
                 profile: frozen.profile(),
@@ -1098,8 +1148,7 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
         let join_key = format!("join-{index}");
         let mut terminal = current_v33_unrouted_fixture(&rebuilt.snapshot().compact_projection);
         terminal.log.join_key = Some(join_key.clone());
-        let routed = logger.route_gatekeeper_buy_decision(terminal.log);
-        let routed_context = routed.pr2c_legacy_live_context().unwrap();
+        let routed_context = logger.pr2c_legacy_live_context(&terminal.log).unwrap();
         let authoritative = pr2c_policy_equivalence_snapshot_v1(
             &terminal.assessment,
             terminal.assessment.decision.as_ref(),
@@ -1113,7 +1162,7 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
         let comparator_us = u32::try_from(started.elapsed().as_micros()).unwrap();
         comparator.push(u128::from(comparator_us));
 
-        let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_from_validated_snapshot_v1(
+        let pair = ghost_launcher::metric_contracts::build_pr2c_timed_paired_record_v1(
             &rebuilt,
             &ghost_launcher::metric_contracts::Pr2cDecisionRecordContextV1 {
                 record_identity: routed_context.record_identity().clone(),
@@ -1157,7 +1206,7 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
         );
         // Exercise both production queues. Their independent workers preserve
         // routing identity without making v33 wait for PR2C fsync/manifest I/O.
-        logger.log_routed_gatekeeper_buy_decision(routed).await;
+        logger.log_gatekeeper_buy_decision(terminal.log).await;
         logger.log_metric_contract_pair(pair).unwrap();
         let expected_rows = u64::try_from(index + 1).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1175,7 +1224,7 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
         .await
         .expect("production DecisionLogger did not persist the measured pair in time");
     }
-    logger.shutdown().await;
+    logger.shutdown().await.unwrap();
     let manifest: MetricContractRotationManifestV1 = serde_json::from_slice(
         &std::fs::read(temp.path().join(METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE)).unwrap(),
     )

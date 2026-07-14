@@ -1,6 +1,6 @@
 # ADR-8D: PR2C — domknięcie blockerów durability, replay i audit
 
-Status: `AMENDED BY SECOND REVIEW / HISTORICAL IMPLEMENTATION RECORD`
+Status: `SUPERSEDED BY 2026-07-14 FINALIZATION / HISTORICAL IMPLEMENTATION RECORD`
 
 Typ: ADR-8D / review amendment / durable evidence / replay / rollout safety
 
@@ -25,6 +25,12 @@ Poziom ryzyka: `HIGH`. Zmiana dotyka terminalnego evidence recordu, paired
 writera, durable provenance, replayu oraz klasyfikacji single-run/bundle audit.
 Nie zmienia aktywnej Gatekeeper policy, authority Profile A ani rollout mode
 `Legacy`.
+
+Uwaga normatywna: wszystkie poniższe twierdzenia o latency gate,
+`BURN_IN_CONTRACT_V2` i prospective readiness są historycznym zapisem etapu
+review i zostały wycofane przez finalizację 2026-07-14. Obowiązujący stan:
+latency jest diagnostyką, BURN V2 nie ma artifactu ani audit entry pointu,
+PR2C jest domyślnie OFF i prospective burn-in nie jest autoryzowany.
 
 ## 1. Problem
 
@@ -131,7 +137,7 @@ COUNTERFACTUAL_POLICY_DELTA_OBSERVED:<lane>:<run>:<join>:<plane>
 
 Diagnostyka nie zmienia authoritative verdictu ani authority assignment.
 
-### 2.6 Bundle i BURN binding
+### 2.6 Bundle provenance (BURN binding wycofany)
 
 Każdy finalized part manifest zawiera:
 
@@ -140,7 +146,6 @@ Każdy finalized part manifest zawiera:
 - rollout mode;
 - decision/evidence/projection/Wire schema versions;
 - Wire V1 codebook BLAKE3;
-- `BURN_IN_CONTRACT_V2` version i canonical hash;
 - profile i exact effective-config provenance.
 
 Bundle wymaga unikalnych `run_id`, globalnie unikalnych pełnych record
@@ -149,13 +154,9 @@ UTC buckets pochodzą ze wszystkich poprawnie sparowanych durable cutoffów.
 Clean Flip wymaga `Available + Measured + eligible_buyer_count > 0`. Real dev
 divergence wymaga dwóch obecnych wartości; `None != Some` nie jest evidence.
 
-Każdy run musi uzyskać `PASS_CUTOVER_READY` przed agregacją minimów frozen
-contractu. Rows niepóźniejsze niż `frozen_at` są wykluczone.
-
-V2 jednoznacznie zastępuje wcześniejszy pre-run draft V1 po autoryzowanej
-zmianie limitu z 1 ms do 5 ms. Wszystkie parts jednego runu muszą dodatkowo
-mieć exact frozen provenance, a histogramy przechodzą closed codebook/count/max
-validation.
+Wszystkie parts jednego runu muszą mieć exact frozen provenance, a histogramy
+przechodzą closed codebook/count/max validation. Historyczne BURN minima i
+latency thresholds nie są egzekwowane ani autoryzowane przez finalny PR2C.
 
 ### 2.7 Durable writer i rotation
 
@@ -247,11 +248,13 @@ Koszt:
 - dodatkowe fsync przy finalizacji/part updates;
 - dirty/unknown build nie może wejść do prospective burn-in.
 
-## 8. Decyzja
+## 8. Decyzja po finalizacji 2026-07-14
 
-Przyjęto amendment. Nowe regresje, pełna macierz i finalny release resource
-harness przeszły; PR2C może wrócić do review, pozostając draftem i bez aktywacji
-DualCompute/V2.
+Zachowano durable evidence, replay, comparator i offline audit. PR2C otrzymał
+osobną bounded queue/writer, nieblokujący `try_send` i switch default `false`.
+Surowy v33 ponownie jest routowany i hydratowany wyłącznie w istniejącym
+workerze; przy OFF nie jest zatrzymywany full evidence snapshot. BURN V2 oraz
+latency acceptance zostały wycofane przed prospective rows.
 
 ```text
 METRIC_CONTRACT_WIRE_V1_CODEBOOK_MANIFEST_FROZEN
@@ -265,11 +268,13 @@ PR2C_EQUIVALENCE_COMPARATOR_ZERO_DRIFT_PASS
 PR2C_COUNTERFACTUAL_DIAGNOSTIC_PASS
 PR2C_SINGLE_RUN_AUDIT_PASS
 PR2C_BUNDLE_AUDIT_PASS
-PR2C_RESOURCE_GATES_PASS
-BURN_IN_CONTRACT_V2_FROZEN
 GATEKEEPER_POLICY_UNCHANGED
 V3_V1_REPLAY_UNCHANGED
 TYPE5_NOT_STARTED
-METRIC_CONTRACTS_V1_1_DUAL_COMPUTE_READY_FOR_PROSPECTIVE_BURN_IN
-PR2C_READY_FOR_REVIEW
+DURABLE_EVIDENCE_READY
+REPLAY_AND_COMPARATOR_READY
+RUNTIME_ISOLATION_PASS
+LEGACY_AND_LIVE_BEHAVIOR_UNCHANGED
+PROSPECTIVE_BURN_IN_NOT_AUTHORIZED
+PR3_NOT_STARTED
 ```

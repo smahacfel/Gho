@@ -124,9 +124,9 @@ pub use tx_metrics::TransactionMetrics;
 pub use decision_logger::{
     CorrectionReason, DecisionLogger, DecisionLoggerConfig, DecisionType, FollowupScore,
     GatekeeperBuyLog, GatekeeperGateTraceEntry, InitialComponents, OracleDecisionLog,
-    Pr2cRoutedDecisionContextV1, Pr2cRoutingContextErrorV1, RoutedGatekeeperDecisionV1, VetoType,
-    DEFAULT_DECISION_LOG_DIR, GATEKEEPER_BUY_LOG_SCHEMA_VERSION, GATEKEEPER_DECISIONS_JSONL,
-    GATEKEEPER_VERSION, LEGACY_GATEKEEPER_VERSION,
+    Pr2cRoutedDecisionContextV1, Pr2cRoutingContextErrorV1, VetoType, DEFAULT_DECISION_LOG_DIR,
+    GATEKEEPER_BUY_LOG_SCHEMA_VERSION, GATEKEEPER_DECISIONS_JSONL, GATEKEEPER_VERSION,
+    LEGACY_GATEKEEPER_VERSION,
 };
 pub use metric_contract_writer::*;
 

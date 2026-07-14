@@ -54,7 +54,6 @@ pub struct Pr2cFrozenInputsFixture {
     recent: RecentBuySellProducerSnapshotV1,
     profile: MetricContractProfileV1,
     effective: ResolvedMetricContractEffectiveConfigV1,
-    static_context: MetricDecisionProjectionValidatedStaticContextV1,
     source_cutoff: MetricContractDecisionSourceCutoffV1,
 }
 
@@ -66,7 +65,13 @@ pub struct CurrentV33UnroutedFixture {
 
 impl Pr2cFrozenInputsFixture {
     pub fn build_timed(&self) -> Pr2bTimedCompleteMetricContractSnapshotV1 {
-        build_pr2b_timed_complete_metric_contract_snapshot_with_validated_static_context_v1(
+        let context = Pr2bBuildContextV1 {
+            rollout_mode: MetricContractRolloutMode::Legacy,
+            profile: &self.profile,
+            effective_config: &self.effective,
+            source_cutoff: self.source_cutoff.clone(),
+        };
+        build_pr2b_timed_complete_metric_contract_snapshot_v1(
             Pr2bFrozenProducerInputsV1 {
                 pr2a: Pr2aFrozenProducerInputsV1 {
                     ftdi: &self.ftdi,
@@ -83,8 +88,7 @@ impl Pr2cFrozenInputsFixture {
                 reserve_velocity: &self.reserve,
                 recent_buy_sell: &self.recent,
             },
-            &self.static_context,
-            self.source_cutoff.clone(),
+            &context,
         )
         .unwrap()
     }
@@ -93,7 +97,13 @@ impl Pr2cFrozenInputsFixture {
         &self,
         full_path_started: std::time::Instant,
     ) -> Pr2bTimedCompleteMetricContractSnapshotV1 {
-        build_pr2b_timed_complete_metric_contract_snapshot_from_producer_start_with_validated_static_context_v1(
+        let context = Pr2bBuildContextV1 {
+            rollout_mode: MetricContractRolloutMode::Legacy,
+            profile: &self.profile,
+            effective_config: &self.effective,
+            source_cutoff: self.source_cutoff.clone(),
+        };
+        build_pr2b_timed_complete_metric_contract_snapshot_from_started_v1(
             Pr2bFrozenProducerInputsV1 {
                 pr2a: Pr2aFrozenProducerInputsV1 {
                     ftdi: &self.ftdi,
@@ -110,8 +120,7 @@ impl Pr2cFrozenInputsFixture {
                 reserve_velocity: &self.reserve,
                 recent_buy_sell: &self.recent,
             },
-            &self.static_context,
-            self.source_cutoff.clone(),
+            &context,
             full_path_started,
         )
         .unwrap()
@@ -265,12 +274,6 @@ pub fn frozen_inputs_fixture() -> Pr2cFrozenInputsFixture {
     )
     .unwrap();
     let profile = MetricContractProfileV1::profile_a().unwrap();
-    let static_context = MetricDecisionProjectionValidatedStaticContextV1::try_new(
-        MetricContractRolloutMode::Legacy,
-        profile.clone(),
-        effective.clone(),
-    )
-    .unwrap();
     let source_cutoff = MetricContractDecisionSourceCutoffV1::try_new(10_000, Some(100)).unwrap();
     let candidate = EnhancedCandidate {
         timestamp: 1_000,
@@ -338,7 +341,6 @@ pub fn frozen_inputs_fixture() -> Pr2cFrozenInputsFixture {
         recent,
         profile,
         effective,
-        static_context,
         source_cutoff,
     }
 }
@@ -594,7 +596,7 @@ pub fn paired_fixture_with_degraded_flip(
 
     // This fixture models a durable, semantically valid degraded producer
     // result. It must remain evaluable for replay, but it is not a clean Flip
-    // sample for BURN minima.
+    // sample for offline audit aggregation.
     pair.evidence
         .payload
         .contracts

@@ -258,47 +258,6 @@ fn projection_context<'a>(
     }
 }
 
-#[test]
-fn validated_static_projection_context_binds_exact_immutable_inputs() {
-    let profile = MetricContractProfileV1::profile_a().unwrap();
-    let config = effective_config();
-    assert!(matches!(
-        MetricDecisionProjectionValidatedStaticContextV1::try_new(
-            MetricContractRolloutMode::DualCompute,
-            profile.clone(),
-            config.clone(),
-        ),
-        Err(MetricContractProjectionErrorV1::ProjectionContextMismatch)
-    ));
-
-    let static_context = MetricDecisionProjectionValidatedStaticContextV1::try_new(
-        MetricContractRolloutMode::Legacy,
-        profile,
-        config,
-    )
-    .unwrap();
-    let bound_context =
-        projection_context(static_context.profile(), static_context.effective_config());
-    assert!(
-        MetricDecisionProjectionValidatedContextV1::try_new_with_static_context(
-            &bound_context,
-            &static_context,
-        )
-        .is_ok()
-    );
-
-    let cloned_profile = static_context.profile().clone();
-    let cloned_config = static_context.effective_config().clone();
-    let substituted_context = projection_context(&cloned_profile, &cloned_config);
-    assert!(matches!(
-        MetricDecisionProjectionValidatedContextV1::try_new_with_static_context(
-            &substituted_context,
-            &static_context,
-        ),
-        Err(MetricContractProjectionErrorV1::ProjectionContextMismatch)
-    ));
-}
-
 fn measured(surface: MetricSurfaceId) -> CanonicalMetricEnvelopeV1 {
     let profile = MetricContractProfileV1::profile_a().unwrap();
     let assignment = profile.entry_for(surface).unwrap();

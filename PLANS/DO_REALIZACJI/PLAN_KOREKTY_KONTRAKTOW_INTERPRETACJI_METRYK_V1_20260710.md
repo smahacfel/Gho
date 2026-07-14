@@ -566,18 +566,16 @@ wyłącznie jawnie nazwanymi diagnostykami i nie wpływają na PASS. Kompresja n
 jest częścią gate'u.
 
 ```text
-metric_contract_projection_build_and_validate_us p99 <= 5_000 us
 metric_contract_projection_serialized_bytes p95 <= 12 KiB
 metric_contract_projection_serialized_bytes hard max <= 16 KiB
 projection build failures = 0
 projection/full-snapshot parity failures = 0
 ```
 
-Limit `5_000 us` jest wartością obowiązującą po autoryzowanym amendmencie PR2C
-z 2026-07-13 i zastępuje historyczny draft `1_000 us`; w tym planie nie
-obowiązuje równoległy limit 1 ms dla tej samej metryki. Build/validation time
-wchodzi także do istniejącego
-`metric_contract_build_and_serialize_us`; limity nie sumują osobnych budżetów.
+`metric_contract_projection_build_and_validate_us` pozostaje raportowaną
+diagnostyką p50/p95/p99/max. Nie jest merge gate'em PR2C ani aktywnym gate'em
+prospective burn-in. Historyczne wartości `1_000 us` oraz `5_000 us` zostały
+wycofane przed zebraniem jakiegokolwiek prospective row.
 Przekroczenie hard max lub utrata detail przez próbę zmieszczenia pełnego
 sidecara daje `FAIL_RESOURCE_BUDGET`, nie silent truncation. Wyjątkiem są tylko
 reason codes z jawnym `omitted_count`.
@@ -887,50 +885,42 @@ Wszystkie rotowane parts mają row/byte counts i SHA-256 w manifeście. Replay v
 łączy sidecar po identity/hash. Replay v1 pozostaje zgodny ze starym payloadem.
 
 Każdy part jednego runu musi mieć dokładnie jedno frozen provenance (build/clean
-bit, config hashes, rollout, schemas, Wire manifest, BURN binding, profile i
-effective config). Histogramy resource są integralną częścią manifestu:
+bit, config hashes, rollout, schemas, Wire manifest, profile i effective
+config). Histogramy resource są integralną częścią manifestu:
 obowiązuje frozen bucket codebook, suma bucketów równa `sample_count`, liczba
 próbek równa liczbie zaakceptowanych paired commands oraz spójne `max_us` i
 overflow semantics.
 
-### 4.2 Resource acceptance
+### 4.2 Resource acceptance — amendment finalizacyjny PR2C (2026-07-14)
 
-**Autoryzowany amendment PR2C (2026-07-13; supersedes §2.6.5).** Pierwotny limit 1 ms dla
-pełnego build+serialize oraz kompletnej projection build/validation okazał się
-nieadekwatny do jawnie mierzonej ścieżki obejmującej wszystkich producentów,
-pełne evidence, semantic validation, canonical hash i finalne bajty. Limit nie
-może być spełniany przez przesunięcie początku timera za producer boundary.
-Zamrożony gate wynosi 5 ms p99 dla tych dwóch pełnych zakresów. Jeden monotonic
-timer zaczyna się bezpośrednio przed pierwszym canonical producer call, jest
-przenoszony przez frozen snapshot, rzeczywistą drugą ewaluację comparatora i
-terminal pair construction, a kończy się dopiero po utworzeniu dokładnych
-finalnych bajtów v34 oraz evidence przez writera. Nie sumuje niezależnych
-timerów i nie pomija przerw między boundary. Comparator i bounded enqueue
-zachowują ostrzejszy limit 1 ms p99. Amendment nie zmienia schema, policy,
-authority ani rollout mode.
+PR2C jest domyślnie OFF, działa wyłącznie w świadomie włączonych shadow evidence
+runs i używa osobnej bounded queue oraz osobnego writer tasku. Enqueue jest
+nieblokującym `try_send`; pełna kolejka lub awaria invaliduje evidence run, ale
+nie blokuje Gatekeepera ani istniejącego v33 writera.
 
-Wcześniejszy payload nazwany `BURN_IN_CONTRACT_V1`, zawierający draft limitu
-1 ms, nigdy nie stał się kontraktem obowiązującym dla prospective runu. Zmiana
-gate'u jest mimo tego wersjonowana fail-closed: obowiązujący artifact to
-`BURN_IN_CONTRACT_V2`, ma nowy `frozen_at` i canonical hash, a żaden run związany
-z V1 nie kwalifikuje się do V2.
+Historyczne limity latency `1 ms` oraz `5 ms`, a także
+`BURN_IN_CONTRACT_V2`, zostały wycofane przed zebraniem jakiegokolwiek
+prospective row. Nie istnieje aktywny BURN contract ani entry point auditowy,
+który mógłby autoryzować prospective burn-in. Latency całej durable ścieżki
+jest raportowana wyłącznie diagnostycznie jako p50/p95/p99/max i nie jest
+warunkiem merge.
 
 ```text
-comparator_elapsed_us p99 <= 1_000 us
-metric_contract_build_and_serialize_us p99 <= 5_000 us
-metric_contract_projection_build_and_validate_us p99 <= 5_000 us
-logger_enqueue_wait_us p99 <= 1_000 us
+existing v33 queue/path unchanged
+PR2C enqueue is non-blocking
+PR2C queue cannot block Gatekeeper or v33
 writer_queue_high_water < 80% capacity
 dropped rows = 0
+send failures = 0
 writer failures = 0
 orphan summaries/evidence = 0
+truncated rows = 0
 ```
 
-`metric_contract_serialize_us` pozostaje trwałą diagnostyką podetapu v34.
-Nie ma osobnego, nakładającego się progu acceptance: exact final serialization
-jest już objęta jednym ciągłym
-`metric_contract_build_and_serialize_us <= 5_000 us` od pierwszego canonical
-producer call do finalnych bajtów.
+`metric_contract_build_and_serialize_us`,
+`metric_contract_projection_build_and_validate_us`, `comparator_elapsed_us`,
+`logger_enqueue_wait_us` oraz `metric_contract_serialize_us` pozostają durable
+diagnostykami bez aktywnego latency threshold.
 
 Rozmiar:
 
@@ -1068,8 +1058,8 @@ candidate, no live reads, no unbounded state, no saturating order concealment.
 - single-run i bundle audit CLI;
 - manifests/rotation/SHA/resource telemetry;
 - historical feasibility po istnieniu referencyjnych V2 producerów;
-- zamrożenie `BURN_IN_CONTRACT_V2` przed prospektywnymi runami; V1 pozostaje
-  wyłącznie superseded pre-run draftem.
+- brak autoryzacji prospective burn-in; ewentualny przyszły contract wymaga
+  osobnej decyzji właściciela po merge.
 
 Comparator używa tego samego frozen MFS/config. Nie czyta live state, nie trzyma
 locka przez await, nie emituje drugiego terminal eventu, nie uruchamia IWIM ani
@@ -1078,12 +1068,15 @@ execution i nie zmienia authority.
 Acceptance:
 
 ```text
-METRIC_CONTRACTS_V1_1_DUAL_COMPUTE_READY_FOR_PROSPECTIVE_BURN_IN
+DURABLE_EVIDENCE_READY
+REPLAY_AND_COMPARATOR_READY
+PROSPECTIVE_BURN_IN_NOT_AUTHORIZED
 ```
 
-### 5.6 Burn-in bundle
+### 5.6 Przyszły burn-in bundle — poza autoryzacją PR2C
 
-Burn-in startuje dopiero po zamrożeniu contractu. Niezmienna struktura:
+Poniższa struktura jest wymaganiem dla przyszłej, odrębnie autoryzowanej fazy.
+PR2C nie zamraża aktywnego contractu i nie upoważnia do rozpoczęcia burn-inu:
 
 - co najmniej 3 immutable, niepokrywające się runy;
 - każdy run minimum 1 h;
@@ -1150,8 +1143,8 @@ Procedura:
 
 1. Historical dataset otrzymuje `FEASIBILITY_ONLY` i manifest SHA.
 2. Audit generuje exact minima oraz uzasadnienie.
-3. Właściciel planu jawnie zatwierdza bieżącą wersję `BURN_IN_CONTRACT`; dla
-   niniejszego gate'u jest to `BURN_IN_CONTRACT_V2`.
+3. Właściciel planu jawnie zatwierdza nową wersję `BURN_IN_CONTRACT`; PR2C nie
+   ustanawia takiej aktywnej wersji.
 4. Contract otrzymuje version/hash/`frozen_at`.
 5. Do bundle kwalifikują się tylko decyzje po `frozen_at`.
 6. Feasibility rows nigdy nie zwiększają validation counts.

@@ -70,6 +70,13 @@ jobs:
           cargo test -p ghost-launcher --test metric_contracts_pr2c_comparator
           cargo test -p ghost-launcher --test metric_contracts_pr2c_audit
 
+      - name: PR2C opt-in routing shutdown and logger integration gates
+        run: |
+          cargo test -p ghost-brain --lib metric_contract_pr2c_switch_is_backward_compatible_and_opt_in
+          cargo test -p ghost-launcher --lib pr2c_durable_evidence_is_opt_in_and_shadow_only
+          cargo test -p ghost-brain --lib shutdown_timeout_is_bounded_and_invalidates_pr2c_run
+          cargo test -p ghost-brain --test oracle_decision_logger_integration
+
       - name: Frozen Gatekeeper and lifecycle regressions
         run: |
           cargo test -p ghost-launcher --test gatekeeper_policy_tests
