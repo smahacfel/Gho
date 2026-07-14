@@ -1,6 +1,6 @@
 # ADR-8D: PR2C — domknięcie blockerów durability, replay i audit
 
-Status: `AMENDED BY SECOND AND THIRD REVIEW / HISTORICAL IMPLEMENTATION RECORD`
+Status: `AMENDED BY SECOND REVIEW / HISTORICAL IMPLEMENTATION RECORD`
 
 Typ: ADR-8D / review amendment / durable evidence / replay / rollout safety
 
@@ -20,9 +20,6 @@ Raport dowodowy:
 
 Nowszy amendment:
 `docs/ADR/ADR_8D_PR2C_SECOND_REVIEW_DURABLE_EQUIVALENCE_RESOURCE_INTEGRITY_20260713.md`
-
-Bieżący amendment:
-`docs/ADR/ADR_8D_PR2C_RUNTIME_ROUTING_PRODUCTION_RESOURCE_P99_20260713.md`
 
 Poziom ryzyka: `HIGH`. Zmiana dotyka terminalnego evidence recordu, paired
 writera, durable provenance, replayu oraz klasyfikacji single-run/bundle audit.
@@ -252,11 +249,9 @@ Koszt:
 
 ## 8. Decyzja
 
-Ten historyczny amendment zamknął pierwszą serię blockerów, lecz jego markery
-readiness zostały później wycofane przez kolejne review. Bieżący stan i
-obowiązujący `BURN_IN_CONTRACT_V3` opisuje trzeci amendment; poniższy blok jest
-zachowany wyłącznie jako historyczny zapis decyzji V2 i nie stanowi aktualnego
-prospective-burn-in acceptance.
+Przyjęto amendment. Nowe regresje, pełna macierz i finalny release resource
+harness przeszły; PR2C może wrócić do review, pozostając draftem i bez aktywacji
+DualCompute/V2.
 
 ```text
 METRIC_CONTRACT_WIRE_V1_CODEBOOK_MANIFEST_FROZEN

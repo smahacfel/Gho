@@ -91,9 +91,22 @@ fn metric_contract_pr2c_keeps_v33_and_v3_v1_frozen_while_adding_separate_v34_str
 
     let decision_logger = include_str!("../../ghost-brain/src/oracle/decision_logger.rs");
     assert!(decision_logger.contains("pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 33;"));
+    let v33_commands = decision_logger
+        .split("enum LogCommand {")
+        .nth(1)
+        .and_then(|rest| rest.split("enum MetricContractLogCommand {").next())
+        .expect("DecisionLogger must retain a dedicated v33 command enum");
     assert!(
-        decision_logger.contains("WriteMetricContractPair(MetricContractPairedRecordV1)"),
-        "PR2C must route v34 and evidence as one additive logical command"
+        !v33_commands.contains("MetricContractPairedRecordV1"),
+        "the established v33 queue must not carry PR2C durable writes"
+    );
+    assert!(
+        decision_logger.contains("WritePair(MetricContractPairedRecordV1)"),
+        "the isolated PR2C queue must route v34 and evidence as one logical command"
+    );
+    assert!(
+        decision_logger.contains("tx.try_send(MetricContractLogCommand::WritePair(pair))"),
+        "PR2C enqueue must be non-blocking"
     );
     let writer = include_str!("../../ghost-brain/src/oracle/metric_contract_writer.rs");
     assert!(writer.contains("metric_contract_decisions_v34.jsonl"));

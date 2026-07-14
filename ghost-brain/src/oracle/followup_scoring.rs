@@ -573,6 +573,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 100,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
 
@@ -607,6 +608,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 100,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
 

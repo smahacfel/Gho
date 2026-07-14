@@ -177,7 +177,7 @@ fn runtime_comparator_is_a_real_pure_policy_evaluation_without_live_or_execution
 }
 
 #[test]
-fn terminal_snapshot_lock_scope_ends_before_async_queue_and_filesystem_work() {
+fn terminal_snapshot_lock_scope_ends_before_nonblocking_isolated_queue_work() {
     let source = include_str!("../src/oracle_runtime.rs");
     let start = source.find("fn build_pr2c_terminal_pair(").unwrap();
     let end = source[start..]
@@ -192,9 +192,7 @@ fn terminal_snapshot_lock_scope_ends_before_async_queue_and_filesystem_work() {
     assert!(boundary.contains("snapshot.compact_projection"));
 
     let logger = include_str!("../../ghost-brain/src/oracle/decision_logger.rs");
-    let start = logger
-        .find("pub async fn log_metric_contract_pair(")
-        .unwrap();
+    let start = logger.find("pub fn log_metric_contract_pair(").unwrap();
     let end = logger[start..]
         .find("pub fn metric_contract_writer_stats")
         .map(|offset| start + offset)
@@ -202,6 +200,16 @@ fn terminal_snapshot_lock_scope_ends_before_async_queue_and_filesystem_work() {
     let enqueue = &logger[start..end];
     assert!(!enqueue.contains("session.read"));
     assert!(!enqueue.contains("parking_lot"));
+    assert!(enqueue.contains("try_send"));
+    assert!(!enqueue.contains("reserve().await"));
+    assert!(!enqueue.contains(".send("));
+
+    let command_start = logger.find("enum LogCommand {").unwrap();
+    let command_end = logger[command_start..]
+        .find("enum MetricContractLogCommand {")
+        .map(|offset| command_start + offset)
+        .unwrap();
+    assert!(!logger[command_start..command_end].contains("MetricContractPair"));
 }
 
 #[test]

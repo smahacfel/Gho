@@ -82,7 +82,7 @@ fn main() {
             });
             let contract: ghost_core::metric_contracts::BurnInContractV1 =
                 serde_json::from_slice(&contract_bytes).unwrap_or_else(|error| {
-                    eprintln!("invalid BURN_IN_CONTRACT_V3: {error}");
+                    eprintln!("invalid BURN_IN_CONTRACT_V2: {error}");
                     std::process::exit(3);
                 });
             audit_pr2c_bundle_against_burn_in_contract_v2(&runs, &contract).and_then(|report| {

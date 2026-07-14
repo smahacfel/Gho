@@ -43,6 +43,7 @@ async fn main() {
         brain_config_path: None,
         brain_config_hash: None,
         channel_buffer_size: 1000,
+        metric_contract_pr2c_enabled: false,
         enabled: true,
     };
     let logger = Arc::new(DecisionLogger::new(logger_config));

@@ -73,6 +73,12 @@ pub struct GhostBrainConfig {
     #[serde(default)]
     pub metric_contract_profile: MetricContractProfileIdV1,
 
+    /// Enables the isolated PR2C durable-evidence branch for dedicated
+    /// shadow evidence runs. The launcher additionally refuses to activate
+    /// this branch outside `ExecutionMode::Shadow`.
+    #[serde(default)]
+    pub metric_contract_pr2c_enabled: bool,
+
     /// Engine configuration (cycle timing, etc.)
     #[serde(default)]
     pub engine: EngineConfig,
@@ -4792,6 +4798,7 @@ impl Default for GhostBrainConfig {
             version: 1,
             metric_contract_rollout_mode: MetricContractRolloutMode::Legacy,
             metric_contract_profile: MetricContractProfileIdV1::MetricContractsV1_1ProfileA,
+            metric_contract_pr2c_enabled: false,
             engine: EngineConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
             gatekeeper_v2: None,
@@ -5640,6 +5647,7 @@ mod tests {
             config.metric_contract_profile,
             MetricContractProfileIdV1::MetricContractsV1_1ProfileA
         );
+        assert!(!config.metric_contract_pr2c_enabled);
         assert_eq!(
             config.shadow_v2_burnin.post_run_manifest_drain_timeout_ms,
             DEFAULT_SHADOW_V2_POST_RUN_MANIFEST_DRAIN_TIMEOUT_MS
@@ -5677,6 +5685,24 @@ mod tests {
             .canonical_hash()
             .unwrap();
         assert_eq!(first_hash, second_hash);
+    }
+
+    #[test]
+    fn metric_contract_pr2c_switch_is_backward_compatible_and_opt_in() {
+        let checked_in_config = include_str!("../../ghost_brain_config.toml");
+        let legacy: GhostBrainConfig = toml::from_str(checked_in_config).unwrap();
+        assert!(!legacy.metric_contract_pr2c_enabled);
+
+        let mut enabled_toml: toml::Value = toml::from_str(checked_in_config).unwrap();
+        enabled_toml
+            .as_table_mut()
+            .expect("Ghost Brain config root must be a TOML table")
+            .insert(
+                "metric_contract_pr2c_enabled".to_string(),
+                toml::Value::Boolean(true),
+            );
+        let enabled: GhostBrainConfig = enabled_toml.try_into().unwrap();
+        assert!(enabled.metric_contract_pr2c_enabled);
     }
 
     #[test]

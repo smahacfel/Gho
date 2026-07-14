@@ -40,7 +40,7 @@ use super::metric_contract_writer::{
     MetricContractPairedWriterConfigV1, MetricContractPairedWriterStatsSnapshotV1,
     MetricContractPairedWriterStatsV1, MetricContractPairedWriterV1,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use ghost_core::features::coordination::CoordinationRiskEvidenceUnit;
 use ghost_core::health::RuntimeHealth;
 use ghost_core::metric_contracts::{
@@ -65,63 +65,6 @@ const DEDUP_MAX_CAPACITY: usize = 100_000;
 /// theoretically possible for pool IDs that reappear after a restart) would
 /// pass through rather than be silently dropped forever.
 const DEDUP_TTL: Duration = Duration::from_secs(20 * 60);
-/// DecisionLogger has a fixed, small set of routed Gatekeeper JSONL sinks per
-/// process (legacy/v25 planes times decision/buy/selector files). Keeping those
-/// handles open removes repeated open/close work from the bounded writer queue
-/// without changing v33 bytes or flush-after-row visibility. The FIFO cap
-/// keeps unexpected routing cardinality bounded and fail-safe.
-const GATEKEEPER_JSONL_FILE_CACHE_CAPACITY: usize = 16;
-
-struct GatekeeperJsonlFileCacheV1 {
-    files: HashMap<PathBuf, tokio::fs::File>,
-    insertion_order: VecDeque<PathBuf>,
-}
-
-impl GatekeeperJsonlFileCacheV1 {
-    fn new() -> Self {
-        Self {
-            files: HashMap::with_capacity(GATEKEEPER_JSONL_FILE_CACHE_CAPACITY),
-            insertion_order: VecDeque::with_capacity(GATEKEEPER_JSONL_FILE_CACHE_CAPACITY),
-        }
-    }
-
-    async fn append_json_line(&mut self, path: &Path, json: &str) -> Result<()> {
-        if !self.files.contains_key(path) {
-            if self.files.len() >= GATEKEEPER_JSONL_FILE_CACHE_CAPACITY {
-                while let Some(evicted_path) = self.insertion_order.pop_front() {
-                    if self.files.remove(&evicted_path).is_some() {
-                        break;
-                    }
-                }
-            }
-            if let Some(parent) = path.parent() {
-                create_dir_all(parent)
-                    .await
-                    .with_context(|| format!("failed to create JSONL parent {parent:?}"))?;
-            }
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .await
-                .with_context(|| format!("failed to open JSONL sink {path:?}"))?;
-            let owned_path = path.to_path_buf();
-            self.files.insert(owned_path.clone(), file);
-            self.insertion_order.push_back(owned_path);
-        }
-
-        let mut line = Vec::with_capacity(json.len().saturating_add(1));
-        line.extend_from_slice(json.as_bytes());
-        line.push(b'\n');
-        let file = self
-            .files
-            .get_mut(path)
-            .ok_or_else(|| anyhow!("JSONL sink cache lost an inserted path: {path:?}"))?;
-        file.write_all(&line).await?;
-        file.flush().await?;
-        Ok(())
-    }
-}
 
 /// Default directory for decision logs
 pub const DEFAULT_DECISION_LOG_DIR: &str = "datasets/decisions";
@@ -2837,6 +2780,9 @@ pub struct DecisionLoggerConfig {
     pub brain_config_hash: Option<String>,
     /// Channel buffer size
     pub channel_buffer_size: usize,
+    /// Enable the isolated PR2C queue and paired writer. This is deliberately
+    /// independent from the existing v33 logger queue and defaults to false.
+    pub metric_contract_pr2c_enabled: bool,
     /// Enable logging
     pub enabled: bool,
 }
@@ -2985,6 +2931,7 @@ impl Default for DecisionLoggerConfig {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 1000,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         }
     }
@@ -2993,6 +2940,7 @@ impl Default for DecisionLoggerConfig {
 /// Async decision logger for Oracle Brain
 pub struct DecisionLogger {
     tx: mpsc::Sender<LogCommand>,
+    metric_contract_tx: Option<mpsc::Sender<MetricContractLogCommand>>,
     metric_contract_stats: Arc<MetricContractPairedWriterStatsV1>,
     routing: DecisionLoggerRoutingContextV1,
     enabled: bool,
@@ -3002,8 +2950,12 @@ enum LogCommand {
     Write(OracleDecisionLog),
     WriteCyclic(CyclicEngineLog),
     WriteGatekeeperBuy(RoutedGatekeeperDecisionV1),
-    WriteMetricContractPair(MetricContractPairedRecordV1),
     WriteCoordinationRiskEvidence(CoordinationRiskEvidenceUnit),
+    Shutdown(oneshot::Sender<()>),
+}
+
+enum MetricContractLogCommand {
+    WritePair(MetricContractPairedRecordV1),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -3011,8 +2963,83 @@ enum LogCommand {
 pub enum MetricContractEnqueueErrorV1 {
     #[error("metric-contract paired writer is disabled")]
     WriterDisabled,
+    #[error("metric-contract paired writer queue is full")]
+    QueueFull,
     #[error("metric-contract paired writer queue is closed")]
     ChannelClosed,
+}
+
+async fn run_metric_contract_writer_task(
+    config: DecisionLoggerConfig,
+    mut rx: mpsc::Receiver<MetricContractLogCommand>,
+    writer_stats: Arc<MetricContractPairedWriterStatsV1>,
+) {
+    let mut writer: Option<MetricContractPairedWriterV1> = None;
+    let mut writer_disabled = false;
+    let mut shutdown_ack = None;
+
+    info!(
+        directory = ?config.gatekeeper_log_dir,
+        queue_capacity = config.channel_buffer_size,
+        "DecisionLogger: isolated PR2C paired writer started"
+    );
+
+    while let Some(command) = rx.recv().await {
+        match command {
+            MetricContractLogCommand::WritePair(pair) => {
+                if writer_disabled {
+                    writer_stats.record_disabled();
+                    continue;
+                }
+                if writer.is_none() {
+                    let mut writer_config = MetricContractPairedWriterConfigV1::new(
+                        config.gatekeeper_log_dir.clone(),
+                        option_env!("GIT_COMMIT").unwrap_or("unknown_build_commit"),
+                    );
+                    writer_config.build_worktree_clean =
+                        option_env!("GIT_WORKTREE_CLEAN") == Some("true");
+                    writer_config.queue_capacity = config.channel_buffer_size;
+                    match MetricContractPairedWriterV1::open(
+                        writer_config,
+                        Arc::clone(&writer_stats),
+                    )
+                    .await
+                    {
+                        Ok(opened) => writer = Some(opened),
+                        Err(error) => {
+                            writer_disabled = true;
+                            writer_stats.record_disabled();
+                            error!(
+                                "DecisionLogger: isolated PR2C writer initialization failed: {error}"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                if let Some(writer) = writer.as_mut() {
+                    if let Err(error) = writer.write_pair(pair).await {
+                        writer_disabled = true;
+                        writer_stats.record_writer_disabled_event();
+                        error!("DecisionLogger: isolated PR2C pair write failed: {error}");
+                    }
+                }
+            }
+            MetricContractLogCommand::Shutdown(ack) => {
+                shutdown_ack = Some(ack);
+                break;
+            }
+        }
+    }
+
+    if let Some(writer) = writer.as_mut() {
+        if let Err(error) = writer.finalize().await {
+            writer_stats.record_writer_disabled_event();
+            error!("DecisionLogger: final isolated PR2C manifest flush failed: {error}");
+        }
+    }
+    if let Some(ack) = shutdown_ack {
+        let _ = ack.send(());
+    }
 }
 
 impl DecisionLogger {
@@ -3037,6 +3064,7 @@ impl DecisionLogger {
             info!("DecisionLogger: disabled by configuration");
             return Self {
                 tx,
+                metric_contract_tx: None,
                 metric_contract_stats: Arc::new(MetricContractPairedWriterStatsV1::default()),
                 routing,
                 enabled: false,
@@ -3044,13 +3072,25 @@ impl DecisionLogger {
         }
 
         let metric_contract_stats = Arc::new(MetricContractPairedWriterStatsV1::default());
-        let writer_stats = Arc::clone(&metric_contract_stats);
+        let metric_contract_tx = if config.metric_contract_pr2c_enabled {
+            let (metric_contract_tx, metric_contract_rx) =
+                mpsc::channel::<MetricContractLogCommand>(config.channel_buffer_size);
+            tokio::spawn(run_metric_contract_writer_task(
+                config.clone(),
+                metric_contract_rx,
+                Arc::clone(&metric_contract_stats),
+            ));
+            Some(metric_contract_tx)
+        } else {
+            info!("DecisionLogger: isolated PR2C durable writer disabled");
+            None
+        };
 
-        // Spawn async writer task
+        // Existing v33/legacy writer task. PR2C is intentionally absent from
+        // this command type and task so its filesystem latency cannot cause
+        // head-of-line blocking for established decision logs.
         tokio::spawn(async move {
             let mut logging_disabled_due_to_enospc = false;
-            let mut metric_contract_writer: Option<MetricContractPairedWriterV1> = None;
-            let mut metric_contract_writer_disabled = false;
             if let Err(e) = create_dir_all(&config.log_dir).await {
                 if is_no_space_error(std::iter::once(&e as &(dyn std::error::Error + 'static))) {
                     logging_disabled_due_to_enospc = true;
@@ -3085,7 +3125,6 @@ impl DecisionLogger {
             // ── A/B dedup guard: TTL+size-bounded cache ──────────────────────
             let mut dedup_map: HashMap<String, ()> = HashMap::new();
             let mut dedup_queue: VecDeque<(Instant, String)> = VecDeque::new();
-            let mut gatekeeper_jsonl_files = GatekeeperJsonlFileCacheV1::new();
             let mut shutdown_ack = None;
 
             while let Some(cmd) = rx.recv().await {
@@ -3182,12 +3221,9 @@ impl DecisionLogger {
                             }
 
                             let buy_eligible = plane_log.decision_verdict_buy == Some(true);
-                            if let Err(e) = write_gatekeeper_buy_log(
-                                &mut gatekeeper_jsonl_files,
-                                &config.gatekeeper_log_dir,
-                                &plane_log,
-                            )
-                            .await
+                            if let Err(e) =
+                                write_gatekeeper_buy_log(&config.gatekeeper_log_dir, &plane_log)
+                                    .await
                             {
                                 if is_no_space_error(e.chain()) {
                                     logging_disabled_due_to_enospc = true;
@@ -3211,7 +3247,6 @@ impl DecisionLogger {
                             } else {
                                 mark_gatekeeper_log_progress(health.as_ref(), buy_eligible);
                                 if let Err(e) = write_selector_shadow_score_sidecar(
-                                    &mut gatekeeper_jsonl_files,
                                     &config.gatekeeper_log_dir,
                                     &plane_log,
                                 )
@@ -3239,52 +3274,6 @@ impl DecisionLogger {
                                         e
                                     );
                                 }
-                            }
-                        }
-                    }
-                    LogCommand::WriteMetricContractPair(pair) => {
-                        if logging_disabled_due_to_enospc || metric_contract_writer_disabled {
-                            writer_stats.record_disabled();
-                            continue;
-                        }
-                        if metric_contract_writer.is_none() {
-                            let mut writer_config = MetricContractPairedWriterConfigV1::new(
-                                config.gatekeeper_log_dir.clone(),
-                                option_env!("GIT_COMMIT").unwrap_or("unknown_build_commit"),
-                            );
-                            writer_config.build_worktree_clean =
-                                option_env!("GIT_WORKTREE_CLEAN") == Some("true");
-                            writer_config.queue_capacity = config.channel_buffer_size;
-                            match MetricContractPairedWriterV1::open(
-                                writer_config,
-                                Arc::clone(&writer_stats),
-                            )
-                            .await
-                            {
-                                Ok(writer) => metric_contract_writer = Some(writer),
-                                Err(error) => {
-                                    metric_contract_writer_disabled = true;
-                                    if is_no_space_error(error.chain()) {
-                                        logging_disabled_due_to_enospc = true;
-                                    }
-                                    writer_stats.record_disabled();
-                                    error!(
-                                        "DecisionLogger: failed to initialize paired metric-contract writer: {error}"
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                        if let Some(writer) = metric_contract_writer.as_mut() {
-                            if let Err(error) = writer.write_pair(pair).await {
-                                metric_contract_writer_disabled = true;
-                                writer_stats.record_writer_disabled_event();
-                                if is_no_space_error(error.chain()) {
-                                    logging_disabled_due_to_enospc = true;
-                                }
-                                error!(
-                                    "DecisionLogger: paired metric-contract write failed: {error}"
-                                );
                             }
                         }
                     }
@@ -3318,11 +3307,6 @@ impl DecisionLogger {
                     }
                 }
             }
-            if let Some(writer) = metric_contract_writer.as_mut() {
-                if let Err(error) = writer.finalize().await {
-                    error!("DecisionLogger: final metric-contract manifest flush failed: {error}");
-                }
-            }
             if let Some(ack) = shutdown_ack {
                 let _ = ack.send(());
             }
@@ -3330,6 +3314,7 @@ impl DecisionLogger {
 
         Self {
             tx,
+            metric_contract_tx,
             metric_contract_stats,
             routing,
             enabled: true,
@@ -3416,32 +3401,46 @@ impl DecisionLogger {
         }
     }
 
-    /// Enqueue the compact v34 summary and its full evidence sidecar as one
-    /// bounded logical command. The writer exposes partial filesystem writes
-    /// through separate orphan/failure counters; it never claims two-file
-    /// filesystem atomicity.
-    pub async fn log_metric_contract_pair(
+    /// Try to enqueue the compact v34 summary and full evidence sidecar on the
+    /// isolated PR2C queue. This call never waits for queue capacity and can
+    /// therefore never transfer PR2C backpressure to Gatekeeper or v33.
+    pub fn log_metric_contract_pair(
         &self,
         pair: MetricContractPairedRecordV1,
     ) -> std::result::Result<(), MetricContractEnqueueErrorV1> {
-        if !self.enabled {
-            self.metric_contract_stats.record_disabled();
+        if !self.enabled || self.metric_contract_tx.is_none() {
             return Err(MetricContractEnqueueErrorV1::WriterDisabled);
         }
+        let Some(tx) = self.metric_contract_tx.as_ref() else {
+            return Err(MetricContractEnqueueErrorV1::WriterDisabled);
+        };
         let started = Instant::now();
-        let permit = self.tx.reserve().await.map_err(|_| {
-            self.metric_contract_stats.record_send_failure();
-            MetricContractEnqueueErrorV1::ChannelClosed
-        })?;
-        let queue_depth = self.tx.max_capacity().saturating_sub(self.tx.capacity());
+        match tx.try_send(MetricContractLogCommand::WritePair(pair)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metric_contract_stats.record_queue_full();
+                ::metrics::counter!("metric_contract_pr2c_queue_full_total", 1);
+                return Err(MetricContractEnqueueErrorV1::QueueFull);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metric_contract_stats.record_queue_closed();
+                ::metrics::counter!("metric_contract_pr2c_queue_closed_total", 1);
+                return Err(MetricContractEnqueueErrorV1::ChannelClosed);
+            }
+        }
+        let queue_depth = tx.max_capacity().saturating_sub(tx.capacity());
         self.metric_contract_stats.record_queue_depth(queue_depth);
-        permit.send(LogCommand::WriteMetricContractPair(pair));
         let enqueue_wait_us = u64::try_from(started.elapsed().as_micros())
-            .expect("a process-local queue wait cannot span u64::MAX microseconds");
+            .expect("a process-local try_send cannot span u64::MAX microseconds");
         self.metric_contract_stats
             .record_enqueue_wait_us(enqueue_wait_us);
         ::metrics::histogram!("logger_enqueue_wait_us", enqueue_wait_us as f64);
         Ok(())
+    }
+
+    #[must_use]
+    pub fn metric_contract_pr2c_enabled(&self) -> bool {
+        self.enabled && self.metric_contract_tx.is_some()
     }
 
     #[must_use]
@@ -3468,10 +3467,24 @@ impl DecisionLogger {
 
     /// Shutdown the logger gracefully
     pub async fn shutdown(&self) {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        if self.tx.send(LogCommand::Shutdown(ack_tx)).await.is_ok() {
-            // The writer sends this acknowledgement only after paired-stream
-            // finalization, manifest sync and directory sync have completed.
+        let (v33_ack_tx, v33_ack_rx) = oneshot::channel();
+        let v33_shutdown_sent = self.tx.send(LogCommand::Shutdown(v33_ack_tx)).await.is_ok();
+
+        let metric_contract_shutdown = if let Some(tx) = self.metric_contract_tx.as_ref() {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            tx.send(MetricContractLogCommand::Shutdown(ack_tx))
+                .await
+                .ok()
+                .map(|_| ack_rx)
+        } else {
+            None
+        };
+
+        if v33_shutdown_sent {
+            let _ = v33_ack_rx.await;
+        }
+        if let Some(ack_rx) = metric_contract_shutdown {
+            // The isolated writer acknowledges only after manifest/data sync.
             let _ = ack_rx.await;
         }
     }
@@ -4494,16 +4507,28 @@ async fn write_coordination_risk_evidence_unit(
 /// `GatekeeperBuyLog` so replay payloads, verdicts, and execution eligibility
 /// remain unchanged.
 async fn write_selector_shadow_score_sidecar(
-    files: &mut GatekeeperJsonlFileCacheV1,
     base_dir: &Path,
     log: &GatekeeperBuyLog,
 ) -> Result<()> {
     let routed_dir = gatekeeper_route_dir(base_dir, log);
+    create_dir_all(&routed_dir)
+        .await
+        .context("Failed to create selector shadow-score sidecar directory")?;
+
     let path = routed_dir.join(SELECTOR_SHADOW_SCORE_JSONL);
     let sidecar = build_selector_shadow_score_sidecar(log);
     let json =
         serde_json::to_string(&sidecar).context("Failed to serialize selector shadow-score")?;
-    files.append_json_line(&path, &json).await?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+        .context("Failed to open selector shadow-score sidecar file")?;
+    file.write_all(json.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    file.flush().await?;
 
     debug!(
         "Selector shadow-score sidecar written for {} to {:?}",
@@ -4520,12 +4545,13 @@ async fn write_selector_shadow_score_sidecar(
 /// Inside that routed directory, every decision is ALWAYS appended to
 /// `gatekeeper_v2_decisions.jsonl`. Decisions where `decision_verdict_buy ==
 /// Some(true)` are ADDITIONALLY appended to `gatekeeper_v2_buys.jsonl`.
-async fn write_gatekeeper_buy_log(
-    files: &mut GatekeeperJsonlFileCacheV1,
-    base_dir: &Path,
-    log: &GatekeeperBuyLog,
-) -> Result<()> {
+async fn write_gatekeeper_buy_log(base_dir: &Path, log: &GatekeeperBuyLog) -> Result<()> {
     let routed_dir = gatekeeper_route_dir(base_dir, log);
+
+    // Create log directory if it doesn't exist
+    create_dir_all(&routed_dir)
+        .await
+        .context("Failed to create gatekeeper buy log directory")?;
 
     // INVARIANT: verdict_type must always be present in every JSONL record.
     // Runtime terminal assessments now carry decision metadata for BUY/REJECT/TIMEOUT,
@@ -4577,13 +4603,31 @@ async fn write_gatekeeper_buy_log(
 
     // 1. ALWAYS write to decisions file (all verdicts)
     let decisions_path = routed_dir.join(GATEKEEPER_DECISIONS_JSONL);
-    files.append_json_line(&decisions_path, &json).await?;
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&decisions_path)
+            .await
+            .context("Failed to open gatekeeper decisions log file")?;
+        file.write_all(json.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+        file.flush().await?;
+    }
 
     // 2. ADDITIONALLY write to passed/buys file only if verdict is BUY
     let is_passed = log.decision_verdict_buy == Some(true);
     if is_passed {
         let passed_path = routed_dir.join(GATEKEEPER_PASSED_JSONL);
-        files.append_json_line(&passed_path, &json).await?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&passed_path)
+            .await
+            .context("Failed to open gatekeeper passed log file")?;
+        file.write_all(json.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+        file.flush().await?;
     }
 
     debug!(
@@ -4713,6 +4757,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
 
@@ -5359,6 +5404,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -6424,6 +6470,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         }
     }
@@ -6885,6 +6932,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -6956,6 +7004,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -7108,6 +7157,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -7216,6 +7266,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -7387,6 +7438,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -7447,6 +7499,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -7525,6 +7578,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);
@@ -7610,6 +7664,7 @@ mod tests {
             brain_config_path: None,
             brain_config_hash: None,
             channel_buffer_size: 10,
+            metric_contract_pr2c_enabled: false,
             enabled: true,
         };
         let logger = DecisionLogger::new(config);

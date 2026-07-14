@@ -1965,6 +1965,9 @@ async fn main() -> Result<()> {
         Some(Arc::new(metric_contract_effective_config));
     oracle_runtime_config.metric_contract_funding_source_producer_config =
         Some(Arc::new(metric_contract_funding_source_producer_config));
+    oracle_runtime_config.metric_contract_pr2c_enabled = ghost_brain_config
+        .as_ref()
+        .is_some_and(|brain| brain.metric_contract_pr2c_enabled);
     oracle_runtime_config.p37_shadow_probe = config.p37_shadow_probe.clone();
     oracle_runtime_config.selector = config.selector.clone();
     oracle_runtime_config.run_id = (!config.p37_shadow_probe.run_id.trim().is_empty())

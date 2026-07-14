@@ -1,6 +1,6 @@
 # ADR-8D: PR2C durable metric-contract evidence, replay v2 i audit
 
-Status: `AMENDED / IMPLEMENTED / THIRD REVIEW VALIDATION IN PROGRESS`
+Status: `AMENDED / IMPLEMENTED / PASS / READY FOR RE-REVIEW`
 
 Typ: ADR-8D / durability, replay, comparator, audit i rollout safety
 
@@ -26,9 +26,6 @@ Amendment po blocking review:
 
 Amendment po drugim review:
 `docs/ADR/ADR_8D_PR2C_SECOND_REVIEW_DURABLE_EQUIVALENCE_RESOURCE_INTEGRITY_20260713.md`
-
-Amendment po trzecim review:
-`docs/ADR/ADR_8D_PR2C_RUNTIME_ROUTING_PRODUCTION_RESOURCE_P99_20260713.md`
 
 Poziom ryzyka: `HIGH`. Zmiana przecina terminalną materializację, DecisionLogger,
 durable JSONL, replay i narzędzia audytowe. Ryzyko wpływu na decyzje jest
@@ -123,13 +120,6 @@ bounded kolejki DecisionLogger. Zapis dwóch plików nie jest nazywany
 filesystem-atomic. Writer utrzymuje osobne liczniki commandów, obu rows,
 summary/evidence failures, disable, send failure, drop, orphan, missing pair,
 enqueue wait i queue high-water.
-
-Surowy `GatekeeperAssessment::to_buy_log()` pozostaje niezależny od file
-routingu. `DecisionLogger` wykonuje plane expansion i provenance hydration raz
-przed pair builderem, zwraca typed legacy-live context oraz zachowuje exact
-routed rows do późniejszego v33 enqueue. Pair nie odczytuje `run_id`, plane ani
-config hashes z niezhydratowanego raw v33. Kolejność jednej bounded kolejki
-pozostaje exact: routed v33, następnie paired v34/evidence command.
 
 ENOSPC wyłącza writer fail-closed. Evidence failure po summary tworzy jawny
 `orphan_summary`; odwrócona fault-injection regression dowodzi również
@@ -245,27 +235,24 @@ minima frozen burn-in contractu. `brain_config_hash` jest frozen w obrębie
 jednego runu, lecz provenance-only pomiędzy runami. Każdy raport zawiera typed
 `cutover_scope = metric_contracts_v1_1_profile_a_equivalence_only`.
 
-## 10. BURN_IN_CONTRACT_V3
+## 10. BURN_IN_CONTRACT_V2
 
 Machine-readable frozen contract:
-`reports/metric_contracts/BURN_IN_CONTRACT_V3.json`
+`reports/metric_contracts/BURN_IN_CONTRACT_V2.json`
 
 Canonical hash:
 
 ```text
-fe363f6730ac8ce554b79f0044de90eba1d9583e4e701ccf84071c0d3e352e57
+3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20
 ```
 
 Contract utrwala minimum 3 niepokrywających się runów, 1 h per run, dwa UTC
 4-hour buckets, 8 h aggregate, 700 decisions, 100 dev-known, 100 clean Flip V2
 evaluable i 30 real dev legacy/V2 divergences oraz wszystkie resource limits.
-Po autoryzowanym resource amendment limit został podniesiony z 1 ms do 5 ms w
-V2. Trzecie review wykazało, że V2 histogram nie miał finite bucketu przy 5 ms
-i używał overflow `max_us` jako percentyla. Przed jakimkolwiek prospective
-runem codebook został rozszerzony i kontrakt zamrożony jako
-`burn_in_contract_version=3`, `latency_histogram_codebook_version=2` oraz
-`frozen_at=2026-07-13T21:30:25Z`. V1 i V2 są wyłącznie superseded pre-run
-artifacts i nie mogą identyfikować prospective row V3.
+Po autoryzowanym resource amendment contract został ponownie zamrożony przed
+jakimkolwiek prospective runem z `burn_in_contract_version=2` i
+`frozen_at=2026-07-13T17:53:14Z`. Wcześniejszy V1 z limitem 1 ms był wyłącznie
+pre-run draftem i nie może identyfikować żadnego prospective row.
 Każdy run manifest jest związany z exact version/hash kontraktu. Rows z
 durable cutoffem niepóźniejszym niż `frozen_at` nie wchodzą do prospective
 counts. Zmiana gate’u wymaga nowej wersji/hash/frozen_at i nowych rows.
@@ -291,23 +278,27 @@ sprawdza jednocześnie:
 - sidecar p95 `<= 24 KiB`, p99 `<= 48 KiB`;
 - combined byte-rate delta `<= 25%` względem paired v33.
 
-`metric_contract_build_and_serialize_us` obejmuje teraz producer input set,
-rzeczywisty comparator, bounded admission, scheduler delay, poprzedzający
-command v33 wraz z jego I/O oraz exact finalne writer bytes v34/evidence.
-Writer nie rehashuje drugi raz semantic evidence przy przypisaniu
-timestamp/part index. Release harness używa tego samego `DecisionLogger` i
-kolejności v33 → pair co runtime; pomiar pochodzi z finalized manifestu, nie z
-bezpośredniego wywołania writera ani sztucznej próbki enqueue.
+`metric_contract_build_and_serialize_us` obejmuje teraz producer input set aż
+do exact finalnych writer bytes. Writer nie rehashuje drugi raz semantic
+evidence przy przypisaniu timestamp/part index. Release measurements oraz
+dokładne komendy są utrwalone w raporcie weryfikacyjnym, nie jako surowe
+benchmark logs.
 
 Autoryzowany amendment resource gate z 2026-07-13 zachowuje pełny zakres
 timera i podnosi dwa nieadekwatne limity 1 ms do 5 ms. Standalone
 `metric_contract_serialize_us` pozostaje diagnostyką podetapu; jego koszt jest
-już objęty ciągłym full-path gate. Wynik `3 545 us` z poprzedniego amendmentu
-pochodził z direct-writer harnessu i nie jest używany jako dowód acceptance
-V3. Aktualny wynik zostanie wpisany po czystym release runie korzystającym z
-realnego `DecisionLogger`, bounded queue, v33-before-pair ordering i finalized
-manifestu. BURN contract został ponownie zamrożony przed prospective runami z
-nowym codebookiem i canonical hash.
+już objęty ciągłym full-path gate. Release
+harness na production-equivalent path zmierzył:
+
+- full build+serialize: p50/p95/p99/max `3 545 / 3 545 / 3 545 / 3 545 us`;
+- complete snapshot: p50/p95/p99 `1 558 / 1 963 / 2 267 us`;
+- projection build/validate/hash: p50/p95/p99 `476 / 669 / 733 us`;
+- final serialization diagnostic: p50/p95/p99 `43 / 67 / 79 us`;
+- comparator: p50/p95/p99 `5 / 8 / 21 us`;
+
+Rozmiary: Wire V1 p95/max `2 339 B`, sidecar p95/p99 `22 180 B`, v34 p95
+`1 176 B`. BURN contract został ponownie zamrożony przed prospective runami z
+nowym canonical hash.
 
 ## 12. Zakres wyłączony
 
@@ -337,10 +328,9 @@ Koszt:
 
 ## 14. Decyzja końcowa
 
-Trzeci amendment jest zaimplementowany. Markery pełnej gotowości pozostają
-wycofane do czasu przejścia czystego terminalnego E2E, produkcyjnego release
-harnessu i pełnej macierzy. Prospective burn-in nie został rozpoczęty; bieżący
-rollout pozostaje `Legacy`.
+PR2C wraz z amendmentem review przechodzi pełną walidację i jest gotowy do
+ponownego review. Prospective burn-in może rozpocząć się dopiero po akceptacji
+i merge PR; bieżący rollout pozostaje `Legacy`.
 
 ```text
 METRIC_CONTRACT_WIRE_V1_CODEBOOK_MANIFEST_FROZEN
@@ -355,9 +345,10 @@ PR2C_COUNTERFACTUAL_DIAGNOSTIC_PASS
 PR2C_SINGLE_RUN_AUDIT_PASS
 PR2C_BUNDLE_AUDIT_PASS
 PR2C_RESOURCE_GATES_PASS
-BURN_IN_CONTRACT_V3_VALIDATION_PENDING
+BURN_IN_CONTRACT_V2_FROZEN
 GATEKEEPER_POLICY_UNCHANGED
 V3_V1_REPLAY_UNCHANGED
 TYPE5_NOT_STARTED
-PR2C_THIRD_REVIEW_VALIDATION_PENDING
+METRIC_CONTRACTS_V1_1_DUAL_COMPUTE_READY_FOR_PROSPECTIVE_BURN_IN
+PR2C_READY_FOR_REVIEW
 ```

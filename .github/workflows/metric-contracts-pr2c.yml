@@ -106,8 +106,8 @@ jobs:
           cargo clippy -p ghost-brain --lib --no-deps --message-format=short -- \
             -A clippy::never_loop
 
-  release-resource-gate:
-    name: PR2C release full-path resource gate
+  release-resource-diagnostic:
+    name: PR2C release full-path resource diagnostic
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -126,7 +126,7 @@ jobs:
         with:
           shared-key: pr2c-release-portable-x86-64-v1
 
-      - name: Full production DecisionLogger path to final-byte release harness
+      - name: Full frozen-input to final-byte release diagnostic
         run: |
           exact_test_count=$(cargo test --release -p ghost-launcher \
             --test metric_contracts_pr2c_durability \

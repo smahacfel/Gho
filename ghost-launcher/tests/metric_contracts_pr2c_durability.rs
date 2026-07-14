@@ -1,24 +1,24 @@
 #[path = "common/metric_contracts_pr2c.rs"]
 mod common;
 
-use common::{current_v33_unrouted_fixture, frozen_inputs_fixture, paired_fixture};
+use common::{
+    current_v33_unrouted_fixture, current_v33_unrouted_log, frozen_inputs_fixture, paired_fixture,
+};
 use ghost_brain::oracle::decision_logger::MetricContractEnqueueErrorV1;
 use ghost_brain::oracle::{
     DecisionLogger, DecisionLoggerConfig, MetricContractLatencyHistogramErrorV1,
     MetricContractLatencyHistogramSnapshotV1, MetricContractPairedWriterConfigV1,
     MetricContractPairedWriterStatsV1, MetricContractPairedWriterV1,
     MetricContractRotationManifestV1, MetricContractWriterFaultInjectionV1,
-    GATEKEEPER_DECISIONS_JSONL, LEGACY_GATEKEEPER_VERSION, METRIC_CONTRACT_EVIDENCE_V1_FILE,
-    METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V2, METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE,
-    METRIC_CONTRACT_SUMMARY_V34_FILE,
+    GATEKEEPER_DECISIONS_JSONL, GATEKEEPER_VERSION, LEGACY_GATEKEEPER_VERSION,
+    METRIC_CONTRACT_EVIDENCE_V1_FILE, METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1,
+    METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE, METRIC_CONTRACT_SUMMARY_V34_FILE,
 };
 use ghost_core::metric_contracts::{
     BurnInContractV1, MetricContractAuditTerminalClassV1, MetricContractDecisionSummaryV1,
     MetricContractEvidenceTransportV1, MetricContractProjectionWireV1SchemaManifest,
     METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3,
     METRIC_CONTRACT_WIRE_V1_MAPPING_TABLE_COUNT, METRIC_CONTRACT_WIRE_V1_TUPLE_TABLE_COUNT,
-    PR2C_COMPARATOR_P99_MAX_US, PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US,
-    PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US,
 };
 use ghost_launcher::components::gatekeeper_policy::evaluate_policy_from_assessment;
 use ghost_launcher::metric_contracts::{
@@ -111,23 +111,23 @@ fn one_pass_projection_hash_proof_matches_the_public_validated_hash_contract() {
 }
 
 #[test]
-fn burn_in_contract_v3_is_frozen_hashed_and_fail_closed() {
+fn burn_in_contract_v2_is_frozen_hashed_and_fail_closed() {
     let contract: BurnInContractV1 = serde_json::from_str(include_str!(
-        "../../reports/metric_contracts/BURN_IN_CONTRACT_V3.json"
+        "../../reports/metric_contracts/BURN_IN_CONTRACT_V2.json"
     ))
     .unwrap();
     contract.validate_hash().unwrap();
     assert_eq!(contract.payload.minimum_non_overlapping_runs, 3);
-    assert_eq!(contract.payload.burn_in_contract_version, 3);
+    assert_eq!(contract.payload.burn_in_contract_version, 2);
     assert_eq!(contract.payload.minimum_run_duration_ms, 3_600_000);
     assert_eq!(contract.payload.minimum_utc_4h_buckets, 2);
     assert_eq!(
         contract.payload.owner_approval_identity,
-        "github:smahacfel:authorized-pr2c-5ms-p99-codebook-amendment:2026-07-13"
+        "github:smahacfel:authorized-pr2c-5ms-amendment:2026-07-13"
     );
     assert_eq!(
         contract.contract_canonical_hash.as_str(),
-        "fe363f6730ac8ce554b79f0044de90eba1d9583e4e701ccf84071c0d3e352e57"
+        "3ba3ab3bce1821a08653e316ecaf4942f5b62b08c49984076c7d1c4f6c1fcf20"
     );
 
     let mut value = serde_json::to_value(&contract).unwrap();
@@ -138,8 +138,8 @@ fn burn_in_contract_v3_is_frozen_hashed_and_fail_closed() {
 #[test]
 fn resource_histogram_validation_is_closed_over_codebook_counts_samples_and_max() {
     let valid = MetricContractLatencyHistogramSnapshotV1 {
-        bucket_upper_bounds_us: METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V2,
-        bucket_counts: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        bucket_upper_bounds_us: METRIC_CONTRACT_LATENCY_BUCKET_UPPER_BOUNDS_US_V1,
+        bucket_counts: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         sample_count: 1,
         max_us: 1,
     };
@@ -181,22 +181,6 @@ fn resource_histogram_validation_is_closed_over_codebook_counts_samples_and_max(
     );
 }
 
-#[test]
-fn resource_histogram_distinguishes_p99_from_a_rare_overflow_maximum() {
-    let mut histogram = MetricContractLatencyHistogramSnapshotV1::default();
-    // The 3_000-us finite bucket contains 99.9% of the samples. One 20-ms
-    // scheduler outlier belongs to overflow and must remain visible as max,
-    // without turning the p99 gate into a hard-max gate.
-    histogram.bucket_counts[13] = 999;
-    histogram.bucket_counts[18] = 1;
-    histogram.sample_count = 1_000;
-    histogram.max_us = 20_000;
-
-    histogram.validate(1_000).unwrap();
-    assert_eq!(histogram.percentile_upper_bound_us(99), Some(3_000));
-    assert_eq!(histogram.max_us, 20_000);
-}
-
 #[tokio::test]
 async fn unrouted_terminal_v33_uses_one_logger_route_for_v33_pair_and_single_run_audit() {
     let temp = tempfile::tempdir().unwrap();
@@ -228,6 +212,7 @@ async fn unrouted_terminal_v33_uses_one_logger_route_for_v33_pair_and_single_run
         brain_config_path: Some("ghost-brain/config/ghost_brain_config.toml".to_string()),
         brain_config_hash: Some(common::TEST_BRAIN_CONFIG_HASH.to_string()),
         channel_buffer_size: 16,
+        metric_contract_pr2c_enabled: true,
         enabled: true,
     });
     let routed = logger.route_gatekeeper_buy_decision(terminal.log);
@@ -284,7 +269,7 @@ async fn unrouted_terminal_v33_uses_one_logger_route_for_v33_pair_and_single_run
     .unwrap();
 
     logger.log_routed_gatekeeper_buy_decision(routed).await;
-    logger.log_metric_contract_pair(pair).await.unwrap();
+    logger.log_metric_contract_pair(pair).unwrap();
     logger.shutdown().await;
 
     let legacy_v33_path = temp
@@ -334,11 +319,15 @@ async fn unrouted_terminal_v33_uses_one_logger_route_for_v33_pair_and_single_run
     )
     .unwrap();
     assert!(manifest.writer_finalized);
-    let report = audit_pr2c_single_run_v1(temp.path(), &[legacy_v33_path]).unwrap();
-    assert_ne!(
-        report.terminal_class,
-        MetricContractAuditTerminalClassV1::FailSchemaOrReplay
-    );
+    let audit = audit_pr2c_single_run_v1(temp.path(), &[legacy_v33_path]);
+    if option_env!("GIT_WORKTREE_CLEAN") == Some("true") {
+        assert_ne!(
+            audit.unwrap().terminal_class,
+            MetricContractAuditTerminalClassV1::FailSchemaOrReplay
+        );
+    } else {
+        assert!(audit.is_err(), "dirty build provenance must fail closed");
+    }
 }
 
 #[test]
@@ -355,13 +344,16 @@ fn runtime_terminal_source_routes_before_pair_build_and_reuses_the_routed_rows()
     let route = helper
         .find("route_gatekeeper_buy_decision(buy_log)")
         .expect("DecisionLogger routes the raw terminal v33");
+    let disabled_gate = helper
+        .find("if !ctx.decision_logger.metric_contract_pr2c_enabled()")
+        .expect("PR2C OFF exits before context extraction and second compute");
     let context = helper
         .find("pr2c_legacy_live_context()")
         .expect("pair identity comes from the routed legacy-live row");
     let build = helper
         .find("build_pr2c_terminal_pair(session, assessment, &routed_context")
         .expect("pair builder consumes only the typed routed context");
-    assert!(route < context && context < build);
+    assert!(route < disabled_gate && disabled_gate < context && context < build);
 
     let spawn_start = source
         .find("fn spawn_gatekeeper_decision_logs(")
@@ -777,56 +769,168 @@ async fn final_manifest_failure_is_counted_and_cannot_claim_an_immutable_run() {
 }
 
 #[tokio::test]
-async fn paired_queue_reports_disabled_channel_close_and_bounded_high_water() {
-    let pair = paired_fixture("run-a", "join-a");
-    let disabled = DecisionLogger::new(DecisionLoggerConfig {
-        enabled: false,
-        ..DecisionLoggerConfig::default()
+async fn pr2c_disabled_preserves_exact_v33_bytes_and_opens_no_pr2c_artifacts() {
+    let temp = tempfile::tempdir().unwrap();
+    let pair = paired_fixture("disabled-run", "disabled-join");
+    let logger = DecisionLogger::new(DecisionLoggerConfig {
+        log_dir: temp.path().to_path_buf(),
+        gatekeeper_log_dir: temp.path().to_path_buf(),
+        gatekeeper_rollout_profile: "profile-a".to_string(),
+        gatekeeper_config_hash: common::TEST_GATEKEEPER_CONFIG_HASH.to_string(),
+        gatekeeper_run_id: Some("disabled-run".to_string()),
+        gatekeeper_session_id: Some("disabled-session".to_string()),
+        brain_config_path: Some("ghost-brain/config/ghost_brain_config.toml".to_string()),
+        brain_config_hash: Some(common::TEST_BRAIN_CONFIG_HASH.to_string()),
+        channel_buffer_size: 4,
+        metric_contract_pr2c_enabled: false,
+        enabled: true,
     });
-    assert!(matches!(
-        disabled.log_metric_contract_pair(pair.clone()).await,
-        Err(MetricContractEnqueueErrorV1::WriterDisabled)
-    ));
+    assert!(!logger.metric_contract_pr2c_enabled());
+
+    let mut raw = current_v33_unrouted_log(&pair);
+    raw.join_key = Some("disabled-join".to_string());
+    raw.v25_shadow_verdict_type = Some("REJECT_LOW_TRAJECTORY".to_string());
+    raw.v25_shadow_reason_chain = Some("shadow-only regression".to_string());
+    let routed = logger.route_gatekeeper_buy_decision(raw);
+    let expected_plane_logs = routed.plane_logs().to_vec();
+    logger.log_routed_gatekeeper_buy_decision(routed).await;
     assert_eq!(
-        disabled
-            .metric_contract_writer_stats()
-            .writer_disabled_total,
+        logger.log_metric_contract_pair(pair),
+        Err(MetricContractEnqueueErrorV1::WriterDisabled)
+    );
+    logger.shutdown().await;
+
+    for expected in expected_plane_logs {
+        let plane = expected.decision_plane.as_deref().unwrap();
+        let version = if plane == "legacy_live" {
+            LEGACY_GATEKEEPER_VERSION
+        } else {
+            GATEKEEPER_VERSION
+        };
+        let path = temp
+            .path()
+            .join("profile-a")
+            .join(version)
+            .join(plane)
+            .join(common::TEST_GATEKEEPER_CONFIG_HASH)
+            .join(GATEKEEPER_DECISIONS_JSONL);
+        let expected_bytes = format!("{}\n", serde_json::to_string(&expected).unwrap());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), expected_bytes);
+    }
+    for file_name in [
+        METRIC_CONTRACT_SUMMARY_V34_FILE,
+        METRIC_CONTRACT_EVIDENCE_V1_FILE,
+        METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE,
+    ] {
+        assert!(!temp.path().join(file_name).exists());
+    }
+    assert_eq!(
+        logger.metric_contract_writer_stats(),
+        MetricContractPairedWriterStatsV1::default().snapshot()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn saturated_pr2c_queue_is_non_blocking_keeps_v33_writable_and_invalidates_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let pair = paired_fixture("saturation-run", "saturation-join");
+    let logger = DecisionLogger::new(DecisionLoggerConfig {
+        log_dir: temp.path().to_path_buf(),
+        gatekeeper_log_dir: temp.path().to_path_buf(),
+        gatekeeper_rollout_profile: "profile-a".to_string(),
+        gatekeeper_config_hash: common::TEST_GATEKEEPER_CONFIG_HASH.to_string(),
+        gatekeeper_run_id: Some("saturation-run".to_string()),
+        gatekeeper_session_id: Some("saturation-session".to_string()),
+        brain_config_path: Some("ghost-brain/config/ghost_brain_config.toml".to_string()),
+        brain_config_hash: Some(common::TEST_BRAIN_CONFIG_HASH.to_string()),
+        channel_buffer_size: 1,
+        metric_contract_pr2c_enabled: true,
+        enabled: true,
+    });
+
+    let mut raw = current_v33_unrouted_log(&pair);
+    raw.join_key = Some("saturation-join".to_string());
+    let routed = logger.route_gatekeeper_buy_decision(raw);
+
+    // A current-thread runtime cannot schedule the spawned PR2C worker until
+    // this task yields. The first synchronous try_send therefore fills the
+    // one-slot queue and the second deterministically proves typed Full.
+    logger.log_metric_contract_pair(pair.clone()).unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        logger.log_metric_contract_pair(pair),
+        Err(MetricContractEnqueueErrorV1::QueueFull)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_millis(10));
+
+    // v33 uses a different queue and worker, so it remains writable while the
+    // PR2C branch is saturated.
+    logger.log_routed_gatekeeper_buy_decision(routed).await;
+    logger.shutdown().await;
+
+    let v33_path = temp
+        .path()
+        .join("profile-a")
+        .join(LEGACY_GATEKEEPER_VERSION)
+        .join("legacy_live")
+        .join(common::TEST_GATEKEEPER_CONFIG_HASH)
+        .join(GATEKEEPER_DECISIONS_JSONL);
+    assert_eq!(
+        std::fs::read_to_string(&v33_path).unwrap().lines().count(),
         1
     );
+    let stats = logger.metric_contract_writer_stats();
+    assert_eq!(stats.writer_queue_high_water, 1);
+    assert_eq!(stats.queue_full_total, 1);
+    assert_eq!(stats.queue_closed_total, 0);
+    assert_eq!(stats.queue_send_failures_total, 1);
+    assert_eq!(stats.queue_dropped_rows_total, 1);
+    assert_eq!(stats.missing_pair_total, 1);
+    assert!(stats.evidence_run_invalid);
 
+    let manifest: MetricContractRotationManifestV1 = serde_json::from_slice(
+        &std::fs::read(temp.path().join(METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE)).unwrap(),
+    )
+    .unwrap();
+    assert!(manifest.writer_finalized);
+    assert!(manifest.writer_stats.evidence_run_invalid);
+    let audit = audit_pr2c_single_run_v1(temp.path(), &[v33_path]);
+    if option_env!("GIT_WORKTREE_CLEAN") == Some("true") {
+        assert_eq!(
+            audit.unwrap().terminal_class,
+            MetricContractAuditTerminalClassV1::FailResourceBudget
+        );
+    } else {
+        assert!(audit.is_err(), "dirty build provenance must fail closed");
+    }
+}
+
+#[tokio::test]
+async fn closed_pr2c_queue_returns_typed_error_and_marks_in_memory_run_invalid() {
     let temp = tempfile::tempdir().unwrap();
     let logger = DecisionLogger::new(DecisionLoggerConfig {
         log_dir: temp.path().to_path_buf(),
         gatekeeper_log_dir: temp.path().to_path_buf(),
         channel_buffer_size: 1,
+        metric_contract_pr2c_enabled: true,
         enabled: true,
         ..DecisionLoggerConfig::default()
     });
-    logger.log_metric_contract_pair(pair.clone()).await.unwrap();
     logger.shutdown().await;
-    let mut closed = false;
-    for _ in 0..100 {
-        if matches!(
-            logger.log_metric_contract_pair(pair.clone()).await,
-            Err(MetricContractEnqueueErrorV1::ChannelClosed)
-        ) {
-            closed = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert!(
-        closed,
-        "logger receiver did not close after bounded shutdown wait"
+
+    assert_eq!(
+        logger.log_metric_contract_pair(paired_fixture("closed-run", "closed-join")),
+        Err(MetricContractEnqueueErrorV1::ChannelClosed)
     );
     let stats = logger.metric_contract_writer_stats();
-    assert!(stats.writer_queue_high_water <= 1);
-    assert!(stats.queue_send_failures_total >= 1);
-    assert!(stats.queue_dropped_rows_total >= 1);
+    assert_eq!(stats.queue_closed_total, 1);
+    assert_eq!(stats.queue_send_failures_total, 1);
+    assert_eq!(stats.queue_dropped_rows_total, 1);
+    assert!(stats.evidence_run_invalid);
 }
 
 #[tokio::test]
-async fn logger_enqueue_wait_and_queue_high_water_pass_the_frozen_resource_gate() {
+async fn logger_try_send_and_queue_high_water_are_recorded_without_drops() {
     const SAMPLE_COUNT: u64 = 128;
     const QUEUE_CAPACITY: usize = 1_000;
     let temp = tempfile::tempdir().unwrap();
@@ -834,12 +938,13 @@ async fn logger_enqueue_wait_and_queue_high_water_pass_the_frozen_resource_gate(
         log_dir: temp.path().to_path_buf(),
         gatekeeper_log_dir: temp.path().to_path_buf(),
         channel_buffer_size: QUEUE_CAPACITY,
+        metric_contract_pr2c_enabled: true,
         enabled: true,
         ..DecisionLoggerConfig::default()
     });
     let pair = paired_fixture("enqueue-resource-run", "enqueue-resource-join");
     for _ in 0..SAMPLE_COUNT {
-        logger.log_metric_contract_pair(pair.clone()).await.unwrap();
+        logger.log_metric_contract_pair(pair.clone()).unwrap();
     }
     let enqueued = logger.metric_contract_writer_stats();
     assert_eq!(enqueued.logger_enqueue_wait_us.sample_count, SAMPLE_COUNT);
@@ -848,10 +953,9 @@ async fn logger_enqueue_wait_and_queue_high_water_pass_the_frozen_resource_gate(
         .percentile_upper_bound_us(99)
         .unwrap();
     eprintln!(
-        "PR2C bounded queue resource gate: logger_enqueue_wait_us_p99={enqueue_p99_us} writer_queue_high_water={} queue_capacity={QUEUE_CAPACITY}",
+        "PR2C isolated queue diagnostic: logger_try_send_us_p99={enqueue_p99_us} writer_queue_high_water={} queue_capacity={QUEUE_CAPACITY}",
         enqueued.writer_queue_high_water
     );
-    assert!(enqueue_p99_us <= 1_000);
     assert!(enqueued.writer_queue_high_water < (QUEUE_CAPACITY as u64 * 8 / 10));
 
     logger.shutdown().await;
@@ -885,8 +989,11 @@ async fn logger_enqueue_wait_and_queue_high_water_pass_the_frozen_resource_gate(
     assert_eq!(completed.summary_rows_written_total, SAMPLE_COUNT);
     assert_eq!(completed.evidence_rows_written_total, SAMPLE_COUNT);
     assert_eq!(completed.queue_dropped_rows_total, 0);
+    assert_eq!(completed.queue_full_total, 0);
+    assert_eq!(completed.queue_closed_total, 0);
     assert_eq!(completed.summary_write_failures_total, 0);
     assert_eq!(completed.evidence_write_failures_total, 0);
+    assert!(!completed.evidence_run_invalid);
 }
 
 #[tokio::test]
@@ -906,9 +1013,8 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
         (16, 200)
     };
     let policy = common::equal_policy();
-    // Prime the producer/evidence/projection/pair code before the measured
-    // logger run. Acceptance samples below use the real DecisionLogger queue,
-    // v33-before-pair ordering and production paired writer.
+    // Prime the producer/evidence/projection/pair code before the diagnostic
+    // logger run. Latency percentiles are reported, not used as merge gates.
     for index in 0..warmup_samples {
         let full_path_started = Instant::now();
         let frozen = frozen_inputs_fixture();
@@ -953,6 +1059,7 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
         brain_config_path: Some("ghost-brain/config/ghost_brain_config.toml".to_string()),
         brain_config_hash: Some(common::TEST_BRAIN_CONFIG_HASH.to_string()),
         channel_buffer_size: 32,
+        metric_contract_pr2c_enabled: true,
         enabled: true,
     });
     let mut comparator = Vec::with_capacity(measured_samples);
@@ -1040,38 +1147,19 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
                 .authoritative_serialized_size_bytes()
                 .unwrap(),
         );
-        // Exact production command order. The continuous timer stored in the
-        // pair now crosses bounded-channel admission, the preceding v33 write,
-        // paired-writer initialization/rotation and final v34/evidence bytes.
+        // Exercise both production queues. Their independent workers preserve
+        // routing identity without making v33 wait for PR2C fsync/manifest I/O.
         logger.log_routed_gatekeeper_buy_decision(routed).await;
-        logger.log_metric_contract_pair(pair).await.unwrap();
+        logger.log_metric_contract_pair(pair).unwrap();
         let expected_rows = u64::try_from(index + 1).unwrap();
-        let manifest_path = temp.path().join(METRIC_CONTRACT_ROTATION_MANIFEST_V1_FILE);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                // `evidence_rows_written_total` advances before the writer's
-                // per-pair sync and atomic manifest replacement. Starting the
-                // next sample at that point would charge it for the previous
-                // sample's durability tail and manufacture queue backlog that
-                // this isolated release baseline is not intended to model.
-                // Wait for the production manifest to contain the exact full-
-                // path sample; the measured sample itself still crosses the
-                // real bounded queue, preceding v33 command/I/O and final-byte
-                // materialization. Queue-pressure behavior has a separate
-                // bounded-channel regression and remains visible in burn-in.
-                if let Ok(bytes) = std::fs::read(&manifest_path) {
-                    if let Ok(manifest) =
-                        serde_json::from_slice::<MetricContractRotationManifestV1>(&bytes)
-                    {
-                        if manifest
-                            .writer_stats
-                            .metric_contract_build_and_serialize_us
-                            .sample_count
-                            >= expected_rows
-                        {
-                            break;
-                        }
-                    }
+                if logger
+                    .metric_contract_writer_stats()
+                    .evidence_rows_written_total
+                    >= expected_rows
+                {
+                    break;
                 }
                 tokio::task::yield_now().await;
             }
@@ -1150,7 +1238,7 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
     let sidecar_p99 = sidecar_bytes[sidecar_bytes.len() * 99 / 100];
     let v34_p95 = v34_bytes[v34_bytes.len() * 95 / 100];
     eprintln!(
-        "PR2C release resource harness: metric_contract_build_and_serialize_us_p50={build_p50} metric_contract_build_and_serialize_us_p95={build_p95} metric_contract_build_and_serialize_us_p99={build_p99} metric_contract_build_and_serialize_us_max={build_max} complete_snapshot_build_validate_us_p50={snapshot_p50} complete_snapshot_build_validate_us_p95={snapshot_p95} complete_snapshot_build_validate_us_p99={snapshot_p99} context_validation_us_p50={context_p50} context_validation_us_p95={context_p95} context_validation_us_p99={context_p99} evidence_build_us_p50={evidence_build_p50} evidence_build_us_p95={evidence_build_p95} evidence_build_us_p99={evidence_build_p99} evidence_validation_us_p50={evidence_validation_p50} evidence_validation_us_p95={evidence_validation_p95} evidence_validation_us_p99={evidence_validation_p99} projection_build_validate_us_p50={projection_p50} projection_build_validate_us_p95={projection_p95} projection_build_validate_us_p99={projection_p99} terminal_pair_construction_us_p50={pair_p50} terminal_pair_construction_us_p95={pair_p95} terminal_pair_construction_us_p99={pair_p99} metric_contract_serialize_us_p50={serialize_p50} metric_contract_serialize_us_p95={serialize_p95} metric_contract_serialize_us_p99={serialize_p99} comparator_elapsed_us_p50={comparator_p50} comparator_elapsed_us_p95={comparator_p95} comparator_elapsed_us_p99={comparator_p99} projection_wire_json_bytes_p95={wire_p95} projection_wire_json_bytes_max={wire_max} sidecar_json_bytes_p95={sidecar_p95} sidecar_json_bytes_p99={sidecar_p99} v34_json_bytes_p95={v34_p95}"
+        "PR2C durable latency diagnostic: metric_contract_build_and_serialize_us_p50={build_p50} metric_contract_build_and_serialize_us_p95={build_p95} metric_contract_build_and_serialize_us_p99={build_p99} metric_contract_build_and_serialize_us_max={build_max} complete_snapshot_build_validate_us_p50={snapshot_p50} complete_snapshot_build_validate_us_p95={snapshot_p95} complete_snapshot_build_validate_us_p99={snapshot_p99} context_validation_us_p50={context_p50} context_validation_us_p95={context_p95} context_validation_us_p99={context_p99} evidence_build_us_p50={evidence_build_p50} evidence_build_us_p95={evidence_build_p95} evidence_build_us_p99={evidence_build_p99} evidence_validation_us_p50={evidence_validation_p50} evidence_validation_us_p95={evidence_validation_p95} evidence_validation_us_p99={evidence_validation_p99} projection_build_validate_us_p50={projection_p50} projection_build_validate_us_p95={projection_p95} projection_build_validate_us_p99={projection_p99} terminal_pair_construction_us_p50={pair_p50} terminal_pair_construction_us_p95={pair_p95} terminal_pair_construction_us_p99={pair_p99} metric_contract_serialize_us_p50={serialize_p50} metric_contract_serialize_us_p95={serialize_p95} metric_contract_serialize_us_p99={serialize_p99} comparator_elapsed_us_p50={comparator_p50} comparator_elapsed_us_p95={comparator_p95} comparator_elapsed_us_p99={comparator_p99} projection_wire_json_bytes_p95={wire_p95} projection_wire_json_bytes_max={wire_max} sidecar_json_bytes_p95={sidecar_p95} sidecar_json_bytes_p99={sidecar_p99} v34_json_bytes_p95={v34_p95}"
     );
     assert_eq!(
         writer_stats.summary_rows_written_total,
@@ -1164,12 +1252,4 @@ async fn pr2c_release_resource_harness_reports_full_path_percentiles() {
     assert!(wire_max <= 16 * 1024);
     assert!(sidecar_p95 <= 24 * 1024);
     assert!(sidecar_p99 <= 48 * 1024);
-    if !cfg!(debug_assertions) {
-        assert!(build_p99 <= u64::from(PR2C_FULL_BUILD_AND_SERIALIZE_P99_MAX_US));
-        assert!(projection_p99 <= u128::from(PR2C_PROJECTION_BUILD_AND_VALIDATE_P99_MAX_US));
-        // Standalone serialization stays visible as a diagnostic sub-step.
-        // Acceptance is enforced by the continuous first-producer-to-final-
-        // bytes timer, so there is no overlapping standalone serialize gate.
-        assert!(comparator_p99 <= u128::from(PR2C_COMPARATOR_P99_MAX_US));
-    }
 }

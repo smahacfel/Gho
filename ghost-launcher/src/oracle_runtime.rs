@@ -1190,7 +1190,7 @@ fn spawn_gatekeeper_decision_logs(
     tokio::spawn(async move {
         dl.log_routed_gatekeeper_buy_decision(routed_buy_log).await;
         if let Some(metric_contract_pair) = metric_contract_pair {
-            if let Err(error) = dl.log_metric_contract_pair(metric_contract_pair).await {
+            if let Err(error) = dl.log_metric_contract_pair(metric_contract_pair) {
                 error!("PR2C paired metric-contract enqueue failed closed: {error}");
             }
         }
@@ -1308,6 +1308,9 @@ fn route_gatekeeper_decision_and_build_pr2c_pair(
     // derive the PR2C identity from the routed legacy-live row, and enqueue
     // these exact same routed rows after the pair has been constructed.
     let routed_buy_log = ctx.decision_logger.route_gatekeeper_buy_decision(buy_log);
+    if !ctx.decision_logger.metric_contract_pr2c_enabled() {
+        return (routed_buy_log, None);
+    }
     let metric_contract_pair = routed_buy_log
         .pr2c_legacy_live_context()
         .map_err(Pr2cTerminalSnapshotErrorV1::from)
@@ -1981,6 +1984,9 @@ pub struct OracleRuntimeConfig {
     /// from compact evidence.
     pub metric_contract_funding_source_producer_config:
         Option<Arc<crate::tx_intelligence::FundingSourceProducerConfigSnapshotV1>>,
+    /// Opt-in switch for the isolated PR2C durable-evidence branch. Runtime
+    /// activation is additionally restricted to dedicated shadow mode.
+    pub metric_contract_pr2c_enabled: bool,
     pub p37_shadow_probe: P37ShadowProbeConfig,
     pub selector: SelectorRuntimeConfig,
     pub run_id: Option<String>,
@@ -2031,6 +2037,7 @@ impl OracleRuntimeConfig {
             ),
             metric_contract_effective_config: None,
             metric_contract_funding_source_producer_config: None,
+            metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
@@ -2052,6 +2059,7 @@ impl OracleRuntimeConfig {
             ),
             metric_contract_effective_config: None,
             metric_contract_funding_source_producer_config: None,
+            metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
@@ -2114,6 +2122,7 @@ impl Default for OracleRuntimeConfig {
             ),
             metric_contract_effective_config: None,
             metric_contract_funding_source_producer_config: None,
+            metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
@@ -16533,6 +16542,10 @@ fn derive_gatekeeper_rollout_profile(log_dir: &std::path::Path) -> String {
         .unwrap_or_else(|| "unknown_rollout".to_string())
 }
 
+const fn pr2c_durable_evidence_enabled(requested: bool, execution_mode: ExecutionMode) -> bool {
+    requested && matches!(execution_mode, ExecutionMode::Shadow)
+}
+
 fn build_decision_logger_config(
     decision_log_path: &str,
     gatekeeper_config: &ghost_brain::config::GatekeeperV2Config,
@@ -16562,6 +16575,7 @@ fn build_decision_logger_config(
         brain_config_path: None,
         brain_config_hash: None,
         channel_buffer_size: 1000,
+        metric_contract_pr2c_enabled: false,
         enabled: true,
     }
 }
@@ -24916,6 +24930,15 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         });
     decision_logger_config.brain_config_path = oracle_runtime.config.brain_config_path.clone();
     decision_logger_config.brain_config_hash = oracle_runtime.config.brain_config_hash.clone();
+    let pr2c_requested = oracle_runtime.config.metric_contract_pr2c_enabled;
+    let pr2c_enabled = pr2c_durable_evidence_enabled(pr2c_requested, execution_mode);
+    if pr2c_requested && !pr2c_enabled {
+        warn!(
+            ?execution_mode,
+            "PR2C durable evidence requested outside dedicated shadow mode; forcing it OFF"
+        );
+    }
+    decision_logger_config.metric_contract_pr2c_enabled = pr2c_enabled;
     let gatekeeper_rollout_profile = decision_logger_config.gatekeeper_rollout_profile.clone();
 
     // Initialize Decision Logger for cyclic engine telemetry
@@ -39557,6 +39580,19 @@ mod tests {
             config.gatekeeper_log_dir,
             std::path::PathBuf::from("logs/decisions.json/rollout/shadow-burnin/decisions")
         );
+    }
+
+    #[test]
+    fn pr2c_durable_evidence_is_opt_in_and_shadow_only() {
+        assert!(!pr2c_durable_evidence_enabled(false, ExecutionMode::Shadow));
+        assert!(pr2c_durable_evidence_enabled(true, ExecutionMode::Shadow));
+        for mode in [
+            ExecutionMode::Live,
+            ExecutionMode::Paper,
+            ExecutionMode::Dual,
+        ] {
+            assert!(!pr2c_durable_evidence_enabled(true, mode));
+        }
     }
 
     #[test]
