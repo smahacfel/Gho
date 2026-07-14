@@ -320,13 +320,17 @@ async fn unrouted_terminal_v33_uses_one_logger_route_for_v33_pair_and_single_run
     .unwrap();
     assert!(manifest.writer_finalized);
     let audit = audit_pr2c_single_run_v1(temp.path(), &[legacy_v33_path]);
-    if option_env!("GIT_WORKTREE_CLEAN") == Some("true") {
+    if manifest.summary_parts[0].build_worktree_clean {
         assert_ne!(
             audit.unwrap().terminal_class,
             MetricContractAuditTerminalClassV1::FailSchemaOrReplay
         );
     } else {
-        assert!(audit.is_err(), "dirty build provenance must fail closed");
+        let error = audit.unwrap_err().to_string();
+        assert!(
+            error.contains("unknown, dirty, or incomplete run/build/schema/BURN provenance"),
+            "dirty build provenance must fail closed with the exact provenance error: {error}"
+        );
     }
 }
 
@@ -895,13 +899,17 @@ async fn saturated_pr2c_queue_is_non_blocking_keeps_v33_writable_and_invalidates
     assert!(manifest.writer_finalized);
     assert!(manifest.writer_stats.evidence_run_invalid);
     let audit = audit_pr2c_single_run_v1(temp.path(), &[v33_path]);
-    if option_env!("GIT_WORKTREE_CLEAN") == Some("true") {
+    if manifest.summary_parts[0].build_worktree_clean {
         assert_eq!(
             audit.unwrap().terminal_class,
             MetricContractAuditTerminalClassV1::FailResourceBudget
         );
     } else {
-        assert!(audit.is_err(), "dirty build provenance must fail closed");
+        let error = audit.unwrap_err().to_string();
+        assert!(
+            error.contains("unknown, dirty, or incomplete run/build/schema/BURN provenance"),
+            "dirty build provenance must fail closed with the exact provenance error: {error}"
+        );
     }
 }
 
