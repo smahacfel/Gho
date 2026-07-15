@@ -115,6 +115,13 @@ struct DecisionSeriesAccountPriceObservation {
     price_sol: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionTransactionAdmission {
+    Accepted,
+    Duplicate { event_ts_ms: u64 },
+    Terminal,
+}
+
 pub struct PoolObservationSession {
     pub session_id: SessionId,
     pub pool_amm_id: Pubkey,
@@ -291,6 +298,49 @@ impl PoolObservationSession {
         self.tx_buffer.push_back(tx);
     }
 
+    /// Canonical session-local admission boundary for decision-plane transaction evidence.
+    ///
+    /// A duplicate is stopped before every reducer. Its event timestamp may still advance the
+    /// Gatekeeper clock so a repeated delivery cannot hold an observation window open forever.
+    /// Terminal sessions are immutable and reject all further ingestion as a no-op.
+    fn admit_transaction(&mut self, tx: &PoolTransaction) -> SessionTransactionAdmission {
+        if matches!(
+            self.status,
+            SessionStatus::Decided(_) | SessionStatus::Closed
+        ) {
+            return SessionTransactionAdmission::Terminal;
+        }
+
+        // Admission intentionally inherits the existing TxKey contract: normalized event time is
+        // part of equality/order. Therefore the same signature and ordinal with a different
+        // normalized timestamp remains a distinct event unless that global TxKey contract is
+        // changed in a separate migration.
+        let Some(tx_key) = GatekeeperBuffer::tx_key_for(tx) else {
+            // Preserve the existing fallback behavior for an event that cannot be keyed. The
+            // downstream reducers retain their own defensive validation for this degraded case.
+            return SessionTransactionAdmission::Accepted;
+        };
+
+        if self.tx_keys_seen.insert(tx_key.clone()) {
+            SessionTransactionAdmission::Accepted
+        } else {
+            SessionTransactionAdmission::Duplicate {
+                event_ts_ms: tx_key.timestamp_ms,
+            }
+        }
+    }
+
+    fn duplicate_ingress_outcome(&mut self, event_ts_ms: u64) -> GatekeeperIngressOutcome {
+        let now_ms = self.gatekeeper_buffer.advance_event_clock(event_ts_ms);
+        let outcome = if now_ms >= self.gatekeeper_buffer.deadline_wall_ts_ms() {
+            GatekeeperIngressOutcome::DeadlineElapsed
+        } else {
+            GatekeeperIngressOutcome::Wait
+        };
+        self.refresh_from_gatekeeper();
+        outcome
+    }
+
     /// Test-only helper retained for in-crate suites that still assert
     /// legacy inline-verdict parity.
     ///
@@ -341,6 +391,14 @@ impl PoolObservationSession {
 
     /// Production ingest path for PR6 trigger cutover.
     pub fn ingest_transaction(&mut self, tx: Arc<PoolTransaction>) -> GatekeeperIngressOutcome {
+        match self.admit_transaction(tx.as_ref()) {
+            SessionTransactionAdmission::Accepted => {}
+            SessionTransactionAdmission::Duplicate { event_ts_ms } => {
+                return self.duplicate_ingress_outcome(event_ts_ms);
+            }
+            SessionTransactionAdmission::Terminal => return GatekeeperIngressOutcome::Wait,
+        }
+
         self.tx_intelligence.on_transaction(tx.as_ref());
         self.refresh_tx_intelligence_snapshot();
 
@@ -352,13 +410,12 @@ impl PoolObservationSession {
 
         if accepted_unique {
             let pool_id = self.pool_amm_id.to_string();
-            self.cross_pool_velocity_index.observe_transaction(
-                pool_id.as_str(),
-                tx.as_ref(),
-                &self.cross_pool_velocity_config,
-            );
-            if let Some(tx_key) = GatekeeperBuffer::tx_key_for(tx.as_ref()) {
-                self.tx_keys_seen.insert(tx_key);
+            if tx.success {
+                self.cross_pool_velocity_index.observe_transaction(
+                    pool_id.as_str(),
+                    tx.as_ref(),
+                    &self.cross_pool_velocity_config,
+                );
             }
             self.retain_decision_series_tx(tx);
             self.diagnostics.total_tx_seen = self.diagnostics.total_tx_seen.saturating_add(1);
@@ -710,6 +767,7 @@ impl PoolObservationSession {
             EvidenceStatus::Unavailable
         } else if organic.status != EvidenceStatus::Clean
             || !sybil.degraded_reasons.is_empty()
+            || alpha.fingerprint_degraded
             || alpha.fixed_size_buy_ratio.is_none()
             || alpha.early_top3_buy_volume_pct_3s.is_none()
         {
@@ -982,12 +1040,14 @@ impl PoolObservationSession {
         .into_iter()
         .filter(|available| *available)
         .count();
-        let alpha = if alpha_available_count == 9 {
-            evidence_clean()
-        } else if alpha_available_count > 0 {
-            evidence_degraded(vec![EvidenceDegradedReason::AlphaEvidencePartial])
-        } else {
+        let alpha = if alpha_available_count == 0 {
             evidence_unavailable(vec![EvidenceUnavailableReason::AlphaFingerprintMissing])
+        } else if materialized.alpha_fingerprint.fingerprint_degraded {
+            evidence_degraded(vec![EvidenceDegradedReason::AlphaEvidencePartial])
+        } else if alpha_available_count == 9 {
+            evidence_clean()
+        } else {
+            evidence_degraded(vec![EvidenceDegradedReason::AlphaEvidencePartial])
         };
 
         let manipulation = if materialized.tx_intel_features.tx_count > 0 {
@@ -2791,6 +2851,8 @@ impl PoolObservationSession {
                 early_top3_buy_volume_pct_3s: fingerprint.early_top3_buy_volume_pct_3s,
                 fixed_size_buy_ratio: fingerprint.fixed_size_buy_ratio,
                 flipper_presence_ratio: fingerprint.flipper_presence_ratio,
+                fingerprint_degraded: fingerprint.fingerprint_degraded,
+                fingerprint_reason: fingerprint.fingerprint_reason.clone(),
             };
         }
 
@@ -2947,6 +3009,7 @@ impl PoolObservationSession {
             .metric_contract_reserve_velocity_snapshot(&self.base_mint);
         let legacy_flip_ratio = fingerprint_metrics
             .as_ref()
+            .filter(|fingerprint| !fingerprint.fingerprint_degraded)
             .and_then(|fingerprint| fingerprint.flipper_presence_ratio);
         let build_context = crate::metric_contracts::Pr2bBuildContextV1 {
             rollout_mode: effective_config.payload.rollout_mode,
@@ -3140,6 +3203,24 @@ impl PoolObservationSession {
         }
         self.tx_intelligence
             .update_fingerprint_anchor(slot, timestamp_ms, self.dev_wallet);
+        self.refresh_tx_intelligence_snapshot();
+    }
+
+    pub fn update_tx_intelligence_pool_identity_and_fingerprint_anchor(
+        &mut self,
+        dev_wallet: Option<Pubkey>,
+        create_signature: Option<&str>,
+        slot: Option<u64>,
+        timestamp_ms: Option<u64>,
+    ) {
+        self.dev_wallet = dev_wallet;
+        self.tx_intelligence
+            .update_pool_identity_and_fingerprint_anchor(
+                dev_wallet,
+                create_signature,
+                slot,
+                timestamp_ms,
+            );
         self.refresh_tx_intelligence_snapshot();
     }
 

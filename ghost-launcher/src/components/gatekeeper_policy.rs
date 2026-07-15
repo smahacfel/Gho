@@ -3657,6 +3657,7 @@ mod tests {
             early_top3_buy_volume_pct_3s: None,
             fixed_size_buy_ratio: Some(0.12),
             flipper_presence_ratio: Some(0.06),
+            ..AlphaFingerprintFeatures::default()
         };
 
         GatekeeperAssessment {

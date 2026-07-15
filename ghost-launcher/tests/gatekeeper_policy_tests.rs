@@ -870,7 +870,7 @@ fn curve_tx(
         is_dev_buy: false,
         dev_buy_lamports: 0,
         arrival_ts_ms: timestamp_ms,
-        event_time: ghost_core::EventTimeMetadata::default(),
+        event_time: ghost_core::EventTimeMetadata::new(None, Some(timestamp_ms), None),
         mpcf_payload: vec![],
         mpcf_payload_missing_reason: RawBytesMissingReason::Unknown,
         v_tokens_in_bonding_curve: Some(v_tokens),
@@ -1321,6 +1321,7 @@ fn feature_snapshot_alpha_fingerprint_can_fail_phase4_without_post_attach() {
         early_top3_buy_volume_pct_3s: Some(0.72),
         fixed_size_buy_ratio: None,
         flipper_presence_ratio: None,
+        ..AlphaFingerprintFeatures::default()
     };
 
     let assessment = build_assessment_from_features(

@@ -10,7 +10,7 @@ use ghost_core::{CurveFinality, CurveFreshnessState};
 use ghost_launcher::events::{FundingTransferObserved, PoolTransaction, RawBytesMissingReason};
 use ghost_launcher::session::{OpenSessionRequest, SessionConfig, SessionManager};
 use ghost_launcher::tx_intelligence::FundingSourceConfig;
-use seer::early_fingerprint::EarlyFingerprintConfig;
+use seer::early_fingerprint::{EarlyFingerprintConfig, TokenDelta};
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,6 +81,17 @@ fn test_tx(pool_id: Pubkey, signature: &str, timestamp_ms: u64) -> Arc<PoolTrans
         curve_data_known: false,
         curve_finality: CurveFinality::Speculative,
     })
+}
+
+fn fingerprint_eligible_tx(
+    pool_id: Pubkey,
+    signature: &str,
+    timestamp_ms: u64,
+) -> Arc<PoolTransaction> {
+    let mut tx = (*test_tx(pool_id, signature, timestamp_ms)).clone();
+    tx.semantic.slot_quality = ghost_core::SlotQuality::Present;
+    tx.token_amount_units = Some(2_000_000_000_000);
+    Arc::new(tx)
 }
 
 fn ftdi_tx(
@@ -1347,18 +1358,485 @@ fn session_dedup_does_not_double_count_duplicates() {
         Pubkey::new_unique(),
         2_000,
     );
-    let tx = test_tx(pool_id, "sig-dup", 2_010);
+    let tx = fingerprint_eligible_tx(pool_id, "sig-dup", 2_010);
 
-    {
+    let (fingerprint_before_duplicate, fingerprint_after_duplicate) = {
         let mut guard = session.write();
+        guard.update_tx_intelligence_fingerprint_anchor(Some(1), Some(2_000), None);
         let _ = guard.ingest_transaction(tx.clone());
+        let before = guard
+            .fingerprint_metrics()
+            .and_then(|metrics| metrics.block0_sniped_supply_pct)
+            .expect("first admitted event should populate the canonical fingerprint");
         let _ = guard.ingest_transaction(tx);
-    }
+        let after = guard
+            .fingerprint_metrics()
+            .and_then(|metrics| metrics.block0_sniped_supply_pct)
+            .expect("duplicate must leave the canonical fingerprint available");
+        (before, after)
+    };
 
     let guard = session.read();
     assert_eq!(guard.diagnostics.total_tx_seen, 1);
     assert_eq!(guard.tx_buffer.len(), 1);
     assert_eq!(guard.tx_keys_seen.len(), 1);
+    assert_eq!(guard.tx_intel_features.tx_count, 1);
+    assert_eq!(guard.tx_intel_features.buy_count, 1);
+    assert_eq!(
+        fingerprint_before_duplicate, fingerprint_after_duplicate,
+        "duplicate must not re-enter the canonical fingerprint reducer"
+    );
+}
+
+#[test]
+fn session_admission_keeps_same_signature_with_different_event_ordinals_distinct() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let session = open_session(
+        &manager,
+        pool_id,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        3_000,
+    );
+    let signature = solana_sdk::signature::Signature::new_unique().to_string();
+    let first = test_tx(pool_id, signature.as_str(), 3_010);
+    let mut second = (*first).clone();
+    second.event_ordinal = Some(1);
+    second.signer = Pubkey::new_unique().to_string();
+
+    {
+        let mut guard = session.write();
+        let _ = guard.ingest_transaction(first);
+        let _ = guard.ingest_transaction(Arc::new(second));
+    }
+
+    let guard = session.read();
+    assert_eq!(guard.tx_keys_seen.len(), 2);
+    assert_eq!(guard.diagnostics.total_tx_seen, 2);
+    assert_eq!(guard.tx_buffer.len(), 2);
+    assert_eq!(guard.tx_intel_features.tx_count, 2);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 2);
+}
+
+#[test]
+fn session_admission_preserves_tx_key_timestamp_drift_semantics() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let session = open_session(
+        &manager,
+        pool_id,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        3_500,
+    );
+    let signature = solana_sdk::signature::Signature::new_unique().to_string();
+    let first = test_tx(pool_id, signature.as_str(), 3_510);
+    let mut timestamp_drift = (*first).clone();
+    timestamp_drift.timestamp_ms = 3_511;
+    timestamp_drift.event_time = ghost_core::EventTimeMetadata::new(None, Some(3_511), None);
+    timestamp_drift.arrival_ts_ms = 3_511;
+
+    {
+        let mut guard = session.write();
+        let _ = guard.ingest_transaction(first);
+        let _ = guard.ingest_transaction(Arc::new(timestamp_drift));
+    }
+
+    let guard = session.read();
+    assert_eq!(
+        guard.tx_keys_seen.len(),
+        2,
+        "TxKey intentionally treats normalized event timestamp as identity/order state"
+    );
+    assert_eq!(guard.diagnostics.total_tx_seen, 2);
+    assert_eq!(guard.tx_intel_features.tx_count, 2);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 2);
+}
+
+#[test]
+fn fingerprint_evidence_survives_late_identity_anchor_and_terminal_variants() {
+    let dev_wallet = Pubkey::new_unique();
+    let mut terminal_fingerprints = Vec::new();
+
+    for (index, verdict) in [
+        VerdictOutcome::Pass {
+            reason: "buy".to_string(),
+        },
+        VerdictOutcome::Fail {
+            reason: "reject".to_string(),
+        },
+        VerdictOutcome::Timeout {
+            reason: "timeout".to_string(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let manager = SessionManager::default();
+        let pool_id = Pubkey::new_unique();
+        let session = open_session(
+            &manager,
+            pool_id,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            7_000,
+        );
+        let buy_signature = format!("late-anchor-buy-{index}");
+        let sell_signature = format!("late-anchor-sell-{index}");
+        let mut buy = (*fingerprint_eligible_tx(pool_id, buy_signature.as_str(), 7_010)).clone();
+        buy.signer = dev_wallet.to_string();
+        buy.owner_token_deltas = vec![TokenDelta {
+            owner: dev_wallet.to_string(),
+            delta_raw: 2_000_000_000_000,
+            decimals: 6,
+        }];
+        let buy = Arc::new(buy);
+
+        let mut sell = (*fingerprint_eligible_tx(pool_id, sell_signature.as_str(), 7_020)).clone();
+        sell.event_ordinal = Some(1);
+        sell.signer = dev_wallet.to_string();
+        sell.is_buy = false;
+        sell.owner_token_deltas = vec![TokenDelta {
+            owner: dev_wallet.to_string(),
+            delta_raw: -1_000_000_000_000,
+            decimals: 6,
+        }];
+
+        let terminal_fingerprint = {
+            let mut guard = session.write();
+            let _ = guard.ingest_transaction(buy.clone());
+            let _ = guard.ingest_transaction(Arc::new(sell));
+            let before_late_metadata = guard
+                .fingerprint_metrics()
+                .expect("eligible events should populate fingerprint before metadata");
+            assert_eq!(before_late_metadata.sell_buy_ratio, Some(1.0));
+            assert_eq!(before_late_metadata.dev_paperhand_latency_ms, None);
+
+            guard.update_tx_intelligence_pool_identity_and_fingerprint_anchor(
+                Some(dev_wallet),
+                Some("late-create-signature"),
+                Some(1),
+                Some(7_000),
+            );
+
+            let after_late_metadata = guard
+                .fingerprint_metrics()
+                .expect("late metadata must not erase admitted fingerprint evidence");
+            assert_eq!(after_late_metadata.sell_buy_ratio, Some(1.0));
+            assert!(
+                after_late_metadata
+                    .block0_sniped_supply_pct
+                    .is_some_and(|value| value > 0.0),
+                "rebuild must replay the pre-anchor BUY against the real creation slot"
+            );
+            assert_eq!(after_late_metadata.dev_paperhand_latency_ms, Some(20));
+            assert_eq!(after_late_metadata.dev_sold_within_3s, Some(true));
+
+            let stable_before_duplicate = serde_json::to_value(&after_late_metadata)
+                .expect("fingerprint must serialize for equality assertion");
+            let _ = guard.ingest_transaction(buy);
+            assert_eq!(
+                serde_json::to_value(
+                    guard
+                        .fingerprint_metrics()
+                        .expect("duplicate must leave fingerprint available")
+                )
+                .expect("fingerprint must serialize after duplicate"),
+                stable_before_duplicate,
+                "duplicate after late metadata must not change fingerprint evidence"
+            );
+
+            guard.apply_verdict(verdict);
+            serde_json::to_value(
+                guard
+                    .fingerprint_metrics()
+                    .expect("terminal session must expose the preserved fingerprint"),
+            )
+            .expect("terminal fingerprint must serialize")
+        };
+        terminal_fingerprints.push(terminal_fingerprint);
+    }
+
+    assert!(terminal_fingerprints
+        .windows(2)
+        .all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn truncated_fingerprint_quality_survives_materialization_and_blocks_v3_actionability() {
+    use ghost_brain::config::GatekeeperV3Config;
+    use ghost_core::metric_contracts::{
+        CanonicalNullableV1, MetricAvailabilityV1, MetricMeasurementQualityV1,
+    };
+    use ghost_core::session::types::SessionId;
+    use ghost_launcher::components::gatekeeper_v3::v3_actionability_payload;
+    use ghost_launcher::session::PoolObservationSession;
+    use ghost_launcher::tx_intelligence::TxIntelligenceConfig;
+
+    let pool_id = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let bonding_curve = Pubkey::new_unique();
+    let dev_wallet = Pubkey::new_unique();
+    let mut candidate = test_candidate(pool_id, base_mint, bonding_curve);
+    candidate.timestamp = 70_000;
+    // The initially observed slot is intentionally stale. The real slot arrives after the
+    // bounded fingerprint replay history has truncated.
+    candidate.slot = Some(2);
+
+    let gatekeeper_config = GatekeeperV2Config::default();
+    let fingerprint_config = EarlyFingerprintConfig::default();
+    let mut tx_intelligence_config =
+        TxIntelligenceConfig::from_gatekeeper_config(&gatekeeper_config, fingerprint_config);
+    tx_intelligence_config.tx_key_capacity = 1;
+    let mut session = PoolObservationSession::new(
+        SessionId(1),
+        pool_id,
+        base_mint,
+        bonding_curve,
+        Some(dev_wallet),
+        candidate,
+        70_000,
+        80_000,
+        &gatekeeper_config,
+        tx_intelligence_config,
+    );
+
+    for index in 0..10_u32 {
+        let signer = Pubkey::new_unique();
+        let mut tx = (*fingerprint_eligible_tx(
+            pool_id,
+            solana_sdk::signature::Signature::new_unique()
+                .to_string()
+                .as_str(),
+            70_100 + u64::from(index) * 10,
+        ))
+        .clone();
+        tx.event_ordinal = Some(index);
+        tx.signer = signer.to_string();
+        tx.slot = Some(1);
+        tx.owner_token_deltas = vec![TokenDelta {
+            owner: signer.to_string(),
+            delta_raw: 2_000_000_000_000,
+            decimals: 6,
+        }];
+        tx.signer_pre_balance_lamports = Some(1_000_000_000 + u64::from(index));
+        tx.cu_price_micro_lamports = Some(10);
+        tx.compute_unit_limit = Some(200_000);
+        tx.compute_units_consumed = Some(100_000);
+        tx.inner_ix_count = Some(2);
+        tx.cpi_depth = Some(2);
+        tx.ata_create_count = Some(0);
+        tx.jito_tip_detected = Some(false);
+        let _ = session.ingest_transaction(Arc::new(tx));
+    }
+
+    session.update_tx_intelligence_pool_identity_and_fingerprint_anchor(
+        Some(dev_wallet),
+        Some("late-create-signature"),
+        Some(1),
+        Some(70_000),
+    );
+
+    let fingerprint = session
+        .fingerprint_metrics()
+        .expect("fingerprint metrics must remain available after truncated rebuild");
+    assert!(fingerprint.fingerprint_degraded);
+    assert!(fingerprint
+        .fingerprint_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("FINGERPRINT_REPLAY_HISTORY_TRUNCATED")));
+    assert!(fingerprint.flipper_presence_ratio.is_some());
+
+    let features = session
+        .try_materialize_features()
+        .expect("degraded fingerprint must still materialize deterministically");
+    assert!(features.alpha_fingerprint.fingerprint_degraded);
+    assert!(features
+        .alpha_fingerprint
+        .fingerprint_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("FINGERPRINT_REPLAY_HISTORY_TRUNCATED")));
+    assert_eq!(
+        features.evidence_status.alpha.status,
+        EvidenceStatus::Degraded,
+        "source degradation must override numeric alpha-field completeness"
+    );
+    assert_ne!(
+        features.manipulation_contradictions.status,
+        EvidenceStatus::Clean,
+        "alpha-dependent manipulation evidence cannot be clean"
+    );
+
+    let actionability = v3_actionability_payload(&features, &GatekeeperV3Config::default(), false);
+    assert_eq!(actionability["groups"]["alpha"]["status"], "Degraded");
+    assert_ne!(
+        actionability["groups"]["alpha"]["actionability"],
+        "actionable"
+    );
+
+    let projection = features
+        .metric_contract_decision_projection_v1
+        .as_ref()
+        .expect("current materialization must emit the PR2B projection");
+    let legacy_flip = &projection.flip_ratio.legacy_slot_gap_ratio;
+    assert_eq!(legacy_flip.value, CanonicalNullableV1::Null);
+    assert_eq!(
+        legacy_flip.envelope.availability,
+        MetricAvailabilityV1::Unavailable
+    );
+    assert_eq!(
+        legacy_flip.envelope.measurement_quality,
+        MetricMeasurementQualityV1::NotApplicable
+    );
+}
+
+#[test]
+fn duplicate_dust_is_counted_once_and_never_becomes_trade_or_fingerprint_evidence() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let session = open_session(
+        &manager,
+        pool_id,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        4_000,
+    );
+    let mut dust = (*fingerprint_eligible_tx(pool_id, "sig-dust", 4_010)).clone();
+    dust.volume_sol = 0.001;
+    dust.sol_amount_lamports = Some(1_000_000);
+    let dust = Arc::new(dust);
+
+    let flip_snapshot = {
+        let mut guard = session.write();
+        guard.update_tx_intelligence_fingerprint_anchor(Some(1), Some(4_000), None);
+        let _ = guard.ingest_transaction(dust.clone());
+        let _ = guard.ingest_transaction(dust);
+        guard.tx_intelligence.flip_v2_snapshot(4_050, Some(1))
+    };
+
+    let guard = session.read();
+    assert_eq!(guard.tx_keys_seen.len(), 1);
+    assert_eq!(guard.diagnostics.total_tx_seen, 0);
+    assert!(guard.tx_buffer.is_empty());
+    assert_eq!(guard.tx_intel_features.dust_tx_count, 1);
+    assert_eq!(guard.tx_intel_features.tx_count, 0);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 0);
+    assert_eq!(
+        guard
+            .fingerprint_metrics()
+            .and_then(|metrics| metrics.sell_buy_ratio),
+        None
+    );
+    assert_eq!(flip_snapshot.eligible_buyer_count, 0);
+    assert!(flip_snapshot
+        .reasons
+        .contains(&ghost_core::metric_contracts::FlipEvidenceReasonV1::DustExcluded));
+}
+
+#[test]
+fn failed_non_dust_preserves_v2_attempt_counts_but_not_positive_evidence() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let session = open_session(
+        &manager,
+        pool_id,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        5_000,
+    );
+    let mut failed = (*fingerprint_eligible_tx(pool_id, "sig-failed", 5_010)).clone();
+    failed.success = false;
+
+    let (flip_snapshot, materialized) = {
+        let mut guard = session.write();
+        guard.update_tx_intelligence_fingerprint_anchor(Some(1), Some(5_000), None);
+        let _ = guard.ingest_transaction(Arc::new(failed));
+        (
+            guard.tx_intelligence.flip_v2_snapshot(5_050, Some(1)),
+            guard.materialize_features(),
+        )
+    };
+
+    let guard = session.read();
+    assert_eq!(guard.diagnostics.total_tx_seen, 1);
+    assert_eq!(guard.tx_buffer.len(), 1);
+    assert_eq!(guard.tx_intel_features.tx_count, 1);
+    assert_eq!(guard.tx_intel_features.buy_count, 1);
+    assert_eq!(guard.tx_intel_features.failed_tx_count, 1);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 1);
+    assert_eq!(
+        guard
+            .fingerprint_metrics()
+            .and_then(|metrics| metrics.sell_buy_ratio),
+        None
+    );
+    assert_eq!(materialized.sybil_resistance.buy_sample_count, 0);
+    assert_eq!(materialized.sybil_resistance.signer_sample_count, 0);
+    assert_eq!(flip_snapshot.eligible_buyer_count, 0);
+    assert!(flip_snapshot
+        .reasons
+        .contains(&ghost_core::metric_contracts::FlipEvidenceReasonV1::FailedTransactionExcluded));
+}
+
+#[test]
+fn decided_and_closed_sessions_ignore_late_transactions_without_mutation() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let session = open_session(
+        &manager,
+        pool_id,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        6_000,
+    );
+
+    let baseline = {
+        let mut guard = session.write();
+        guard.update_tx_intelligence_fingerprint_anchor(Some(1), Some(6_000), None);
+        let _ = guard.ingest_transaction(fingerprint_eligible_tx(
+            pool_id,
+            "sig-before-terminal",
+            6_010,
+        ));
+        guard.apply_verdict(VerdictOutcome::Pass {
+            reason: "terminal".to_string(),
+        });
+        (
+            guard.diagnostics.clone(),
+            guard.tx_keys_seen.len(),
+            guard.tx_buffer.len(),
+            guard.tx_intel_features.clone(),
+            guard.gatekeeper_buffer().total_tx_count(),
+            guard
+                .fingerprint_metrics()
+                .and_then(|metrics| metrics.sell_buy_ratio),
+        )
+    };
+
+    {
+        let mut guard = session.write();
+        let mut late = (*fingerprint_eligible_tx(pool_id, "sig-after-decided", 6_020)).clone();
+        late.is_buy = false;
+        let _ = guard.ingest_transaction(Arc::new(late));
+        guard.close();
+        let mut later = (*fingerprint_eligible_tx(pool_id, "sig-after-closed", 6_030)).clone();
+        later.is_buy = false;
+        let _ = guard.ingest_transaction(Arc::new(later));
+    }
+
+    let guard = session.read();
+    assert_eq!(guard.diagnostics, baseline.0);
+    assert_eq!(guard.tx_keys_seen.len(), baseline.1);
+    assert_eq!(guard.tx_buffer.len(), baseline.2);
+    assert_eq!(guard.tx_intel_features, baseline.3);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), baseline.4);
+    assert_eq!(
+        guard
+            .fingerprint_metrics()
+            .and_then(|metrics| metrics.sell_buy_ratio),
+        baseline.5
+    );
 }
 
 #[test]

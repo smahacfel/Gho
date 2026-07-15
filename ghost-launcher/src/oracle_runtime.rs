@@ -101,9 +101,7 @@ use ghost_core::features::coordination::{
 use metrics::increment_counter;
 use parking_lot::{Mutex, RwLock};
 use seer::binary_parser::BinaryParser;
-use seer::early_fingerprint::{
-    EarlyFingerprintConfig, FingerprintAggregator, FingerprintTxEvent, TokenDelta,
-};
+use seer::early_fingerprint::EarlyFingerprintConfig;
 use seer::types::{GeyserEvent as SeerGeyserEvent, RawBytesMissingReason, TradeEvent};
 use seer::websocket_connection::{
     extract_balances_from_meta, extract_inner_instructions_from_meta, extract_logs_from_meta,
@@ -685,59 +683,6 @@ fn enrich_pool_tx_from_canonical_state(
     );
 
     Arc::new(enriched)
-}
-
-/// Pump.fun token decimals (6).
-const PUMPFUN_TOKEN_DECIMALS: u8 = 6;
-
-/// Convert a [`PoolTransaction`] into a [`FingerprintTxEvent`] for the
-/// early-fingerprint aggregator. Returns `None` if the transaction has no
-/// slot (required for block-0 snipe detection and event-time ordering).
-fn pool_tx_to_fingerprint_event(tx: &PoolTransaction) -> Option<FingerprintTxEvent> {
-    // Slot is required for block-0 snipe detection and event ordering.
-    let slot = tx.slot?;
-    let signer = tx.signer.clone();
-
-    // Build token delta: buy → positive, sell → negative
-    let mut token_deltas = Vec::new();
-    if let Some(token_units) = tx.token_amount_units {
-        let delta_raw = if tx.is_buy {
-            token_units as i128
-        } else {
-            -(token_units as i128)
-        };
-        token_deltas.push(TokenDelta {
-            owner: signer.clone(),
-            delta_raw,
-            decimals: PUMPFUN_TOKEN_DECIMALS,
-        });
-    }
-
-    // SOL pre-balance: use real signer pre-balance from gRPC meta.pre_balances
-    // when available. Do not fabricate proxy balances from trade size.
-    let mut sol_pre_balances = std::collections::HashMap::new();
-    if let Some(pre_bal) = tx.signer_pre_balance_lamports {
-        sol_pre_balances.insert(signer.clone(), pre_bal);
-    }
-
-    Some(FingerprintTxEvent {
-        slot,
-        tx_index: 0, // not available in PoolTransaction
-        signature: tx.signature.clone(),
-        timestamp_ms: tx.effective_event_ts_ms().unwrap_or_else(current_time_ms),
-        is_buy: tx.is_buy,
-        sol_amount_sol: Some(tx.volume_sol),
-        resolved_owner_deltas: tx.owner_token_deltas.clone(),
-        token_deltas,
-        sol_pre_balances,
-        cu_price_micro_lamports: tx.cu_price_micro_lamports,
-        compute_unit_limit: tx.compute_unit_limit,
-        compute_units_consumed: tx.compute_units_consumed,
-        inner_ix_count: tx.inner_ix_count,
-        cpi_depth: tx.cpi_depth,
-        ata_create_count: tx.ata_create_count,
-        jito_tip_detected: tx.jito_tip_detected,
-    })
 }
 
 #[inline]
@@ -23617,31 +23562,6 @@ async fn pool_observation_task(
         }
     }
 
-    // ── Fingerprint aggregator ──────────────────────────────────────────
-    let slot_known = pool_data.as_ref().and_then(|pd| pd.slot).is_some();
-    let creation_slot = pool_data
-        .as_ref()
-        .and_then(|pd| pd.slot)
-        .unwrap_or(u64::MAX);
-    let creation_ts = pool_data
-        .as_ref()
-        .and_then(|pd| detected_pool_epoch_like_ts_ms(pd))
-        .unwrap_or(0);
-    let supply_raw = if slot_known {
-        Some(GENESIS_TOKEN_RESERVES as u128)
-    } else {
-        None
-    };
-    let mut fingerprint_agg: Option<FingerprintAggregator> = Some(FingerprintAggregator::new(
-        ctx.fingerprint_config.clone(),
-        creation_slot,
-        slot_known,
-        creation_ts,
-        supply_raw,
-        PUMPFUN_TOKEN_DECIMALS,
-        pool_data.as_ref().map(|pd| pd.creator.clone()),
-    ));
-
     // ── A/B window state ────────────────────────────────────────────────
     let mut window_state = initial_window_state_for_task(
         pool_data.as_deref(),
@@ -23752,15 +23672,6 @@ async fn pool_observation_task(
                             ctx.oracle_runtime.shadow_ledger_enrichment_freshness_ms(),
                         );
 
-                        // Feed fingerprint aggregator
-                        if let Some(ref mut fp_agg) = fingerprint_agg {
-                            if let Some(fp_event) = pool_tx_to_fingerprint_event(&tx) {
-                                if fp_agg.in_window(&fp_event) {
-                                    fp_agg.ingest(&fp_event);
-                                }
-                            }
-                        }
-
                         // Update A/B window state
                         let window_state =
                             ensure_window_state_for_tx(&mut window_state, normalized_ts, ctx.ab_window_ms);
@@ -23817,15 +23728,11 @@ async fn pool_observation_task(
 
                             if let Ok(dev_wallet) = Pubkey::try_from(pd.creator.as_str()) {
                                 let mut session = session.write();
-                                session.dev_wallet = Some(dev_wallet);
-                                session.update_tx_intelligence_dev_identity(
+                                session.update_tx_intelligence_pool_identity_and_fingerprint_anchor(
                                     Some(dev_wallet),
                                     Some(pd.signature.as_str()),
-                                );
-                                session.update_tx_intelligence_fingerprint_anchor(
                                     pd.slot,
                                     detected_pool_epoch_like_ts_ms(&pd),
-                                    Some(dev_wallet),
                                 );
                                 if let Some(curve_t0) = detected_pool_epoch_like_ts_ms(&pd) {
                                     session
@@ -23850,19 +23757,6 @@ async fn pool_observation_task(
                                         curve_t0,
                                         detected_pool_epoch_source_label(&pd),
                                     );
-                            }
-
-                            // Re-init fingerprint aggregator with real slot data
-                            if let Some(slot) = pd.slot {
-                                fingerprint_agg = Some(FingerprintAggregator::new(
-                                    ctx.fingerprint_config.clone(),
-                                    slot,
-                                    true,
-                                    detected_pool_event_ts_ms(&pd),
-                                    Some(GENESIS_TOKEN_RESERVES as u128),
-                                    PUMPFUN_TOKEN_DECIMALS,
-                                    Some(pd.creator.clone()),
-                                ));
                             }
 
                             maybe_emit_init_pool_event(&ctx, pool_id, Some(&pd));
@@ -24030,9 +23924,7 @@ async fn pool_observation_task(
                     Some(window_state),
                     &mut coverage_window_opened,
                 );
-                if let Some(fp_agg) = fingerprint_agg.take() {
-                    assessment.early_fingerprint = Some(fp_agg.finalize());
-                }
+                assessment.early_fingerprint = session.read().fingerprint_metrics();
                 window_state.mark_verdict_early(WindowCloseReason::PoolRejectedEarly);
                 info!(
                     "🚫 GATEKEEPER MOWI: WYPIERDALAC! : pool={} reason={} (signers={} tx={} phases={}/6 in {}ms lag={}ms dust={}){}",
@@ -24147,9 +24039,7 @@ async fn pool_observation_task(
                     Some(window_state),
                     &mut coverage_window_opened,
                 );
-                if let Some(fp_agg) = fingerprint_agg.take() {
-                    assessment.early_fingerprint = Some(fp_agg.finalize());
-                }
+                assessment.early_fingerprint = session.read().fingerprint_metrics();
                 window_state.mark_verdict_early(WindowCloseReason::GatekeeperTimeout);
                 let timeout_reason = assessment
                     .decision
@@ -24255,9 +24145,7 @@ async fn pool_observation_task(
                 buffered_txs,
                 mut assessment,
             } => {
-                if let Some(fp_agg) = fingerprint_agg.take() {
-                    assessment.early_fingerprint = Some(fp_agg.finalize());
-                }
+                assessment.early_fingerprint = session.read().fingerprint_metrics();
 
                 let gatekeeper_verdict_at = current_time_ms();
                 let gatekeeper_base_mint = base_mint_pubkey
@@ -32846,38 +32734,6 @@ mod tests {
         assert_eq!(
             SessionRuntimeConfig::default().active_buy_route_manifest_cache_ttl_ms,
             120_000
-        );
-    }
-
-    #[test]
-    fn test_pool_tx_to_fingerprint_event_prefers_effective_event_time() {
-        let mut tx = (*test_pool_observation_tx("fingerprint-sig")).clone();
-        tx.slot = Some(42);
-        tx.timestamp_ms = 100;
-        tx.event_time = ghost_core::EventTimeMetadata::new(None, Some(150), None);
-
-        let event = pool_tx_to_fingerprint_event(&tx).expect("fingerprint event");
-        assert_eq!(event.timestamp_ms, 150);
-    }
-
-    #[test]
-    fn test_pool_tx_to_fingerprint_event_ignores_legacy_only_timestamp() {
-        let mut tx = (*test_pool_observation_tx("fingerprint-legacy-sig")).clone();
-        tx.slot = Some(42);
-        tx.timestamp_ms = 100;
-        tx.event_time = ghost_core::EventTimeMetadata::default();
-
-        let before = current_time_ms();
-        let event = pool_tx_to_fingerprint_event(&tx).expect("fingerprint event");
-        let after = current_time_ms();
-
-        assert_ne!(event.timestamp_ms, 100);
-        assert!(
-            event.timestamp_ms >= before && event.timestamp_ms <= after,
-            "expected wall-clock fallback, got {} outside [{}, {}]",
-            event.timestamp_ms,
-            before,
-            after
         );
     }
 

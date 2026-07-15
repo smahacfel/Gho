@@ -216,6 +216,12 @@ fn materialized_feature_set_deserializes_without_v3_fields_as_unavailable() {
     object.remove("evidence_status");
     object.remove("organic_broadening");
     object.remove("manipulation_contradictions");
+    let alpha = object
+        .get_mut("alpha_fingerprint")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("alpha fingerprint should be an object");
+    alpha.remove("fingerprint_degraded");
+    alpha.remove("fingerprint_reason");
 
     let decoded: MaterializedFeatureSet =
         serde_json::from_value(value).expect("deserialize old feature set json");
@@ -234,6 +240,8 @@ fn materialized_feature_set_deserializes_without_v3_fields_as_unavailable() {
     );
     assert!(!decoded.organic_broadening.sequence_available);
     assert_eq!(decoded.manipulation_contradictions.max_tx_per_signer, 0);
+    assert!(!decoded.alpha_fingerprint.fingerprint_degraded);
+    assert_eq!(decoded.alpha_fingerprint.fingerprint_reason, None);
 }
 
 #[test]

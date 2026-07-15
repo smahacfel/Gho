@@ -125,14 +125,14 @@ fn metric_contract_pr2c_keeps_v33_and_v3_v1_frozen_while_adding_separate_v34_str
 fn oracle_runtime_keeps_early_fingerprint_post_verdict_only() {
     let runtime_src = include_str!("../src/oracle_runtime.rs");
     let attachments: Vec<usize> = runtime_src
-        .match_indices("assessment.early_fingerprint = Some")
+        .match_indices("assessment.early_fingerprint = session.read().fingerprint_metrics();")
         .map(|(idx, _)| idx)
         .collect();
 
     assert_eq!(
         attachments.len(),
         3,
-        "oracle_runtime.rs should only attach early_fingerprint in the three terminal verdict arms"
+        "oracle_runtime.rs should attach the session-owned early_fingerprint in exactly the three terminal verdict arms"
     );
     assert!(
         !runtime_src.contains("refresh_assessment_thresholds("),

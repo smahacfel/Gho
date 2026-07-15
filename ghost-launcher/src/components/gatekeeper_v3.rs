@@ -429,6 +429,8 @@ pub fn v3_feature_snapshot_hash(
             "early_top3_buy_volume_pct_3s_bits": opt_f64_bits(alpha.early_top3_buy_volume_pct_3s),
             "fixed_size_buy_ratio_bits": opt_f64_bits(alpha.fixed_size_buy_ratio),
             "flipper_presence_ratio_bits": opt_f64_bits(alpha.flipper_presence_ratio),
+            "fingerprint_degraded": alpha.fingerprint_degraded,
+            "fingerprint_reason": alpha.fingerprint_reason.clone(),
             "jito_tip_intensity_bits": opt_f64_bits(alpha.jito_tip_intensity),
             "sell_buy_ratio_bits": opt_f64_bits(alpha.sell_buy_ratio),
             "static_fee_profile_ratio_bits": opt_f64_bits(alpha.static_fee_profile_ratio)
@@ -1030,6 +1032,11 @@ mod tests {
 
         features.session_metadata.session_id = SessionId(99);
         assert_eq!(original, v3_feature_snapshot_hash(&features, 1));
+
+        features.alpha_fingerprint.fingerprint_degraded = true;
+        features.alpha_fingerprint.fingerprint_reason =
+            Some("FINGERPRINT_REPLAY_HISTORY_TRUNCATED".to_string());
+        assert_ne!(original, v3_feature_snapshot_hash(&features, 1));
     }
 
     #[test]
