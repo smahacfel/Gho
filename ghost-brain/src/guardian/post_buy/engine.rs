@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use solana_sdk::pubkey::Pubkey;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use ghost_core::account_state_core::reducer::AccountStateReducer;
@@ -39,6 +39,7 @@ use crate::events::{
     CloseReason, ControlCommandAppliedPayload, ControlCommandIssuedPayload, EventEmitter,
     EventKind, ExecutionEvent, ExecutionStressChangedPayload, ExitFilledPayload,
     ExitSubmittedPayload, OracleStalePayload, PositionClosedPayload, PositionOpenedPayload,
+    ShadowPositionUnresolvedPayload, ShadowUnresolvedReason,
 };
 use crate::execution::backend::{
     CommandId as ExecCommandId, ExecutionStressSnapshot as ExecStressSnapshot,
@@ -55,6 +56,12 @@ use trigger::{
 #[cfg(test)]
 use super::config::DEFAULT_WAIT_FOR_TIMESTOP_MS;
 use super::config::{PostBuyGuardianConfig, TimeStopV2Config, TimeStopV2Mode};
+use super::exit_policy_v1::{
+    CrashVectorV1, EffectiveExitPolicyV1Config, ExecutableExitQuote, ExitCandidate,
+    ExitCandidateReason, ExitPolicyConfigError, ExitPolicyV1, FinalPolicyDecision,
+    MarkEvidenceStatus, PositionSnapshotGuard, PostBuyDecisionSnapshot, PreQuoteDecision,
+    EXECUTABLE_QUOTE_GRADE, EXECUTION_COST_COVERAGE_UNMODELED,
+};
 use super::exit_replay::{
     ShadowExitReplayIdentity, ShadowExitReplayRecord, ShadowExitReplayTracker,
     REASON_SHUTDOWN_BEFORE_HORIZON,
@@ -78,80 +85,13 @@ use super::shadow_v2::{
 
 #[cfg(test)]
 const SHADOW_POSITION_TIME_STOP_MS: u64 = DEFAULT_WAIT_FOR_TIMESTOP_MS;
-const SHADOW_EXIT_TRACE_FORMULA_ID: &str = "bonding_curve.calculate_sell_price.v1";
-const SHADOW_TIME_STOP_STALE_SOURCE_PATH: &str = "guardian.post_buy.shadow_time_stop_stale";
 const SHADOW_LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
 const SHADOW_TOKEN_DECIMAL_FACTOR_F64: f64 = 1_000_000.0;
 const SHADOW_V2_EXIT_FEE_BPS_DIAGNOSTIC_MODEL: u16 = 100;
 const SHADOW_V2_EXIT_SLIPPAGE_BPS_DIAGNOSTIC_MODEL: u16 = 150;
 use super::signals::*;
 
-#[derive(Debug, Clone, Copy)]
-struct ShadowSimpleExitThresholds {
-    take_profit_pct: f64,
-    stop_loss_pct: f64,
-}
-
-impl ShadowSimpleExitThresholds {
-    fn new(take_profit_pct: f64, stop_loss_pct: f64) -> Self {
-        Self {
-            take_profit_pct: sanitize_shadow_target_threshold_pct(take_profit_pct),
-            stop_loss_pct: sanitize_shadow_stoploss_threshold_pct(stop_loss_pct),
-        }
-    }
-
-    fn prices_for_entry(self, entry_price_sol: f64) -> Option<(f64, f64)> {
-        if !entry_price_sol.is_finite() || entry_price_sol <= 0.0 {
-            return None;
-        }
-
-        let upper = entry_price_sol * (1.0 + self.take_profit_pct);
-        let lower = entry_price_sol * (1.0 - self.stop_loss_pct);
-        (upper.is_finite() && lower.is_finite() && upper > 0.0 && lower >= 0.0)
-            .then_some((upper, lower))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShadowSimpleExitTrigger {
-    TakeProfit,
-    StopLoss,
-    TimeStop,
-}
-
-impl ShadowSimpleExitTrigger {
-    const fn as_label(self) -> &'static str {
-        match self {
-            Self::TakeProfit => "take_profit",
-            Self::StopLoss => "stop_loss",
-            Self::TimeStop => "time_stop",
-        }
-    }
-
-    const fn reason_code(self) -> &'static str {
-        match self {
-            Self::TakeProfit => "target",
-            Self::StopLoss => "stop_loss",
-            Self::TimeStop => "time_stop",
-        }
-    }
-}
-
-fn sanitize_shadow_target_threshold_pct(value: f64) -> f64 {
-    if value.is_finite() {
-        value.max(0.0)
-    } else {
-        0.0
-    }
-}
-
-fn sanitize_shadow_stoploss_threshold_pct(value: f64) -> f64 {
-    if value.is_finite() {
-        value.clamp(0.0, 1.0)
-    } else {
-        0.0
-    }
-}
+const SHADOW_QUOTE_RETRY_INTERVAL_MS: u64 = 500;
 
 #[derive(Debug, Default)]
 struct NoopAemLedgerWriter;
@@ -527,6 +467,31 @@ impl SnapshotTimeline {
         self.snapshots.clone()
     }
 
+    /// Signed mark-return range over the bounded canonical timeline. MFE is
+    /// the greatest return and MAE the lowest return (normally negative).
+    fn mark_excursions_pct(&self, entry_price_sol: Option<f64>) -> (Option<f64>, Option<f64>) {
+        let Some(entry_price_sol) =
+            entry_price_sol.filter(|price| price.is_finite() && *price > 0.0)
+        else {
+            return (None, None);
+        };
+        let mut mfe: Option<f64> = None;
+        let mut mae: Option<f64> = None;
+        for mark_price_sol in self
+            .snapshots
+            .iter()
+            .filter_map(PriceTruthResolver::normalize_shadow_snapshot_price_sol)
+        {
+            let return_pct = ((mark_price_sol - entry_price_sol) / entry_price_sol) * 100.0;
+            if !return_pct.is_finite() {
+                continue;
+            }
+            mfe = Some(mfe.map_or(return_pct, |current| current.max(return_pct)));
+            mae = Some(mae.map_or(return_pct, |current| current.min(return_pct)));
+        }
+        (mfe, mae)
+    }
+
     fn replace_with(
         &mut self,
         snapshots: Vec<MarketSnapshot>,
@@ -685,6 +650,14 @@ struct MonitoredPosition {
     remaining_token_amount_raw: u64,
     position_id: String,
     position_epoch: u64,
+    state_revision: u64,
+    next_exit_action_seq: u64,
+    pending_exit_proposal: Option<PendingExitProposal>,
+    terminal_tx: Option<oneshot::Sender<ShadowTerminalDisposition>>,
+    last_applied_action_id: Option<String>,
+    last_source_snapshot_id: Option<String>,
+    last_resolved_exit_metrics: Option<ResolvedShadowExitMetrics>,
+    last_shadow_outcome: Option<ShadowOutcomeKind>,
     join_metadata: PositionJoinMetadata,
     entry_order_id: String,
     quote_id: String,
@@ -724,6 +697,167 @@ struct MonitoredPosition {
     shadow_market_activity: ShadowMarketActivityAnchor,
     time_stop_v2: TimeStopV2State,
     snapshot_timeline: SnapshotTimeline,
+}
+
+#[derive(Debug, Clone)]
+struct PendingExitProposal {
+    action_id: String,
+    position_id: String,
+    position_epoch: u64,
+    reason: ExitCandidateReason,
+    triggered_at_ms: u64,
+    recovery_deadline_ms: u64,
+    expected_remaining_quantity: u64,
+    source_snapshot_id: String,
+    last_quote_attempt_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedShadowExitMetrics {
+    entry_token_amount_raw: u64,
+    exit_token_amount_raw: u64,
+    mark_return_pct: Option<f64>,
+    executable_gross_return_pct: f64,
+    mfe_mark_pct: Option<f64>,
+    mae_mark_pct: Option<f64>,
+    quote_reserve_base_raw: Option<f64>,
+    quote_reserve_quote_sol: Option<f64>,
+    quote_own_impact_bps: Option<f64>,
+    decision_mark_source: PriceTruthSource,
+    decision_mark_slot: Option<u64>,
+    decision_mark_timestamp_ms: Option<u64>,
+    decision_mark_age_ms: Option<u64>,
+}
+
+impl ResolvedShadowExitMetrics {
+    fn from_snapshot_and_truth(
+        snapshot: &PostBuyDecisionSnapshot,
+        truth: &ShadowExitTruth,
+    ) -> Self {
+        let mark_return_pct = snapshot
+            .entry_price_sol()
+            .zip(snapshot.mark_price_sol())
+            .and_then(|(entry, mark)| {
+                (entry.is_finite() && entry > 0.0 && mark.is_finite() && mark > 0.0)
+                    .then_some(((mark - entry) / entry) * 100.0)
+            });
+        let quote_own_impact_bps = snapshot.mark_price_sol().and_then(|mark| {
+            (mark.is_finite()
+                && mark > 0.0
+                && truth.exit_price_sol.is_finite()
+                && truth.exit_price_sol > 0.0)
+                .then_some(((mark - truth.exit_price_sol) / mark).max(0.0) * 10_000.0)
+        });
+        Self {
+            entry_token_amount_raw: snapshot.entry_token_amount_raw(),
+            exit_token_amount_raw: truth.exit_token_amount_raw,
+            mark_return_pct,
+            executable_gross_return_pct: truth.pnl_pct,
+            mfe_mark_pct: snapshot.mfe_mark_pct(),
+            mae_mark_pct: snapshot.mae_mark_pct(),
+            quote_reserve_base_raw: snapshot.quote_reserve_base_raw(),
+            quote_reserve_quote_sol: snapshot.quote_reserve_quote_sol(),
+            quote_own_impact_bps,
+            decision_mark_source: snapshot.mark_source(),
+            decision_mark_slot: snapshot.latest_sample_slot(),
+            decision_mark_timestamp_ms: snapshot.latest_sample_timestamp_ms(),
+            decision_mark_age_ms: snapshot.latest_sample_age_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadowOutcomeKind {
+    SimulatedFilled,
+    BlockedByData,
+    NoFill,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct ShadowExitActionHandle {
+    base_mint: Pubkey,
+    action_id: String,
+    position_id: String,
+    position_epoch: u64,
+    state_revision: u64,
+    expected_remaining_quantity: u64,
+    reason: ExitCandidateReason,
+    triggered_at_ms: u64,
+    recovery_deadline_ms: u64,
+    source_snapshot_id: String,
+}
+
+impl ShadowUnresolvedReason {
+    fn terminal_reason_v2(self) -> TerminalReasonV2 {
+        match self {
+            Self::BlockedByData => TerminalReasonV2::BlockedByData,
+            Self::NoFill => TerminalReasonV2::NoFill,
+            Self::Failed => TerminalReasonV2::Failed,
+        }
+    }
+
+    fn outcome_kind(self) -> ShadowOutcomeKind {
+        match self {
+            Self::BlockedByData => ShadowOutcomeKind::BlockedByData,
+            Self::NoFill => ShadowOutcomeKind::NoFill,
+            Self::Failed => ShadowOutcomeKind::Failed,
+        }
+    }
+
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::BlockedByData => "blocked_by_data",
+            Self::NoFill => "no_fill",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShadowTerminalDisposition {
+    SimulatedClosed {
+        action_id: String,
+        reason: String,
+    },
+    SimulationBlocked {
+        action_id: String,
+        reason: ShadowUnresolvedReason,
+    },
+}
+
+pub struct RegisteredShadowPosition {
+    registration: RegisteredPosition,
+    terminal_rx: oneshot::Receiver<ShadowTerminalDisposition>,
+}
+
+impl RegisteredShadowPosition {
+    pub fn into_parts(
+        self,
+    ) -> (
+        RegisteredPosition,
+        oneshot::Receiver<ShadowTerminalDisposition>,
+    ) {
+        (self.registration, self.terminal_rx)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum PositionApplyError {
+    #[error("position not found")]
+    PositionNotFound,
+    #[error("position epoch mismatch")]
+    EpochMismatch,
+    #[error("stale position revision")]
+    StaleRevision,
+    #[error("remaining quantity mismatch")]
+    QuantityMismatch,
+    #[error("pending action mismatch")]
+    ActionMismatch,
+    #[error("another action is already pending")]
+    ConcurrentActionPending,
+    #[error("position is already terminal")]
+    AlreadyTerminal,
 }
 
 /// Signal with its emission timestamp, for aggregation window management.
@@ -784,6 +918,7 @@ enum ShadowLifecycleRecordType {
     ExitFilled,
     ExitBlocked,
     PositionClosed,
+    PositionUnresolved,
     TimeStopV2Window,
 }
 
@@ -818,6 +953,60 @@ struct ShadowLifecycleRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     brain_config_hash: Option<String>,
     record_type: ShadowLifecycleRecordType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_version: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_config_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_reason_v2: Option<TerminalReasonV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_disposition: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remaining_token_amount_raw: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_token_amount_raw: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executable_quote_grade: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_cost_coverage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    net_pnl_authoritative: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mark_return_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executable_gross_return_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mfe_mark_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mae_mark_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_reserve_base_raw: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_reserve_quote_sol: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_own_impact_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_mark_source: Option<PriceTruthSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_mark_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_mark_timestamp_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_mark_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_drawdown_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    absolute_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inactivity_age_ms: Option<u64>,
     timestamp: String,
     timestamp_ms: u64,
     candidate_id: String,
@@ -969,6 +1158,7 @@ fn shadow_lifecycle_record_type_label(record_type: ShadowLifecycleRecordType) ->
         ShadowLifecycleRecordType::ExitFilled => "exit_filled",
         ShadowLifecycleRecordType::ExitBlocked => "exit_blocked",
         ShadowLifecycleRecordType::PositionClosed => "position_closed",
+        ShadowLifecycleRecordType::PositionUnresolved => "position_unresolved",
         ShadowLifecycleRecordType::TimeStopV2Window => "time_stop_v2_window",
     }
 }
@@ -1178,7 +1368,7 @@ pub struct MonitoringEngine {
     config: PostBuyGuardianConfig,
     shadow_ledger: Arc<ShadowLedger>,
     account_state_core: Option<Arc<AccountStateReducer>>,
-    shadow_simple_exit_thresholds: Option<ShadowSimpleExitThresholds>,
+    exit_policy_v1: Option<EffectiveExitPolicyV1Config>,
     positions: Arc<RwLock<HashMap<Pubkey, MonitoredPosition>>>,
     signal_tx: mpsc::Sender<GuardianSignal>,
     /// Optional lane-aware position-management router.
@@ -1216,11 +1406,15 @@ impl MonitoringEngine {
         shadow_ledger: Arc<ShadowLedger>,
         signal_tx: mpsc::Sender<GuardianSignal>,
     ) -> Self {
+        let exit_policy_v1 = match (config.target_threshold, config.stoploss_threshold) {
+            (Some(_), Some(_)) => EffectiveExitPolicyV1Config::from_guardian(&config).ok(),
+            _ => None,
+        };
         Self {
             config,
             shadow_ledger,
             account_state_core: None,
-            shadow_simple_exit_thresholds: None,
+            exit_policy_v1,
             positions: Arc::new(RwLock::new(HashMap::new())),
             signal_tx,
             position_router: None,
@@ -1236,6 +1430,25 @@ impl MonitoringEngine {
         }
     }
 
+    /// Construct the active Position Manager Lite runtime with fail-closed
+    /// validation of its effective policy config.
+    pub fn try_new(
+        config: PostBuyGuardianConfig,
+        shadow_ledger: Arc<ShadowLedger>,
+        signal_tx: mpsc::Sender<GuardianSignal>,
+    ) -> Result<Self, ExitPolicyConfigError> {
+        let exit_policy_v1 = EffectiveExitPolicyV1Config::from_guardian(&config)?;
+        let mut engine = Self::new(config, shadow_ledger, signal_tx);
+        engine.exit_policy_v1 = Some(exit_policy_v1);
+        Ok(engine)
+    }
+
+    pub fn exit_policy_v1_status(&self) -> Option<super::ExitPolicyV1Status> {
+        self.exit_policy_v1
+            .as_ref()
+            .map(EffectiveExitPolicyV1Config::status)
+    }
+
     /// Attach the lane-aware position-management router shared with SignalRouter/AEM.
     pub fn set_position_router(&mut self, position_router: Arc<PositionRuntimeRouter>) {
         self.position_router = Some(position_router);
@@ -1245,11 +1458,19 @@ impl MonitoringEngine {
         self.account_state_core = Some(account_state_core);
     }
 
-    pub fn set_shadow_simple_exit_thresholds(&mut self, take_profit_pct: f64, stop_loss_pct: f64) {
-        self.shadow_simple_exit_thresholds = Some(ShadowSimpleExitThresholds::new(
+    #[cfg(test)]
+    fn set_exit_policy_v1_thresholds_for_tests(
+        &mut self,
+        take_profit_pct: f64,
+        stop_loss_pct: f64,
+    ) {
+        self.exit_policy_v1 = EffectiveExitPolicyV1Config::new(
             take_profit_pct,
             stop_loss_pct,
-        ));
+            self.config.wait_for_timestop_ms(),
+            self.config.exit_policy_v1.quote_recovery_ms,
+        )
+        .ok();
     }
 
     pub async fn wait_for_canonical_snapshot(
@@ -1413,8 +1634,24 @@ impl MonitoringEngine {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(base_mint) {
             if matches!(pos.lane, Lane::Shadow) {
+                let changed = pos
+                    .last_shadow_snapshot
+                    .as_ref()
+                    .is_none_or(|previous| !SnapshotTimeline::equivalent(previous, snapshot));
+                if !changed {
+                    return;
+                }
                 pos.last_shadow_snapshot = Some(snapshot.clone());
                 pos.last_snapshot_source = snapshot_source;
+                if let Some(mark_price) =
+                    PriceTruthResolver::normalize_shadow_snapshot_price_sol(snapshot)
+                {
+                    if mark_price > pos.peak_since_entry {
+                        pos.peak_since_entry = mark_price;
+                        pos.last_peak_unix_ms = snapshot.timestamp_ms;
+                    }
+                }
+                pos.state_revision = pos.state_revision.saturating_add(1);
             }
         }
     }
@@ -1432,8 +1669,324 @@ impl MonitoringEngine {
         if !matches!(pos.lane, Lane::Shadow) {
             return false;
         }
-        pos.shadow_market_activity
-            .observe_snapshot(snapshot, now_ms)
+        let changed = pos
+            .shadow_market_activity
+            .observe_snapshot(snapshot, now_ms);
+        if changed {
+            pos.state_revision = pos.state_revision.saturating_add(1);
+        }
+        changed
+    }
+
+    fn materialize_post_buy_decision_snapshot(
+        &self,
+        base_mint: &Pubkey,
+        now_ms: u64,
+    ) -> Option<(PostBuyDecisionSnapshot, Option<MarketSnapshot>)> {
+        let policy = self.exit_policy_v1.as_ref()?;
+        let positions = self.positions.read();
+        let pos = positions.get(base_mint)?;
+        if !matches!(pos.lane, Lane::Shadow) {
+            return None;
+        }
+
+        let latest_snapshot = pos.last_shadow_snapshot.clone();
+        let (mark_price_sol, mut mark_evidence_status, sample_slot, sample_timestamp_ms) =
+            match latest_snapshot.as_ref() {
+                Some(snapshot) => {
+                    match PriceTruthResolver::normalize_shadow_snapshot_price_sol(snapshot) {
+                        Some(price) => (
+                            Some(price),
+                            MarkEvidenceStatus::Available,
+                            snapshot.slot.or(pos.slot),
+                            Some(snapshot.timestamp_ms),
+                        ),
+                        None => (
+                            None,
+                            MarkEvidenceStatus::Invalid,
+                            snapshot.slot.or(pos.slot),
+                            Some(snapshot.timestamp_ms),
+                        ),
+                    }
+                }
+                None => (None, MarkEvidenceStatus::Unavailable, pos.slot, None),
+            };
+        let drawdown_pct = mark_price_sol.and_then(|price| {
+            (pos.peak_since_entry.is_finite() && pos.peak_since_entry > 0.0)
+                .then_some(((pos.peak_since_entry - price) / pos.peak_since_entry).max(0.0) * 100.0)
+        });
+        let sample_age_ms =
+            sample_timestamp_ms.map(|timestamp_ms| now_ms.saturating_sub(timestamp_ms));
+        if matches!(mark_evidence_status, MarkEvidenceStatus::Available)
+            && sample_age_ms.is_some_and(|age_ms| {
+                let stale_after_ms = self.shadow_exit_stale_after_ms();
+                stale_after_ms > 0 && age_ms > stale_after_ms
+            })
+        {
+            mark_evidence_status = MarkEvidenceStatus::Stale;
+        }
+        let quote_reserve_base_raw = latest_snapshot.as_ref().and_then(|snapshot| {
+            (snapshot.reserve_base.is_finite() && snapshot.reserve_base > 0.0)
+                .then_some(snapshot.reserve_base)
+        });
+        let quote_reserve_quote_sol = latest_snapshot.as_ref().and_then(|snapshot| {
+            (snapshot.reserve_quote.is_finite() && snapshot.reserve_quote > 0.0)
+                .then_some(snapshot.reserve_quote)
+        });
+        let (mut mfe_mark_pct, mut mae_mark_pct) = pos
+            .snapshot_timeline
+            .mark_excursions_pct(pos.entry_price_sol);
+        if let Some(current_mark_return_pct) =
+            pos.entry_price_sol
+                .zip(mark_price_sol)
+                .and_then(|(entry, mark)| {
+                    (entry.is_finite() && entry > 0.0 && mark.is_finite() && mark > 0.0)
+                        .then_some(((mark - entry) / entry) * 100.0)
+                })
+        {
+            mfe_mark_pct = Some(mfe_mark_pct.map_or(current_mark_return_pct, |current| {
+                current.max(current_mark_return_pct)
+            }));
+            mae_mark_pct = Some(mae_mark_pct.map_or(current_mark_return_pct, |current| {
+                current.min(current_mark_return_pct)
+            }));
+        }
+        let guard = PositionSnapshotGuard::new(
+            pos.position_id.clone(),
+            pos.position_epoch,
+            pos.state_revision,
+            pos.remaining_token_amount_raw,
+            sample_slot,
+            sample_timestamp_ms,
+        );
+        let snapshot = PostBuyDecisionSnapshot::new(
+            guard,
+            pos.lane,
+            pos.entry_price_sol,
+            pos.entry_token_amount_raw,
+            pos.remaining_token_amount_raw,
+            pos.entry_unix_ms,
+            now_ms.saturating_sub(pos.entry_unix_ms),
+            now_ms.saturating_sub(pos.shadow_market_activity.last_seen_ms),
+            mark_price_sol,
+            mark_evidence_status,
+            pos.last_snapshot_source,
+            sample_slot,
+            sample_timestamp_ms,
+            sample_age_ms,
+            quote_reserve_base_raw,
+            quote_reserve_quote_sol,
+            mfe_mark_pct,
+            mae_mark_pct,
+            pos.peak_since_entry,
+            drawdown_pct,
+            CrashVectorV1::default(),
+            pos.pending_exit_proposal.is_some(),
+            policy.config_hash().to_string(),
+        );
+        Some((snapshot, latest_snapshot))
+    }
+
+    fn validate_snapshot_guard(
+        pos: &MonitoredPosition,
+        guard: &PositionSnapshotGuard,
+    ) -> Result<(), PositionApplyError> {
+        if pos.position_id != guard.position_id() {
+            return Err(PositionApplyError::PositionNotFound);
+        }
+        if pos.position_epoch != guard.position_epoch() {
+            return Err(PositionApplyError::EpochMismatch);
+        }
+        if pos.state_revision != guard.state_revision() {
+            return Err(PositionApplyError::StaleRevision);
+        }
+        if pos.remaining_token_amount_raw != guard.remaining_token_amount_raw() {
+            return Err(PositionApplyError::QuantityMismatch);
+        }
+        if pos.last_shadow_outcome.is_some() {
+            return Err(PositionApplyError::AlreadyTerminal);
+        }
+        Ok(())
+    }
+
+    fn begin_exit_proposal(
+        &self,
+        base_mint: &Pubkey,
+        snapshot_guard: &PositionSnapshotGuard,
+        candidate: &ExitCandidate,
+        source_snapshot_id: &str,
+        now_ms: u64,
+    ) -> Result<ShadowExitActionHandle, PositionApplyError> {
+        let quote_recovery_ms = self
+            .exit_policy_v1
+            .as_ref()
+            .map(EffectiveExitPolicyV1Config::quote_recovery_ms)
+            .ok_or(PositionApplyError::PositionNotFound)?;
+        let mut positions = self.positions.write();
+        let pos = positions
+            .get_mut(base_mint)
+            .ok_or(PositionApplyError::PositionNotFound)?;
+        Self::validate_snapshot_guard(pos, snapshot_guard)?;
+        if pos.pending_exit_proposal.is_some() {
+            return Err(PositionApplyError::ConcurrentActionPending);
+        }
+
+        let action_seq = pos.next_exit_action_seq;
+        pos.next_exit_action_seq = pos.next_exit_action_seq.saturating_add(1);
+        let action_id = format!("{}:{}:{}", pos.position_id, pos.position_epoch, action_seq);
+        let proposal = PendingExitProposal {
+            action_id: action_id.clone(),
+            position_id: pos.position_id.clone(),
+            position_epoch: pos.position_epoch,
+            reason: candidate.reason(),
+            triggered_at_ms: now_ms,
+            recovery_deadline_ms: now_ms.saturating_add(quote_recovery_ms),
+            expected_remaining_quantity: pos.remaining_token_amount_raw,
+            source_snapshot_id: source_snapshot_id.to_string(),
+            last_quote_attempt_ms: Some(now_ms),
+        };
+        pos.pending_exit_proposal = Some(proposal.clone());
+        pos.state_revision = pos.state_revision.saturating_add(1);
+
+        Ok(ShadowExitActionHandle {
+            base_mint: *base_mint,
+            action_id,
+            position_id: pos.position_id.clone(),
+            position_epoch: pos.position_epoch,
+            state_revision: pos.state_revision,
+            expected_remaining_quantity: pos.remaining_token_amount_raw,
+            reason: candidate.reason(),
+            triggered_at_ms: now_ms,
+            recovery_deadline_ms: proposal.recovery_deadline_ms,
+            source_snapshot_id: source_snapshot_id.to_string(),
+        })
+    }
+
+    fn prepare_pending_quote_retry(
+        &self,
+        base_mint: &Pubkey,
+        snapshot_guard: &PositionSnapshotGuard,
+        now_ms: u64,
+    ) -> Result<Option<ShadowExitActionHandle>, PositionApplyError> {
+        let mut positions = self.positions.write();
+        let pos = positions
+            .get_mut(base_mint)
+            .ok_or(PositionApplyError::PositionNotFound)?;
+        Self::validate_snapshot_guard(pos, snapshot_guard)?;
+        let proposal = pos
+            .pending_exit_proposal
+            .as_mut()
+            .ok_or(PositionApplyError::ActionMismatch)?;
+        if proposal
+            .last_quote_attempt_ms
+            .is_some_and(|last| now_ms.saturating_sub(last) < SHADOW_QUOTE_RETRY_INTERVAL_MS)
+        {
+            return Ok(None);
+        }
+        proposal.last_quote_attempt_ms = Some(now_ms);
+        let proposal = proposal.clone();
+        pos.state_revision = pos.state_revision.saturating_add(1);
+        Ok(Some(ShadowExitActionHandle {
+            base_mint: *base_mint,
+            action_id: proposal.action_id,
+            position_id: proposal.position_id,
+            position_epoch: proposal.position_epoch,
+            state_revision: pos.state_revision,
+            expected_remaining_quantity: proposal.expected_remaining_quantity,
+            reason: proposal.reason,
+            triggered_at_ms: proposal.triggered_at_ms,
+            recovery_deadline_ms: proposal.recovery_deadline_ms,
+            source_snapshot_id: proposal.source_snapshot_id,
+        }))
+    }
+
+    fn validate_action_handle(
+        pos: &MonitoredPosition,
+        handle: &ShadowExitActionHandle,
+    ) -> Result<(), PositionApplyError> {
+        if pos.position_id != handle.position_id {
+            return Err(PositionApplyError::PositionNotFound);
+        }
+        if pos.position_epoch != handle.position_epoch {
+            return Err(PositionApplyError::EpochMismatch);
+        }
+        if pos.state_revision != handle.state_revision {
+            return Err(PositionApplyError::StaleRevision);
+        }
+        if pos.remaining_token_amount_raw != handle.expected_remaining_quantity {
+            return Err(PositionApplyError::QuantityMismatch);
+        }
+        if pos.last_shadow_outcome.is_some() {
+            return Err(PositionApplyError::AlreadyTerminal);
+        }
+        match pos.pending_exit_proposal.as_ref() {
+            Some(proposal) if proposal.action_id == handle.action_id => Ok(()),
+            _ => Err(PositionApplyError::ActionMismatch),
+        }
+    }
+
+    fn apply_shadow_quote_outcome(
+        &self,
+        handle: &ShadowExitActionHandle,
+        snapshot: &PostBuyDecisionSnapshot,
+        truth: &ShadowExitTruth,
+    ) -> Result<(), PositionApplyError> {
+        let mut positions = self.positions.write();
+        let pos = positions
+            .get_mut(&handle.base_mint)
+            .ok_or(PositionApplyError::PositionNotFound)?;
+        Self::validate_action_handle(pos, handle)?;
+        if truth.exit_token_amount_raw != handle.expected_remaining_quantity {
+            return Err(PositionApplyError::QuantityMismatch);
+        }
+
+        pos.realized_exit_value_sol += truth.exit_value_sol;
+        pos.estimated_costs_sol += truth.estimated_costs_sol;
+        pos.realized_pnl_sol += truth.gross_pnl_sol;
+        if pos.entry_value_sol > 0.0 {
+            pos.realized_pnl_pct = (pos.realized_pnl_sol / pos.entry_value_sol) * 100.0;
+        }
+        pos.total_exits = pos.total_exits.saturating_add(1);
+        pos.remaining_fraction_bps = 0;
+        pos.remaining_token_amount_raw = 0;
+        pos.last_price_truth = Some(truth.evidence.clone());
+        pos.last_blocked_truth_status = None;
+        pos.last_blocked_truth_timestamp_ms = None;
+        pos.last_force_exit_reason_code = Some(handle.reason.reason_code().to_string());
+        pos.last_close_reason = Some(Self::shadow_close_reason_from_reason_code(Some(
+            handle.reason.reason_code(),
+        )));
+        pos.last_applied_action_id = Some(handle.action_id.clone());
+        pos.last_source_snapshot_id = Some(handle.source_snapshot_id.clone());
+        pos.last_resolved_exit_metrics = Some(ResolvedShadowExitMetrics::from_snapshot_and_truth(
+            snapshot, truth,
+        ));
+        pos.last_shadow_outcome = Some(ShadowOutcomeKind::SimulatedFilled);
+        pos.pending_exit_proposal = None;
+        pos.state_revision = pos.state_revision.saturating_add(1);
+        Ok(())
+    }
+
+    fn terminate_shadow_proposal(
+        &self,
+        handle: &ShadowExitActionHandle,
+        reason: ShadowUnresolvedReason,
+        evidence: PriceTruthEvidence,
+    ) -> Result<MonitoredPosition, PositionApplyError> {
+        let mut positions = self.positions.write();
+        let pos = positions
+            .get(&handle.base_mint)
+            .ok_or(PositionApplyError::PositionNotFound)?;
+        Self::validate_action_handle(pos, handle)?;
+        let mut pos = positions
+            .remove(&handle.base_mint)
+            .ok_or(PositionApplyError::PositionNotFound)?;
+        pos.last_price_truth = Some(evidence);
+        pos.last_applied_action_id = Some(handle.action_id.clone());
+        pos.last_source_snapshot_id = Some(handle.source_snapshot_id.clone());
+        pos.last_shadow_outcome = Some(reason.outcome_kind());
+        pos.state_revision = pos.state_revision.saturating_add(1);
+        Ok(pos)
     }
 
     async fn refresh_shadow_time_stop_anchor(&self, base_mint: &Pubkey) {
@@ -1563,14 +2116,8 @@ impl MonitoringEngine {
         let max_snapshots = self.snapshot_history_max_snapshots();
         let mut positions = self.positions.write();
         let pos = positions.get_mut(base_mint)?;
-        let latest = pos
-            .snapshot_timeline
-            .ingest_canonical_state(&canonical_state, max_snapshots, retention_ms)
-            .clone();
-        if matches!(pos.lane, Lane::Shadow) {
-            pos.last_shadow_snapshot = Some(latest);
-            pos.last_snapshot_source = PriceTruthSource::CanonicalAccountStateSnapshot;
-        }
+        pos.snapshot_timeline
+            .ingest_canonical_state(&canonical_state, max_snapshots, retention_ms);
         Some(pos.snapshot_timeline.clone_snapshots())
     }
 
@@ -1590,12 +2137,6 @@ impl MonitoringEngine {
         let pos = positions.get_mut(base_mint)?;
         pos.snapshot_timeline
             .replace_with(snapshots, max_snapshots, retention_ms);
-        if let Some(latest) = pos.snapshot_timeline.latest().cloned() {
-            if matches!(pos.lane, Lane::Shadow) {
-                pos.last_shadow_snapshot = Some(latest);
-                pos.last_snapshot_source = PriceTruthSource::ShadowLedgerSnapshot;
-            }
-        }
         Some(pos.snapshot_timeline.clone_snapshots())
     }
 
@@ -1604,15 +2145,6 @@ impl MonitoringEngine {
             self.refresh_snapshot_timeline_from_canonical(base_mint)
         } else {
             self.refresh_snapshot_timeline_from_legacy(base_mint)
-        }
-    }
-
-    fn remember_shadow_time_stop_reason(&self, base_mint: &Pubkey) {
-        let mut positions = self.positions.write();
-        if let Some(pos) = positions.get_mut(base_mint) {
-            if pos.last_force_exit_reason_code.is_none() {
-                pos.last_force_exit_reason_code = Some("time_stop".to_string());
-            }
         }
     }
 
@@ -1628,131 +2160,6 @@ impl MonitoringEngine {
             stale_after_ms,
             source,
         )
-    }
-
-    fn shadow_snapshot_trace_id(snapshot: &MarketSnapshot) -> String {
-        let slot = snapshot
-            .slot
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string());
-        format!("slot={slot}:timestamp_ms={}", snapshot.timestamp_ms)
-    }
-
-    fn stale_time_stop_rejection_evidence(
-        position_id: &str,
-        snapshot: &MarketSnapshot,
-        now_ms: u64,
-        exit_token_amount_raw: u64,
-        evidence: &PriceTruthEvidence,
-    ) -> PriceTruthEvidence {
-        let oracle_spot_price = PriceTruthResolver::normalize_shadow_snapshot_price_sol(snapshot);
-        let computed_exit_price = PriceTruthResolver::resolve_shadow_exit_sample_with_source(
-            snapshot,
-            now_ms,
-            0,
-            evidence.source,
-        )
-        .ok()
-        .and_then(|sample| {
-            let exit_qty_tokens = exit_token_amount_raw as f64 / SHADOW_TOKEN_DECIMAL_FACTOR_F64;
-            if exit_qty_tokens <= 0.0 {
-                return None;
-            }
-            let exit_value_sol = sample.curve.calculate_sell_price(exit_token_amount_raw) as f64
-                / SHADOW_LAMPORTS_PER_SOL_F64;
-            let exit_price_sol = exit_value_sol / exit_qty_tokens;
-            (exit_price_sol.is_finite() && exit_price_sol > 0.0).then_some(exit_price_sol)
-        });
-        let snapshot_id = Self::shadow_snapshot_trace_id(snapshot);
-        warn!(
-            position_id = %position_id,
-            truth_status = "stale",
-            sample_slot = ?snapshot.slot,
-            oracle_spot_price = oracle_spot_price.unwrap_or(0.0),
-            reserve_in = snapshot.reserve_base,
-            reserve_out = snapshot.reserve_quote,
-            exit_qty = exit_token_amount_raw,
-            computed_exit_price = computed_exit_price.unwrap_or(0.0),
-            formula_id = SHADOW_EXIT_TRACE_FORMULA_ID,
-            snapshot_id = %snapshot_id,
-            source_path = SHADOW_TIME_STOP_STALE_SOURCE_PATH,
-            "PostBuyGuardian: stale time-stop trace"
-        );
-
-        let mut blocked_evidence = evidence.clone();
-        let mut detail = blocked_evidence
-            .detail
-            .clone()
-            .unwrap_or_else(|| "stale shadow exit sample".to_string());
-        detail.push_str("; stale time-stop rejected without emitting fill");
-        detail.push_str(&format!("; formula_id={SHADOW_EXIT_TRACE_FORMULA_ID}"));
-        detail.push_str(&format!("; snapshot_id={snapshot_id}"));
-        detail.push_str(&format!(
-            "; source_path={SHADOW_TIME_STOP_STALE_SOURCE_PATH}"
-        ));
-        detail.push_str(&format!("; reserve_in={}", snapshot.reserve_base));
-        detail.push_str(&format!("; reserve_out={}", snapshot.reserve_quote));
-        detail.push_str(&format!("; exit_qty={exit_token_amount_raw}"));
-        if let Some(oracle_spot_price) = oracle_spot_price {
-            detail.push_str(&format!("; oracle_spot_price={oracle_spot_price}"));
-        }
-        if let Some(computed_exit_price) = computed_exit_price {
-            detail.push_str(&format!("; computed_exit_price={computed_exit_price}"));
-        }
-
-        let semantic_violation = match (oracle_spot_price, computed_exit_price) {
-            (Some(oracle_spot_price), Some(computed_exit_price))
-                if oracle_spot_price.is_finite()
-                    && oracle_spot_price > 0.0
-                    && computed_exit_price
-                        > oracle_spot_price + (oracle_spot_price.abs() * 1e-9 + 1e-15) =>
-            {
-                true
-            }
-            _ => false,
-        };
-        if semantic_violation {
-            detail.push_str("; semantic_violation=exit_fill_above_oracle_spot");
-            blocked_evidence.status = PriceTruthStatus::SemanticViolation;
-        }
-        blocked_evidence.detail = Some(detail);
-        blocked_evidence
-    }
-
-    async fn force_close_shadow_without_exit_truth(
-        &self,
-        base_mint: &Pubkey,
-        position_id: &str,
-        now_ms: u64,
-        evidence: PriceTruthEvidence,
-    ) {
-        self.maybe_record_shadow_exit_blocked(base_mint, now_ms, 10_000, &evidence);
-
-        {
-            let mut positions = self.positions.write();
-            let Some(pos) = positions.get_mut(base_mint) else {
-                return;
-            };
-            pos.last_force_exit_reason_code = Some("time_stop".to_string());
-            pos.last_close_reason = Some(CloseReason::TimeStop);
-            pos.last_price_truth = Some(evidence);
-        }
-
-        if let Some(router) = self.position_router.as_ref() {
-            if let Some(shadow_book) = router.shadow_book() {
-                let _ = shadow_book.write().await.remove_position(position_id);
-            }
-        }
-        let shadow_backend = { self.shadow_backend.read().clone() };
-        if let Some(shadow_backend) = shadow_backend {
-            let _ = shadow_backend.unregister_position(position_id).await;
-        }
-
-        warn!(
-            position_id = %position_id,
-            "PostBuyGuardian: forcing shadow time-stop close without resolved exit truth"
-        );
-        self.unregister_position(base_mint);
     }
 
     fn append_jsonl_record(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
@@ -1904,6 +2311,7 @@ impl MonitoringEngine {
             ShadowLifecycleRecordType::ExitFilled
                 | ShadowLifecycleRecordType::ExitBlocked
                 | ShadowLifecycleRecordType::PositionClosed
+                | ShadowLifecycleRecordType::PositionUnresolved
         ) {
             records.push(ShadowV2Record::ShadowPathSampleV2(
                 self.shadow_v2_path_sample_from_lifecycle(record),
@@ -1912,26 +2320,35 @@ impl MonitoringEngine {
 
         if matches!(
             record.record_type,
-            ShadowLifecycleRecordType::ExitFilled | ShadowLifecycleRecordType::ExitBlocked
+            ShadowLifecycleRecordType::ExitFilled
+                | ShadowLifecycleRecordType::ExitBlocked
+                | ShadowLifecycleRecordType::PositionUnresolved
         ) {
             records.push(ShadowV2Record::ShadowExitAttemptV2(
                 self.shadow_v2_exit_attempt_from_lifecycle(record),
             ));
-            let exit_pool_state = self.shadow_v2_exit_pool_state_sample_from_lifecycle(record);
-            if let Some(pool_state) = exit_pool_state.as_ref() {
-                records.push(ShadowV2Record::PoolStateSampleV2(pool_state.clone()));
+            if matches!(record.record_type, ShadowLifecycleRecordType::ExitFilled) {
+                let exit_pool_state = self.shadow_v2_exit_pool_state_sample_from_lifecycle(record);
+                if let Some(pool_state) = exit_pool_state.as_ref() {
+                    records.push(ShadowV2Record::PoolStateSampleV2(pool_state.clone()));
+                }
+                let exit_fill =
+                    self.shadow_v2_exit_fill_from_lifecycle(record, exit_pool_state.as_ref());
+                pending_exit_fill_for_terminal = Some(exit_fill.clone());
+                records.push(ShadowV2Record::ShadowExitFillV2(exit_fill));
             }
-            let exit_fill =
-                self.shadow_v2_exit_fill_from_lifecycle(record, exit_pool_state.as_ref());
-            pending_exit_fill_for_terminal = Some(exit_fill.clone());
-            records.push(ShadowV2Record::ShadowExitFillV2(exit_fill));
         }
 
         if matches!(
             record.record_type,
             ShadowLifecycleRecordType::PositionClosed
+                | ShadowLifecycleRecordType::PositionUnresolved
         ) {
-            if record.total_exits == 0 {
+            if matches!(
+                record.record_type,
+                ShadowLifecycleRecordType::PositionClosed
+            ) && record.total_exits == 0
+            {
                 records.push(ShadowV2Record::ShadowExitAttemptV2(
                     self.shadow_v2_exit_attempt_from_lifecycle(record),
                 ));
@@ -1949,11 +2366,18 @@ impl MonitoringEngine {
 
         let mut harness = harness.lock();
         if terminal_truth_requested {
-            let executable_pnl_link = executable_pnl_link_from_canonical_position_fills(
-                harness.canonical_stream(),
-                &record.position_id,
-                pending_exit_fill_for_terminal.as_ref(),
-            );
+            let executable_pnl_link = if matches!(
+                record.record_type,
+                ShadowLifecycleRecordType::PositionUnresolved
+            ) {
+                None
+            } else {
+                executable_pnl_link_from_canonical_position_fills(
+                    harness.canonical_stream(),
+                    &record.position_id,
+                    pending_exit_fill_for_terminal.as_ref(),
+                )
+            };
             records.push(ShadowV2Record::ShadowTerminalTruthV2(
                 self.shadow_v2_terminal_truth_from_lifecycle(record, executable_pnl_link),
             ));
@@ -2245,6 +2669,7 @@ impl MonitoringEngine {
             if matches!(
                 record.record_type,
                 ShadowLifecycleRecordType::PositionClosed
+                    | ShadowLifecycleRecordType::PositionUnresolved
             ) {
                 ShadowPathSamplingReasonV2::Terminal
             } else {
@@ -2305,10 +2730,12 @@ impl MonitoringEngine {
             },
             record.exit_sample_slot.or(record.sample_slot),
             format!("{:?}", record.truth_source),
-            self.shadow_simple_exit_thresholds
-                .map(|thresholds| (thresholds.take_profit_pct * 100.0).round() as i32),
-            self.shadow_simple_exit_thresholds
-                .map(|thresholds| -((thresholds.stop_loss_pct * 100.0).round() as i32)),
+            self.exit_policy_v1
+                .as_ref()
+                .map(|policy| (policy.take_profit_fraction() * 100.0).round() as i32),
+            self.exit_policy_v1
+                .as_ref()
+                .map(|policy| -((policy.stop_loss_fraction() * 100.0).round() as i32)),
             Some(self.config.wait_for_timestop_ms()),
             false,
             Some("BLOCK_AMBIGUOUS".to_string()),
@@ -2499,6 +2926,14 @@ impl MonitoringEngine {
         record: &ShadowLifecycleRecord,
         executable_pnl_link: Option<ShadowV2ExecutablePnlLink>,
     ) -> ShadowTerminalTruthV2 {
+        let terminal_source = if matches!(
+            record.record_type,
+            ShadowLifecycleRecordType::PositionUnresolved
+        ) {
+            "shadow_lifecycle.position_unresolved"
+        } else {
+            "shadow_lifecycle.position_closed"
+        };
         let terminal_ts = record
             .exit_reason_evaluation_ts_ms
             .or(record.sample_timestamp_ms)
@@ -2518,9 +2953,7 @@ impl MonitoringEngine {
         envelope.simulation_level = SimulationLevel::MarkOnly;
         envelope.measurement_grade = MeasurementGrade::MarkPriceReplay;
         envelope.quality = "TERMINAL_TRUTH_DERIVED_FROM_LEGACY_LIFECYCLE".to_string();
-        envelope
-            .source_refs
-            .push("shadow_lifecycle:position_closed".to_string());
+        envelope.source_refs.push(terminal_source.replace('.', ":"));
         envelope
             .limitations
             .push("TERMINAL_TRUTH_MARK_PATH_ONLY_NOT_EXECUTABLE_FILL".to_string());
@@ -2572,17 +3005,26 @@ impl MonitoringEngine {
                 shadow_v2_event_seq(terminal_ts, 5),
                 terminal_ts,
             ),
-            terminal_reason: shadow_v2_terminal_reason(record.close_reason),
+            terminal_reason: record
+                .terminal_reason_v2
+                .unwrap_or_else(|| shadow_v2_terminal_reason(record.close_reason)),
             terminal_ts_ms: ClockedTimestamp {
                 field_name: "terminal_ts_ms".to_string(),
                 value: Some(terminal_ts as i64),
                 clock_domain: ClockDomain::StreamObservedMs,
-                clock_source: "shadow_lifecycle.position_closed".to_string(),
+                clock_source: terminal_source.to_string(),
                 causal_boundary: "POST_EXIT_TERMINAL_TRUTH".to_string(),
             },
             terminal_slot: record.exit_landed_slot.or(record.exit_sample_slot),
-            terminal_source: "shadow_lifecycle.position_closed".to_string(),
-            final_pnl_mark_bps: shadow_v2_pnl_bps_from_lifecycle(record),
+            terminal_source: terminal_source.to_string(),
+            final_pnl_mark_bps: if matches!(
+                record.record_type,
+                ShadowLifecycleRecordType::PositionUnresolved
+            ) {
+                None
+            } else {
+                shadow_v2_pnl_bps_from_lifecycle(record)
+            },
             final_pnl_executable_bps,
             close_age_ms: record.duration_ms,
             linked_entry_fill,
@@ -2939,6 +3381,13 @@ impl MonitoringEngine {
         now_ms: u64,
         evidence: &PriceTruthEvidence,
     ) -> ShadowLifecycleRecord {
+        let has_executable_quote_contract = matches!(
+            record_type,
+            ShadowLifecycleRecordType::ExitFilled
+                | ShadowLifecycleRecordType::ExitBlocked
+                | ShadowLifecycleRecordType::PositionClosed
+                | ShadowLifecycleRecordType::PositionUnresolved
+        );
         let exit_landed_slot = synthetic_next_slot(evidence.slot);
         let time_stop_v2_observed = pos.time_stop_v2.has_observed();
         ShadowLifecycleRecord {
@@ -2957,6 +3406,114 @@ impl MonitoringEngine {
             brain_config_path: pos.join_metadata.brain_config_path.clone(),
             brain_config_hash: pos.join_metadata.brain_config_hash.clone(),
             record_type,
+            policy_id: self
+                .exit_policy_v1
+                .as_ref()
+                .map(|policy| policy.policy_id().to_string()),
+            policy_version: self
+                .exit_policy_v1
+                .as_ref()
+                .map(EffectiveExitPolicyV1Config::policy_version),
+            policy_config_hash: self
+                .exit_policy_v1
+                .as_ref()
+                .map(|policy| policy.config_hash().to_string()),
+            source_snapshot_id: pos
+                .pending_exit_proposal
+                .as_ref()
+                .map(|proposal| proposal.source_snapshot_id.clone())
+                .or_else(|| pos.last_source_snapshot_id.clone()),
+            action_id: pos
+                .pending_exit_proposal
+                .as_ref()
+                .map(|proposal| proposal.action_id.clone())
+                .or_else(|| pos.last_applied_action_id.clone()),
+            terminal_reason_v2: None,
+            terminal_disposition: None,
+            remaining_token_amount_raw: Some(pos.remaining_token_amount_raw),
+            entry_token_amount_raw: Some(
+                pos.last_resolved_exit_metrics
+                    .as_ref()
+                    .map_or(pos.entry_token_amount_raw, |metrics| {
+                        metrics.entry_token_amount_raw
+                    }),
+            ),
+            recovery_elapsed_ms: None,
+            executable_quote_grade: has_executable_quote_contract
+                .then(|| EXECUTABLE_QUOTE_GRADE.to_string()),
+            execution_cost_coverage: has_executable_quote_contract
+                .then(|| EXECUTION_COST_COVERAGE_UNMODELED.to_string()),
+            net_pnl_authoritative: has_executable_quote_contract.then_some(false),
+            mark_return_pct: pos
+                .last_resolved_exit_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.mark_return_pct),
+            executable_gross_return_pct: pos
+                .last_resolved_exit_metrics
+                .as_ref()
+                .map(|metrics| metrics.executable_gross_return_pct),
+            mfe_mark_pct: pos
+                .last_resolved_exit_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.mfe_mark_pct),
+            mae_mark_pct: pos
+                .last_resolved_exit_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.mae_mark_pct),
+            quote_reserve_base_raw: pos
+                .last_resolved_exit_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.quote_reserve_base_raw),
+            quote_reserve_quote_sol: pos
+                .last_resolved_exit_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.quote_reserve_quote_sol),
+            quote_own_impact_bps: pos
+                .last_resolved_exit_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.quote_own_impact_bps),
+            decision_mark_source: Some(
+                pos.last_resolved_exit_metrics
+                    .as_ref()
+                    .map_or(pos.last_snapshot_source, |metrics| {
+                        metrics.decision_mark_source
+                    }),
+            ),
+            decision_mark_slot: pos
+                .last_resolved_exit_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.decision_mark_slot)
+                .or_else(|| {
+                    pos.last_shadow_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.slot)
+                }),
+            decision_mark_timestamp_ms: pos
+                .last_resolved_exit_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.decision_mark_timestamp_ms)
+                .or_else(|| {
+                    pos.last_shadow_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.timestamp_ms)
+                }),
+            decision_mark_age_ms: pos
+                .last_resolved_exit_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.decision_mark_age_ms)
+                .or_else(|| {
+                    pos.last_shadow_snapshot
+                        .as_ref()
+                        .map(|snapshot| now_ms.saturating_sub(snapshot.timestamp_ms))
+                }),
+            peak_drawdown_pct: pos.last_shadow_snapshot.as_ref().and_then(|snapshot| {
+                let mark = PriceTruthResolver::normalize_shadow_snapshot_price_sol(snapshot)?;
+                (pos.peak_since_entry.is_finite() && pos.peak_since_entry > 0.0).then_some(
+                    ((pos.peak_since_entry - mark) / pos.peak_since_entry).max(0.0) * 100.0,
+                )
+            }),
+            absolute_age_ms: Some(now_ms.saturating_sub(pos.entry_unix_ms)),
+            inactivity_age_ms: Some(now_ms.saturating_sub(pos.shadow_market_activity.last_seen_ms)),
             timestamp: chrono::Utc::now().to_rfc3339(),
             timestamp_ms: now_ms,
             candidate_id: pos.candidate_id.clone(),
@@ -2983,7 +3540,10 @@ impl MonitoringEngine {
             exit_price: None,
             entry_value_sol: None,
             exit_value_sol: None,
-            exit_token_amount_raw: None,
+            exit_token_amount_raw: pos
+                .last_resolved_exit_metrics
+                .as_ref()
+                .map(|metrics| metrics.exit_token_amount_raw),
             gross_pnl_sol: None,
             net_pnl_sol: None,
             estimated_costs_sol: None,
@@ -3159,6 +3719,62 @@ impl MonitoringEngine {
         entry_token_amount_raw: Option<u64>,
         context: Option<PositionEventContext>,
     ) -> Option<RegisteredPosition> {
+        self.register_position_with_context_internal(
+            pool_amm_id,
+            base_mint,
+            bonding_curve,
+            entry_price_sol,
+            entry_amount_lamports,
+            entry_token_amount_raw,
+            context,
+            None,
+        )
+    }
+
+    /// Register an active shadow position together with the exact terminal
+    /// notification channel consumed by `PostBuyRuntime`.
+    pub fn register_shadow_position_with_terminal(
+        &self,
+        pool_amm_id: Pubkey,
+        base_mint: Pubkey,
+        bonding_curve: Pubkey,
+        entry_price_sol: Option<f64>,
+        entry_amount_lamports: Option<u64>,
+        entry_token_amount_raw: Option<u64>,
+        context: PositionEventContext,
+    ) -> Option<RegisteredShadowPosition> {
+        if !matches!(context.lane, Lane::Shadow) {
+            return None;
+        }
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let registration = self.register_position_with_context_internal(
+            pool_amm_id,
+            base_mint,
+            bonding_curve,
+            entry_price_sol,
+            entry_amount_lamports,
+            entry_token_amount_raw,
+            Some(context),
+            Some(terminal_tx),
+        )?;
+        Some(RegisteredShadowPosition {
+            registration,
+            terminal_rx,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_position_with_context_internal(
+        &self,
+        pool_amm_id: Pubkey,
+        base_mint: Pubkey,
+        bonding_curve: Pubkey,
+        entry_price_sol: Option<f64>,
+        entry_amount_lamports: Option<u64>,
+        entry_token_amount_raw: Option<u64>,
+        context: Option<PositionEventContext>,
+        terminal_tx: Option<oneshot::Sender<ShadowTerminalDisposition>>,
+    ) -> Option<RegisteredPosition> {
         let initial_shadow_snapshot = self.current_shadow_curve_snapshot(&base_mint);
         let mut snapshot_timeline = SnapshotTimeline::default();
         if let Some(snapshot) = initial_shadow_snapshot.clone() {
@@ -3233,6 +3849,14 @@ impl MonitoringEngine {
             remaining_token_amount_raw: entry_token_amount_raw.unwrap_or(0),
             position_id: position_id.clone(),
             position_epoch,
+            state_revision: 1,
+            next_exit_action_seq: 1,
+            pending_exit_proposal: None,
+            terminal_tx,
+            last_applied_action_id: None,
+            last_source_snapshot_id: None,
+            last_resolved_exit_metrics: None,
+            last_shadow_outcome: None,
             join_metadata: event_context.join_metadata.clone(),
             entry_order_id: event_context.entry_order_id.clone(),
             quote_id: event_context.quote_id.clone(),
@@ -3308,8 +3932,9 @@ impl MonitoringEngine {
         })
     }
 
-    /// Remove position from monitoring (after sell, expiry, or panic kill).
-    pub fn unregister_position(&self, base_mint: &Pubkey) {
+    /// Administrative removal for shutdown/tests. It deliberately emits no
+    /// economic terminal event and therefore cannot masquerade as a fill.
+    pub fn remove_position_administratively(&self, base_mint: &Pubkey) {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.remove(base_mint) {
             if let Some(ref runtime) = self.aem_runtime {
@@ -3323,7 +3948,6 @@ impl MonitoringEngine {
                 duration_ms as f64 / 1000.0,
                 pos.recent_signals.len()
             );
-            self.emit_position_closed(&pos, duration_ms);
         }
     }
 
@@ -3575,7 +4199,7 @@ impl MonitoringEngine {
             // ── AEM v1 decision loop ────────────────────────────────
             self.run_aem_tick(base_mint, &snapshots, now_ms).await;
 
-            // ── Shadow virtual magazine / exit runtime ─────────────
+            // ── Position Manager Lite V1 policy ────────────────────
             let runtime_snapshot = self.current_runtime_shadow_snapshot(base_mint, now_ms);
             let runtime_snapshot = runtime_snapshot.as_ref().unwrap_or(latest);
             self.observe_exit_replay_snapshot(base_mint, runtime_snapshot);
@@ -3636,14 +4260,25 @@ impl MonitoringEngine {
             }
             if !router.is_position_active(lane, &mint, &position_id).await {
                 if matches!(lane, Lane::Shadow) {
-                    let shadow_backend = { self.shadow_backend.read().clone() };
-                    if let Some(shadow_backend) = shadow_backend {
-                        let _ = shadow_backend.unregister_position(&position_id).await;
+                    {
+                        let mut positions = self.positions.write();
+                        if let Some(pos) = positions.get_mut(&mint) {
+                            pos.runtime_registered = false;
+                        }
                     }
+                    let repaired = self.ensure_shadow_runtime_registered(&mint).await;
+                    warn!(
+                        position_id = %position_id,
+                        mint = %mint,
+                        consumed_by_policy = false,
+                        mirror_repaired = repaired,
+                        "PostBuyGuardian: non-authoritative shadow mirror was missing; canonical position retained"
+                    );
+                    continue;
                 }
-                self.unregister_position(&mint);
+                self.remove_position_administratively(&mint);
                 info!(
-                    "🛡️ PostBuyGuardian: Auto-unregistered lane={} mint={} (no longer in managed runtime)",
+                    "🛡️ PostBuyGuardian: Administratively removed lane={} mint={} (no longer in managed runtime)",
                     lane, mint
                 );
             }
@@ -4663,659 +5298,309 @@ impl MonitoringEngine {
         latest: Option<&MarketSnapshot>,
         now_ms: u64,
     ) {
-        if self.shadow_simple_exit_thresholds.is_some() {
-            self.run_shadow_simple_threshold_tick(base_mint, latest, now_ms)
-                .await;
+        let Some(policy) = self.exit_policy_v1.as_ref() else {
             return;
+        };
+        if let Some(latest) = latest {
+            self.remember_shadow_snapshot(base_mint, latest);
         }
 
-        let Some(ref router) = self.position_router else {
-            return;
-        };
-        let Some(shadow_book) = router.shadow_book() else {
-            return;
-        };
-        if !self.ensure_shadow_runtime_registered(base_mint).await {
-            return;
-        }
-
-        let (
-            candidate_id,
-            position_id,
-            position_epoch,
-            entry_order_id,
-            quote_id,
-            slot,
-            entry_price_opt,
-            entry_unix_ms,
-            last_market_activity_seen_ms,
-            snapshot_source,
-        ) = {
-            let positions = self.positions.read();
-            let Some(pos) = positions.get(base_mint) else {
-                return;
-            };
-            if !matches!(pos.lane, Lane::Shadow) {
-                return;
-            }
-            (
-                pos.candidate_id.clone(),
-                pos.position_id.clone(),
-                pos.position_epoch,
-                pos.entry_order_id.clone(),
-                pos.quote_id.clone(),
-                pos.slot,
-                pos.entry_price_sol,
-                pos.entry_unix_ms,
-                pos.shadow_market_activity.last_seen_ms,
-                pos.last_snapshot_source,
-            )
-        };
-
-        let Some(entry_price_sol) =
-            entry_price_opt.and_then(|price| (price.is_finite() && price > 0.0).then_some(price))
+        let Some((snapshot, latest_snapshot)) =
+            self.materialize_post_buy_decision_snapshot(base_mint, now_ms)
         else {
-            warn!(
-                position_id = %position_id,
-                "PostBuyGuardian: shadow runtime missing authoritative entry price; refusing synthetic fallback"
-            );
             return;
         };
 
-        let inactivity_elapsed_ms = now_ms.saturating_sub(last_market_activity_seen_ms);
-        let time_stop_due = inactivity_elapsed_ms >= self.shadow_position_time_stop_ms();
-        let latest_snapshot = latest.cloned();
-        let Some(latest_snapshot) = latest_snapshot else {
-            if time_stop_due {
-                let evidence = PriceTruthEvidence {
-                    source: snapshot_source,
-                    status: PriceTruthStatus::Failure,
-                    detail: Some(
-                        "shadow time-stop expired before any canonical snapshot reached guardian"
-                            .to_string(),
-                    ),
-                    slot,
-                    timestamp_ms: Some(now_ms),
-                    age_ms: None,
-                    price_state: None,
-                    price_reason: None,
-                };
-                self.force_close_shadow_without_exit_truth(
-                    base_mint,
-                    &position_id,
-                    now_ms,
-                    evidence,
-                )
-                .await;
-            }
-            return;
-        };
-        self.remember_shadow_snapshot(base_mint, &latest_snapshot);
-        let Some(current_price_sol) =
-            PriceTruthResolver::normalize_shadow_snapshot_price_sol(&latest_snapshot)
-        else {
-            if time_stop_due {
-                let evidence = PriceTruthEvidence {
-                    source: snapshot_source,
-                    status: PriceTruthStatus::Failure,
-                    detail: Some(
-                        "shadow snapshot price could not be normalized into canonical SOL/token"
-                            .to_string(),
-                    ),
-                    slot,
-                    timestamp_ms: Some(latest_snapshot.timestamp_ms),
-                    age_ms: Some(now_ms.saturating_sub(latest_snapshot.timestamp_ms)),
-                    price_state: Some(latest_snapshot.price_state),
-                    price_reason: latest_snapshot.price_reason,
-                };
-                self.force_close_shadow_without_exit_truth(
-                    base_mint,
-                    &position_id,
-                    now_ms,
-                    evidence,
-                )
-                .await;
-            }
-            return;
-        };
-
-        let mut exit_preview = shadow_book
-            .read()
-            .await
-            .preview_exit(base_mint, current_price_sol);
-        let mut triggered_fraction_bps = exit_preview.fraction_bps;
-        if time_stop_due && exit_preview.has_time_stop_trigger {
-            self.remember_shadow_time_stop_reason(base_mint);
-        }
-        if triggered_fraction_bps == 0 && time_stop_due {
-            {
-                let mut positions = self.positions.write();
-                if let Some(pos) = positions.get_mut(base_mint) {
-                    if pos.last_force_exit_reason_code.is_none() {
-                        pos.last_force_exit_reason_code = Some("time_stop".to_string());
-                    }
-                }
-            }
-            if shadow_book.write().await.force_exit_all(base_mint) {
-                info!(
-                    position_id = %position_id,
-                    inactivity_elapsed_ms,
-                    position_age_ms = now_ms.saturating_sub(entry_unix_ms),
-                    sample_age_ms = now_ms.saturating_sub(latest_snapshot.timestamp_ms),
-                    "PostBuyGuardian: shadow inactivity time-stop forcing full exit"
-                );
-            }
-            exit_preview = shadow_book
-                .read()
-                .await
-                .preview_exit(base_mint, current_price_sol);
-            triggered_fraction_bps = exit_preview.fraction_bps;
-            if time_stop_due && exit_preview.has_time_stop_trigger {
-                self.remember_shadow_time_stop_reason(base_mint);
-            }
-        }
-        if triggered_fraction_bps == 0 {
-            return;
-        }
-
-        let sample = match Self::resolve_shadow_exit_sample_for_runtime(
-            &latest_snapshot,
-            now_ms,
-            self.shadow_exit_stale_after_ms(),
-            snapshot_source,
-        ) {
-            Ok(sample) => {
-                let mut positions = self.positions.write();
-                if let Some(pos) = positions.get_mut(base_mint) {
-                    pos.last_blocked_truth_status = None;
-                    pos.last_blocked_truth_timestamp_ms = None;
-                }
-                sample
-            }
-            Err(error) => {
-                if time_stop_due {
-                    let evidence = match &error {
-                        trigger::PriceTruthError::Stale { evidence, .. } => {
-                            let exit_token_amount_raw = self
-                                .positions
-                                .read()
-                                .get(base_mint)
-                                .map(|pos| pos.remaining_token_amount_raw)
-                                .unwrap_or(0);
-                            Self::stale_time_stop_rejection_evidence(
-                                &position_id,
-                                &latest_snapshot,
-                                now_ms,
-                                exit_token_amount_raw,
-                                evidence,
-                            )
-                        }
-                        _ => error.evidence().clone(),
-                    };
-                    self.force_close_shadow_without_exit_truth(
-                        base_mint,
-                        &position_id,
-                        now_ms,
-                        evidence,
-                    )
-                    .await;
+        let action = if snapshot.has_pending_proposal() {
+            match self.prepare_pending_quote_retry(base_mint, snapshot.guard(), now_ms) {
+                Ok(Some(action)) => action,
+                Ok(None) => return,
+                Err(PositionApplyError::StaleRevision) => return,
+                Err(error) => {
+                    debug!(
+                        base_mint = %base_mint,
+                        error = %error,
+                        "PostBuyGuardian: pending exit proposal could not be retried"
+                    );
                     return;
                 }
-                self.maybe_record_shadow_exit_blocked(
-                    base_mint,
-                    now_ms,
-                    triggered_fraction_bps,
-                    error.evidence(),
-                );
-                warn!(
-                    position_id = %position_id,
-                    truth_status = ?error.status(),
-                    error = %error,
-                    "PostBuyGuardian: shadow exit blocked because price truth is unavailable"
-                );
-                return;
+            }
+        } else {
+            let candidate = match ExitPolicyV1::evaluate_prequote(&snapshot, policy) {
+                PreQuoteDecision::Hold | PreQuoteDecision::UnknownEvidence { .. } => return,
+                PreQuoteDecision::QuoteRequired { candidate } => candidate,
+            };
+            match self.begin_exit_proposal(
+                base_mint,
+                snapshot.guard(),
+                &candidate,
+                snapshot.snapshot_id(),
+                now_ms,
+            ) {
+                Ok(action) => action,
+                Err(PositionApplyError::StaleRevision) => return,
+                Err(error) => {
+                    debug!(
+                        base_mint = %base_mint,
+                        error = %error,
+                        "PostBuyGuardian: exit proposal rejected by guarded apply"
+                    );
+                    return;
+                }
             }
         };
 
-        let exits = shadow_book.write().await.process_market_snapshot(
-            base_mint,
-            sample.exit_price_sol,
-            now_ms,
-        );
-        if exits.is_empty() {
-            return;
-        }
-
-        for exit in exits {
-            let exit_token_amount_result = {
-                let positions = self.positions.read();
-                let Some(pos) = positions.get(base_mint) else {
-                    return;
-                };
-                Self::shadow_exit_token_amount_raw(pos, &exit)
-            };
-            let exit_token_amount_raw = match exit_token_amount_result {
-                Ok(amount) => amount,
-                Err(detail) => {
-                    let evidence = PriceTruthEvidence {
+        let evidence_source = self.snapshot_source_for_position(base_mint);
+        let quote_result = latest_snapshot
+            .as_ref()
+            .ok_or_else(|| PriceTruthEvidence {
+                source: evidence_source,
+                status: PriceTruthStatus::Failure,
+                detail: Some("no canonical snapshot available for pending shadow exit".to_string()),
+                slot: snapshot.guard().latest_sample_slot(),
+                timestamp_ms: snapshot.guard().latest_sample_timestamp_ms(),
+                age_ms: None,
+                price_state: None,
+                price_reason: None,
+            })
+            .and_then(|latest_snapshot| {
+                Self::resolve_shadow_exit_sample_for_runtime(
+                    latest_snapshot,
+                    now_ms,
+                    self.shadow_exit_stale_after_ms(),
+                    evidence_source,
+                )
+                .map_err(|error| error.evidence().clone())
+            })
+            .and_then(|sample| {
+                let entry_price = snapshot
+                    .entry_price_sol()
+                    .ok_or_else(|| PriceTruthEvidence {
                         source: sample.evidence.source,
-                        status: PriceTruthStatus::Failure,
-                        detail: Some(detail),
+                        status: PriceTruthStatus::SemanticViolation,
+                        detail: Some("shadow entry price missing at quote boundary".to_string()),
                         slot: sample.evidence.slot,
                         timestamp_ms: sample.evidence.timestamp_ms,
                         age_ms: sample.evidence.age_ms,
                         price_state: sample.evidence.price_state,
                         price_reason: sample.evidence.price_reason,
+                    })?;
+                PriceTruthResolver::resolve_shadow_exit(
+                    entry_price,
+                    action.expected_remaining_quantity,
+                    &sample,
+                    0.0,
+                )
+                .map_err(|error| error.evidence().clone())
+            });
+
+        let truth = match quote_result {
+            Ok(truth) => truth,
+            Err(evidence) => {
+                self.handle_shadow_quote_failure(action, evidence, now_ms)
+                    .await;
+                return;
+            }
+        };
+
+        let quote = ExecutableExitQuote::new(
+            truth.exit_token_amount_raw,
+            truth.exit_price_sol,
+            truth.exit_value_sol,
+            truth.gross_pnl_sol,
+            truth.pnl_pct,
+        );
+        let candidate = ExitCandidate::from_reason(action.reason);
+        match ExitPolicyV1::finalize_with_quote(&snapshot, &candidate, &quote, policy) {
+            FinalPolicyDecision::Exit { intent } => {
+                if intent.quantity_raw() != action.expected_remaining_quantity
+                    || intent.reason() != action.reason
+                {
+                    let evidence = PriceTruthEvidence {
+                        source: truth.evidence.source,
+                        status: PriceTruthStatus::SemanticViolation,
+                        detail: Some(
+                            "pure exit intent disagreed with guarded pending proposal".to_string(),
+                        ),
+                        slot: truth.evidence.slot,
+                        timestamp_ms: truth.evidence.timestamp_ms,
+                        age_ms: truth.evidence.age_ms,
+                        price_state: truth.evidence.price_state,
+                        price_reason: truth.evidence.price_reason,
                     };
-                    if time_stop_due {
-                        self.force_close_shadow_without_exit_truth(
-                            base_mint,
-                            &position_id,
-                            now_ms,
-                            evidence,
-                        )
+                    self.handle_shadow_quote_failure(action, evidence, now_ms)
                         .await;
-                    } else {
-                        self.maybe_record_shadow_exit_blocked(
-                            base_mint,
-                            now_ms,
-                            exit.fraction_bps,
-                            &evidence,
-                        );
-                        warn!(
-                            position_id = %position_id,
-                            detail = %evidence.detail.as_deref().unwrap_or("shadow_exit_qty_missing"),
-                            "PostBuyGuardian: shadow exit blocked because authoritative token quantity is unavailable"
-                        );
-                    }
                     return;
                 }
-            };
-            let truth = match PriceTruthResolver::resolve_shadow_exit(
-                entry_price_sol,
-                exit_token_amount_raw,
-                &sample,
-                0.0,
-            ) {
-                Ok(truth) => truth,
-                Err(error) => {
-                    if time_stop_due {
-                        self.force_close_shadow_without_exit_truth(
-                            base_mint,
-                            &position_id,
-                            now_ms,
-                            error.evidence().clone(),
-                        )
-                        .await;
-                    } else {
-                        self.maybe_record_shadow_exit_blocked(
-                            base_mint,
-                            now_ms,
-                            exit.fraction_bps,
-                            error.evidence(),
-                        );
-                        warn!(
-                            position_id = %position_id,
-                            truth_status = ?error.status(),
-                            error = %error,
-                            "PostBuyGuardian: shadow exit truth failed after trigger"
-                        );
-                    }
+                if let Err(error) = self.apply_shadow_quote_outcome(&action, &snapshot, &truth) {
+                    debug!(
+                        action_id = %action.action_id,
+                        error = %error,
+                        "PostBuyGuardian: resolved quote rejected by guarded apply"
+                    );
                     return;
                 }
-            };
-            self.apply_shadow_exit_execution(base_mint, &exit, &truth);
-            self.emit_shadow_exit(
-                base_mint,
-                &candidate_id,
-                &position_id,
-                position_epoch,
-                &entry_order_id,
-                &quote_id,
-                slot,
-                &exit,
-                &truth,
-                now_ms,
-            );
+
+                let exit = super::integration::ShadowExitExecution {
+                    position_id: action.position_id.clone(),
+                    position_epoch: action.position_epoch,
+                    fraction_bps: 10_000,
+                    remaining_fraction_bps: 0,
+                    fill_price: truth.exit_price_sol,
+                };
+                self.emit_shadow_exit_for_action(&action, &exit, &truth, now_ms);
+                self.finish_resolved_shadow_position(action, now_ms).await;
+            }
+            FinalPolicyDecision::UnknownEvidence { reason } => {
+                let evidence = PriceTruthEvidence {
+                    source: truth.evidence.source,
+                    status: PriceTruthStatus::SemanticViolation,
+                    detail: Some(format!("exit quote rejected by policy: {reason:?}")),
+                    slot: truth.evidence.slot,
+                    timestamp_ms: truth.evidence.timestamp_ms,
+                    age_ms: truth.evidence.age_ms,
+                    price_state: truth.evidence.price_state,
+                    price_reason: truth.evidence.price_reason,
+                };
+                self.handle_shadow_quote_failure(action, evidence, now_ms)
+                    .await;
+            }
+            FinalPolicyDecision::Hold => {}
         }
     }
 
-    async fn run_shadow_simple_threshold_tick(
+    async fn handle_shadow_quote_failure(
         &self,
-        base_mint: &Pubkey,
-        latest: Option<&MarketSnapshot>,
+        action: ShadowExitActionHandle,
+        evidence: PriceTruthEvidence,
         now_ms: u64,
     ) {
-        let Some(thresholds) = self.shadow_simple_exit_thresholds else {
+        self.maybe_record_shadow_exit_blocked(&action.base_mint, now_ms, 10_000, &evidence);
+        if now_ms < action.recovery_deadline_ms {
             return;
-        };
+        }
 
-        let (
-            candidate_id,
-            position_id,
-            position_epoch,
-            entry_order_id,
-            quote_id,
-            slot,
-            entry_price_opt,
-            entry_unix_ms,
-            last_market_activity_seen_ms,
-            snapshot_source,
-            remaining_fraction_bps,
-        ) = {
-            let positions = self.positions.read();
-            let Some(pos) = positions.get(base_mint) else {
-                return;
-            };
-            if !matches!(pos.lane, Lane::Shadow) {
-                return;
-            }
-            (
-                pos.candidate_id.clone(),
-                pos.position_id.clone(),
-                pos.position_epoch,
-                pos.entry_order_id.clone(),
-                pos.quote_id.clone(),
-                pos.slot,
-                pos.entry_price_sol,
-                pos.entry_unix_ms,
-                pos.shadow_market_activity.last_seen_ms,
-                pos.last_snapshot_source,
-                pos.remaining_fraction_bps,
-            )
-        };
-
-        let Some(entry_price_sol) =
-            entry_price_opt.and_then(|price| (price.is_finite() && price > 0.0).then_some(price))
-        else {
-            warn!(
-                position_id = %position_id,
-                "PostBuyGuardian: shadow simple exit missing authoritative entry price; refusing synthetic fallback"
-            );
-            return;
-        };
-        let Some((upper_exit_price_sol, lower_exit_price_sol)) =
-            thresholds.prices_for_entry(entry_price_sol)
-        else {
-            warn!(
-                position_id = %position_id,
-                entry_price_sol,
-                "PostBuyGuardian: shadow simple exit thresholds are invalid for the current entry price"
-            );
-            return;
-        };
-
-        let inactivity_elapsed_ms = now_ms.saturating_sub(last_market_activity_seen_ms);
-        let time_stop_due = inactivity_elapsed_ms >= self.shadow_position_time_stop_ms();
-        let latest_snapshot = latest.cloned();
-        let Some(latest_snapshot) = latest_snapshot else {
-            if time_stop_due {
-                let evidence = PriceTruthEvidence {
-                    source: snapshot_source,
-                    status: PriceTruthStatus::Failure,
-                    detail: Some(
-                        "shadow time-stop expired before any canonical snapshot reached guardian"
-                            .to_string(),
-                    ),
-                    slot,
-                    timestamp_ms: Some(now_ms),
-                    age_ms: None,
-                    price_state: None,
-                    price_reason: None,
-                };
-                self.force_close_shadow_without_exit_truth(
-                    base_mint,
-                    &position_id,
+        let unresolved_reason = Self::classify_shadow_unresolved_reason(&evidence);
+        match self.terminate_shadow_proposal(&action, unresolved_reason, evidence.clone()) {
+            Ok(mut pos) => {
+                let recovery_elapsed_ms = now_ms.saturating_sub(action.triggered_at_ms);
+                self.emit_shadow_unresolved(
+                    &pos,
+                    &action,
+                    unresolved_reason,
+                    recovery_elapsed_ms,
                     now_ms,
-                    evidence,
-                )
-                .await;
-            }
-            return;
-        };
-        self.remember_shadow_snapshot(base_mint, &latest_snapshot);
-        let Some(current_price_sol) =
-            PriceTruthResolver::normalize_shadow_snapshot_price_sol(&latest_snapshot)
-        else {
-            if time_stop_due {
-                let evidence = PriceTruthEvidence {
-                    source: snapshot_source,
-                    status: PriceTruthStatus::Failure,
-                    detail: Some(
-                        "shadow snapshot price could not be normalized into canonical SOL/token"
-                            .to_string(),
-                    ),
-                    slot,
-                    timestamp_ms: Some(latest_snapshot.timestamp_ms),
-                    age_ms: Some(now_ms.saturating_sub(latest_snapshot.timestamp_ms)),
-                    price_state: Some(latest_snapshot.price_state),
-                    price_reason: latest_snapshot.price_reason,
-                };
-                self.force_close_shadow_without_exit_truth(
-                    base_mint,
-                    &position_id,
-                    now_ms,
-                    evidence,
-                )
-                .await;
-            }
-            return;
-        };
-
-        let Some(trigger) = Self::determine_shadow_simple_exit_trigger(
-            current_price_sol,
-            upper_exit_price_sol,
-            lower_exit_price_sol,
-            time_stop_due,
-        ) else {
-            return;
-        };
-        let triggered_fraction_bps = remaining_fraction_bps.max(1);
-
-        let sample = match Self::resolve_shadow_exit_sample_for_runtime(
-            &latest_snapshot,
-            now_ms,
-            self.shadow_exit_stale_after_ms(),
-            snapshot_source,
-        ) {
-            Ok(sample) => {
-                let mut positions = self.positions.write();
-                if let Some(pos) = positions.get_mut(base_mint) {
-                    pos.last_blocked_truth_status = None;
-                    pos.last_blocked_truth_timestamp_ms = None;
-                }
-                sample
-            }
-            Err(error) => {
-                if matches!(trigger, ShadowSimpleExitTrigger::TimeStop) {
-                    let evidence = match &error {
-                        trigger::PriceTruthError::Stale { evidence, .. } => {
-                            let exit_token_amount_raw = self
-                                .positions
-                                .read()
-                                .get(base_mint)
-                                .map(|pos| pos.remaining_token_amount_raw)
-                                .unwrap_or(0);
-                            Self::stale_time_stop_rejection_evidence(
-                                &position_id,
-                                &latest_snapshot,
-                                now_ms,
-                                exit_token_amount_raw,
-                                evidence,
-                            )
-                        }
-                        _ => error.evidence().clone(),
-                    };
-                    self.force_close_shadow_without_exit_truth(
-                        base_mint,
-                        &position_id,
-                        now_ms,
-                        evidence,
-                    )
-                    .await;
-                    return;
-                }
-                self.maybe_record_shadow_exit_blocked(
-                    base_mint,
-                    now_ms,
-                    triggered_fraction_bps,
-                    error.evidence(),
+                    &evidence,
                 );
-                warn!(
-                    position_id = %position_id,
-                    trigger = trigger.as_label(),
-                    truth_status = ?error.status(),
-                    error = %error,
-                    "PostBuyGuardian: shadow simple threshold exit blocked because price truth is unavailable"
-                );
-                return;
-            }
-        };
-
-        let exit_token_amount_result = {
-            let positions = self.positions.read();
-            let Some(pos) = positions.get(base_mint) else {
-                return;
-            };
-            if pos.remaining_token_amount_raw == 0 {
-                Err(PriceTruthEvidence {
-                    source: sample.evidence.source,
-                    status: PriceTruthStatus::Failure,
-                    detail: Some("shadow remaining token amount is exhausted".to_string()),
-                    slot: sample.evidence.slot,
-                    timestamp_ms: sample.evidence.timestamp_ms,
-                    age_ms: sample.evidence.age_ms,
-                    price_state: sample.evidence.price_state,
-                    price_reason: sample.evidence.price_reason,
-                })
-            } else {
-                Ok(pos.remaining_token_amount_raw)
-            }
-        };
-        let exit_token_amount_raw = match exit_token_amount_result {
-            Ok(amount) => amount,
-            Err(evidence) => {
-                if matches!(trigger, ShadowSimpleExitTrigger::TimeStop) {
-                    self.force_close_shadow_without_exit_truth(
-                        base_mint,
-                        &position_id,
-                        now_ms,
-                        evidence,
-                    )
-                    .await;
-                } else {
-                    self.maybe_record_shadow_exit_blocked(
-                        base_mint,
-                        now_ms,
-                        triggered_fraction_bps,
-                        &evidence,
-                    );
-                    warn!(
-                        position_id = %position_id,
-                        trigger = trigger.as_label(),
-                        detail = %evidence.detail.as_deref().unwrap_or("shadow_exit_qty_missing"),
-                        "PostBuyGuardian: shadow simple threshold exit blocked because authoritative token quantity is unavailable"
-                    );
+                if let Some(terminal_tx) = pos.terminal_tx.take() {
+                    let _ = terminal_tx.send(ShadowTerminalDisposition::SimulationBlocked {
+                        action_id: action.action_id.clone(),
+                        reason: unresolved_reason,
+                    });
                 }
-                return;
-            }
-        };
-        let truth = match PriceTruthResolver::resolve_shadow_exit(
-            entry_price_sol,
-            exit_token_amount_raw,
-            &sample,
-            0.0,
-        ) {
-            Ok(truth) => truth,
-            Err(error) => {
-                if matches!(trigger, ShadowSimpleExitTrigger::TimeStop) {
-                    self.force_close_shadow_without_exit_truth(
-                        base_mint,
-                        &position_id,
-                        now_ms,
-                        error.evidence().clone(),
-                    )
+                self.cleanup_shadow_runtime_artifacts(&action.base_mint, &action.position_id)
                     .await;
-                } else {
-                    self.maybe_record_shadow_exit_blocked(
-                        base_mint,
-                        now_ms,
-                        triggered_fraction_bps,
-                        error.evidence(),
-                    );
-                    warn!(
-                        position_id = %position_id,
-                        trigger = trigger.as_label(),
-                        truth_status = ?error.status(),
-                        error = %error,
-                        "PostBuyGuardian: shadow simple threshold exit truth failed after trigger"
-                    );
-                }
-                return;
             }
-        };
+            Err(PositionApplyError::StaleRevision) => {}
+            Err(error) => debug!(
+                action_id = %action.action_id,
+                error = %error,
+                "PostBuyGuardian: unresolved shadow terminal rejected by guarded apply"
+            ),
+        }
+    }
 
-        self.set_shadow_exit_reason_code(base_mint, trigger.reason_code());
-        let exit = super::integration::ShadowExitExecution {
-            position_id: position_id.clone(),
-            position_epoch,
-            fraction_bps: triggered_fraction_bps,
-            remaining_fraction_bps: 0,
-            fill_price: sample.exit_price_sol,
+    fn classify_shadow_unresolved_reason(evidence: &PriceTruthEvidence) -> ShadowUnresolvedReason {
+        match evidence.status {
+            PriceTruthStatus::SemanticViolation
+            | PriceTruthStatus::Stale
+            | PriceTruthStatus::BackfillRequired => ShadowUnresolvedReason::BlockedByData,
+            PriceTruthStatus::Failure => {
+                match evidence.detail.as_deref().map(str::to_ascii_lowercase) {
+                    Some(detail)
+                        if detail.contains("zero")
+                            || detail.contains("no fill")
+                            || detail.contains("no executable") =>
+                    {
+                        ShadowUnresolvedReason::NoFill
+                    }
+                    Some(detail)
+                        if detail.contains("no canonical snapshot")
+                            || detail.contains("could not be normalized")
+                            || detail.contains("missing at quote boundary") =>
+                    {
+                        ShadowUnresolvedReason::BlockedByData
+                    }
+                    _ => ShadowUnresolvedReason::Failed,
+                }
+            }
+            PriceTruthStatus::Resolved => ShadowUnresolvedReason::Failed,
+        }
+    }
+
+    fn emit_shadow_exit_for_action(
+        &self,
+        action: &ShadowExitActionHandle,
+        exit: &super::integration::ShadowExitExecution,
+        truth: &ShadowExitTruth,
+        now_ms: u64,
+    ) {
+        let identity = self
+            .positions
+            .read()
+            .get(&action.base_mint)
+            .map(|pos| (pos.candidate_id.clone(), pos.quote_id.clone(), pos.slot));
+        let Some((candidate_id, quote_id, slot)) = identity else {
+            return;
         };
-        self.apply_shadow_exit_execution(base_mint, &exit, &truth);
         self.emit_shadow_exit(
-            base_mint,
+            &action.base_mint,
+            &action.action_id,
             &candidate_id,
-            &position_id,
-            position_epoch,
-            &entry_order_id,
+            &action.position_id,
+            action.position_epoch,
             &quote_id,
             slot,
-            &exit,
-            &truth,
+            exit,
+            truth,
             now_ms,
         );
-        self.cleanup_closed_shadow_position(base_mint, &position_id)
+    }
+
+    async fn finish_resolved_shadow_position(&self, action: ShadowExitActionHandle, now_ms: u64) {
+        let removed = {
+            let mut positions = self.positions.write();
+            let Some(pos) = positions.get(&action.base_mint) else {
+                return;
+            };
+            if pos.position_id != action.position_id
+                || pos.position_epoch != action.position_epoch
+                || pos.last_applied_action_id.as_deref() != Some(action.action_id.as_str())
+                || !matches!(
+                    pos.last_shadow_outcome,
+                    Some(ShadowOutcomeKind::SimulatedFilled)
+                )
+            {
+                return;
+            }
+            positions.remove(&action.base_mint)
+        };
+        let Some(mut pos) = removed else {
+            return;
+        };
+        let duration_ms = now_ms.saturating_sub(pos.entry_unix_ms);
+        self.emit_position_closed(&pos, duration_ms);
+        if let Some(terminal_tx) = pos.terminal_tx.take() {
+            let _ = terminal_tx.send(ShadowTerminalDisposition::SimulatedClosed {
+                action_id: action.action_id.clone(),
+                reason: action.reason.reason_code().to_string(),
+            });
+        }
+        self.cleanup_shadow_runtime_artifacts(&action.base_mint, &action.position_id)
             .await;
-        info!(
-            position_id = %position_id,
-            trigger = trigger.as_label(),
-            current_price_sol,
-            entry_price_sol,
-            upper_exit_price_sol,
-            lower_exit_price_sol,
-            inactivity_elapsed_ms,
-            position_age_ms = now_ms.saturating_sub(entry_unix_ms),
-            "PostBuyGuardian: shadow simple threshold exit executed"
-        );
     }
 
-    fn determine_shadow_simple_exit_trigger(
-        current_price_sol: f64,
-        upper_exit_price_sol: f64,
-        lower_exit_price_sol: f64,
-        time_stop_due: bool,
-    ) -> Option<ShadowSimpleExitTrigger> {
-        if current_price_sol <= lower_exit_price_sol {
-            Some(ShadowSimpleExitTrigger::StopLoss)
-        } else if current_price_sol >= upper_exit_price_sol {
-            Some(ShadowSimpleExitTrigger::TakeProfit)
-        } else if time_stop_due {
-            Some(ShadowSimpleExitTrigger::TimeStop)
-        } else {
-            None
-        }
-    }
-
-    fn set_shadow_exit_reason_code(&self, base_mint: &Pubkey, reason_code: &str) {
-        let mut positions = self.positions.write();
-        if let Some(pos) = positions.get_mut(base_mint) {
-            pos.last_force_exit_reason_code = Some(reason_code.to_string());
-        }
-    }
-
-    async fn cleanup_closed_shadow_position(&self, base_mint: &Pubkey, position_id: &str) {
+    async fn cleanup_shadow_runtime_artifacts(&self, base_mint: &Pubkey, position_id: &str) {
         if let Some(router) = self.position_router.as_ref() {
             if let Some(shadow_book) = router.shadow_book() {
                 let _ = shadow_book.write().await.remove_position(position_id);
@@ -5325,7 +5610,79 @@ impl MonitoringEngine {
         if let Some(shadow_backend) = shadow_backend {
             let _ = shadow_backend.unregister_position(position_id).await;
         }
-        self.unregister_position(base_mint);
+        debug!(
+            base_mint = %base_mint,
+            position_id,
+            "PostBuyGuardian: cleaned non-authoritative shadow runtime mirrors"
+        );
+    }
+
+    fn emit_shadow_unresolved(
+        &self,
+        pos: &MonitoredPosition,
+        action: &ShadowExitActionHandle,
+        reason: ShadowUnresolvedReason,
+        recovery_elapsed_ms: u64,
+        now_ms: u64,
+        evidence: &PriceTruthEvidence,
+    ) {
+        let policy = self.exit_policy_v1.as_ref();
+        if let Some(emitter) = self.event_emitter.as_ref() {
+            let mut env = emitter.make_envelope_at(&pos.candidate_id, now_ms);
+            env.position_id = Some(pos.position_id.clone());
+            env.position_epoch = Some(pos.position_epoch);
+            env.order_id = Some(format!("shadow-unresolved:{}", action.action_id));
+            env.quote_id = Some(pos.quote_id.clone());
+            env.slot = evidence.slot.or(pos.slot);
+            emitter.emit_raw(ExecutionEvent::new(
+                env,
+                EventKind::ShadowPositionUnresolved(ShadowPositionUnresolvedPayload {
+                    reason,
+                    action_id: action.action_id.clone(),
+                    policy_id: policy
+                        .map(|policy| policy.policy_id().to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    policy_version: policy.map_or(0, EffectiveExitPolicyV1Config::policy_version),
+                    policy_config_hash: policy
+                        .map(|policy| policy.config_hash().to_string())
+                        .unwrap_or_default(),
+                    remaining_qty: pos.remaining_token_amount_raw,
+                    recovery_elapsed_ms,
+                    truth_status: evidence.status,
+                    truth_source: evidence.source,
+                    truth_slot: evidence.slot,
+                    truth_timestamp_ms: evidence.timestamp_ms,
+                    truth_age_ms: evidence.age_ms,
+                    truth_detail: evidence.detail.clone(),
+                    source_snapshot_id: action.source_snapshot_id.clone(),
+                    execution_cost_coverage: EXECUTION_COST_COVERAGE_UNMODELED.to_string(),
+                    net_pnl_authoritative: false,
+                }),
+            ));
+        }
+
+        let mut record = self.shadow_lifecycle_record_base(
+            pos,
+            ShadowLifecycleRecordType::PositionUnresolved,
+            now_ms,
+            evidence,
+        );
+        record.action_id = Some(action.action_id.clone());
+        record.source_snapshot_id = Some(action.source_snapshot_id.clone());
+        record.terminal_reason_v2 = Some(reason.terminal_reason_v2());
+        record.terminal_disposition = Some("simulation_blocked".to_string());
+        record.recovery_elapsed_ms = Some(recovery_elapsed_ms);
+        record.remaining_token_amount_raw = Some(pos.remaining_token_amount_raw);
+        record.final_pnl = None;
+        record.final_pnl_pct = None;
+        record.gross_pnl_sol = None;
+        record.net_pnl_sol = None;
+        record.exit_price = None;
+        record.exit_value_sol = None;
+        record.exit_token_amount_raw = None;
+        record.exit_landed_slot = None;
+        record.exit_landed_slot_source = None;
+        self.append_shadow_lifecycle_record(&record);
     }
 
     fn maybe_record_shadow_exit_blocked(
@@ -5335,78 +5692,45 @@ impl MonitoringEngine {
         fraction_bps: u16,
         evidence: &PriceTruthEvidence,
     ) {
-        let mut positions = self.positions.write();
-        let Some(pos) = positions.get_mut(base_mint) else {
-            return;
-        };
-        if pos.last_blocked_truth_status == Some(evidence.status)
-            && pos.last_blocked_truth_timestamp_ms == evidence.timestamp_ms
-        {
-            return;
-        }
-        pos.last_blocked_truth_status = Some(evidence.status);
-        pos.last_blocked_truth_timestamp_ms = evidence.timestamp_ms;
+        let record = {
+            let mut positions = self.positions.write();
+            let Some(pos) = positions.get_mut(base_mint) else {
+                return;
+            };
+            if pos.last_blocked_truth_status == Some(evidence.status)
+                && pos.last_blocked_truth_timestamp_ms == evidence.timestamp_ms
+            {
+                return;
+            }
+            pos.last_blocked_truth_status = Some(evidence.status);
+            pos.last_blocked_truth_timestamp_ms = evidence.timestamp_ms;
 
-        let mut record = self.shadow_lifecycle_record_base(
-            pos,
-            ShadowLifecycleRecordType::ExitBlocked,
-            now_ms,
-            evidence,
-        );
-        record.fraction_bps = Some(fraction_bps);
+            let mut record = self.shadow_lifecycle_record_base(
+                pos,
+                ShadowLifecycleRecordType::ExitBlocked,
+                now_ms,
+                evidence,
+            );
+            record.fraction_bps = Some(fraction_bps);
+            record
+        };
         self.append_shadow_lifecycle_record(&record);
-    }
-
-    fn apply_shadow_exit_execution(
-        &self,
-        base_mint: &Pubkey,
-        exit: &super::integration::ShadowExitExecution,
-        truth: &ShadowExitTruth,
-    ) {
-        let mut positions = self.positions.write();
-        let Some(pos) = positions.get_mut(base_mint) else {
-            return;
-        };
-
-        pos.realized_exit_value_sol += truth.exit_value_sol;
-        pos.estimated_costs_sol += truth.estimated_costs_sol;
-        pos.realized_pnl_sol += truth.gross_pnl_sol;
-        if pos.entry_value_sol > 0.0 {
-            pos.realized_pnl_pct = (pos.realized_pnl_sol / pos.entry_value_sol) * 100.0;
-        }
-        pos.total_exits = pos.total_exits.saturating_add(1);
-        pos.remaining_fraction_bps = exit.remaining_fraction_bps;
-        pos.remaining_token_amount_raw = pos
-            .remaining_token_amount_raw
-            .saturating_sub(truth.exit_token_amount_raw);
-        pos.last_price_truth = Some(truth.evidence.clone());
-        pos.last_blocked_truth_status = None;
-        pos.last_blocked_truth_timestamp_ms = None;
-        if pos.remaining_fraction_bps == 0 {
-            pos.remaining_token_amount_raw = 0;
-            pos.last_close_reason = Some(Self::shadow_close_reason_from_reason_code(
-                pos.last_force_exit_reason_code.as_deref(),
-            ));
-        }
     }
 
     fn emit_shadow_exit(
         &self,
         base_mint: &Pubkey,
+        action_id: &str,
         candidate_id: &str,
         position_id: &str,
         position_epoch: u64,
-        entry_order_id: &str,
         quote_id: &str,
         slot: Option<u64>,
         exit: &super::integration::ShadowExitExecution,
         truth: &ShadowExitTruth,
         now_ms: u64,
     ) {
-        let exit_order_id = format!(
-            "shadow-exit:{}:{}:{}",
-            position_id, now_ms, exit.remaining_fraction_bps
-        );
+        let exit_order_id = format!("shadow-exit:{action_id}");
         let remaining_qty = self
             .positions
             .read()
@@ -5421,12 +5745,12 @@ impl MonitoringEngine {
             exit_sub_env.order_id = Some(exit_order_id.clone());
             exit_sub_env.quote_id = Some(quote_id.to_string());
             exit_sub_env.slot = slot;
-            exit_sub_env.command_id = Some(format!("shadow-runtime-{}", entry_order_id));
+            exit_sub_env.command_id = Some(action_id.to_string());
             emitter.emit_raw(ExecutionEvent::new(
                 exit_sub_env,
                 EventKind::ExitSubmitted(ExitSubmittedPayload {
                     fraction_bps: exit.fraction_bps,
-                    command_ref: None,
+                    command_ref: Some(action_id.to_string()),
                 }),
             ));
 
@@ -5436,13 +5760,14 @@ impl MonitoringEngine {
             exit_fill_env.order_id = Some(exit_order_id);
             exit_fill_env.quote_id = Some(quote_id.to_string());
             exit_fill_env.slot = slot;
+            exit_fill_env.command_id = Some(action_id.to_string());
             emitter.emit_raw(ExecutionEvent::new(
                 exit_fill_env,
                 EventKind::ExitFilled(ExitFilledPayload {
                     fill_price: truth.exit_price_sol,
                     fill_qty: truth.exit_token_amount_raw,
                     realized_pnl_delta: truth.gross_pnl_sol,
-                    status: ExecFillStatus::Confirmed,
+                    status: ExecFillStatus::Filled,
                     is_partial: exit.remaining_fraction_bps > 0,
                     remaining_qty,
                 }),
@@ -5469,31 +5794,6 @@ impl MonitoringEngine {
             record.final_pnl_pct = Some(truth.pnl_pct);
             self.append_shadow_lifecycle_record(&record);
         }
-    }
-
-    fn shadow_exit_token_amount_raw(
-        pos: &MonitoredPosition,
-        exit: &super::integration::ShadowExitExecution,
-    ) -> Result<u64, String> {
-        if pos.entry_token_amount_raw == 0 {
-            return Err("shadow entry token amount is missing".to_string());
-        }
-        if pos.remaining_token_amount_raw == 0 {
-            return Err("shadow remaining token amount is exhausted".to_string());
-        }
-        if exit.fraction_bps == 0 || exit.fraction_bps > 10_000 {
-            return Err(format!(
-                "shadow exit fraction is outside the valid 1..=10000 range: {}",
-                exit.fraction_bps
-            ));
-        }
-        if exit.remaining_fraction_bps == 0 {
-            return Ok(pos.remaining_token_amount_raw);
-        }
-
-        let proportional = (u128::from(pos.entry_token_amount_raw) * u128::from(exit.fraction_bps)
-            / 10_000) as u64;
-        Ok(proportional.max(1).min(pos.remaining_token_amount_raw))
     }
 
     fn close_reason_from_reason_code_with_default(
@@ -5841,6 +6141,10 @@ mod tests {
         )
     }
 
+    fn enable_baseline_exit_policy(engine: &mut MonitoringEngine) {
+        engine.set_exit_policy_v1_thresholds_for_tests(0.50, 0.50);
+    }
+
     fn apply_test_canonical_update(
         account_state_core: &AccountStateReducer,
         mint: Pubkey,
@@ -6130,6 +6434,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_timeline_refresh_does_not_bypass_peak_and_revision_apply() {
+        let config = PostBuyGuardianConfig::default();
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, shadow_ledger, tx);
+        engine.set_account_state_core(Arc::clone(&account_state_core));
+
+        let mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                bonding_curve,
+                Some(0.000_000_001),
+                Some(1_000_000),
+                Some(1_000_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
+                    candidate_id: "candidate-peak-apply".to_string(),
+                    entry_order_id: "entry-peak-apply".to_string(),
+                    quote_id: "quote-peak-apply".to_string(),
+                    slot: Some(10),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:test:peak-apply".to_string()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("position registration");
+
+        let revision_before = engine
+            .positions
+            .read()
+            .get(&mint)
+            .expect("position")
+            .state_revision;
+        apply_test_canonical_update_with_receive_ts(
+            &account_state_core,
+            mint,
+            bonding_curve,
+            11,
+            1_100,
+        );
+        let snapshots = engine
+            .snapshots_for_tick(&mint)
+            .expect("canonical timeline");
+        let latest = snapshots.last().expect("latest canonical snapshot");
+        let expected_peak = PriceTruthResolver::normalize_shadow_snapshot_price_sol(latest)
+            .expect("normalized canonical mark");
+        engine.remember_shadow_snapshot(&mint, latest);
+
+        let positions = engine.positions.read();
+        let pos = positions.get(&mint).expect("position retained");
+        assert_eq!(pos.peak_since_entry, expected_peak);
+        assert!(pos
+            .last_shadow_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| SnapshotTimeline::equivalent(snapshot, latest)));
+        assert!(pos.state_revision > revision_before);
+    }
+
     #[tokio::test]
     async fn shadow_runtime_lazily_registers_virtual_magazine_without_aem() {
         let config = PostBuyGuardianConfig::default();
@@ -6174,9 +6542,8 @@ mod tests {
             ..MarketSnapshot::default()
         };
 
-        engine
-            .run_shadow_runtime_tick(&mint, Some(&snapshot), 1_000)
-            .await;
+        shadow_ledger.set_snapshots(mint, vec![snapshot]);
+        engine.tick().await;
 
         let shadow_book = runtime_router.shadow_book().expect("shadow book");
         assert!(shadow_book.read().await.has_position("shadow:test:1"));
@@ -6381,7 +6748,27 @@ mod tests {
         );
         assert!(registered.is_some());
 
-        engine.unregister_position(&mint);
+        let evidence = PriceTruthEvidence {
+            source: PriceTruthSource::ShadowLedgerSnapshot,
+            status: PriceTruthStatus::Stale,
+            detail: Some("join metadata projection test".to_string()),
+            slot: Some(88),
+            timestamp_ms: Some(1_000),
+            age_ms: Some(1),
+            price_state: Some(PriceState::Valid),
+            price_reason: None,
+        };
+        let record = {
+            let positions = engine.positions.read();
+            let pos = positions.get(&mint).expect("registered position");
+            engine.shadow_lifecycle_record_base(
+                pos,
+                ShadowLifecycleRecordType::ExitBlocked,
+                1_001,
+                &evidence,
+            )
+        };
+        engine.append_shadow_lifecycle_record(&record);
 
         let lifecycle_rows = read_jsonl_rows(&lifecycle_log);
         assert_eq!(lifecycle_rows.len(), 1);
@@ -6405,8 +6792,8 @@ mod tests {
         assert_eq!(row["brain_config_hash"], "brain-hash");
     }
 
-    #[test]
-    fn shadow_v2_lifecycle_close_emits_path_exit_terminal_records() {
+    #[tokio::test]
+    async fn shadow_v2_unresolved_emits_terminal_blocked_without_fill_or_close() {
         let tmp = TempDir::new().expect("tempdir");
         let harness = Arc::new(Mutex::new(
             ShadowV2ValidationHarness::new(shadow_v2_harness_config_for_dir(tmp.path()))
@@ -6417,7 +6804,11 @@ mod tests {
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        enable_baseline_exit_policy(&mut engine);
         engine.set_shadow_v2_validation_harness(Arc::clone(&harness));
+        let events_dir = tmp.path().join("events");
+        let emitter = make_shadow_emitter(&events_dir);
+        engine.set_event_emitter(Arc::clone(&emitter));
         let engine = Arc::new(engine);
 
         let pool = Pubkey::new_unique();
@@ -6425,33 +6816,86 @@ mod tests {
         let bonding_curve = Pubkey::new_unique();
         let opened_at_ms = 1_785_000_200_000;
         let position_id = "shadow-v2-terminal-test-position".to_string();
-        let registered = engine.register_position_with_context(
-            pool,
-            mint,
-            bonding_curve,
-            Some(0.0000001),
-            Some(7_000_000),
-            Some(7_000_000_000),
-            Some(PositionEventContext {
-                join_metadata: PositionJoinMetadata {
-                    run_id: Some("shadow-v2-pr18-test".to_string()),
-                    session_id: Some("session-terminal-test".to_string()),
-                    decision_plane: Some("pr18-test".to_string()),
-                    ..Default::default()
+        let registered = engine
+            .register_shadow_position_with_terminal(
+                pool,
+                mint,
+                bonding_curve,
+                Some(0.0000001),
+                Some(7_000_000),
+                Some(7_000_000_000),
+                PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("shadow-v2-pr18-test".to_string()),
+                        session_id: Some("session-terminal-test".to_string()),
+                        decision_plane: Some("pr18-test".to_string()),
+                        ..Default::default()
+                    },
+                    candidate_id: "candidate-terminal-test".to_string(),
+                    entry_order_id: "entry-order-terminal-test".to_string(),
+                    quote_id: "quote-terminal-test".to_string(),
+                    slot: Some(430_000_020),
+                    lane: Lane::Shadow,
+                    position_id: Some(position_id.clone()),
+                    position_epoch: Some(7),
+                    opened_at_ms: Some(opened_at_ms),
                 },
-                candidate_id: "candidate-terminal-test".to_string(),
-                entry_order_id: "entry-order-terminal-test".to_string(),
-                quote_id: "quote-terminal-test".to_string(),
-                slot: Some(430_000_020),
-                lane: Lane::Shadow,
-                position_id: Some(position_id.clone()),
-                position_epoch: Some(7),
-                opened_at_ms: Some(opened_at_ms),
-            }),
-        );
-        assert!(registered.is_some());
+            )
+            .expect("shadow registration with terminal receiver");
 
-        engine.unregister_position(&mint);
+        engine
+            .run_shadow_runtime_tick(&mint, None, opened_at_ms + 30_000)
+            .await;
+        assert_eq!(engine.active_position_count(), 1);
+        engine
+            .run_shadow_runtime_tick(&mint, None, opened_at_ms + 35_000)
+            .await;
+        assert_eq!(engine.active_position_count(), 0);
+        let (_, terminal_rx) = registered.into_parts();
+        let terminal_disposition = terminal_rx
+            .await
+            .expect("typed shadow terminal disposition");
+        let terminal_action_id = match terminal_disposition {
+            ShadowTerminalDisposition::SimulationBlocked { action_id, reason } => {
+                assert_eq!(reason, ShadowUnresolvedReason::BlockedByData);
+                action_id
+            }
+            other => panic!("expected simulation-blocked disposition, got {other:?}"),
+        };
+        emitter
+            .shared_writer()
+            .lock()
+            .expect("event writer")
+            .flush()
+            .expect("flush unresolved event");
+
+        let event_rows = read_event_rows(&events_dir);
+        let unresolved_payload = event_rows
+            .iter()
+            .find_map(|row| {
+                let kind = row.get("kind")?.as_object()?;
+                (kind.get("type")? == "ShadowPositionUnresolved").then(|| kind.get("payload"))?
+            })
+            .and_then(Value::as_object)
+            .expect("operational unresolved payload");
+        assert_eq!(
+            unresolved_payload.get("reason"),
+            Some(&Value::String("blocked_by_data".to_string()))
+        );
+        assert_eq!(
+            unresolved_payload.get("action_id"),
+            Some(&Value::String(terminal_action_id))
+        );
+        assert_eq!(
+            unresolved_payload.get("net_pnl_authoritative"),
+            Some(&Value::Bool(false))
+        );
+        assert!(event_rows.iter().all(|row| {
+            row.get("kind")
+                .and_then(Value::as_object)
+                .and_then(|kind| kind.get("type"))
+                .is_none_or(|kind| kind != "ExitFilled" && kind != "PositionClosed")
+        }));
 
         let canonical_rows = read_jsonl_rows(&tmp.path().join("shadow_position_event_v2.jsonl"));
         let event_kinds: Vec<_> = canonical_rows
@@ -6467,36 +6911,21 @@ mod tests {
             "missing EXIT_ATTEMPT in canonical rows: {canonical_rows:?}"
         );
         assert!(
-            event_kinds.contains(&"EXIT_FILL"),
-            "missing EXIT_FILL in canonical rows: {canonical_rows:?}"
+            !event_kinds.contains(&"EXIT_FILL"),
+            "unresolved shadow terminal must not contain EXIT_FILL: {canonical_rows:?}"
         );
         assert!(
             event_kinds.contains(&"TERMINAL_TRUTH"),
             "missing TERMINAL_TRUTH in canonical rows: {canonical_rows:?}"
         );
 
-        let exit_fill = canonical_rows
-            .iter()
-            .find(|row| row["event_kind"] == "EXIT_FILL")
-            .expect("exit fill row");
-        assert_eq!(
-            exit_fill["payload"]["record"]["fill_status"],
-            "BLOCKED_BY_DATA"
-        );
-        let exit_fill_limitations = exit_fill["payload"]["record"]["limitations"]
-            .as_array()
-            .expect("exit fill limitations");
-        assert!(exit_fill_limitations
-            .iter()
-            .any(|value| value == "EXIT_FILL_POOL_STATE_SAMPLE_MISSING"));
-
         let terminal = canonical_rows
             .iter()
             .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
             .expect("terminal truth row");
         assert_eq!(
-            terminal["payload"]["record"]["terminal_source"],
-            "shadow_lifecycle.position_closed"
+            terminal["payload"]["record"]["terminal_reason"],
+            "BLOCKED_BY_DATA"
         );
         assert_eq!(
             terminal["payload"]["record"]["final_pnl_executable_bps"],
@@ -6506,15 +6935,9 @@ mod tests {
             terminal["payload"]["record"]["linked_exit_fill"],
             serde_json::Value::Null
         );
-        assert!(terminal["envelope"]["limitations"]
-            .as_array()
-            .expect("terminal limitations")
-            .iter()
-            .any(|value| value == "TERMINAL_EXECUTABLE_PNL_BLOCKED_BY_ENTRY_EXIT_FILL_LINK"));
-
         assert_eq!(
-            exit_fill["payload"]["record"]["fill_status"],
-            "BLOCKED_BY_DATA"
+            terminal["payload"]["record"]["final_pnl_mark_bps"],
+            serde_json::Value::Null
         );
 
         assert_eq!(
@@ -6958,6 +7381,118 @@ mod tests {
         assert!(fill.pool_state_after.is_none());
     }
 
+    #[test]
+    fn guarded_apply_rejects_stale_revision_without_mutating_position() {
+        let config = PostBuyGuardianConfig::default();
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, shadow_ledger, tx);
+        enable_baseline_exit_policy(&mut engine);
+
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000_000),
+                Some(1_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
+                    candidate_id: "cand-guarded-stale-apply".to_string(),
+                    entry_order_id: "entry-guarded-stale-apply".to_string(),
+                    quote_id: "quote-guarded-stale-apply".to_string(),
+                    slot: Some(10),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:test:guarded-stale-apply".to_string()),
+                    position_epoch: Some(3),
+                    opened_at_ms: Some(100),
+                }),
+            )
+            .expect("shadow registration");
+
+        let market_snapshot = MarketSnapshot {
+            slot: Some(11),
+            timestamp_ms: 200,
+            price_sol_per_token: 2.0,
+            price_state: PriceState::Valid,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 2.0,
+            ..MarketSnapshot::default()
+        };
+        engine.remember_shadow_snapshot(&mint, &market_snapshot);
+        let (decision_snapshot, _) = engine
+            .materialize_post_buy_decision_snapshot(&mint, 200)
+            .expect("decision snapshot");
+        let candidate = match ExitPolicyV1::evaluate_prequote(
+            &decision_snapshot,
+            engine.exit_policy_v1.as_ref().expect("exit policy"),
+        ) {
+            PreQuoteDecision::QuoteRequired { candidate } => candidate,
+            other => panic!("expected take-profit candidate, got {other:?}"),
+        };
+        let action = engine
+            .begin_exit_proposal(
+                &mint,
+                decision_snapshot.guard(),
+                &candidate,
+                decision_snapshot.snapshot_id(),
+                200,
+            )
+            .expect("pending proposal");
+        assert!(
+            matches!(
+                engine.prepare_pending_quote_retry(&mint, decision_snapshot.guard(), 700),
+                Err(PositionApplyError::StaleRevision)
+            ),
+            "a pending retry must not reuse the pre-proposal snapshot guard"
+        );
+
+        {
+            let mut positions = engine.positions.write();
+            let pos = positions.get_mut(&mint).expect("monitored position");
+            pos.state_revision = pos.state_revision.saturating_add(1);
+        }
+
+        let truth = ShadowExitTruth {
+            exit_price_sol: 2.0,
+            exit_token_amount_raw: 1_000,
+            entry_value_sol: 1.0,
+            exit_value_sol: 2.0,
+            gross_pnl_sol: 1.0,
+            net_pnl_sol: 1.0,
+            estimated_costs_sol: 0.0,
+            pnl_pct: 100.0,
+            evidence: PriceTruthEvidence {
+                source: PriceTruthSource::ShadowLedgerSnapshot,
+                status: PriceTruthStatus::Resolved,
+                detail: None,
+                slot: Some(11),
+                timestamp_ms: Some(200),
+                age_ms: Some(0),
+                price_state: Some(PriceState::Valid),
+                price_reason: None,
+            },
+        };
+        assert_eq!(
+            engine.apply_shadow_quote_outcome(&action, &decision_snapshot, &truth),
+            Err(PositionApplyError::StaleRevision)
+        );
+
+        let positions = engine.positions.read();
+        let pos = positions.get(&mint).expect("position retained");
+        assert_eq!(pos.remaining_token_amount_raw, 1_000);
+        assert_eq!(pos.total_exits, 0);
+        assert!(pos.last_shadow_outcome.is_none());
+        assert_eq!(
+            pos.pending_exit_proposal
+                .as_ref()
+                .map(|proposal| proposal.action_id.as_str()),
+            Some(action.action_id.as_str())
+        );
+    }
+
     #[tokio::test]
     async fn shadow_runtime_close_writes_economics_and_lifecycle_proof() {
         let tmp = TempDir::new().expect("tempdir");
@@ -6968,6 +7503,7 @@ mod tests {
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        enable_baseline_exit_policy(&mut engine);
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             AsyncRwLock::new(ShadowPositionBook::new()),
         ))));
@@ -7065,6 +7601,26 @@ mod tests {
             exit_filled_row["exit_landed_slot_source"],
             "synthetic_next_slot_after_exit_sample"
         );
+        assert_eq!(exit_filled_row["entry_token_amount_raw"], 1_000_000);
+        assert_eq!(exit_filled_row["exit_token_amount_raw"], 1_000_000);
+        assert_eq!(exit_filled_row["mark_return_pct"], 900.0);
+        assert!(exit_filled_row["executable_gross_return_pct"]
+            .as_f64()
+            .is_some());
+        assert_eq!(exit_filled_row["mfe_mark_pct"], 900.0);
+        assert_eq!(exit_filled_row["mae_mark_pct"], 900.0);
+        assert_eq!(exit_filled_row["quote_reserve_base_raw"], 1_000_000.0);
+        assert_eq!(exit_filled_row["quote_reserve_quote_sol"], 10.0);
+        assert!(exit_filled_row["quote_own_impact_bps"]
+            .as_f64()
+            .is_some_and(|impact| impact >= 0.0));
+        assert_eq!(
+            exit_filled_row["decision_mark_source"],
+            "shadow_ledger_snapshot"
+        );
+        assert_eq!(exit_filled_row["decision_mark_slot"], 99);
+        assert_eq!(exit_filled_row["decision_mark_timestamp_ms"], 1_000);
+        assert_eq!(exit_filled_row["decision_mark_age_ms"], 0);
         assert!(
             lifecycle_rows.iter().any(|row| {
                 row.get("record_type") == Some(&Value::String("exit_filled".to_string()))
@@ -7145,7 +7701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_runtime_simple_threshold_take_profit_closes_without_virtual_magazine() {
+    async fn exit_policy_v1_take_profit_closes_without_virtual_magazine() {
         let tmp = TempDir::new().expect("tempdir");
         let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
         let events_dir = tmp.path().join("events");
@@ -7154,7 +7710,7 @@ mod tests {
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
-        engine.set_shadow_simple_exit_thresholds(0.02, 0.02);
+        engine.set_exit_policy_v1_thresholds_for_tests(0.02, 0.02);
         engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
         let emitter = make_shadow_emitter(&events_dir);
         engine.set_event_emitter(Arc::clone(&emitter));
@@ -7222,7 +7778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_runtime_simple_threshold_stop_loss_closes_with_stop_loss_reason() {
+    async fn exit_policy_v1_stop_loss_closes_with_stop_loss_reason() {
         let tmp = TempDir::new().expect("tempdir");
         let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
         let events_dir = tmp.path().join("events");
@@ -7231,7 +7787,7 @@ mod tests {
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
-        engine.set_shadow_simple_exit_thresholds(0.02, 0.02);
+        engine.set_exit_policy_v1_thresholds_for_tests(0.02, 0.02);
         engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
         let emitter = make_shadow_emitter(&events_dir);
         engine.set_event_emitter(Arc::clone(&emitter));
@@ -7296,22 +7852,12 @@ mod tests {
     }
 
     #[test]
-    fn shadow_simple_exit_thresholds_allow_target_above_100_percent() {
-        let thresholds = ShadowSimpleExitThresholds::new(1.5, 0.5);
-        let (upper, lower) = thresholds
-            .prices_for_entry(1.0)
-            .expect("thresholds should produce prices");
+    fn effective_exit_policy_allows_target_above_100_percent() {
+        let policy = EffectiveExitPolicyV1Config::new(1.5, 0.5, 30_000, 5_000)
+            .expect("valid effective policy");
 
-        assert_eq!(upper, 2.5);
-        assert_eq!(lower, 0.5);
-        assert_eq!(
-            MonitoringEngine::determine_shadow_simple_exit_trigger(2.4, upper, lower, true),
-            Some(ShadowSimpleExitTrigger::TimeStop)
-        );
-        assert_eq!(
-            MonitoringEngine::determine_shadow_simple_exit_trigger(2.5, upper, lower, false),
-            Some(ShadowSimpleExitTrigger::TakeProfit)
-        );
+        assert_eq!(policy.take_profit_fraction(), 1.5);
+        assert_eq!(policy.stop_loss_fraction(), 0.5);
     }
 
     #[test]
@@ -7653,6 +8199,7 @@ mod tests {
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        enable_baseline_exit_policy(&mut engine);
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             AsyncRwLock::new(ShadowPositionBook::new()),
         ))));
@@ -7737,7 +8284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_runtime_expired_bullets_close_as_time_stop_below_target() {
+    async fn expired_virtual_bullets_do_not_override_exit_policy_v1() {
         let tmp = TempDir::new().expect("tempdir");
         let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
         let events_dir = tmp.path().join("events");
@@ -7746,6 +8293,7 @@ mod tests {
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        enable_baseline_exit_policy(&mut engine);
         let shadow_book = Arc::new(AsyncRwLock::new(ShadowPositionBook::new()));
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(
             Arc::clone(&shadow_book),
@@ -7786,7 +8334,7 @@ mod tests {
                 SHADOW_VIRTUAL_MAGAZINE_TIME_STOP_SECS + 1
             ));
 
-        let now_ms = registered.opened_at_ms + SHADOW_POSITION_TIME_STOP_MS + 1;
+        let now_ms = registered.opened_at_ms + 1_000;
         let snapshot = MarketSnapshot {
             slot: Some(68),
             timestamp_ms: now_ms,
@@ -7809,7 +8357,7 @@ mod tests {
             .flush()
             .expect("flush events");
 
-        assert_eq!(engine.active_position_count(), 0);
+        assert_eq!(engine.active_position_count(), 1);
 
         let lifecycle_rows = read_jsonl_rows(&lifecycle_log);
         let candidate_rows: Vec<_> = lifecycle_rows
@@ -7817,41 +8365,19 @@ mod tests {
             .filter(|row| row.get("candidate_id") == Some(&Value::String(candidate_id.clone())))
             .collect();
         assert!(
-            candidate_rows.iter().any(|row| {
-                row.get("record_type") == Some(&Value::String("position_closed".to_string()))
-                    && row.get("close_reason") == Some(&Value::String("TimeStop".to_string()))
-                    && row
-                        .get("final_pnl_pct")
-                        .and_then(Value::as_f64)
-                        .is_some_and(|pct| pct < 0.0)
-            }),
-            "missing time-stop close proof for expired bullets: {candidate_rows:?}"
-        );
-        assert!(
             !candidate_rows.iter().any(|row| {
                 row.get("record_type") == Some(&Value::String("position_closed".to_string()))
-                    && row.get("close_reason") == Some(&Value::String("Target".to_string()))
             }),
-            "expired below-target bullets must not close as Target: {candidate_rows:?}"
+            "non-authoritative virtual bullets must not close the canonical position: {candidate_rows:?}"
         );
 
         let event_rows = read_event_rows(&events_dir);
-        let closed_payload = event_rows
-            .iter()
-            .find_map(|row| {
-                let kind = row.get("kind")?.as_object()?;
-                if kind.get("type")? != "PositionClosed" {
-                    return None;
-                }
-                kind.get("payload")
-            })
-            .and_then(Value::as_object)
-            .cloned()
-            .expect("position closed payload");
-        assert_eq!(
-            closed_payload.get("reason"),
-            Some(&Value::String("TimeStop".to_string()))
-        );
+        assert!(event_rows.iter().all(|row| {
+            row.get("kind")
+                .and_then(Value::as_object)
+                .and_then(|kind| kind.get("type"))
+                != Some(&Value::String("PositionClosed".to_string()))
+        }));
     }
 
     #[tokio::test]
@@ -7935,6 +8461,7 @@ mod tests {
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        enable_baseline_exit_policy(&mut engine);
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             AsyncRwLock::new(ShadowPositionBook::new()),
         ))));
@@ -7983,6 +8510,10 @@ mod tests {
 
         let now_ms = registered.opened_at_ms + SHADOW_POSITION_TIME_STOP_MS + 1;
         engine.run_shadow_runtime_tick(&mint, None, now_ms).await;
+        assert_eq!(engine.active_position_count(), 1);
+        engine
+            .run_shadow_runtime_tick(&mint, None, now_ms + 5_000)
+            .await;
         engine.sync_with_position_runtime(&[mint]).await;
         emitter
             .shared_writer()
@@ -8003,44 +8534,37 @@ mod tests {
         assert!(
             lifecycle_rows.iter().any(|row| {
                 row.get("record_type") == Some(&Value::String("exit_blocked".to_string()))
-                    && row.get("truth_status") == Some(&Value::String("failure".to_string()))
+                    && row.get("truth_status") == Some(&Value::String("stale".to_string()))
                     && row
                         .get("truth_detail")
                         .and_then(Value::as_str)
-                        .is_some_and(|detail| {
-                            detail.contains(
-                                "shadow time-stop expired before any canonical snapshot reached guardian",
-                            )
-                        })
+                        .is_some_and(|detail| detail.contains("exceeded stale_after_ms=1500"))
             }),
             "missing cache-reject exit_blocked proof: {lifecycle_rows:?}"
         );
         assert!(
             lifecycle_rows.iter().any(|row| {
-                row.get("record_type") == Some(&Value::String("position_closed".to_string()))
-                    && row.get("close_reason") == Some(&Value::String("TimeStop".to_string()))
-                    && row.get("truth_status") == Some(&Value::String("failure".to_string()))
+                row.get("record_type") == Some(&Value::String("position_unresolved".to_string()))
+                    && row.get("terminal_reason_v2")
+                        == Some(&Value::String("BLOCKED_BY_DATA".to_string()))
+                    && row.get("truth_status") == Some(&Value::String("stale".to_string()))
             }),
-            "missing cache-reject time-stop close proof: {lifecycle_rows:?}"
+            "missing cache-reject unresolved proof: {lifecycle_rows:?}"
         );
 
         let event_rows = read_event_rows(&events_dir);
-        let closed_payload = event_rows
-            .iter()
-            .find_map(|row| {
-                let kind = row.get("kind")?.as_object()?;
-                if kind.get("type")? != "PositionClosed" {
-                    return None;
-                }
-                kind.get("payload")
-            })
-            .and_then(Value::as_object)
-            .cloned()
-            .expect("position closed payload");
-        assert_eq!(
-            closed_payload.get("reason"),
-            Some(&Value::String("TimeStop".to_string()))
-        );
+        assert!(event_rows.iter().any(|row| {
+            row.get("kind")
+                .and_then(Value::as_object)
+                .and_then(|kind| kind.get("type"))
+                == Some(&Value::String("ShadowPositionUnresolved".to_string()))
+        }));
+        assert!(event_rows.iter().all(|row| {
+            row.get("kind")
+                .and_then(Value::as_object)
+                .and_then(|kind| kind.get("type"))
+                != Some(&Value::String("PositionClosed".to_string()))
+        }));
     }
 
     #[tokio::test]
@@ -8052,6 +8576,7 @@ mod tests {
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        enable_baseline_exit_policy(&mut engine);
         let shadow_book = Arc::new(AsyncRwLock::new(ShadowPositionBook::new()));
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(
             Arc::clone(&shadow_book),
@@ -8066,7 +8591,7 @@ mod tests {
                 Pubkey::new_unique(),
                 mint,
                 bonding_curve,
-                Some(1.0),
+                Some(0.0001),
                 Some(1_000_000_000),
                 Some(1_000_000),
                 Some(PositionEventContext {
@@ -8177,6 +8702,7 @@ mod tests {
         let account_state_core = Arc::new(AccountStateReducer::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        enable_baseline_exit_policy(&mut engine);
         engine.set_account_state_core(Arc::clone(&account_state_core));
         let shadow_book = Arc::new(AsyncRwLock::new(ShadowPositionBook::new()));
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(
@@ -8307,6 +8833,7 @@ mod tests {
         let account_state_core = Arc::new(AccountStateReducer::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        enable_baseline_exit_policy(&mut engine);
         engine.set_account_state_core(Arc::clone(&account_state_core));
         let shadow_book = Arc::new(AsyncRwLock::new(ShadowPositionBook::new()));
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(
@@ -8560,15 +9087,19 @@ mod tests {
     async fn shadow_runtime_time_stop_rejects_stale_snapshot_without_emitting_fill() {
         let tmp = TempDir::new().expect("tempdir");
         let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
+        let events_dir = tmp.path().join("events");
 
         let config = PostBuyGuardianConfig::default();
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        enable_baseline_exit_policy(&mut engine);
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             AsyncRwLock::new(ShadowPositionBook::new()),
         ))));
         engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
+        let emitter = make_shadow_emitter(&events_dir);
+        engine.set_event_emitter(Arc::clone(&emitter));
         let engine = Arc::new(engine);
 
         let mint = Pubkey::new_unique();
@@ -8608,7 +9139,17 @@ mod tests {
         engine
             .run_shadow_runtime_tick(&mint, Some(&snapshot), now_ms)
             .await;
+        assert_eq!(engine.active_position_count(), 1);
+        engine
+            .run_shadow_runtime_tick(&mint, None, now_ms + 5_000)
+            .await;
         engine.sync_with_position_runtime(&[mint]).await;
+        emitter
+            .shared_writer()
+            .lock()
+            .expect("event writer")
+            .flush()
+            .expect("flush events");
 
         assert_eq!(engine.active_position_count(), 0);
 
@@ -8627,26 +9168,66 @@ mod tests {
                         .get("truth_detail")
                         .and_then(Value::as_str)
                         .is_some_and(|detail| {
-                            detail.contains("stale time-stop rejected without emitting fill")
-                                && detail.contains(
-                                    "source_path=guardian.post_buy.shadow_time_stop_stale",
-                                )
+                            detail.contains("sample_age_ms=10000")
+                                && detail.contains("stale_after_ms=1500")
                         })
             }),
             "missing stale time-stop rejection proof: {lifecycle_rows:?}"
         );
-        assert!(
-            lifecycle_rows.iter().any(|row| {
-                row.get("record_type") == Some(&Value::String("position_closed".to_string()))
-                    && row.get("close_reason") == Some(&Value::String("TimeStop".to_string()))
-                    && row.get("truth_status") == Some(&Value::String("stale".to_string()))
-            }),
-            "missing stale time-stop close proof: {lifecycle_rows:?}"
+        let unresolved = lifecycle_rows
+            .iter()
+            .find(|row| {
+                row.get("record_type") == Some(&Value::String("position_unresolved".to_string()))
+            })
+            .expect("stale quote must end as unresolved shadow terminal");
+        assert_eq!(unresolved["terminal_disposition"], "simulation_blocked");
+        assert_eq!(unresolved["terminal_reason_v2"], "BLOCKED_BY_DATA");
+        assert_eq!(
+            unresolved["remaining_token_amount_raw"],
+            120_080_136_032_u64
         );
+        assert_eq!(unresolved["recovery_elapsed_ms"], 5_000);
+        for forbidden_pnl_field in [
+            "exit_price",
+            "exit_value_sol",
+            "exit_token_amount_raw",
+            "gross_pnl_sol",
+            "net_pnl_sol",
+            "final_pnl",
+            "final_pnl_pct",
+            "mark_return_pct",
+            "executable_gross_return_pct",
+            "mfe_mark_pct",
+            "mae_mark_pct",
+            "exit_landed_slot",
+            "exit_landed_slot_source",
+        ] {
+            assert!(
+                unresolved.get(forbidden_pnl_field).is_none(),
+                "unresolved outcome leaked {forbidden_pnl_field}: {unresolved:?}"
+            );
+        }
+        assert!(lifecycle_rows.iter().all(|row| {
+            row.get("record_type") != Some(&Value::String("position_closed".to_string()))
+        }));
+
+        let event_rows = read_event_rows(&events_dir);
+        assert!(event_rows.iter().any(|row| {
+            row.get("kind")
+                .and_then(Value::as_object)
+                .and_then(|kind| kind.get("type"))
+                == Some(&Value::String("ShadowPositionUnresolved".to_string()))
+        }));
+        assert!(event_rows.iter().all(|row| {
+            row.get("kind")
+                .and_then(Value::as_object)
+                .and_then(|kind| kind.get("type"))
+                != Some(&Value::String("PositionClosed".to_string()))
+        }));
     }
 
     #[tokio::test]
-    async fn shadow_runtime_records_blocked_exit_when_price_truth_is_stale() {
+    async fn shadow_runtime_stale_price_does_not_create_price_triggered_proposal() {
         let tmp = TempDir::new().expect("tempdir");
         let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
 
@@ -8654,6 +9235,7 @@ mod tests {
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        enable_baseline_exit_policy(&mut engine);
         let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             AsyncRwLock::new(ShadowPositionBook::new()),
         )));
@@ -8700,15 +9282,17 @@ mod tests {
 
         let lifecycle_rows = read_jsonl_rows(&lifecycle_log);
         assert!(
-            lifecycle_rows.iter().any(|row| {
-                row.get("record_type") == Some(&Value::String("exit_blocked".to_string()))
-                    && row.get("truth_status") == Some(&Value::String("stale".to_string()))
-            }),
-            "missing exit_blocked stale proof: {lifecycle_rows:?}"
+            lifecycle_rows.is_empty(),
+            "stale mark must not create a sticky TP/SL proposal: {lifecycle_rows:?}"
         );
-
-        let shadow_book = runtime_router.shadow_book().expect("shadow book");
-        assert!(shadow_book.read().await.has_position("shadow:test:stale"));
         assert_eq!(engine.active_position_count(), 1);
+        let (decision_snapshot, _) = engine
+            .materialize_post_buy_decision_snapshot(&mint, 10_000)
+            .expect("decision snapshot");
+        assert_eq!(
+            decision_snapshot.mark_evidence_status(),
+            MarkEvidenceStatus::Stale
+        );
+        assert!(!decision_snapshot.has_pending_proposal());
     }
 }

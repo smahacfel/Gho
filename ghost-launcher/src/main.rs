@@ -2141,7 +2141,9 @@ async fn main() -> Result<()> {
     let post_buy_rx = event_bus_tx.subscribe();
     let post_buy_shutdown_rx = shutdown_tx.subscribe();
     let (post_buy_direct_tx, post_buy_direct_rx) =
-        ghost_launcher::components::post_buy_runtime::create_direct_post_buy_handoff_channel();
+        ghost_launcher::components::post_buy_runtime::create_direct_post_buy_handoff_channel(
+            config.trigger.max_concurrent_positions,
+        );
 
     let live_tx_sender = build_live_tx_sender(&config)
         .context("failed to initialize live BUY/SELL Sender transport")?;
@@ -2179,21 +2181,9 @@ async fn main() -> Result<()> {
         slippage_tolerance: config.trigger.slippage_tolerance,
         live_exit_take_profit_pct: config.trigger.live_exit_take_profit_pct,
         live_exit_stop_loss_pct: config.trigger.live_exit_stop_loss_pct,
-        shadow_target_threshold: ghost_brain_config
+        shadow_guardian: ghost_brain_config
             .as_ref()
-            .and_then(|brain| brain.post_buy_guardian.target_threshold),
-        shadow_stoploss_threshold: ghost_brain_config
-            .as_ref()
-            .and_then(|brain| brain.post_buy_guardian.stoploss_threshold),
-        shadow_wait_for_timestop: ghost_brain_config
-            .as_ref()
-            .and_then(|brain| brain.post_buy_guardian.wait_for_timestop),
-        shadow_time_stop_v2: ghost_brain_config
-            .as_ref()
-            .map(|brain| brain.post_buy_guardian.time_stop_v2.clone()),
-        shadow_exit_replay_v1: ghost_brain_config
-            .as_ref()
-            .map(|brain| brain.post_buy_guardian.exit_replay_v1.clone()),
+            .map(|brain| brain.post_buy_guardian.clone()),
         shadow_ledger: Some(Arc::clone(&shadow_ledger)),
         account_state_core: Some(Arc::clone(oracle_runtime.account_state_core())),
         shadow_lifecycle_log_path,
@@ -2202,6 +2192,10 @@ async fn main() -> Result<()> {
             .enabled
             .then(|| shadow_v2_burnin_config.clone()),
     };
+    post_buy_config
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .context("invalid Position Manager Lite V1 configuration")?;
     let hydration_live_sell_handle = post_buy_config.live_sell.clone();
     let post_buy_handle = tokio::spawn(async move {
         ghost_launcher::components::post_buy_runtime::run(

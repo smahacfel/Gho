@@ -43,7 +43,9 @@ struct CandidateTrajectory {
     has_candidate: bool,
     has_entry_submitted: bool,
     has_position_opened: bool,
-    has_position_closed: bool,
+    position_closed_count: usize,
+    shadow_position_unresolved_count: usize,
+    has_terminal_schema_violation: bool,
     entry_fill_statuses: Vec<FillStatus>,
     commands_issued: HashSet<String>,
     commands_applied: HashSet<String>,
@@ -276,7 +278,58 @@ impl EventValidator {
                     }
                 }
                 EventKind::PositionClosed(_) => {
-                    trajectory.has_position_closed = true;
+                    trajectory.position_closed_count =
+                        trajectory.position_closed_count.saturating_add(1);
+                }
+                EventKind::ShadowPositionUnresolved(payload) => {
+                    trajectory.shadow_position_unresolved_count = trajectory
+                        .shadow_position_unresolved_count
+                        .saturating_add(1);
+                    if !matches!(lane, Lane::Shadow) {
+                        trajectory.has_terminal_schema_violation = true;
+                        metrics.invariant_violations.push(Self::violation(
+                            &run_id,
+                            lane,
+                            &candidate_id,
+                            "timeline:ShadowPositionUnresolved is only valid for shadow lane",
+                        ));
+                    }
+                    if !trajectory.has_position_opened {
+                        trajectory.has_terminal_schema_violation = true;
+                        metrics.invariant_violations.push(Self::violation(
+                            &run_id,
+                            lane,
+                            &candidate_id,
+                            "timeline:ShadowPositionUnresolved without PositionOpened",
+                        ));
+                    }
+                    if event.envelope.position_id.is_none() {
+                        trajectory.has_terminal_schema_violation = true;
+                        metrics.invariant_violations.push(Self::violation(
+                            &run_id,
+                            lane,
+                            &candidate_id,
+                            "join:ShadowPositionUnresolved missing position_id",
+                        ));
+                    }
+                    if event.envelope.position_epoch.is_none() {
+                        trajectory.has_terminal_schema_violation = true;
+                        metrics.invariant_violations.push(Self::violation(
+                            &run_id,
+                            lane,
+                            &candidate_id,
+                            "join:ShadowPositionUnresolved missing position_epoch",
+                        ));
+                    }
+                    if payload.net_pnl_authoritative {
+                        trajectory.has_terminal_schema_violation = true;
+                        metrics.invariant_violations.push(Self::violation(
+                            &run_id,
+                            lane,
+                            &candidate_id,
+                            "schema:ShadowPositionUnresolved cannot claim authoritative net PnL",
+                        ));
+                    }
                 }
                 EventKind::ControlCommandIssued(_) => {
                     if let Some(command_id) = event.envelope.command_id.clone() {
@@ -435,7 +488,7 @@ impl EventValidator {
         }
 
         for trajectory in trajectories.values() {
-            let mut valid = true;
+            let mut valid = !trajectory.has_terminal_schema_violation;
 
             if !trajectory.has_candidate {
                 metrics.invariant_violations.push(Self::violation(
@@ -482,12 +535,24 @@ impl EventValidator {
                 valid = false;
             }
 
-            if trajectory.has_position_opened && !trajectory.has_position_closed {
+            let terminal_count = trajectory
+                .position_closed_count
+                .saturating_add(trajectory.shadow_position_unresolved_count);
+            if trajectory.has_position_opened && terminal_count == 0 {
                 metrics.invariant_violations.push(Self::violation(
                     &trajectory.run_id,
                     trajectory.lane,
                     &trajectory.candidate_id,
-                    "timeline:PositionOpened without PositionClosed",
+                    "timeline:PositionOpened without PositionClosed or ShadowPositionUnresolved",
+                ));
+                valid = false;
+            }
+            if terminal_count > 1 {
+                metrics.invariant_violations.push(Self::violation(
+                    &trajectory.run_id,
+                    trajectory.lane,
+                    &trajectory.candidate_id,
+                    "timeline:position lifecycle requires exactly one terminal PositionClosed or ShadowPositionUnresolved",
                 ));
                 valid = false;
             }
@@ -673,11 +738,136 @@ mod tests {
     use super::*;
     use crate::events::schema::{
         CandidatePayload, EntryFilledPayload, EntrySubmittedPayload, EventEnvelope, EventKind,
-        PoolTransactionPayload,
+        PoolTransactionPayload, PositionClosedPayload, PositionOpenedPayload,
+        ShadowPositionUnresolvedPayload, ShadowUnresolvedReason,
     };
     use crate::execution::backend::{FillStatus, OrderSide};
     use std::io::Write;
     use tempfile::NamedTempFile;
+    use trigger::{PriceTruthSource, PriceTruthStatus};
+
+    fn write_events(file: &mut NamedTempFile, events: Vec<ExecutionEvent>) {
+        for event in events {
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&event).expect("serialize")
+            )
+            .expect("write event");
+        }
+    }
+
+    fn shadow_lifecycle_with_unresolved(
+        unresolved_lane: Lane,
+        include_open: bool,
+        include_close: bool,
+    ) -> Vec<ExecutionEvent> {
+        let run_id = "r-shadow-unresolved".to_string();
+        let candidate_id = "candidate-shadow-unresolved".to_string();
+        let position_id = "position-shadow-unresolved".to_string();
+        let position_epoch = 7;
+        let entry_order_id = "entry-shadow-unresolved".to_string();
+
+        let mut entry_env =
+            EventEnvelope::new(run_id.clone(), Lane::Shadow, candidate_id.clone(), 100);
+        entry_env.order_id = Some(entry_order_id.clone());
+        entry_env.position_id = Some(position_id.clone());
+        entry_env.position_epoch = Some(position_epoch);
+
+        let mut events = vec![
+            ExecutionEvent::new(
+                EventEnvelope::new(run_id.clone(), Lane::Shadow, candidate_id.clone(), 99),
+                EventKind::Candidate(CandidatePayload {
+                    mcap_snapshot: None,
+                    price_snapshot: None,
+                    gatekeeper_verdict: "PASS".to_string(),
+                    gatekeeper_flags: vec![],
+                    source: "test".to_string(),
+                }),
+            ),
+            ExecutionEvent::new(
+                entry_env.derive(100),
+                EventKind::EntrySubmitted(EntrySubmittedPayload {
+                    side: OrderSide::Entry,
+                    planned_delay_ms: None,
+                    send_params: None,
+                    amount_lamports: 10,
+                    min_tokens_out: 10,
+                }),
+            ),
+            ExecutionEvent::new(
+                entry_env.derive(101),
+                EventKind::EntryFilled(EntryFilledPayload {
+                    fill_time_ms: 101,
+                    fill_price_effective: 1.0,
+                    fill_qty: 10,
+                    quote_id_used: "0_101_1".to_string(),
+                    status: FillStatus::Filled,
+                    latency_ms: 1,
+                }),
+            ),
+        ];
+
+        if include_open {
+            events.push(ExecutionEvent::new(
+                entry_env.derive(102),
+                EventKind::PositionOpened(PositionOpenedPayload {
+                    entry_price: 1.0,
+                    entry_time_ms: 102,
+                    epoch_id: position_epoch,
+                    size_tokens: 10,
+                    size_sol: 10,
+                }),
+            ));
+        }
+
+        let mut unresolved_env =
+            EventEnvelope::new(run_id.clone(), unresolved_lane, candidate_id.clone(), 103);
+        unresolved_env.position_id = Some(position_id.clone());
+        unresolved_env.position_epoch = Some(position_epoch);
+        unresolved_env.order_id = Some("shadow-unresolved-action".to_string());
+        events.push(ExecutionEvent::new(
+            unresolved_env,
+            EventKind::ShadowPositionUnresolved(ShadowPositionUnresolvedPayload {
+                reason: ShadowUnresolvedReason::BlockedByData,
+                action_id: "shadow-unresolved-action".to_string(),
+                policy_id: "position_manager_lite_exit_policy_v1".to_string(),
+                policy_version: 1,
+                policy_config_hash: "hash".to_string(),
+                remaining_qty: 10,
+                recovery_elapsed_ms: 5_000,
+                truth_status: PriceTruthStatus::Stale,
+                truth_source: PriceTruthSource::CanonicalAccountStateSnapshot,
+                truth_slot: Some(103),
+                truth_timestamp_ms: Some(103),
+                truth_age_ms: Some(5_000),
+                truth_detail: Some("stale".to_string()),
+                source_snapshot_id: "snapshot".to_string(),
+                execution_cost_coverage: "unmodeled".to_string(),
+                net_pnl_authoritative: false,
+            }),
+        ));
+
+        if include_close {
+            events.push(ExecutionEvent::new(
+                entry_env.derive(104),
+                EventKind::PositionClosed(PositionClosedPayload {
+                    final_pnl: 1.0,
+                    final_pnl_pct: 10.0,
+                    entry_value_sol: Some(10.0),
+                    exit_value_sol: Some(11.0),
+                    gross_pnl_sol: Some(1.0),
+                    net_pnl_sol: Some(1.0),
+                    estimated_costs_sol: Some(0.0),
+                    duration_ms: 1_000,
+                    reason: crate::events::schema::CloseReason::Target,
+                    total_exits: 1,
+                }),
+            ));
+        }
+
+        events
+    }
 
     #[test]
     fn test_validator_happy_path() {
@@ -871,5 +1061,73 @@ mod tests {
                 .any(|violation| violation.reason.contains("overlap between live and shadow")),
             "expected live/shadow overlap violation, got: {joins:?}"
         );
+    }
+
+    #[test]
+    fn validator_accepts_shadow_unresolved_as_the_only_terminal() {
+        let mut file = NamedTempFile::new().expect("tmp file");
+        write_events(
+            &mut file,
+            shadow_lifecycle_with_unresolved(Lane::Shadow, true, false),
+        );
+
+        let metrics = EventValidator::validate_jsonl(file.path()).expect("validate");
+        assert!(
+            metrics.invariant_violations.is_empty(),
+            "valid unresolved trajectory was rejected: {:?}",
+            metrics.invariant_violations
+        );
+        assert_eq!(metrics.valid_trajectories, 1);
+    }
+
+    #[test]
+    fn validator_rejects_unresolved_outside_shadow_lane() {
+        let mut file = NamedTempFile::new().expect("tmp file");
+        write_events(
+            &mut file,
+            shadow_lifecycle_with_unresolved(Lane::Live, true, false),
+        );
+
+        let metrics = EventValidator::validate_jsonl(file.path()).expect("validate");
+        assert!(metrics.invariant_violations.iter().any(|violation| {
+            violation
+                .reason
+                .contains("ShadowPositionUnresolved is only valid for shadow lane")
+        }));
+        assert_eq!(metrics.valid_trajectories, 0);
+    }
+
+    #[test]
+    fn validator_rejects_unresolved_without_position_opened() {
+        let mut file = NamedTempFile::new().expect("tmp file");
+        write_events(
+            &mut file,
+            shadow_lifecycle_with_unresolved(Lane::Shadow, false, false),
+        );
+
+        let metrics = EventValidator::validate_jsonl(file.path()).expect("validate");
+        assert!(metrics.invariant_violations.iter().any(|violation| {
+            violation
+                .reason
+                .contains("ShadowPositionUnresolved without PositionOpened")
+        }));
+        assert_eq!(metrics.valid_trajectories, 0);
+    }
+
+    #[test]
+    fn validator_rejects_close_and_unresolved_for_one_position() {
+        let mut file = NamedTempFile::new().expect("tmp file");
+        write_events(
+            &mut file,
+            shadow_lifecycle_with_unresolved(Lane::Shadow, true, true),
+        );
+
+        let metrics = EventValidator::validate_jsonl(file.path()).expect("validate");
+        assert!(metrics.invariant_violations.iter().any(|violation| {
+            violation.reason.contains(
+                "requires exactly one terminal PositionClosed or ShadowPositionUnresolved",
+            )
+        }));
+        assert_eq!(metrics.valid_trajectories, 0);
     }
 }

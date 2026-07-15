@@ -134,6 +134,7 @@ pub enum EventKind {
     ExitSubmitted(ExitSubmittedPayload),
     ExitFilled(ExitFilledPayload),
     PositionClosed(PositionClosedPayload),
+    ShadowPositionUnresolved(ShadowPositionUnresolvedPayload),
     ManagementDecision(ManagementDecisionPayload),
     ManagementOutcome(ManagementOutcomePayload),
 
@@ -159,6 +160,7 @@ impl EventKind {
             Self::ExitSubmitted(_) => "ExitSubmitted",
             Self::ExitFilled(_) => "ExitFilled",
             Self::PositionClosed(_) => "PositionClosed",
+            Self::ShadowPositionUnresolved(_) => "ShadowPositionUnresolved",
             Self::ManagementDecision(_) => "ManagementDecision",
             Self::ManagementOutcome(_) => "ManagementOutcome",
             Self::ExecutionStressChanged(_) => "ExecutionStressChanged",
@@ -525,6 +527,42 @@ pub struct PositionClosedPayload {
     pub reason: CloseReason,
     /// Total number of exit events.
     pub total_exits: u32,
+}
+
+/// Typed terminal reason for a shadow position that could not produce a
+/// resolved simulated fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowUnresolvedReason {
+    BlockedByData,
+    NoFill,
+    Failed,
+}
+
+/// Operational projection of an unresolved shadow terminal. By contract this
+/// payload contains no fill price and no PnL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowPositionUnresolvedPayload {
+    pub reason: ShadowUnresolvedReason,
+    pub action_id: String,
+    pub policy_id: String,
+    pub policy_version: u16,
+    pub policy_config_hash: String,
+    pub remaining_qty: u64,
+    pub recovery_elapsed_ms: u64,
+    pub truth_status: trigger::PriceTruthStatus,
+    pub truth_source: trigger::PriceTruthSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truth_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truth_timestamp_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truth_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truth_detail: Option<String>,
+    pub source_snapshot_id: String,
+    pub execution_cost_coverage: String,
+    pub net_pnl_authoritative: bool,
 }
 
 /// Why a position was closed.
