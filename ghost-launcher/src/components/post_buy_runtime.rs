@@ -316,6 +316,28 @@ fn init_shadow_v2_validation_harness(
         .map_err(|error| error.to_string())
 }
 
+fn init_position_manager_terminal_harness(
+    config: Option<&ShadowV2BurninConfig>,
+    events_output_path: &Path,
+    run_id: &str,
+) -> Result<Option<ShadowV2ValidationHarness>, String> {
+    if config.is_some_and(|config| config.enabled) {
+        return init_shadow_v2_validation_harness(config);
+    }
+
+    let root = events_output_path.join("position_manager_terminal_truth_v2");
+    let harness_config = ShadowV2ValidationHarnessConfig::new(
+        run_id,
+        root.join("shadow_position_event_v2.jsonl"),
+        root.join("shadow_replay_v2.jsonl"),
+        root.join("shadow_lifecycle_v2.jsonl"),
+        root.join("shadow_path_density_v2.jsonl"),
+    );
+    ShadowV2ValidationHarness::new(harness_config)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 fn shadow_v2_scope_root(config: &ShadowV2BurninConfig) -> Result<&str, String> {
     config
         .scope_root_path
@@ -2195,19 +2217,26 @@ pub async fn run(
             return;
         }
     };
-    let shadow_v2_harness =
-        match init_shadow_v2_validation_harness(config.shadow_v2_burnin.as_ref()) {
-            Ok(harness) => harness.map(|harness| Arc::new(ParkingMutex::new(harness))),
-            Err(error) => {
-                warn!(
-                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-                    error = %error,
-                    validation_harness_status = "FAILED",
-                    "PostBuyRuntime: SHADOW_V2_VALIDATION_PREFLIGHT_FAILED"
-                );
-                return;
-            }
-        };
+    let shadow_v2_harness = match if config.execution_mode == "shadow" {
+        init_position_manager_terminal_harness(
+            config.shadow_v2_burnin.as_ref(),
+            &config.events_output_path,
+            &run_id,
+        )
+    } else {
+        init_shadow_v2_validation_harness(config.shadow_v2_burnin.as_ref())
+    } {
+        Ok(harness) => harness.map(|harness| Arc::new(ParkingMutex::new(harness))),
+        Err(error) => {
+            warn!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                error = %error,
+                validation_harness_status = "FAILED",
+                "PostBuyRuntime: SHADOW_V2_VALIDATION_PREFLIGHT_FAILED"
+            );
+            return;
+        }
+    };
 
     // Shared QuoteProvider for ghost-brain PaperBroker (paper compatibility path only)
     let quote_provider = Arc::new(RwLock::new(ExecutableQuoteProvider::new(
@@ -5323,6 +5352,21 @@ sys.exit(0)
         assert!(
             manifest.contains("\"status\":\"PASS\"") || manifest.contains("\"status\": \"PASS\""),
             "post-run manifest must be generated before PostBuyRuntime returns: {manifest}"
+        );
+    }
+
+    #[test]
+    fn shadow_mode_initializes_terminal_truth_harness_without_optional_burnin() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let harness = init_position_manager_terminal_harness(None, tmp.path(), "runtime-run")
+            .expect("terminal harness init")
+            .expect("shadow mode terminal harness");
+
+        assert_eq!(
+            harness.canonical_event_stream_path(),
+            tmp.path()
+                .join("position_manager_terminal_truth_v2")
+                .join("shadow_position_event_v2.jsonl")
         );
     }
 

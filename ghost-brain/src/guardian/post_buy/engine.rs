@@ -49,8 +49,8 @@ use crate::execution::shadow::ShadowBackend;
 use crate::oracle::tcf::field::TrendCohesionField;
 use crate::oracle::tcf::observation::MarketObservation;
 use trigger::{
-    PriceTruthEvidence, PriceTruthResolver, PriceTruthSource, PriceTruthStatus,
-    ShadowExitPriceSample, ShadowExitTruth,
+    PriceTruthError, PriceTruthEvidence, PriceTruthFailureKind, PriceTruthResolver,
+    PriceTruthSource, PriceTruthStatus, ShadowExitPriceSample, ShadowExitTruth,
 };
 
 #[cfg(test)]
@@ -79,8 +79,8 @@ use super::shadow_v2::{
     ShadowExitAttemptV2, ShadowExitFillModelConfig, ShadowExitFillV2, ShadowPathSampleV2,
     ShadowPathSamplerConfigV2, ShadowPathSamplingModeV2, ShadowPathSamplingReasonV2,
     ShadowTerminalTruthV2, ShadowV2Envelope, ShadowV2ExecutablePnlLink, ShadowV2Record,
-    ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness, SimulationLevel, TemporalClass,
-    TerminalReasonV2, SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+    ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness, ShadowV2WriteStatus,
+    SimulationLevel, TemporalClass, TerminalReasonV2, SHADOW_V2_EXIT_FILL_MODEL_VERSION,
 };
 
 #[cfg(test)]
@@ -653,6 +653,7 @@ struct MonitoredPosition {
     state_revision: u64,
     next_exit_action_seq: u64,
     pending_exit_proposal: Option<PendingExitProposal>,
+    pending_terminal_commit: Option<PendingTerminalCommit>,
     terminal_tx: Option<oneshot::Sender<ShadowTerminalDisposition>>,
     last_applied_action_id: Option<String>,
     last_source_snapshot_id: Option<String>,
@@ -710,6 +711,101 @@ struct PendingExitProposal {
     expected_remaining_quantity: u64,
     source_snapshot_id: String,
     last_quote_attempt_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTerminalCommit {
+    action_id: String,
+    record: ShadowLifecycleRecord,
+    disposition: ShadowTerminalDisposition,
+    last_attempt_ms: Option<u64>,
+    lifecycle_jsonl_committed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalWriteStatus {
+    Ok,
+    NotConfigured,
+    NotRequired,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalCommitReceipt {
+    lifecycle_jsonl: TerminalWriteStatus,
+    canonical_shadow_v2: TerminalWriteStatus,
+    replay_projection: TerminalWriteStatus,
+}
+
+impl TerminalCommitReceipt {
+    fn canonical_committed(&self) -> bool {
+        matches!(self.canonical_shadow_v2, TerminalWriteStatus::Ok)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExecutableQuoteFailure {
+    kind: ExecutableQuoteFailureKind,
+    evidence: PriceTruthEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutableQuoteFailureKind {
+    MissingSnapshot,
+    StaleSnapshot,
+    InvalidReserves,
+    InvalidNormalization,
+    QuantityMismatch,
+    ZeroOutput,
+    SemanticViolation,
+    InternalFailure,
+}
+
+impl ExecutableQuoteFailureKind {
+    fn unresolved_reason(self) -> ShadowUnresolvedReason {
+        match self {
+            Self::MissingSnapshot
+            | Self::StaleSnapshot
+            | Self::InvalidReserves
+            | Self::InvalidNormalization
+            | Self::QuantityMismatch
+            | Self::SemanticViolation => ShadowUnresolvedReason::BlockedByData,
+            Self::ZeroOutput => ShadowUnresolvedReason::NoFill,
+            Self::InternalFailure => ShadowUnresolvedReason::Failed,
+        }
+    }
+}
+
+impl ExecutableQuoteFailure {
+    fn from_price_truth_error(error: PriceTruthError) -> Self {
+        let kind = match &error {
+            PriceTruthError::Stale { .. } => ExecutableQuoteFailureKind::StaleSnapshot,
+            PriceTruthError::BackfillRequired { .. } => ExecutableQuoteFailureKind::MissingSnapshot,
+            PriceTruthError::Failure { kind, .. }
+            | PriceTruthError::SemanticViolation { kind, .. } => match kind {
+                PriceTruthFailureKind::InvalidReserves => {
+                    ExecutableQuoteFailureKind::InvalidReserves
+                }
+                PriceTruthFailureKind::InvalidNormalization => {
+                    ExecutableQuoteFailureKind::InvalidNormalization
+                }
+                PriceTruthFailureKind::QuantityMismatch => {
+                    ExecutableQuoteFailureKind::QuantityMismatch
+                }
+                PriceTruthFailureKind::ZeroOutput => ExecutableQuoteFailureKind::ZeroOutput,
+                PriceTruthFailureKind::SemanticViolation => {
+                    ExecutableQuoteFailureKind::SemanticViolation
+                }
+                PriceTruthFailureKind::InternalFailure => {
+                    ExecutableQuoteFailureKind::InternalFailure
+                }
+            },
+        };
+        Self {
+            kind,
+            evidence: error.evidence().clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -922,7 +1018,7 @@ enum ShadowLifecycleRecordType {
     TimeStopV2Window,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ShadowLifecycleRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     ab_record_id: Option<String>,
@@ -1972,21 +2068,19 @@ impl MonitoringEngine {
         handle: &ShadowExitActionHandle,
         reason: ShadowUnresolvedReason,
         evidence: PriceTruthEvidence,
-    ) -> Result<MonitoredPosition, PositionApplyError> {
+    ) -> Result<(), PositionApplyError> {
         let mut positions = self.positions.write();
         let pos = positions
-            .get(&handle.base_mint)
+            .get_mut(&handle.base_mint)
             .ok_or(PositionApplyError::PositionNotFound)?;
         Self::validate_action_handle(pos, handle)?;
-        let mut pos = positions
-            .remove(&handle.base_mint)
-            .ok_or(PositionApplyError::PositionNotFound)?;
         pos.last_price_truth = Some(evidence);
         pos.last_applied_action_id = Some(handle.action_id.clone());
         pos.last_source_snapshot_id = Some(handle.source_snapshot_id.clone());
         pos.last_shadow_outcome = Some(reason.outcome_kind());
+        pos.pending_exit_proposal = None;
         pos.state_revision = pos.state_revision.saturating_add(1);
-        Ok(pos)
+        Ok(())
     }
 
     async fn refresh_shadow_time_stop_anchor(&self, base_mint: &Pubkey) {
@@ -2279,28 +2373,61 @@ impl MonitoringEngine {
         }
     }
 
-    fn append_shadow_lifecycle_record(&self, record: &ShadowLifecycleRecord) {
-        let Some(path) = self.shadow_lifecycle_log_path.as_deref() else {
-            self.append_shadow_v2_lifecycle_record(record);
-            return;
-        };
-        if let Err(error) = Self::append_jsonl_record(path, record) {
-            error!(
-                path = %path.display(),
-                position_id = %record.position_id,
-                error = %error,
-                "PostBuyGuardian: failed to append shadow lifecycle proof"
-            );
-        }
-        self.append_shadow_v2_lifecycle_record(record);
+    fn append_shadow_lifecycle_record(
+        &self,
+        record: &ShadowLifecycleRecord,
+    ) -> TerminalCommitReceipt {
+        self.append_shadow_record(record, true)
     }
 
-    fn append_shadow_v2_lifecycle_record(&self, record: &ShadowLifecycleRecord) {
+    fn append_shadow_record(
+        &self,
+        record: &ShadowLifecycleRecord,
+        write_lifecycle_jsonl: bool,
+    ) -> TerminalCommitReceipt {
+        let lifecycle_jsonl = match (
+            write_lifecycle_jsonl,
+            self.shadow_lifecycle_log_path.as_deref(),
+        ) {
+            (false, _) => TerminalWriteStatus::NotRequired,
+            (true, Some(path)) => match Self::append_jsonl_record(path, record) {
+                Ok(()) => TerminalWriteStatus::Ok,
+                Err(error) => {
+                    error!(
+                        path = %path.display(),
+                        position_id = %record.position_id,
+                        error = %error,
+                        "PostBuyGuardian: failed to append shadow lifecycle proof"
+                    );
+                    TerminalWriteStatus::Failed(error.to_string())
+                }
+            },
+            (true, None) => TerminalWriteStatus::NotConfigured,
+        };
+        let (canonical_shadow_v2, replay_projection) =
+            self.append_shadow_v2_lifecycle_record(record);
+        TerminalCommitReceipt {
+            lifecycle_jsonl,
+            canonical_shadow_v2,
+            replay_projection,
+        }
+    }
+
+    fn append_shadow_v2_lifecycle_record(
+        &self,
+        record: &ShadowLifecycleRecord,
+    ) -> (TerminalWriteStatus, TerminalWriteStatus) {
         let Some(harness) = self.shadow_v2_validation_harness.as_ref() else {
-            return;
+            return (
+                TerminalWriteStatus::NotConfigured,
+                TerminalWriteStatus::NotConfigured,
+            );
         };
         if !matches!(record.lane, Lane::Shadow) {
-            return;
+            return (
+                TerminalWriteStatus::NotRequired,
+                TerminalWriteStatus::NotRequired,
+            );
         }
 
         let mut records = Vec::new();
@@ -2382,9 +2509,16 @@ impl MonitoringEngine {
                 self.shadow_v2_terminal_truth_from_lifecycle(record, executable_pnl_link),
             ));
         }
+        let mut terminal_canonical = TerminalWriteStatus::NotRequired;
+        let mut terminal_replay = TerminalWriteStatus::NotRequired;
         for record in records {
+            let is_terminal = matches!(record, ShadowV2Record::ShadowTerminalTruthV2(_));
             let event_id = record.envelope().event_id.clone();
             let outcome = harness.append_record(record);
+            if is_terminal {
+                terminal_canonical = Self::terminal_write_status(outcome.canonical_write.clone());
+                terminal_replay = Self::terminal_write_status(outcome.replay_write.clone());
+            }
             if outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete {
                 debug!(
                     position_id = %event_id,
@@ -2400,6 +2534,16 @@ impl MonitoringEngine {
                     density_write = ?outcome.density_write,
                     "PostBuyGuardian: Shadow V2 lifecycle evidence append incomplete"
                 );
+            }
+        }
+        (terminal_canonical, terminal_replay)
+    }
+
+    fn terminal_write_status(status: ShadowV2WriteStatus) -> TerminalWriteStatus {
+        match status {
+            ShadowV2WriteStatus::Ok => TerminalWriteStatus::Ok,
+            ShadowV2WriteStatus::Err(error) | ShadowV2WriteStatus::Skipped(error) => {
+                TerminalWriteStatus::Failed(error)
             }
         }
     }
@@ -2960,6 +3104,14 @@ impl MonitoringEngine {
         envelope
             .limitations
             .push("TERMINAL_TRUTH_DERIVED_FROM_LEGACY_LIFECYCLE_RECORD".to_string());
+        if matches!(
+            record.record_type,
+            ShadowLifecycleRecordType::PositionUnresolved
+        ) {
+            envelope
+                .limitations
+                .push("TERMINAL_OBSERVED_CHAIN_SLOT_UNAVAILABLE_RUNTIME_ONLY_TERMINAL".to_string());
+        }
 
         let (final_pnl_executable_bps, linked_entry_fill, linked_exit_fill, reconciliation_status) =
             if let Some(link) = executable_pnl_link {
@@ -3015,7 +3167,23 @@ impl MonitoringEngine {
                 clock_source: terminal_source.to_string(),
                 causal_boundary: "POST_EXIT_TERMINAL_TRUTH".to_string(),
             },
-            terminal_slot: record.exit_landed_slot.or(record.exit_sample_slot),
+            truth_slot: record.exit_sample_slot.or(record.sample_slot),
+            terminal_observed_slot: if matches!(
+                record.record_type,
+                ShadowLifecycleRecordType::PositionUnresolved
+            ) {
+                None
+            } else {
+                record.exit_landed_slot
+            },
+            terminal_slot: if matches!(
+                record.record_type,
+                ShadowLifecycleRecordType::PositionUnresolved
+            ) {
+                None
+            } else {
+                record.exit_landed_slot.or(record.exit_sample_slot)
+            },
             terminal_source: terminal_source.to_string(),
             final_pnl_mark_bps: if matches!(
                 record.record_type,
@@ -3388,7 +3556,12 @@ impl MonitoringEngine {
                 | ShadowLifecycleRecordType::PositionClosed
                 | ShadowLifecycleRecordType::PositionUnresolved
         );
-        let exit_landed_slot = synthetic_next_slot(evidence.slot);
+        let exit_landed_slot =
+            if matches!(record_type, ShadowLifecycleRecordType::PositionUnresolved) {
+                None
+            } else {
+                synthetic_next_slot(evidence.slot)
+            };
         let time_stop_v2_observed = pos.time_stop_v2.has_observed();
         ShadowLifecycleRecord {
             ab_record_id: pos.join_metadata.ab_record_id.clone(),
@@ -3606,7 +3779,11 @@ impl MonitoringEngine {
         }
     }
 
-    fn emit_position_closed(&self, pos: &MonitoredPosition, duration_ms: u64) {
+    fn emit_position_closed(
+        &self,
+        pos: &MonitoredPosition,
+        duration_ms: u64,
+    ) -> Option<ShadowLifecycleRecord> {
         let gross_pnl_sol = if pos.total_exits > 0 {
             Some(pos.realized_exit_value_sol - pos.entry_value_sol)
         } else {
@@ -3677,8 +3854,9 @@ impl MonitoringEngine {
             record.final_pnl_pct = (pos.total_exits > 0).then_some(final_pnl_pct);
             record.duration_ms = Some(duration_ms);
             record.close_reason = Some(close_reason);
-            self.append_shadow_lifecycle_record(&record);
+            return Some(record);
         }
+        None
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -3830,6 +4008,25 @@ impl MonitoringEngine {
             .clone()
             .unwrap_or_else(|| format!("{}:{}:{}", pool_amm_id, base_mint, now_ms));
         let position_epoch = event_context.position_epoch.unwrap_or(1_u64);
+        if matches!(event_context.lane, Lane::Shadow) {
+            let valid_entry_price =
+                entry_price_sol.is_some_and(|price| price.is_finite() && price > 0.0);
+            let valid_quantity = entry_token_amount_raw.is_some_and(|quantity| quantity > 0);
+            let valid_identity = !event_context.candidate_id.trim().is_empty()
+                && !position_id.trim().is_empty()
+                && position_epoch > 0;
+            if !valid_identity || !valid_entry_price || !valid_quantity {
+                warn!(
+                    candidate_id = %event_context.candidate_id,
+                    %position_id,
+                    position_epoch,
+                    entry_price_sol = ?entry_price_sol,
+                    entry_token_amount_raw = ?entry_token_amount_raw,
+                    "PostBuyGuardian: rejected invalid immutable shadow position contract"
+                );
+                return None;
+            }
+        }
         let shadow_market_activity = ShadowMarketActivityAnchor::from_registration(
             opened_at_ms,
             initial_shadow_snapshot.as_ref(),
@@ -3852,6 +4049,7 @@ impl MonitoringEngine {
             state_revision: 1,
             next_exit_action_seq: 1,
             pending_exit_proposal: None,
+            pending_terminal_commit: None,
             terminal_tx,
             last_applied_action_id: None,
             last_source_snapshot_id: None,
@@ -5298,6 +5496,10 @@ impl MonitoringEngine {
         latest: Option<&MarketSnapshot>,
         now_ms: u64,
     ) {
+        if self.has_pending_terminal_commit(base_mint) {
+            self.retry_pending_terminal_commit(base_mint, now_ms).await;
+            return;
+        }
         let Some(policy) = self.exit_policy_v1.as_ref() else {
             return;
         };
@@ -5353,15 +5555,20 @@ impl MonitoringEngine {
         let evidence_source = self.snapshot_source_for_position(base_mint);
         let quote_result = latest_snapshot
             .as_ref()
-            .ok_or_else(|| PriceTruthEvidence {
-                source: evidence_source,
-                status: PriceTruthStatus::Failure,
-                detail: Some("no canonical snapshot available for pending shadow exit".to_string()),
-                slot: snapshot.guard().latest_sample_slot(),
-                timestamp_ms: snapshot.guard().latest_sample_timestamp_ms(),
-                age_ms: None,
-                price_state: None,
-                price_reason: None,
+            .ok_or_else(|| ExecutableQuoteFailure {
+                kind: ExecutableQuoteFailureKind::MissingSnapshot,
+                evidence: PriceTruthEvidence {
+                    source: evidence_source,
+                    status: PriceTruthStatus::Failure,
+                    detail: Some(
+                        "no canonical snapshot available for pending shadow exit".to_string(),
+                    ),
+                    slot: snapshot.guard().latest_sample_slot(),
+                    timestamp_ms: snapshot.guard().latest_sample_timestamp_ms(),
+                    age_ms: None,
+                    price_state: None,
+                    price_reason: None,
+                },
             })
             .and_then(|latest_snapshot| {
                 Self::resolve_shadow_exit_sample_for_runtime(
@@ -5370,34 +5577,40 @@ impl MonitoringEngine {
                     self.shadow_exit_stale_after_ms(),
                     evidence_source,
                 )
-                .map_err(|error| error.evidence().clone())
+                .map_err(ExecutableQuoteFailure::from_price_truth_error)
             })
             .and_then(|sample| {
-                let entry_price = snapshot
-                    .entry_price_sol()
-                    .ok_or_else(|| PriceTruthEvidence {
-                        source: sample.evidence.source,
-                        status: PriceTruthStatus::SemanticViolation,
-                        detail: Some("shadow entry price missing at quote boundary".to_string()),
-                        slot: sample.evidence.slot,
-                        timestamp_ms: sample.evidence.timestamp_ms,
-                        age_ms: sample.evidence.age_ms,
-                        price_state: sample.evidence.price_state,
-                        price_reason: sample.evidence.price_reason,
-                    })?;
+                let entry_price =
+                    snapshot
+                        .entry_price_sol()
+                        .ok_or_else(|| ExecutableQuoteFailure {
+                            kind: ExecutableQuoteFailureKind::InternalFailure,
+                            evidence: PriceTruthEvidence {
+                                source: sample.evidence.source,
+                                status: PriceTruthStatus::SemanticViolation,
+                                detail: Some(
+                                    "shadow entry price missing at quote boundary".to_string(),
+                                ),
+                                slot: sample.evidence.slot,
+                                timestamp_ms: sample.evidence.timestamp_ms,
+                                age_ms: sample.evidence.age_ms,
+                                price_state: sample.evidence.price_state,
+                                price_reason: sample.evidence.price_reason,
+                            },
+                        })?;
                 PriceTruthResolver::resolve_shadow_exit(
                     entry_price,
                     action.expected_remaining_quantity,
                     &sample,
                     0.0,
                 )
-                .map_err(|error| error.evidence().clone())
+                .map_err(ExecutableQuoteFailure::from_price_truth_error)
             });
 
         let truth = match quote_result {
             Ok(truth) => truth,
-            Err(evidence) => {
-                self.handle_shadow_quote_failure(action, evidence, now_ms)
+            Err(failure) => {
+                self.handle_shadow_quote_failure(action, failure, now_ms)
                     .await;
                 return;
             }
@@ -5416,19 +5629,23 @@ impl MonitoringEngine {
                 if intent.quantity_raw() != action.expected_remaining_quantity
                     || intent.reason() != action.reason
                 {
-                    let evidence = PriceTruthEvidence {
-                        source: truth.evidence.source,
-                        status: PriceTruthStatus::SemanticViolation,
-                        detail: Some(
-                            "pure exit intent disagreed with guarded pending proposal".to_string(),
-                        ),
-                        slot: truth.evidence.slot,
-                        timestamp_ms: truth.evidence.timestamp_ms,
-                        age_ms: truth.evidence.age_ms,
-                        price_state: truth.evidence.price_state,
-                        price_reason: truth.evidence.price_reason,
+                    let failure = ExecutableQuoteFailure {
+                        kind: ExecutableQuoteFailureKind::QuantityMismatch,
+                        evidence: PriceTruthEvidence {
+                            source: truth.evidence.source,
+                            status: PriceTruthStatus::SemanticViolation,
+                            detail: Some(
+                                "pure exit intent disagreed with guarded pending proposal"
+                                    .to_string(),
+                            ),
+                            slot: truth.evidence.slot,
+                            timestamp_ms: truth.evidence.timestamp_ms,
+                            age_ms: truth.evidence.age_ms,
+                            price_state: truth.evidence.price_state,
+                            price_reason: truth.evidence.price_reason,
+                        },
                     };
-                    self.handle_shadow_quote_failure(action, evidence, now_ms)
+                    self.handle_shadow_quote_failure(action, failure, now_ms)
                         .await;
                     return;
                 }
@@ -5452,17 +5669,20 @@ impl MonitoringEngine {
                 self.finish_resolved_shadow_position(action, now_ms).await;
             }
             FinalPolicyDecision::UnknownEvidence { reason } => {
-                let evidence = PriceTruthEvidence {
-                    source: truth.evidence.source,
-                    status: PriceTruthStatus::SemanticViolation,
-                    detail: Some(format!("exit quote rejected by policy: {reason:?}")),
-                    slot: truth.evidence.slot,
-                    timestamp_ms: truth.evidence.timestamp_ms,
-                    age_ms: truth.evidence.age_ms,
-                    price_state: truth.evidence.price_state,
-                    price_reason: truth.evidence.price_reason,
+                let failure = ExecutableQuoteFailure {
+                    kind: ExecutableQuoteFailureKind::SemanticViolation,
+                    evidence: PriceTruthEvidence {
+                        source: truth.evidence.source,
+                        status: PriceTruthStatus::SemanticViolation,
+                        detail: Some(format!("exit quote rejected by policy: {reason:?}")),
+                        slot: truth.evidence.slot,
+                        timestamp_ms: truth.evidence.timestamp_ms,
+                        age_ms: truth.evidence.age_ms,
+                        price_state: truth.evidence.price_state,
+                        price_reason: truth.evidence.price_reason,
+                    },
                 };
-                self.handle_shadow_quote_failure(action, evidence, now_ms)
+                self.handle_shadow_quote_failure(action, failure, now_ms)
                     .await;
             }
             FinalPolicyDecision::Hold => {}
@@ -5472,34 +5692,44 @@ impl MonitoringEngine {
     async fn handle_shadow_quote_failure(
         &self,
         action: ShadowExitActionHandle,
-        evidence: PriceTruthEvidence,
+        failure: ExecutableQuoteFailure,
         now_ms: u64,
     ) {
+        let evidence = failure.evidence.clone();
         self.maybe_record_shadow_exit_blocked(&action.base_mint, now_ms, 10_000, &evidence);
         if now_ms < action.recovery_deadline_ms {
             return;
         }
 
-        let unresolved_reason = Self::classify_shadow_unresolved_reason(&evidence);
+        let unresolved_reason = failure.kind.unresolved_reason();
         match self.terminate_shadow_proposal(&action, unresolved_reason, evidence.clone()) {
-            Ok(mut pos) => {
+            Ok(()) => {
                 let recovery_elapsed_ms = now_ms.saturating_sub(action.triggered_at_ms);
-                self.emit_shadow_unresolved(
-                    &pos,
-                    &action,
-                    unresolved_reason,
-                    recovery_elapsed_ms,
-                    now_ms,
-                    &evidence,
-                );
-                if let Some(terminal_tx) = pos.terminal_tx.take() {
-                    let _ = terminal_tx.send(ShadowTerminalDisposition::SimulationBlocked {
-                        action_id: action.action_id.clone(),
-                        reason: unresolved_reason,
-                    });
+                let terminal = {
+                    let positions = self.positions.read();
+                    let Some(pos) = positions.get(&action.base_mint) else {
+                        return;
+                    };
+                    self.emit_shadow_unresolved(
+                        pos,
+                        &action,
+                        unresolved_reason,
+                        recovery_elapsed_ms,
+                        now_ms,
+                        &evidence,
+                    )
+                };
+                let disposition = ShadowTerminalDisposition::SimulationBlocked {
+                    action_id: action.action_id.clone(),
+                    reason: unresolved_reason,
+                };
+                if self
+                    .stage_terminal_commit(&action, terminal, disposition)
+                    .is_ok()
+                {
+                    self.retry_pending_terminal_commit(&action.base_mint, now_ms)
+                        .await;
                 }
-                self.cleanup_shadow_runtime_artifacts(&action.base_mint, &action.position_id)
-                    .await;
             }
             Err(PositionApplyError::StaleRevision) => {}
             Err(error) => debug!(
@@ -5507,34 +5737,6 @@ impl MonitoringEngine {
                 error = %error,
                 "PostBuyGuardian: unresolved shadow terminal rejected by guarded apply"
             ),
-        }
-    }
-
-    fn classify_shadow_unresolved_reason(evidence: &PriceTruthEvidence) -> ShadowUnresolvedReason {
-        match evidence.status {
-            PriceTruthStatus::SemanticViolation
-            | PriceTruthStatus::Stale
-            | PriceTruthStatus::BackfillRequired => ShadowUnresolvedReason::BlockedByData,
-            PriceTruthStatus::Failure => {
-                match evidence.detail.as_deref().map(str::to_ascii_lowercase) {
-                    Some(detail)
-                        if detail.contains("zero")
-                            || detail.contains("no fill")
-                            || detail.contains("no executable") =>
-                    {
-                        ShadowUnresolvedReason::NoFill
-                    }
-                    Some(detail)
-                        if detail.contains("no canonical snapshot")
-                            || detail.contains("could not be normalized")
-                            || detail.contains("missing at quote boundary") =>
-                    {
-                        ShadowUnresolvedReason::BlockedByData
-                    }
-                    _ => ShadowUnresolvedReason::Failed,
-                }
-            }
-            PriceTruthStatus::Resolved => ShadowUnresolvedReason::Failed,
         }
     }
 
@@ -5568,8 +5770,8 @@ impl MonitoringEngine {
     }
 
     async fn finish_resolved_shadow_position(&self, action: ShadowExitActionHandle, now_ms: u64) {
-        let removed = {
-            let mut positions = self.positions.write();
+        let terminal = {
+            let positions = self.positions.read();
             let Some(pos) = positions.get(&action.base_mint) else {
                 return;
             };
@@ -5583,20 +5785,136 @@ impl MonitoringEngine {
             {
                 return;
             }
-            positions.remove(&action.base_mint)
+            let duration_ms = now_ms.saturating_sub(pos.entry_unix_ms);
+            self.emit_position_closed(pos, duration_ms)
+        };
+        let Some(terminal) = terminal else {
+            return;
+        };
+        let disposition = ShadowTerminalDisposition::SimulatedClosed {
+            action_id: action.action_id.clone(),
+            reason: action.reason.reason_code().to_string(),
+        };
+        if self
+            .stage_terminal_commit(&action, terminal, disposition)
+            .is_ok()
+        {
+            self.retry_pending_terminal_commit(&action.base_mint, now_ms)
+                .await;
+        }
+    }
+
+    fn has_pending_terminal_commit(&self, base_mint: &Pubkey) -> bool {
+        self.positions
+            .read()
+            .get(base_mint)
+            .is_some_and(|pos| pos.pending_terminal_commit.is_some())
+    }
+
+    fn stage_terminal_commit(
+        &self,
+        action: &ShadowExitActionHandle,
+        record: ShadowLifecycleRecord,
+        disposition: ShadowTerminalDisposition,
+    ) -> Result<(), PositionApplyError> {
+        let mut positions = self.positions.write();
+        let pos = positions
+            .get_mut(&action.base_mint)
+            .ok_or(PositionApplyError::PositionNotFound)?;
+        if pos.position_id != action.position_id {
+            return Err(PositionApplyError::PositionNotFound);
+        }
+        if pos.position_epoch != action.position_epoch {
+            return Err(PositionApplyError::EpochMismatch);
+        }
+        if pos.last_applied_action_id.as_deref() != Some(action.action_id.as_str()) {
+            return Err(PositionApplyError::ActionMismatch);
+        }
+        if pos.pending_terminal_commit.is_some() {
+            return Err(PositionApplyError::ConcurrentActionPending);
+        }
+        pos.pending_terminal_commit = Some(PendingTerminalCommit {
+            action_id: action.action_id.clone(),
+            record,
+            disposition,
+            last_attempt_ms: None,
+            lifecycle_jsonl_committed: false,
+        });
+        Ok(())
+    }
+
+    async fn retry_pending_terminal_commit(&self, base_mint: &Pubkey, now_ms: u64) {
+        let pending = {
+            let mut positions = self.positions.write();
+            let Some(pos) = positions.get_mut(base_mint) else {
+                return;
+            };
+            let Some(pending) = pos.pending_terminal_commit.as_mut() else {
+                return;
+            };
+            if pending
+                .last_attempt_ms
+                .is_some_and(|last| now_ms.saturating_sub(last) < SHADOW_QUOTE_RETRY_INTERVAL_MS)
+            {
+                return;
+            }
+            pending.last_attempt_ms = Some(now_ms);
+            pending.clone()
+        };
+
+        let receipt =
+            self.append_shadow_record(&pending.record, !pending.lifecycle_jsonl_committed);
+        if !pending.lifecycle_jsonl_committed
+            && matches!(receipt.lifecycle_jsonl, TerminalWriteStatus::Ok)
+        {
+            if let Some(pos) = self.positions.write().get_mut(base_mint) {
+                if let Some(current) = pos.pending_terminal_commit.as_mut() {
+                    if current.action_id == pending.action_id {
+                        current.lifecycle_jsonl_committed = true;
+                    }
+                }
+            }
+        }
+
+        if !receipt.canonical_committed() {
+            error!(
+                base_mint = %base_mint,
+                action_id = %pending.action_id,
+                lifecycle_jsonl = ?receipt.lifecycle_jsonl,
+                canonical_shadow_v2 = ?receipt.canonical_shadow_v2,
+                replay_projection = ?receipt.replay_projection,
+                "PostBuyGuardian: terminal persistence pending; capacity remains reserved"
+            );
+            return;
+        }
+
+        if !matches!(receipt.replay_projection, TerminalWriteStatus::Ok) {
+            warn!(
+                base_mint = %base_mint,
+                action_id = %pending.action_id,
+                replay_projection = ?receipt.replay_projection,
+                "PostBuyGuardian: canonical terminal committed with degraded replay projection"
+            );
+        }
+
+        let removed = {
+            let mut positions = self.positions.write();
+            let matches_pending = positions.get(base_mint).is_some_and(|pos| {
+                pos.pending_terminal_commit
+                    .as_ref()
+                    .is_some_and(|current| current.action_id == pending.action_id)
+            });
+            matches_pending
+                .then(|| positions.remove(base_mint))
+                .flatten()
         };
         let Some(mut pos) = removed else {
             return;
         };
-        let duration_ms = now_ms.saturating_sub(pos.entry_unix_ms);
-        self.emit_position_closed(&pos, duration_ms);
         if let Some(terminal_tx) = pos.terminal_tx.take() {
-            let _ = terminal_tx.send(ShadowTerminalDisposition::SimulatedClosed {
-                action_id: action.action_id.clone(),
-                reason: action.reason.reason_code().to_string(),
-            });
+            let _ = terminal_tx.send(pending.disposition);
         }
-        self.cleanup_shadow_runtime_artifacts(&action.base_mint, &action.position_id)
+        self.cleanup_shadow_runtime_artifacts(base_mint, &pos.position_id)
             .await;
     }
 
@@ -5625,7 +5943,7 @@ impl MonitoringEngine {
         recovery_elapsed_ms: u64,
         now_ms: u64,
         evidence: &PriceTruthEvidence,
-    ) {
+    ) -> ShadowLifecycleRecord {
         let policy = self.exit_policy_v1.as_ref();
         if let Some(emitter) = self.event_emitter.as_ref() {
             let mut env = emitter.make_envelope_at(&pos.candidate_id, now_ms);
@@ -5682,7 +6000,7 @@ impl MonitoringEngine {
         record.exit_token_amount_raw = None;
         record.exit_landed_slot = None;
         record.exit_landed_slot_source = None;
-        self.append_shadow_lifecycle_record(&record);
+        record
     }
 
     fn maybe_record_shadow_exit_blocked(
@@ -6143,6 +6461,120 @@ mod tests {
 
     fn enable_baseline_exit_policy(engine: &mut MonitoringEngine) {
         engine.set_exit_policy_v1_thresholds_for_tests(0.50, 0.50);
+    }
+
+    fn enable_terminal_truth_harness(engine: &mut MonitoringEngine, path: &Path) {
+        let harness = ShadowV2ValidationHarness::new(shadow_v2_harness_config_for_dir(path))
+            .expect("terminal truth harness");
+        engine.set_shadow_v2_validation_harness(Arc::new(Mutex::new(harness)));
+    }
+
+    #[test]
+    fn shadow_registration_rejects_invalid_immutable_contract_before_open_event() {
+        let tmp = TempDir::new().expect("tempdir");
+        let events_dir = tmp.path().join("events");
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::new(
+            PostBuyGuardianConfig::default(),
+            Arc::new(ShadowLedger::new()),
+            tx,
+        );
+        let emitter = make_shadow_emitter(&events_dir);
+        engine.set_event_emitter(Arc::clone(&emitter));
+
+        let invalid_price = engine.register_position_with_context(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            None,
+            Some(1_000_000),
+            Some(1_000),
+            Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
+                candidate_id: "invalid-price".to_string(),
+                entry_order_id: "invalid-price-entry".to_string(),
+                quote_id: "invalid-price-quote".to_string(),
+                slot: Some(1),
+                lane: Lane::Shadow,
+                position_id: Some("shadow:invalid-price".to_string()),
+                position_epoch: Some(1),
+                opened_at_ms: Some(1),
+            }),
+        );
+        let invalid_quantity = engine.register_position_with_context(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Some(1.0),
+            Some(1_000_000),
+            Some(0),
+            Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
+                candidate_id: "invalid-quantity".to_string(),
+                entry_order_id: "invalid-quantity-entry".to_string(),
+                quote_id: "invalid-quantity-quote".to_string(),
+                slot: Some(1),
+                lane: Lane::Shadow,
+                position_id: Some("shadow:invalid-quantity".to_string()),
+                position_epoch: Some(1),
+                opened_at_ms: Some(1),
+            }),
+        );
+        let invalid_identity = engine.register_position_with_context(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Some(1.0),
+            Some(1_000_000),
+            Some(1_000),
+            Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
+                candidate_id: String::new(),
+                entry_order_id: "invalid-identity-entry".to_string(),
+                quote_id: "invalid-identity-quote".to_string(),
+                slot: Some(1),
+                lane: Lane::Shadow,
+                position_id: Some(String::new()),
+                position_epoch: Some(0),
+                opened_at_ms: Some(1),
+            }),
+        );
+
+        assert!(invalid_price.is_none());
+        assert!(invalid_quantity.is_none());
+        assert!(invalid_identity.is_none());
+        assert_eq!(engine.active_position_count(), 0);
+        emitter
+            .shared_writer()
+            .lock()
+            .expect("event writer")
+            .flush()
+            .expect("flush events");
+        assert!(read_event_rows(&events_dir).iter().all(|row| {
+            row.pointer("/kind/type") != Some(&Value::String("PositionOpened".to_string()))
+        }));
+    }
+
+    #[test]
+    fn quote_failure_terminal_reason_depends_on_type_not_detail_text() {
+        let failure = ExecutableQuoteFailure {
+            kind: ExecutableQuoteFailureKind::InternalFailure,
+            evidence: PriceTruthEvidence {
+                source: PriceTruthSource::ShadowLedgerSnapshot,
+                status: PriceTruthStatus::Failure,
+                detail: Some("zero no fill no executable output".to_string()),
+                slot: None,
+                timestamp_ms: None,
+                age_ms: None,
+                price_state: None,
+                price_reason: None,
+            },
+        };
+
+        assert_eq!(
+            failure.kind.unresolved_reason(),
+            ShadowUnresolvedReason::Failed
+        );
     }
 
     fn apply_test_canonical_update(
@@ -6939,6 +7371,15 @@ mod tests {
             terminal["payload"]["record"]["final_pnl_mark_bps"],
             serde_json::Value::Null
         );
+        assert_eq!(terminal["payload"]["record"]["terminal_slot"], Value::Null);
+        assert_eq!(
+            terminal["payload"]["record"]["terminal_observed_slot"],
+            Value::Null
+        );
+        assert_eq!(
+            terminal["payload"]["record"]["truth_slot"],
+            serde_json::json!(430_000_020_u64)
+        );
 
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("shadow_replay_v2.jsonl"))
@@ -7711,6 +8152,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
         engine.set_exit_policy_v1_thresholds_for_tests(0.02, 0.02);
+        enable_terminal_truth_harness(&mut engine, tmp.path());
         engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
         let emitter = make_shadow_emitter(&events_dir);
         engine.set_event_emitter(Arc::clone(&emitter));
@@ -7788,6 +8230,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
         engine.set_exit_policy_v1_thresholds_for_tests(0.02, 0.02);
+        enable_terminal_truth_harness(&mut engine, tmp.path());
         engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
         let emitter = make_shadow_emitter(&events_dir);
         engine.set_event_emitter(Arc::clone(&emitter));
@@ -8200,6 +8643,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
         enable_baseline_exit_policy(&mut engine);
+        enable_terminal_truth_harness(&mut engine, tmp.path());
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             AsyncRwLock::new(ShadowPositionBook::new()),
         ))));
@@ -8462,6 +8906,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
         enable_baseline_exit_policy(&mut engine);
+        enable_terminal_truth_harness(&mut engine, tmp.path());
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             AsyncRwLock::new(ShadowPositionBook::new()),
         ))));
@@ -8577,6 +9022,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
         enable_baseline_exit_policy(&mut engine);
+        enable_terminal_truth_harness(&mut engine, tmp.path());
         let shadow_book = Arc::new(AsyncRwLock::new(ShadowPositionBook::new()));
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(
             Arc::clone(&shadow_book),
@@ -8703,6 +9149,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
         enable_baseline_exit_policy(&mut engine);
+        enable_terminal_truth_harness(&mut engine, tmp.path());
         engine.set_account_state_core(Arc::clone(&account_state_core));
         let shadow_book = Arc::new(AsyncRwLock::new(ShadowPositionBook::new()));
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(
@@ -8834,6 +9281,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
         enable_baseline_exit_policy(&mut engine);
+        enable_terminal_truth_harness(&mut engine, tmp.path());
         engine.set_account_state_core(Arc::clone(&account_state_core));
         let shadow_book = Arc::new(AsyncRwLock::new(ShadowPositionBook::new()));
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(
@@ -9094,6 +9542,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
         enable_baseline_exit_policy(&mut engine);
+        enable_terminal_truth_harness(&mut engine, tmp.path());
         engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             AsyncRwLock::new(ShadowPositionBook::new()),
         ))));
@@ -9224,6 +9673,92 @@ mod tests {
                 .and_then(|kind| kind.get("type"))
                 != Some(&Value::String("PositionClosed".to_string()))
         }));
+    }
+
+    #[tokio::test]
+    async fn terminal_persistence_failure_withholds_notification_until_canonical_retry() {
+        let tmp = TempDir::new().expect("tempdir");
+        let canonical_path = tmp.path().join("shadow_position_event_v2.jsonl");
+        let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::new(
+            PostBuyGuardianConfig::default(),
+            Arc::new(ShadowLedger::new()),
+            tx,
+        );
+        enable_baseline_exit_policy(&mut engine);
+        enable_terminal_truth_harness(&mut engine, tmp.path());
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_log));
+        let engine = Arc::new(engine);
+
+        std::fs::create_dir(&canonical_path).expect("fault injection canonical directory");
+        let mint = Pubkey::new_unique();
+        let registered = engine
+            .register_shadow_position_with_terminal(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000),
+                Some(1_000),
+                PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("terminal-persistence-fault".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "terminal-persistence-fault".to_string(),
+                    entry_order_id: "terminal-persistence-entry".to_string(),
+                    quote_id: "terminal-persistence-quote".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:terminal-persistence-fault".to_string()),
+                    position_epoch: Some(7),
+                    opened_at_ms: Some(1_000),
+                },
+            )
+            .expect("valid shadow registration");
+        let mut terminal_rx = registered.terminal_rx;
+
+        let trigger_ms = 1_000 + SHADOW_POSITION_TIME_STOP_MS + 1;
+        engine
+            .run_shadow_runtime_tick(&mint, None, trigger_ms)
+            .await;
+        engine
+            .run_shadow_runtime_tick(&mint, None, trigger_ms + 5_000)
+            .await;
+
+        assert_eq!(engine.active_position_count(), 1);
+        assert!(engine.has_pending_terminal_commit(&mint));
+        assert!(matches!(
+            terminal_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        std::fs::remove_dir(&canonical_path).expect("remove injected canonical directory");
+        engine
+            .run_shadow_runtime_tick(
+                &mint,
+                None,
+                trigger_ms + 5_000 + SHADOW_QUOTE_RETRY_INTERVAL_MS,
+            )
+            .await;
+
+        assert_eq!(engine.active_position_count(), 0);
+        assert!(matches!(
+            terminal_rx.try_recv(),
+            Ok(ShadowTerminalDisposition::SimulationBlocked {
+                reason: ShadowUnresolvedReason::BlockedByData,
+                ..
+            })
+        ));
+        let canonical_rows = read_jsonl_rows(&canonical_path);
+        assert_eq!(
+            canonical_rows
+                .iter()
+                .filter(|row| row["event_kind"] == "TERMINAL_TRUTH")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

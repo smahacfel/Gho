@@ -86,7 +86,8 @@ pub use direct_buy_builder::{
 pub use direct_sell_builder::{DirectSellBuilder, DEFAULT_SELL_SLIPPAGE_BPS};
 pub use entry_price_extractor::{
     EntryPriceError, EntryPriceExtractor, EntryPriceInfo, PriceTruthError, PriceTruthEvidence,
-    PriceTruthResolver, PriceTruthSource, PriceTruthStatus, ShadowExitPriceSample, ShadowExitTruth,
+    PriceTruthFailureKind, PriceTruthResolver, PriceTruthSource, PriceTruthStatus,
+    ShadowExitPriceSample, ShadowExitTruth,
 };
 pub use errors::{Result, TriggerError};
 pub use execution_guard::{ExecutionGuardError, SafeBuyBuilder};

@@ -897,6 +897,13 @@ cargo test -p ghost-launcher --test post_buy_runtime_integration
 cargo clippy -p trigger -p ghost-brain -p ghost-launcher --all-targets -- -D warnings
 ```
 
+Jeżeli dokładny gate `--all-targets -- -D warnings` jest blokowany wyłącznie
+przez diagnostyki istniejące na bazowym SHA i poza diffem danego PR, dopuszcza
+się formalny waiver w ADR. Waiver musi podać bazowy SHA, toolchain, konkretne
+klasy i pierwsze lokalizacje diagnostyk oraz zaliczony scoped Clippy dla
+powierzchni zmienianych przez PR. Nie wolno nim objąć nowej diagnostyki w pliku
+zmienionym przez PR.
+
 Dodatkowo należy uruchomić istniejące changed-crate, logger/replay i shadow lifecycle suites używane przez repozytoryjne CI.
 
 Merge jest blokowany przez:
@@ -907,7 +914,8 @@ Merge jest blokowany przez:
 - live Unknown zwalniające slot;
 - stale apply zmieniające quantity;
 - aktywne Guardian/AEM/Revolver authority;
-- niezielone pełne wymagane CI.
+- niezielone pełne wymagane CI, z wyjątkiem jawnie udokumentowanego baseline
+  Clippy spełniającego powyższy kontrakt waivera.
 
 ---
 
@@ -985,7 +993,8 @@ Dokumentacja jest ograniczona do:
 - [ ] Gross executable PnL nie jest nazywany wiarygodnym net PnL.
 - [ ] Live pozostaje disabled.
 - [ ] Prebuy Decision Plane pozostaje bez zmian.
-- [ ] Pełne wymagane CI jest zielone.
+- [ ] Pełne wymagane CI jest zielone albo jedyny wyjątek stanowi formalny,
+      diff-scoped waiver istniejącego baseline Clippy.
 
 ---
 

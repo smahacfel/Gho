@@ -43,12 +43,26 @@ struct CandidateTrajectory {
     has_candidate: bool,
     has_entry_submitted: bool,
     has_position_opened: bool,
-    position_closed_count: usize,
-    shadow_position_unresolved_count: usize,
     has_terminal_schema_violation: bool,
     entry_fill_statuses: Vec<FillStatus>,
     commands_issued: HashSet<String>,
     commands_applied: HashSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PositionLifecycleKey {
+    run_id: String,
+    lane: Lane,
+    position_id: String,
+    position_epoch: u64,
+}
+
+#[derive(Debug, Default)]
+struct PositionLifecycleState {
+    candidate_id: CandidateId,
+    opened_count: usize,
+    closed_count: usize,
+    unresolved_count: usize,
 }
 
 #[derive(Debug, Default)]
@@ -67,13 +81,15 @@ impl EventValidator {
 
         let mut trajectories: HashMap<(String, Lane, CandidateId), CandidateTrajectory> =
             HashMap::new();
+        let mut position_lifecycles: HashMap<PositionLifecycleKey, PositionLifecycleState> =
+            HashMap::new();
         let mut cross_lane: HashMap<(String, CandidateId), CrossLaneState> = HashMap::new();
 
         let mut entry_submitted_orders: HashSet<(String, Lane, String)> = HashSet::new();
         let mut exit_submitted_orders: HashSet<(String, Lane, String)> = HashSet::new();
         let mut exit_order_to_position: HashMap<(String, Lane, String), String> = HashMap::new();
-        let mut seen_position_opened: HashSet<(String, Lane, String)> = HashSet::new();
-        let mut position_epoch_by_id: HashMap<(String, Lane, String), u64> = HashMap::new();
+        let mut seen_position_opened: HashSet<(String, Lane, String, u64)> = HashSet::new();
+        let mut opened_position_ids: HashSet<(String, Lane, String)> = HashSet::new();
         let mut epoch_start_by_candidate: HashMap<(String, Lane, CandidateId, u64), String> =
             HashMap::new();
 
@@ -201,61 +217,69 @@ impl EventValidator {
                 }
                 EventKind::PositionOpened(payload) => {
                     trajectory.has_position_opened = true;
-                    match event.envelope.position_id.as_ref() {
-                        Some(position_id) => {
-                            let key = (run_id.clone(), lane, position_id.clone());
-                            if !seen_position_opened.insert(key.clone()) {
+                    match (
+                        event.envelope.position_id.as_ref(),
+                        event.envelope.position_epoch,
+                    ) {
+                        (Some(position_id), Some(epoch)) => {
+                            opened_position_ids.insert((run_id.clone(), lane, position_id.clone()));
+                            let seen_key = (run_id.clone(), lane, position_id.clone(), epoch);
+                            if !seen_position_opened.insert(seen_key) {
                                 metrics.invariant_violations.push(Self::violation(
                                     &run_id,
                                     lane,
                                     &candidate_id,
                                     &format!(
-                                        "join:PositionOpened repeated for position_id {}",
-                                        position_id
+                                        "join:PositionOpened repeated for position_id {} epoch {}",
+                                        position_id, epoch
                                     ),
                                 ));
                             }
-                            if let Some(epoch) = event.envelope.position_epoch {
-                                if let Some(previous_epoch) =
-                                    position_epoch_by_id.insert(key.clone(), epoch)
-                                {
-                                    if previous_epoch != epoch {
-                                        metrics.invariant_violations.push(Self::violation(
-                                            &run_id,
-                                            lane,
-                                            &candidate_id,
-                                            &format!(
-                                                "join:position_epoch changed for position_id {} ({} -> {})",
-                                                position_id, previous_epoch, epoch
-                                            ),
-                                        ));
-                                    }
-                                }
-
-                                let epoch_key = (run_id.clone(), lane, candidate_id.clone(), epoch);
-                                if let Some(previous_position) =
-                                    epoch_start_by_candidate.insert(epoch_key, position_id.clone())
-                                {
-                                    if previous_position != *position_id {
-                                        metrics.invariant_violations.push(Self::violation(
-                                            &run_id,
-                                            lane,
-                                            &candidate_id,
-                                            &format!(
-                                                "join:duplicate epoch start {} for candidate maps to multiple positions ({} vs {})",
-                                                epoch, previous_position, position_id
-                                            ),
-                                        ));
-                                    }
+                            let epoch_key = (run_id.clone(), lane, candidate_id.clone(), epoch);
+                            if let Some(previous_position) =
+                                epoch_start_by_candidate.insert(epoch_key, position_id.clone())
+                            {
+                                if previous_position != *position_id {
+                                    metrics.invariant_violations.push(Self::violation(
+                                        &run_id,
+                                        lane,
+                                        &candidate_id,
+                                        &format!(
+                                            "join:duplicate epoch start {} for candidate maps to multiple positions ({} vs {})",
+                                            epoch, previous_position, position_id
+                                        ),
+                                    ));
                                 }
                             }
+
+                            let lifecycle = position_lifecycles
+                                .entry(PositionLifecycleKey {
+                                    run_id: run_id.clone(),
+                                    lane,
+                                    position_id: position_id.clone(),
+                                    position_epoch: epoch,
+                                })
+                                .or_insert_with(|| PositionLifecycleState {
+                                    candidate_id: candidate_id.clone(),
+                                    ..Default::default()
+                                });
+                            if lifecycle.candidate_id != candidate_id {
+                                metrics.invariant_violations.push(Self::violation(
+                                    &run_id,
+                                    lane,
+                                    &candidate_id,
+                                    "join:PositionOpened candidate mismatch for position epoch",
+                                ));
+                            }
+                            lifecycle.opened_count = lifecycle.opened_count.saturating_add(1);
                         }
-                        None => metrics.invariant_violations.push(Self::violation(
+                        (None, _) => metrics.invariant_violations.push(Self::violation(
                             &run_id,
                             lane,
                             &candidate_id,
                             "join:PositionOpened missing position_id",
                         )),
+                        (_, None) => {}
                     }
 
                     if event.envelope.position_epoch.is_none() {
@@ -278,13 +302,26 @@ impl EventValidator {
                     }
                 }
                 EventKind::PositionClosed(_) => {
-                    trajectory.position_closed_count =
-                        trajectory.position_closed_count.saturating_add(1);
+                    Self::record_position_terminal(
+                        &mut position_lifecycles,
+                        event,
+                        &run_id,
+                        lane,
+                        &candidate_id,
+                        true,
+                        &mut metrics,
+                    );
                 }
                 EventKind::ShadowPositionUnresolved(payload) => {
-                    trajectory.shadow_position_unresolved_count = trajectory
-                        .shadow_position_unresolved_count
-                        .saturating_add(1);
+                    Self::record_position_terminal(
+                        &mut position_lifecycles,
+                        event,
+                        &run_id,
+                        lane,
+                        &candidate_id,
+                        false,
+                        &mut metrics,
+                    );
                     if !matches!(lane, Lane::Shadow) {
                         trajectory.has_terminal_schema_violation = true;
                         metrics.invariant_violations.push(Self::violation(
@@ -292,15 +329,6 @@ impl EventValidator {
                             lane,
                             &candidate_id,
                             "timeline:ShadowPositionUnresolved is only valid for shadow lane",
-                        ));
-                    }
-                    if !trajectory.has_position_opened {
-                        trajectory.has_terminal_schema_violation = true;
-                        metrics.invariant_violations.push(Self::violation(
-                            &run_id,
-                            lane,
-                            &candidate_id,
-                            "timeline:ShadowPositionUnresolved without PositionOpened",
                         ));
                     }
                     if event.envelope.position_id.is_none() {
@@ -381,7 +409,7 @@ impl EventValidator {
                                     (run_id.clone(), lane, order_id.clone()),
                                     position_id.clone(),
                                 );
-                                if !seen_position_opened.contains(&(
+                                if !opened_position_ids.contains(&(
                                     run_id.clone(),
                                     lane,
                                     position_id.clone(),
@@ -463,10 +491,10 @@ impl EventValidator {
                             &candidate_id,
                             "join:ExitFilled missing position_id",
                         ));
-                    } else if matched_exit_submit {
-                        let position_id =
-                            event.envelope.position_id.as_ref().expect("checked above");
-                        if !seen_position_opened.contains(&(
+                    } else if let (true, Some(position_id)) =
+                        (matched_exit_submit, event.envelope.position_id.as_ref())
+                    {
+                        if !opened_position_ids.contains(&(
                             run_id.clone(),
                             lane,
                             position_id.clone(),
@@ -487,8 +515,65 @@ impl EventValidator {
             }
         }
 
+        for (key, lifecycle) in &position_lifecycles {
+            if lifecycle.opened_count != 1 {
+                metrics.invariant_violations.push(Self::violation(
+                    &key.run_id,
+                    key.lane,
+                    &lifecycle.candidate_id,
+                    &format!(
+                        "timeline:position_id {} epoch {} requires exactly one PositionOpened",
+                        key.position_id, key.position_epoch
+                    ),
+                ));
+            }
+            let terminal_count = lifecycle
+                .closed_count
+                .saturating_add(lifecycle.unresolved_count);
+            if lifecycle.opened_count == 1 && terminal_count == 0 {
+                metrics.invariant_violations.push(Self::violation(
+                    &key.run_id,
+                    key.lane,
+                    &lifecycle.candidate_id,
+                    &format!(
+                        "timeline:PositionOpened without terminal for position_id {} epoch {}",
+                        key.position_id, key.position_epoch
+                    ),
+                ));
+            }
+            if terminal_count > 1 {
+                metrics.invariant_violations.push(Self::violation(
+                    &key.run_id,
+                    key.lane,
+                    &lifecycle.candidate_id,
+                    &format!(
+                        "timeline:position_id {} epoch {} requires exactly one terminal PositionClosed or ShadowPositionUnresolved",
+                        key.position_id, key.position_epoch
+                    ),
+                ));
+            }
+        }
+
+        let invalid_trajectory_keys: HashSet<(String, Lane, CandidateId)> = metrics
+            .invariant_violations
+            .iter()
+            .map(|violation| {
+                (
+                    violation.run_id.clone(),
+                    violation.lane,
+                    violation.candidate_id.clone(),
+                )
+            })
+            .collect();
+
         for trajectory in trajectories.values() {
-            let mut valid = !trajectory.has_terminal_schema_violation;
+            let trajectory_key = (
+                trajectory.run_id.clone(),
+                trajectory.lane,
+                trajectory.candidate_id.clone(),
+            );
+            let mut valid = !trajectory.has_terminal_schema_violation
+                && !invalid_trajectory_keys.contains(&trajectory_key);
 
             if !trajectory.has_candidate {
                 metrics.invariant_violations.push(Self::violation(
@@ -531,28 +616,6 @@ impl EventValidator {
                     trajectory.lane,
                     &trajectory.candidate_id,
                     "timeline:successful EntryFilled without PositionOpened",
-                ));
-                valid = false;
-            }
-
-            let terminal_count = trajectory
-                .position_closed_count
-                .saturating_add(trajectory.shadow_position_unresolved_count);
-            if trajectory.has_position_opened && terminal_count == 0 {
-                metrics.invariant_violations.push(Self::violation(
-                    &trajectory.run_id,
-                    trajectory.lane,
-                    &trajectory.candidate_id,
-                    "timeline:PositionOpened without PositionClosed or ShadowPositionUnresolved",
-                ));
-                valid = false;
-            }
-            if terminal_count > 1 {
-                metrics.invariant_violations.push(Self::violation(
-                    &trajectory.run_id,
-                    trajectory.lane,
-                    &trajectory.candidate_id,
-                    "timeline:position lifecycle requires exactly one terminal PositionClosed or ShadowPositionUnresolved",
                 ));
                 valid = false;
             }
@@ -636,6 +699,77 @@ impl EventValidator {
         }
 
         Ok(metrics)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_position_terminal(
+        position_lifecycles: &mut HashMap<PositionLifecycleKey, PositionLifecycleState>,
+        event: &ExecutionEvent,
+        run_id: &str,
+        lane: Lane,
+        candidate_id: &str,
+        is_closed: bool,
+        metrics: &mut ValidatorMetrics,
+    ) {
+        let terminal_label = if is_closed {
+            "PositionClosed"
+        } else {
+            "ShadowPositionUnresolved"
+        };
+        let Some(position_id) = event.envelope.position_id.as_ref() else {
+            metrics.invariant_violations.push(Self::violation(
+                run_id,
+                lane,
+                candidate_id,
+                &format!("join:{terminal_label} missing position_id"),
+            ));
+            return;
+        };
+        let Some(position_epoch) = event.envelope.position_epoch else {
+            metrics.invariant_violations.push(Self::violation(
+                run_id,
+                lane,
+                candidate_id,
+                &format!("join:{terminal_label} missing position_epoch"),
+            ));
+            return;
+        };
+        let lifecycle = position_lifecycles
+            .entry(PositionLifecycleKey {
+                run_id: run_id.to_string(),
+                lane,
+                position_id: position_id.clone(),
+                position_epoch,
+            })
+            .or_insert_with(|| PositionLifecycleState {
+                candidate_id: candidate_id.to_string(),
+                ..Default::default()
+            });
+        if lifecycle.opened_count == 0 {
+            metrics.invariant_violations.push(Self::violation(
+                run_id,
+                lane,
+                candidate_id,
+                &format!(
+                    "timeline:{terminal_label} without PositionOpened exact match for position_id {position_id} epoch {position_epoch}"
+                ),
+            ));
+        }
+        if lifecycle.candidate_id != candidate_id {
+            metrics.invariant_violations.push(Self::violation(
+                run_id,
+                lane,
+                candidate_id,
+                &format!(
+                    "join:{terminal_label} candidate mismatch for position_id {position_id} epoch {position_epoch}"
+                ),
+            ));
+        }
+        if is_closed {
+            lifecycle.closed_count = lifecycle.closed_count.saturating_add(1);
+        } else {
+            lifecycle.unresolved_count = lifecycle.unresolved_count.saturating_add(1);
+        }
     }
 
     pub fn validate_timeline<P: AsRef<Path>>(path: P) -> anyhow::Result<Vec<InvariantViolation>> {
@@ -1129,5 +1263,82 @@ mod tests {
             )
         }));
         assert_eq!(metrics.valid_trajectories, 0);
+    }
+
+    #[test]
+    fn validator_rejects_terminal_for_wrong_position() {
+        let mut file = NamedTempFile::new().expect("tmp file");
+        let mut events = shadow_lifecycle_with_unresolved(Lane::Shadow, true, false);
+        events.last_mut().expect("terminal").envelope.position_id = Some("wrong-position".into());
+        write_events(&mut file, events);
+
+        let metrics = EventValidator::validate_jsonl(file.path()).expect("validate");
+        assert!(metrics.invariant_violations.iter().any(|violation| {
+            violation
+                .reason
+                .contains("without PositionOpened exact match")
+        }));
+    }
+
+    #[test]
+    fn validator_rejects_terminal_for_wrong_epoch() {
+        let mut file = NamedTempFile::new().expect("tmp file");
+        let mut events = shadow_lifecycle_with_unresolved(Lane::Shadow, true, false);
+        events.last_mut().expect("terminal").envelope.position_epoch = Some(99);
+        write_events(&mut file, events);
+
+        let metrics = EventValidator::validate_jsonl(file.path()).expect("validate");
+        assert!(metrics.invariant_violations.iter().any(|violation| {
+            violation
+                .reason
+                .contains("without PositionOpened exact match")
+        }));
+    }
+
+    #[test]
+    fn validator_rejects_duplicate_terminal_for_exact_position_epoch() {
+        let mut file = NamedTempFile::new().expect("tmp file");
+        let mut events = shadow_lifecycle_with_unresolved(Lane::Shadow, true, false);
+        events.push(events.last().expect("terminal").clone());
+        write_events(&mut file, events);
+
+        let metrics = EventValidator::validate_jsonl(file.path()).expect("validate");
+        assert!(metrics.invariant_violations.iter().any(|violation| {
+            violation.reason.contains(
+                "requires exactly one terminal PositionClosed or ShadowPositionUnresolved",
+            )
+        }));
+    }
+
+    #[test]
+    fn validator_accepts_two_sequential_epochs_for_one_candidate() {
+        let mut file = NamedTempFile::new().expect("tmp file");
+        let mut events = shadow_lifecycle_with_unresolved(Lane::Shadow, true, false);
+        let terminal = events.last().expect("terminal").clone();
+        let mut second_open_env = terminal.envelope.derive(104);
+        second_open_env.position_epoch = Some(8);
+        events.push(ExecutionEvent::new(
+            second_open_env,
+            EventKind::PositionOpened(PositionOpenedPayload {
+                entry_price: 1.0,
+                entry_time_ms: 104,
+                epoch_id: 8,
+                size_tokens: 10,
+                size_sol: 10,
+            }),
+        ));
+        let mut second_terminal = terminal;
+        second_terminal.envelope = second_terminal.envelope.derive(105);
+        second_terminal.envelope.position_epoch = Some(8);
+        events.push(second_terminal);
+        write_events(&mut file, events);
+
+        let metrics = EventValidator::validate_jsonl(file.path()).expect("validate");
+        assert!(
+            metrics.invariant_violations.is_empty(),
+            "valid sequential epochs rejected: {:?}",
+            metrics.invariant_violations
+        );
+        assert_eq!(metrics.valid_trajectories, 1);
     }
 }
