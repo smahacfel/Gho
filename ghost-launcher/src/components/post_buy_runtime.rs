@@ -338,6 +338,21 @@ fn init_position_manager_terminal_harness(
         .map_err(|error| error.to_string())
 }
 
+fn init_probe_position_manager_terminal_harness(
+    events_output_path: &Path,
+    run_id: &str,
+) -> Result<ShadowV2ValidationHarness, String> {
+    let root = events_output_path.join("position_manager_probe_terminal_truth_v2");
+    let harness_config = ShadowV2ValidationHarnessConfig::new(
+        run_id,
+        root.join("shadow_position_event_v2.jsonl"),
+        root.join("shadow_replay_v2.jsonl"),
+        root.join("shadow_lifecycle_v2.jsonl"),
+        root.join("shadow_path_density_v2.jsonl"),
+    );
+    ShadowV2ValidationHarness::new(harness_config).map_err(|error| error.to_string())
+}
+
 fn shadow_v2_scope_root(config: &ShadowV2BurninConfig) -> Result<&str, String> {
     config
         .scope_root_path
@@ -2237,6 +2252,24 @@ pub async fn run(
             return;
         }
     };
+    let probe_shadow_v2_harness = if config.execution_mode == "shadow"
+        && config.probe_lifecycle_log_path.is_some()
+    {
+        match init_probe_position_manager_terminal_harness(&config.events_output_path, &run_id) {
+            Ok(harness) => Some(Arc::new(ParkingMutex::new(harness))),
+            Err(error) => {
+                warn!(
+                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                    error = %error,
+                    validation_harness_status = "FAILED",
+                    "PostBuyRuntime: PROBE_TERMINAL_TRUTH_PREFLIGHT_FAILED"
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     // Shared QuoteProvider for ghost-brain PaperBroker (paper compatibility path only)
     let quote_provider = Arc::new(RwLock::new(ExecutableQuoteProvider::new(
@@ -2356,6 +2389,10 @@ pub async fn run(
                     };
                 if let Some(account_state_core) = config.account_state_core.clone() {
                     monitoring_engine.set_account_state_core(account_state_core);
+                }
+                if let Some(probe_shadow_v2_harness) = probe_shadow_v2_harness.as_ref() {
+                    monitoring_engine
+                        .set_shadow_v2_validation_harness(Arc::clone(probe_shadow_v2_harness));
                 }
                 monitoring_engine.set_position_router(Arc::clone(&runtime_router));
                 monitoring_engine.set_shadow_lifecycle_log_path(Some(probe_lifecycle_log_path));
@@ -8368,7 +8405,7 @@ sys.exit(0)
             stoploss_threshold: Some(50.0),
             wait_for_timestop: Some(1),
             exit_policy_v1: ghost_brain::guardian::post_buy::ExitPolicyV1Config {
-                quote_recovery_ms: 5_000,
+                quote_recovery_ms: 1,
             },
             aem: ghost_brain::aem::config::AemConfig {
                 enabled: false,
@@ -8407,6 +8444,14 @@ sys.exit(0)
             Arc::new(RwLock::new(ShadowPositionBook::new())),
         )));
         probe_monitor.set_shadow_lifecycle_log_path(Some(probe_lifecycle_log_path.clone()));
+        let probe_terminal_harness =
+            init_probe_position_manager_terminal_harness(tmp_dir.path(), "test-probe-terminal-run")
+                .expect("probe terminal harness");
+        let probe_terminal_path = probe_terminal_harness
+            .canonical_event_stream_path()
+            .to_path_buf();
+        probe_monitor
+            .set_shadow_v2_validation_harness(Arc::new(ParkingMutex::new(probe_terminal_harness)));
         let probe_monitor = Arc::new(probe_monitor);
 
         let pool_amm_id = Pubkey::new_unique();
@@ -8466,21 +8511,66 @@ sys.exit(0)
         assert!(lifecycle_handles.is_empty());
 
         let probe_runtime_handle = Arc::clone(&probe_monitor).start();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if probe_lifecycle_log_path.exists() {
+                if probe_monitor.active_position_count() == 0 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("probe Position Manager must emit a real blocked-exit lifecycle row");
+        .expect("probe Position Manager must commit terminal truth and remove the position");
         probe_runtime_handle.abort();
         let _ = probe_runtime_handle.await;
 
-        probe_monitor.remove_position_administratively(&base_mint);
         assert_eq!(probe_monitor.active_position_count(), 0);
+        let canonical_probe_rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(&probe_terminal_path)
+                .expect("probe canonical terminal stream")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("canonical probe row"))
+                .collect();
+        let canonical_probe_terminals: Vec<&serde_json::Value> = canonical_probe_rows
+            .iter()
+            .filter(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .collect();
+        assert_eq!(canonical_probe_terminals.len(), 1);
+        let canonical_probe_terminal = canonical_probe_terminals[0];
+        assert_eq!(
+            canonical_probe_terminal["payload"]["record"]["truth_slot"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            canonical_probe_terminal["payload"]["record"]["terminal_observed_slot"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            canonical_probe_terminal["payload"]["record"]["terminal_slot"],
+            serde_json::Value::Null
+        );
+
+        let second_handoff = handle_shadow_post_buy_handoff(
+            Some(&probe_monitor),
+            "probe-lifecycle-handoff-second",
+            &pool_amm_id.to_string(),
+            &base_mint.to_string(),
+            0.007,
+            Some(250_000),
+            Some(778),
+            Some(778),
+            None,
+            2,
+            PositionJoinMetadata {
+                probe_id: Some("probe-lifecycle-handoff-second".to_string()),
+                dispatch_source: Some("counterfactual_shadow_probe".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(second_handoff.ack, DirectPostBuyHandoffAck::Accepted);
+        assert_eq!(probe_monitor.active_position_count(), 1);
+        probe_monitor.remove_position_administratively(&base_mint);
 
         let probe_rows =
             std::fs::read_to_string(&probe_lifecycle_log_path).expect("probe lifecycle row");
@@ -8501,14 +8591,17 @@ sys.exit(0)
             first_row["entry_landed_slot_source"],
             "synthetic_next_slot_after_entry_simulation_rpc_slot"
         );
-        assert_eq!(first_row["exit_sample_slot"], 777);
-        assert_eq!(first_row["exit_market_anchor_slot"], 777);
+        assert_eq!(first_row["exit_sample_slot"], serde_json::Value::Null);
+        assert_eq!(
+            first_row["exit_market_anchor_slot"],
+            serde_json::Value::Null
+        );
         assert!(first_row.get("exit_market_anchor_tx_signature").is_none());
         assert!(first_row["exit_reason_evaluation_ts_ms"].as_u64().is_some());
-        assert_eq!(first_row["exit_landed_slot"], 778);
+        assert_eq!(first_row["exit_landed_slot"], serde_json::Value::Null);
         assert_eq!(
             first_row["exit_landed_slot_source"],
-            "synthetic_next_slot_after_exit_sample"
+            serde_json::Value::Null
         );
         assert_eq!(
             first_row["position_id"],

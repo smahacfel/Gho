@@ -1794,18 +1794,18 @@ impl MonitoringEngine {
                         Some(price) => (
                             Some(price),
                             MarkEvidenceStatus::Available,
-                            snapshot.slot.or(pos.slot),
+                            snapshot.slot,
                             Some(snapshot.timestamp_ms),
                         ),
                         None => (
                             None,
                             MarkEvidenceStatus::Invalid,
-                            snapshot.slot.or(pos.slot),
+                            snapshot.slot,
                             Some(snapshot.timestamp_ms),
                         ),
                     }
                 }
-                None => (None, MarkEvidenceStatus::Unavailable, pos.slot, None),
+                None => (None, MarkEvidenceStatus::Unavailable, None, None),
             };
         let drawdown_pct = mark_price_sol.and_then(|price| {
             (pos.peak_since_entry.is_finite() && pos.peak_since_entry > 0.0)
@@ -7238,6 +7238,8 @@ mod tests {
         let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
         enable_baseline_exit_policy(&mut engine);
         engine.set_shadow_v2_validation_harness(Arc::clone(&harness));
+        let operational_lifecycle_path = tmp.path().join("shadow_operational_lifecycle.jsonl");
+        engine.set_shadow_lifecycle_log_path(Some(operational_lifecycle_path.clone()));
         let events_dir = tmp.path().join("events");
         let emitter = make_shadow_emitter(&events_dir);
         engine.set_event_emitter(Arc::clone(&emitter));
@@ -7376,10 +7378,18 @@ mod tests {
             terminal["payload"]["record"]["terminal_observed_slot"],
             Value::Null
         );
+        assert_eq!(terminal["payload"]["record"]["truth_slot"], Value::Null);
+
+        let unresolved_record = read_jsonl_rows(&operational_lifecycle_path)
+            .into_iter()
+            .find(|row| row["record_type"] == "position_unresolved")
+            .expect("operational unresolved record");
         assert_eq!(
-            terminal["payload"]["record"]["truth_slot"],
+            unresolved_record["entry_slot"],
             serde_json::json!(430_000_020_u64)
         );
+        assert_eq!(unresolved_record["sample_slot"], Value::Null);
+        assert_eq!(unresolved_record["exit_sample_slot"], Value::Null);
 
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("shadow_replay_v2.jsonl"))
