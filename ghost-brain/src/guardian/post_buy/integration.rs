@@ -556,6 +556,7 @@ impl<'a> TriggerControlAdapter for ShadowPositionBookAemAdapter<'a> {
 pub struct SignalRouter {
     signal_rx: mpsc::Receiver<GuardianSignal>,
     runtime_router: Arc<PositionRuntimeRouter>,
+    observation_only: bool,
     signals_processed: u64,
     action_counts: ActionCounts,
 }
@@ -577,9 +578,21 @@ impl SignalRouter {
         Self {
             signal_rx,
             runtime_router,
+            observation_only: false,
             signals_processed: 0,
             action_counts: ActionCounts::default(),
         }
+    }
+
+    /// Active launcher mode: Guardian signals remain durable evidence but
+    /// cannot mutate the virtual magazine or canonical position lifecycle.
+    pub fn new_observation_only(
+        signal_rx: mpsc::Receiver<GuardianSignal>,
+        runtime_router: Arc<PositionRuntimeRouter>,
+    ) -> Self {
+        let mut router = Self::new(signal_rx, runtime_router);
+        router.observation_only = true;
+        router
     }
 
     pub async fn run(mut self) {
@@ -614,6 +627,25 @@ impl SignalRouter {
 
     async fn route_signal(&mut self, signal: &GuardianSignal) {
         let action = self.determine_action(signal);
+
+        if self.observation_only {
+            match action {
+                RecommendedAction::Hold => self.action_counts.hold += 1,
+                RecommendedAction::TightenStop => self.action_counts.tighten_stop += 1,
+                RecommendedAction::DefensiveMode => self.action_counts.defensive_mode += 1,
+                RecommendedAction::PanicSell => self.action_counts.panic_sell += 1,
+            }
+            info!(
+                lane = %signal.lane,
+                mint = %signal.base_mint,
+                source = ?signal.source,
+                severity = ?signal.severity,
+                recommended_action = ?action,
+                consumed_by_policy = false,
+                "PostBuyGuardian: observation-only signal"
+            );
+            return;
+        }
 
         match action {
             RecommendedAction::Hold => {
@@ -988,5 +1020,45 @@ mod tests {
         let book = shadow_book.read().await;
         let token_rev = book.tokens.get(&mint).unwrap();
         assert!(token_rev.is_panic_sell());
+    }
+
+    #[tokio::test]
+    async fn observation_only_router_never_mutates_shadow_position_strategy() {
+        let shadow_book = Arc::new(RwLock::new(ShadowPositionBook::new()));
+        let (tx, rx) = mpsc::channel(16);
+        let mint = Pubkey::new_unique();
+        {
+            let mut book = shadow_book.write().await;
+            book.register_position(mint, "shadow:observation-only:1", 1, 1.0)
+                .expect("register shadow position");
+        }
+
+        let router = SignalRouter::new_observation_only(
+            rx,
+            Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::clone(
+                &shadow_book,
+            ))),
+        );
+        let handle = tokio::spawn(router.run());
+        tx.send(GuardianSignal {
+            lane: Lane::Shadow,
+            position_id: Some("shadow:observation-only:1".to_string()),
+            base_mint: mint,
+            pool_amm_id: Pubkey::new_unique(),
+            source: SignalSource::Panic,
+            severity: SignalSeverity::Critical,
+            reason: "observation-only panic".to_string(),
+            confidence: 1.0,
+            timestamp_ms: 1234,
+            raw_score: Some(100.0),
+        })
+        .await
+        .expect("send observation signal");
+        drop(tx);
+        handle.await.expect("router task");
+
+        let book = shadow_book.read().await;
+        let token_revolver = book.tokens.get(&mint).expect("shadow position mirror");
+        assert!(!token_revolver.is_panic_sell());
     }
 }

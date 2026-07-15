@@ -40,6 +40,8 @@ pub use schema::{
     PoolTransactionPayload,
     PositionClosedPayload,
     PositionOpenedPayload,
+    ShadowPositionUnresolvedPayload,
+    ShadowUnresolvedReason,
 };
 pub use validator::{EventValidator, InvariantViolation, ValidatorMetrics};
 pub use writer::{EventWriter, EventWriterConfig};

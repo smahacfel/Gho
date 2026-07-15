@@ -16,6 +16,11 @@ fn post_buy_guardian_lifecycle_thresholds_load_from_production_toml() {
     assert_eq!(config.post_buy_guardian.stoploss_threshold, Some(50.0));
     assert_eq!(config.post_buy_guardian.wait_for_timestop, Some(30_000));
     assert_eq!(config.post_buy_guardian.wait_for_timestop_ms(), 30_000);
+    assert_eq!(
+        config.post_buy_guardian.exit_policy_v1.quote_recovery_ms,
+        5_000
+    );
+    assert!(!config.post_buy_guardian.aem.enabled);
 }
 
 #[test]

@@ -22175,24 +22175,29 @@ fn send_direct_post_buy_handoff(
     };
 
     post_buy_tx
-        .send(DirectPostBuyHandoff::without_ack(event.clone()))
-        .map_err(|e| {
+        .try_send(DirectPostBuyHandoff::without_ack(event.clone()))
+        .map_err(|error| {
+            let reason = match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
+            };
             ::metrics::counter!(
                 "trigger_post_buy_handoff_failed_total",
                 1u64,
                 "lane" => post_buy_lane.to_string(),
-                "transport" => "direct_queue"
+                "transport" => "direct_queue",
+                "reason" => reason
             );
             error!(
                 pool = %pool_amm_id,
                 lane = post_buy_lane,
-                "Confirmed BUY could not be handed off to direct PostBuyRuntime queue: {}",
-                e
+                reason,
+                "Confirmed BUY could not be handed off to direct PostBuyRuntime queue"
             );
             anyhow::anyhow!(
-                "direct post-buy handoff failed for pool {}: {}",
+                "direct post-buy handoff failed for pool {}: queue {}",
                 pool_amm_id,
-                e
+                reason
             )
         })
 }
@@ -22208,23 +22213,28 @@ async fn send_direct_shadow_post_buy_handoff(
     };
 
     let (handoff, ack_rx) = DirectPostBuyHandoff::with_ack(event.clone());
-    post_buy_tx.send(handoff).map_err(|e| {
+    post_buy_tx.try_send(handoff).map_err(|error| {
+        let reason = match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
+        };
         ::metrics::counter!(
             "trigger_post_buy_handoff_failed_total",
             1u64,
             "lane" => post_buy_lane.to_string(),
-            "transport" => "direct_queue"
+            "transport" => "direct_queue",
+            "reason" => reason
         );
         error!(
             pool = %pool_amm_id,
             lane = post_buy_lane,
-            "Confirmed BUY could not be handed off to direct PostBuyRuntime queue: {}",
-            e
+            reason,
+            "Confirmed BUY could not be handed off to direct PostBuyRuntime queue"
         );
         anyhow::anyhow!(
-            "direct post-buy handoff failed for pool {}: {}",
+            "direct post-buy handoff failed for pool {}: queue {}",
             pool_amm_id,
-            e
+            reason
         )
     })?;
 
@@ -40344,7 +40354,7 @@ mod tests {
         );
         let (event_tx, _event_rx) = crate::events::create_event_bus();
         let (direct_tx, mut direct_rx) =
-            crate::components::post_buy_runtime::create_direct_post_buy_handoff_channel();
+            crate::components::post_buy_runtime::create_direct_post_buy_handoff_channel(1);
         let post_buy_epoch = std::sync::atomic::AtomicU64::new(1);
         let pool_id = Pubkey::new_unique();
         let pool = crate::events::DetectedPool {
@@ -40948,7 +40958,7 @@ mod tests {
         );
         let (event_tx, _event_rx) = crate::events::create_event_bus();
         let (direct_tx, mut direct_rx) =
-            crate::components::post_buy_runtime::create_direct_post_buy_handoff_channel();
+            crate::components::post_buy_runtime::create_direct_post_buy_handoff_channel(1);
         let post_buy_epoch = std::sync::atomic::AtomicU64::new(1);
         let pool_id = Pubkey::new_unique();
         let pool = crate::events::DetectedPool {

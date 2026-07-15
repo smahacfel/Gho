@@ -8,6 +8,7 @@ use crate::aem::config::AemConfig;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_WAIT_FOR_TIMESTOP_MS: u64 = 30_000;
+pub const DEFAULT_EXIT_POLICY_V1_QUOTE_RECOVERY_MS: u64 = 5_000;
 pub const DEFAULT_TIME_STOP_V2_FIRST_CHECK_MS: u64 = 3_000;
 pub const DEFAULT_TIME_STOP_V2_WINDOW_MS: u64 = 4_000;
 pub const DEFAULT_TIME_STOP_V2_FAILED_WINDOWS_TO_SIGNAL: u32 = 3;
@@ -116,6 +117,27 @@ impl TimeStopV2Config {
     }
 }
 
+/// Backward-compatible runtime knobs owned by Position Manager Lite V1.
+///
+/// PR1 intentionally exposes only the bounded quote-recovery window. Absolute
+/// max-hold and CrashGuard remain out of scope and can extend this nested
+/// config additively in a later change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExitPolicyV1Config {
+    /// Maximum time spent retrying a shadow executable quote after an exit
+    /// proposal has become sticky.
+    pub quote_recovery_ms: u64,
+}
+
+impl Default for ExitPolicyV1Config {
+    fn default() -> Self {
+        Self {
+            quote_recovery_ms: DEFAULT_EXIT_POLICY_V1_QUOTE_RECOVERY_MS,
+        }
+    }
+}
+
 /// Compact, shadow-only post-buy price path evidence for offline exit replay.
 ///
 /// This is a research sidecar. It must never influence BUY/REJECT, live exits,
@@ -217,8 +239,8 @@ pub struct PostBuyGuardianConfig {
 
     /// Shadow/probe stop-loss threshold in percentage points (50.0 = -50%).
     ///
-    /// Values above 100 are clamped by the consumer because stop-loss cannot
-    /// move below zero price.
+    /// Values outside 0..=100 are rejected at Position Manager startup because
+    /// a stop-loss cannot move below zero price.
     #[serde(default)]
     pub stoploss_threshold: Option<f64>,
 
@@ -233,6 +255,10 @@ pub struct PostBuyGuardianConfig {
     /// Shadow-only compact exit path replay evidence.
     #[serde(default)]
     pub exit_replay_v1: ShadowExitReplayConfig,
+
+    /// Position Manager Lite V1 policy runtime settings.
+    #[serde(default)]
+    pub exit_policy_v1: ExitPolicyV1Config,
 
     // ── LIGMA thresholds ────────────────────────────────────────────────
     /// Retail impact (bps) above which we emit Warning.
@@ -325,6 +351,7 @@ impl Default for PostBuyGuardianConfig {
             wait_for_timestop: None,
             time_stop_v2: TimeStopV2Config::default(),
             exit_replay_v1: ShadowExitReplayConfig::default(),
+            exit_policy_v1: ExitPolicyV1Config::default(),
 
             // LIGMA
             ligma_warning_impact_bps: 3500.0,
@@ -460,6 +487,28 @@ mod tests {
         assert_eq!(cfg.stoploss_threshold, None);
         assert_eq!(cfg.wait_for_timestop, None);
         assert_eq!(cfg.wait_for_timestop_ms(), DEFAULT_WAIT_FOR_TIMESTOP_MS);
+        assert_eq!(
+            cfg.exit_policy_v1.quote_recovery_ms,
+            DEFAULT_EXIT_POLICY_V1_QUOTE_RECOVERY_MS
+        );
+    }
+
+    #[test]
+    fn deserialize_exit_policy_v1_defaults_and_override() {
+        let default_cfg: PostBuyGuardianConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            default_cfg.exit_policy_v1.quote_recovery_ms,
+            DEFAULT_EXIT_POLICY_V1_QUOTE_RECOVERY_MS
+        );
+
+        let cfg: PostBuyGuardianConfig = toml::from_str(
+            r#"
+            [exit_policy_v1]
+            quote_recovery_ms = 7500
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.exit_policy_v1.quote_recovery_ms, 7_500);
     }
 
     #[test]

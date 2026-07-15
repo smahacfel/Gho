@@ -223,14 +223,29 @@ pub enum PriceTruthError {
     },
     #[error("Shadow exit price truth failed: {reason}")]
     Failure {
+        kind: PriceTruthFailureKind,
         reason: String,
         evidence: PriceTruthEvidence,
     },
     #[error("Shadow exit semantic violation: {reason}")]
     SemanticViolation {
+        kind: PriceTruthFailureKind,
         reason: String,
         evidence: PriceTruthEvidence,
     },
+}
+
+/// Stable machine-readable classification for executable quote failures.
+/// Human-readable `reason`/`detail` values are diagnostics only and must never
+/// select a lifecycle or economic outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceTruthFailureKind {
+    InvalidReserves,
+    InvalidNormalization,
+    QuantityMismatch,
+    ZeroOutput,
+    SemanticViolation,
+    InternalFailure,
 }
 
 impl PriceTruthError {
@@ -245,6 +260,13 @@ impl PriceTruthError {
 
     pub fn status(&self) -> PriceTruthStatus {
         self.evidence().status
+    }
+
+    pub fn failure_kind(&self) -> Option<PriceTruthFailureKind> {
+        match self {
+            Self::Failure { kind, .. } | Self::SemanticViolation { kind, .. } => Some(*kind),
+            Self::Stale { .. } | Self::BackfillRequired { .. } => None,
+        }
     }
 }
 
@@ -361,6 +383,7 @@ impl PriceTruthResolver {
 
         if snapshot.price_state.is_invalid() {
             return Err(PriceTruthError::Failure {
+                kind: PriceTruthFailureKind::InvalidNormalization,
                 reason: "price_state_invalid".to_string(),
                 evidence: PriceTruthEvidence {
                     status: PriceTruthStatus::Failure,
@@ -372,6 +395,7 @@ impl PriceTruthResolver {
 
         let Some(exit_price_sol) = Self::normalize_shadow_snapshot_price_sol(snapshot) else {
             return Err(PriceTruthError::Failure {
+                kind: PriceTruthFailureKind::InvalidNormalization,
                 reason: format!(
                     "shadow_price_normalization_failed raw_price={} reserve_base={} reserve_quote={}",
                     snapshot.price_sol_per_token, snapshot.reserve_base, snapshot.reserve_quote
@@ -404,6 +428,7 @@ impl PriceTruthResolver {
 
         let Some(curve) = Self::curve_from_shadow_snapshot(snapshot) else {
             return Err(PriceTruthError::Failure {
+                kind: PriceTruthFailureKind::InvalidReserves,
                 reason: format!(
                     "shadow_curve_materialization_failed reserve_base={} reserve_quote={}",
                     snapshot.reserve_base, snapshot.reserve_quote
@@ -434,6 +459,7 @@ impl PriceTruthResolver {
     ) -> Result<ShadowExitTruth, PriceTruthError> {
         if !entry_price_sol.is_finite() || entry_price_sol <= 0.0 {
             return Err(PriceTruthError::Failure {
+                kind: PriceTruthFailureKind::InternalFailure,
                 reason: format!("invalid_entry_price={entry_price_sol}"),
                 evidence: PriceTruthEvidence {
                     source: sample.evidence.source,
@@ -450,6 +476,7 @@ impl PriceTruthResolver {
 
         if exit_token_amount_raw == 0 {
             return Err(PriceTruthError::Failure {
+                kind: PriceTruthFailureKind::QuantityMismatch,
                 reason: "invalid_exit_token_amount_raw=0".to_string(),
                 evidence: PriceTruthEvidence {
                     source: sample.evidence.source,
@@ -466,6 +493,7 @@ impl PriceTruthResolver {
 
         if sample.curve.virtual_token_reserves > u64::MAX.saturating_sub(exit_token_amount_raw) {
             return Err(PriceTruthError::Failure {
+                kind: PriceTruthFailureKind::QuantityMismatch,
                 reason: format!("shadow_exit_amount_overflows_curve={exit_token_amount_raw}"),
                 evidence: PriceTruthEvidence {
                     source: sample.evidence.source,
@@ -485,6 +513,7 @@ impl PriceTruthResolver {
 
         if !estimated_costs_sol.is_finite() || estimated_costs_sol < 0.0 {
             return Err(PriceTruthError::Failure {
+                kind: PriceTruthFailureKind::InternalFailure,
                 reason: format!("invalid_estimated_costs_sol={estimated_costs_sol}"),
                 evidence: PriceTruthEvidence {
                     source: sample.evidence.source,
@@ -505,6 +534,22 @@ impl PriceTruthResolver {
         let entry_value_sol = entry_price_sol * exit_qty_tokens;
         let exit_value_sol =
             sample.curve.calculate_sell_price(exit_token_amount_raw) as f64 / LAMPORTS_PER_SOL_F64;
+        if !exit_value_sol.is_finite() || exit_value_sol <= 0.0 {
+            return Err(PriceTruthError::Failure {
+                kind: PriceTruthFailureKind::ZeroOutput,
+                reason: format!("non_executable_exit_value_sol={exit_value_sol}"),
+                evidence: PriceTruthEvidence {
+                    source: sample.evidence.source,
+                    status: PriceTruthStatus::Failure,
+                    detail: Some("shadow executable quote produced zero output".to_string()),
+                    slot: sample.evidence.slot,
+                    timestamp_ms: sample.evidence.timestamp_ms,
+                    age_ms: sample.evidence.age_ms,
+                    price_state: sample.evidence.price_state,
+                    price_reason: sample.evidence.price_reason,
+                },
+            });
+        }
         let exit_price_sol = if exit_qty_tokens > 0.0 {
             exit_value_sol / exit_qty_tokens
         } else {
@@ -514,6 +559,7 @@ impl PriceTruthResolver {
         let invariant_tolerance = oracle_spot_price.abs() * 1e-9 + 1e-15;
         if !oracle_spot_price.is_finite() || oracle_spot_price <= 0.0 {
             return Err(PriceTruthError::Failure {
+                kind: PriceTruthFailureKind::InvalidNormalization,
                 reason: format!("invalid_oracle_spot_price={oracle_spot_price}"),
                 evidence: PriceTruthEvidence {
                     source: sample.evidence.source,
@@ -546,6 +592,7 @@ impl PriceTruthResolver {
                 "PriceTruthResolver: shadow exit semantic violation"
             );
             return Err(PriceTruthError::SemanticViolation {
+                kind: PriceTruthFailureKind::SemanticViolation,
                 reason: "exit_fill_above_oracle_spot".to_string(),
                 evidence: PriceTruthEvidence {
                     source: sample.evidence.source,
@@ -565,6 +612,7 @@ impl PriceTruthResolver {
         }
         if !entry_value_sol.is_finite() || entry_value_sol <= 0.0 {
             return Err(PriceTruthError::Failure {
+                kind: PriceTruthFailureKind::InternalFailure,
                 reason: format!("invalid_entry_value_sol={entry_value_sol}"),
                 evidence: PriceTruthEvidence {
                     source: sample.evidence.source,
@@ -936,6 +984,7 @@ mod tests {
         let err = PriceTruthResolver::resolve_shadow_exit_sample(&snapshot, 3_000, 1_000)
             .expect_err("stale sample");
         assert_eq!(err.status(), PriceTruthStatus::Stale);
+        assert_eq!(err.failure_kind(), None);
         assert_eq!(err.evidence().slot, Some(7));
     }
 
@@ -1009,6 +1058,10 @@ mod tests {
         )
         .expect_err("semantic violation");
         assert_eq!(err.status(), PriceTruthStatus::SemanticViolation);
+        assert_eq!(
+            err.failure_kind(),
+            Some(PriceTruthFailureKind::SemanticViolation)
+        );
         let detail = err
             .evidence()
             .detail
@@ -1018,5 +1071,39 @@ mod tests {
         assert!(detail.contains("oracle_spot_price="));
         assert!(detail.contains("computed_exit_price="));
         assert!(detail.contains("source_path=trigger.price_truth.resolve_shadow_exit"));
+    }
+
+    #[test]
+    fn test_price_truth_resolver_classifies_zero_quantity_without_parsing_detail() {
+        let sample = ShadowExitPriceSample {
+            exit_price_sol: 1.0,
+            curve: BondingCurve {
+                discriminator: 0,
+                virtual_token_reserves: 1_000_000,
+                virtual_sol_reserves: 1_000_000_000,
+                real_token_reserves: 1_000_000,
+                real_sol_reserves: 1_000_000_000,
+                token_total_supply: 1_000_000,
+                complete: 0,
+                _padding: [0; 7],
+            },
+            evidence: PriceTruthEvidence {
+                source: PriceTruthSource::ShadowLedgerSnapshot,
+                status: PriceTruthStatus::Resolved,
+                detail: None,
+                slot: Some(10),
+                timestamp_ms: Some(1_000),
+                age_ms: Some(0),
+                price_state: Some(PriceState::Valid),
+                price_reason: None,
+            },
+        };
+
+        let err = PriceTruthResolver::resolve_shadow_exit(1.0, 0, &sample, 0.0)
+            .expect_err("zero quantity must fail");
+        assert_eq!(
+            err.failure_kind(),
+            Some(PriceTruthFailureKind::QuantityMismatch)
+        );
     }
 }

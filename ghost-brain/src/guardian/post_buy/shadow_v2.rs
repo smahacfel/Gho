@@ -4466,6 +4466,10 @@ pub struct ShadowTerminalTruthV2 {
     pub event_order_key: EventOrderKey,
     pub terminal_reason: TerminalReasonV2,
     pub terminal_ts_ms: ClockedTimestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truth_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_observed_slot: Option<u64>,
     pub terminal_slot: Option<u64>,
     pub terminal_source: String,
     pub final_pnl_mark_bps: Option<i32>,
@@ -6103,6 +6107,8 @@ mod tests {
                 1_785_000_003_123,
                 ClockDomain::StreamObservedMs,
             ),
+            truth_slot: Some(45),
+            terminal_observed_slot: Some(45),
             terminal_slot: Some(45),
             terminal_source: "canonical_event_stream".to_string(),
             final_pnl_mark_bps: Some(12),

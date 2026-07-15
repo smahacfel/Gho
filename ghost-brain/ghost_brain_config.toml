@@ -1185,7 +1185,7 @@ signal_channel_buffer = 256
 
 # Shadow/probe lifecycle close thresholds.
 # Values are percentages: 50.0 means +50% Target / -50% StopLoss.
-# Target can be set above 100.0; StopLoss is clamped by runtime to max 100%.
+# Target can be set above 100.0; StopLoss outside 0..=100% blocks startup.
 target_threshold = 50.0
 stoploss_threshold = 50.0
 wait_for_timestop = 30000
@@ -1223,6 +1223,11 @@ escalation_critical_count = 1
 signal_aggregation_window_ms = 5000
 max_signals_per_position = 200
 
+# Position Manager Lite V1 retries a lazy, position-sized executable quote for
+# this bounded window after an exit condition becomes sticky.
+[post_buy_guardian.exit_policy_v1]
+quote_recovery_ms = 5000
+
 # TimeStop V2 vitality telemetry.
 # Disabled by default. Observe-only mode emits counterfactual lifecycle rows and
 # does not change Target/StopLoss/legacy TimeStop close decisions.
@@ -1246,7 +1251,7 @@ max_bonding_delta_pct_heartbeat = 0.25
 emit_window_records = true
 
 [post_buy_guardian.aem]
-enabled = true
+enabled = false
 t_s = 120
 min_stabilization_ticks = 2
 n_min_per_key = 20

@@ -12,27 +12,36 @@
 //! Pipeline (BUY success)
 //!   → MonitoringEngine::register_position()
 //!
-//! ShadowLedger (continuous snapshots)
+//! AccountStateCore (canonical snapshots)
 //!   → MonitoringEngine::tick() every N ms
-//!     → [LIGMA, WHF, TCF, PANIC] checks
-//!       → GuardianSignal (via mpsc channel)
-//!         → SignalRouter
-//!           → lane-aware position sink (live Revolver / shadow virtual magazine)
+//!     → immutable PostBuyDecisionSnapshot
+//!       → pure ExitPolicyV1
+//!         → lazy full-position executable quote
+//!           → guarded shadow outcome apply
+//!             → typed terminal notification
 //!
-//! Pipeline (SELL / position closed)
-//!   → MonitoringEngine::unregister_position()
+//! LIGMA, WHF, TCF and PANIC continue to emit evidence. In the active launcher
+//! their SignalRouter is observation-only and cannot mutate the position or
+//! virtual magazine.
 //! ```
 
 pub mod config;
 pub mod engine;
+mod exit_policy_v1;
 pub mod exit_replay;
 pub mod integration;
 pub mod shadow_v2;
 pub mod shadow_v2_execution;
 pub mod signals;
 
-pub use config::{PostBuyGuardianConfig, ShadowExitReplayConfig, TimeStopV2Config};
-pub use engine::MonitoringEngine;
+pub use crate::events::ShadowUnresolvedReason;
+pub use config::{
+    ExitPolicyV1Config, PostBuyGuardianConfig, ShadowExitReplayConfig, TimeStopV2Config,
+};
+pub use engine::{MonitoringEngine, RegisteredShadowPosition, ShadowTerminalDisposition};
+pub use exit_policy_v1::{
+    validate_exit_policy_v1_config, ExitPolicyConfigError, ExitPolicyV1Status,
+};
 pub use integration::{PositionRuntimeRouter, ShadowPositionBook, SignalRouter};
 pub use signals::{
     GuardianSignal, PositionHealth, RecommendedAction, SignalSeverity, SignalSource,

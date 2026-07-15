@@ -4,7 +4,8 @@
 //! Listens on the event bus for `PostBuySubmitted` events and routes them:
 //!
 //! - **lane == "live"** + `live_sell` configured: persists confirmed BUY entry metadata, monitors
-//!   canonical price, and executes a single 100% SELL via Helius Sender when +2% or -2% is hit.
+//!   canonical price, and executes a single 100% SELL via Helius Sender when the configured
+//!   dormant-live take-profit or stop-loss threshold is hit.
 //! - **lane == "shadow"**: registers the position in ghost-brain `MonitoringEngine` backed by the
 //!   lane-aware `ShadowPositionBook`, so canonical shadow lifecycle proof lands in
 //!   `shadow_lifecycle.jsonl`.
@@ -51,8 +52,8 @@ use ghost_brain::guardian::post_buy::shadow_v2::{
     SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
 };
 use ghost_brain::guardian::post_buy::{
-    MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, ShadowExitReplayConfig,
-    ShadowPositionBook, SignalRouter, TimeStopV2Config,
+    validate_exit_policy_v1_config, ExitPolicyV1Status, MonitoringEngine, PositionRuntimeRouter,
+    PostBuyGuardianConfig, ShadowPositionBook, ShadowTerminalDisposition, SignalRouter,
 };
 use ghost_brain::quotes::{ExecutableQuoteProvider, QuoteProviderConfig};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
@@ -153,11 +154,17 @@ impl DirectPostBuyHandoff {
     }
 }
 
-pub type DirectPostBuySender = mpsc::UnboundedSender<DirectPostBuyHandoff>;
-pub type DirectPostBuyReceiver = mpsc::UnboundedReceiver<DirectPostBuyHandoff>;
+pub type DirectPostBuySender = mpsc::Sender<DirectPostBuyHandoff>;
+pub type DirectPostBuyReceiver = mpsc::Receiver<DirectPostBuyHandoff>;
 
-pub fn create_direct_post_buy_handoff_channel() -> (DirectPostBuySender, DirectPostBuyReceiver) {
-    mpsc::unbounded_channel()
+pub fn direct_post_buy_handoff_capacity(max_concurrent_positions: usize) -> usize {
+    max_concurrent_positions.saturating_mul(4).clamp(8, 256)
+}
+
+pub fn create_direct_post_buy_handoff_channel(
+    max_concurrent_positions: usize,
+) -> (DirectPostBuySender, DirectPostBuyReceiver) {
+    mpsc::channel(direct_post_buy_handoff_capacity(max_concurrent_positions))
 }
 
 /// Configuration for the PostBuyRuntime adapter.
@@ -188,20 +195,13 @@ pub struct PostBuyRuntimeConfig {
     pub live_position_registry: Option<LivePositionRegistry>,
     /// Maximum slippage tolerance mirrored from trigger config (0.20 = 20%).
     pub slippage_tolerance: f64,
-    /// Live take-profit threshold as a fraction of entry price (0.02 = +2%).
+    /// Live take-profit threshold as a fraction of entry price.
     pub live_exit_take_profit_pct: f64,
-    /// Live stop-loss threshold as a fraction of entry price (0.02 = -2%).
+    /// Live stop-loss threshold as a fraction of entry price.
     pub live_exit_stop_loss_pct: f64,
-    /// Shadow/probe target threshold from `[post_buy_guardian]` in percentage points.
-    pub shadow_target_threshold: Option<f64>,
-    /// Shadow/probe stop-loss threshold from `[post_buy_guardian]` in percentage points.
-    pub shadow_stoploss_threshold: Option<f64>,
-    /// Shadow/probe TimeStop inactivity timeout from `[post_buy_guardian]` in ms.
-    pub shadow_wait_for_timestop: Option<u64>,
-    /// Shadow/probe TimeStop V2 observe-only config from `[post_buy_guardian.time_stop_v2]`.
-    pub shadow_time_stop_v2: Option<TimeStopV2Config>,
-    /// Shadow-only compact exit replay config from `[post_buy_guardian.exit_replay_v1]`.
-    pub shadow_exit_replay_v1: Option<ShadowExitReplayConfig>,
+    /// Complete Guardian configuration loaded from the brain config. Runtime
+    /// may only overlay capacity and artifact paths.
+    pub shadow_guardian: Option<PostBuyGuardianConfig>,
     /// Canonical ShadowLedger shared with the shadow Guardian runtime.
     pub shadow_ledger: Option<Arc<ShadowLedger>>,
     /// Canonical account-state runtime truth shared with shadow guardian.
@@ -231,11 +231,7 @@ impl Default for PostBuyRuntimeConfig {
             slippage_tolerance: 0.20,
             live_exit_take_profit_pct: 0.02,
             live_exit_stop_loss_pct: 0.02,
-            shadow_target_threshold: None,
-            shadow_stoploss_threshold: None,
-            shadow_wait_for_timestop: None,
-            shadow_time_stop_v2: None,
-            shadow_exit_replay_v1: None,
+            shadow_guardian: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
@@ -258,20 +254,29 @@ impl PostBuyRuntimeConfig {
         percent_fraction_to_bps(self.live_exit_stop_loss_pct)
     }
 
-    fn shadow_take_profit_fraction(&self) -> f64 {
-        percent_points_to_fraction(
-            self.shadow_target_threshold,
-            self.live_exit_take_profit_pct,
-            None,
-        )
-    }
+    pub fn validate(&self) -> Result<Option<ExitPolicyV1Status>, String> {
+        if self.execution_mode != "shadow" {
+            return Ok(None);
+        }
 
-    fn shadow_stop_loss_fraction(&self) -> f64 {
-        percent_points_to_fraction(
-            self.shadow_stoploss_threshold,
-            self.live_exit_stop_loss_pct,
-            Some(100.0),
-        )
+        if self.shadow_guardian.is_none() {
+            return Err(
+                "shadow mode requires the complete post_buy_guardian configuration".to_string(),
+            );
+        }
+        let guardian = build_shadow_guardian_config(self);
+        if !guardian.enabled {
+            return Err("shadow mode requires post_buy_guardian.enabled=true".to_string());
+        }
+        if guardian.aem.enabled {
+            return Err(
+                "Position Manager Lite V1 requires post_buy_guardian.aem.enabled=false".to_string(),
+            );
+        }
+
+        validate_exit_policy_v1_config(&guardian)
+            .map(Some)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -286,24 +291,6 @@ fn percent_fraction_to_bps(value: f64) -> u16 {
         0.0
     };
     (clamped * 10_000.0).round() as u16
-}
-
-fn percent_points_to_fraction(
-    value_pct: Option<f64>,
-    fallback_fraction: f64,
-    max_pct: Option<f64>,
-) -> f64 {
-    let Some(value_pct) = value_pct else {
-        return fallback_fraction;
-    };
-    if !value_pct.is_finite() {
-        return fallback_fraction;
-    }
-    let clamped = match max_pct {
-        Some(max_pct) => value_pct.clamp(0.0, max_pct),
-        None => value_pct.max(0.0),
-    };
-    clamped / 100.0
 }
 
 fn now_ms() -> u64 {
@@ -327,6 +314,43 @@ fn init_shadow_v2_validation_harness(
     ShadowV2ValidationHarness::new(harness_config)
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+fn init_position_manager_terminal_harness(
+    config: Option<&ShadowV2BurninConfig>,
+    events_output_path: &Path,
+    run_id: &str,
+) -> Result<Option<ShadowV2ValidationHarness>, String> {
+    if config.is_some_and(|config| config.enabled) {
+        return init_shadow_v2_validation_harness(config);
+    }
+
+    let root = events_output_path.join("position_manager_terminal_truth_v2");
+    let harness_config = ShadowV2ValidationHarnessConfig::new(
+        run_id,
+        root.join("shadow_position_event_v2.jsonl"),
+        root.join("shadow_replay_v2.jsonl"),
+        root.join("shadow_lifecycle_v2.jsonl"),
+        root.join("shadow_path_density_v2.jsonl"),
+    );
+    ShadowV2ValidationHarness::new(harness_config)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn init_probe_position_manager_terminal_harness(
+    events_output_path: &Path,
+    run_id: &str,
+) -> Result<ShadowV2ValidationHarness, String> {
+    let root = events_output_path.join("position_manager_probe_terminal_truth_v2");
+    let harness_config = ShadowV2ValidationHarnessConfig::new(
+        run_id,
+        root.join("shadow_position_event_v2.jsonl"),
+        root.join("shadow_replay_v2.jsonl"),
+        root.join("shadow_lifecycle_v2.jsonl"),
+        root.join("shadow_path_density_v2.jsonl"),
+    );
+    ShadowV2ValidationHarness::new(harness_config).map_err(|error| error.to_string())
 }
 
 fn shadow_v2_scope_root(config: &ShadowV2BurninConfig) -> Result<&str, String> {
@@ -804,19 +828,8 @@ fn shadow_v2_post_buy_event_seq(timestamp_ms: u64, offset: u64) -> u64 {
 }
 
 fn build_shadow_guardian_config(config: &PostBuyRuntimeConfig) -> PostBuyGuardianConfig {
-    let mut guardian = PostBuyGuardianConfig::default();
-    guardian.tick_interval_ms = config.tick_interval_ms;
+    let mut guardian = config.shadow_guardian.clone().unwrap_or_default();
     guardian.max_monitored_positions = config.max_concurrent_positions;
-    guardian.aem.t_s = config.aem_t_s;
-    guardian.target_threshold = config.shadow_target_threshold;
-    guardian.stoploss_threshold = config.shadow_stoploss_threshold;
-    guardian.wait_for_timestop = config.shadow_wait_for_timestop;
-    if let Some(time_stop_v2) = config.shadow_time_stop_v2.clone() {
-        guardian.time_stop_v2 = time_stop_v2;
-    }
-    if let Some(exit_replay_v1) = config.shadow_exit_replay_v1.clone() {
-        guardian.exit_replay_v1 = exit_replay_v1;
-    }
     guardian
 }
 
@@ -944,6 +957,7 @@ enum LiveExitStatus {
     ExitBuildFailed,
     ExitSubmitFailed,
     ExitConfirmFailed,
+    ExitConfirmationUnknown,
     LifecycleAbortedWithReason,
 }
 
@@ -963,6 +977,7 @@ impl LiveExitStatus {
             Self::ExitBuildFailed => "exit_build_failed",
             Self::ExitSubmitFailed => "exit_submit_failed",
             Self::ExitConfirmFailed => "exit_confirm_failed",
+            Self::ExitConfirmationUnknown => "exit_confirmation_unknown",
             Self::LifecycleAbortedWithReason => "lifecycle_aborted",
         }
     }
@@ -2182,6 +2197,17 @@ pub async fn run(
     mut direct_handoff_rx: Option<DirectPostBuyReceiver>,
     config: PostBuyRuntimeConfig,
 ) {
+    let effective_policy_status = match config.validate() {
+        Ok(status) => status,
+        Err(error) => {
+            warn!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                error = %error,
+                "PostBuyRuntime: invalid effective Position Manager Lite configuration"
+            );
+            return;
+        }
+    };
     let output_dir = config.events_output_path.to_string_lossy().to_string();
 
     // Initialize ghost-brain EventEmitter (shared by canonical paper/shadow post-buy paths).
@@ -2206,19 +2232,44 @@ pub async fn run(
             return;
         }
     };
-    let shadow_v2_harness =
-        match init_shadow_v2_validation_harness(config.shadow_v2_burnin.as_ref()) {
-            Ok(harness) => harness.map(|harness| Arc::new(ParkingMutex::new(harness))),
+    let shadow_v2_harness = match if config.execution_mode == "shadow" {
+        init_position_manager_terminal_harness(
+            config.shadow_v2_burnin.as_ref(),
+            &config.events_output_path,
+            &run_id,
+        )
+    } else {
+        init_shadow_v2_validation_harness(config.shadow_v2_burnin.as_ref())
+    } {
+        Ok(harness) => harness.map(|harness| Arc::new(ParkingMutex::new(harness))),
+        Err(error) => {
+            warn!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                error = %error,
+                validation_harness_status = "FAILED",
+                "PostBuyRuntime: SHADOW_V2_VALIDATION_PREFLIGHT_FAILED"
+            );
+            return;
+        }
+    };
+    let probe_shadow_v2_harness = if config.execution_mode == "shadow"
+        && config.probe_lifecycle_log_path.is_some()
+    {
+        match init_probe_position_manager_terminal_harness(&config.events_output_path, &run_id) {
+            Ok(harness) => Some(Arc::new(ParkingMutex::new(harness))),
             Err(error) => {
                 warn!(
                     runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                     error = %error,
                     validation_harness_status = "FAILED",
-                    "PostBuyRuntime: SHADOW_V2_VALIDATION_PREFLIGHT_FAILED"
+                    "PostBuyRuntime: PROBE_TERMINAL_TRUTH_PREFLIGHT_FAILED"
                 );
                 return;
             }
-        };
+        }
+    } else {
+        None
+    };
 
     // Shared QuoteProvider for ghost-brain PaperBroker (paper compatibility path only)
     let quote_provider = Arc::new(RwLock::new(ExecutableQuoteProvider::new(
@@ -2260,18 +2311,17 @@ pub async fn run(
                     RwLock::new(ShadowPositionBook::with_time_stop_ms(wait_for_timestop_ms)),
                 )));
                 let mut monitoring_engine =
-                    MonitoringEngine::new(guardian_config, shadow_ledger, signal_tx);
-                monitoring_engine.set_shadow_simple_exit_thresholds(
-                    config.shadow_take_profit_fraction(),
-                    config.shadow_stop_loss_fraction(),
-                );
-                info!(
-                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-                    target_threshold_pct = ?config.shadow_target_threshold,
-                    stoploss_threshold_pct = ?config.shadow_stoploss_threshold,
-                    wait_for_timestop_ms,
-                    "PostBuyRuntime: configured shadow lifecycle close thresholds"
-                );
+                    match MonitoringEngine::try_new(guardian_config, shadow_ledger, signal_tx) {
+                        Ok(engine) => engine,
+                        Err(error) => {
+                            warn!(
+                                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                                error = %error,
+                                "PostBuyRuntime: shadow Position Manager policy validation failed"
+                            );
+                            return;
+                        }
+                    };
                 if let Some(account_state_core) = config.account_state_core.clone() {
                     monitoring_engine.set_account_state_core(account_state_core);
                 }
@@ -2294,7 +2344,7 @@ pub async fn run(
                 monitoring_engine.set_shadow_exit_replay_log_path(exit_replay_log_path);
                 let monitoring_engine = Arc::new(monitoring_engine);
                 shadow_signal_router_handle = Some(tokio::spawn(
-                    SignalRouter::new(signal_rx, runtime_router).run(),
+                    SignalRouter::new_observation_only(signal_rx, runtime_router).run(),
                 ));
                 shadow_runtime_handle = Some(Arc::clone(&monitoring_engine).start());
                 Some(monitoring_engine)
@@ -2326,26 +2376,29 @@ pub async fn run(
                     RwLock::new(ShadowPositionBook::with_time_stop_ms(wait_for_timestop_ms)),
                 )));
                 let mut monitoring_engine =
-                    MonitoringEngine::new(guardian_config, shadow_ledger, signal_tx);
-                monitoring_engine.set_shadow_simple_exit_thresholds(
-                    config.shadow_take_profit_fraction(),
-                    config.shadow_stop_loss_fraction(),
-                );
-                info!(
-                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-                    target_threshold_pct = ?config.shadow_target_threshold,
-                    stoploss_threshold_pct = ?config.shadow_stoploss_threshold,
-                    wait_for_timestop_ms,
-                    "PostBuyRuntime: configured probe lifecycle close thresholds"
-                );
+                    match MonitoringEngine::try_new(guardian_config, shadow_ledger, signal_tx) {
+                        Ok(engine) => engine,
+                        Err(error) => {
+                            warn!(
+                                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                                error = %error,
+                                "PostBuyRuntime: probe Position Manager policy validation failed"
+                            );
+                            return;
+                        }
+                    };
                 if let Some(account_state_core) = config.account_state_core.clone() {
                     monitoring_engine.set_account_state_core(account_state_core);
+                }
+                if let Some(probe_shadow_v2_harness) = probe_shadow_v2_harness.as_ref() {
+                    monitoring_engine
+                        .set_shadow_v2_validation_harness(Arc::clone(probe_shadow_v2_harness));
                 }
                 monitoring_engine.set_position_router(Arc::clone(&runtime_router));
                 monitoring_engine.set_shadow_lifecycle_log_path(Some(probe_lifecycle_log_path));
                 let monitoring_engine = Arc::new(monitoring_engine);
                 probe_signal_router_handle = Some(tokio::spawn(
-                    SignalRouter::new(signal_rx, runtime_router).run(),
+                    SignalRouter::new_observation_only(signal_rx, runtime_router).run(),
                 ));
                 probe_runtime_handle = Some(Arc::clone(&monitoring_engine).start());
                 Some(monitoring_engine)
@@ -2362,6 +2415,25 @@ pub async fn run(
     } else {
         None
     };
+
+    if let Some(status) = effective_policy_status.as_ref() {
+        info!(
+            runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+            policy_id = %status.policy_id,
+            policy_version = status.policy_version,
+            policy_config_hash = %status.config_hash,
+            lane = "shadow",
+            take_profit_fraction = status.take_profit_fraction,
+            stop_loss_fraction = status.stop_loss_fraction,
+            inactivity_timeout_ms = status.inactivity_timeout_ms,
+            quote_recovery_ms = status.quote_recovery_ms,
+            guardian_authority = "observation_only",
+            aem_authority = "disabled",
+            revolver_authority = "disabled",
+            live_authority = "disabled",
+            "PostBuyRuntime: effective Position Manager Lite V1 configuration"
+        );
+    }
 
     info!(
         runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
@@ -2845,7 +2917,7 @@ async fn handle_post_buy_event(
             brain_config_hash: join_metadata.brain_config_hash.clone(),
             ..Default::default()
         };
-        let handoff = handle_shadow_post_buy_handoff(
+        let mut handoff = handle_shadow_post_buy_handoff(
             shadow_monitor,
             &candidate_id,
             &pool_amm_id,
@@ -2889,20 +2961,31 @@ async fn handle_post_buy_event(
                 &position_join_metadata,
                 shadow_v2_entry_boundary,
             );
-            if let (Some(tracker), Some(slot_id), Some(mint_pubkey), Some(shadow_monitor)) = (
-                config.position_limit_tracker.clone(),
-                position_slot_id,
-                handoff.mint_pubkey,
-                shadow_monitor.cloned(),
-            ) {
-                lifecycle_handles.push(spawn_shadow_slot_release_watcher(
-                    shadow_monitor,
-                    tracker,
-                    slot_id,
-                    mint_pubkey,
-                    candidate_id.clone(),
-                    config.tick_interval_ms.max(50),
-                ));
+            if let (Some(tracker), Some(slot_id)) =
+                (config.position_limit_tracker.clone(), position_slot_id)
+            {
+                if let Some(terminal_rx) = handoff.terminal_rx.take() {
+                    lifecycle_handles.push(spawn_shadow_terminal_watcher(
+                        terminal_rx,
+                        tracker,
+                        slot_id,
+                        candidate_id.clone(),
+                    ));
+                } else {
+                    ::metrics::counter!(
+                        "post_buy_shadow_terminal_total",
+                        1u64,
+                        "disposition" => "terminal_channel_dropped",
+                        "reason" => "terminal_receiver_missing"
+                    );
+                    let _ = tracker.release(slot_id);
+                    warn!(
+                        runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                        candidate_id = %candidate_id,
+                        slot_id = %slot_id,
+                        "PostBuyRuntime: accepted shadow handoff had no terminal receiver; slot released fail-closed for shadow"
+                    );
+                }
             }
         }
         return finish_direct_handoff(recent_handoffs, &candidate_id, handoff.ack);
@@ -3756,8 +3839,8 @@ fn maybe_emit_shadow_v2_validation_smoke_marker(
 
 struct ShadowPostBuyHandoffResult {
     ack: DirectPostBuyHandoffAck,
-    mint_pubkey: Option<Pubkey>,
     position_id: Option<String>,
+    terminal_rx: Option<oneshot::Receiver<ShadowTerminalDisposition>>,
 }
 
 async fn handle_shadow_post_buy_handoff(
@@ -3781,8 +3864,8 @@ async fn handle_shadow_post_buy_handoff(
         );
         return ShadowPostBuyHandoffResult {
             ack: DirectPostBuyHandoffAck::Rejected("guardian_unavailable"),
-            mint_pubkey: None,
             position_id: None,
+            terminal_rx: None,
         };
     };
 
@@ -3798,8 +3881,8 @@ async fn handle_shadow_post_buy_handoff(
             );
             return ShadowPostBuyHandoffResult {
                 ack: DirectPostBuyHandoffAck::Rejected("invalid_pool_pubkey"),
-                mint_pubkey: None,
                 position_id: None,
+                terminal_rx: None,
             };
         }
     };
@@ -3815,8 +3898,8 @@ async fn handle_shadow_post_buy_handoff(
             );
             return ShadowPostBuyHandoffResult {
                 ack: DirectPostBuyHandoffAck::Rejected("invalid_base_mint_pubkey"),
-                mint_pubkey: None,
                 position_id: None,
+                terminal_rx: None,
             };
         }
     };
@@ -3831,8 +3914,8 @@ async fn handle_shadow_post_buy_handoff(
         );
         return ShadowPostBuyHandoffResult {
             ack: DirectPostBuyHandoffAck::Rejected("missing_entry_price"),
-            mint_pubkey: None,
             position_id: None,
+            terminal_rx: None,
         };
     };
     let entry_amount_lamports = if amount_sol.is_finite() && amount_sol > 0.0 {
@@ -3890,29 +3973,30 @@ async fn handle_shadow_post_buy_handoff(
         position_epoch: Some(epoch),
         opened_at_ms: entry_opened_at_ms,
     };
-    let registered = shadow_monitor.register_position_with_context(
+    let registered = shadow_monitor.register_shadow_position_with_terminal(
         pool_pubkey,
         mint_pubkey,
         pool_pubkey,
         Some(entry_price),
         Some(entry_amount_lamports),
         entry_token_amount_raw,
-        Some(context),
+        context,
     );
     match registered {
         Some(registered) => {
+            let (registration, terminal_rx) = registered.into_parts();
             info!(
                 runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                 candidate_id,
-                position_id = %registered.position_id,
-                position_epoch = registered.position_epoch,
+                position_id = %registration.position_id,
+                position_epoch = registration.position_epoch,
                 entry_price,
                 "PostBuyRuntime: canonical shadow position handed off to MonitoringEngine"
             );
             ShadowPostBuyHandoffResult {
                 ack: DirectPostBuyHandoffAck::Accepted,
-                mint_pubkey: Some(mint_pubkey),
-                position_id: Some(registered.position_id),
+                position_id: Some(registration.position_id),
+                terminal_rx: Some(terminal_rx),
             }
         }
         None => {
@@ -3923,36 +4007,61 @@ async fn handle_shadow_post_buy_handoff(
             );
             ShadowPostBuyHandoffResult {
                 ack: DirectPostBuyHandoffAck::Rejected("monitoring_rejected"),
-                mint_pubkey: None,
                 position_id: None,
+                terminal_rx: None,
             }
         }
     }
 }
 
-fn spawn_shadow_slot_release_watcher(
-    shadow_monitor: Arc<MonitoringEngine>,
+fn spawn_shadow_terminal_watcher(
+    terminal_rx: oneshot::Receiver<ShadowTerminalDisposition>,
     position_limit_tracker: PositionLimitTracker,
     slot_id: PositionSlotId,
-    mint_pubkey: Pubkey,
     candidate_id: String,
-    poll_interval_ms: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let poll_interval = Duration::from_millis(poll_interval_ms.max(50));
-        loop {
-            if shadow_monitor.get_position_health(&mint_pubkey).is_none() {
-                if !position_limit_tracker.release(slot_id) {
-                    warn!(
-                        runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-                        candidate_id = %candidate_id,
-                        slot_id = %slot_id,
-                        "PostBuyRuntime: shadow position slot already released before lifecycle close watcher fired"
-                    );
-                }
-                break;
+        let (disposition, action_id, reason) = match terminal_rx.await {
+            Ok(ShadowTerminalDisposition::SimulatedClosed { action_id, reason }) => {
+                ("simulated_closed", Some(action_id), reason)
             }
-            tokio::time::sleep(poll_interval).await;
+            Ok(ShadowTerminalDisposition::SimulationBlocked { action_id, reason }) => (
+                "simulation_blocked",
+                Some(action_id),
+                reason.as_label().to_string(),
+            ),
+            Err(_) => (
+                "terminal_channel_dropped",
+                None,
+                "terminal_channel_dropped".to_string(),
+            ),
+        };
+        ::metrics::counter!(
+            "post_buy_shadow_terminal_total",
+            1u64,
+            "disposition" => disposition,
+            "reason" => reason.clone()
+        );
+        if !position_limit_tracker.release(slot_id) {
+            warn!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                candidate_id = %candidate_id,
+                slot_id = %slot_id,
+                disposition,
+                action_id = ?action_id,
+                reason,
+                "PostBuyRuntime: shadow position slot already released before terminal notification"
+            );
+        } else {
+            info!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                candidate_id = %candidate_id,
+                slot_id = %slot_id,
+                disposition,
+                action_id = ?action_id,
+                reason,
+                "PostBuyRuntime: shadow position slot released from typed terminal notification"
+            );
         }
     })
 }
@@ -3963,7 +4072,7 @@ fn spawn_shadow_slot_release_watcher(
 /// 1. Persist confirmed BUY metadata and real entry price from transaction metadata.
 /// 2. Poll canonical price from `AccountStateCore` and use read-only RPC point
 ///    queries only when canonical state is unavailable.
-/// 3. Trigger a single full 100% SELL at +2% or -2%.
+/// 3. Trigger a single full 100% SELL at the configured dormant-live thresholds.
 /// 4. Submit and confirm that exit only via Helius Sender transport.
 /// 5. Release the bulkhead slot only after an explicit terminal outcome proves the
 ///    live position is closed on-chain; otherwise keep the slot reserved fail-closed.
@@ -4568,10 +4677,10 @@ async fn submit_live_exit_transaction(
             log_live_sell_attempt_summary(
                 "uncertain",
                 None,
-                LiveExitStatus::ExitConfirmFailed,
+                LiveExitStatus::ExitConfirmationUnknown,
                 Some(&detail),
             );
-            Err((LiveExitStatus::ExitConfirmFailed, detail))
+            Err((LiveExitStatus::ExitConfirmationUnknown, detail))
         }
     }
 }
@@ -4975,6 +5084,7 @@ mod tests {
     use crate::events::{create_event_bus, create_event_bus_with_capacity, GhostEvent};
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use ghost_brain::events::{EventKind, ExecutionEvent};
+    use ghost_brain::guardian::post_buy::ShadowUnresolvedReason;
     use ghost_core::account_state_core::types::{
         AccountStateUpdate, CanonicalPoolState, StatePhase, UpdateSource,
     };
@@ -5279,6 +5389,21 @@ sys.exit(0)
         assert!(
             manifest.contains("\"status\":\"PASS\"") || manifest.contains("\"status\": \"PASS\""),
             "post-run manifest must be generated before PostBuyRuntime returns: {manifest}"
+        );
+    }
+
+    #[test]
+    fn shadow_mode_initializes_terminal_truth_harness_without_optional_burnin() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let harness = init_position_manager_terminal_harness(None, tmp.path(), "runtime-run")
+            .expect("terminal harness init")
+            .expect("shadow mode terminal harness");
+
+        assert_eq!(
+            harness.canonical_event_stream_path(),
+            tmp.path()
+                .join("position_manager_terminal_truth_v2")
+                .join("shadow_position_event_v2.jsonl")
         );
     }
 
@@ -6951,33 +7076,204 @@ sys.exit(0)
     }
 
     #[test]
-    fn shadow_exit_thresholds_use_post_buy_guardian_percent_fields() {
-        let config = PostBuyRuntimeConfig {
-            live_exit_take_profit_pct: 0.02,
-            live_exit_stop_loss_pct: 0.02,
-            shadow_target_threshold: Some(150.0),
-            shadow_stoploss_threshold: Some(50.0),
-            shadow_wait_for_timestop: Some(45_000),
-            ..PostBuyRuntimeConfig::default()
-        };
-
-        assert_eq!(config.shadow_take_profit_fraction(), 1.5);
-        assert_eq!(config.shadow_stop_loss_fraction(), 0.5);
-        let guardian_config = build_shadow_guardian_config(&config);
-        assert_eq!(guardian_config.target_threshold, Some(150.0));
-        assert_eq!(guardian_config.stoploss_threshold, Some(50.0));
-        assert_eq!(guardian_config.wait_for_timestop_ms(), 45_000);
+    fn direct_post_buy_handoff_capacity_is_bounded_and_scaled() {
+        assert_eq!(direct_post_buy_handoff_capacity(0), 8);
+        assert_eq!(direct_post_buy_handoff_capacity(1), 8);
+        assert_eq!(direct_post_buy_handoff_capacity(2), 8);
+        assert_eq!(direct_post_buy_handoff_capacity(3), 12);
+        assert_eq!(direct_post_buy_handoff_capacity(64), 256);
+        assert_eq!(direct_post_buy_handoff_capacity(1_000), 256);
     }
 
     #[test]
-    fn shadow_stoploss_percent_is_clamped_to_full_position_loss() {
+    fn direct_post_buy_handoff_distinguishes_full_and_closed() {
+        let event = GhostEvent::post_buy_submitted(
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+            "bounded-direct-handoff",
+            0.1,
+            0,
+            "shadow",
+            1,
+            None,
+            PostBuySource::LiveBuy,
+            None,
+            None,
+            None,
+            None,
+        );
+        let (sender, receiver) = create_direct_post_buy_handoff_channel(1);
+        for _ in 0..8 {
+            sender
+                .try_send(DirectPostBuyHandoff::without_ack(event.clone()))
+                .expect("bounded queue should accept exactly its capacity");
+        }
+        assert!(matches!(
+            sender.try_send(DirectPostBuyHandoff::without_ack(event.clone())),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+
+        drop(receiver);
+        assert!(matches!(
+            sender.try_send(DirectPostBuyHandoff::without_ack(event)),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+    }
+
+    #[test]
+    fn shadow_exit_thresholds_use_post_buy_guardian_percent_fields() {
+        let supplied_guardian = PostBuyGuardianConfig {
+            target_threshold: Some(150.0),
+            stoploss_threshold: Some(50.0),
+            wait_for_timestop: Some(45_000),
+            tick_interval_ms: 777,
+            signal_channel_buffer: 31,
+            ligma_warning_impact_bps: 1_234.0,
+            whf_min_confidence: 0.73,
+            tcf_consecutive_low_max: 9,
+            panic_rate_window_ms: 2_345,
+            exit_policy_v1: ghost_brain::guardian::post_buy::ExitPolicyV1Config {
+                quote_recovery_ms: 6_789,
+            },
+            aem: ghost_brain::aem::config::AemConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..PostBuyGuardianConfig::default()
+        };
         let config = PostBuyRuntimeConfig {
+            live_exit_take_profit_pct: 0.02,
             live_exit_stop_loss_pct: 0.02,
-            shadow_stoploss_threshold: Some(250.0),
+            execution_mode: "shadow".to_string(),
+            max_concurrent_positions: 17,
+            shadow_guardian: Some(supplied_guardian.clone()),
             ..PostBuyRuntimeConfig::default()
         };
 
-        assert_eq!(config.shadow_stop_loss_fraction(), 1.0);
+        let guardian_config = build_shadow_guardian_config(&config);
+        let mut expected_guardian = supplied_guardian;
+        expected_guardian.max_monitored_positions = 17;
+        assert_eq!(
+            serde_json::to_value(&guardian_config).expect("effective guardian JSON"),
+            serde_json::to_value(&expected_guardian).expect("expected guardian JSON"),
+            "runtime may overlay only max_monitored_positions; all other Guardian fields must survive"
+        );
+        assert_eq!(guardian_config.target_threshold, Some(150.0));
+        assert_eq!(guardian_config.stoploss_threshold, Some(50.0));
+        assert_eq!(guardian_config.wait_for_timestop_ms(), 45_000);
+        let status = config
+            .validate()
+            .expect("valid complete shadow config")
+            .expect("shadow policy status");
+        assert_eq!(status.take_profit_fraction, 1.5);
+        assert_eq!(status.stop_loss_fraction, 0.5);
+        assert_eq!(status.quote_recovery_ms, 6_789);
+    }
+
+    #[test]
+    fn shadow_stoploss_above_full_loss_is_rejected() {
+        let config = PostBuyRuntimeConfig {
+            execution_mode: "shadow".to_string(),
+            shadow_guardian: Some(PostBuyGuardianConfig {
+                target_threshold: Some(50.0),
+                stoploss_threshold: Some(250.0),
+                wait_for_timestop: Some(30_000),
+                aem: ghost_brain::aem::config::AemConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..PostBuyGuardianConfig::default()
+            }),
+            ..PostBuyRuntimeConfig::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn shadow_position_manager_startup_validation_fails_closed() {
+        let guardian = PostBuyGuardianConfig {
+            enabled: true,
+            target_threshold: Some(50.0),
+            stoploss_threshold: Some(50.0),
+            wait_for_timestop: Some(30_000),
+            exit_policy_v1: ghost_brain::guardian::post_buy::ExitPolicyV1Config {
+                quote_recovery_ms: 5_000,
+            },
+            aem: ghost_brain::aem::config::AemConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..PostBuyGuardianConfig::default()
+        };
+        let base = PostBuyRuntimeConfig {
+            execution_mode: "shadow".to_string(),
+            shadow_guardian: Some(guardian),
+            ..PostBuyRuntimeConfig::default()
+        };
+        assert!(base.validate().is_ok());
+
+        let mut missing_guardian = base.clone();
+        missing_guardian.shadow_guardian = None;
+        assert!(missing_guardian.validate().is_err());
+
+        let mut guardian_disabled = base.clone();
+        guardian_disabled
+            .shadow_guardian
+            .as_mut()
+            .expect("guardian")
+            .enabled = false;
+        assert!(guardian_disabled.validate().is_err());
+
+        let mut aem_enabled = base.clone();
+        aem_enabled
+            .shadow_guardian
+            .as_mut()
+            .expect("guardian")
+            .aem
+            .enabled = true;
+        assert!(aem_enabled.validate().is_err());
+
+        let mut missing_take_profit = base.clone();
+        missing_take_profit
+            .shadow_guardian
+            .as_mut()
+            .expect("guardian")
+            .target_threshold = None;
+        assert!(missing_take_profit.validate().is_err());
+
+        let mut invalid_take_profit = base.clone();
+        invalid_take_profit
+            .shadow_guardian
+            .as_mut()
+            .expect("guardian")
+            .target_threshold = Some(f64::NAN);
+        assert!(invalid_take_profit.validate().is_err());
+
+        let mut invalid_stop_loss = base.clone();
+        invalid_stop_loss
+            .shadow_guardian
+            .as_mut()
+            .expect("guardian")
+            .stoploss_threshold = Some(-0.1);
+        assert!(invalid_stop_loss.validate().is_err());
+
+        let mut zero_inactivity = base.clone();
+        zero_inactivity
+            .shadow_guardian
+            .as_mut()
+            .expect("guardian")
+            .wait_for_timestop = Some(0);
+        assert!(zero_inactivity.validate().is_err());
+
+        let mut zero_quote_recovery = base;
+        zero_quote_recovery
+            .shadow_guardian
+            .as_mut()
+            .expect("guardian")
+            .exit_policy_v1
+            .quote_recovery_ms = 0;
+        assert!(zero_quote_recovery.validate().is_err());
     }
 
     #[test]
@@ -7026,6 +7322,15 @@ sys.exit(0)
             "terminal live exit confirmation failure must keep the slot reserved"
         );
 
+        session.transition_terminal(
+            LiveExitStatus::ExitConfirmationUnknown,
+            "confirmation_unknown",
+        );
+        assert!(
+            !session.should_release_position_slot(),
+            "unknown live confirmation must keep the slot reserved"
+        );
+
         session.status = LiveExitStatus::ExitConfirmed;
         assert!(
             session.should_release_position_slot(),
@@ -7047,6 +7352,32 @@ sys.exit(0)
         assert!(!is_retryable_live_exit_failure(
             LiveExitStatus::MonitoringUnavailable
         ));
+        assert!(!is_retryable_live_exit_failure(
+            LiveExitStatus::ExitConfirmationUnknown
+        ));
+    }
+
+    #[test]
+    fn live_confirmation_unknown_preserves_signature_and_visible_quantity() {
+        let mint = Pubkey::new_unique();
+        let mut session = seeded_live_exit_session(mint, 10_000_000, 1_500_000);
+        session.exit_signature = Some("submitted-signature".to_string());
+        session.visible_token_balance = Some(1_234_567);
+
+        session.transition_terminal(
+            LiveExitStatus::ExitConfirmationUnknown,
+            "confirmation remained inconclusive",
+        );
+
+        assert_eq!(session.status, LiveExitStatus::ExitConfirmationUnknown);
+        assert_eq!(
+            session.exit_signature.as_deref(),
+            Some("submitted-signature")
+        );
+        assert_eq!(session.visible_token_balance, Some(1_234_567));
+        assert_eq!(session.sellable_token_amount(), Some(1_234_567));
+        assert!(!session.should_release_position_slot());
+        assert!(!is_retryable_live_exit_failure(session.status));
     }
 
     #[test]
@@ -7648,11 +7979,7 @@ sys.exit(0)
             slippage_tolerance: 0.20,
             live_exit_take_profit_pct: 0.02,
             live_exit_stop_loss_pct: 0.02,
-            shadow_target_threshold: None,
-            shadow_stoploss_threshold: None,
-            shadow_wait_for_timestop: None,
-            shadow_time_stop_v2: None,
-            shadow_exit_replay_v1: None,
+            shadow_guardian: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
@@ -7735,7 +8062,7 @@ sys.exit(0)
         let (event_tx, _event_rx) = create_event_bus_with_capacity(1);
         let event_rx = event_tx.subscribe();
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let (direct_tx, direct_rx) = create_direct_post_buy_handoff_channel();
+        let (direct_tx, direct_rx) = create_direct_post_buy_handoff_channel(1);
 
         let config = PostBuyRuntimeConfig {
             events_output_path: events_dir.clone(),
@@ -7752,11 +8079,7 @@ sys.exit(0)
             slippage_tolerance: 0.20,
             live_exit_take_profit_pct: 0.02,
             live_exit_stop_loss_pct: 0.02,
-            shadow_target_threshold: None,
-            shadow_stoploss_threshold: None,
-            shadow_wait_for_timestop: None,
-            shadow_time_stop_v2: None,
-            shadow_exit_replay_v1: None,
+            shadow_guardian: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
@@ -7806,7 +8129,7 @@ sys.exit(0)
             .send(post_buy.clone())
             .expect("send broadcast handoff");
         direct_tx
-            .send(DirectPostBuyHandoff::without_ack(post_buy))
+            .try_send(DirectPostBuyHandoff::without_ack(post_buy))
             .expect("send direct handoff");
 
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -7850,7 +8173,7 @@ sys.exit(0)
         let (event_tx, _event_rx) = create_event_bus();
         let event_rx = event_tx.subscribe();
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let (direct_tx, direct_rx) = create_direct_post_buy_handoff_channel();
+        let (direct_tx, direct_rx) = create_direct_post_buy_handoff_channel(1);
 
         let config = PostBuyRuntimeConfig {
             events_output_path: events_dir.clone(),
@@ -7867,11 +8190,7 @@ sys.exit(0)
             slippage_tolerance: 0.20,
             live_exit_take_profit_pct: 0.02,
             live_exit_stop_loss_pct: 0.02,
-            shadow_target_threshold: None,
-            shadow_stoploss_threshold: None,
-            shadow_wait_for_timestop: None,
-            shadow_time_stop_v2: None,
-            shadow_exit_replay_v1: None,
+            shadow_guardian: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
@@ -7888,7 +8207,7 @@ sys.exit(0)
         let signature = "direct_handoff_closed_sig";
         let expected_candidate_id = format!("{}_{}_{}", base_mint, pool_amm_id, signature);
         direct_tx
-            .send(DirectPostBuyHandoff::without_ack(
+            .try_send(DirectPostBuyHandoff::without_ack(
                 GhostEvent::post_buy_submitted(
                     pool_amm_id,
                     base_mint,
@@ -8079,21 +8398,37 @@ sys.exit(0)
         ));
 
         let shadow_ledger = Arc::new(ShadowLedger::new());
+        let guardian_config = PostBuyGuardianConfig {
+            enabled: true,
+            tick_interval_ms: 5,
+            target_threshold: Some(50.0),
+            stoploss_threshold: Some(50.0),
+            wait_for_timestop: Some(1),
+            exit_policy_v1: ghost_brain::guardian::post_buy::ExitPolicyV1Config {
+                quote_recovery_ms: 1,
+            },
+            aem: ghost_brain::aem::config::AemConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..PostBuyGuardianConfig::default()
+        };
         let config = PostBuyRuntimeConfig {
             execution_mode: "shadow".to_string(),
             shadow_ledger: Some(Arc::clone(&shadow_ledger)),
+            shadow_guardian: Some(guardian_config.clone()),
             shadow_lifecycle_log_path: Some(shadow_lifecycle_log_path.clone()),
             probe_lifecycle_log_path: Some(probe_lifecycle_log_path.clone()),
             ..PostBuyRuntimeConfig::default()
         };
-        let guardian_config = build_shadow_guardian_config(&config);
         let (shadow_signal_tx, _shadow_signal_rx) =
             mpsc::channel(guardian_config.signal_channel_buffer.max(1));
-        let mut shadow_monitor = MonitoringEngine::new(
+        let mut shadow_monitor = MonitoringEngine::try_new(
             guardian_config.clone(),
             Arc::clone(&shadow_ledger),
             shadow_signal_tx,
-        );
+        )
+        .expect("valid shadow Position Manager config");
         shadow_monitor.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(
             Arc::new(RwLock::new(ShadowPositionBook::new())),
         )));
@@ -8103,11 +8438,20 @@ sys.exit(0)
         let (probe_signal_tx, _probe_signal_rx) =
             mpsc::channel(guardian_config.signal_channel_buffer.max(1));
         let mut probe_monitor =
-            MonitoringEngine::new(guardian_config, Arc::clone(&shadow_ledger), probe_signal_tx);
+            MonitoringEngine::try_new(guardian_config, Arc::clone(&shadow_ledger), probe_signal_tx)
+                .expect("valid probe Position Manager config");
         probe_monitor.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(
             Arc::new(RwLock::new(ShadowPositionBook::new())),
         )));
         probe_monitor.set_shadow_lifecycle_log_path(Some(probe_lifecycle_log_path.clone()));
+        let probe_terminal_harness =
+            init_probe_position_manager_terminal_harness(tmp_dir.path(), "test-probe-terminal-run")
+                .expect("probe terminal harness");
+        let probe_terminal_path = probe_terminal_harness
+            .canonical_event_stream_path()
+            .to_path_buf();
+        probe_monitor
+            .set_shadow_v2_validation_harness(Arc::new(ParkingMutex::new(probe_terminal_harness)));
         let probe_monitor = Arc::new(probe_monitor);
 
         let pool_amm_id = Pubkey::new_unique();
@@ -8166,8 +8510,67 @@ sys.exit(0)
         assert_eq!(probe_monitor.active_position_count(), 1);
         assert!(lifecycle_handles.is_empty());
 
-        probe_monitor.unregister_position(&base_mint);
+        let probe_runtime_handle = Arc::clone(&probe_monitor).start();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if probe_monitor.active_position_count() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("probe Position Manager must commit terminal truth and remove the position");
+        probe_runtime_handle.abort();
+        let _ = probe_runtime_handle.await;
+
         assert_eq!(probe_monitor.active_position_count(), 0);
+        let canonical_probe_rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(&probe_terminal_path)
+                .expect("probe canonical terminal stream")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("canonical probe row"))
+                .collect();
+        let canonical_probe_terminals: Vec<&serde_json::Value> = canonical_probe_rows
+            .iter()
+            .filter(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .collect();
+        assert_eq!(canonical_probe_terminals.len(), 1);
+        let canonical_probe_terminal = canonical_probe_terminals[0];
+        assert_eq!(
+            canonical_probe_terminal["payload"]["record"]["truth_slot"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            canonical_probe_terminal["payload"]["record"]["terminal_observed_slot"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            canonical_probe_terminal["payload"]["record"]["terminal_slot"],
+            serde_json::Value::Null
+        );
+
+        let second_handoff = handle_shadow_post_buy_handoff(
+            Some(&probe_monitor),
+            "probe-lifecycle-handoff-second",
+            &pool_amm_id.to_string(),
+            &base_mint.to_string(),
+            0.007,
+            Some(250_000),
+            Some(778),
+            Some(778),
+            None,
+            2,
+            PositionJoinMetadata {
+                probe_id: Some("probe-lifecycle-handoff-second".to_string()),
+                dispatch_source: Some("counterfactual_shadow_probe".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(second_handoff.ack, DirectPostBuyHandoffAck::Accepted);
+        assert_eq!(probe_monitor.active_position_count(), 1);
+        probe_monitor.remove_position_administratively(&base_mint);
 
         let probe_rows =
             std::fs::read_to_string(&probe_lifecycle_log_path).expect("probe lifecycle row");
@@ -8188,14 +8591,17 @@ sys.exit(0)
             first_row["entry_landed_slot_source"],
             "synthetic_next_slot_after_entry_simulation_rpc_slot"
         );
-        assert_eq!(first_row["exit_sample_slot"], 777);
-        assert_eq!(first_row["exit_market_anchor_slot"], 777);
+        assert_eq!(first_row["exit_sample_slot"], serde_json::Value::Null);
+        assert_eq!(
+            first_row["exit_market_anchor_slot"],
+            serde_json::Value::Null
+        );
         assert!(first_row.get("exit_market_anchor_tx_signature").is_none());
         assert!(first_row["exit_reason_evaluation_ts_ms"].as_u64().is_some());
-        assert_eq!(first_row["exit_landed_slot"], 778);
+        assert_eq!(first_row["exit_landed_slot"], serde_json::Value::Null);
         assert_eq!(
             first_row["exit_landed_slot_source"],
-            "synthetic_next_slot_after_exit_sample"
+            serde_json::Value::Null
         );
         assert_eq!(
             first_row["position_id"],
@@ -8279,49 +8685,11 @@ sys.exit(0)
     }
 
     #[tokio::test]
-    async fn shadow_slot_release_watcher_releases_reserved_position_slot_after_close() {
-        let config = PostBuyRuntimeConfig {
-            execution_mode: "shadow".to_string(),
-            shadow_ledger: Some(Arc::new(ShadowLedger::new())),
-            max_concurrent_positions: 1,
-            ..PostBuyRuntimeConfig::default()
-        };
-        let guardian_config = build_shadow_guardian_config(&config);
-        let (signal_tx, _signal_rx) = mpsc::channel(guardian_config.signal_channel_buffer.max(1));
-        let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
-            RwLock::new(ShadowPositionBook::new()),
-        )));
-        let mut monitoring_engine = MonitoringEngine::new(
-            guardian_config,
-            config
-                .shadow_ledger
-                .clone()
-                .expect("shadow ledger for canonical handoff"),
-            signal_tx,
-        );
-        monitoring_engine.set_position_router(runtime_router);
-        let monitoring_engine = Arc::new(monitoring_engine);
-
+    async fn shadow_terminal_watcher_releases_reserved_slot_after_blocked_outcome() {
         let pool_amm_id = Pubkey::new_unique().to_string();
         let mint_pubkey = Pubkey::new_unique();
         let base_mint = mint_pubkey.to_string();
         let candidate_id = format!("{}_{}_{}", base_mint, pool_amm_id, 1234);
-        let handoff = handle_shadow_post_buy_handoff(
-            Some(&monitoring_engine),
-            &candidate_id,
-            &pool_amm_id,
-            &base_mint,
-            0.25,
-            Some(250_000),
-            Some(777),
-            Some(777),
-            None,
-            9,
-            PositionJoinMetadata::default(),
-        )
-        .await;
-        assert_eq!(handoff.ack, DirectPostBuyHandoffAck::Accepted);
-
         let tracker = PositionLimitTracker::new(1);
         let slot_owner = Pubkey::new_unique();
         let slot_id = PositionSlotId::derive(&slot_owner, &mint_pubkey);
@@ -8330,26 +8698,62 @@ sys.exit(0)
             .expect("slot must register");
         assert_eq!(tracker.active_positions(), 1);
 
-        let watcher = spawn_shadow_slot_release_watcher(
-            Arc::clone(&monitoring_engine),
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let watcher =
+            spawn_shadow_terminal_watcher(terminal_rx, tracker.clone(), slot_id, candidate_id);
+        terminal_tx
+            .send(ShadowTerminalDisposition::SimulationBlocked {
+                action_id: "shadow-action:1".to_string(),
+                reason: ShadowUnresolvedReason::BlockedByData,
+            })
+            .expect("terminal receiver must remain active");
+        watcher.await.expect("watcher should finish");
+        assert_eq!(tracker.active_positions(), 0);
+    }
+
+    #[tokio::test]
+    async fn shadow_terminal_watcher_releases_reserved_slot_after_resolved_close() {
+        let mint = Pubkey::new_unique();
+        let tracker = PositionLimitTracker::new(1);
+        let slot_id = PositionSlotId::derive(&Pubkey::new_unique(), &mint);
+        tracker
+            .register_existing(slot_id, Pubkey::new_unique().to_string(), mint.to_string())
+            .expect("slot must register");
+
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let watcher = spawn_shadow_terminal_watcher(
+            terminal_rx,
             tracker.clone(),
             slot_id,
-            mint_pubkey,
-            candidate_id,
-            10,
+            "candidate-shadow-closed".to_string(),
         );
+        terminal_tx
+            .send(ShadowTerminalDisposition::SimulatedClosed {
+                action_id: "shadow-action:closed".to_string(),
+                reason: "target".to_string(),
+            })
+            .expect("terminal receiver must remain active");
+        watcher.await.expect("watcher should finish");
+        assert_eq!(tracker.active_positions(), 0);
+    }
 
-        monitoring_engine.unregister_position(&mint_pubkey);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if tracker.active_positions() == 0 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("watcher should release slot after close");
+    #[tokio::test]
+    async fn shadow_terminal_watcher_releases_reserved_slot_when_channel_is_dropped() {
+        let mint = Pubkey::new_unique();
+        let tracker = PositionLimitTracker::new(1);
+        let slot_id = PositionSlotId::derive(&Pubkey::new_unique(), &mint);
+        tracker
+            .register_existing(slot_id, Pubkey::new_unique().to_string(), mint.to_string())
+            .expect("slot must register");
+
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let watcher = spawn_shadow_terminal_watcher(
+            terminal_rx,
+            tracker.clone(),
+            slot_id,
+            "candidate-shadow-dropped".to_string(),
+        );
+        drop(terminal_tx);
         watcher.await.expect("watcher should finish");
         assert_eq!(tracker.active_positions(), 0);
     }
