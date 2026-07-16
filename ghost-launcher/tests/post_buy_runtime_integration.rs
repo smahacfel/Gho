@@ -26,7 +26,7 @@ fn read_events_from_dir(dir: &std::path::Path) -> Vec<serde_json::Value> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "jsonl") {
+            if path.extension().is_some_and(|e| e == "jsonl") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     for line in content.lines() {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
@@ -76,6 +76,7 @@ async fn test_post_buy_runtime_paper_lifecycle() {
         tick_interval_ms: 50,     // Fast ticks for test
         max_ticks_before_exit: 5, // Quick exit for test
         execution_mode: "paper".to_string(),
+        entry_mode: "dry_run_mock".to_string(),
         aem_t_s: 1, // Short horizon for deterministic ManagementDecision
         max_concurrent_positions: 1,
         position_limit_tracker: None,
@@ -297,6 +298,7 @@ async fn test_post_buy_runtime_no_event_loss_with_early_subscribe() {
         tick_interval_ms: 50,
         max_ticks_before_exit: 3,
         execution_mode: "paper".to_string(),
+        entry_mode: "dry_run_mock".to_string(),
         aem_t_s: 1, // Short horizon for deterministic ManagementDecision
         max_concurrent_positions: 2,
         position_limit_tracker: None,
@@ -427,6 +429,7 @@ async fn test_live_lane_routes_to_sender_not_paper_lifecycle() {
         tick_interval_ms: 10,
         max_ticks_before_exit: 2,
         execution_mode: "live".to_string(),
+        entry_mode: "live".to_string(),
         aem_t_s: 1,
         max_concurrent_positions: 1,
         position_limit_tracker: Some(tracker.clone()),
@@ -542,6 +545,7 @@ async fn test_live_lane_without_handle_fails_closed_instead_of_paper_fallback() 
         tick_interval_ms: 10,
         max_ticks_before_exit: 2,
         execution_mode: "live".to_string(),
+        entry_mode: "live".to_string(),
         aem_t_s: 1,
         max_concurrent_positions: 1,
         position_limit_tracker: Some(tracker.clone()),

@@ -1,7 +1,7 @@
 # Ghost Brain Unified Configuration - PREDATOR v11 (Data-Driven A/B Calibration)
 # Strategy: "Aggressive Precision" — maximise A-pool capture, eliminate B-pool ściek
 # Kalibracja: 700-pool A vs B percentile analysis (2026-02-22)
-# Kluczowe zmiany: ilościowe progi GK v2, HHI/top3 sito, reject_on_dev_sell=false, mcap=48
+# Kluczowe zmiany: ilościowe progi GK v2, HHI/top3 sito, reject_on_dev_sell=false, mcap=115
 version = 11
 
 [engine]
@@ -1227,6 +1227,18 @@ max_signals_per_position = 200
 # this bounded window after an exit condition becomes sticky.
 [post_buy_guardian.exit_policy_v1]
 quote_recovery_ms = 5000
+
+# Position Manager Lite V1 PR2: absolute age is independent of market
+# activity, while CrashGuard remains strictly counterfactual in this profile.
+absolute_max_hold_enabled = true
+absolute_max_hold_ms = 120000
+crash_guard_mode = "observe_only"
+crash_window_ms = 1500
+crash_min_short_window_drop_pct = 25.0
+crash_min_peak_drawdown_pct = 30.0
+crash_min_distinct_slots = 2
+crash_max_sample_age_ms = 1500
+crash_max_executable_return_pct = -20.0
 
 # TimeStop V2 vitality telemetry.
 # Disabled by default. Observe-only mode emits counterfactual lifecycle rows and
