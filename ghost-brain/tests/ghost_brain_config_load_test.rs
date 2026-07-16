@@ -49,11 +49,15 @@ fn post_buy_guardian_lifecycle_thresholds_load_from_production_toml() {
     assert_eq!(het.vitality_required_non_alive_windows, 3);
     assert_eq!(het.vitality_min_time_since_peak_ms, 5_000);
     assert_eq!(het.vitality_recovery_return_bps, 300);
+    assert_eq!(het.writer_queue_capacity, 256);
+    assert_eq!(het.terminal_write_budget_ms, 25);
     let status = validate_het_pm_v2_config(&config.post_buy_guardian)
         .expect("production HET-PM V2 config should validate");
     assert!(status.v1_shadow_authority);
     assert!(!status.v2_shadow_authority);
     assert!(!status.live_authority);
+    assert_eq!(status.writer_queue_capacity, 256);
+    assert_eq!(status.terminal_write_budget_ms, 25);
     assert_eq!(status.crash_guard_mode, CrashGuardMode::ObserveOnly);
     assert!(!config.post_buy_guardian.aem.enabled);
 }

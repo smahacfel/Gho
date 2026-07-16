@@ -13,7 +13,12 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{
+    sync_channel, Receiver as StdReceiver, SyncSender, TrySendError as StdTrySendError,
+};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
@@ -68,9 +73,9 @@ use super::exit_policy_v1::{
 use super::exit_policy_v1::{EXIT_POLICY_V1_ID, EXIT_POLICY_V1_VERSION};
 use super::exit_policy_v2::{
     build_entry_value_contract, materialize_anchor, prequote_label, EffectiveHetPmV2Config,
-    ExecutablePeakAnchorV1, ExecutableQuoteKeyV2, ExitPolicyV2, HetPmCandidateV2,
-    HetPmFinalDecisionV2, HetPmQuoteFinalizationInputV2, HetPmV2ConfigError, HetPmV2Status,
-    PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2, PostBuySnapshotBundle,
+    ExecutablePeakAnchorV1, ExecutableQuoteKeyV2, ExitPolicyV2, HetComparisonCorrelationV1,
+    HetPmCandidateV2, HetPmFinalDecisionV2, HetPmQuoteFinalizationInputV2, HetPmV2ConfigError,
+    HetPmV2Status, PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2, PostBuySnapshotBundle,
     PreparedHetComparisonV1, PreparedV1V2ComparisonCoreV1, RouteStatusV1,
     TerminalV2ComparisonSkipReasonV1, TimeStopV2ProjectionV1, TimeStopV2Subreason,
     TimeStopV2WindowStatus, V1AuthorityTickOutcomeV1, V1AuthorityTickReceiptV1,
@@ -793,6 +798,187 @@ struct PendingTerminalCommit {
     lifecycle_jsonl_committed: bool,
     prepared_het_comparison: Option<PreparedHetComparisonV1>,
     het_comparison_write_status: HetComparisonWriteStatusV1,
+}
+
+struct HetPmV2ObservationWriteJobV1 {
+    correlation: HetComparisonCorrelationV1,
+    encoded: Vec<u8>,
+    acknowledgement: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+#[derive(Debug, Default)]
+struct HetPmV2ObservationWriterStatsV1 {
+    enqueue_attempts: AtomicU64,
+    enqueued: AtomicU64,
+    queue_full_drops: AtomicU64,
+    queue_closed_drops: AtomicU64,
+    writes_succeeded: AtomicU64,
+    writes_failed: AtomicU64,
+    cancelled_before_write: AtomicU64,
+    terminal_timeouts: AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HetPmV2ObservationWriterStatsSnapshotV1 {
+    enqueue_attempts: u64,
+    enqueued: u64,
+    queue_full_drops: u64,
+    queue_closed_drops: u64,
+    writes_succeeded: u64,
+    writes_failed: u64,
+    cancelled_before_write: u64,
+    terminal_timeouts: u64,
+}
+
+enum HetPmV2ObservationEnqueueErrorV1 {
+    Full,
+    Closed,
+}
+
+struct HetPmV2ObservationWriterV1 {
+    sender: Option<SyncSender<HetPmV2ObservationWriteJobV1>>,
+    worker: Option<JoinHandle<()>>,
+    stats: Arc<HetPmV2ObservationWriterStatsV1>,
+    #[cfg(test)]
+    stalled_receiver: Option<parking_lot::Mutex<StdReceiver<HetPmV2ObservationWriteJobV1>>>,
+}
+
+impl HetPmV2ObservationWriterV1 {
+    fn spawn(path: PathBuf, queue_capacity: usize) -> std::io::Result<Self> {
+        let (sender, receiver) = sync_channel(queue_capacity);
+        let stats = Arc::new(HetPmV2ObservationWriterStatsV1::default());
+        let worker_stats = Arc::clone(&stats);
+        let worker = std::thread::Builder::new()
+            .name("het-pm-v2-sidecar".to_string())
+            .spawn(move || Self::run(path, receiver, worker_stats))?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            stats,
+            #[cfg(test)]
+            stalled_receiver: None,
+        })
+    }
+
+    fn run(
+        path: PathBuf,
+        receiver: StdReceiver<HetPmV2ObservationWriteJobV1>,
+        stats: Arc<HetPmV2ObservationWriterStatsV1>,
+    ) {
+        while let Ok(job) = receiver.recv() {
+            if job
+                .acknowledgement
+                .as_ref()
+                .is_some_and(oneshot::Sender::is_closed)
+            {
+                stats.cancelled_before_write.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let result = MonitoringEngine::append_prepared_jsonl_bytes(&path, &job.encoded)
+                .map_err(|error| error.to_string());
+            match &result {
+                Ok(()) => {
+                    stats.writes_succeeded.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    stats.writes_failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        path = %path.display(),
+                        comparison_id = %job.correlation.comparison_id,
+                        source_snapshot_id = %job.correlation.source_snapshot_id,
+                        error,
+                        reason = TerminalV2ComparisonSkipReasonV1::WriterIoFailed.as_label(),
+                        "PostBuyGuardian: asynchronous HET-PM V2 sidecar write failed; V1 remains unaffected"
+                    );
+                }
+            }
+            if let Some(acknowledgement) = job.acknowledgement {
+                let _ = acknowledgement.send(result);
+            }
+        }
+    }
+
+    fn try_enqueue(
+        &self,
+        correlation: HetComparisonCorrelationV1,
+        encoded: Vec<u8>,
+        acknowledgement: Option<oneshot::Sender<Result<(), String>>>,
+    ) -> Result<(), HetPmV2ObservationEnqueueErrorV1> {
+        self.stats.enqueue_attempts.fetch_add(1, Ordering::Relaxed);
+        let Some(sender) = self.sender.as_ref() else {
+            self.stats
+                .queue_closed_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(HetPmV2ObservationEnqueueErrorV1::Closed);
+        };
+        let job = HetPmV2ObservationWriteJobV1 {
+            correlation,
+            encoded,
+            acknowledgement,
+        };
+        match sender.try_send(job) {
+            Ok(()) => {
+                self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(StdTrySendError::Full(_)) => {
+                self.stats.queue_full_drops.fetch_add(1, Ordering::Relaxed);
+                Err(HetPmV2ObservationEnqueueErrorV1::Full)
+            }
+            Err(StdTrySendError::Disconnected(_)) => {
+                self.stats
+                    .queue_closed_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(HetPmV2ObservationEnqueueErrorV1::Closed)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn stalled(queue_capacity: usize) -> Self {
+        let (sender, receiver) = sync_channel(queue_capacity);
+        Self {
+            sender: Some(sender),
+            worker: None,
+            stats: Arc::new(HetPmV2ObservationWriterStatsV1::default()),
+            stalled_receiver: Some(parking_lot::Mutex::new(receiver)),
+        }
+    }
+
+    #[cfg(test)]
+    fn stats_snapshot(&self) -> HetPmV2ObservationWriterStatsSnapshotV1 {
+        HetPmV2ObservationWriterStatsSnapshotV1 {
+            enqueue_attempts: self.stats.enqueue_attempts.load(Ordering::Relaxed),
+            enqueued: self.stats.enqueued.load(Ordering::Relaxed),
+            queue_full_drops: self.stats.queue_full_drops.load(Ordering::Relaxed),
+            queue_closed_drops: self.stats.queue_closed_drops.load(Ordering::Relaxed),
+            writes_succeeded: self.stats.writes_succeeded.load(Ordering::Relaxed),
+            writes_failed: self.stats.writes_failed.load(Ordering::Relaxed),
+            cancelled_before_write: self.stats.cancelled_before_write.load(Ordering::Relaxed),
+            terminal_timeouts: self.stats.terminal_timeouts.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for HetPmV2ObservationWriterV1 {
+    fn drop(&mut self) {
+        self.sender.take();
+        #[cfg(test)]
+        self.stalled_receiver.take();
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        if worker.is_finished() {
+            if worker.join().is_err() {
+                warn!("PostBuyGuardian: HET-PM V2 sidecar worker panicked during shutdown");
+            }
+        } else {
+            debug!(
+                "PostBuyGuardian: HET-PM V2 sidecar worker detached on bounded shutdown; lifecycle remains fail-open"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1713,9 +1899,12 @@ pub struct MonitoringEngine {
     shadow_lifecycle_log_path: Option<PathBuf>,
     /// Compact research-only exit replay sidecar log.
     shadow_exit_replay_log_path: Option<PathBuf>,
-    /// Optional observe-only HET V2 comparison sidecar. It is never part of
-    /// the canonical terminal commit receipt.
-    het_pm_v2_observation_log_path: Option<PathBuf>,
+    /// Single bounded observe-only HET V2 comparison writer. Filesystem I/O
+    /// runs outside the Tokio authority task and never owns terminal truth.
+    het_pm_v2_observation_writer: Option<HetPmV2ObservationWriterV1>,
+    /// Preserves a typed startup failure when the optional writer thread could
+    /// not be created. V1 remains active and HET rows degrade to `Skipped`.
+    het_pm_v2_observation_writer_start_error: Option<String>,
     /// Optional Shadow V2 validation harness. Logging-only evidence sink; never consumed by policy.
     shadow_v2_validation_harness: Option<Arc<Mutex<ShadowV2ValidationHarness>>>,
     /// Passive replay trackers keyed by mint; independent from active position lifecycle.
@@ -1779,7 +1968,8 @@ impl MonitoringEngine {
             event_emitter_secondary: None,
             shadow_lifecycle_log_path: None,
             shadow_exit_replay_log_path: None,
-            het_pm_v2_observation_log_path: None,
+            het_pm_v2_observation_writer: None,
+            het_pm_v2_observation_writer_start_error: None,
             shadow_v2_validation_harness: None,
             exit_replay_trackers: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -1890,16 +2080,63 @@ impl MonitoringEngine {
     }
 
     pub fn set_shadow_lifecycle_log_path(&mut self, shadow_lifecycle_log_path: Option<PathBuf>) {
-        self.het_pm_v2_observation_log_path = shadow_lifecycle_log_path.as_ref().map(|path| {
+        let het_pm_v2_observation_log_path = shadow_lifecycle_log_path.as_ref().map(|path| {
             path.parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join("het_pm_v2_observations_v1.jsonl")
         });
+        self.set_het_pm_v2_observation_log_path(het_pm_v2_observation_log_path);
+        self.shadow_lifecycle_log_path = shadow_lifecycle_log_path;
+    }
+
+    /// Configure the probe lifecycle sink without constructing a second HET
+    /// sidecar worker. The primary shadow monitor remains the sole producer.
+    pub fn set_shadow_lifecycle_log_path_without_het_pm_v2_sidecar(
+        &mut self,
+        shadow_lifecycle_log_path: Option<PathBuf>,
+    ) {
+        self.set_het_pm_v2_observation_log_path(None);
         self.shadow_lifecycle_log_path = shadow_lifecycle_log_path;
     }
 
     pub fn set_het_pm_v2_observation_log_path(&mut self, path: Option<PathBuf>) {
-        self.het_pm_v2_observation_log_path = path;
+        self.het_pm_v2_observation_writer = None;
+        self.het_pm_v2_observation_writer_start_error = None;
+        let Some(path) = path else {
+            return;
+        };
+        let Some(policy) = self.het_pm_v2.as_ref().filter(|policy| policy.enabled()) else {
+            return;
+        };
+        match HetPmV2ObservationWriterV1::spawn(path.clone(), policy.writer_queue_capacity()) {
+            Ok(writer) => {
+                self.het_pm_v2_observation_writer = Some(writer);
+            }
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "PostBuyGuardian: HET-PM V2 sidecar worker could not start; V1 remains active"
+                );
+                self.het_pm_v2_observation_writer_start_error = Some(error.to_string());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_stalled_het_pm_v2_observation_writer(&mut self, queue_capacity: usize) {
+        self.het_pm_v2_observation_writer =
+            Some(HetPmV2ObservationWriterV1::stalled(queue_capacity));
+        self.het_pm_v2_observation_writer_start_error = None;
+    }
+
+    #[cfg(test)]
+    fn het_pm_v2_observation_writer_stats(
+        &self,
+    ) -> Option<HetPmV2ObservationWriterStatsSnapshotV1> {
+        self.het_pm_v2_observation_writer
+            .as_ref()
+            .map(HetPmV2ObservationWriterV1::stats_snapshot)
     }
 
     pub fn set_shadow_exit_replay_log_path(
@@ -2950,10 +3187,11 @@ impl MonitoringEngine {
         file.flush()
     }
 
-    fn persist_prepared_het_pm_v2_comparison(
+    fn enqueue_prepared_het_pm_v2_comparison(
         &self,
         prepared: &PreparedHetComparisonV1,
-    ) -> HetComparisonWriteStatusV1 {
+        acknowledgement: Option<oneshot::Sender<Result<(), String>>>,
+    ) -> Result<(), HetComparisonWriteStatusV1> {
         let correlation = prepared.correlation();
         let encoded = match prepared {
             PreparedHetComparisonV1::Ready { encoded, .. } => encoded,
@@ -2965,36 +3203,119 @@ impl MonitoringEngine {
                     detail,
                     "PostBuyGuardian: HET-PM V2 comparison locally degraded to typed Skipped"
                 );
-                return HetComparisonWriteStatusV1::Skipped {
+                return Err(HetComparisonWriteStatusV1::Skipped {
                     reason: *reason,
                     detail: detail.clone(),
-                };
+                });
             }
         };
-        let Some(path) = self.het_pm_v2_observation_log_path.as_ref() else {
+        let Some(writer) = self.het_pm_v2_observation_writer.as_ref() else {
+            let (reason, detail) = self
+                .het_pm_v2_observation_writer_start_error
+                .as_ref()
+                .map(|detail| {
+                    (
+                        TerminalV2ComparisonSkipReasonV1::WriterUnavailable,
+                        detail.clone(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        TerminalV2ComparisonSkipReasonV1::WriterNotConfigured,
+                        "het_pm_v2_observation_writer_missing".to_string(),
+                    )
+                });
             debug!(
                 comparison_id = %correlation.comparison_id,
                 source_snapshot_id = %correlation.source_snapshot_id,
-                "PostBuyGuardian: HET-PM V2 sidecar not configured; V1 remains unaffected"
+                reason = reason.as_label(),
+                "PostBuyGuardian: HET-PM V2 sidecar unavailable; V1 remains unaffected"
             );
-            return HetComparisonWriteStatusV1::Skipped {
-                reason: TerminalV2ComparisonSkipReasonV1::WriterNotConfigured,
-                detail: "het_pm_v2_observation_log_path_missing".to_string(),
-            };
+            return Err(HetComparisonWriteStatusV1::Skipped { reason, detail });
         };
-        match Self::append_prepared_jsonl_bytes(path, encoded) {
-            Ok(()) => HetComparisonWriteStatusV1::Written,
-            Err(error) => {
+        match writer.try_enqueue(correlation.clone(), encoded.clone(), acknowledgement) {
+            Ok(()) => Ok(()),
+            Err(HetPmV2ObservationEnqueueErrorV1::Full) => {
                 warn!(
-                    path = %path.display(),
                     comparison_id = %correlation.comparison_id,
                     source_snapshot_id = %correlation.source_snapshot_id,
-                    error = %error,
-                    "PostBuyGuardian: HET-PM V2 sidecar write failed; V1 lifecycle remains fail-open"
+                    reason = TerminalV2ComparisonSkipReasonV1::WriterQueueFull.as_label(),
+                    "PostBuyGuardian: bounded HET-PM V2 sidecar queue is full; observer row dropped"
+                );
+                Err(HetComparisonWriteStatusV1::Skipped {
+                    reason: TerminalV2ComparisonSkipReasonV1::WriterQueueFull,
+                    detail: "het_pm_v2_observation_writer_queue_full".to_string(),
+                })
+            }
+            Err(HetPmV2ObservationEnqueueErrorV1::Closed) => {
+                warn!(
+                    comparison_id = %correlation.comparison_id,
+                    source_snapshot_id = %correlation.source_snapshot_id,
+                    reason = TerminalV2ComparisonSkipReasonV1::WriterQueueClosed.as_label(),
+                    "PostBuyGuardian: HET-PM V2 sidecar queue is closed; observer row dropped"
+                );
+                Err(HetComparisonWriteStatusV1::Skipped {
+                    reason: TerminalV2ComparisonSkipReasonV1::WriterQueueClosed,
+                    detail: "het_pm_v2_observation_writer_queue_closed".to_string(),
+                })
+            }
+        }
+    }
+
+    fn enqueue_nonterminal_het_pm_v2_comparison(&self, prepared: &PreparedHetComparisonV1) {
+        if let Err(status) = self.enqueue_prepared_het_pm_v2_comparison(prepared, None) {
+            debug!(
+                comparison_id = %prepared.correlation().comparison_id,
+                source_snapshot_id = %prepared.correlation().source_snapshot_id,
+                write_status = status.as_label(),
+                skip_reason = status.skip_reason().map(TerminalV2ComparisonSkipReasonV1::as_label),
+                "PostBuyGuardian: nonterminal HET-PM V2 observation dropped without delaying V1"
+            );
+        }
+    }
+
+    async fn persist_terminal_het_pm_v2_comparison(
+        &self,
+        prepared: &PreparedHetComparisonV1,
+    ) -> HetComparisonWriteStatusV1 {
+        let (acknowledgement, receiver) = oneshot::channel();
+        if let Err(status) =
+            self.enqueue_prepared_het_pm_v2_comparison(prepared, Some(acknowledgement))
+        {
+            return status;
+        }
+        let budget_ms = self
+            .het_pm_v2
+            .as_ref()
+            .map(EffectiveHetPmV2Config::terminal_write_budget_ms)
+            .unwrap_or(1);
+        match tokio::time::timeout(Duration::from_millis(budget_ms), receiver).await {
+            Ok(Ok(Ok(()))) => HetComparisonWriteStatusV1::Written,
+            Ok(Ok(Err(detail))) => HetComparisonWriteStatusV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::WriterIoFailed,
+                detail,
+            },
+            Ok(Err(error)) => HetComparisonWriteStatusV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::WriterQueueClosed,
+                detail: error.to_string(),
+            },
+            Err(_) => {
+                if let Some(writer) = self.het_pm_v2_observation_writer.as_ref() {
+                    writer
+                        .stats
+                        .terminal_timeouts
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                warn!(
+                    comparison_id = %prepared.correlation().comparison_id,
+                    source_snapshot_id = %prepared.correlation().source_snapshot_id,
+                    budget_ms,
+                    reason = TerminalV2ComparisonSkipReasonV1::WriterTimedOut.as_label(),
+                    "PostBuyGuardian: terminal HET-PM V2 sidecar acknowledgement timed out; canonical V1 commit continues"
                 );
                 HetComparisonWriteStatusV1::Skipped {
-                    reason: TerminalV2ComparisonSkipReasonV1::WriterIoFailed,
-                    detail: error.to_string(),
+                    reason: TerminalV2ComparisonSkipReasonV1::WriterTimedOut,
+                    detail: format!("terminal_het_write_budget_exhausted:{budget_ms}ms"),
                 }
             }
         }
@@ -6719,7 +7040,9 @@ impl MonitoringEngine {
             {
                 Ok(()) => {}
                 Err(unattached) => {
-                    let status = self.persist_prepared_het_pm_v2_comparison(&unattached);
+                    let status = self
+                        .persist_terminal_het_pm_v2_comparison(&unattached)
+                        .await;
                     error!(
                         base_mint = %base_mint,
                         comparison_id = %unattached.correlation().comparison_id,
@@ -6730,7 +7053,7 @@ impl MonitoringEngine {
             }
             self.retry_pending_terminal_commit(base_mint, now_ms).await;
         } else {
-            let _ = self.persist_prepared_het_pm_v2_comparison(&prepared_comparison);
+            self.enqueue_nonterminal_het_pm_v2_comparison(&prepared_comparison);
         }
     }
 
@@ -7524,7 +7847,7 @@ impl MonitoringEngine {
             HetComparisonWriteStatusV1::NotAttempted
         ) {
             if let Some(prepared) = pending.prepared_het_comparison.as_ref() {
-                let write_status = self.persist_prepared_het_pm_v2_comparison(prepared);
+                let write_status = self.persist_terminal_het_pm_v2_comparison(prepared).await;
                 let mut positions = self.positions.write();
                 let Some(pos) = positions.get_mut(base_mint) else {
                     return;
@@ -8324,6 +8647,20 @@ mod tests {
             .collect()
     }
 
+    async fn wait_for_jsonl_rows(path: &Path, minimum_rows: usize) -> Vec<Value> {
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let rows = read_jsonl_rows(path);
+                if rows.len() >= minimum_rows {
+                    return rows;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("bounded wait for asynchronous HET sidecar writer")
+    }
+
     fn terminal_het_source_ref<'a>(terminal: &'a Value, field: &str) -> Option<&'a str> {
         let prefix = format!("het_pm_v2:{field}:");
         terminal["payload"]["record"]["envelope"]["source_refs"]
@@ -8430,9 +8767,23 @@ mod tests {
         fail_canonical_terminal: bool,
         fail_sidecar: bool,
     ) -> HetTerminalTestContext {
+        setup_het_terminal_exit_with_writer(tmp, fail_canonical_terminal, fail_sidecar, None)
+    }
+
+    fn setup_het_terminal_exit_with_writer(
+        tmp: &TempDir,
+        fail_canonical_terminal: bool,
+        fail_sidecar: bool,
+        stalled_writer_capacity: Option<usize>,
+    ) -> HetTerminalTestContext {
         let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
         config.het_pm_v2.enabled = true;
         config.time_stop_v2.enabled = true;
+        config.het_pm_v2.terminal_write_budget_ms = if stalled_writer_capacity.is_some() {
+            10
+        } else {
+            100
+        };
         let (tx, _rx) = mpsc::channel(4);
         let mut engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
             .expect("valid HET terminal test config");
@@ -8441,7 +8792,9 @@ mod tests {
         let canonical_path = tmp.path().join("shadow_position_event_v2.jsonl");
         enable_terminal_truth_harness(&mut engine, tmp.path());
         engine.set_shadow_lifecycle_log_path(Some(lifecycle_path.clone()));
-        engine.set_het_pm_v2_observation_log_path(Some(sidecar_path.clone()));
+        if let Some(capacity) = stalled_writer_capacity {
+            engine.set_stalled_het_pm_v2_observation_writer(capacity);
+        }
         if fail_canonical_terminal {
             std::fs::create_dir(&canonical_path).expect("canonical writer fault directory");
         }
@@ -13190,6 +13543,204 @@ mod tests {
         );
     }
 
+    fn setup_stalled_nonterminal_het_engine(
+        queue_capacity: usize,
+    ) -> (Arc<MonitoringEngine>, Pubkey) {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        config.het_pm_v2.writer_queue_capacity = queue_capacity;
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid HET-PM stalled-writer config");
+        engine.set_stalled_het_pm_v2_observation_writer(queue_capacity);
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000),
+                Some(1_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("het-stalled-nonterminal-writer".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "het-stalled-nonterminal-writer".to_string(),
+                    entry_order_id: "het-stalled-nonterminal-writer-entry".to_string(),
+                    quote_id: "het-stalled-nonterminal-writer-quote".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:het-stalled-nonterminal-writer".to_string()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("valid shadow registration");
+        (Arc::new(engine), mint)
+    }
+
+    #[tokio::test]
+    async fn slow_nonterminal_het_writer_does_not_delay_next_v1_tick() {
+        let (engine, mint) = setup_stalled_nonterminal_het_engine(1);
+        engine.run_shadow_runtime_tick(&mint, None, 1_500).await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            engine.run_shadow_runtime_tick(&mint, None, 1_600),
+        )
+        .await
+        .expect("full observer queue must not delay the next V1 tick");
+
+        let stats = engine
+            .het_pm_v2_observation_writer_stats()
+            .expect("stalled writer stats");
+        assert_eq!(stats.enqueue_attempts, 2);
+        assert_eq!(stats.enqueued, 1);
+        assert_eq!(stats.queue_full_drops, 1);
+    }
+
+    #[tokio::test]
+    async fn full_het_writer_queue_does_not_block_v1_evaluation() {
+        let (engine, mint) = setup_stalled_nonterminal_het_engine(1);
+        engine.run_shadow_runtime_tick(&mint, None, 1_500).await;
+        engine.run_shadow_runtime_tick(&mint, None, 1_600).await;
+
+        let stats = engine
+            .het_pm_v2_observation_writer_stats()
+            .expect("stalled writer stats");
+        assert_eq!(stats.enqueue_attempts, 2);
+        assert_eq!(stats.queue_full_drops, 1);
+        assert!(
+            engine.positions.read().contains_key(&mint),
+            "observer backpressure must not mutate or remove the V1 position"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_writer_cannot_trigger_missed_authority_tick() {
+        let (engine, mint) = setup_stalled_nonterminal_het_engine(1);
+        tokio::time::timeout(Duration::from_millis(150), async {
+            let mut interval = tokio::time::interval(Duration::from_millis(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            for offset in 0..5 {
+                interval.tick().await;
+                engine
+                    .run_shadow_runtime_tick(&mint, None, 1_500 + offset)
+                    .await;
+            }
+        })
+        .await
+        .expect("stalled sidecar must not overrun the authority cadence");
+
+        let stats = engine
+            .het_pm_v2_observation_writer_stats()
+            .expect("stalled writer stats");
+        assert_eq!(stats.enqueue_attempts, 5);
+        assert_eq!(stats.enqueued, 1);
+        assert_eq!(stats.queue_full_drops, 4);
+    }
+
+    #[tokio::test]
+    async fn terminal_het_writer_timeout_marks_skipped_and_continues_canonical_commit() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut context = setup_het_terminal_exit_with_writer(&tmp, false, false, Some(1));
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        assert_eq!(context.engine.active_position_count(), 0);
+        assert!(!context.engine.has_pending_terminal_commit(&context.mint));
+        assert!(matches!(
+            context.terminal_rx.try_recv(),
+            Ok(ShadowTerminalDisposition::SimulatedClosed { .. })
+        ));
+        let closed = read_jsonl_rows(&context.lifecycle_path)
+            .into_iter()
+            .find(|row| row["record_type"] == "position_closed")
+            .expect("operational terminal record");
+        assert_eq!(closed["het_pm_v2_comparison_write_status"], "skipped");
+        assert_eq!(
+            closed["het_pm_v2_comparison_skip_reason"],
+            "writer_timed_out"
+        );
+        assert!(read_jsonl_rows(&context.canonical_path)
+            .iter()
+            .any(|row| row["event_kind"] == "TERMINAL_TRUTH"));
+    }
+
+    #[tokio::test]
+    async fn terminal_het_writer_timeout_does_not_delay_capacity_beyond_configured_budget() {
+        let tmp = TempDir::new().expect("tempdir");
+        let context = setup_het_terminal_exit_with_writer(&tmp, false, false, Some(1));
+        let started = Instant::now();
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            context.engine.run_shadow_runtime_tick(
+                &context.mint,
+                Some(&context.snapshot),
+                context.tick_ms,
+            ),
+        )
+        .await
+        .expect("terminal must finish within the 10ms HET budget plus test tolerance");
+
+        assert!(
+            started.elapsed() <= Duration::from_millis(250),
+            "capacity release exceeded the configured writer budget plus tolerance"
+        );
+        assert_eq!(context.engine.active_position_count(), 0);
+        let stats = context
+            .engine
+            .het_pm_v2_observation_writer_stats()
+            .expect("stalled writer stats");
+        assert_eq!(stats.terminal_timeouts, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_writer_timeout_preserves_comparison_id_and_typed_skip_reason() {
+        let tmp = TempDir::new().expect("tempdir");
+        let context = setup_het_terminal_exit_with_writer(&tmp, false, false, Some(1));
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        let closed = read_jsonl_rows(&context.lifecycle_path)
+            .into_iter()
+            .find(|row| row["record_type"] == "position_closed")
+            .expect("operational terminal record");
+        let comparison_id = closed["het_pm_v2_comparison_id"]
+            .as_str()
+            .expect("comparison correlation ID");
+        assert!(!comparison_id.is_empty());
+        assert_eq!(
+            closed["het_pm_v2_comparison_skip_reason"],
+            "writer_timed_out"
+        );
+        let terminal = read_jsonl_rows(&context.canonical_path)
+            .into_iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("canonical terminal truth");
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_id"),
+            Some(comparison_id)
+        );
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_write_status"),
+            Some("skipped")
+        );
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_skip_reason"),
+            Some("writer_timed_out")
+        );
+    }
+
     #[tokio::test]
     async fn actual_v1_receipt_and_v2_record_share_exact_snapshot_id_revision_quantity() {
         let tmp = TempDir::new().expect("tempdir");
@@ -13241,7 +13792,7 @@ mod tests {
 
         engine.run_shadow_runtime_tick(&mint, None, 1_500).await;
 
-        let rows = read_jsonl_rows(&sidecar_path);
+        let rows = wait_for_jsonl_rows(&sidecar_path, 1).await;
         assert_eq!(rows.len(), 1, "one comparison row per HET tick");
         let row = &rows[0];
         let receipt = row["v1_authority_receipt"]
@@ -13316,7 +13867,7 @@ mod tests {
             .run_shadow_runtime_tick(&mint, Some(&stale), 10_000)
             .await;
 
-        let rows = read_jsonl_rows(&sidecar_path);
+        let rows = wait_for_jsonl_rows(&sidecar_path, 1).await;
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row["v1_prequote"], "unknown:MarkStale");

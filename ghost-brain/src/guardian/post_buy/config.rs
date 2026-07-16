@@ -48,6 +48,8 @@ pub const DEFAULT_HET_PM_V2_VITALITY_MIN_AGE_MS: u64 = 11_000;
 pub const DEFAULT_HET_PM_V2_VITALITY_REQUIRED_NON_ALIVE_WINDOWS: u32 = 3;
 pub const DEFAULT_HET_PM_V2_VITALITY_MIN_TIME_SINCE_PEAK_MS: u64 = 5_000;
 pub const DEFAULT_HET_PM_V2_VITALITY_RECOVERY_RETURN_BPS: i32 = 300;
+pub const DEFAULT_HET_PM_V2_WRITER_QUEUE_CAPACITY: usize = 256;
+pub const DEFAULT_HET_PM_V2_TERMINAL_WRITE_BUDGET_MS: u64 = 25;
 pub const DEFAULT_EXIT_REPLAY_LEVELS_BPS: [i32; 23] = [
     -5000, -3000, -2000, -1500, -1000, -700, -500, -300, -200, -100, 100, 200, 300, 400, 500, 700,
     1000, 1500, 2000, 3000, 5000, 7500, 10000,
@@ -321,6 +323,13 @@ pub struct HetPmV2Config {
     pub vitality_required_non_alive_windows: u32,
     pub vitality_min_time_since_peak_ms: u64,
     pub vitality_recovery_return_bps: i32,
+    /// Maximum number of pre-serialized observation rows waiting for the
+    /// single HET sidecar writer. A full queue drops observer-only rows.
+    pub writer_queue_capacity: usize,
+    /// Hard upper bound for awaiting a terminal sidecar acknowledgement.
+    /// Expiry degrades the observer payload to typed `Skipped` and canonical
+    /// V1 terminal persistence continues.
+    pub terminal_write_budget_ms: u64,
 }
 
 impl Default for HetPmV2Config {
@@ -344,6 +353,8 @@ impl Default for HetPmV2Config {
                 DEFAULT_HET_PM_V2_VITALITY_REQUIRED_NON_ALIVE_WINDOWS,
             vitality_min_time_since_peak_ms: DEFAULT_HET_PM_V2_VITALITY_MIN_TIME_SINCE_PEAK_MS,
             vitality_recovery_return_bps: DEFAULT_HET_PM_V2_VITALITY_RECOVERY_RETURN_BPS,
+            writer_queue_capacity: DEFAULT_HET_PM_V2_WRITER_QUEUE_CAPACITY,
+            terminal_write_budget_ms: DEFAULT_HET_PM_V2_TERMINAL_WRITE_BUDGET_MS,
         }
     }
 }

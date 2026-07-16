@@ -2458,10 +2458,11 @@ pub async fn run(
                         .set_shadow_v2_validation_harness(Arc::clone(probe_shadow_v2_harness));
                 }
                 monitoring_engine.set_position_router(Arc::clone(&runtime_router));
-                monitoring_engine.set_shadow_lifecycle_log_path(Some(probe_lifecycle_log_path));
                 // HET-PM PR A owns one primary comparison sidecar. The probe
                 // monitor must not create a second writer or duplicate rows.
-                monitoring_engine.set_het_pm_v2_observation_log_path(None);
+                monitoring_engine.set_shadow_lifecycle_log_path_without_het_pm_v2_sidecar(Some(
+                    probe_lifecycle_log_path,
+                ));
                 let monitoring_engine = Arc::new(monitoring_engine);
                 probe_signal_router_handle = Some(tokio::spawn(
                     SignalRouter::new_observation_only(signal_rx, runtime_router).run(),
@@ -2541,6 +2542,8 @@ pub async fn run(
                 vitality_required_non_alive_windows = status.vitality_required_non_alive_windows,
                 vitality_min_time_since_peak_ms = status.vitality_min_time_since_peak_ms,
                 vitality_recovery_return_bps = status.vitality_recovery_return_bps,
+                writer_queue_capacity = status.writer_queue_capacity,
+                terminal_write_budget_ms = status.terminal_write_budget_ms,
                 crash_guard_mode = ?status.crash_guard_mode,
                 crash_guard_mode_source = %status.crash_guard_mode_source,
                 v1_shadow_authority = status.v1_shadow_authority,

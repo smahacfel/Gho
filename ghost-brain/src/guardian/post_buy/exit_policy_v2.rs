@@ -28,6 +28,8 @@ pub(super) const HET_PM_V2_PUMP_ROUTE_ID: &str = "pump_curve";
 pub(super) const HET_PM_V2_QUOTE_MODEL_ID: &str = "price_truth_resolver_shadow_curve_v1";
 pub(super) const HET_PM_V2_MAX_QUOTE_CELLS: usize = 2;
 pub(super) const HET_PM_V2_MAX_SERIALIZED_RECORD_BYTES: usize = 64 * 1024;
+const HET_PM_V2_MAX_WRITER_QUEUE_CAPACITY: usize = 4_096;
+const HET_PM_V2_MAX_TERMINAL_WRITE_BUDGET_MS: u64 = 100;
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum HetPmV2ConfigError {
@@ -55,6 +57,10 @@ pub enum HetPmV2ConfigError {
     InvalidVitalityPeakAge,
     #[error("HET-PM V2 vitality recovery return must be within 0..=10000 bps")]
     InvalidVitalityRecoveryReturn,
+    #[error("HET-PM V2 writer queue capacity must be within 1..=4096")]
+    InvalidWriterQueueCapacity,
+    #[error("HET-PM V2 terminal write budget must be within 1..=100 ms")]
+    InvalidTerminalWriteBudget,
     #[error("HET-PM V2 authoritative_shadow is forbidden in PR A")]
     AuthoritativeModeForbidden,
     #[error("HET-PM V2 vitality requires time_stop_v2.enabled=true")]
@@ -80,6 +86,8 @@ pub(super) struct EffectiveHetPmV2Config {
     vitality_required_non_alive_windows: u32,
     vitality_min_time_since_peak_ms: u64,
     vitality_recovery_return_bps: i32,
+    writer_queue_capacity: usize,
+    terminal_write_budget_ms: u64,
     policy_id: &'static str,
     policy_version: u16,
     config_hash: String,
@@ -138,6 +146,13 @@ impl EffectiveHetPmV2Config {
         if !(0..=10_000).contains(&config.vitality_recovery_return_bps) {
             return Err(HetPmV2ConfigError::InvalidVitalityRecoveryReturn);
         }
+        if !(1..=HET_PM_V2_MAX_WRITER_QUEUE_CAPACITY).contains(&config.writer_queue_capacity) {
+            return Err(HetPmV2ConfigError::InvalidWriterQueueCapacity);
+        }
+        if !(1..=HET_PM_V2_MAX_TERMINAL_WRITE_BUDGET_MS).contains(&config.terminal_write_budget_ms)
+        {
+            return Err(HetPmV2ConfigError::InvalidTerminalWriteBudget);
+        }
         if matches!(config.mode, HetPmV2Mode::AuthoritativeShadow) {
             return Err(HetPmV2ConfigError::AuthoritativeModeForbidden);
         }
@@ -159,6 +174,8 @@ impl EffectiveHetPmV2Config {
             vitality_required_non_alive_windows: u32,
             vitality_min_time_since_peak_ms: u64,
             vitality_recovery_return_bps: i32,
+            writer_queue_capacity: usize,
+            terminal_write_budget_ms: u64,
         }
 
         let encoded = serde_json::to_vec(&HashInput {
@@ -178,6 +195,8 @@ impl EffectiveHetPmV2Config {
             vitality_required_non_alive_windows: config.vitality_required_non_alive_windows,
             vitality_min_time_since_peak_ms: config.vitality_min_time_since_peak_ms,
             vitality_recovery_return_bps: config.vitality_recovery_return_bps,
+            writer_queue_capacity: config.writer_queue_capacity,
+            terminal_write_budget_ms: config.terminal_write_budget_ms,
         })
         .map_err(|_| HetPmV2ConfigError::ConfigHashSerialization)?;
 
@@ -198,6 +217,8 @@ impl EffectiveHetPmV2Config {
             vitality_required_non_alive_windows: config.vitality_required_non_alive_windows,
             vitality_min_time_since_peak_ms: config.vitality_min_time_since_peak_ms,
             vitality_recovery_return_bps: config.vitality_recovery_return_bps,
+            writer_queue_capacity: config.writer_queue_capacity,
+            terminal_write_budget_ms: config.terminal_write_budget_ms,
             policy_id: HET_PM_V2_POLICY_ID,
             policy_version: HET_PM_V2_POLICY_VERSION,
             config_hash: blake3::hash(&encoded).to_hex().to_string(),
@@ -221,6 +242,12 @@ impl EffectiveHetPmV2Config {
     }
     pub(super) fn config_hash(&self) -> &str {
         &self.config_hash
+    }
+    pub(super) const fn writer_queue_capacity(&self) -> usize {
+        self.writer_queue_capacity
+    }
+    pub(super) const fn terminal_write_budget_ms(&self) -> u64 {
+        self.terminal_write_budget_ms
     }
     pub(super) fn status(&self, crash_guard_mode: CrashGuardMode) -> HetPmV2Status {
         HetPmV2Status {
@@ -248,6 +275,8 @@ impl EffectiveHetPmV2Config {
             vitality_required_non_alive_windows: self.vitality_required_non_alive_windows,
             vitality_min_time_since_peak_ms: self.vitality_min_time_since_peak_ms,
             vitality_recovery_return_bps: self.vitality_recovery_return_bps,
+            writer_queue_capacity: self.writer_queue_capacity,
+            terminal_write_budget_ms: self.terminal_write_budget_ms,
             crash_guard_mode,
             crash_guard_mode_source: "effective_exit_policy_v1_config".to_string(),
             v1_shadow_authority: true,
@@ -278,6 +307,8 @@ pub struct HetPmV2Status {
     pub vitality_required_non_alive_windows: u32,
     pub vitality_min_time_since_peak_ms: u64,
     pub vitality_recovery_return_bps: i32,
+    pub writer_queue_capacity: usize,
+    pub terminal_write_budget_ms: u64,
     pub crash_guard_mode: CrashGuardMode,
     pub crash_guard_mode_source: String,
     pub v1_shadow_authority: bool,
@@ -1051,6 +1082,8 @@ pub(super) struct V1AuthorityTickReceiptV1 {
     pub(super) remaining_quantity_raw: u64,
     pub(super) outcome: V1AuthorityTickOutcomeV1,
     pub(super) exit_apply_status: V1ExitApplyStatusV1,
+    /// Terminal persistence state observed when this comparison was finalized.
+    /// The final canonical outcome is joined later through comparison/action IDs.
     pub(super) terminal_commit_status: V1TerminalCommitStatusV1,
     pub(super) action_id: Option<String>,
     pub(super) reason: Option<String>,
@@ -1237,6 +1270,10 @@ pub(super) enum TerminalV2ComparisonSkipReasonV1 {
     SerializationFailed,
     PayloadOversized,
     WriterNotConfigured,
+    WriterUnavailable,
+    WriterQueueFull,
+    WriterQueueClosed,
+    WriterTimedOut,
     WriterIoFailed,
 }
 
@@ -1248,6 +1285,10 @@ impl TerminalV2ComparisonSkipReasonV1 {
             Self::SerializationFailed => "serialization_failed",
             Self::PayloadOversized => "payload_oversized",
             Self::WriterNotConfigured => "writer_not_configured",
+            Self::WriterUnavailable => "writer_unavailable",
+            Self::WriterQueueFull => "writer_queue_full",
+            Self::WriterQueueClosed => "writer_queue_closed",
+            Self::WriterTimedOut => "writer_timed_out",
             Self::WriterIoFailed => "writer_io_failed",
         }
     }
@@ -1864,6 +1905,39 @@ mod tests {
                 .crash_guard_mode,
             CrashGuardMode::ObserveOnly,
             "toggling HET must not rewrite the effective CrashGuard mode"
+        );
+
+        guardian.het_pm_v2.enabled = true;
+        guardian.het_pm_v2.writer_queue_capacity += 1;
+        let changed_writer_contract =
+            EffectiveHetPmV2Config::from_guardian(&guardian).expect("valid writer contract");
+        assert_ne!(
+            first.config_hash(),
+            changed_writer_contract.config_hash(),
+            "writer sampling/backpressure semantics belong to the HET config identity"
+        );
+    }
+
+    #[test]
+    fn writer_queue_and_terminal_budget_are_bounded_at_startup() {
+        let mut guardian = PostBuyGuardianConfig::default();
+        guardian.het_pm_v2.writer_queue_capacity = 0;
+        assert_eq!(
+            EffectiveHetPmV2Config::from_guardian(&guardian),
+            Err(HetPmV2ConfigError::InvalidWriterQueueCapacity)
+        );
+
+        guardian.het_pm_v2.writer_queue_capacity = HET_PM_V2_MAX_WRITER_QUEUE_CAPACITY;
+        guardian.het_pm_v2.terminal_write_budget_ms = 0;
+        assert_eq!(
+            EffectiveHetPmV2Config::from_guardian(&guardian),
+            Err(HetPmV2ConfigError::InvalidTerminalWriteBudget)
+        );
+
+        guardian.het_pm_v2.terminal_write_budget_ms = HET_PM_V2_MAX_TERMINAL_WRITE_BUDGET_MS + 1;
+        assert_eq!(
+            EffectiveHetPmV2Config::from_guardian(&guardian),
+            Err(HetPmV2ConfigError::InvalidTerminalWriteBudget)
         );
     }
 
