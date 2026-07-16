@@ -26,7 +26,7 @@ fn read_events_from_dir(dir: &std::path::Path) -> Vec<serde_json::Value> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "jsonl") {
+            if path.extension().is_some_and(|e| e == "jsonl") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     for line in content.lines() {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {

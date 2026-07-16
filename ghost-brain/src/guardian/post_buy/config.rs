@@ -40,16 +40,11 @@ pub const DEFAULT_EXIT_REPLAY_LEVELS_BPS: [i32; 23] = [
     1000, 1500, 2000, 3000, 5000, 7500, 10000,
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeStopV2Mode {
+    #[default]
     ObserveOnly,
-}
-
-impl Default for TimeStopV2Mode {
-    fn default() -> Self {
-        Self::ObserveOnly
-    }
 }
 
 /// Observe-only vitality checks for the post-buy TimeStop V2 experiment.
@@ -130,18 +125,13 @@ impl TimeStopV2Config {
 /// mutate a position. `AuthoritativeShadow` is intentionally accepted only by
 /// the pure policy; launcher startup must separately prove the complete shadow
 /// profile before allowing it to become active.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CrashGuardMode {
+    #[default]
     Disabled,
     ObserveOnly,
     AuthoritativeShadow,
-}
-
-impl Default for CrashGuardMode {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 /// Backward-compatible runtime knobs owned by Position Manager Lite V1.

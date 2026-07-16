@@ -3797,6 +3797,10 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         format!("http://{}", addr)
     }
 
+    #[expect(
+        dead_code,
+        reason = "reserved test-only Jito fixture retained for focused sender tests"
+    )]
     async fn spawn_mock_jito_server() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3831,6 +3835,10 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         format!("http://{}", addr)
     }
 
+    #[expect(
+        dead_code,
+        reason = "reserved test-only rate-limit fixture retained for focused sender tests"
+    )]
     async fn spawn_mock_jito_rate_limited_server() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3932,6 +3940,10 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
     }
 
     impl MockGeyserService {
+        #[expect(
+            clippy::result_large_err,
+            reason = "the tonic test service must return protocol Status directly for `?` propagation"
+        )]
         fn assert_x_token<T>(&self, request: &Request<T>) -> std::result::Result<(), Status> {
             let actual = request
                 .metadata()

@@ -799,11 +799,7 @@ impl QuoteEvidenceRevisionV1 {
         }
     }
 
-    fn is_same_or_newer_and_fresh(
-        self,
-        crash_vector: &CrashVectorV1,
-        max_sample_age_ms: u64,
-    ) -> bool {
+    fn is_same_or_newer_and_fresh_than(self, candidate: Self, max_sample_age_ms: u64) -> bool {
         let Some(quote_slot) = self.slot else {
             return false;
         };
@@ -816,10 +812,53 @@ impl QuoteEvidenceRevisionV1 {
         if quote_age_ms > max_sample_age_ms {
             return false;
         }
-        let Some(mark) = crash_vector.latest() else {
+        let (Some(candidate_slot), Some(candidate_timestamp_ms)) =
+            (candidate.slot, candidate.timestamp_ms)
+        else {
             return false;
         };
-        quote_slot >= mark.slot() && quote_timestamp_ms >= mark.timestamp_ms()
+        quote_slot >= candidate_slot && quote_timestamp_ms >= candidate_timestamp_ms
+    }
+}
+
+/// Immutable evidence captured exactly when a CrashGuard action becomes
+/// sticky. Retries must prove their fresh executable quote against this
+/// original candidate, not against a later prequote result that may only say
+/// `PendingProposal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CrashGuardQuoteRequirementV1 {
+    candidate_snapshot_id: String,
+    candidate_evidence: QuoteEvidenceRevisionV1,
+}
+
+impl CrashGuardQuoteRequirementV1 {
+    fn from_snapshot(snapshot: &PostBuyDecisionSnapshot) -> Option<Self> {
+        let latest = snapshot.crash_vector().latest()?;
+        Some(Self {
+            candidate_snapshot_id: snapshot.snapshot_id().to_string(),
+            candidate_evidence: QuoteEvidenceRevisionV1::new(
+                Some(latest.slot()),
+                Some(latest.timestamp_ms()),
+                snapshot.crash_vector().latest_sample_age_ms(),
+            ),
+        })
+    }
+
+    fn accepts_quote(
+        &self,
+        quote_evidence: QuoteEvidenceRevisionV1,
+        max_sample_age_ms: u64,
+    ) -> bool {
+        quote_evidence.is_same_or_newer_and_fresh_than(self.candidate_evidence, max_sample_age_ms)
+    }
+
+    pub(super) fn candidate_snapshot_id(&self) -> &str {
+        &self.candidate_snapshot_id
+    }
+
+    #[cfg(test)]
+    fn candidate_evidence(&self) -> QuoteEvidenceRevisionV1 {
+        self.candidate_evidence
     }
 }
 
@@ -1203,6 +1242,7 @@ impl ExitPolicyV1 {
         snapshot: &PostBuyDecisionSnapshot,
         quote: &ExecutableExitQuote,
         quote_evidence: QuoteEvidenceRevisionV1,
+        requirement: &CrashGuardQuoteRequirementV1,
         config: &EffectiveExitPolicyV1Config,
     ) -> CrashGuardQuoteDecision {
         if Self::validate_snapshot_contract(snapshot, config).is_err() {
@@ -1218,9 +1258,7 @@ impl ExitPolicyV1 {
                 reason: CrashGuardQuoteRejectionReason::QuoteNotExecutable,
             };
         }
-        if !quote_evidence
-            .is_same_or_newer_and_fresh(snapshot.crash_vector(), config.crash_max_sample_age_ms())
-        {
+        if !requirement.accepts_quote(quote_evidence, config.crash_max_sample_age_ms()) {
             return CrashGuardQuoteDecision::BlockedByData;
         }
         if quote.gross_return_pct() > config.crash_max_executable_return_pct() {
@@ -1229,6 +1267,15 @@ impl ExitPolicyV1 {
             };
         }
         CrashGuardQuoteDecision::Confirmed
+    }
+
+    /// Capture the raw canonical evidence that proved a CrashGuard candidate.
+    /// The engine persists this compact contract inside a pending action so a
+    /// retry cannot silently inherit a later `PendingProposal` prequote.
+    pub(super) fn crash_guard_quote_requirement(
+        snapshot: &PostBuyDecisionSnapshot,
+    ) -> Option<CrashGuardQuoteRequirementV1> {
+        CrashGuardQuoteRequirementV1::from_snapshot(snapshot)
     }
 
     pub(super) fn finalize_with_quote(
@@ -1662,16 +1709,35 @@ mod tests {
             1,
             crash_vector(1.0, 0.80, 0.70, 100, 3, true, true),
         );
+        let requirement = ExitPolicyV1::crash_guard_quote_requirement(&snapshot)
+            .expect("CrashGuard candidate provenance");
+        assert_eq!(requirement.candidate_snapshot_id(), snapshot.snapshot_id());
+        assert_eq!(
+            requirement.candidate_evidence(),
+            QuoteEvidenceRevisionV1::new(Some(102), Some(11_000), Some(100))
+        );
         let fresh = QuoteEvidenceRevisionV1::new(Some(102), Some(11_000), Some(100));
         let confirmed_quote = ExecutableExitQuote::new(100, 0.70, 0.70, -0.30, -30.0);
         assert_eq!(
-            ExitPolicyV1::evaluate_crash_guard_quote(&snapshot, &confirmed_quote, fresh, &config),
+            ExitPolicyV1::evaluate_crash_guard_quote(
+                &snapshot,
+                &confirmed_quote,
+                fresh,
+                &requirement,
+                &config,
+            ),
             CrashGuardQuoteDecision::Confirmed
         );
 
         let wrong_quantity = ExecutableExitQuote::new(99, 0.70, 0.70, -0.30, -30.0);
         assert!(matches!(
-            ExitPolicyV1::evaluate_crash_guard_quote(&snapshot, &wrong_quantity, fresh, &config),
+            ExitPolicyV1::evaluate_crash_guard_quote(
+                &snapshot,
+                &wrong_quantity,
+                fresh,
+                &requirement,
+                &config,
+            ),
             CrashGuardQuoteDecision::RejectedByQuote {
                 reason: CrashGuardQuoteRejectionReason::QuoteQuantityMismatch
             }
@@ -1679,7 +1745,13 @@ mod tests {
 
         let no_fill = ExecutableExitQuote::new(100, 0.0, 0.0, 0.0, 0.0);
         assert!(matches!(
-            ExitPolicyV1::evaluate_crash_guard_quote(&snapshot, &no_fill, fresh, &config),
+            ExitPolicyV1::evaluate_crash_guard_quote(
+                &snapshot,
+                &no_fill,
+                fresh,
+                &requirement,
+                &config,
+            ),
             CrashGuardQuoteDecision::RejectedByQuote {
                 reason: CrashGuardQuoteRejectionReason::QuoteNotExecutable
             }
@@ -1687,7 +1759,13 @@ mod tests {
 
         let not_severe = ExecutableExitQuote::new(100, 0.90, 0.90, -0.10, -10.0);
         assert!(matches!(
-            ExitPolicyV1::evaluate_crash_guard_quote(&snapshot, &not_severe, fresh, &config),
+            ExitPolicyV1::evaluate_crash_guard_quote(
+                &snapshot,
+                &not_severe,
+                fresh,
+                &requirement,
+                &config,
+            ),
             CrashGuardQuoteDecision::RejectedByQuote {
                 reason: CrashGuardQuoteRejectionReason::ExecutableReturnNotSevereEnough
             }
@@ -1699,6 +1777,7 @@ mod tests {
                 &snapshot,
                 &confirmed_quote,
                 stale_or_older,
+                &requirement,
                 &config,
             ),
             CrashGuardQuoteDecision::BlockedByData

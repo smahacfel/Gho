@@ -1,6 +1,6 @@
 # ADR-8D: Position Manager Lite V1 PR2 — absolute max-hold i CrashGuard V1
 
-Status: `IMPLEMENTED / LOCAL VALIDATION PASSED / CI NOT YET RUN`
+Status: `IMPLEMENTED / REVIEW REMEDIATION COMPLETE LOCALLY / CI RERUN REQUIRED`
 
 Typ: ADR-8D / Position Manager Lite V1 PR2 / aktywny shadow post-buy / evidence i exit-policy safety
 
@@ -118,6 +118,16 @@ tickami, position-sized executable quote. `CrashConfirmed` wymaga pełnej
 pozostałej quantity, executable output, quote z tej samej/nowszej świeżej
 revision oraz executable gross return nie wyższego niż -20% względem entry.
 
+Jeżeli `authoritative_shadow` utworzy sticky action, zapisuje w nim prywatny
+`CrashGuardQuoteRequirementV1`: source snapshot ID oraz slot/timestamp próbki,
+która stworzyła candidate. Każdy retry rozpoznaje ownership z samego
+`action.reason=CrashGuard`, nie z bieżącego prequote (który poprawnie zwraca
+`PendingProposal`), i ponownie sprawdza to immutable wymaganie. Generic
+`finalize_with_quote()` jest nieosiągalny dla takiej akcji przed
+`CrashGuardQuoteDecision::Confirmed`; quote po odbiciu powyżej -20% powoduje
+`RejectedByQuote` i cancel albo guarded retarget wyłącznie do aktualnego
+baselineowego exit.
+
 Każdy transition `NotTriggered`, `Candidate`, `Confirmed`,
 `RejectedByQuote` albo `BlockedByData` ma observation lifecycle record z:
 
@@ -127,6 +137,9 @@ Każdy transition `NotTriggered`, `Candidate`, `Confirmed`,
 - `crash_guard_consumed_by_policy=false` w aktywnym profilu.
 
 Te obserwacje nie są canonical terminal truth i nie zmieniają outcome pozycji.
+Nie reprezentują też wykonania: `CrashGuardObservation` ma wyłącznie
+sample/truth provenance, bez `exit_landed_slot` oraz
+`exit_landed_slot_source`.
 
 ## 5. Jedno quote i przyszły tryb authoritative
 
@@ -138,6 +151,8 @@ baselineowego exit: gdy CrashGuard dostanie resolved quote, ale odpadnie na
 własnym progu, istniejący guarded action jest retargetowany na baseline
 SL/TP/time candidate. Zachowuje ten sam `action_id`, quantity, recovery window
 i pojedynczy quote; nie powstaje drugi sell ani druga ścieżka execution.
+Jeżeli nie ma aktualnego baseline candidate, CrashGuard proposal jest po prostu
+anulowany — nie wolno zamknąć pozycji przez historyczny crash candidate.
 
 ## 6. Zakres celowo wyłączony
 
@@ -167,6 +182,11 @@ nie zmienia żadnego progu Gatekeepera.
 - failed/missing quote po proposal nadal używa bounded recovery i nie tworzy
   resolved close;
 - obserwacyjny CrashGuard nie wpływa na lifecycle ani capacity;
+- dedupe CrashGuardObservation staje się trwałe dopiero po udanym appendzie
+  lifecycle JSONL; błąd zapisu czyści wyłącznie krótką reservation i pozwala
+  ponowić obserwację przy kolejnym ticku;
+- synthetic `exit_landed_slot` jest zapisywany wyłącznie dla `ExitFilled` i
+  `PositionClosed`, nigdy dla observation, blocked ani unresolved evidence;
 - shadow `SimulationBlocked` nie jest live `Unknown`, a live unknown nadal nie
   zwalnia capacity;
 - canonical `ShadowTerminalTruthV2` pozostaje commit pointem PR1;
@@ -191,8 +211,9 @@ Wykonano na branchu `agent/position-manager-lite-pr2-20260715`, względem
 
 | Kontrola | Wynik |
 | --- | --- |
-| `cargo test -p ghost-brain guardian::post_buy::engine::tests --lib --quiet -- --test-threads=1` | PASS — 51 testów, w tym exact-boundary max-hold, CrashGuard negative predicates, stale raw evidence, retry/retarget i observe-only non-interference. |
-| `cargo test -p ghost-brain guardian::post_buy::exit_policy_v1::tests --lib --quiet -- --test-threads=1` | PASS — 15 testów pure policy i source guard. |
+| `cargo test -p ghost-brain guardian::post_buy::engine::tests --lib --quiet -- --test-threads=1` | PASS — exact-boundary max-hold, CrashGuard negative predicates, stale raw evidence, full runtime `quote failure → pending CrashGuard → recovered non-severe quote`, retarget oraz observe-only non-interference. |
+| `cargo test -p ghost-brain guardian::post_buy::exit_policy_v1::tests --lib --quiet -- --test-threads=1` | PASS — pure policy, source guard oraz immutable CrashGuard candidate provenance. |
+| `cargo test -p ghost-brain guardian::post_buy::engine::tests::crash_guard_observation_retries_after_lifecycle_append_failure --lib --quiet -- --exact --test-threads=1` | PASS — fault injection: błąd appendu nie zapisuje trwałego stanu deduplikacji; candidate i confirmed są zapisane po odzyskaniu lifecycle JSONL. |
 | `cargo test -p ghost-brain guardian::post_buy::config::tests --lib --quiet -- --test-threads=1` | PASS — 10 testów serde-default i exact PR2 config. |
 | `cargo test -p ghost-brain events::validator::tests --lib --quiet -- --test-threads=1` | PASS — 12 testów lifecycle position/epoch. |
 | `cargo test -p ghost-brain --test ghost_brain_config_load_test --quiet` | PASS — 7 testów; aktywny TOML oraz serde-default historycznego profilu. |
@@ -207,16 +228,42 @@ Wykonano na branchu `agent/position-manager-lite-pr2-20260715`, względem
 | `python3 -m unittest scripts.test_guard_restore_shadow_lifecycle -v` oraz `python3 scripts/guard_restore_shadow_lifecycle.py --skip-runtime --output-dir /tmp/position_manager_lite_pr2_restore_guard --json` | PASS — 10 testów guardu oraz `RESTORE_PATH_STATIC_GUARD_PASS`; runtime smoke celowo skipped przez flagę. |
 | `cargo fmt --all -- --check` i `git diff --check` | PASS. |
 
-### Scoped Clippy i formalny baseline waiver
+### Diff-scoped Clippy i formalny baseline waiver
 
-Wykonano:
+Poprzednia lokalna komenda scoped Clippy potwierdzała wyłącznie kompilację i
+nie była lint-clean gate: nie używała `-D warnings`, a globalne `-A` mogłyby
+ukryć diagnostykę w przyszłym diffie. Nie jest już używana jako dowód jakości
+PR2.
+
+Nowy merge-blocking workflow uruchamia:
 
 ```text
-cargo clippy -p ghost-brain -p ghost-launcher --lib --tests --quiet --message-format=short -- -A clippy::never_loop -A clippy::absurd_extreme_comparisons
+python3 scripts/guard_diff_scoped_clippy.py \
+  --base "${{ github.event.pull_request.base.sha }}" \
+  --head "${{ github.sha }}"
 ```
 
-Wynik: `PASS` dla kompilacji zmienionych crate’ów. Dwa wyciszenia dotyczą
-wyłącznie istniejących testowych diagnostyk poza diffem PR2.
+Skrypt tworzy odseparowany worktree base, uruchamia dla Rust crate’ów
+dotkniętych diffem `cargo clippy --lib --tests --no-deps --message-format=json`
+bez globalnego `-A`, porównuje diagnostyki base/head i failuje, gdy:
+
+- head wnosi dowolną nową diagnostykę względem base; albo
+- dowolna diagnostyka head ma primary span w pliku Rust zmienionym przez PR.
+
+Candidate head używa istniejącego targetu workflow, a base ma osobny target;
+gate nie tworzy drugiego globalnego waivera ani nie maskuje warningów PR.
+Istniejący bazowy `clippy::never_loop` nadal zwraca niezerowy kod Cargo, lecz
+pozostaje w strumieniu JSON i jest porównywany z base — nie jest wyciszany.
+Niezerowy wynik bez compiler-error JSON nadal jest fail-closed jako błąd
+infrastruktury albo kompilacji, którego porównanie nie może wiarygodnie
+wyjaśnić.
+
+W tej remediacji nie dodano globalnego `-A`. Tam, gdzie publiczny albo
+runtimeowy boundary celowo utrzymuje więcej niż siedem niezależnych,
+niemutowalnych faktów (handoff, lifecycle albo sidecar), zastosowano lokalne
+`#[expect(clippy::too_many_arguments, reason = ...)]`. Jest to kontrakt
+sprawdzalny: gdy sygnatura przestanie wymagać tego wyjątku, Rust zgłosi
+`unfulfilled_lint_expectations`, który ta sama bramka odrzuci.
 
 Pełna literalna komenda z planu:
 
@@ -236,4 +283,5 @@ diffem PR2**, między innymi:
 
 Waiver nie obejmuje żadnej diagnostyki w zmienionych plikach PR2. Nie jest to
 twierdzenie, że pełny workspace Clippy jest zielony; jest to jawne rozdzielenie
-historycznego długu od walidacji tego diffu.
+historycznego długu od walidacji tego diffu. Po review remediation wymagany
+jest nowy zielony przebieg workflow dla aktualnego SHA.

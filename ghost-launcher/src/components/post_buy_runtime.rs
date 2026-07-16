@@ -455,6 +455,10 @@ fn append_executable_dynamic_exit_sidecar_row(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sidecar schema requires each immutable identity and evidence input to stay explicit"
+)]
 fn emit_executable_dynamic_exit_sidecar_rows(
     config: &ShadowV2BurninConfig,
     position_id: &str,
@@ -706,9 +710,7 @@ const LIVE_EXIT_MAX_TIP_LAMPORTS: u64 = 1_500_000;
 const LIVE_EXIT_THRESHOLD_DENOMINATOR_BPS: u64 = 10_000;
 
 fn resolve_live_exit_tip_lamports(session_tip_lamports: u64) -> u64 {
-    session_tip_lamports
-        .min(LIVE_EXIT_MAX_TIP_LAMPORTS)
-        .max(LIVE_EXIT_MIN_TIP_LAMPORTS)
+    session_tip_lamports.clamp(LIVE_EXIT_MIN_TIP_LAMPORTS, LIVE_EXIT_MAX_TIP_LAMPORTS)
 }
 
 fn saturating_elapsed_ms(started_at: Instant) -> u64 {
@@ -1098,6 +1100,10 @@ struct BuiltLiveExitTransaction {
 }
 
 impl LiveExitSession {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "live entry facts are independently derived and must not be reconstructed from mutable state"
+    )]
     fn new(
         candidate_id: String,
         pool_amm_id: Pubkey,
@@ -2081,8 +2087,7 @@ fn try_canonical_live_price(
     let state = account_state_core.get_canonical_state(mint)?;
     if state.price_sol.is_finite() && state.price_sol > 0.0 {
         return Some(
-            (state.price_sol * LAMPORTS_PER_SOL as f64 * LIVE_EXIT_PRICE_SOL_SCALE_FACTOR).round()
-                as u64,
+            (state.price_sol * LAMPORTS_PER_SOL * LIVE_EXIT_PRICE_SOL_SCALE_FACTOR).round() as u64,
         );
     }
 
@@ -2205,7 +2210,7 @@ fn read_shadow_price_for_compare(shadow_ledger: &ShadowLedger, mint: &Pubkey) ->
             let Some(price) = price_lamports_from_raw_reserves(vs, vt) else {
                 continue;
             };
-            if best.map_or(true, |(_, slot)| shadow.last_updated_slot > slot) {
+            if best.is_none_or(|(_, slot)| shadow.last_updated_slot > slot) {
                 best = Some((price, shadow.last_updated_slot));
             }
         }
@@ -2581,7 +2586,7 @@ pub async fn run(
                         .await;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        crate::events::record_event_bus_lag("post_buy_runtime", n as u64);
+                        crate::events::record_event_bus_lag("post_buy_runtime", n);
                         warn!(
                             runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                             direct_handoff_enabled = direct_handoff_rx.is_some(),
@@ -2743,6 +2748,10 @@ pub async fn run(
     );
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "runtime orchestration keeps independently owned dependencies explicit at the handoff boundary"
+)]
 async fn handle_post_buy_event(
     event: GhostEvent,
     config: &PostBuyRuntimeConfig,
@@ -3159,6 +3168,10 @@ async fn handle_post_buy_event(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shadow V2 projection records explicit join and entry provenance without mutable reconstruction"
+)]
 fn maybe_emit_shadow_v2_position_created(
     harness: &Option<Arc<ParkingMutex<ShadowV2ValidationHarness>>>,
     config: &PostBuyRuntimeConfig,
@@ -3658,7 +3671,7 @@ fn maybe_emit_shadow_v2_entry_evidence_with_pool_state(
             })
             .unwrap_or_else(|| {
                 (
-                    (amount_sol.max(0.0) * LAMPORTS_PER_SOL as f64).round() as u64,
+                    (amount_sol.max(0.0) * LAMPORTS_PER_SOL).round() as u64,
                     min_tokens_out,
                     slippage_tolerance_to_bps(config.slippage_tolerance),
                     SHADOW_V2_ENTRY_FEE_BPS_FALLBACK,
@@ -3905,6 +3918,10 @@ struct ShadowPostBuyHandoffResult {
     terminal_rx: Option<oneshot::Receiver<ShadowTerminalDisposition>>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shadow handoff preserves distinct immutable entry, epoch, and join-contract values"
+)]
 async fn handle_shadow_post_buy_handoff(
     shadow_monitor: Option<&Arc<MonitoringEngine>>,
     candidate_id: &str,
@@ -3981,7 +3998,7 @@ async fn handle_shadow_post_buy_handoff(
         };
     };
     let entry_amount_lamports = if amount_sol.is_finite() && amount_sol > 0.0 {
-        (amount_sol * LAMPORTS_PER_SOL as f64).round() as u64
+        (amount_sol * LAMPORTS_PER_SOL).round() as u64
     } else {
         0
     };
@@ -4290,8 +4307,10 @@ async fn build_full_exit_transaction_with_retry(
     let fee_recipient = session
         .fee_recipient
         .ok_or_else(|| "pump_fee_recipient_missing".to_string())?;
-    let mut sell_config = SellTxConfig::default();
-    sell_config.pump_fee_recipient = fee_recipient;
+    let sell_config = SellTxConfig {
+        pump_fee_recipient: fee_recipient,
+        ..SellTxConfig::default()
+    };
     let sell_builder = SellTxBuilder::new(live.payer.insecure_clone(), sell_config);
     let previous_blockhash = session.last_exit_recent_blockhash;
     let mut last_error = None;
@@ -5749,7 +5768,7 @@ sys.exit(0)
         assert!(rows[3]["payload"]["record"]
             .get("provenance_blockers")
             .and_then(|value| value.as_array())
-            .map_or(true, |blockers| blockers.is_empty()));
+            .is_none_or(|blockers| blockers.is_empty()));
     }
 
     #[test]
@@ -6598,19 +6617,6 @@ sys.exit(0)
             source: UpdateSource::GeyserAccountUpdate,
         };
         let _ = account_state_core.apply_account_update(update);
-    }
-
-    fn serialize_bonding_curve(curve: &BondingCurve) -> [u8; 56] {
-        let mut bytes = [0u8; 56];
-        bytes[0..8].copy_from_slice(&curve.discriminator.to_le_bytes());
-        bytes[8..16].copy_from_slice(&curve.virtual_token_reserves.to_le_bytes());
-        bytes[16..24].copy_from_slice(&curve.virtual_sol_reserves.to_le_bytes());
-        bytes[24..32].copy_from_slice(&curve.real_token_reserves.to_le_bytes());
-        bytes[32..40].copy_from_slice(&curve.real_sol_reserves.to_le_bytes());
-        bytes[40..48].copy_from_slice(&curve.token_total_supply.to_le_bytes());
-        bytes[48] = curve.complete;
-        bytes[49..56].copy_from_slice(&curve._padding);
-        bytes
     }
 
     fn mock_curve_account_info_body(curve: &BondingCurve) -> String {

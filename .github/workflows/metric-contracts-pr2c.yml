@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - ".github/workflows/metric-contracts-pr2c.yml"
+      - "scripts/guard_diff_scoped_clippy.py"
       - "ghost-core/**"
       - "ghost-launcher/**"
       - "ghost-brain/**"
@@ -114,6 +115,13 @@ jobs:
           # line 1569. PR2C does not modify execution policy/sender code.
           cargo clippy -p ghost-brain --lib --no-deps --message-format=short -- \
             -A clippy::never_loop
+
+      - name: Diff-scoped Clippy diagnostic gate
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 scripts/guard_diff_scoped_clippy.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.sha }}"
 
   release-resource-diagnostic:
     name: PR2C release full-path resource diagnostic
