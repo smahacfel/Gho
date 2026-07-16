@@ -52,8 +52,9 @@ use ghost_brain::guardian::post_buy::shadow_v2::{
     SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
 };
 use ghost_brain::guardian::post_buy::{
-    validate_exit_policy_v1_config, ExitPolicyV1Status, MonitoringEngine, PositionRuntimeRouter,
-    PostBuyGuardianConfig, ShadowPositionBook, ShadowTerminalDisposition, SignalRouter,
+    validate_exit_policy_v1_config, CrashGuardMode, ExitPolicyV1Status, MonitoringEngine,
+    PositionRuntimeRouter, PostBuyGuardianConfig, ShadowPositionBook, ShadowTerminalDisposition,
+    SignalRouter,
 };
 use ghost_brain::quotes::{ExecutableQuoteProvider, QuoteProviderConfig};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
@@ -182,6 +183,10 @@ pub struct PostBuyRuntimeConfig {
     pub max_ticks_before_exit: u64,
     /// Execution mode: "paper", "live", "dual".
     pub execution_mode: String,
+    /// Effective trigger admission mode. It is copied into this boundary so a
+    /// future authoritative CrashGuard cannot be enabled under a live-capable
+    /// entry profile by accident.
+    pub entry_mode: String,
     /// AEM outcome horizon in seconds (ghost-brain `AemConfig.t_s`).
     /// Use a short value (e.g. 1) in tests for deterministic ManagementDecision emission.
     pub aem_t_s: u64,
@@ -223,6 +228,7 @@ impl Default for PostBuyRuntimeConfig {
             tick_interval_ms: 500,
             max_ticks_before_exit: 240, // 120s at 500ms tick
             execution_mode: "paper".to_string(),
+            entry_mode: "dry_run_mock".to_string(),
             aem_t_s: 120,
             max_concurrent_positions: 1,
             position_limit_tracker: None,
@@ -255,6 +261,48 @@ impl PostBuyRuntimeConfig {
     }
 
     pub fn validate(&self) -> Result<Option<ExitPolicyV1Status>, String> {
+        let crash_guard_authoritative = self.shadow_guardian.as_ref().is_some_and(|guardian| {
+            matches!(
+                guardian.exit_policy_v1.crash_guard_mode,
+                CrashGuardMode::AuthoritativeShadow
+            )
+        });
+        if crash_guard_authoritative {
+            if self.execution_mode != "shadow" {
+                return Err(
+                    "CrashGuard authoritative_shadow requires execution_mode=shadow".to_string(),
+                );
+            }
+            if self.entry_mode != "shadow_only" {
+                return Err(
+                    "CrashGuard authoritative_shadow requires entry_mode=shadow_only".to_string(),
+                );
+            }
+            if self.live_sell.is_some() {
+                return Err(
+                    "CrashGuard authoritative_shadow requires live sell dispatch to be disabled"
+                        .to_string(),
+                );
+            }
+            if self.shadow_ledger.is_none() {
+                return Err(
+                    "CrashGuard authoritative_shadow requires the canonical shadow monitor to be wired"
+                        .to_string(),
+                );
+            }
+            if self.shadow_lifecycle_log_path.is_none() {
+                return Err(
+                    "CrashGuard authoritative_shadow requires shadow lifecycle evidence logging"
+                        .to_string(),
+                );
+            }
+            if self.events_output_path.as_os_str().is_empty() {
+                return Err(
+                    "CrashGuard authoritative_shadow requires canonical terminal evidence output"
+                        .to_string(),
+                );
+            }
+        }
         if self.execution_mode != "shadow" {
             return Ok(None);
         }
@@ -2427,6 +2475,20 @@ pub async fn run(
             stop_loss_fraction = status.stop_loss_fraction,
             inactivity_timeout_ms = status.inactivity_timeout_ms,
             quote_recovery_ms = status.quote_recovery_ms,
+            absolute_max_hold_enabled = status.absolute_max_hold_enabled,
+            absolute_max_hold_ms = status.absolute_max_hold_ms,
+            crash_guard_mode = ?status.crash_guard_mode,
+            crash_window_ms = status.crash_window_ms,
+            crash_min_short_window_drop_pct = status.crash_min_short_window_drop_pct,
+            crash_min_peak_drawdown_pct = status.crash_min_peak_drawdown_pct,
+            crash_min_distinct_slots = status.crash_min_distinct_slots,
+            crash_max_sample_age_ms = status.crash_max_sample_age_ms,
+            crash_max_executable_return_pct = status.crash_max_executable_return_pct,
+            crash_guard_authority = match status.crash_guard_mode {
+                CrashGuardMode::Disabled => "disabled",
+                CrashGuardMode::ObserveOnly => "observation_only",
+                CrashGuardMode::AuthoritativeShadow => "shadow_only",
+            },
             guardian_authority = "observation_only",
             aem_authority = "disabled",
             revolver_authority = "disabled",
@@ -7134,6 +7196,7 @@ sys.exit(0)
             panic_rate_window_ms: 2_345,
             exit_policy_v1: ghost_brain::guardian::post_buy::ExitPolicyV1Config {
                 quote_recovery_ms: 6_789,
+                ..Default::default()
             },
             aem: ghost_brain::aem::config::AemConfig {
                 enabled: false,
@@ -7168,6 +7231,8 @@ sys.exit(0)
         assert_eq!(status.take_profit_fraction, 1.5);
         assert_eq!(status.stop_loss_fraction, 0.5);
         assert_eq!(status.quote_recovery_ms, 6_789);
+        assert!(!status.absolute_max_hold_enabled);
+        assert_eq!(status.crash_guard_mode, CrashGuardMode::Disabled);
     }
 
     #[test]
@@ -7199,6 +7264,7 @@ sys.exit(0)
             wait_for_timestop: Some(30_000),
             exit_policy_v1: ghost_brain::guardian::post_buy::ExitPolicyV1Config {
                 quote_recovery_ms: 5_000,
+                ..Default::default()
             },
             aem: ghost_brain::aem::config::AemConfig {
                 enabled: false,
@@ -7266,7 +7332,7 @@ sys.exit(0)
             .wait_for_timestop = Some(0);
         assert!(zero_inactivity.validate().is_err());
 
-        let mut zero_quote_recovery = base;
+        let mut zero_quote_recovery = base.clone();
         zero_quote_recovery
             .shadow_guardian
             .as_mut()
@@ -7274,6 +7340,77 @@ sys.exit(0)
             .exit_policy_v1
             .quote_recovery_ms = 0;
         assert!(zero_quote_recovery.validate().is_err());
+
+        let mut zero_enabled_max_hold = base.clone();
+        let policy = &mut zero_enabled_max_hold
+            .shadow_guardian
+            .as_mut()
+            .expect("guardian")
+            .exit_policy_v1;
+        policy.absolute_max_hold_enabled = true;
+        policy.absolute_max_hold_ms = 0;
+        assert!(zero_enabled_max_hold.validate().is_err());
+
+        let mut invalid_observe_crash = base;
+        let policy = &mut invalid_observe_crash
+            .shadow_guardian
+            .as_mut()
+            .expect("guardian")
+            .exit_policy_v1;
+        policy.crash_guard_mode = CrashGuardMode::ObserveOnly;
+        policy.crash_min_distinct_slots = 1;
+        assert!(invalid_observe_crash.validate().is_err());
+    }
+
+    #[test]
+    fn authoritative_crash_guard_is_allowed_only_for_a_complete_shadow_profile() {
+        let guardian = PostBuyGuardianConfig {
+            enabled: true,
+            target_threshold: Some(50.0),
+            stoploss_threshold: Some(50.0),
+            wait_for_timestop: Some(30_000),
+            exit_policy_v1: ghost_brain::guardian::post_buy::ExitPolicyV1Config {
+                crash_guard_mode: CrashGuardMode::AuthoritativeShadow,
+                ..Default::default()
+            },
+            aem: ghost_brain::aem::config::AemConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..PostBuyGuardianConfig::default()
+        };
+        let base = PostBuyRuntimeConfig {
+            execution_mode: "shadow".to_string(),
+            entry_mode: "shadow_only".to_string(),
+            shadow_ledger: Some(Arc::new(ShadowLedger::new())),
+            shadow_lifecycle_log_path: Some(PathBuf::from("/tmp/crash-guard-lifecycle.jsonl")),
+            shadow_guardian: Some(guardian),
+            ..PostBuyRuntimeConfig::default()
+        };
+        assert!(base.validate().is_ok());
+
+        let mut wrong_execution = base.clone();
+        wrong_execution.execution_mode = "live".to_string();
+        assert!(wrong_execution.validate().is_err());
+
+        let mut wrong_entry_mode = base.clone();
+        wrong_entry_mode.entry_mode = "dry_run_mock".to_string();
+        assert!(wrong_entry_mode.validate().is_err());
+
+        let mut missing_lifecycle_log = base.clone();
+        missing_lifecycle_log.shadow_lifecycle_log_path = None;
+        assert!(missing_lifecycle_log.validate().is_err());
+
+        let mut missing_shadow_monitor = base.clone();
+        missing_shadow_monitor.shadow_ledger = None;
+        assert!(missing_shadow_monitor.validate().is_err());
+
+        let mut live_dispatch_present = base;
+        live_dispatch_present.live_sell = Some(test_live_sell_handle(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(AccountStateReducer::new()),
+        ));
+        assert!(live_dispatch_present.validate().is_err());
     }
 
     #[test]
@@ -7971,6 +8108,7 @@ sys.exit(0)
             tick_interval_ms: 10,
             max_ticks_before_exit: 2,
             execution_mode: "paper".to_string(),
+            entry_mode: "paper".to_string(),
             aem_t_s: 1,
             max_concurrent_positions: 1,
             position_limit_tracker: None,
@@ -8071,6 +8209,7 @@ sys.exit(0)
             tick_interval_ms: 10,
             max_ticks_before_exit: 2,
             execution_mode: "paper".to_string(),
+            entry_mode: "paper".to_string(),
             aem_t_s: 1,
             max_concurrent_positions: 1,
             position_limit_tracker: None,
@@ -8182,6 +8321,7 @@ sys.exit(0)
             tick_interval_ms: 10,
             max_ticks_before_exit: 2,
             execution_mode: "paper".to_string(),
+            entry_mode: "paper".to_string(),
             aem_t_s: 1,
             max_concurrent_positions: 1,
             position_limit_tracker: None,
@@ -8406,6 +8546,7 @@ sys.exit(0)
             wait_for_timestop: Some(1),
             exit_policy_v1: ghost_brain::guardian::post_buy::ExitPolicyV1Config {
                 quote_recovery_ms: 1,
+                ..Default::default()
             },
             aem: ghost_brain::aem::config::AemConfig {
                 enabled: false,

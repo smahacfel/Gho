@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_WAIT_FOR_TIMESTOP_MS: u64 = 30_000;
 pub const DEFAULT_EXIT_POLICY_V1_QUOTE_RECOVERY_MS: u64 = 5_000;
+pub const DEFAULT_EXIT_POLICY_V1_ABSOLUTE_MAX_HOLD_MS: u64 = 120_000;
+pub const DEFAULT_EXIT_POLICY_V1_CRASH_WINDOW_MS: u64 = 1_500;
+pub const DEFAULT_EXIT_POLICY_V1_CRASH_MIN_SHORT_WINDOW_DROP_PCT: f64 = 25.0;
+pub const DEFAULT_EXIT_POLICY_V1_CRASH_MIN_PEAK_DRAWDOWN_PCT: f64 = 30.0;
+pub const DEFAULT_EXIT_POLICY_V1_CRASH_MIN_DISTINCT_SLOTS: u8 = 2;
+pub const DEFAULT_EXIT_POLICY_V1_CRASH_MAX_SAMPLE_AGE_MS: u64 = 1_500;
+pub const DEFAULT_EXIT_POLICY_V1_CRASH_MAX_EXECUTABLE_RETURN_PCT: f64 = -20.0;
 pub const DEFAULT_TIME_STOP_V2_FIRST_CHECK_MS: u64 = 3_000;
 pub const DEFAULT_TIME_STOP_V2_WINDOW_MS: u64 = 4_000;
 pub const DEFAULT_TIME_STOP_V2_FAILED_WINDOWS_TO_SIGNAL: u32 = 3;
@@ -117,23 +124,70 @@ impl TimeStopV2Config {
     }
 }
 
+/// CrashGuard authority contract.
+///
+/// `ObserveOnly` materializes and logs a counterfactual candidate but cannot
+/// mutate a position. `AuthoritativeShadow` is intentionally accepted only by
+/// the pure policy; launcher startup must separately prove the complete shadow
+/// profile before allowing it to become active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashGuardMode {
+    Disabled,
+    ObserveOnly,
+    AuthoritativeShadow,
+}
+
+impl Default for CrashGuardMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
 /// Backward-compatible runtime knobs owned by Position Manager Lite V1.
 ///
-/// PR1 intentionally exposes only the bounded quote-recovery window. Absolute
-/// max-hold and CrashGuard remain out of scope and can extend this nested
-/// config additively in a later change.
+/// Missing fields deliberately preserve the PR1 behavior: max-hold and
+/// CrashGuard are disabled. The numerical defaults are retained solely so an
+/// operator can enable either feature with an explicit, complete setting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExitPolicyV1Config {
     /// Maximum time spent retrying a shadow executable quote after an exit
     /// proposal has become sticky.
     pub quote_recovery_ms: u64,
+    /// Enables the shadow-only absolute hold-time exit.
+    pub absolute_max_hold_enabled: bool,
+    /// Absolute position age at which a full exit is proposed when enabled.
+    pub absolute_max_hold_ms: u64,
+    /// CrashGuard authority mode. Defaults to disabled for old configs.
+    pub crash_guard_mode: CrashGuardMode,
+    /// Maximum chronological window considered by CrashGuard.
+    pub crash_window_ms: u64,
+    /// Required oldest-to-newest mark-price fall within the crash window.
+    pub crash_min_short_window_drop_pct: f64,
+    /// Required drawdown from the canonical peak since entry.
+    pub crash_min_peak_drawdown_pct: f64,
+    /// Minimum number of valid, strictly ordered distinct-slot samples.
+    pub crash_min_distinct_slots: u8,
+    /// Maximum age of the newest CrashGuard sample.
+    pub crash_max_sample_age_ms: u64,
+    /// Maximum executable gross return needed to confirm a crash candidate.
+    pub crash_max_executable_return_pct: f64,
 }
 
 impl Default for ExitPolicyV1Config {
     fn default() -> Self {
         Self {
             quote_recovery_ms: DEFAULT_EXIT_POLICY_V1_QUOTE_RECOVERY_MS,
+            absolute_max_hold_enabled: false,
+            absolute_max_hold_ms: DEFAULT_EXIT_POLICY_V1_ABSOLUTE_MAX_HOLD_MS,
+            crash_guard_mode: CrashGuardMode::Disabled,
+            crash_window_ms: DEFAULT_EXIT_POLICY_V1_CRASH_WINDOW_MS,
+            crash_min_short_window_drop_pct: DEFAULT_EXIT_POLICY_V1_CRASH_MIN_SHORT_WINDOW_DROP_PCT,
+            crash_min_peak_drawdown_pct: DEFAULT_EXIT_POLICY_V1_CRASH_MIN_PEAK_DRAWDOWN_PCT,
+            crash_min_distinct_slots: DEFAULT_EXIT_POLICY_V1_CRASH_MIN_DISTINCT_SLOTS,
+            crash_max_sample_age_ms: DEFAULT_EXIT_POLICY_V1_CRASH_MAX_SAMPLE_AGE_MS,
+            crash_max_executable_return_pct: DEFAULT_EXIT_POLICY_V1_CRASH_MAX_EXECUTABLE_RETURN_PCT,
         }
     }
 }
@@ -491,6 +545,11 @@ mod tests {
             cfg.exit_policy_v1.quote_recovery_ms,
             DEFAULT_EXIT_POLICY_V1_QUOTE_RECOVERY_MS
         );
+        assert!(!cfg.exit_policy_v1.absolute_max_hold_enabled);
+        assert_eq!(
+            cfg.exit_policy_v1.crash_guard_mode,
+            CrashGuardMode::Disabled
+        );
     }
 
     #[test]
@@ -509,6 +568,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.exit_policy_v1.quote_recovery_ms, 7_500);
+    }
+
+    #[test]
+    fn deserialize_exit_policy_v1_pr2_fields_is_backward_compatible_and_exact() {
+        let defaults: PostBuyGuardianConfig = toml::from_str("").unwrap();
+        assert!(!defaults.exit_policy_v1.absolute_max_hold_enabled);
+        assert_eq!(defaults.exit_policy_v1.absolute_max_hold_ms, 120_000);
+        assert_eq!(
+            defaults.exit_policy_v1.crash_guard_mode,
+            CrashGuardMode::Disabled
+        );
+
+        let cfg: PostBuyGuardianConfig = toml::from_str(
+            r#"
+            [exit_policy_v1]
+            quote_recovery_ms = 5000
+            absolute_max_hold_enabled = true
+            absolute_max_hold_ms = 120000
+            crash_guard_mode = "observe_only"
+            crash_window_ms = 1500
+            crash_min_short_window_drop_pct = 25.0
+            crash_min_peak_drawdown_pct = 30.0
+            crash_min_distinct_slots = 2
+            crash_max_sample_age_ms = 1500
+            crash_max_executable_return_pct = -20.0
+            "#,
+        )
+        .unwrap();
+        let policy = &cfg.exit_policy_v1;
+        assert!(policy.absolute_max_hold_enabled);
+        assert_eq!(policy.absolute_max_hold_ms, 120_000);
+        assert_eq!(policy.crash_guard_mode, CrashGuardMode::ObserveOnly);
+        assert_eq!(policy.crash_window_ms, 1_500);
+        assert_eq!(policy.crash_min_short_window_drop_pct, 25.0);
+        assert_eq!(policy.crash_min_peak_drawdown_pct, 30.0);
+        assert_eq!(policy.crash_min_distinct_slots, 2);
+        assert_eq!(policy.crash_max_sample_age_ms, 1_500);
+        assert_eq!(policy.crash_max_executable_return_pct, -20.0);
     }
 
     #[test]

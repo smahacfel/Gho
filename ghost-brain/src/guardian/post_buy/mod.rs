@@ -36,7 +36,8 @@ pub mod signals;
 
 pub use crate::events::ShadowUnresolvedReason;
 pub use config::{
-    ExitPolicyV1Config, PostBuyGuardianConfig, ShadowExitReplayConfig, TimeStopV2Config,
+    CrashGuardMode, ExitPolicyV1Config, PostBuyGuardianConfig, ShadowExitReplayConfig,
+    TimeStopV2Config,
 };
 pub use engine::{MonitoringEngine, RegisteredShadowPosition, ShadowTerminalDisposition};
 pub use exit_policy_v1::{

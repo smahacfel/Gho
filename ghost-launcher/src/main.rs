@@ -2173,6 +2173,7 @@ async fn main() -> Result<()> {
         tick_interval_ms: 500,
         max_ticks_before_exit: 240,
         execution_mode: format!("{:?}", config.execution.execution_mode).to_lowercase(),
+        entry_mode: config.trigger.entry_mode.as_str().to_string(),
         aem_t_s: 120,
         max_concurrent_positions: config.trigger.max_concurrent_positions,
         position_limit_tracker: Some(position_limit_tracker.clone()),

@@ -1,4 +1,4 @@
-use ghost_brain::config::GhostBrainConfig;
+use ghost_brain::{config::GhostBrainConfig, guardian::post_buy::CrashGuardMode};
 
 #[test]
 fn test_production_toml_loads() {
@@ -20,6 +20,16 @@ fn post_buy_guardian_lifecycle_thresholds_load_from_production_toml() {
         config.post_buy_guardian.exit_policy_v1.quote_recovery_ms,
         5_000
     );
+    let policy = &config.post_buy_guardian.exit_policy_v1;
+    assert!(policy.absolute_max_hold_enabled);
+    assert_eq!(policy.absolute_max_hold_ms, 120_000);
+    assert_eq!(policy.crash_guard_mode, CrashGuardMode::ObserveOnly);
+    assert_eq!(policy.crash_window_ms, 1_500);
+    assert_eq!(policy.crash_min_short_window_drop_pct, 25.0);
+    assert_eq!(policy.crash_min_peak_drawdown_pct, 30.0);
+    assert_eq!(policy.crash_min_distinct_slots, 2);
+    assert_eq!(policy.crash_max_sample_age_ms, 1_500);
+    assert_eq!(policy.crash_max_executable_return_pct, -20.0);
     assert!(!config.post_buy_guardian.aem.enabled);
 }
 
@@ -49,7 +59,7 @@ fn gatekeeper_v3_config_loads_from_production_toml() {
         .gatekeeper_v2
         .as_ref()
         .expect("production config should include gatekeeper_v2");
-    assert_eq!(gatekeeper_v2.min_market_cap_sol, 5.0);
+    assert_eq!(gatekeeper_v2.min_market_cap_sol, 115.0);
     assert_eq!(config.gatekeeper_v3.normal.min_tx_count, 4);
     assert_eq!(config.gatekeeper_v3.normal.min_unique_signers, 3);
     assert_eq!(config.gatekeeper_v3.normal.min_buy_count, 2);
