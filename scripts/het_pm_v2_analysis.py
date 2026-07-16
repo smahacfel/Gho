@@ -40,16 +40,18 @@ ENTRY_VALUE_SOURCES = {
     "persisted_entry_amount", "diagnostic_price_times_quantity_fallback", "unavailable"
 }
 V1_OUTCOMES = {
-    "hold", "proposal_started", "terminal_applied", "pending_recovery", "blocked", "apply_rejected"
+    "hold", "proposal_started", "exit_applied", "pending_recovery", "blocked", "apply_rejected"
 }
 V1_FINAL_BY_OUTCOME = {
     "hold": "Hold",
     "proposal_started": "ProposalStarted",
-    "terminal_applied": "TerminalApplied",
+    "exit_applied": "ExitApplied",
     "pending_recovery": "PendingRecovery",
     "blocked": "Blocked",
     "apply_rejected": "ApplyRejected",
 }
+V1_EXIT_APPLY_STATUSES = {"not_applied", "applied", "rejected"}
+V1_TERMINAL_COMMIT_STATUSES = {"not_required", "pending", "committed"}
 V1_UNKNOWN_REASONS = {
     "PolicyConfigMismatch", "MarkUnavailable", "MarkStale", "MarkInvalid",
     "InvalidEntryPrice", "InvalidEntryQuantity", "InvalidRemainingQuantity",
@@ -277,6 +279,8 @@ def validate_record(record: dict[str, Any], source: str) -> None:
     reject_non_finite(record, source)
     if require(record, "schema_version", int) != SCHEMA_VERSION:
         raise ContractError(f"{source}: unsupported schema_version")
+    if not require(record, "comparison_id", str):
+        raise ContractError(f"{source}: empty comparison_id")
     if require(record, "policy_id", str) != POLICY_ID:
         raise ContractError(f"{source}: unexpected policy_id")
     if require(record, "policy_version", int) != POLICY_VERSION:
@@ -329,10 +333,38 @@ def validate_record(record: dict[str, Any], source: str) -> None:
         raise ContractError(f"{source}: invalid V1 receipt outcome")
     if v1_final != V1_FINAL_BY_OUTCOME[outcome]:
         raise ContractError(f"{source}: v1_final disagrees with V1 receipt outcome")
+    exit_apply_status = require(receipt, "exit_apply_status", str)
+    terminal_commit_status = require(receipt, "terminal_commit_status", str)
+    if exit_apply_status not in V1_EXIT_APPLY_STATUSES:
+        raise ContractError(f"{source}: invalid V1 exit_apply_status")
+    if terminal_commit_status not in V1_TERMINAL_COMMIT_STATUSES:
+        raise ContractError(f"{source}: invalid V1 terminal_commit_status")
+    axes_valid = (
+        outcome == "exit_applied"
+        and exit_apply_status == "applied"
+        and terminal_commit_status in {"pending", "committed"}
+    ) or (
+        outcome == "apply_rejected"
+        and exit_apply_status == "rejected"
+        and terminal_commit_status == "not_required"
+    ) or (
+        outcome == "pending_recovery"
+        and exit_apply_status == "not_applied"
+        and terminal_commit_status in {"not_required", "pending", "committed"}
+    ) or (
+        outcome in {"hold", "proposal_started", "blocked"}
+        and exit_apply_status == "not_applied"
+        and terminal_commit_status == "not_required"
+    )
+    if not axes_valid:
+        raise ContractError(f"{source}: V1 apply/terminal commit axes disagree with outcome")
     require_optional(receipt, "action_id", str)
     require_optional(receipt, "reason", str)
     validate_crash_quote_decision(require_optional(receipt, "crash_quote_decision", dict), "v1 receipt crash_quote_decision")
-    if terminal_tick != (outcome == "terminal_applied"):
+    expected_terminal_tick = (
+        exit_apply_status == "applied" or terminal_commit_status != "not_required"
+    )
+    if terminal_tick != expected_terminal_tick:
         raise ContractError(f"{source}: terminal_tick disagrees with V1 receipt")
 
     validate_v2_prequote(require(record, "v2_prequote", str), source)
@@ -463,6 +495,9 @@ def load_records(paths: Iterable[Path]) -> tuple[list[dict[str, Any]], list[dict
         )
     if not records:
         raise ContractError("no HET-PM V2 observations found")
+    comparison_ids = [record["comparison_id"] for record in records]
+    if len(comparison_ids) != len(set(comparison_ids)):
+        raise ContractError("duplicate comparison_id is forbidden")
     contracts = {comparison_contract(record) for record in records}
     if len(contracts) != 1:
         raise ContractError(

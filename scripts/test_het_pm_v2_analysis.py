@@ -17,6 +17,7 @@ SPEC.loader.exec_module(MODULE)
 def fixture() -> dict:
     return {
         "schema_version": 1,
+        "comparison_id": "comparison-1",
         "policy_id": "hierarchical_executable_trajectory_pm_v2",
         "policy_version": 2,
         "policy_config_hash": "config-hash-1",
@@ -74,6 +75,8 @@ def fixture() -> dict:
             "state_revision": 7,
             "remaining_quantity_raw": 100,
             "outcome": "hold",
+            "exit_apply_status": "not_applied",
+            "terminal_commit_status": "not_required",
             "action_id": None,
             "reason": None,
             "crash_quote_decision": None,
@@ -169,6 +172,7 @@ class AnalysisContractTest(unittest.TestCase):
             path = Path(temp_dir) / "input.jsonl"
             first = fixture()
             second = fixture()
+            second["comparison_id"] = "comparison-2"
             second["snapshot_id"] = "snapshot-2"
             second["v1_authority_receipt"]["snapshot_id"] = "snapshot-2"
             second["policy_config_hash"] = "config-hash-2"
@@ -184,6 +188,7 @@ class AnalysisContractTest(unittest.TestCase):
             path = Path(temp_dir) / "input.jsonl"
             first = fixture()
             second = fixture()
+            second["comparison_id"] = "comparison-2"
             second["snapshot_id"] = "snapshot-2"
             second["v1_authority_receipt"]["snapshot_id"] = "snapshot-2"
             second["v1_policy_config_hash"] = "v1-config-hash-2"
@@ -199,6 +204,7 @@ class AnalysisContractTest(unittest.TestCase):
             path = Path(temp_dir) / "input.jsonl"
             first = fixture()
             second = fixture()
+            second["comparison_id"] = "comparison-2"
             second["snapshot_id"] = "snapshot-2"
             second["v1_authority_receipt"]["snapshot_id"] = "snapshot-2"
             second["time_stop_v2_config_hash"] = "time-stop-config-hash-2"
@@ -251,9 +257,67 @@ class AnalysisContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "input.jsonl"
             row = fixture()
-            row["v1_final"] = "TerminalApplied"
+            row["v1_final"] = "ExitApplied"
             path.write_text(json.dumps(row) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(MODULE.ContractError, "disagrees with V1 receipt"):
+                MODULE.load_records([path])
+
+    def test_exit_applied_with_terminal_commit_pending_is_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "input.jsonl"
+            row = fixture()
+            row["terminal_tick"] = True
+            row["v1_final"] = "ExitApplied"
+            row["v1_authority_receipt"].update(
+                {
+                    "outcome": "exit_applied",
+                    "exit_apply_status": "applied",
+                    "terminal_commit_status": "pending",
+                    "action_id": "action-1",
+                }
+            )
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            records, _ = MODULE.load_records([path])
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(
+                records[0]["v1_authority_receipt"]["terminal_commit_status"],
+                "pending",
+            )
+
+    def test_exit_applied_cannot_claim_terminal_not_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "input.jsonl"
+            row = fixture()
+            row["terminal_tick"] = True
+            row["v1_final"] = "ExitApplied"
+            row["v1_authority_receipt"].update(
+                {
+                    "outcome": "exit_applied",
+                    "exit_apply_status": "applied",
+                    "terminal_commit_status": "not_required",
+                    "action_id": "action-1",
+                }
+            )
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(MODULE.ContractError, "axes disagree"):
+                MODULE.load_records([path])
+
+    def test_duplicate_comparison_id_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "input.jsonl"
+            first = fixture()
+            second = fixture()
+            second["snapshot_id"] = "snapshot-2"
+            second["v1_authority_receipt"]["snapshot_id"] = "snapshot-2"
+            path.write_text(
+                json.dumps(first) + "\n" + json.dumps(second) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(MODULE.ContractError, "duplicate comparison_id"):
                 MODULE.load_records([path])
 
 

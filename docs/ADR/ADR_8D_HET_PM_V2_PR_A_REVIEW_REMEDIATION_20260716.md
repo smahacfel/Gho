@@ -20,7 +20,9 @@ gdzie dotyczą one Crash finalization, same-snapshot comparison, vitality wiring
 startup validation, route bootstrap, strictness analizatora albo formalnego
 base/head test evidence. Drugi focused re-review rozszerza ten dokument o
 identity konfiguracji źródłowych, lokalną walidację receipt, semantykę
-UnknownEvidence i diff-scoped Clippy.
+UnknownEvidence i diff-scoped Clippy. Trzeci focused re-review rozszerza ADR o
+trwałą granicę terminalnego comparison, korelację retry i rozdzielenie faktu
+zastosowania exitu od stanu canonical terminal commit.
 
 Poziom ryzyka: `MEDIUM-HIGH` — poprawka dotyka aktywnego shadow post-buy
 runtime i kontraktu danych burn-in. Nie zmienia prebuy Gatekeepera, nie dodaje
@@ -89,10 +91,16 @@ remember latest canonical shadow snapshot
   -> V1 prequote + Crash prequote from bundle.base
   -> V2 prequote + local bounded quote plan from the same bundle
   -> resolve local quote cells
+  -> prepare + validate immutable comparison core
   -> run V1 authority with references to the exact base/prequotes/cells
+  -> apply exit and stage terminal, without canonical append
   -> derive V1AuthorityTickReceiptV1 from guarded runtime outcome
   -> observer-only anchor apply after V1
-  -> sidecar append
+  -> finalize + bound + pre-serialize comparison
+  -> attach comparison to PendingTerminalCommit
+  -> persist comparison or typed Skipped
+  -> append operational/canonical terminal truth
+  -> cleanup mirrors and release capacity
 ```
 
 `run_shadow_runtime_tick_v1()` przyjmuje gotowe:
@@ -114,8 +122,10 @@ Receipt posiada:
 snapshot_id
 state_revision
 remaining_quantity_raw
-outcome = Hold | ProposalStarted | TerminalApplied |
+outcome = Hold | ProposalStarted | ExitApplied |
           PendingRecovery | Blocked | ApplyRejected
+exit_apply_status = NotApplied | Applied | Rejected
+terminal_commit_status = NotRequired | Pending | Committed
 action_id
 reason
 crash_quote_decision
@@ -124,9 +134,10 @@ crash_quote_decision
 `V1V2ComparisonRecord.v1_final` jest wyprowadzane z receipt. Serializer failuje
 przed appendem, jeżeli receipt nie ma dokładnie tego samego snapshot ID,
 revision albo quantity co rekord. `terminal_tick` jest wyprowadzany z
-`TerminalApplied`. Outcome posiada typed `as_label()`; runtime serializer
+obu osi: jest prawdziwy, gdy exit został zastosowany albo terminal commit jest
+wymagany. Outcome posiada typed `as_label()`; runtime serializer
 odrzuca również każdy rekord, w którym `v1_final` nie odpowiada receipt albo
-`terminal_tick` nie odpowiada `TerminalApplied`.
+`terminal_tick` nie odpowiada osiom apply/commit.
 
 `PreQuoteDecision::UnknownEvidence` nie jest finalizowane jako świadome
 `Hold`. Receipt ma wtedy `Blocked` i reason `prequote_unknown:<typed reason>`.
@@ -329,7 +340,72 @@ counterfactual_outcome_attribution_status =
 Gotowość PR A oznacza gotowość do późniejszego zbierania porównywalnego
 evidence, nie ekonomiczną lub kohortową promocję PR B.
 
-## 10. Testy regresyjne dodane lub rozszerzone
+## 10. Trzeci focused re-review: trwała terminalna granica §14/§15
+
+Trzeci review wykazał, że comparison używał poprawnego pre-mutation snapshotu,
+ale był finalizowany i zapisywany dopiero po powrocie z pełnego V1 authority
+ticku. W udanym terminalu canonical append, cleanup i capacity release mogły
+więc poprzedzić sidecar. W wariancie canonical retry pierwszy tick zapisywał
+`PendingRecovery`, a tick retry terminalizował pozycję bez rekordu HET.
+
+Poprawiona granica ma dwa jawne typy przygotowanego payloadu:
+
+```text
+PreparedV1V2ComparisonCoreV1
+  = Ready(immutable pre-authority record)
+  | Skipped { correlation, typed reason }
+
+PreparedHetComparisonV1
+  = Ready { correlation, action_id, bounded encoded bytes }
+  | Skipped { correlation, action_id, typed reason }
+```
+
+Core jest walidowany przed wejściem do V1. Dopiero actual receipt uzupełnia
+post-authority pola, po czym pełny rekord jest ponownie walidowany, ograniczany
+rozmiarem i serializowany. Terminalny payload jest przenoszony przez istniejący
+`PendingTerminalCommit`; nie tworzy nowego terminal ownera i nie uczestniczy w
+`canonical_committed()`.
+
+`PendingTerminalCommit` zachowuje:
+
+```text
+prepared_het_comparison
+het_comparison_write_status = NotAttempted | Written | Skipped
+comparison_id
+source_snapshot_id
+original V1 action_id
+```
+
+Przed każdą pierwszą próbą canonical append runtime wykonuje synchroniczny,
+best-effort append gotowych bytes. Wynik `Written` albo typed `Skipped` jest
+nanoszony na operational terminal record i canonical `TERMINAL_TRUTH`.
+Obsługiwane powody degradacji obejmują błędy core/final validation,
+serialization, payload bound, brak writer configu oraz writer I/O failure.
+Żaden z nich nie blokuje canonical terminal commit ani capacity release.
+Canonical terminal zachowuje korelację w namespaced `envelope.source_refs`,
+bez rozszerzania istniejącego `ShadowTerminalTruthV2` i jego historycznego
+kontraktu schema.
+
+Retry używa wyłącznie payloadu z pierwotnego decision ticku. Nie materializuje
+nowego snapshotu, nie uruchamia V2 i nie zapisuje drugi raz porównania, jeżeli
+status jest już `Written` albo `Skipped`. Korelacja canonical terminal truth
+pozwala połączyć wynik z dokładnym `comparison_id`, `source_snapshot_id` oraz
+V1 `action_id`.
+
+Semantyka V1 została rozdzielona na niezależne osie. Pełny fill z awarią
+canonical writera jest teraz:
+
+```text
+outcome = ExitApplied
+exit_apply_status = Applied
+terminal_commit_status = Pending
+```
+
+Nie jest już anonimowym `PendingRecovery`. `PendingRecovery` pozostaje dla
+przypadków, w których ekonomiczny exit nie został zastosowany, np. oczekiwania
+na executable quote albo terminalizacji unresolved bez fillu.
+
+## 11. Testy regresyjne dodane lub rozszerzone
 
 Crash:
 
@@ -364,9 +440,21 @@ Analyzer:
 - missing provenance;
 - unknown decision enum;
 - V1 final/receipt mismatch;
+- poprawny `ExitApplied + Applied + Pending`;
+- odrzucenie sprzecznych osi apply/commit;
+- odrzucenie zduplikowanego `comparison_id`;
 - quote ownership attribution.
 
-## 11. Inwarianty zachowane
+Terminal same-tick/retry:
+
+- `het_exit_tick_persists_original_pre_mutation_comparison`;
+- `het_terminal_retry_uses_original_comparison_without_v2_reevaluation`;
+- `het_terminal_retry_success_emits_exactly_one_terminal_outcome_for_original_action`;
+- `exit_applied_with_terminal_commit_pending_is_not_labeled_generic_pending_recovery`;
+- `process_boundary_after_canonical_commit_cannot_silently_erase_exit_comparison`;
+- `terminal_sidecar_failure_records_typed_skipped_without_blocking_capacity_release`.
+
+## 12. Inwarianty zachowane
 
 - V1 pozostaje jedynym proposal/apply/terminal/capacity ownerem;
 - V2 nie wywołuje `begin_exit_proposal` ani żadnego apply;
@@ -376,15 +464,18 @@ Analyzer:
 - Crash threshold i freshness pozostają SSOT w ExitPolicyV1 configu;
 - TimeStop mutation pozostaje w istniejącej ścieżce, HET używa projection;
 - quote plan pozostaje lokalny dla ticku, deduplikowany i bounded do dwóch;
-- sidecar failure pozostaje fail-open względem V1 terminal commit;
+- sidecar jest `Written` albo terminal truth zawiera typed `Skipped` przed
+  canonical commit; każda taka degradacja pozostaje fail-open względem V1;
 - sidecar nie jest canonical terminal truth ani niezależnym lifecycle proof;
+- retry terminala zachowuje oryginalny snapshot/action i nie ewaluuje V2;
+- exit apply i terminal persistence są raportowane na osobnych osiach;
 - executable anchor nadal ma własne `anchor_seq` i nie zwiększa economic revision;
 - unknown/unsupported route blokuje V2 zamiast udawać Hold/exit;
 - V1 UnknownEvidence jest receipted jako Blocked, nie Hold;
 - shadow simulation nie jest live inclusion;
 - live authority pozostaje disabled.
 
-## 12. Zakres plików remediation
+## 13. Zakres plików remediation
 
 - `ghost-brain/ghost_brain_config.toml` — aktywne observe-only TimeStop vitality;
 - `ghost-brain/src/guardian/post_buy/engine.rs` — one-bundle orchestration,
@@ -395,7 +486,7 @@ Analyzer:
 - `ghost-brain/src/guardian/post_buy/exit_policy_v1.rs` — serializowalny typed
   Crash quote result dla evidence;
 - `ghost-brain/src/guardian/post_buy/exit_policy_v2.rs` — V1 Crash finalization,
-  typed Crash outcomes i strict receipt record;
+  typed Crash outcomes, prepared comparison core i dwuosiowy receipt;
 - `ghost-brain/src/pipeline/builder.rs` — produkcyjny fail-closed constructor;
 - `ghost-launcher/src/components/post_buy_runtime.rs` — route source startup guard
   i produkcyjne `try_new()` call-site'y;
@@ -403,23 +494,24 @@ Analyzer:
 - `scripts/test_het_pm_v2_analysis.py` — negatywne testy schema;
 - niniejszy ADR-8D.
 
-## 13. Walidacja lokalna remediation
+## 14. Walidacja lokalna remediation
 
 | Kontrola | Wynik |
 | --- | --- |
 | `cargo check -p ghost-brain --lib` | PASS. |
-| `cargo test -q -p ghost-brain guardian::post_buy --lib -- --test-threads=1` | PASS — 223/223. Sekwencyjność izoluje istniejącą globalną flagę budżetu artifactów między testami. |
+| `cargo test -p ghost-brain guardian::post_buy --lib` | PASS — 231/231. |
+| sześć exact terminal same-tick/retry fault-injection tests | PASS — 6/6. |
 | `cargo test -p ghost-brain guardian::post_buy::exit_policy_v2::tests::crash_ --lib` | PASS — 4/4. |
 | `cargo test -p ghost-brain guardian::post_buy::engine::tests --lib` | PASS — 64/64. |
 | `cargo test -q -p ghost-launcher shadow_handoff --lib` | PASS — 3/3. |
 | exact launcher base/head comparison | PARITY PROVEN — base 65/66 i head 67/68; ten sam jedyny niezwiązany density failure. |
-| `python3 -m unittest scripts/test_het_pm_v2_analysis.py` | PASS — 11/11. |
+| `python3 -m unittest scripts/test_het_pm_v2_analysis.py` | PASS — 14/14. |
 | `python3 -m py_compile scripts/het_pm_v2_analysis.py scripts/test_het_pm_v2_analysis.py` | PASS. |
 | exact diff-scoped Clippy względem base SHA | PASS — brak nowych diagnostics i brak primary spans w zmienionym Rust. |
 | `cargo fmt --all -- --check` | PASS; wymagane ponownie bezpośrednio przed commitem. |
 | `git diff --check` | PASS; wymagane ponownie bezpośrednio przed commitem. |
 
-## 14. Rollback
+## 15. Rollback
 
 Rollback to revert jednego remediation commita do poprzedniego head PR #71.
 Nie ma migracji canonical state ani publicznego API. Taki rollback przywraca

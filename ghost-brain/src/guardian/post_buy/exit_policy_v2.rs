@@ -1009,7 +1009,7 @@ impl ExitPolicyV2 {
 pub(super) enum V1AuthorityTickOutcomeV1 {
     Hold,
     ProposalStarted,
-    TerminalApplied,
+    ExitApplied,
     PendingRecovery,
     Blocked,
     ApplyRejected,
@@ -1020,12 +1020,28 @@ impl V1AuthorityTickOutcomeV1 {
         match self {
             Self::Hold => "Hold",
             Self::ProposalStarted => "ProposalStarted",
-            Self::TerminalApplied => "TerminalApplied",
+            Self::ExitApplied => "ExitApplied",
             Self::PendingRecovery => "PendingRecovery",
             Self::Blocked => "Blocked",
             Self::ApplyRejected => "ApplyRejected",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum V1ExitApplyStatusV1 {
+    NotApplied,
+    Applied,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum V1TerminalCommitStatusV1 {
+    NotRequired,
+    Pending,
+    Committed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1034,6 +1050,8 @@ pub(super) struct V1AuthorityTickReceiptV1 {
     pub(super) state_revision: u64,
     pub(super) remaining_quantity_raw: u64,
     pub(super) outcome: V1AuthorityTickOutcomeV1,
+    pub(super) exit_apply_status: V1ExitApplyStatusV1,
+    pub(super) terminal_commit_status: V1TerminalCommitStatusV1,
     pub(super) action_id: Option<String>,
     pub(super) reason: Option<String>,
     pub(super) crash_quote_decision: Option<CrashGuardQuoteDecision>,
@@ -1149,6 +1167,7 @@ pub(super) fn materialize_anchor(
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct V1V2ComparisonRecord {
     pub(super) schema_version: u16,
+    pub(super) comparison_id: String,
     pub(super) policy_id: String,
     pub(super) policy_version: u16,
     pub(super) policy_config_hash: String,
@@ -1204,8 +1223,154 @@ pub(super) struct V1V2ComparisonRecord {
     pub(super) known_estimated_costs_sol: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HetComparisonCorrelationV1 {
+    pub(super) comparison_id: String,
+    pub(super) source_snapshot_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TerminalV2ComparisonSkipReasonV1 {
+    CoreSemanticValidationFailed,
+    FinalSemanticValidationFailed,
+    SerializationFailed,
+    PayloadOversized,
+    WriterNotConfigured,
+    WriterIoFailed,
+}
+
+impl TerminalV2ComparisonSkipReasonV1 {
+    pub(super) const fn as_label(self) -> &'static str {
+        match self {
+            Self::CoreSemanticValidationFailed => "core_semantic_validation_failed",
+            Self::FinalSemanticValidationFailed => "final_semantic_validation_failed",
+            Self::SerializationFailed => "serialization_failed",
+            Self::PayloadOversized => "payload_oversized",
+            Self::WriterNotConfigured => "writer_not_configured",
+            Self::WriterIoFailed => "writer_io_failed",
+        }
+    }
+
+    fn from_validation_failure(reason: &'static str, core: bool) -> Self {
+        match reason {
+            "serialization_failed" => Self::SerializationFailed,
+            "comparison_payload_oversized" => Self::PayloadOversized,
+            _ if core => Self::CoreSemanticValidationFailed,
+            _ => Self::FinalSemanticValidationFailed,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum PreparedV1V2ComparisonCoreV1 {
+    Ready(Box<V1V2ComparisonRecord>),
+    Skipped {
+        correlation: HetComparisonCorrelationV1,
+        reason: TerminalV2ComparisonSkipReasonV1,
+        detail: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum PreparedHetComparisonV1 {
+    Ready {
+        correlation: HetComparisonCorrelationV1,
+        action_id: Option<String>,
+        encoded: Vec<u8>,
+    },
+    Skipped {
+        correlation: HetComparisonCorrelationV1,
+        action_id: Option<String>,
+        reason: TerminalV2ComparisonSkipReasonV1,
+        detail: String,
+    },
+}
+
+impl PreparedHetComparisonV1 {
+    pub(super) fn correlation(&self) -> &HetComparisonCorrelationV1 {
+        match self {
+            Self::Ready { correlation, .. } | Self::Skipped { correlation, .. } => correlation,
+        }
+    }
+
+    pub(super) fn action_id(&self) -> Option<&str> {
+        match self {
+            Self::Ready { action_id, .. } | Self::Skipped { action_id, .. } => action_id.as_deref(),
+        }
+    }
+}
+
+impl PreparedV1V2ComparisonCoreV1 {
+    pub(super) fn prepare(record: V1V2ComparisonRecord) -> Self {
+        let correlation = HetComparisonCorrelationV1 {
+            comparison_id: record.comparison_id.clone(),
+            source_snapshot_id: record.snapshot_id.clone(),
+        };
+        match record.validate_core() {
+            Ok(()) => Self::Ready(Box::new(record)),
+            Err(detail) => Self::Skipped {
+                correlation,
+                reason: TerminalV2ComparisonSkipReasonV1::from_validation_failure(detail, true),
+                detail: detail.to_string(),
+            },
+        }
+    }
+
+    pub(super) fn finalize(
+        self,
+        receipt: V1AuthorityTickReceiptV1,
+        anchor_applied: bool,
+    ) -> PreparedHetComparisonV1 {
+        let action_id = receipt.action_id.clone();
+        match self {
+            Self::Ready(record) => {
+                let mut record = *record;
+                let correlation = HetComparisonCorrelationV1 {
+                    comparison_id: record.comparison_id.clone(),
+                    source_snapshot_id: record.snapshot_id.clone(),
+                };
+                record.terminal_tick =
+                    matches!(receipt.exit_apply_status, V1ExitApplyStatusV1::Applied)
+                        || !matches!(
+                            receipt.terminal_commit_status,
+                            V1TerminalCommitStatusV1::NotRequired
+                        );
+                record.v1_final = Some(receipt.outcome.as_label().to_string());
+                record.v1_authority_receipt = Some(receipt);
+                record.anchor_applied = anchor_applied;
+                match record.validate_and_serialize() {
+                    Ok(encoded) => PreparedHetComparisonV1::Ready {
+                        correlation,
+                        action_id,
+                        encoded,
+                    },
+                    Err(detail) => PreparedHetComparisonV1::Skipped {
+                        correlation,
+                        action_id,
+                        reason: TerminalV2ComparisonSkipReasonV1::from_validation_failure(
+                            detail, false,
+                        ),
+                        detail: detail.to_string(),
+                    },
+                }
+            }
+            Self::Skipped {
+                correlation,
+                reason,
+                detail,
+            } => PreparedHetComparisonV1::Skipped {
+                correlation,
+                action_id,
+                reason,
+                detail,
+            },
+        }
+    }
+}
+
 impl V1V2ComparisonRecord {
-    pub(super) fn validate_and_serialize(&self) -> Result<Vec<u8>, &'static str> {
+    fn validate_common(&self) -> Result<(), &'static str> {
         if self.schema_version != HET_PM_V2_SCHEMA_VERSION
             || self.policy_id != HET_PM_V2_POLICY_ID
             || self.policy_version != HET_PM_V2_POLICY_VERSION
@@ -1222,29 +1387,19 @@ impl V1V2ComparisonRecord {
         {
             return Err("comparison_source_config_identity_mismatch");
         }
+        if self.comparison_id.is_empty()
+            || self.run_id.is_empty()
+            || self.position_id.is_empty()
+            || self.snapshot_id.is_empty()
+            || self.remaining_quantity_raw == 0
+        {
+            return Err("comparison_identity_contract_mismatch");
+        }
         if !matches!(self.lane, Lane::Shadow) {
             return Err("comparison_lane_is_not_shadow");
         }
         if self.consumed_by_policy {
             return Err("observe_only_record_marked_as_policy_consumed");
-        }
-        let Some(receipt) = self.v1_authority_receipt.as_ref() else {
-            return Err("v1_authority_receipt_missing");
-        };
-        if receipt.snapshot_id != self.snapshot_id
-            || receipt.state_revision != self.state_revision
-            || receipt.remaining_quantity_raw != self.remaining_quantity_raw
-            || self.remaining_quantity_raw == 0
-        {
-            return Err("v1_authority_receipt_snapshot_mismatch");
-        }
-        if self.v1_final.as_deref() != Some(receipt.outcome.as_label()) {
-            return Err("v1_final_receipt_outcome_mismatch");
-        }
-        if self.terminal_tick
-            != matches!(receipt.outcome, V1AuthorityTickOutcomeV1::TerminalApplied)
-        {
-            return Err("terminal_tick_receipt_outcome_mismatch");
         }
         if !self.v1_shadow_authority || self.v2_shadow_authority || self.live_authority {
             return Err("comparison_authority_contract_mismatch");
@@ -1286,11 +1441,88 @@ impl V1V2ComparisonRecord {
         {
             return Err("comparison_contains_non_finite_metric");
         }
+        Ok(())
+    }
+
+    fn serialize_bounded(&self) -> Result<Vec<u8>, &'static str> {
         let encoded = serde_json::to_vec(self).map_err(|_| "serialization_failed")?;
         if encoded.len() > HET_PM_V2_MAX_SERIALIZED_RECORD_BYTES {
             return Err("comparison_payload_oversized");
         }
         Ok(encoded)
+    }
+
+    /// Validate the immutable comparison boundary before V1 can mutate the
+    /// position. Final authority fields are deliberately absent at this stage.
+    pub(super) fn validate_core(&self) -> Result<(), &'static str> {
+        self.validate_common()?;
+        if self.v1_final.is_some() || self.v1_authority_receipt.is_some() || self.terminal_tick {
+            return Err("comparison_core_contains_post_authority_outcome");
+        }
+        self.serialize_bounded().map(|_| ())
+    }
+
+    pub(super) fn validate_and_serialize(&self) -> Result<Vec<u8>, &'static str> {
+        self.validate_common()?;
+        let Some(receipt) = self.v1_authority_receipt.as_ref() else {
+            return Err("v1_authority_receipt_missing");
+        };
+        if receipt.snapshot_id != self.snapshot_id
+            || receipt.state_revision != self.state_revision
+            || receipt.remaining_quantity_raw != self.remaining_quantity_raw
+        {
+            return Err("v1_authority_receipt_snapshot_mismatch");
+        }
+        if self.v1_final.as_deref() != Some(receipt.outcome.as_label()) {
+            return Err("v1_final_receipt_outcome_mismatch");
+        }
+        let terminal_tick_expected =
+            matches!(receipt.exit_apply_status, V1ExitApplyStatusV1::Applied)
+                || !matches!(
+                    receipt.terminal_commit_status,
+                    V1TerminalCommitStatusV1::NotRequired
+                );
+        if self.terminal_tick != terminal_tick_expected {
+            return Err("terminal_tick_receipt_outcome_mismatch");
+        }
+        let receipt_axes_valid = match receipt.outcome {
+            V1AuthorityTickOutcomeV1::ExitApplied => {
+                matches!(receipt.exit_apply_status, V1ExitApplyStatusV1::Applied)
+                    && matches!(
+                        receipt.terminal_commit_status,
+                        V1TerminalCommitStatusV1::Pending | V1TerminalCommitStatusV1::Committed
+                    )
+            }
+            V1AuthorityTickOutcomeV1::ApplyRejected => {
+                matches!(receipt.exit_apply_status, V1ExitApplyStatusV1::Rejected)
+                    && matches!(
+                        receipt.terminal_commit_status,
+                        V1TerminalCommitStatusV1::NotRequired
+                    )
+            }
+            V1AuthorityTickOutcomeV1::PendingRecovery => {
+                matches!(receipt.exit_apply_status, V1ExitApplyStatusV1::NotApplied)
+                    && matches!(
+                        receipt.terminal_commit_status,
+                        V1TerminalCommitStatusV1::NotRequired
+                            | V1TerminalCommitStatusV1::Pending
+                            | V1TerminalCommitStatusV1::Committed
+                    )
+            }
+            V1AuthorityTickOutcomeV1::Hold
+            | V1AuthorityTickOutcomeV1::ProposalStarted
+            | V1AuthorityTickOutcomeV1::Blocked => {
+                matches!(receipt.exit_apply_status, V1ExitApplyStatusV1::NotApplied)
+                    && matches!(
+                        receipt.terminal_commit_status,
+                        V1TerminalCommitStatusV1::NotRequired
+                    )
+            }
+        };
+        if !receipt_axes_valid {
+            return Err("v1_receipt_apply_commit_axes_mismatch");
+        }
+        self.serialize_bounded()
     }
 }
 
@@ -1524,6 +1756,7 @@ mod tests {
     fn comparison_record() -> V1V2ComparisonRecord {
         V1V2ComparisonRecord {
             schema_version: HET_PM_V2_SCHEMA_VERSION,
+            comparison_id: "comparison".to_string(),
             policy_id: HET_PM_V2_POLICY_ID.to_string(),
             policy_version: HET_PM_V2_POLICY_VERSION,
             policy_config_hash: "hash".to_string(),
@@ -1551,6 +1784,8 @@ mod tests {
                 state_revision: 2,
                 remaining_quantity_raw: 100,
                 outcome: V1AuthorityTickOutcomeV1::Hold,
+                exit_apply_status: V1ExitApplyStatusV1::NotApplied,
+                terminal_commit_status: V1TerminalCommitStatusV1::NotRequired,
                 action_id: None,
                 reason: None,
                 crash_quote_decision: None,
@@ -1675,7 +1910,7 @@ mod tests {
     #[test]
     fn comparison_rejects_v1_final_receipt_mismatch() {
         let mut record = comparison_record();
-        record.v1_final = Some("TerminalApplied".to_string());
+        record.v1_final = Some("ExitApplied".to_string());
 
         assert_eq!(
             record.validate_and_serialize(),
@@ -1691,6 +1926,44 @@ mod tests {
         assert_eq!(
             record.validate_and_serialize(),
             Err("terminal_tick_receipt_outcome_mismatch")
+        );
+    }
+
+    #[test]
+    fn comparison_core_is_validated_before_authority_outcome() {
+        let mut record = comparison_record();
+        record.v1_final = None;
+        record.v1_authority_receipt = None;
+
+        assert!(record.validate_core().is_ok());
+
+        record.terminal_tick = true;
+        assert_eq!(
+            record.validate_core(),
+            Err("comparison_core_contains_post_authority_outcome")
+        );
+    }
+
+    #[test]
+    fn exit_applied_requires_separate_pending_or_committed_terminal_axis() {
+        let mut record = comparison_record();
+        let receipt = record.v1_authority_receipt.as_mut().unwrap();
+        receipt.outcome = V1AuthorityTickOutcomeV1::ExitApplied;
+        receipt.exit_apply_status = V1ExitApplyStatusV1::Applied;
+        receipt.terminal_commit_status = V1TerminalCommitStatusV1::Pending;
+        receipt.action_id = Some("action".to_string());
+        record.v1_final = Some("ExitApplied".to_string());
+        record.terminal_tick = true;
+        assert!(record.validate_and_serialize().is_ok());
+
+        record
+            .v1_authority_receipt
+            .as_mut()
+            .unwrap()
+            .terminal_commit_status = V1TerminalCommitStatusV1::NotRequired;
+        assert_eq!(
+            record.validate_and_serialize(),
+            Err("v1_receipt_apply_commit_axes_mismatch")
         );
     }
 

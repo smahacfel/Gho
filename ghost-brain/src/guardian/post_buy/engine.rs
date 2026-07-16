@@ -70,11 +70,13 @@ use super::exit_policy_v2::{
     build_entry_value_contract, materialize_anchor, prequote_label, EffectiveHetPmV2Config,
     ExecutablePeakAnchorV1, ExecutableQuoteKeyV2, ExitPolicyV2, HetPmCandidateV2,
     HetPmFinalDecisionV2, HetPmQuoteFinalizationInputV2, HetPmV2ConfigError, HetPmV2Status,
-    PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2, PostBuySnapshotBundle, RouteStatusV1,
-    TimeStopV2ProjectionV1, TimeStopV2Subreason, TimeStopV2WindowStatus, V1AuthorityTickOutcomeV1,
-    V1AuthorityTickReceiptV1, V1V2ComparisonRecord, VitalityFeaturesV1, HET_PM_V2_MAX_QUOTE_CELLS,
-    HET_PM_V2_POLICY_ID, HET_PM_V2_POLICY_VERSION, HET_PM_V2_SAMPLING_MODE,
-    HET_PM_V2_SCHEMA_VERSION, HET_PM_V2_TRAJECTORY_GRADE,
+    PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2, PostBuySnapshotBundle,
+    PreparedHetComparisonV1, PreparedV1V2ComparisonCoreV1, RouteStatusV1,
+    TerminalV2ComparisonSkipReasonV1, TimeStopV2ProjectionV1, TimeStopV2Subreason,
+    TimeStopV2WindowStatus, V1AuthorityTickOutcomeV1, V1AuthorityTickReceiptV1,
+    V1ExitApplyStatusV1, V1TerminalCommitStatusV1, V1V2ComparisonRecord, VitalityFeaturesV1,
+    HET_PM_V2_MAX_QUOTE_CELLS, HET_PM_V2_POLICY_ID, HET_PM_V2_POLICY_VERSION,
+    HET_PM_V2_SAMPLING_MODE, HET_PM_V2_SCHEMA_VERSION, HET_PM_V2_TRAJECTORY_GRADE,
 };
 use super::exit_replay::{
     ShadowExitReplayIdentity, ShadowExitReplayRecord, ShadowExitReplayTracker,
@@ -789,6 +791,37 @@ struct PendingTerminalCommit {
     disposition: ShadowTerminalDisposition,
     last_attempt_ms: Option<u64>,
     lifecycle_jsonl_committed: bool,
+    prepared_het_comparison: Option<PreparedHetComparisonV1>,
+    het_comparison_write_status: HetComparisonWriteStatusV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HetComparisonWriteStatusV1 {
+    NotApplicable,
+    NotAttempted,
+    Written,
+    Skipped {
+        reason: TerminalV2ComparisonSkipReasonV1,
+        detail: String,
+    },
+}
+
+impl HetComparisonWriteStatusV1 {
+    const fn as_label(&self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::NotAttempted => "not_attempted",
+            Self::Written => "written",
+            Self::Skipped { .. } => "skipped",
+        }
+    }
+
+    const fn skip_reason(&self) -> Option<TerminalV2ComparisonSkipReasonV1> {
+        match self {
+            Self::Skipped { reason, .. } => Some(*reason),
+            Self::NotApplicable | Self::NotAttempted | Self::Written => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -857,7 +890,7 @@ impl HetPmV2QuotePlan {
 
 #[derive(Debug)]
 struct PreparedHetPmV2Tick {
-    record: V1V2ComparisonRecord,
+    comparison_core: PreparedV1V2ComparisonCoreV1,
     quote_cells: Vec<HetPmV2QuoteCell>,
     anchor_request: PeakAnchorPreQuoteDecisionV1,
 }
@@ -1197,6 +1230,14 @@ struct ShadowLifecycleRecord {
     source_snapshot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     action_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    het_pm_v2_comparison_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    het_pm_v2_source_snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    het_pm_v2_comparison_write_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    het_pm_v2_comparison_skip_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal_reason_v2: Option<TerminalReasonV2>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2909,32 +2950,53 @@ impl MonitoringEngine {
         file.flush()
     }
 
-    fn append_het_pm_v2_observation(&self, record: &V1V2ComparisonRecord) {
-        let Some(path) = self.het_pm_v2_observation_log_path.as_ref() else {
-            debug!(
-                position_id = %record.position_id,
-                "PostBuyGuardian: HET-PM V2 sidecar not configured; V1 remains unaffected"
-            );
-            return;
-        };
-        let encoded = match record.validate_and_serialize() {
-            Ok(encoded) => encoded,
-            Err(reason) => {
+    fn persist_prepared_het_pm_v2_comparison(
+        &self,
+        prepared: &PreparedHetComparisonV1,
+    ) -> HetComparisonWriteStatusV1 {
+        let correlation = prepared.correlation();
+        let encoded = match prepared {
+            PreparedHetComparisonV1::Ready { encoded, .. } => encoded,
+            PreparedHetComparisonV1::Skipped { reason, detail, .. } => {
                 warn!(
-                    position_id = %record.position_id,
-                    reason,
-                    "PostBuyGuardian: HET-PM V2 comparison skipped before sidecar append"
+                    comparison_id = %correlation.comparison_id,
+                    source_snapshot_id = %correlation.source_snapshot_id,
+                    reason = reason.as_label(),
+                    detail,
+                    "PostBuyGuardian: HET-PM V2 comparison locally degraded to typed Skipped"
                 );
-                return;
+                return HetComparisonWriteStatusV1::Skipped {
+                    reason: *reason,
+                    detail: detail.clone(),
+                };
             }
         };
-        if let Err(error) = Self::append_prepared_jsonl_bytes(path, &encoded) {
-            warn!(
-                path = %path.display(),
-                position_id = %record.position_id,
-                error = %error,
-                "PostBuyGuardian: HET-PM V2 sidecar write failed; V1 lifecycle remains fail-open"
+        let Some(path) = self.het_pm_v2_observation_log_path.as_ref() else {
+            debug!(
+                comparison_id = %correlation.comparison_id,
+                source_snapshot_id = %correlation.source_snapshot_id,
+                "PostBuyGuardian: HET-PM V2 sidecar not configured; V1 remains unaffected"
             );
+            return HetComparisonWriteStatusV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::WriterNotConfigured,
+                detail: "het_pm_v2_observation_log_path_missing".to_string(),
+            };
+        };
+        match Self::append_prepared_jsonl_bytes(path, encoded) {
+            Ok(()) => HetComparisonWriteStatusV1::Written,
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    comparison_id = %correlation.comparison_id,
+                    source_snapshot_id = %correlation.source_snapshot_id,
+                    error = %error,
+                    "PostBuyGuardian: HET-PM V2 sidecar write failed; V1 lifecycle remains fail-open"
+                );
+                HetComparisonWriteStatusV1::Skipped {
+                    reason: TerminalV2ComparisonSkipReasonV1::WriterIoFailed,
+                    detail: error.to_string(),
+                }
+            }
         }
     }
 
@@ -3770,6 +3832,31 @@ impl MonitoringEngine {
         envelope.measurement_grade = MeasurementGrade::MarkPriceReplay;
         envelope.quality = "TERMINAL_TRUTH_DERIVED_FROM_LEGACY_LIFECYCLE".to_string();
         envelope.source_refs.push(terminal_source.replace('.', ":"));
+        if let Some(comparison_id) = record.het_pm_v2_comparison_id.as_deref() {
+            envelope
+                .source_refs
+                .push(format!("het_pm_v2:comparison_id:{comparison_id}"));
+            if let Some(snapshot_id) = record.het_pm_v2_source_snapshot_id.as_deref() {
+                envelope
+                    .source_refs
+                    .push(format!("het_pm_v2:source_snapshot_id:{snapshot_id}"));
+            }
+            if let Some(action_id) = record.action_id.as_deref() {
+                envelope
+                    .source_refs
+                    .push(format!("het_pm_v2:v1_action_id:{action_id}"));
+            }
+            if let Some(status) = record.het_pm_v2_comparison_write_status.as_deref() {
+                envelope
+                    .source_refs
+                    .push(format!("het_pm_v2:comparison_write_status:{status}"));
+            }
+            if let Some(reason) = record.het_pm_v2_comparison_skip_reason.as_deref() {
+                envelope
+                    .source_refs
+                    .push(format!("het_pm_v2:comparison_skip_reason:{reason}"));
+            }
+        }
         envelope
             .limitations
             .push("TERMINAL_TRUTH_MARK_PATH_ONLY_NOT_EXECUTABLE_FILL".to_string());
@@ -4276,6 +4363,10 @@ impl MonitoringEngine {
                 .as_ref()
                 .map(|proposal| proposal.action_id.clone())
                 .or_else(|| pos.last_applied_action_id.clone()),
+            het_pm_v2_comparison_id: None,
+            het_pm_v2_source_snapshot_id: None,
+            het_pm_v2_comparison_write_status: None,
+            het_pm_v2_comparison_skip_reason: None,
             terminal_reason_v2: None,
             exit_policy_reason_code: pos.last_force_exit_reason_code.clone(),
             terminal_disposition: None,
@@ -6422,65 +6513,78 @@ impl MonitoringEngine {
             PeakAnchorPreQuoteDecisionV1::Blocked { reason } => Some(format!("blocked:{reason:?}")),
         };
 
+        let comparison_identity_material = format!(
+            "{}:{}:{}:{}:{}",
+            bundle.base.guard().position_id(),
+            bundle.base.guard().position_epoch(),
+            bundle.base.guard().state_revision(),
+            bundle.base.snapshot_id(),
+            now_ms
+        );
+        let comparison_id = format!(
+            "het_pm_v2:{}",
+            blake3::hash(comparison_identity_material.as_bytes()).to_hex()
+        );
+        let record = V1V2ComparisonRecord {
+            schema_version: HET_PM_V2_SCHEMA_VERSION,
+            comparison_id,
+            policy_id: HET_PM_V2_POLICY_ID.to_string(),
+            policy_version: HET_PM_V2_POLICY_VERSION,
+            policy_config_hash: het_policy.config_hash().to_string(),
+            v1_policy_id: v1_policy.policy_id().to_string(),
+            v1_policy_version: v1_policy.policy_version(),
+            v1_policy_config_hash: v1_policy.config_hash().to_string(),
+            time_stop_v2_config_hash: self.time_stop_v2_config_hash.clone(),
+            run_id: bundle.v2.run_id.clone(),
+            lane: bundle.base.lane(),
+            position_id: bundle.base.guard().position_id().to_string(),
+            position_epoch: bundle.base.guard().position_epoch(),
+            state_revision: bundle.base.guard().state_revision(),
+            remaining_quantity_raw: bundle.base.remaining_token_amount_raw(),
+            snapshot_id: bundle.base.snapshot_id().to_string(),
+            observation_timestamp_ms: now_ms,
+            terminal_tick: false,
+            trajectory_sampling_mode: HET_PM_V2_SAMPLING_MODE.to_string(),
+            trajectory_measurement_grade: HET_PM_V2_TRAJECTORY_GRADE.to_string(),
+            monitor_tick_ms: self.config.tick_interval_ms,
+            v1_prequote: prequote_label(v1_prequote),
+            v1_crash_prequote: format!("{crash_prequote:?}"),
+            v1_final: None,
+            v1_authority_receipt: None,
+            v2_prequote: format!("{:?}", v2_prequote.candidate),
+            v2_final: Some(format!("{v2_final:?}")),
+            v2_crash_quote_decision,
+            v2_winning_gate: v2_prequote.winning_gate,
+            v2_suppressed_gates_mask: v2_prequote.suppressed_gates_mask,
+            consumed_by_policy: false,
+            v1_shadow_authority: true,
+            v2_shadow_authority: false,
+            live_authority: false,
+            v2_economic_mutation: false,
+            v2_proposal_created: false,
+            v2_time_stop_mutation: false,
+            duplicate_action_observed: false,
+            route_build_authority_changed: false,
+            terminal_isolation_violation: false,
+            trajectory: bundle.v2.trajectory.clone(),
+            vitality: bundle.v2.vitality.clone(),
+            route_status: bundle.v2.route_status,
+            entry_value_quote_raw: bundle.v2.entry_value_quote_raw,
+            entry_value_source: bundle.v2.entry_value_source,
+            entry_value_authoritative_for_shadow: bundle.v2.entry_value_authoritative_for_shadow,
+            anchor_before: bundle.v2.executable_peak_anchor.clone(),
+            anchor_request: anchor_request_label,
+            anchor_applied: false,
+            quote_keys,
+            quote_resolution_count: quote_statuses.len() as u8,
+            quote_statuses,
+            current_executable_value_sol,
+            current_executable_gross_return_bps,
+            known_estimated_costs_sol,
+        };
+
         PreparedHetPmV2Tick {
-            record: V1V2ComparisonRecord {
-                schema_version: HET_PM_V2_SCHEMA_VERSION,
-                policy_id: HET_PM_V2_POLICY_ID.to_string(),
-                policy_version: HET_PM_V2_POLICY_VERSION,
-                policy_config_hash: het_policy.config_hash().to_string(),
-                v1_policy_id: v1_policy.policy_id().to_string(),
-                v1_policy_version: v1_policy.policy_version(),
-                v1_policy_config_hash: v1_policy.config_hash().to_string(),
-                time_stop_v2_config_hash: self.time_stop_v2_config_hash.clone(),
-                run_id: bundle.v2.run_id.clone(),
-                lane: bundle.base.lane(),
-                position_id: bundle.base.guard().position_id().to_string(),
-                position_epoch: bundle.base.guard().position_epoch(),
-                state_revision: bundle.base.guard().state_revision(),
-                remaining_quantity_raw: bundle.base.remaining_token_amount_raw(),
-                snapshot_id: bundle.base.snapshot_id().to_string(),
-                observation_timestamp_ms: now_ms,
-                terminal_tick: false,
-                trajectory_sampling_mode: HET_PM_V2_SAMPLING_MODE.to_string(),
-                trajectory_measurement_grade: HET_PM_V2_TRAJECTORY_GRADE.to_string(),
-                monitor_tick_ms: self.config.tick_interval_ms,
-                v1_prequote: prequote_label(v1_prequote),
-                v1_crash_prequote: format!("{crash_prequote:?}"),
-                v1_final: None,
-                v1_authority_receipt: None,
-                v2_prequote: format!("{:?}", v2_prequote.candidate),
-                v2_final: Some(format!("{v2_final:?}")),
-                v2_crash_quote_decision,
-                v2_winning_gate: v2_prequote.winning_gate,
-                v2_suppressed_gates_mask: v2_prequote.suppressed_gates_mask,
-                consumed_by_policy: false,
-                v1_shadow_authority: true,
-                v2_shadow_authority: false,
-                live_authority: false,
-                v2_economic_mutation: false,
-                v2_proposal_created: false,
-                v2_time_stop_mutation: false,
-                duplicate_action_observed: false,
-                route_build_authority_changed: false,
-                terminal_isolation_violation: false,
-                trajectory: bundle.v2.trajectory.clone(),
-                vitality: bundle.v2.vitality.clone(),
-                route_status: bundle.v2.route_status,
-                entry_value_quote_raw: bundle.v2.entry_value_quote_raw,
-                entry_value_source: bundle.v2.entry_value_source,
-                entry_value_authoritative_for_shadow: bundle
-                    .v2
-                    .entry_value_authoritative_for_shadow,
-                anchor_before: bundle.v2.executable_peak_anchor.clone(),
-                anchor_request: anchor_request_label,
-                anchor_applied: false,
-                quote_keys,
-                quote_resolution_count: quote_statuses.len() as u8,
-                quote_statuses,
-                current_executable_value_sol,
-                current_executable_gross_return_bps,
-                known_estimated_costs_sol,
-            },
+            comparison_core: PreparedV1V2ComparisonCoreV1::prepare(record),
             quote_cells,
             anchor_request,
         }
@@ -6574,7 +6678,7 @@ impl MonitoringEngine {
         };
         let v1_prequote = ExitPolicyV1::evaluate_prequote(&bundle.base, v1_policy);
         let crash_prequote = ExitPolicyV1::evaluate_crash_guard_prequote(&bundle.base, v1_policy);
-        let mut prepared = self.prepare_het_pm_v2_tick(HetPmV2TickInput {
+        let prepared = self.prepare_het_pm_v2_tick(HetPmV2TickInput {
             bundle: &bundle,
             latest_snapshot: latest_snapshot.as_ref(),
             raw_canonical_snapshot: raw_canonical_snapshot.as_ref(),
@@ -6600,11 +6704,7 @@ impl MonitoringEngine {
                 },
             )
             .await;
-        prepared.record.terminal_tick =
-            matches!(receipt.outcome, V1AuthorityTickOutcomeV1::TerminalApplied);
-        prepared.record.v1_final = Some(receipt.outcome.as_label().to_string());
-        prepared.record.v1_authority_receipt = Some(receipt);
-        prepared.record.anchor_applied = self.apply_het_pm_v2_anchor_after_v1(
+        let anchor_applied = self.apply_het_pm_v2_anchor_after_v1(
             base_mint,
             &prepared.anchor_request,
             &prepared.quote_cells,
@@ -6612,7 +6712,26 @@ impl MonitoringEngine {
             het_policy.config_hash(),
             now_ms,
         );
-        self.append_het_pm_v2_observation(&prepared.record);
+        let prepared_comparison = prepared.comparison_core.finalize(receipt, anchor_applied);
+        if self.has_pending_terminal_commit(base_mint) {
+            match self
+                .attach_prepared_het_comparison_to_pending_terminal(base_mint, prepared_comparison)
+            {
+                Ok(()) => {}
+                Err(unattached) => {
+                    let status = self.persist_prepared_het_pm_v2_comparison(&unattached);
+                    error!(
+                        base_mint = %base_mint,
+                        comparison_id = %unattached.correlation().comparison_id,
+                        write_status = status.as_label(),
+                        "PostBuyGuardian: terminal comparison could not attach to pending commit; persisted before fail-open canonical retry"
+                    );
+                }
+            }
+            self.retry_pending_terminal_commit(base_mint, now_ms).await;
+        } else {
+            let _ = self.persist_prepared_het_pm_v2_comparison(&prepared_comparison);
+        }
     }
 
     async fn prepare_and_run_shadow_runtime_tick_v1(
@@ -6653,6 +6772,9 @@ impl MonitoringEngine {
                 },
             )
             .await;
+        if self.has_pending_terminal_commit(base_mint) {
+            self.retry_pending_terminal_commit(base_mint, now_ms).await;
+        }
     }
 
     async fn run_shadow_runtime_tick_v1(
@@ -6674,6 +6796,7 @@ impl MonitoringEngine {
         let mut receipt_action_id = None;
         let mut receipt_reason = None;
         let mut receipt_crash_quote_decision = None;
+        let mut exit_applied = false;
 
         if let PreQuoteDecision::UnknownEvidence { reason } = authoritative_prequote {
             receipt_outcome = V1AuthorityTickOutcomeV1::Blocked;
@@ -7109,9 +7232,10 @@ impl MonitoringEngine {
                         fill_price: truth.exit_price_sol,
                     };
                     self.emit_shadow_exit_for_action(&action, &exit, &truth, now_ms);
+                    exit_applied = true;
                     receipt_action_id = Some(action.action_id.clone());
                     receipt_reason = Some(format!("{:?}", action.reason));
-                    self.finish_resolved_shadow_position(action, now_ms).await;
+                    self.finish_resolved_shadow_position(action, now_ms);
                 }
                 FinalPolicyDecision::UnknownEvidence { reason } => {
                     receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery;
@@ -7142,8 +7266,17 @@ impl MonitoringEngine {
                 pos.pending_terminal_commit.is_some(),
             )
         });
+        let terminal_commit_status = match position_state {
+            None => V1TerminalCommitStatusV1::Committed,
+            Some((_, true)) => V1TerminalCommitStatusV1::Pending,
+            Some(_) => V1TerminalCommitStatusV1::NotRequired,
+        };
         match position_state {
-            None => receipt_outcome = V1AuthorityTickOutcomeV1::TerminalApplied,
+            None if exit_applied => receipt_outcome = V1AuthorityTickOutcomeV1::ExitApplied,
+            None => receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery,
+            Some((_, true)) if exit_applied => {
+                receipt_outcome = V1AuthorityTickOutcomeV1::ExitApplied;
+            }
             Some((_, true)) => receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery,
             Some((true, false))
                 if !matches!(receipt_outcome, V1AuthorityTickOutcomeV1::ApplyRejected) =>
@@ -7158,6 +7291,14 @@ impl MonitoringEngine {
             state_revision: snapshot.guard().state_revision(),
             remaining_quantity_raw: snapshot.remaining_token_amount_raw(),
             outcome: receipt_outcome,
+            exit_apply_status: if exit_applied {
+                V1ExitApplyStatusV1::Applied
+            } else if matches!(receipt_outcome, V1AuthorityTickOutcomeV1::ApplyRejected) {
+                V1ExitApplyStatusV1::Rejected
+            } else {
+                V1ExitApplyStatusV1::NotApplied
+            },
+            terminal_commit_status,
             action_id: receipt_action_id,
             reason: receipt_reason,
             crash_quote_decision: receipt_crash_quote_decision,
@@ -7198,13 +7339,7 @@ impl MonitoringEngine {
                     action_id: action.action_id.clone(),
                     reason: unresolved_reason,
                 };
-                if self
-                    .stage_terminal_commit(&action, terminal, disposition)
-                    .is_ok()
-                {
-                    self.retry_pending_terminal_commit(&action.base_mint, now_ms)
-                        .await;
-                }
+                let _ = self.stage_terminal_commit(&action, terminal, disposition);
             }
             Err(PositionApplyError::StaleRevision) => {}
             Err(error) => debug!(
@@ -7244,7 +7379,7 @@ impl MonitoringEngine {
         );
     }
 
-    async fn finish_resolved_shadow_position(&self, action: ShadowExitActionHandle, now_ms: u64) {
+    fn finish_resolved_shadow_position(&self, action: ShadowExitActionHandle, now_ms: u64) {
         let terminal = {
             let positions = self.positions.read();
             let Some(pos) = positions.get(&action.base_mint) else {
@@ -7270,13 +7405,7 @@ impl MonitoringEngine {
             action_id: action.action_id.clone(),
             reason: action.reason.reason_code().to_string(),
         };
-        if self
-            .stage_terminal_commit(&action, terminal, disposition)
-            .is_ok()
-        {
-            self.retry_pending_terminal_commit(&action.base_mint, now_ms)
-                .await;
-        }
+        let _ = self.stage_terminal_commit(&action, terminal, disposition);
     }
 
     fn has_pending_terminal_commit(&self, base_mint: &Pubkey) -> bool {
@@ -7314,12 +7443,65 @@ impl MonitoringEngine {
             disposition,
             last_attempt_ms: None,
             lifecycle_jsonl_committed: false,
+            prepared_het_comparison: None,
+            het_comparison_write_status: HetComparisonWriteStatusV1::NotApplicable,
         });
         Ok(())
     }
 
+    fn apply_het_comparison_status_to_terminal_record(
+        record: &mut ShadowLifecycleRecord,
+        prepared: &PreparedHetComparisonV1,
+        status: &HetComparisonWriteStatusV1,
+    ) {
+        let correlation = prepared.correlation();
+        record.het_pm_v2_comparison_id = Some(correlation.comparison_id.clone());
+        record.het_pm_v2_source_snapshot_id = Some(correlation.source_snapshot_id.clone());
+        record.het_pm_v2_comparison_write_status = Some(status.as_label().to_string());
+        record.het_pm_v2_comparison_skip_reason = status
+            .skip_reason()
+            .map(|reason| reason.as_label().to_string());
+    }
+
+    fn attach_prepared_het_comparison_to_pending_terminal(
+        &self,
+        base_mint: &Pubkey,
+        prepared: PreparedHetComparisonV1,
+    ) -> Result<(), PreparedHetComparisonV1> {
+        let Some(action_id) = prepared.action_id().map(str::to_string) else {
+            return Err(prepared);
+        };
+        let initial_status = match &prepared {
+            PreparedHetComparisonV1::Ready { .. } => HetComparisonWriteStatusV1::NotAttempted,
+            PreparedHetComparisonV1::Skipped { reason, detail, .. } => {
+                HetComparisonWriteStatusV1::Skipped {
+                    reason: *reason,
+                    detail: detail.clone(),
+                }
+            }
+        };
+        let mut positions = self.positions.write();
+        let Some(pos) = positions.get_mut(base_mint) else {
+            return Err(prepared);
+        };
+        let Some(pending) = pos.pending_terminal_commit.as_mut() else {
+            return Err(prepared);
+        };
+        if pending.action_id != action_id || pending.prepared_het_comparison.is_some() {
+            return Err(prepared);
+        }
+        Self::apply_het_comparison_status_to_terminal_record(
+            &mut pending.record,
+            &prepared,
+            &initial_status,
+        );
+        pending.prepared_het_comparison = Some(prepared);
+        pending.het_comparison_write_status = initial_status;
+        Ok(())
+    }
+
     async fn retry_pending_terminal_commit(&self, base_mint: &Pubkey, now_ms: u64) {
-        let pending = {
+        let mut pending = {
             let mut positions = self.positions.write();
             let Some(pos) = positions.get_mut(base_mint) else {
                 return;
@@ -7336,6 +7518,40 @@ impl MonitoringEngine {
             pending.last_attempt_ms = Some(now_ms);
             pending.clone()
         };
+
+        if matches!(
+            pending.het_comparison_write_status,
+            HetComparisonWriteStatusV1::NotAttempted
+        ) {
+            if let Some(prepared) = pending.prepared_het_comparison.as_ref() {
+                let write_status = self.persist_prepared_het_pm_v2_comparison(prepared);
+                let mut positions = self.positions.write();
+                let Some(pos) = positions.get_mut(base_mint) else {
+                    return;
+                };
+                let Some(current) = pos.pending_terminal_commit.as_mut() else {
+                    return;
+                };
+                if current.action_id != pending.action_id
+                    || !matches!(
+                        current.het_comparison_write_status,
+                        HetComparisonWriteStatusV1::NotAttempted
+                    )
+                {
+                    return;
+                }
+                let Some(current_prepared) = current.prepared_het_comparison.clone() else {
+                    return;
+                };
+                Self::apply_het_comparison_status_to_terminal_record(
+                    &mut current.record,
+                    &current_prepared,
+                    &write_status,
+                );
+                current.het_comparison_write_status = write_status;
+                pending = current.clone();
+            }
+        }
 
         let receipt =
             self.append_shadow_record(&pending.record, !pending.lifecycle_jsonl_committed);
@@ -8108,6 +8324,15 @@ mod tests {
             .collect()
     }
 
+    fn terminal_het_source_ref<'a>(terminal: &'a Value, field: &str) -> Option<&'a str> {
+        let prefix = format!("het_pm_v2:{field}:");
+        terminal["payload"]["record"]["envelope"]["source_refs"]
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .find_map(|value| value.strip_prefix(&prefix))
+    }
+
     fn shadow_v2_harness_config_for_dir(path: &Path) -> ShadowV2ValidationHarnessConfig {
         ShadowV2ValidationHarnessConfig::new(
             "shadow-v2-pr18-test",
@@ -8187,6 +8412,117 @@ mod tests {
         let harness = ShadowV2ValidationHarness::new(shadow_v2_harness_config_for_dir(path))
             .expect("terminal truth harness");
         engine.set_shadow_v2_validation_harness(Arc::new(Mutex::new(harness)));
+    }
+
+    struct HetTerminalTestContext {
+        engine: Arc<MonitoringEngine>,
+        mint: Pubkey,
+        terminal_rx: oneshot::Receiver<ShadowTerminalDisposition>,
+        snapshot: MarketSnapshot,
+        tick_ms: u64,
+        sidecar_path: PathBuf,
+        lifecycle_path: PathBuf,
+        canonical_path: PathBuf,
+    }
+
+    fn setup_het_terminal_exit(
+        tmp: &TempDir,
+        fail_canonical_terminal: bool,
+        fail_sidecar: bool,
+    ) -> HetTerminalTestContext {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid HET terminal test config");
+        let lifecycle_path = tmp.path().join("shadow_lifecycle.jsonl");
+        let sidecar_path = tmp.path().join("het_pm_v2_observations_v1.jsonl");
+        let canonical_path = tmp.path().join("shadow_position_event_v2.jsonl");
+        enable_terminal_truth_harness(&mut engine, tmp.path());
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_path.clone()));
+        engine.set_het_pm_v2_observation_log_path(Some(sidecar_path.clone()));
+        if fail_canonical_terminal {
+            std::fs::create_dir(&canonical_path).expect("canonical writer fault directory");
+        }
+        if fail_sidecar {
+            std::fs::create_dir(&sidecar_path).expect("sidecar writer fault directory");
+        }
+
+        let mint = Pubkey::new_unique();
+        let registered = engine
+            .register_shadow_position_with_terminal(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000_000),
+                Some(1_000_000),
+                PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("het-terminal-boundary".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "het-terminal-boundary".to_string(),
+                    entry_order_id: "het-terminal-boundary-entry".to_string(),
+                    quote_id: "het-terminal-boundary-quote".to_string(),
+                    slot: Some(10),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:het-terminal-boundary".to_string()),
+                    position_epoch: Some(11),
+                    opened_at_ms: Some(1_000),
+                },
+            )
+            .expect("valid HET terminal test registration");
+        let snapshot = MarketSnapshot {
+            slot: Some(11),
+            timestamp_ms: 2_000,
+            price_sol_per_token: 10.0,
+            price_state: PriceState::Valid,
+            market_cap_sol: 10.0,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 10.0,
+            ..MarketSnapshot::default()
+        };
+
+        HetTerminalTestContext {
+            engine: Arc::new(engine),
+            mint,
+            terminal_rx: registered.terminal_rx,
+            snapshot,
+            tick_ms: 2_000,
+            sidecar_path,
+            lifecycle_path,
+            canonical_path,
+        }
+    }
+
+    async fn complete_het_terminal_retry(tmp: &TempDir) -> (HetTerminalTestContext, Value, Value) {
+        let context = setup_het_terminal_exit(tmp, true, false);
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+        let comparison = read_jsonl_rows(&context.sidecar_path)
+            .into_iter()
+            .next()
+            .expect("pre-canonical HET comparison");
+        std::fs::remove_dir(&context.canonical_path).expect("repair canonical writer");
+        context
+            .engine
+            .run_shadow_runtime_tick(
+                &context.mint,
+                None,
+                context
+                    .tick_ms
+                    .saturating_add(SHADOW_QUOTE_RETRY_INTERVAL_MS),
+            )
+            .await;
+        let terminal = read_jsonl_rows(&context.canonical_path)
+            .into_iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("canonical terminal outcome");
+        (context, comparison, terminal)
     }
 
     #[test]
@@ -12603,6 +12939,254 @@ mod tests {
                 .filter(|row| row["event_kind"] == "TERMINAL_TRUTH")
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn het_exit_tick_persists_original_pre_mutation_comparison() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut context = setup_het_terminal_exit(&tmp, false, false);
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        let comparison_rows = read_jsonl_rows(&context.sidecar_path);
+        assert_eq!(comparison_rows.len(), 1);
+        let comparison = &comparison_rows[0];
+        assert_eq!(comparison["terminal_tick"], true);
+        assert_eq!(comparison["v1_final"], "ExitApplied");
+        assert_eq!(
+            comparison["v1_authority_receipt"]["exit_apply_status"],
+            "applied"
+        );
+        assert_eq!(
+            comparison["v1_authority_receipt"]["terminal_commit_status"],
+            "pending"
+        );
+        assert_eq!(
+            comparison["snapshot_id"],
+            comparison["v1_authority_receipt"]["snapshot_id"]
+        );
+        assert_eq!(
+            comparison["state_revision"],
+            comparison["v1_authority_receipt"]["state_revision"]
+        );
+        assert_eq!(
+            comparison["remaining_quantity_raw"],
+            comparison["v1_authority_receipt"]["remaining_quantity_raw"]
+        );
+
+        let terminal_rows = read_jsonl_rows(&context.canonical_path);
+        let terminal = terminal_rows
+            .iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("canonical terminal truth");
+        assert_eq!(
+            terminal_het_source_ref(terminal, "comparison_id"),
+            comparison["comparison_id"].as_str()
+        );
+        assert_eq!(
+            terminal_het_source_ref(terminal, "source_snapshot_id"),
+            comparison["snapshot_id"].as_str()
+        );
+        assert_eq!(
+            terminal_het_source_ref(terminal, "comparison_write_status"),
+            Some("written")
+        );
+        assert_eq!(
+            terminal_het_source_ref(terminal, "v1_action_id"),
+            comparison["v1_authority_receipt"]["action_id"].as_str()
+        );
+        assert_eq!(context.engine.active_position_count(), 0);
+        assert!(matches!(
+            context.terminal_rx.try_recv(),
+            Ok(ShadowTerminalDisposition::SimulatedClosed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn het_terminal_retry_uses_original_comparison_without_v2_reevaluation() {
+        let tmp = TempDir::new().expect("tempdir");
+        let context = setup_het_terminal_exit(&tmp, true, false);
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+        let before_retry = read_jsonl_rows(&context.sidecar_path);
+        assert_eq!(before_retry.len(), 1);
+        let comparison_id = before_retry[0]["comparison_id"].clone();
+        let snapshot_id = before_retry[0]["snapshot_id"].clone();
+        {
+            let positions = context.engine.positions.read();
+            let pending = positions[&context.mint]
+                .pending_terminal_commit
+                .as_ref()
+                .expect("retained terminal commit");
+            assert!(matches!(
+                pending.het_comparison_write_status,
+                HetComparisonWriteStatusV1::Written
+            ));
+            let prepared = pending
+                .prepared_het_comparison
+                .as_ref()
+                .expect("retained original comparison");
+            assert_eq!(prepared.correlation().comparison_id, comparison_id);
+            assert_eq!(prepared.correlation().source_snapshot_id, snapshot_id);
+        }
+
+        std::fs::remove_dir(&context.canonical_path).expect("repair canonical writer");
+        context
+            .engine
+            .run_shadow_runtime_tick(
+                &context.mint,
+                None,
+                context
+                    .tick_ms
+                    .saturating_add(SHADOW_QUOTE_RETRY_INTERVAL_MS),
+            )
+            .await;
+
+        let after_retry = read_jsonl_rows(&context.sidecar_path);
+        assert_eq!(
+            after_retry.len(),
+            1,
+            "retry must not reevaluate or rewrite V2"
+        );
+        assert_eq!(after_retry[0]["comparison_id"], comparison_id);
+        assert_eq!(after_retry[0]["snapshot_id"], snapshot_id);
+        let terminal = read_jsonl_rows(&context.canonical_path)
+            .into_iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("terminal truth after retry");
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_id"),
+            comparison_id.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn het_terminal_retry_success_emits_exactly_one_terminal_outcome_for_original_action() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (mut context, comparison, terminal) = complete_het_terminal_retry(&tmp).await;
+        let canonical_rows = read_jsonl_rows(&context.canonical_path);
+        assert_eq!(
+            canonical_rows
+                .iter()
+                .filter(|row| row["event_kind"] == "TERMINAL_TRUTH")
+                .count(),
+            1
+        );
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_id"),
+            comparison["comparison_id"].as_str()
+        );
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "v1_action_id"),
+            comparison["v1_authority_receipt"]["action_id"].as_str()
+        );
+        assert_eq!(context.engine.active_position_count(), 0);
+        assert!(matches!(
+            context.terminal_rx.try_recv(),
+            Ok(ShadowTerminalDisposition::SimulatedClosed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn exit_applied_with_terminal_commit_pending_is_not_labeled_generic_pending_recovery() {
+        let tmp = TempDir::new().expect("tempdir");
+        let context = setup_het_terminal_exit(&tmp, true, false);
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        let comparison = read_jsonl_rows(&context.sidecar_path)
+            .into_iter()
+            .next()
+            .expect("exit comparison");
+        assert_eq!(comparison["v1_final"], "ExitApplied");
+        assert_eq!(
+            comparison["v1_authority_receipt"]["outcome"],
+            "exit_applied"
+        );
+        assert_eq!(
+            comparison["v1_authority_receipt"]["exit_apply_status"],
+            "applied"
+        );
+        assert_eq!(
+            comparison["v1_authority_receipt"]["terminal_commit_status"],
+            "pending"
+        );
+        assert!(context.engine.has_pending_terminal_commit(&context.mint));
+    }
+
+    #[tokio::test]
+    async fn process_boundary_after_canonical_commit_cannot_silently_erase_exit_comparison() {
+        let tmp = TempDir::new().expect("tempdir");
+        let context = setup_het_terminal_exit(&tmp, true, false);
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        let comparison_rows = read_jsonl_rows(&context.sidecar_path);
+        assert_eq!(comparison_rows.len(), 1);
+        assert!(context.canonical_path.is_dir());
+        assert!(context.engine.has_pending_terminal_commit(&context.mint));
+        let lifecycle_rows = read_jsonl_rows(&context.lifecycle_path);
+        let closed = lifecycle_rows
+            .iter()
+            .find(|row| row["record_type"] == "position_closed")
+            .expect("operational terminal record");
+        assert_eq!(closed["het_pm_v2_comparison_write_status"], "written");
+        assert_eq!(
+            closed["het_pm_v2_comparison_id"],
+            comparison_rows[0]["comparison_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_sidecar_failure_records_typed_skipped_without_blocking_capacity_release() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut context = setup_het_terminal_exit(&tmp, false, true);
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        assert_eq!(context.engine.active_position_count(), 0);
+        assert!(!context.engine.has_pending_terminal_commit(&context.mint));
+        assert!(matches!(
+            context.terminal_rx.try_recv(),
+            Ok(ShadowTerminalDisposition::SimulatedClosed { .. })
+        ));
+        let lifecycle_rows = read_jsonl_rows(&context.lifecycle_path);
+        let closed = lifecycle_rows
+            .iter()
+            .find(|row| row["record_type"] == "position_closed")
+            .expect("operational terminal record");
+        assert_eq!(closed["het_pm_v2_comparison_write_status"], "skipped");
+        assert_eq!(
+            closed["het_pm_v2_comparison_skip_reason"],
+            "writer_io_failed"
+        );
+        let terminal = read_jsonl_rows(&context.canonical_path)
+            .into_iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("canonical terminal truth");
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_write_status"),
+            Some("skipped")
+        );
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_skip_reason"),
+            Some("writer_io_failed")
         );
     }
 
