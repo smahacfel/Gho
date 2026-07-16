@@ -12,14 +12,75 @@ import argparse
 import hashlib
 import json
 import math
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
 TOOL_ID = "het_pm_v2_analysis_v1"
 SCHEMA_VERSION = 1
+POLICY_ID = "hierarchical_executable_trajectory_pm_v2"
+POLICY_VERSION = 2
+SAMPLING_MODE = "latest_canonical_state_per_monitor_tick"
+TRAJECTORY_GRADE = "online_non_lookahead_sampled_trajectory"
 COLLAPSED_CANONICAL_UPDATES = 1 << 3
 SAME_SLOT_ONLY = 1 << 4
+ROUTES = {"pump_curve_supported", "curve_complete_pump_swap_unsupported", "unknown"}
+TRAJECTORY_QUALITIES = {
+    "usable", "partial_history", "insufficient_samples", "stale", "invalid", "unavailable"
+}
+VITALITY_STATES = {"alive", "weak", "heartbeat_only", "stale_or_unknown"}
+WINNING_GATES = {
+    "pending", "integrity", "crash", "hard_loss", "executable_trailing",
+    "vitality_decay", "absolute_max_hold", "hold",
+}
+ENTRY_VALUE_SOURCES = {
+    "persisted_entry_amount", "diagnostic_price_times_quantity_fallback", "unavailable"
+}
+V1_OUTCOMES = {
+    "hold", "proposal_started", "terminal_applied", "pending_recovery", "blocked", "apply_rejected"
+}
+V1_FINAL_BY_OUTCOME = {
+    "hold": "Hold",
+    "proposal_started": "ProposalStarted",
+    "terminal_applied": "TerminalApplied",
+    "pending_recovery": "PendingRecovery",
+    "blocked": "Blocked",
+    "apply_rejected": "ApplyRejected",
+}
+V1_UNKNOWN_REASONS = {
+    "PolicyConfigMismatch", "MarkUnavailable", "MarkStale", "MarkInvalid",
+    "InvalidEntryPrice", "InvalidEntryQuantity", "InvalidRemainingQuantity",
+    "QuoteUnavailable", "QuoteStale", "QuoteSemanticViolation", "QuoteNoFill",
+    "QuoteQuantityMismatch",
+}
+V1_CANDIDATE_LABELS = {
+    "stop_loss", "take_profit", "inactivity", "absolute_max_hold", "crash_guard"
+}
+CRASH_NOT_TRIGGERED_REASONS = {
+    "Disabled", "NotShadowLane", "InvalidPositionContract", "PendingProposal",
+    "MissingSample", "StaleSample", "InsufficientDistinctSlots", "InvalidOrdering",
+    "NonDescendingPath", "ShortWindowDropTooSmall", "PeakDrawdownTooSmall",
+}
+V2_EXIT_REASONS = {
+    "Crash", "HardLoss", "ExecutableTrailing", "VitalityDecay", "AbsoluteMaxHold"
+}
+V2_UNKNOWN_REASONS = {
+    "PolicyDisabled", "InvalidPositionContract", "EntryCapitalUnavailable",
+    "MarkUnavailable", "MarkStale", "MarkInvalid", "TrajectoryUnavailable",
+    "TrajectoryStale", "TrajectoryInvalid", "RouteUnsupported", "RouteUnknown",
+    "VitalityEvidenceStale", "AnchorUnavailable", "AnchorPositionMismatch",
+    "AnchorEpochMismatch", "AnchorQuantityMismatch", "AnchorRouteMismatch",
+    "AnchorQuoteModelMismatch", "AnchorPolicyConfigMismatch", "AnchorRevisionAhead",
+    "QuoteUnavailable", "QuoteQuantityMismatch", "QuoteInvalid",
+}
+CRASH_QUOTE_REJECTION_REASONS_DEBUG = {
+    "QuoteNotExecutable", "QuoteQuantityMismatch", "ExecutableReturnNotSevereEnough"
+}
+QUOTE_FAILURE_KINDS = {
+    "MissingSnapshot", "StaleSnapshot", "InvalidReserves", "InvalidNormalization",
+    "QuantityMismatch", "ZeroOutput", "SemanticViolation", "InternalFailure",
+}
 
 
 class ContractError(ValueError):
@@ -42,9 +103,271 @@ def require(record: dict[str, Any], name: str, expected_type: type | tuple[type,
     if name not in record:
         raise ContractError(f"missing required field: {name}")
     value = record[name]
-    if not isinstance(value, expected_type) or isinstance(value, bool) and expected_type is not bool:
+    allowed_types = expected_type if isinstance(expected_type, tuple) else (expected_type,)
+    if not isinstance(value, allowed_types) or isinstance(value, bool) and bool not in allowed_types:
         raise ContractError(f"invalid type for field: {name}")
     return value
+
+
+def require_optional(
+    record: dict[str, Any], name: str, expected_type: type | tuple[type, ...]
+) -> Any:
+    value = require(record, name, (expected_type, type(None)) if isinstance(expected_type, type) else (*expected_type, type(None)))
+    return value
+
+
+def reject_non_finite(value: Any, path: str = "record") -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ContractError(f"non-finite numeric value at {path}")
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            reject_non_finite(nested, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            reject_non_finite(nested, f"{path}[{index}]")
+
+
+def validate_trajectory(record: dict[str, Any]) -> None:
+    trajectory = require(record, "trajectory", dict)
+    for name in (
+        "return_1500ms_bps", "return_5s_bps", "return_15s_bps",
+        "drawdown_from_peak_bps", "peak_giveback_velocity_bps_per_sec",
+    ):
+        require_optional(trajectory, name, int)
+    require_optional(trajectory, "peak_mark_price_sol", (int, float))
+    for name in (
+        "peak_sample_slot", "peak_sample_timestamp_ms", "time_since_peak_ms",
+        "newest_sample_slot", "newest_sample_timestamp_ms", "newest_sample_age_ms",
+    ):
+        require_optional(trajectory, name, int)
+    require(trajectory, "distinct_slots_1500ms", int)
+    require(trajectory, "state_update_delta_since_previous_sample", int)
+    quality = require(trajectory, "quality", str)
+    if quality not in TRAJECTORY_QUALITIES:
+        raise ContractError(f"invalid trajectory quality: {quality}")
+    require(trajectory, "flags", int)
+
+
+def validate_vitality(record: dict[str, Any]) -> None:
+    vitality = require(record, "vitality", dict)
+    state = require(vitality, "current_state", str)
+    if state not in VITALITY_STATES:
+        raise ContractError(f"invalid vitality state: {state}")
+    require(vitality, "consecutive_non_alive_windows", int)
+    require_optional(vitality, "last_window_at_ms", int)
+    require_optional(vitality, "last_alive_at_ms", int)
+    require_optional(vitality, "latest_window_price_delta_bps", int)
+    require_optional(vitality, "latest_window_state_update_delta", int)
+    require(vitality, "quality_fresh", bool)
+
+
+def validate_crash_quote_decision(value: Any, name: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ContractError(f"{name} must be an object or null")
+    status = require(value, "status", str)
+    if status not in {"confirmed", "rejected_by_quote", "blocked_by_data"}:
+        raise ContractError(f"invalid {name}.status: {status}")
+    if status == "rejected_by_quote":
+        reason_payload = require(value, "reason", (str, dict))
+        reason = (
+            require(reason_payload, "reason", str)
+            if isinstance(reason_payload, dict)
+            else reason_payload
+        )
+        if reason not in {
+            "quote_quantity_mismatch", "quote_not_executable", "executable_return_not_severe_enough"
+        }:
+            raise ContractError(f"invalid {name}.reason: {reason}")
+
+
+def validate_anchor(value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ContractError("anchor_before must be an object or null")
+    for name in ("position_id", "route_id", "quote_model_id", "policy_config_hash", "source_snapshot_id"):
+        require(value, name, str)
+    for name in ("position_epoch", "remaining_quantity_raw", "quote_state_revision", "anchor_seq", "created_at_ms"):
+        require(value, name, int)
+    require_optional(value, "source_sample_slot", int)
+    require_optional(value, "source_sample_timestamp_ms", int)
+    require(value, "peak_mark_price_sol", (int, float))
+    require_optional(value, "executable_value_quote_raw", int)
+    require(value, "executable_value_sol", (int, float))
+    require_optional(value, "executable_gross_return_bps", int)
+
+
+def validate_v1_prequote(value: str, source: str) -> None:
+    if value == "hold":
+        return
+    if value.startswith("unknown:") and value.removeprefix("unknown:") in V1_UNKNOWN_REASONS:
+        return
+    if value.startswith("quote_required:") and value.removeprefix("quote_required:") in V1_CANDIDATE_LABELS:
+        return
+    raise ContractError(f"{source}: invalid v1_prequote enum label")
+
+
+def validate_v1_crash_prequote(value: str, source: str) -> None:
+    if value == "Disabled":
+        return
+    not_triggered = re.fullmatch(r"NotTriggered \{ reason: ([A-Za-z]+) \}", value)
+    if not_triggered and not_triggered.group(1) in CRASH_NOT_TRIGGERED_REASONS:
+        return
+    if value == "QuoteRequired { candidate: ExitCandidate { reason: CrashGuard } }":
+        return
+    raise ContractError(f"{source}: invalid v1_crash_prequote enum label")
+
+
+def validate_v2_prequote(value: str, source: str) -> None:
+    if value in {"Hold", "Pending"}:
+        return
+    blocked = re.fullmatch(r"Blocked\(([A-Za-z]+)\)", value)
+    if blocked and blocked.group(1) in V2_UNKNOWN_REASONS:
+        return
+    required = re.fullmatch(r"QuoteRequired\(([A-Za-z]+)\)", value)
+    if required and required.group(1) in V2_EXIT_REASONS:
+        return
+    raise ContractError(f"{source}: invalid v2_prequote enum label")
+
+
+def validate_v2_final(value: str, source: str) -> None:
+    if value in {"Hold", "Pending", "CrashBlockedByData"}:
+        return
+    blocked = re.fullmatch(r"Blocked\(([A-Za-z]+)\)", value)
+    if blocked and blocked.group(1) in V2_UNKNOWN_REASONS:
+        return
+    rejected = re.fullmatch(
+        r"CrashRejectedByQuote \{ reason: ([A-Za-z]+) \}", value
+    )
+    if rejected and rejected.group(1) in CRASH_QUOTE_REJECTION_REASONS_DEBUG:
+        return
+    exit_all = re.fullmatch(
+        r"ExitAll \{ reason: ([A-Za-z]+), quantity_raw: ([0-9]+), "
+        r"executable_gross_return_bps: (-?[0-9]+) \}",
+        value,
+    )
+    if exit_all and exit_all.group(1) in V2_EXIT_REASONS and int(exit_all.group(2)) > 0:
+        return
+    raise ContractError(f"{source}: invalid v2_final enum label")
+
+
+def validate_quote_status(value: str, source: str) -> None:
+    if value == "resolved":
+        return
+    blocked = re.fullmatch(r"blocked:([A-Za-z]+)", value)
+    if blocked and blocked.group(1) in QUOTE_FAILURE_KINDS:
+        return
+    raise ContractError(f"{source}: invalid quote status enum label")
+
+
+def validate_anchor_request(value: str | None, source: str) -> None:
+    if value is None or value == "quote_required_on_new_canonical_peak":
+        return
+    blocked = re.fullmatch(r"blocked:([A-Za-z]+)", value)
+    if blocked and blocked.group(1) in V2_UNKNOWN_REASONS:
+        return
+    raise ContractError(f"{source}: invalid anchor_request enum label")
+
+
+def validate_record(record: dict[str, Any], source: str) -> None:
+    reject_non_finite(record, source)
+    if require(record, "schema_version", int) != SCHEMA_VERSION:
+        raise ContractError(f"{source}: unsupported schema_version")
+    if require(record, "policy_id", str) != POLICY_ID:
+        raise ContractError(f"{source}: unexpected policy_id")
+    if require(record, "policy_version", int) != POLICY_VERSION:
+        raise ContractError(f"{source}: unsupported policy_version")
+    if not require(record, "policy_config_hash", str):
+        raise ContractError(f"{source}: empty policy_config_hash")
+    if not require(record, "run_id", str):
+        raise ContractError(f"{source}: empty run_id")
+    if require(record, "lane", str) != "shadow":
+        raise ContractError(f"{source}: lane must be shadow")
+    if not require(record, "position_id", str):
+        raise ContractError(f"{source}: empty position_id")
+    require(record, "position_epoch", int)
+    state_revision = require(record, "state_revision", int)
+    remaining_quantity = require(record, "remaining_quantity_raw", int)
+    if remaining_quantity <= 0:
+        raise ContractError(f"{source}: remaining_quantity_raw must be positive")
+    snapshot_id = require(record, "snapshot_id", str)
+    if not snapshot_id:
+        raise ContractError(f"{source}: empty snapshot_id")
+    require(record, "observation_timestamp_ms", int)
+    terminal_tick = require(record, "terminal_tick", bool)
+    if require(record, "trajectory_sampling_mode", str) != SAMPLING_MODE:
+        raise ContractError(f"{source}: unexpected trajectory_sampling_mode")
+    if require(record, "trajectory_measurement_grade", str) != TRAJECTORY_GRADE:
+        raise ContractError(f"{source}: unexpected trajectory_measurement_grade")
+    if require(record, "monitor_tick_ms", int) <= 0:
+        raise ContractError(f"{source}: monitor_tick_ms must be positive")
+
+    validate_v1_prequote(require(record, "v1_prequote", str), source)
+    validate_v1_crash_prequote(require(record, "v1_crash_prequote", str), source)
+    v1_final = require(record, "v1_final", str)
+    receipt = require(record, "v1_authority_receipt", dict)
+    if require(receipt, "snapshot_id", str) != snapshot_id:
+        raise ContractError(f"{source}: V1 receipt snapshot_id mismatch")
+    if require(receipt, "state_revision", int) != state_revision:
+        raise ContractError(f"{source}: V1 receipt state_revision mismatch")
+    if require(receipt, "remaining_quantity_raw", int) != remaining_quantity:
+        raise ContractError(f"{source}: V1 receipt quantity mismatch")
+    outcome = require(receipt, "outcome", str)
+    if outcome not in V1_OUTCOMES:
+        raise ContractError(f"{source}: invalid V1 receipt outcome")
+    if v1_final != V1_FINAL_BY_OUTCOME[outcome]:
+        raise ContractError(f"{source}: v1_final disagrees with V1 receipt outcome")
+    require_optional(receipt, "action_id", str)
+    require_optional(receipt, "reason", str)
+    validate_crash_quote_decision(require_optional(receipt, "crash_quote_decision", dict), "v1 receipt crash_quote_decision")
+    if terminal_tick != (outcome == "terminal_applied"):
+        raise ContractError(f"{source}: terminal_tick disagrees with V1 receipt")
+
+    validate_v2_prequote(require(record, "v2_prequote", str), source)
+    validate_v2_final(require(record, "v2_final", str), source)
+    validate_crash_quote_decision(require_optional(record, "v2_crash_quote_decision", dict), "v2_crash_quote_decision")
+    if require(record, "v2_winning_gate", str) not in WINNING_GATES:
+        raise ContractError(f"{source}: invalid v2_winning_gate")
+    require(record, "v2_suppressed_gates_mask", int)
+    if require(record, "consumed_by_policy", bool):
+        raise ContractError(f"{source}: consumed_by_policy must be false")
+    if not require(record, "v1_shadow_authority", bool):
+        raise ContractError(f"{source}: v1_shadow_authority must be true")
+    if require(record, "v2_shadow_authority", bool) or require(record, "live_authority", bool):
+        raise ContractError(f"{source}: V2/live authority must be false")
+    for name in (
+        "v2_economic_mutation", "v2_proposal_created", "v2_time_stop_mutation",
+        "duplicate_action_observed", "route_build_authority_changed",
+        "terminal_isolation_violation", "entry_value_authoritative_for_shadow", "anchor_applied",
+    ):
+        require(record, name, bool)
+
+    validate_trajectory(record)
+    validate_vitality(record)
+    route = require(record, "route_status", str)
+    if route not in ROUTES:
+        raise ContractError(f"{source}: invalid route_status")
+    require_optional(record, "entry_value_quote_raw", int)
+    if require(record, "entry_value_source", str) not in ENTRY_VALUE_SOURCES:
+        raise ContractError(f"{source}: invalid entry_value_source")
+    validate_anchor(require_optional(record, "anchor_before", dict))
+    validate_anchor_request(require_optional(record, "anchor_request", str), source)
+    quote_keys = require(record, "quote_keys", list)
+    quote_statuses = require(record, "quote_statuses", list)
+    if not all(isinstance(item, str) for item in quote_keys + quote_statuses):
+        raise ContractError(f"{source}: quote keys and statuses must be strings")
+    for status in quote_statuses:
+        validate_quote_status(status, source)
+    resolution_count = require(record, "quote_resolution_count", int)
+    if resolution_count != len(quote_keys) or resolution_count != len(quote_statuses):
+        raise ContractError(f"{source}: quote plan cardinalities disagree")
+    if resolution_count > 2:
+        raise ContractError(f"{source}: quote plan exceeds PR A bound")
+    require_optional(record, "current_executable_value_sol", (int, float))
+    require_optional(record, "current_executable_gross_return_bps", int)
+    require_optional(record, "known_estimated_costs_sol", (int, float))
 
 
 def load_records(paths: Iterable[Path]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -59,27 +382,36 @@ def load_records(paths: Iterable[Path]) -> tuple[list[dict[str, Any]], list[dict
                 if not line.strip():
                     continue
                 try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as error:
+                    record = json.loads(
+                        line,
+                        parse_constant=lambda value: (_ for _ in ()).throw(
+                            ValueError(f"non-finite JSON constant: {value}")
+                        ),
+                    )
+                except (json.JSONDecodeError, ValueError) as error:
                     raise ContractError(f"{path}:{line_number}: invalid JSON: {error}") from error
                 if not isinstance(record, dict):
                     raise ContractError(f"{path}:{line_number}: row is not an object")
-                if require(record, "schema_version", int) != SCHEMA_VERSION:
-                    raise ContractError(f"{path}:{line_number}: unsupported schema_version")
-                if require(record, "policy_id", str) != "hierarchical_executable_trajectory_pm_v2":
-                    raise ContractError(f"{path}:{line_number}: unexpected policy_id")
-                require(record, "position_id", str)
-                require(record, "position_epoch", int)
-                require(record, "snapshot_id", str)
-                require(record, "trajectory", dict)
-                require(record, "vitality", dict)
-                require(record, "v1_prequote", str)
-                require(record, "v2_prequote", str)
-                require(record, "quote_keys", list)
-                require(record, "quote_statuses", list)
+                validate_record(record, f"{path}:{line_number}")
                 records.append(record)
     if not records:
         raise ContractError("no HET-PM V2 observations found")
+    contracts = {
+        (
+            record["schema_version"],
+            record["policy_id"],
+            record["policy_version"],
+            record["policy_config_hash"],
+            record["trajectory_sampling_mode"],
+            record["trajectory_measurement_grade"],
+            record["monitor_tick_ms"],
+        )
+        for record in records
+    }
+    if len(contracts) != 1:
+        raise ContractError(
+            "mixed schema/policy/config/sampling contracts are forbidden in one report"
+        )
     return records, inputs
 
 
@@ -193,6 +525,8 @@ def analyze(records: list[dict[str, Any]], inputs: list[dict[str, Any]], fixed_f
         "record_count": len(records),
         "position_count": position_count,
         "lifecycle_integrity": {
+            "evidence_class": "producer_asserted_plus_sidecar_internal_consistency_only",
+            "independent_reconciliation_status": "not_evaluated",
             "duplicate_action_count": duplicate_actions,
             "duplicate_terminal_count": duplicate_terminals,
             "v2_economic_mutation_count": v2_economic_mutations,
@@ -204,6 +538,25 @@ def analyze(records: list[dict[str, Any]], inputs: list[dict[str, Any]], fixed_f
             "terminal_isolation_violation_count": sum(
                 bool(record.get("terminal_isolation_violation")) for record in records
             ),
+        },
+        "producer_asserted_integrity": {
+            "evidence_origin": "het_pm_v2_runtime_record_self_report",
+            "v2_economic_mutation_count": v2_economic_mutations,
+            "v2_proposal_creation_count": v2_proposals,
+            "route_build_authority_change_count": sum(
+                bool(record["route_build_authority_changed"]) for record in records
+            ),
+            "time_stop_parity_violation_count": v2_time_stop_mutations,
+            "terminal_isolation_violation_count": sum(
+                bool(record["terminal_isolation_violation"]) for record in records
+            ),
+            "promotion_evidence": False,
+        },
+        "independently_measured_integrity": {
+            "status": "not_evaluated_requires_lifecycle_reconciliation_artifact",
+            "reconciliation_artifact_present": False,
+            "promotion_gate_1_satisfied": False,
+            "sidecar_internal_duplicate_terminal_count": duplicate_terminals,
         },
         "coverage": {
             "trajectory_usable_record_count": usable,

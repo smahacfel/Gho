@@ -1259,11 +1259,10 @@ vitality_required_non_alive_windows = 3
 vitality_min_time_since_peak_ms = 5000
 vitality_recovery_return_bps = 300
 
-# TimeStop V2 vitality telemetry.
-# Disabled by default. Observe-only mode emits counterfactual lifecycle rows and
-# does not change Target/StopLoss/legacy TimeStop close decisions.
+# TimeStop V2 vitality telemetry is the immutable vitality source for the active
+# observe-only HET-PM profile. It remains non-authoritative for lifecycle exits.
 [post_buy_guardian.time_stop_v2]
-enabled = false
+enabled = true
 mode = "observe_only"
 first_check_ms = 3000
 window_ms = 4000

@@ -773,7 +773,8 @@ pub(super) enum CrashGuardQuoteRejectionReason {
     ExecutableReturnNotSevereEnough,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "reason")]
 pub(super) enum CrashGuardQuoteDecision {
     Confirmed,
     RejectedByQuote {

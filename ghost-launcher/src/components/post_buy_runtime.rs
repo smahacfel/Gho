@@ -263,6 +263,12 @@ impl PostBuyRuntimeConfig {
     pub fn validate(&self) -> Result<Option<ExitPolicyV1Status>, String> {
         if let Some(guardian) = self.shadow_guardian.as_ref() {
             validate_het_pm_v2_config(guardian).map_err(|error| error.to_string())?;
+            if guardian.het_pm_v2.enabled && self.account_state_core.is_none() {
+                return Err(
+                    "HET-PM V2 requires AccountStateCore route truth; route cannot be inferred from component absence"
+                        .to_string(),
+                );
+            }
         }
         let crash_guard_authoritative = self.shadow_guardian.as_ref().is_some_and(|guardian| {
             matches!(
@@ -7213,6 +7219,24 @@ sys.exit(0)
     }
 
     #[test]
+    fn het_enabled_without_account_state_core_fails_startup() {
+        let mut guardian = PostBuyGuardianConfig::default();
+        guardian.het_pm_v2.enabled = true;
+        guardian.time_stop_v2.enabled = true;
+        let config = PostBuyRuntimeConfig {
+            execution_mode: "shadow".to_string(),
+            shadow_guardian: Some(guardian),
+            account_state_core: None,
+            ..PostBuyRuntimeConfig::default()
+        };
+
+        let error = config
+            .validate()
+            .expect_err("HET route truth must fail closed without AccountStateCore");
+        assert!(error.contains("requires AccountStateCore route truth"));
+    }
+
+    #[test]
     fn direct_post_buy_handoff_distinguishes_full_and_closed() {
         let event = GhostEvent::post_buy_submitted(
             Pubkey::new_unique().to_string(),
@@ -8494,19 +8518,22 @@ sys.exit(0)
             shadow_lifecycle_log_path: Some(lifecycle_log_path),
             ..PostBuyRuntimeConfig::default()
         };
-        let guardian_config = build_shadow_guardian_config(&config);
+        let mut guardian_config = build_shadow_guardian_config(&config);
+        guardian_config.target_threshold = Some(50.0);
+        guardian_config.stoploss_threshold = Some(50.0);
         let (signal_tx, _signal_rx) = mpsc::channel(guardian_config.signal_channel_buffer.max(1));
         let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             RwLock::new(ShadowPositionBook::new()),
         )));
-        let mut monitoring_engine = MonitoringEngine::new(
+        let mut monitoring_engine = MonitoringEngine::try_new(
             guardian_config,
             config
                 .shadow_ledger
                 .clone()
                 .expect("shadow ledger for canonical handoff"),
             signal_tx,
-        );
+        )
+        .expect("valid PostBuy Guardian policy config");
         monitoring_engine.set_position_router(runtime_router);
         monitoring_engine.set_event_emitter(Arc::clone(&emitter));
         monitoring_engine.set_shadow_lifecycle_log_path(config.shadow_lifecycle_log_path.clone());
@@ -8831,19 +8858,22 @@ sys.exit(0)
             max_concurrent_positions: 1,
             ..PostBuyRuntimeConfig::default()
         };
-        let guardian_config = build_shadow_guardian_config(&config);
+        let mut guardian_config = build_shadow_guardian_config(&config);
+        guardian_config.target_threshold = Some(50.0);
+        guardian_config.stoploss_threshold = Some(50.0);
         let (signal_tx, _signal_rx) = mpsc::channel(guardian_config.signal_channel_buffer.max(1));
         let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             RwLock::new(ShadowPositionBook::new()),
         )));
-        let mut monitoring_engine = MonitoringEngine::new(
+        let mut monitoring_engine = MonitoringEngine::try_new(
             guardian_config,
             config
                 .shadow_ledger
                 .clone()
                 .expect("shadow ledger for canonical handoff"),
             signal_tx,
-        );
+        )
+        .expect("valid PostBuy Guardian policy config");
         monitoring_engine.set_position_router(runtime_router);
         let monitoring_engine = Arc::new(monitoring_engine);
 
@@ -8971,19 +9001,22 @@ sys.exit(0)
             shadow_ledger: Some(Arc::new(ShadowLedger::new())),
             ..PostBuyRuntimeConfig::default()
         };
-        let guardian_config = build_shadow_guardian_config(&config);
+        let mut guardian_config = build_shadow_guardian_config(&config);
+        guardian_config.target_threshold = Some(50.0);
+        guardian_config.stoploss_threshold = Some(50.0);
         let (signal_tx, _signal_rx) = mpsc::channel(guardian_config.signal_channel_buffer.max(1));
         let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             RwLock::new(ShadowPositionBook::new()),
         )));
-        let mut monitoring_engine = MonitoringEngine::new(
+        let mut monitoring_engine = MonitoringEngine::try_new(
             guardian_config,
             config
                 .shadow_ledger
                 .clone()
                 .expect("shadow ledger for canonical handoff"),
             signal_tx,
-        );
+        )
+        .expect("valid PostBuy Guardian policy config");
         let account_state_core = Arc::new(AccountStateReducer::new());
         monitoring_engine.set_account_state_core(Arc::clone(&account_state_core));
         monitoring_engine.set_position_router(runtime_router);

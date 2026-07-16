@@ -12,8 +12,10 @@ use crate::execution::backend::Lane;
 
 use super::config::{CrashGuardMode, HetPmV2Config, HetPmV2Mode, PostBuyGuardianConfig};
 use super::exit_policy_v1::{
-    CrashGuardPreQuoteDecision, ExecutableExitQuote, ExitCandidateReason, MarkEvidenceStatus,
-    PostBuyDecisionSnapshot, PreQuoteDecision,
+    CrashGuardPreQuoteDecision, CrashGuardQuoteDecision, CrashGuardQuoteRejectionReason,
+    CrashGuardQuoteRequirementV1, EffectiveExitPolicyV1Config, ExecutableExitQuote,
+    ExitCandidateReason, ExitPolicyV1, MarkEvidenceStatus, PostBuyDecisionSnapshot,
+    PreQuoteDecision, QuoteEvidenceRevisionV1,
 };
 use super::trajectory_v1::{TrajectoryFeaturesV1, TrajectoryQualityV1};
 
@@ -55,6 +57,8 @@ pub enum HetPmV2ConfigError {
     InvalidVitalityRecoveryReturn,
     #[error("HET-PM V2 authoritative_shadow is forbidden in PR A")]
     AuthoritativeModeForbidden,
+    #[error("HET-PM V2 vitality requires time_stop_v2.enabled=true")]
+    VitalitySourceDisabled,
     #[error("HET-PM V2 config could not be serialized for hashing")]
     ConfigHashSerialization,
 }
@@ -85,7 +89,11 @@ impl EffectiveHetPmV2Config {
     pub(super) fn from_guardian(
         guardian: &PostBuyGuardianConfig,
     ) -> Result<Self, HetPmV2ConfigError> {
-        Self::from_config(&guardian.het_pm_v2)
+        let effective = Self::from_config(&guardian.het_pm_v2)?;
+        if guardian.het_pm_v2.enabled && !guardian.time_stop_v2.enabled {
+            return Err(HetPmV2ConfigError::VitalitySourceDisabled);
+        }
+        Ok(effective)
     }
 
     fn from_config(config: &HetPmV2Config) -> Result<Self, HetPmV2ConfigError> {
@@ -594,6 +602,10 @@ pub(super) enum HetPmFinalDecisionV2 {
     Hold,
     Pending,
     Blocked(HetPmUnknownReasonV2),
+    CrashRejectedByQuote {
+        reason: CrashGuardQuoteRejectionReason,
+    },
+    CrashBlockedByData,
     ExitAll {
         reason: HetPmExitReasonV2,
         quantity_raw: u64,
@@ -882,6 +894,9 @@ impl ExitPolicyV2 {
         prequote: &HetPmPreQuoteEvaluationV2,
         quote: Option<&ExecutableExitQuote>,
         quote_key: Option<&ExecutableQuoteKeyV2>,
+        quote_evidence: Option<QuoteEvidenceRevisionV1>,
+        crash_requirement: Option<&CrashGuardQuoteRequirementV1>,
+        v1_config: &EffectiveExitPolicyV1Config,
         config: &EffectiveHetPmV2Config,
     ) -> HetPmFinalDecisionV2 {
         match &prequote.candidate {
@@ -890,11 +905,48 @@ impl ExitPolicyV2 {
             HetPmCandidateV2::Blocked(reason) => HetPmFinalDecisionV2::Blocked(*reason),
             HetPmCandidateV2::QuoteRequired(reason) => {
                 let Some(quote) = quote else {
-                    return HetPmFinalDecisionV2::Blocked(HetPmUnknownReasonV2::QuoteUnavailable);
+                    return if matches!(reason, HetPmExitReasonV2::Crash) {
+                        HetPmFinalDecisionV2::CrashBlockedByData
+                    } else {
+                        HetPmFinalDecisionV2::Blocked(HetPmUnknownReasonV2::QuoteUnavailable)
+                    };
                 };
                 let Some(key) = quote_key else {
-                    return HetPmFinalDecisionV2::Blocked(HetPmUnknownReasonV2::QuoteUnavailable);
+                    return if matches!(reason, HetPmExitReasonV2::Crash) {
+                        HetPmFinalDecisionV2::CrashBlockedByData
+                    } else {
+                        HetPmFinalDecisionV2::Blocked(HetPmUnknownReasonV2::QuoteUnavailable)
+                    };
                 };
+                if matches!(reason, HetPmExitReasonV2::Crash) {
+                    let (Some(quote_evidence), Some(requirement)) =
+                        (quote_evidence, crash_requirement)
+                    else {
+                        return HetPmFinalDecisionV2::CrashBlockedByData;
+                    };
+                    return match ExitPolicyV1::evaluate_crash_guard_quote(
+                        view.base,
+                        quote,
+                        quote_evidence,
+                        requirement,
+                        v1_config,
+                    ) {
+                        CrashGuardQuoteDecision::Confirmed => HetPmFinalDecisionV2::ExitAll {
+                            reason: HetPmExitReasonV2::Crash,
+                            quantity_raw: quote.quantity_raw(),
+                            executable_gross_return_bps: (quote.gross_return_pct() * 100.0)
+                                .round()
+                                .clamp(i32::MIN as f64, i32::MAX as f64)
+                                as i32,
+                        },
+                        CrashGuardQuoteDecision::RejectedByQuote { reason } => {
+                            HetPmFinalDecisionV2::CrashRejectedByQuote { reason }
+                        }
+                        CrashGuardQuoteDecision::BlockedByData => {
+                            HetPmFinalDecisionV2::CrashBlockedByData
+                        }
+                    };
+                }
                 if key.remaining_quantity_raw != view.base.remaining_token_amount_raw()
                     || quote.quantity_raw() != view.base.remaining_token_amount_raw()
                 {
@@ -940,6 +992,28 @@ impl ExitPolicyV2 {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum V1AuthorityTickOutcomeV1 {
+    Hold,
+    ProposalStarted,
+    TerminalApplied,
+    PendingRecovery,
+    Blocked,
+    ApplyRejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct V1AuthorityTickReceiptV1 {
+    pub(super) snapshot_id: String,
+    pub(super) state_revision: u64,
+    pub(super) remaining_quantity_raw: u64,
+    pub(super) outcome: V1AuthorityTickOutcomeV1,
+    pub(super) action_id: Option<String>,
+    pub(super) reason: Option<String>,
+    pub(super) crash_quote_decision: Option<CrashGuardQuoteDecision>,
 }
 
 fn comparable_anchor(
@@ -1060,6 +1134,7 @@ pub(super) struct V1V2ComparisonRecord {
     pub(super) position_id: String,
     pub(super) position_epoch: u64,
     pub(super) state_revision: u64,
+    pub(super) remaining_quantity_raw: u64,
     pub(super) snapshot_id: String,
     pub(super) observation_timestamp_ms: u64,
     pub(super) terminal_tick: bool,
@@ -1067,12 +1142,18 @@ pub(super) struct V1V2ComparisonRecord {
     pub(super) trajectory_measurement_grade: String,
     pub(super) monitor_tick_ms: u64,
     pub(super) v1_prequote: String,
+    pub(super) v1_crash_prequote: String,
     pub(super) v1_final: Option<String>,
+    pub(super) v1_authority_receipt: Option<V1AuthorityTickReceiptV1>,
     pub(super) v2_prequote: String,
     pub(super) v2_final: Option<String>,
+    pub(super) v2_crash_quote_decision: Option<CrashGuardQuoteDecision>,
     pub(super) v2_winning_gate: HetPmGateV2,
     pub(super) v2_suppressed_gates_mask: u16,
     pub(super) consumed_by_policy: bool,
+    pub(super) v1_shadow_authority: bool,
+    pub(super) v2_shadow_authority: bool,
+    pub(super) live_authority: bool,
     pub(super) v2_economic_mutation: bool,
     pub(super) v2_proposal_created: bool,
     pub(super) v2_time_stop_mutation: bool,
@@ -1111,6 +1192,19 @@ impl V1V2ComparisonRecord {
         }
         if self.consumed_by_policy {
             return Err("observe_only_record_marked_as_policy_consumed");
+        }
+        let Some(receipt) = self.v1_authority_receipt.as_ref() else {
+            return Err("v1_authority_receipt_missing");
+        };
+        if receipt.snapshot_id != self.snapshot_id
+            || receipt.state_revision != self.state_revision
+            || receipt.remaining_quantity_raw != self.remaining_quantity_raw
+            || self.remaining_quantity_raw == 0
+        {
+            return Err("v1_authority_receipt_snapshot_mismatch");
+        }
+        if !self.v1_shadow_authority || self.v2_shadow_authority || self.live_authority {
+            return Err("comparison_authority_contract_mismatch");
         }
         if self.v2_economic_mutation
             || self.v2_proposal_created
@@ -1169,7 +1263,9 @@ pub(super) fn prequote_label(decision: &PreQuoteDecision) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::exit_policy_v1::{CrashVectorV1, ExitCandidate, PositionSnapshotGuard};
+    use super::super::exit_policy_v1::{
+        CrashSampleV1, CrashVectorV1, ExitCandidate, PositionSnapshotGuard,
+    };
     use super::super::trajectory_v1::TrajectoryFlagsV1;
     use super::*;
     use trigger::PriceTruthSource;
@@ -1222,6 +1318,31 @@ mod tests {
         vitality: VitalityFeaturesV1,
         anchor: Option<ExecutablePeakAnchorV1>,
     ) -> PostBuySnapshotBundle {
+        bundle_with_crash_vector(
+            pending,
+            age_ms,
+            mark_price,
+            route,
+            trajectory,
+            vitality,
+            anchor,
+            CrashVectorV1::default(),
+            "v1-hash",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bundle_with_crash_vector(
+        pending: bool,
+        age_ms: u64,
+        mark_price: f64,
+        route: RouteStatusV1,
+        trajectory: TrajectoryFeaturesV1,
+        vitality: VitalityFeaturesV1,
+        anchor: Option<ExecutablePeakAnchorV1>,
+        crash_vector: CrashVectorV1,
+        v1_policy_config_hash: &str,
+    ) -> PostBuySnapshotBundle {
         let guard =
             PositionSnapshotGuard::new("position".to_string(), 1, 7, 100, Some(20), Some(16_000));
         let base = PostBuyDecisionSnapshot::new(
@@ -1245,9 +1366,9 @@ mod tests {
             Some(-10.0),
             1.5,
             Some(20.0),
-            CrashVectorV1::default(),
+            crash_vector,
             pending,
-            "v1-hash".to_string(),
+            v1_policy_config_hash.to_string(),
         );
         PostBuySnapshotBundle {
             base,
@@ -1262,6 +1383,76 @@ mod tests {
                 entry_value_authoritative_for_shadow: true,
             },
         }
+    }
+
+    fn crash_bundle(v1_config: &EffectiveExitPolicyV1Config) -> PostBuySnapshotBundle {
+        let crash_vector = CrashVectorV1::new(
+            1.5,
+            Some(CrashSampleV1::new(1.4, 19, 15_000)),
+            Some(CrashSampleV1::new(1.2, 19, 15_500)),
+            Some(CrashSampleV1::new(0.9, 20, 16_000)),
+            Some(0),
+            2,
+            Some(0.35),
+            Some(0.40),
+            true,
+            true,
+        );
+        bundle_with_crash_vector(
+            false,
+            20_000,
+            0.9,
+            RouteStatusV1::PumpCurveSupported,
+            usable_trajectory(),
+            vitality(VitalityStateV1::Alive, 0),
+            None,
+            crash_vector,
+            v1_config.config_hash(),
+        )
+    }
+
+    fn crash_prequote() -> CrashGuardPreQuoteDecision {
+        CrashGuardPreQuoteDecision::QuoteRequired {
+            candidate: ExitCandidate::from_reason(ExitCandidateReason::CrashGuard),
+        }
+    }
+
+    fn crash_v1_config(max_executable_return_pct: f64) -> EffectiveExitPolicyV1Config {
+        let mut guardian = PostBuyGuardianConfig::default();
+        guardian.target_threshold = Some(50.0);
+        guardian.stoploss_threshold = Some(50.0);
+        guardian.exit_policy_v1.crash_guard_mode = CrashGuardMode::ObserveOnly;
+        guardian.exit_policy_v1.crash_max_executable_return_pct = max_executable_return_pct;
+        EffectiveExitPolicyV1Config::from_guardian(&guardian).expect("valid V1 CrashGuard config")
+    }
+
+    fn finalize_crash(
+        bundle: &PostBuySnapshotBundle,
+        v1_config: &EffectiveExitPolicyV1Config,
+        quote: &ExecutableExitQuote,
+        quote_evidence: QuoteEvidenceRevisionV1,
+    ) -> HetPmFinalDecisionV2 {
+        let het_config = effective();
+        let crash_prequote = crash_prequote();
+        let prequote = ExitPolicyV2::evaluate_prequote(
+            bundle.view(),
+            &PreQuoteDecision::Hold,
+            &crash_prequote,
+            &het_config,
+        );
+        let key = ExecutableQuoteKeyV2::from_view(bundle.view());
+        let requirement = ExitPolicyV1::crash_guard_quote_requirement(&bundle.base)
+            .expect("crash candidate requirement");
+        ExitPolicyV2::finalize_with_quote(
+            bundle.view(),
+            &prequote,
+            Some(quote),
+            Some(&key),
+            Some(quote_evidence),
+            Some(&requirement),
+            v1_config,
+            &het_config,
+        )
     }
 
     fn anchor(config: &EffectiveHetPmV2Config) -> ExecutablePeakAnchorV1 {
@@ -1296,6 +1487,7 @@ mod tests {
             position_id: "position".to_string(),
             position_epoch: 1,
             state_revision: 2,
+            remaining_quantity_raw: 100,
             snapshot_id: "snapshot".to_string(),
             observation_timestamp_ms: 16_000,
             terminal_tick: false,
@@ -1303,12 +1495,26 @@ mod tests {
             trajectory_measurement_grade: HET_PM_V2_TRAJECTORY_GRADE.to_string(),
             monitor_tick_ms: 500,
             v1_prequote: "hold".to_string(),
-            v1_final: None,
+            v1_crash_prequote: "Disabled".to_string(),
+            v1_final: Some("Hold".to_string()),
+            v1_authority_receipt: Some(V1AuthorityTickReceiptV1 {
+                snapshot_id: "snapshot".to_string(),
+                state_revision: 2,
+                remaining_quantity_raw: 100,
+                outcome: V1AuthorityTickOutcomeV1::Hold,
+                action_id: None,
+                reason: None,
+                crash_quote_decision: None,
+            }),
             v2_prequote: "Hold".to_string(),
             v2_final: Some("Hold".to_string()),
+            v2_crash_quote_decision: None,
             v2_winning_gate: HetPmGateV2::Hold,
             v2_suppressed_gates_mask: 0,
             consumed_by_policy: false,
+            v1_shadow_authority: true,
+            v2_shadow_authority: false,
+            live_authority: false,
             v2_economic_mutation: false,
             v2_proposal_created: false,
             v2_time_stop_mutation: false,
@@ -1355,6 +1561,7 @@ mod tests {
 
         let mut guardian = PostBuyGuardianConfig::default();
         guardian.het_pm_v2.enabled = true;
+        guardian.time_stop_v2.enabled = true;
         guardian.exit_policy_v1.crash_guard_mode = CrashGuardMode::ObserveOnly;
         let changed_v1 = EffectiveHetPmV2Config::from_guardian(&guardian).unwrap();
         assert_eq!(first.config_hash(), changed_v1.config_hash());
@@ -1710,8 +1917,88 @@ mod tests {
     }
 
     #[test]
+    fn crash_mark_candidate_with_mild_executable_loss_is_rejected() {
+        let v1_config = crash_v1_config(-20.0);
+        let bundle = crash_bundle(&v1_config);
+        let mild_loss = ExecutableExitQuote::new(100, 0.90, 0.90, -0.10, -10.0);
+
+        assert_eq!(
+            finalize_crash(
+                &bundle,
+                &v1_config,
+                &mild_loss,
+                QuoteEvidenceRevisionV1::new(Some(20), Some(16_000), Some(0)),
+            ),
+            HetPmFinalDecisionV2::CrashRejectedByQuote {
+                reason: CrashGuardQuoteRejectionReason::ExecutableReturnNotSevereEnough,
+            }
+        );
+    }
+
+    #[test]
+    fn crash_quote_older_than_candidate_is_blocked() {
+        let v1_config = crash_v1_config(-20.0);
+        let bundle = crash_bundle(&v1_config);
+        let severe_loss = ExecutableExitQuote::new(100, 0.75, 0.75, -0.25, -25.0);
+
+        assert_eq!(
+            finalize_crash(
+                &bundle,
+                &v1_config,
+                &severe_loss,
+                QuoteEvidenceRevisionV1::new(Some(19), Some(15_999), Some(0)),
+            ),
+            HetPmFinalDecisionV2::CrashBlockedByData
+        );
+    }
+
+    #[test]
+    fn crash_quantity_mismatch_is_rejected() {
+        let v1_config = crash_v1_config(-20.0);
+        let bundle = crash_bundle(&v1_config);
+        let wrong_quantity = ExecutableExitQuote::new(99, 0.75, 0.75, -0.25, -25.0);
+
+        assert_eq!(
+            finalize_crash(
+                &bundle,
+                &v1_config,
+                &wrong_quantity,
+                QuoteEvidenceRevisionV1::new(Some(20), Some(16_000), Some(0)),
+            ),
+            HetPmFinalDecisionV2::CrashRejectedByQuote {
+                reason: CrashGuardQuoteRejectionReason::QuoteQuantityMismatch,
+            }
+        );
+    }
+
+    #[test]
+    fn crash_confirmed_requires_v1_threshold() {
+        let strict_v1 = crash_v1_config(-30.0);
+        let strict_bundle = crash_bundle(&strict_v1);
+        let quote = ExecutableExitQuote::new(100, 0.75, 0.75, -0.25, -25.0);
+        let evidence = QuoteEvidenceRevisionV1::new(Some(20), Some(16_000), Some(0));
+        assert_eq!(
+            finalize_crash(&strict_bundle, &strict_v1, &quote, evidence),
+            HetPmFinalDecisionV2::CrashRejectedByQuote {
+                reason: CrashGuardQuoteRejectionReason::ExecutableReturnNotSevereEnough,
+            }
+        );
+
+        let normal_v1 = crash_v1_config(-20.0);
+        let normal_bundle = crash_bundle(&normal_v1);
+        assert!(matches!(
+            finalize_crash(&normal_bundle, &normal_v1, &quote, evidence),
+            HetPmFinalDecisionV2::ExitAll {
+                reason: HetPmExitReasonV2::Crash,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn executable_trailing_requires_comparable_anchor_and_breach() {
         let config = effective();
+        let v1_config = crash_v1_config(-20.0);
         let bundle = bundle(
             false,
             20_000,
@@ -1735,6 +2022,9 @@ mod tests {
                 &prequote,
                 Some(&breached),
                 Some(&key),
+                None,
+                None,
+                &v1_config,
                 &config
             ),
             HetPmFinalDecisionV2::ExitAll {
@@ -1750,6 +2040,9 @@ mod tests {
                 &prequote,
                 Some(&not_breached),
                 Some(&key),
+                None,
+                None,
+                &v1_config,
                 &config
             ),
             HetPmFinalDecisionV2::Hold

@@ -328,11 +328,12 @@ impl E2EPipeline {
                 let (signal_tx, signal_rx) = tokio::sync::mpsc::channel(buffer_size);
                 let aem_enabled = guardian_config.aem.enabled;
 
-                let mut engine = MonitoringEngine::new(
+                let mut engine = MonitoringEngine::try_new(
                     guardian_config.clone(),
                     Arc::clone(&shadow_ledger),
                     signal_tx,
-                );
+                )
+                .context("invalid PostBuy Guardian policy configuration")?;
                 if matches!(config.execution.execution_mode, ExecutionMode::Shadow) {
                     let lifecycle_log_path = config
                         .execution
