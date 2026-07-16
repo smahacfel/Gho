@@ -21,6 +21,8 @@ TOOL_ID = "het_pm_v2_analysis_v1"
 SCHEMA_VERSION = 1
 POLICY_ID = "hierarchical_executable_trajectory_pm_v2"
 POLICY_VERSION = 2
+V1_POLICY_ID = "position_manager_lite_exit_policy_v1"
+V1_POLICY_VERSION = 1
 SAMPLING_MODE = "latest_canonical_state_per_monitor_tick"
 TRAJECTORY_GRADE = "online_non_lookahead_sampled_trajectory"
 COLLAPSED_CANONICAL_UPDATES = 1 << 3
@@ -281,6 +283,14 @@ def validate_record(record: dict[str, Any], source: str) -> None:
         raise ContractError(f"{source}: unsupported policy_version")
     if not require(record, "policy_config_hash", str):
         raise ContractError(f"{source}: empty policy_config_hash")
+    if require(record, "v1_policy_id", str) != V1_POLICY_ID:
+        raise ContractError(f"{source}: unexpected v1_policy_id")
+    if require(record, "v1_policy_version", int) != V1_POLICY_VERSION:
+        raise ContractError(f"{source}: unsupported v1_policy_version")
+    if not require(record, "v1_policy_config_hash", str):
+        raise ContractError(f"{source}: empty v1_policy_config_hash")
+    if not require(record, "time_stop_v2_config_hash", str):
+        raise ContractError(f"{source}: empty time_stop_v2_config_hash")
     if not require(record, "run_id", str):
         raise ContractError(f"{source}: empty run_id")
     if require(record, "lane", str) != "shadow":
@@ -370,13 +380,53 @@ def validate_record(record: dict[str, Any], source: str) -> None:
     require_optional(record, "known_estimated_costs_sol", (int, float))
 
 
+def comparison_contract(record: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        record["schema_version"],
+        record["policy_id"],
+        record["policy_version"],
+        record["policy_config_hash"],
+        record["v1_policy_id"],
+        record["v1_policy_version"],
+        record["v1_policy_config_hash"],
+        record["time_stop_v2_config_hash"],
+        record["trajectory_sampling_mode"],
+        record["trajectory_measurement_grade"],
+        record["monitor_tick_ms"],
+    )
+
+
+def evidence_contract_manifest(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": record["schema_version"],
+        "het_pm_v2": {
+            "policy_id": record["policy_id"],
+            "policy_version": record["policy_version"],
+            "policy_config_hash": record["policy_config_hash"],
+        },
+        "v1_authority": {
+            "policy_id": record["v1_policy_id"],
+            "policy_version": record["v1_policy_version"],
+            "policy_config_hash": record["v1_policy_config_hash"],
+        },
+        "time_stop_v2_source": {
+            "config_hash": record["time_stop_v2_config_hash"],
+        },
+        "sampling": {
+            "mode": record["trajectory_sampling_mode"],
+            "measurement_grade": record["trajectory_measurement_grade"],
+            "monitor_tick_ms": record["monitor_tick_ms"],
+        },
+    }
+
+
 def load_records(paths: Iterable[Path]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     records: list[dict[str, Any]] = []
     inputs: list[dict[str, Any]] = []
     for path in sorted(paths, key=lambda item: str(item)):
         if not path.is_file():
             raise ContractError(f"input does not exist: {path}")
-        inputs.append({"path": str(path), "sha256": sha256(path)})
+        input_start = len(records)
         with path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, 1):
                 if not line.strip():
@@ -394,23 +444,29 @@ def load_records(paths: Iterable[Path]) -> tuple[list[dict[str, Any]], list[dict
                     raise ContractError(f"{path}:{line_number}: row is not an object")
                 validate_record(record, f"{path}:{line_number}")
                 records.append(record)
+        input_records = records[input_start:]
+        if not input_records:
+            raise ContractError(f"input contains no HET-PM V2 observations: {path}")
+        input_contracts = {comparison_contract(record) for record in input_records}
+        if len(input_contracts) != 1:
+            raise ContractError(f"{path}: mixed evidence contracts are forbidden")
+        manifest = evidence_contract_manifest(input_records[0])
+        inputs.append(
+            {
+                "path": str(path),
+                "sha256": sha256(path),
+                "record_count": len(input_records),
+                "policy_config_hash": manifest["het_pm_v2"]["policy_config_hash"],
+                "v1_policy_config_hash": manifest["v1_authority"]["policy_config_hash"],
+                "time_stop_v2_config_hash": manifest["time_stop_v2_source"]["config_hash"],
+            }
+        )
     if not records:
         raise ContractError("no HET-PM V2 observations found")
-    contracts = {
-        (
-            record["schema_version"],
-            record["policy_id"],
-            record["policy_version"],
-            record["policy_config_hash"],
-            record["trajectory_sampling_mode"],
-            record["trajectory_measurement_grade"],
-            record["monitor_tick_ms"],
-        )
-        for record in records
-    }
+    contracts = {comparison_contract(record) for record in records}
     if len(contracts) != 1:
         raise ContractError(
-            "mixed schema/policy/config/sampling contracts are forbidden in one report"
+            "mixed schema/HET/V1/TimeStop/sampling contracts are forbidden in one report"
         )
     return records, inputs
 
@@ -520,6 +576,7 @@ def analyze(records: list[dict[str, Any]], inputs: list[dict[str, Any]], fixed_f
     return {
         "tool_id": TOOL_ID,
         "schema_version": SCHEMA_VERSION,
+        "evidence_contract": evidence_contract_manifest(records[0]),
         "inputs": inputs,
         "denominator_contract": "unique_position_id_position_epoch",
         "record_count": len(records),

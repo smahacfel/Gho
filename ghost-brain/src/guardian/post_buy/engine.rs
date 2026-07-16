@@ -64,12 +64,14 @@ use super::exit_policy_v1::{
     MarkEvidenceStatus, PositionSnapshotGuard, PostBuyDecisionSnapshot, PreQuoteDecision,
     QuoteEvidenceRevisionV1, EXECUTABLE_QUOTE_GRADE, EXECUTION_COST_COVERAGE_UNMODELED,
 };
+#[cfg(test)]
+use super::exit_policy_v1::{EXIT_POLICY_V1_ID, EXIT_POLICY_V1_VERSION};
 use super::exit_policy_v2::{
     build_entry_value_contract, materialize_anchor, prequote_label, EffectiveHetPmV2Config,
     ExecutablePeakAnchorV1, ExecutableQuoteKeyV2, ExitPolicyV2, HetPmCandidateV2,
-    HetPmFinalDecisionV2, HetPmV2ConfigError, HetPmV2Status, PeakAnchorPreQuoteDecisionV1,
-    PostBuyDecisionExtrasV2, PostBuySnapshotBundle, RouteStatusV1, TimeStopV2ProjectionV1,
-    TimeStopV2Subreason, TimeStopV2WindowStatus, V1AuthorityTickOutcomeV1,
+    HetPmFinalDecisionV2, HetPmQuoteFinalizationInputV2, HetPmV2ConfigError, HetPmV2Status,
+    PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2, PostBuySnapshotBundle, RouteStatusV1,
+    TimeStopV2ProjectionV1, TimeStopV2Subreason, TimeStopV2WindowStatus, V1AuthorityTickOutcomeV1,
     V1AuthorityTickReceiptV1, V1V2ComparisonRecord, VitalityFeaturesV1, HET_PM_V2_MAX_QUOTE_CELLS,
     HET_PM_V2_POLICY_ID, HET_PM_V2_POLICY_VERSION, HET_PM_V2_SAMPLING_MODE,
     HET_PM_V2_SCHEMA_VERSION, HET_PM_V2_TRAJECTORY_GRADE,
@@ -1640,6 +1642,8 @@ pub enum MonitoringEngineConfigError {
     ExitPolicyV1(#[from] ExitPolicyConfigError),
     #[error(transparent)]
     HetPmV2(#[from] HetPmV2ConfigError),
+    #[error("TimeStop V2 projection config could not be serialized for hashing")]
+    TimeStopV2ConfigHashSerialization,
 }
 
 pub struct MonitoringEngine {
@@ -1648,6 +1652,7 @@ pub struct MonitoringEngine {
     account_state_core: Option<Arc<AccountStateReducer>>,
     exit_policy_v1: Option<EffectiveExitPolicyV1Config>,
     het_pm_v2: Option<EffectiveHetPmV2Config>,
+    time_stop_v2_config_hash: String,
     positions: Arc<RwLock<HashMap<Pubkey, MonitoredPosition>>>,
     signal_tx: mpsc::Sender<GuardianSignal>,
     /// Optional lane-aware position-management router.
@@ -1694,7 +1699,18 @@ impl MonitoringEngine {
             _ => None,
         };
         let het_pm_v2 = EffectiveHetPmV2Config::from_guardian(&config).ok();
-        Self::from_effective_configs(config, shadow_ledger, signal_tx, exit_policy_v1, het_pm_v2)
+        let time_stop_v2_config_hash = config
+            .time_stop_v2
+            .projection_config_hash()
+            .expect("TimeStop V2 test config must be serializable");
+        Self::from_effective_configs(
+            config,
+            shadow_ledger,
+            signal_tx,
+            exit_policy_v1,
+            het_pm_v2,
+            time_stop_v2_config_hash,
+        )
     }
 
     fn from_effective_configs(
@@ -1703,6 +1719,7 @@ impl MonitoringEngine {
         signal_tx: mpsc::Sender<GuardianSignal>,
         exit_policy_v1: Option<EffectiveExitPolicyV1Config>,
         het_pm_v2: Option<EffectiveHetPmV2Config>,
+        time_stop_v2_config_hash: String,
     ) -> Self {
         Self {
             config,
@@ -1710,6 +1727,7 @@ impl MonitoringEngine {
             account_state_core: None,
             exit_policy_v1,
             het_pm_v2,
+            time_stop_v2_config_hash,
             positions: Arc::new(RwLock::new(HashMap::new())),
             signal_tx,
             position_router: None,
@@ -1735,12 +1753,17 @@ impl MonitoringEngine {
     ) -> Result<Self, MonitoringEngineConfigError> {
         let exit_policy_v1 = EffectiveExitPolicyV1Config::from_guardian(&config)?;
         let het_pm_v2 = EffectiveHetPmV2Config::from_guardian(&config)?;
+        let time_stop_v2_config_hash = config
+            .time_stop_v2
+            .projection_config_hash()
+            .map_err(|_| MonitoringEngineConfigError::TimeStopV2ConfigHashSerialization)?;
         Ok(Self::from_effective_configs(
             config,
             shadow_ledger,
             signal_tx,
             Some(exit_policy_v1),
             Some(het_pm_v2),
+            time_stop_v2_config_hash,
         ))
     }
 
@@ -6361,10 +6384,12 @@ impl MonitoringEngine {
         let v2_final = ExitPolicyV2::finalize_with_quote(
             view,
             &v2_prequote,
-            v2_quote.as_ref(),
-            v2_truth.and(v2_cell).map(|cell| &cell.key),
-            v2_quote_evidence,
-            v2_crash_requirement.as_ref(),
+            HetPmQuoteFinalizationInputV2 {
+                quote: v2_quote.as_ref(),
+                quote_key: v2_truth.and(v2_cell).map(|cell| &cell.key),
+                quote_evidence: v2_quote_evidence,
+                crash_requirement: v2_crash_requirement.as_ref(),
+            },
             v1_policy,
             het_policy,
         );
@@ -6403,6 +6428,10 @@ impl MonitoringEngine {
                 policy_id: HET_PM_V2_POLICY_ID.to_string(),
                 policy_version: HET_PM_V2_POLICY_VERSION,
                 policy_config_hash: het_policy.config_hash().to_string(),
+                v1_policy_id: v1_policy.policy_id().to_string(),
+                v1_policy_version: v1_policy.policy_version(),
+                v1_policy_config_hash: v1_policy.config_hash().to_string(),
+                time_stop_v2_config_hash: self.time_stop_v2_config_hash.clone(),
                 run_id: bundle.v2.run_id.clone(),
                 lane: bundle.base.lane(),
                 position_id: bundle.base.guard().position_id().to_string(),
@@ -6573,7 +6602,7 @@ impl MonitoringEngine {
             .await;
         prepared.record.terminal_tick =
             matches!(receipt.outcome, V1AuthorityTickOutcomeV1::TerminalApplied);
-        prepared.record.v1_final = Some(format!("{:?}", receipt.outcome));
+        prepared.record.v1_final = Some(receipt.outcome.as_label().to_string());
         prepared.record.v1_authority_receipt = Some(receipt);
         prepared.record.anchor_applied = self.apply_het_pm_v2_anchor_after_v1(
             base_mint,
@@ -6646,6 +6675,11 @@ impl MonitoringEngine {
         let mut receipt_reason = None;
         let mut receipt_crash_quote_decision = None;
 
+        if let PreQuoteDecision::UnknownEvidence { reason } = authoritative_prequote {
+            receipt_outcome = V1AuthorityTickOutcomeV1::Blocked;
+            receipt_reason = Some(format!("prequote_unknown:{reason:?}"));
+        }
+
         'authority_tick: {
             let baseline_candidate = match authoritative_prequote {
                 PreQuoteDecision::QuoteRequired { candidate } => Some(candidate.clone()),
@@ -6653,15 +6687,15 @@ impl MonitoringEngine {
             };
             let crash_prequote_evidence = Self::crash_guard_prequote_evidence(snapshot, policy);
 
-            if let CrashGuardPreQuoteDecision::NotTriggered { reason } = &crash_prequote {
+            if let CrashGuardPreQuoteDecision::NotTriggered { reason } = crash_prequote {
                 self.maybe_record_crash_guard_observation(
                     base_mint,
-                    &snapshot,
+                    snapshot,
                     CrashGuardObservationState::NotTriggered,
                     Some(*reason),
                     None,
-                    &authoritative_prequote,
-                    &crash_prequote,
+                    authoritative_prequote,
+                    crash_prequote,
                     &crash_prequote_evidence,
                     policy,
                     now_ms,
@@ -6669,21 +6703,21 @@ impl MonitoringEngine {
             }
 
             let crash_candidate = matches!(
-                &crash_prequote,
+                crash_prequote,
                 CrashGuardPreQuoteDecision::QuoteRequired { .. }
             );
             let prequote_crash_requirement = crash_candidate
-                .then(|| ExitPolicyV1::crash_guard_quote_requirement(&snapshot))
+                .then(|| ExitPolicyV1::crash_guard_quote_requirement(snapshot))
                 .flatten();
             if crash_candidate {
                 self.maybe_record_crash_guard_observation(
                     base_mint,
-                    &snapshot,
+                    snapshot,
                     CrashGuardObservationState::Candidate,
                     None,
                     None,
-                    &authoritative_prequote,
-                    &crash_prequote,
+                    authoritative_prequote,
+                    crash_prequote,
                     &crash_prequote_evidence,
                     policy,
                     now_ms,
@@ -6712,7 +6746,7 @@ impl MonitoringEngine {
                     }
                 }
             } else {
-                let selected = match (&crash_prequote, &authoritative_prequote) {
+                let selected = match (crash_prequote, authoritative_prequote) {
                     (CrashGuardPreQuoteDecision::QuoteRequired { candidate }, _)
                         if matches!(
                             policy.crash_guard_mode(),
@@ -6842,7 +6876,7 @@ impl MonitoringEngine {
             });
             let truth_result = pre_resolved_outcome.unwrap_or_else(|| {
                 self.resolve_shadow_exit_truth_for_policy(
-                    &snapshot,
+                    snapshot,
                     quote_snapshot,
                     expected_quantity,
                     now_ms,
@@ -6861,12 +6895,12 @@ impl MonitoringEngine {
                     if crash_quote_requirement.is_some() {
                         self.maybe_record_crash_guard_observation(
                             base_mint,
-                            &snapshot,
+                            snapshot,
                             CrashGuardObservationState::BlockedByData,
                             None,
                             None,
-                            &authoritative_prequote,
-                            &crash_prequote,
+                            authoritative_prequote,
+                            crash_prequote,
                             &failure.evidence,
                             policy,
                             now_ms,
@@ -6893,7 +6927,7 @@ impl MonitoringEngine {
             );
             let crash_quote_decision = crash_quote_requirement.as_ref().map(|requirement| {
                 ExitPolicyV1::evaluate_crash_guard_quote(
-                    &snapshot,
+                    snapshot,
                     &quote,
                     quote_evidence,
                     requirement,
@@ -6901,7 +6935,7 @@ impl MonitoringEngine {
                 )
             });
             if let Some(crash_quote_decision) = crash_quote_decision {
-                receipt_crash_quote_decision = Some(crash_quote_decision.clone());
+                receipt_crash_quote_decision = Some(crash_quote_decision);
                 if matches!(crash_quote_decision, CrashGuardQuoteDecision::BlockedByData)
                     && action.is_none()
                 {
@@ -6912,12 +6946,12 @@ impl MonitoringEngine {
                     CrashGuardQuoteDecision::Confirmed => self
                         .maybe_record_crash_guard_observation(
                             base_mint,
-                            &snapshot,
+                            snapshot,
                             CrashGuardObservationState::Confirmed,
                             None,
                             None,
-                            &authoritative_prequote,
-                            &crash_prequote,
+                            authoritative_prequote,
+                            crash_prequote,
                             &truth.evidence,
                             policy,
                             now_ms,
@@ -6925,12 +6959,12 @@ impl MonitoringEngine {
                     CrashGuardQuoteDecision::RejectedByQuote { reason } => {
                         self.maybe_record_crash_guard_observation(
                             base_mint,
-                            &snapshot,
+                            snapshot,
                             CrashGuardObservationState::RejectedByQuote,
                             None,
                             Some(reason),
-                            &authoritative_prequote,
-                            &crash_prequote,
+                            authoritative_prequote,
+                            crash_prequote,
                             &truth.evidence,
                             policy,
                             now_ms,
@@ -6939,12 +6973,12 @@ impl MonitoringEngine {
                     CrashGuardQuoteDecision::BlockedByData => self
                         .maybe_record_crash_guard_observation(
                             base_mint,
-                            &snapshot,
+                            snapshot,
                             CrashGuardObservationState::BlockedByData,
                             None,
                             None,
-                            &authoritative_prequote,
-                            &crash_prequote,
+                            authoritative_prequote,
+                            crash_prequote,
                             &truth.evidence,
                             policy,
                             now_ms,
@@ -7029,7 +7063,7 @@ impl MonitoringEngine {
                 break 'authority_tick;
             };
             let candidate = ExitCandidate::from_reason(action.reason);
-            match ExitPolicyV1::finalize_with_quote(&snapshot, &candidate, &quote, policy) {
+            match ExitPolicyV1::finalize_with_quote(snapshot, &candidate, &quote, policy) {
                 FinalPolicyDecision::Exit { intent } => {
                     if intent.quantity_raw() != action.expected_remaining_quantity
                         || intent.reason() != action.reason
@@ -7056,8 +7090,7 @@ impl MonitoringEngine {
                         receipt_reason = Some("final_intent_mismatch".to_string());
                         break 'authority_tick;
                     }
-                    if let Err(error) = self.apply_shadow_quote_outcome(&action, &snapshot, &truth)
-                    {
+                    if let Err(error) = self.apply_shadow_quote_outcome(&action, snapshot, &truth) {
                         receipt_outcome = V1AuthorityTickOutcomeV1::ApplyRejected;
                         receipt_reason = Some(format!("resolved_quote_apply_rejected:{error}"));
                         debug!(
@@ -12580,9 +12613,19 @@ mod tests {
         let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
         config.het_pm_v2.enabled = true;
         config.time_stop_v2.enabled = true;
+        let expected_time_stop_v2_hash = config
+            .time_stop_v2
+            .projection_config_hash()
+            .expect("serializable TimeStop V2 config");
         let (tx, _rx) = mpsc::channel(4);
         let mut engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
             .expect("valid HET-PM runtime config");
+        let expected_v1_hash = engine
+            .exit_policy_v1
+            .as_ref()
+            .expect("V1 policy")
+            .config_hash()
+            .to_string();
         engine.set_het_pm_v2_observation_log_path(Some(sidecar_path.clone()));
         let engine = Arc::new(engine);
 
@@ -12626,7 +12669,80 @@ mod tests {
             receipt.get("remaining_quantity_raw"),
             row.get("remaining_quantity_raw")
         );
-        assert_eq!(receipt.get("outcome"), Some(&Value::String("hold".into())));
+        assert_eq!(
+            receipt.get("outcome"),
+            Some(&Value::String("blocked".into()))
+        );
+        assert_eq!(row["v1_policy_id"], EXIT_POLICY_V1_ID);
+        assert_eq!(row["v1_policy_version"], EXIT_POLICY_V1_VERSION);
+        assert_eq!(row["v1_policy_config_hash"], expected_v1_hash);
+        assert_eq!(row["time_stop_v2_config_hash"], expected_time_stop_v2_hash);
+    }
+
+    #[tokio::test]
+    async fn v1_unknown_prequote_is_receipted_as_blocked_not_hold() {
+        let tmp = TempDir::new().expect("tempdir");
+        let sidecar_path = tmp.path().join("het_pm_v2_observations_v1.jsonl");
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid HET-PM runtime config");
+        engine.set_het_pm_v2_observation_log_path(Some(sidecar_path.clone()));
+        let engine = Arc::new(engine);
+
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000),
+                Some(1_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("v1-unknown-receipt".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "v1-unknown-receipt".to_string(),
+                    entry_order_id: "v1-unknown-receipt-entry".to_string(),
+                    quote_id: "v1-unknown-receipt-quote".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:v1-unknown-receipt".to_string()),
+                    position_epoch: Some(4),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("valid shadow registration");
+
+        let stale = MarketSnapshot {
+            slot: Some(2),
+            timestamp_ms: 1_000,
+            price_sol_per_token: 1.0,
+            price_state: PriceState::Valid,
+            market_cap_sol: 1.0,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 1.0,
+            ..MarketSnapshot::default()
+        };
+        engine
+            .run_shadow_runtime_tick(&mint, Some(&stale), 10_000)
+            .await;
+
+        let rows = read_jsonl_rows(&sidecar_path);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["v1_prequote"], "unknown:MarkStale");
+        assert_eq!(row["v1_final"], "Blocked");
+        assert_eq!(row["v1_authority_receipt"]["outcome"], "blocked");
+        assert_eq!(
+            row["v1_authority_receipt"]["reason"],
+            "prequote_unknown:MarkStale"
+        );
+        assert!(engine.positions.read().contains_key(&mint));
     }
 
     #[tokio::test]

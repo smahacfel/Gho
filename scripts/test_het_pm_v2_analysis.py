@@ -20,6 +20,10 @@ def fixture() -> dict:
         "policy_id": "hierarchical_executable_trajectory_pm_v2",
         "policy_version": 2,
         "policy_config_hash": "config-hash-1",
+        "v1_policy_id": "position_manager_lite_exit_policy_v1",
+        "v1_policy_version": 1,
+        "v1_policy_config_hash": "v1-config-hash-1",
+        "time_stop_v2_config_hash": "time-stop-config-hash-1",
         "run_id": "run-1",
         "lane": "shadow",
         "position_id": "position-1",
@@ -113,6 +117,20 @@ class AnalysisContractTest(unittest.TestCase):
             self.assertEqual(first, second)
             report = json.loads(first)
             self.assertEqual(report["position_count"], 1)
+            self.assertEqual(
+                report["evidence_contract"]["v1_authority"]["policy_config_hash"],
+                "v1-config-hash-1",
+            )
+            self.assertEqual(
+                report["evidence_contract"]["time_stop_v2_source"]["config_hash"],
+                "time-stop-config-hash-1",
+            )
+            self.assertEqual(inputs[0]["record_count"], 1)
+            self.assertEqual(inputs[0]["v1_policy_config_hash"], "v1-config-hash-1")
+            self.assertEqual(
+                inputs[0]["time_stop_v2_config_hash"],
+                "time-stop-config-hash-1",
+            )
             self.assertEqual(report["quote_budget"]["hold_quote_count"], 0)
             self.assertIsNone(
                 report["quote_budget"]["between_tick_cache_reuse_violation_count"]
@@ -158,7 +176,37 @@ class AnalysisContractTest(unittest.TestCase):
                 json.dumps(first) + "\n" + json.dumps(second) + "\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(MODULE.ContractError, "mixed schema/policy/config"):
+            with self.assertRaisesRegex(MODULE.ContractError, "mixed evidence contracts"):
+                MODULE.load_records([path])
+
+    def test_mixed_v1_policy_config_hash_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "input.jsonl"
+            first = fixture()
+            second = fixture()
+            second["snapshot_id"] = "snapshot-2"
+            second["v1_authority_receipt"]["snapshot_id"] = "snapshot-2"
+            second["v1_policy_config_hash"] = "v1-config-hash-2"
+            path.write_text(
+                json.dumps(first) + "\n" + json.dumps(second) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(MODULE.ContractError, "mixed evidence contracts"):
+                MODULE.load_records([path])
+
+    def test_mixed_time_stop_v2_config_hash_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "input.jsonl"
+            first = fixture()
+            second = fixture()
+            second["snapshot_id"] = "snapshot-2"
+            second["v1_authority_receipt"]["snapshot_id"] = "snapshot-2"
+            second["time_stop_v2_config_hash"] = "time-stop-config-hash-2"
+            path.write_text(
+                json.dumps(first) + "\n" + json.dumps(second) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(MODULE.ContractError, "mixed evidence contracts"):
                 MODULE.load_records([path])
 
     def test_wrong_lane_or_authority_is_rejected(self) -> None:

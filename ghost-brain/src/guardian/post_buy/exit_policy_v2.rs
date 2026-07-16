@@ -15,7 +15,7 @@ use super::exit_policy_v1::{
     CrashGuardPreQuoteDecision, CrashGuardQuoteDecision, CrashGuardQuoteRejectionReason,
     CrashGuardQuoteRequirementV1, EffectiveExitPolicyV1Config, ExecutableExitQuote,
     ExitCandidateReason, ExitPolicyV1, MarkEvidenceStatus, PostBuyDecisionSnapshot,
-    PreQuoteDecision, QuoteEvidenceRevisionV1,
+    PreQuoteDecision, QuoteEvidenceRevisionV1, EXIT_POLICY_V1_ID, EXIT_POLICY_V1_VERSION,
 };
 use super::trajectory_v1::{TrajectoryFeaturesV1, TrajectoryQualityV1};
 
@@ -615,6 +615,13 @@ pub(super) enum HetPmFinalDecisionV2 {
 
 pub(super) struct ExitPolicyV2;
 
+pub(super) struct HetPmQuoteFinalizationInputV2<'a> {
+    pub(super) quote: Option<&'a ExecutableExitQuote>,
+    pub(super) quote_key: Option<&'a ExecutableQuoteKeyV2>,
+    pub(super) quote_evidence: Option<QuoteEvidenceRevisionV1>,
+    pub(super) crash_requirement: Option<&'a CrashGuardQuoteRequirementV1>,
+}
+
 impl ExitPolicyV2 {
     pub(super) fn evaluate_prequote(
         view: PostBuyDecisionViewV2<'_>,
@@ -892,13 +899,16 @@ impl ExitPolicyV2 {
     pub(super) fn finalize_with_quote(
         view: PostBuyDecisionViewV2<'_>,
         prequote: &HetPmPreQuoteEvaluationV2,
-        quote: Option<&ExecutableExitQuote>,
-        quote_key: Option<&ExecutableQuoteKeyV2>,
-        quote_evidence: Option<QuoteEvidenceRevisionV1>,
-        crash_requirement: Option<&CrashGuardQuoteRequirementV1>,
+        resolution: HetPmQuoteFinalizationInputV2<'_>,
         v1_config: &EffectiveExitPolicyV1Config,
         config: &EffectiveHetPmV2Config,
     ) -> HetPmFinalDecisionV2 {
+        let HetPmQuoteFinalizationInputV2 {
+            quote,
+            quote_key,
+            quote_evidence,
+            crash_requirement,
+        } = resolution;
         match &prequote.candidate {
             HetPmCandidateV2::Hold => HetPmFinalDecisionV2::Hold,
             HetPmCandidateV2::Pending => HetPmFinalDecisionV2::Pending,
@@ -1003,6 +1013,19 @@ pub(super) enum V1AuthorityTickOutcomeV1 {
     PendingRecovery,
     Blocked,
     ApplyRejected,
+}
+
+impl V1AuthorityTickOutcomeV1 {
+    pub(super) const fn as_label(self) -> &'static str {
+        match self {
+            Self::Hold => "Hold",
+            Self::ProposalStarted => "ProposalStarted",
+            Self::TerminalApplied => "TerminalApplied",
+            Self::PendingRecovery => "PendingRecovery",
+            Self::Blocked => "Blocked",
+            Self::ApplyRejected => "ApplyRejected",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1129,6 +1152,10 @@ pub(super) struct V1V2ComparisonRecord {
     pub(super) policy_id: String,
     pub(super) policy_version: u16,
     pub(super) policy_config_hash: String,
+    pub(super) v1_policy_id: String,
+    pub(super) v1_policy_version: u16,
+    pub(super) v1_policy_config_hash: String,
+    pub(super) time_stop_v2_config_hash: String,
     pub(super) run_id: String,
     pub(super) lane: Lane,
     pub(super) position_id: String,
@@ -1187,6 +1214,14 @@ impl V1V2ComparisonRecord {
         {
             return Err("comparison_schema_or_policy_mismatch");
         }
+        if self.v1_policy_id != EXIT_POLICY_V1_ID
+            || self.v1_policy_version != EXIT_POLICY_V1_VERSION
+            || self.policy_config_hash.is_empty()
+            || self.v1_policy_config_hash.is_empty()
+            || self.time_stop_v2_config_hash.is_empty()
+        {
+            return Err("comparison_source_config_identity_mismatch");
+        }
         if !matches!(self.lane, Lane::Shadow) {
             return Err("comparison_lane_is_not_shadow");
         }
@@ -1202,6 +1237,14 @@ impl V1V2ComparisonRecord {
             || self.remaining_quantity_raw == 0
         {
             return Err("v1_authority_receipt_snapshot_mismatch");
+        }
+        if self.v1_final.as_deref() != Some(receipt.outcome.as_label()) {
+            return Err("v1_final_receipt_outcome_mismatch");
+        }
+        if self.terminal_tick
+            != matches!(receipt.outcome, V1AuthorityTickOutcomeV1::TerminalApplied)
+        {
+            return Err("terminal_tick_receipt_outcome_mismatch");
         }
         if !self.v1_shadow_authority || self.v2_shadow_authority || self.live_authority {
             return Err("comparison_authority_contract_mismatch");
@@ -1446,10 +1489,12 @@ mod tests {
         ExitPolicyV2::finalize_with_quote(
             bundle.view(),
             &prequote,
-            Some(quote),
-            Some(&key),
-            Some(quote_evidence),
-            Some(&requirement),
+            HetPmQuoteFinalizationInputV2 {
+                quote: Some(quote),
+                quote_key: Some(&key),
+                quote_evidence: Some(quote_evidence),
+                crash_requirement: Some(&requirement),
+            },
             v1_config,
             &het_config,
         )
@@ -1482,6 +1527,10 @@ mod tests {
             policy_id: HET_PM_V2_POLICY_ID.to_string(),
             policy_version: HET_PM_V2_POLICY_VERSION,
             policy_config_hash: "hash".to_string(),
+            v1_policy_id: EXIT_POLICY_V1_ID.to_string(),
+            v1_policy_version: EXIT_POLICY_V1_VERSION,
+            v1_policy_config_hash: "v1-hash".to_string(),
+            time_stop_v2_config_hash: "time-stop-hash".to_string(),
             run_id: "run".to_string(),
             lane: Lane::Shadow,
             position_id: "position".to_string(),
@@ -1620,6 +1669,28 @@ mod tests {
         assert_eq!(
             oversized.validate_and_serialize(),
             Err("comparison_payload_oversized")
+        );
+    }
+
+    #[test]
+    fn comparison_rejects_v1_final_receipt_mismatch() {
+        let mut record = comparison_record();
+        record.v1_final = Some("TerminalApplied".to_string());
+
+        assert_eq!(
+            record.validate_and_serialize(),
+            Err("v1_final_receipt_outcome_mismatch")
+        );
+    }
+
+    #[test]
+    fn comparison_rejects_terminal_tick_receipt_mismatch() {
+        let mut record = comparison_record();
+        record.terminal_tick = true;
+
+        assert_eq!(
+            record.validate_and_serialize(),
+            Err("terminal_tick_receipt_outcome_mismatch")
         );
     }
 
@@ -2020,10 +2091,12 @@ mod tests {
             ExitPolicyV2::finalize_with_quote(
                 bundle.view(),
                 &prequote,
-                Some(&breached),
-                Some(&key),
-                None,
-                None,
+                HetPmQuoteFinalizationInputV2 {
+                    quote: Some(&breached),
+                    quote_key: Some(&key),
+                    quote_evidence: None,
+                    crash_requirement: None,
+                },
                 &v1_config,
                 &config
             ),
@@ -2038,10 +2111,12 @@ mod tests {
             ExitPolicyV2::finalize_with_quote(
                 bundle.view(),
                 &prequote,
-                Some(&not_breached),
-                Some(&key),
-                None,
-                None,
+                HetPmQuoteFinalizationInputV2 {
+                    quote: Some(&not_breached),
+                    quote_key: Some(&key),
+                    quote_evidence: None,
+                    crash_requirement: None,
+                },
                 &v1_config,
                 &config
             ),

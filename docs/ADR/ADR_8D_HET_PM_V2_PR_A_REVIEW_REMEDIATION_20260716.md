@@ -18,7 +18,9 @@ Powiązany dokument: `ADR_8D_HET_PM_V2_PR_A_OBSERVE_ONLY_20260716.md`.
 Niniejszy ADR jest addendum po review i zastępuje wcześniejsze opisy wszędzie,
 gdzie dotyczą one Crash finalization, same-snapshot comparison, vitality wiring,
 startup validation, route bootstrap, strictness analizatora albo formalnego
-base/head test evidence.
+base/head test evidence. Drugi focused re-review rozszerza ten dokument o
+identity konfiguracji źródłowych, lokalną walidację receipt, semantykę
+UnknownEvidence i diff-scoped Clippy.
 
 Poziom ryzyka: `MEDIUM-HIGH` — poprawka dotyka aktywnego shadow post-buy
 runtime i kontraktu danych burn-in. Nie zmienia prebuy Gatekeepera, nie dodaje
@@ -122,7 +124,13 @@ crash_quote_decision
 `V1V2ComparisonRecord.v1_final` jest wyprowadzane z receipt. Serializer failuje
 przed appendem, jeżeli receipt nie ma dokładnie tego samego snapshot ID,
 revision albo quantity co rekord. `terminal_tick` jest wyprowadzany z
-`TerminalApplied`.
+`TerminalApplied`. Outcome posiada typed `as_label()`; runtime serializer
+odrzuca również każdy rekord, w którym `v1_final` nie odpowiada receipt albo
+`terminal_tick` nie odpowiada `TerminalApplied`.
+
+`PreQuoteDecision::UnknownEvidence` nie jest finalizowane jako świadome
+`Hold`. Receipt ma wtedy `Blocked` i reason `prequote_unknown:<typed reason>`.
+Pozycja pozostaje otwarta, ale evidence nie zaciera braku rozstrzygalności V1.
 
 Ścieżka bez aktywnego HET nadal materializuje V1 base snapshot samodzielnie.
 V1 base snapshot nie zależy już od obecności valid HET extras/configu.
@@ -188,8 +196,11 @@ bez wymaganego AccountStateCore feedu.
 
 `scripts/het_pm_v2_analysis.py` wymaga pełnego kontraktu identity/provenance:
 
-- schema, policy ID i policy version;
-- policy config hash i run ID;
+- schema;
+- osobne identity HET: policy ID, version i config hash;
+- osobne identity V1: policy ID, version i config hash;
+- osobny pełny `time_stop_v2_config_hash` źródła vitality;
+- run ID;
 - lane, position/epoch/revision/quantity/snapshot ID;
 - sampling mode, measurement grade i monitor tick;
 - V1 prequote, Crash prequote, actual final i authority receipt;
@@ -198,9 +209,15 @@ bez wymaganego AccountStateCore feedu.
 - quote keys/statuses/cardinality;
 - authority i observe-only flags.
 
+Hash TimeStop V2 obejmuje kompletną konfigurację źródła, w tym scheduling,
+window/candidate thresholds, meaningful-progress thresholds, heartbeat
+thresholds, mode, enabled oraz emission setting. Jest liczony raz przy
+fail-closed konstrukcji engine'u. Nie jest włączany do HET hash, ponieważ
+kontrakty HET, V1 i TimeStop pozostają rozdzielonymi identities.
+
 Loader odrzuca:
 
-- mixed schema/policy version/config hash/sampling/tick;
+- mixed schema/HET config/V1 config/TimeStop V2 config/sampling/tick;
 - lane inne niż `shadow`;
 - `consumed_by_policy = true`;
 - brak V1 authority albo obecność V2/live authority;
@@ -265,7 +282,54 @@ Formalny wariant akceptacyjny „exact test na base i head z identycznym failure
 jest zatem spełniony. PR A nie rozszerza zakresu o naprawę niezwiązanego
 emitera density.
 
-## 9. Testy regresyjne dodane lub rozszerzone
+## 9. Drugi focused re-review i jawna granica burn-inu
+
+Drugi review wykazał cztery pozostałe problemy:
+
+1. diff-scoped Clippy zgłaszał `needless_borrow`, `clone_on_copy`,
+   `too_many_arguments` i `needless_update` w plikach PR;
+2. sidecar posiadał wyłącznie HET config hash;
+3. runtime serializer nie porównywał final/terminal z receipt;
+4. V1 `UnknownEvidence` kończyło jako `Hold`.
+
+Wszystkie cztery klasy zostały naprawione. Exact lokalny gate:
+
+```text
+python3 scripts/guard_diff_scoped_clippy.py \
+  --base 18d94b0cc5a226496a5ac2bc616e7488a7f78d5d \
+  --head HEAD
+```
+
+zwraca:
+
+```text
+PASS: no new Clippy diagnostics and no diagnostic with a primary span in changed Rust source.
+```
+
+PR A nadal jest wyłącznie producentem observe-only evidence. W ramach tej
+implementacji nie uruchomiono shadow burn-inu i nie policzono promotion Gate 4
+ani Gate 5 z sekcji 19 planu. W szczególności nie wyliczano:
+
+- CVaR ani tail-loss delta;
+- MFE capture ratio;
+- outlier concentration/share;
+- creator/funder cohort dominance;
+- stabilności kierunku między runami i launch cohorts.
+
+W repo nie ma jeszcze committed promotion criteria, promotion gate tool ani
+`het_pm_v2_promotion_gate_v1.json`. Analyzer zachowuje zatem jawnie:
+
+```text
+promotion_gate_evaluated = false
+promotion_gate_passed = false
+counterfactual_outcome_attribution_status =
+  not_evaluated; requires explicit lifecycle_and_replay_join
+```
+
+Gotowość PR A oznacza gotowość do późniejszego zbierania porównywalnego
+evidence, nie ekonomiczną lub kohortową promocję PR B.
+
+## 10. Testy regresyjne dodane lub rozszerzone
 
 Crash:
 
@@ -277,6 +341,9 @@ Crash:
 Bundle/receipt:
 
 - `actual_v1_receipt_and_v2_record_share_exact_snapshot_id_revision_quantity`.
+- `comparison_rejects_v1_final_receipt_mismatch`;
+- `comparison_rejects_terminal_tick_receipt_mismatch`;
+- `v1_unknown_prequote_is_receipted_as_blocked_not_hold`.
 
 Vitality/startup/route:
 
@@ -291,7 +358,7 @@ Analyzer:
 
 - deterministic report;
 - unsupported schema;
-- mixed policy config hash;
+- mixed HET, V1 i TimeStop V2 config hash;
 - wrong lane/authority;
 - non-finite JSON;
 - missing provenance;
@@ -299,7 +366,7 @@ Analyzer:
 - V1 final/receipt mismatch;
 - quote ownership attribution.
 
-## 10. Inwarianty zachowane
+## 11. Inwarianty zachowane
 
 - V1 pozostaje jedynym proposal/apply/terminal/capacity ownerem;
 - V2 nie wywołuje `begin_exit_proposal` ani żadnego apply;
@@ -313,14 +380,18 @@ Analyzer:
 - sidecar nie jest canonical terminal truth ani niezależnym lifecycle proof;
 - executable anchor nadal ma własne `anchor_seq` i nie zwiększa economic revision;
 - unknown/unsupported route blokuje V2 zamiast udawać Hold/exit;
+- V1 UnknownEvidence jest receipted jako Blocked, nie Hold;
 - shadow simulation nie jest live inclusion;
 - live authority pozostaje disabled.
 
-## 11. Zakres plików remediation
+## 12. Zakres plików remediation
 
 - `ghost-brain/ghost_brain_config.toml` — aktywne observe-only TimeStop vitality;
 - `ghost-brain/src/guardian/post_buy/engine.rs` — one-bundle orchestration,
-  receipt, V1-independent snapshot i route bootstrap;
+  receipt, source identities, UnknownEvidence, V1-independent snapshot i route
+  bootstrap;
+- `ghost-brain/src/guardian/post_buy/config.rs` — deterministyczny pełny hash
+  konfiguracji źródła TimeStop V2;
 - `ghost-brain/src/guardian/post_buy/exit_policy_v1.rs` — serializowalny typed
   Crash quote result dla evidence;
 - `ghost-brain/src/guardian/post_buy/exit_policy_v2.rs` — V1 Crash finalization,
@@ -332,22 +403,23 @@ Analyzer:
 - `scripts/test_het_pm_v2_analysis.py` — negatywne testy schema;
 - niniejszy ADR-8D.
 
-## 12. Walidacja lokalna remediation
+## 13. Walidacja lokalna remediation
 
 | Kontrola | Wynik |
 | --- | --- |
 | `cargo check -p ghost-brain --lib` | PASS. |
-| `cargo test -p ghost-brain guardian::post_buy --lib` | PASS — 219/219. |
+| `cargo test -q -p ghost-brain guardian::post_buy --lib -- --test-threads=1` | PASS — 223/223. Sekwencyjność izoluje istniejącą globalną flagę budżetu artifactów między testami. |
 | `cargo test -p ghost-brain guardian::post_buy::exit_policy_v2::tests::crash_ --lib` | PASS — 4/4. |
 | `cargo test -p ghost-brain guardian::post_buy::engine::tests --lib` | PASS — 64/64. |
 | `cargo test -q -p ghost-launcher shadow_handoff --lib` | PASS — 3/3. |
 | exact launcher base/head comparison | PARITY PROVEN — base 65/66 i head 67/68; ten sam jedyny niezwiązany density failure. |
-| `python3 -m unittest scripts/test_het_pm_v2_analysis.py` | PASS — 9/9. |
+| `python3 -m unittest scripts/test_het_pm_v2_analysis.py` | PASS — 11/11. |
 | `python3 -m py_compile scripts/het_pm_v2_analysis.py scripts/test_het_pm_v2_analysis.py` | PASS. |
-| `cargo fmt --all -- --check` | wymagane ponownie bezpośrednio przed commitem. |
-| `git diff --check` | wymagane ponownie bezpośrednio przed commitem. |
+| exact diff-scoped Clippy względem base SHA | PASS — brak nowych diagnostics i brak primary spans w zmienionym Rust. |
+| `cargo fmt --all -- --check` | PASS; wymagane ponownie bezpośrednio przed commitem. |
+| `git diff --check` | PASS; wymagane ponownie bezpośrednio przed commitem. |
 
-## 13. Rollback
+## 14. Rollback
 
 Rollback to revert jednego remediation commita do poprzedniego head PR #71.
 Nie ma migracji canonical state ani publicznego API. Taki rollback przywraca

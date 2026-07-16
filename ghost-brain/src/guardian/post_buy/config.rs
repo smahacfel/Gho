@@ -115,6 +115,27 @@ impl Default for TimeStopV2Config {
 }
 
 impl TimeStopV2Config {
+    /// Deterministic identity of the complete TimeStop V2 evidence producer.
+    ///
+    /// HET-PM V2 consumes the projection emitted by this source, so burn-in
+    /// records must remain distinguishable when any source knob changes. The
+    /// HET policy hash intentionally stays separate from this identity.
+    pub fn projection_config_hash(&self) -> Result<String, serde_json::Error> {
+        #[derive(Serialize)]
+        struct HashInput<'a> {
+            projection_id: &'static str,
+            projection_version: u16,
+            config: &'a TimeStopV2Config,
+        }
+
+        let encoded = serde_json::to_vec(&HashInput {
+            projection_id: "post_buy_time_stop_v2_projection_v1",
+            projection_version: 1,
+            config: self,
+        })?;
+        Ok(blake3::hash(&encoded).to_hex().to_string())
+    }
+
     pub fn first_check_ms(&self) -> u64 {
         self.first_check_ms.max(1)
     }
@@ -808,5 +829,29 @@ mod tests {
         assert_eq!(cfg.time_stop_v2.max_abs_mcap_delta_pct_heartbeat, 0.9);
         assert_eq!(cfg.time_stop_v2.max_bonding_delta_pct_heartbeat, 0.2);
         assert!(!cfg.time_stop_v2.emit_window_records);
+    }
+
+    #[test]
+    fn time_stop_v2_projection_hash_covers_source_semantics() {
+        let base = TimeStopV2Config::default();
+        let same = TimeStopV2Config::default();
+        assert_eq!(
+            base.projection_config_hash().unwrap(),
+            same.projection_config_hash().unwrap()
+        );
+
+        let mut changed_window = base.clone();
+        changed_window.window_ms += 1;
+        assert_ne!(
+            base.projection_config_hash().unwrap(),
+            changed_window.projection_config_hash().unwrap()
+        );
+
+        let mut changed_vitality_threshold = base.clone();
+        changed_vitality_threshold.min_price_delta_pct_alive += 0.5;
+        assert_ne!(
+            base.projection_config_hash().unwrap(),
+            changed_vitality_threshold.projection_config_hash().unwrap()
+        );
     }
 }

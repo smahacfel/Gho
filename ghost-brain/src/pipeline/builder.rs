@@ -78,7 +78,6 @@ impl E2EPipeline {
                 max_file_size_bytes: config.execution.events.max_file_size_bytes,
                 enable_aem_ticks: config.execution.events.enable_aem_ticks,
                 enable_optional_events: config.execution.events.enable_optional_events,
-                ..Default::default()
             };
             match EventEmitter::new(writer_cfg, run_id.clone(), event_lane) {
                 Ok(emitter) => {
