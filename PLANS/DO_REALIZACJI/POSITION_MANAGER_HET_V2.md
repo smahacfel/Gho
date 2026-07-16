@@ -2,16 +2,18 @@
 
 ## 0. Status i źródło prawdy
 
-- Status: `PLAN DO REALIZACJI / SHADOW-FIRST / POST-PR68`
+- Status: `PLAN DO REALIZACJI / SHADOW-FIRST / POST-PR68 / REVIEW FIXES INCORPORATED`
 - Data: `2026-07-16`
 - Repozytorium: `smahacfel/Gho`
-- Branch planu: `agent/het-pm-v2-plan-20260716`
+- Branch planu: `agent/het-pm-v2-review-fixes-20260716`
 - Fundament:
   - PR #67 — `Position Manager Lite V1: pure exit policy and safe lifecycle`;
   - PR #68 — `Position Manager Lite V1 PR2: max-hold and CrashGuard`.
 - Docelowa architektura długoterminowa: `HEOS-PM`.
 - Najbliższa implementacja: `HET-PM V2`.
-- Ten dokument jest jedynym normatywnym planem HET-PM V2. Nie obowiązują osobne amendmenty.
+- Ten dokument jest jedynym normatywnym planem HET-PM V2.
+- HET-PM V2 nie zmienia prebuy BUY/REJECT/TIMEOUT.
+- PR A jest wyłącznie `observe_only`; PR B jest osobnym, późniejszym cutoverem authority.
 
 ## 1. Cel nadrzędny i reguła wykonawcza
 
@@ -21,7 +23,7 @@ Obowiązuje reguła:
 
 > Identyfikuj punkt zapalny i root cause. Wprowadzaj najmniejszą zmianę, która realnie rozwiązuje problem i daje mierzalny rezultat. Nie buduj systemu wokół problemu, gdy wystarcza jego bezpośrednia naprawa.
 
-HET-PM V2 ma zastąpić prymitywne zarządzanie oparte głównie na bieżącym TP/SL/time-stop przez deterministyczną politykę, która rozumie kierunek i ewolucję pozycji, ale nadal korzysta z jednego właściciela lifecycle, jednego quote pathu i istniejących terminalnych kontraktów.
+HET-PM V2 ma zastąpić prymitywne zarządzanie oparte głównie na bieżącym TP/SL/time-stop przez deterministyczną politykę rozumiejącą kierunek i ewolucję pozycji, ale nadal korzystającą z jednego właściciela lifecycle, jednego quote pathu i istniejących kontraktów terminalnych.
 
 ## 2. Decyzja architektoniczna
 
@@ -117,7 +119,7 @@ Bez zmian pozostają:
 - raw canonical provenance CrashGuarda;
 - brak aktywacji live.
 
-HET-PM V2 nie zastępuje tego fundamentu. Rozszerza jedynie sposób oceny pozycji przed istniejącym quote/apply/outcome contractem.
+HET-PM V2 nie zastępuje tego fundamentu. Rozszerza sposób oceny pozycji przed istniejącym quote/apply/outcome contractem.
 
 ## 4. Charakter trajektorii i granice semantyczne
 
@@ -151,7 +153,7 @@ Każdy sample zapisuje:
 
 Pole historycznie materializowane jako `MarketSnapshot.tx_count` reprezentuje liczbę zaakceptowanych aktualizacji `AccountStateCore`, a nie udowodnioną liczbę swapów.
 
-W HET-PM V2 dozwolone nazwy to:
+Dozwolone nazwy:
 
 ```text
 state_update_delta_since_previous_sample
@@ -207,7 +209,7 @@ wallet cluster growth
 
 ### 4.5. Brak look-ahead
 
-Każda projekcja V2 musi być obliczana wyłącznie z próbek dostępnych do `latest_sample_timestamp_ms`. Nie wolno:
+Każda projekcja V2 jest obliczana wyłącznie z próbek dostępnych do `latest_sample_timestamp_ms`. Nie wolno:
 
 - interpolować z późniejszej próbki;
 - wybierać próbki znajdującej się po docelowym czasie okna;
@@ -273,8 +275,6 @@ INVALID_TIMESTAMP_ORDERING
 INVALID_PRICE
 ```
 
-Semantyka proxy pól jest stałą cechą schema i nie wymaga powtarzania osobnego wpisu w `Vec` na każdym ticku.
-
 ### 6.3. `TrajectoryFeaturesV1`
 
 Pierwsza polityka nie potrzebuje okna 500 ms. Najszybszą warstwą pozostaje istniejący CrashGuard z distinct-slot evidence.
@@ -282,12 +282,10 @@ Pierwsza polityka nie potrzebuje okna 500 ms. Najszybszą warstwą pozostaje ist
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct TrajectoryFeaturesV1 {
-    // Wieloskalowa ścieżka mark.
     return_1500ms_bps: Option<i32>,
     return_5s_bps: Option<i32>,
     return_15s_bps: Option<i32>,
 
-    // Peak i giveback.
     peak_mark_price_sol: Option<f64>,
     peak_sample_slot: Option<u64>,
     peak_sample_timestamp_ms: Option<u64>,
@@ -295,7 +293,6 @@ pub(super) struct TrajectoryFeaturesV1 {
     time_since_peak_ms: Option<u64>,
     peak_giveback_velocity_bps_per_sec: Option<i32>,
 
-    // Sampling provenance.
     newest_sample_slot: Option<u64>,
     newest_sample_timestamp_ms: Option<u64>,
     newest_sample_age_ms: Option<u64>,
@@ -316,8 +313,6 @@ abs_quote_reserve_movement_proxy
 bonding_velocity
 ```
 
-Mogą zostać zapisane w rozszerzonym evidence recordzie, ale nie powinny zwiększać liczby aktywnych bramek ani progów.
-
 ### 6.4. Materializacja returnów
 
 Dla okna `W`:
@@ -331,19 +326,12 @@ Dla okna `W`:
 
 ```text
 return_W_bps = round(10_000 × (P_now / P_ref - 1))
-```
-
-Tolerance jest wyprowadzana z monitor ticku:
-
-```text
 reference_tolerance_ms = max(2 × monitor_tick_ms, W / 2)
 ```
 
 ### 6.5. Peak giveback velocity
 
 Nie implementować niestabilnej numerycznej drugiej pochodnej.
-
-Pierwsza wersja używa średniej prędkości oddawania od ostatniego kanonicznego peaku:
 
 ```text
 peak_giveback_velocity_bps_per_sec =
@@ -352,11 +340,56 @@ peak_giveback_velocity_bps_per_sec =
 
 Pole jest ważne tylko, gdy peak i current sample mają prawidłową kolejność oraz pochodzą z tego samego route/modelu.
 
-## 7. Vitality jako bieżący stan, nie sticky historyczny kandydat
+## 7. TimeStop V2 i immutable vitality projection
 
-HET-PM V2 wykorzystuje istniejący `TimeStopV2State`, ale nie konsumuje bezpośrednio historycznego `candidate_emitted`.
+### 7.1. Jeden właściciel mutacji `TimeStopV2State`
 
-Powstaje immutable projekcja:
+`TimeStopV2State::evaluate(...)` jest mutującym krokiem istniejącego TimeStop V2. HET-PM V2 nie może wykonywać tej funkcji drugi raz ani bezpośrednio zapisywać do `pos.time_stop_v2`.
+
+Normatywny kontrakt:
+
+> Tylko istniejący krok TimeStop V2 może mutować `TimeStopV2State`. HET-PM V2 otrzymuje wyłącznie immutable projekcję rezultatu już wykonanej ewaluacji.
+
+Dla danego monitora/ticku lub zaplanowanego okna:
+
+```text
+TimeStopV2State::evaluate(...) — najwyżej jedno wywołanie
+      ↓
+immutable TimeStopV2ProjectionV1
+      ↓ pure mapping
+VitalityFeaturesV1
+```
+
+Zakazane:
+
+- drugie wywołanie `evaluate()` dla potrzeb HET-PM;
+- inkrementacja `failed_windows` przez HET-PM;
+- zmiana `candidate_emitted`, `candidate_ts_ms`, `candidate_subreason` przez HET-PM;
+- zmiana checkpointu lub `next_window_index` przez HET-PM;
+- dodatkowa emisja istniejących TimeStop V2 rows z powodu HET-PM.
+
+### 7.2. Immutable `TimeStopV2ProjectionV1`
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct TimeStopV2ProjectionV1 {
+    current_status: TimeStopV2WindowStatus,
+    current_subreason: TimeStopV2Subreason,
+    consecutive_non_alive_windows: u32,
+    last_window_at_ms: Option<u64>,
+    last_alive_at_ms: Option<u64>,
+    latest_window_price_delta_bps: Option<i32>,
+    latest_window_state_update_delta: Option<u64>,
+    source_window_index: Option<u32>,
+    source_checkpoint_slot: Option<u64>,
+    source_latest_slot: Option<u64>,
+    quality_fresh: bool,
+}
+```
+
+Projection jest tworzona bez dodatkowej mutacji po istniejącym wywołaniu `evaluate()`. Gdy w danym ticku TimeStop V2 nie wykonuje nowego zaplanowanego okna, projection odzwierciedla ostatni już zapisany bieżący stan bez wywoływania `evaluate()`.
+
+### 7.3. `VitalityFeaturesV1`
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,11 +415,32 @@ pub(super) struct VitalityFeaturesV1 {
 
 Zasady:
 
-- `Alive` zeruje serię nieudanych okien;
+- `Alive` zeruje serię nieudanych okien wyłącznie w istniejącym TimeStop V2 kroku;
 - późniejszy recovery może usunąć bieżący vitality candidate;
-- historyczny fakt, że kiedyś wyemitowano candidate, nie jest authority;
+- historyczny `candidate_emitted` nie jest authority;
 - `StaleOrUnknown` nie jest automatycznym EXIT;
-- vitality exit wymaga świeżego route i executable quote.
+- vitality exit wymaga świeżego route i executable quote;
+- HET-PM jest czystym konsumentem `TimeStopV2ProjectionV1`.
+
+### 7.4. Parity acceptance
+
+Przy identycznym streamie wejściowym przebieg:
+
+- `TimeStopV2State`;
+- `failed_windows`;
+- `candidate_emitted` i timestamps;
+- checkpoint/index;
+- istniejące TimeStop V2 lifecycle/evidence rows
+
+musi być bitowo lub semantycznie identyczny dla:
+
+```text
+HET-PM V2 disabled
+versus
+HET-PM V2 enabled observe_only
+```
+
+Jedyną dopuszczalną różnicą są dodatkowe HET-PM sidecar/comparison records.
 
 ## 8. Route jako osobny kontrakt
 
@@ -404,13 +458,7 @@ Kontrakt:
 
 ```text
 StatePhase::Migrated != PumpSwapReady
-```
-
-W pierwszym HET-PM:
-
-```text
-StatePhase::Migrated
-    -> CurveCompletePumpSwapUnsupported
+StatePhase::Migrated -> CurveCompletePumpSwapUnsupported
 ```
 
 Route unsupported nie jest:
@@ -662,11 +710,10 @@ Sprawdzane są:
 Brak danych nie jest `Hold`.
 
 ```text
-invalid/stale/unsupported
-    -> typed Blocked / UnknownEvidence
+invalid/stale/unsupported -> typed Blocked / UnknownEvidence
 ```
 
-### 12.5. Gate 2 — emergency crash
+### 12.5. Gate 2 — emergency crash i dokładna semantyka defaultów
 
 Reuse istniejącego PR #68:
 
@@ -680,9 +727,25 @@ raw canonical distinct-slot path
 
 Nie powstaje drugi CrashGuard ani composite PANIC score.
 
-W PR A CrashGuard zachowuje aktywny effective mode z PR #68, domyślnie `observe_only`.
+Normatywny kontrakt konfiguracji:
 
-PR B nie promuje CrashGuarda automatycznie. Jego promocja wymaga jawnego wyniku burn-inu i jawnej zmiany configu.
+- PR A zachowuje `CrashGuardMode` wynikający z faktycznie załadowanego effective configu;
+- Rust/serde default `CrashGuardMode` pozostaje `Disabled`;
+- `ExitPolicyV1Config::default()` pozostaje `crash_guard_mode = Disabled`;
+- pusty lub historyczny TOML nie zostaje automatycznie promowany;
+- aktualny główny profil `ghost_brain_config.toml` jawnie ustawia `crash_guard_mode = "observe_only"`;
+- HET-PM nie nadpisuje, nie normalizuje i nie zmienia tego pola;
+- PR B nie promuje CrashGuarda automatycznie.
+
+Nie wolno używać sformułowania „domyślnie observe-only” bez doprecyzowania, że dotyczy ono wyłącznie aktualnego aktywnego profilu, a nie Rust defaultu.
+
+Obowiązkowe testy:
+
+- pusty TOML -> CrashGuard `Disabled`;
+- `PostBuyGuardianConfig::default()` -> CrashGuard `Disabled`;
+- aktualny main profile -> effective CrashGuard `ObserveOnly`;
+- HET-PM enabled/disabled nie zmienia effective CrashGuard mode;
+- historyczny config bez sekcji nie zmienia zachowania.
 
 ### 12.6. Gate 3 — hard loss
 
@@ -743,8 +806,6 @@ Vitality candidate wymaga łącznie:
 - braku dodatniego recovery w ostatnim oknie 5 s;
 - braku wyższego gate'u;
 - resolved full-position executable quote przed finalnym EXIT.
-
-Przykładowa reguła recovery:
 
 ```text
 return_5s_bps >= vitality_recovery_return_bps
@@ -836,13 +897,24 @@ Dopiero przed PR B zostaje zamrożony ewentualny conservative cost contract. PR 
 
 Jeżeli V1 zostanie zastosowane przed materializacją V2, terminalny tick może usunąć pozycję i spowodować brak V2 evidence dokładnie na najważniejszych obserwacjach.
 
+Drugim ryzykiem jest przypadkowe ponowne wywołanie mutującego `TimeStopV2State::evaluate()` przez HET-PM.
+
 ### 14.2. Normatywna kolejność PR A
 
 ```text
 1. refresh existing SnapshotTimeline
 2. update canonical mark peak
-3. evaluate/update existing TimeStopV2 state
-4. pod jednym read boundary zmaterializuj PostBuySnapshotBundle
+3. wykonaj istniejący TimeStopV2 step najwyżej raz:
+     - jeśli window jest due: wywołaj TimeStopV2State::evaluate(...) dokładnie raz
+     - utrwal istniejący TimeStopV2 state/rows zgodnie z bazowym kontraktem
+     - zmaterializuj immutable TimeStopV2ProjectionV1
+     - HET-PM nie wykonuje drugiego evaluate i nie zapisuje do pos.time_stop_v2
+4. pod jednym read boundary zmaterializuj PostBuySnapshotBundle:
+     - base V1 snapshot
+     - trajectory features
+     - vitality z TimeStopV2ProjectionV1
+     - route status
+     - anchor-before
 5. oceń pure V1 prequote
 6. oceń pure V2 prequote
 7. oceń pure peak-anchor request
@@ -850,22 +922,37 @@ Jeżeli V1 zostanie zastosowane przed materializacją V2, terminalny tick może 
 9. rozwiąż potrzebne quote cells bez mutacji pozycji
 10. zmaterializuj immutable V1V2ComparisonRecord
 11. zastosuj wyłącznie V1 authority przez existing guarded apply
-12. zapisz V2 observation z pre-mutation bundle
+12. przygotuj V2 observation do fail-open sidecara lub lokalnie degradowalnego terminal payloadu
 13. zastosuj observer-only anchor wyłącznie, jeśli pozycja nadal istnieje i guard jest aktualny
 ```
 
 Inwarianty:
 
 - V1 i V2 widzą ten sam base snapshot;
+- HET-PM nie wywołuje `TimeStopV2State::evaluate()`;
+- HET-PM nie zapisuje do `pos.time_stop_v2`;
+- TimeStop V2 state i rows są identyczne przy HET enabled/disabled;
 - V2 nie zwiększa ekonomicznego `state_revision`;
 - V2 nie tworzy `PendingExitProposal`;
 - V2 nie zmienia V1 guard ani evidence source;
 - po terminalizacji nie powstaje nowa V2 ocena ani quote;
 - anchor apply ma niższy priorytet niż V1 authority apply.
 
-## 15. Durable comparison evidence bez drugiego terminal systemu
+## 15. Durable comparison evidence bez wpływu na terminal commit
 
-### 15.1. Nonterminal ticks
+### 15.1. Fundamentalna reguła izolacji
+
+Observe-only HET-PM V2 nie może być warunkiem:
+
+- `canonical_committed()`;
+- canonical `ShadowTerminalTruthV2` append;
+- usunięcia pozycji;
+- terminal notification;
+- zwolnienia capacity.
+
+Żaden błąd HET-PM V2 — serializacja, walidacja, writer, sidecar, schema mismatch lub brak payloadu — nie może zmienić wyniku istniejącego terminal commit flow.
+
+### 15.2. Nonterminal ticks
 
 Nonterminal V2 observations trafiają do jednego bounded sidecara:
 
@@ -882,28 +969,80 @@ Sidecar jest:
 - bez osobnego terminal truth;
 - bez wpływu na capacity.
 
-### 15.2. Terminal ticks
+### 15.3. Terminal ticks — local degradation przed canonical append
 
-Na terminalnym ticku immutable V2 comparison zostaje dołączone jako optional nested payload do istniejącego operational terminal recordu przechowywanego w `PendingTerminalCommit`.
+Immutable V2 comparison może zostać dodane do istniejącego operational terminal recordu wyłącznie po lokalnym, przedterminalnym przygotowaniu:
+
+```rust
+pub(super) enum PreparedTerminalV2ComparisonV1 {
+    Ready(ValidatedV1V2ComparisonRecord),
+    Skipped(TerminalV2ComparisonSkipReasonV1),
+}
+```
+
+Przygotowanie musi obejmować przed istniejącym canonical appendem:
+
+- semantic validation;
+- bounded-size validation;
+- pełną serializowalność lub pre-serialization do niezależnego bufora;
+- brak referencji do mutable runtime state;
+- brak możliwości zwrócenia błędu z późniejszego canonical terminal writer path.
+
+Jeżeli którakolwiek kontrola HET-PM nie przejdzie:
+
+```text
+PreparedTerminalV2ComparisonV1::Skipped(exact_reason)
+```
+
+Następnie:
+
+- canonical terminal append przebiega bez V2 payloadu;
+- operational diagnostic może zawierać wyłącznie prosty, bezpieczny `v2_comparison_write_status = "skipped"` i typed reason;
+- pełny comparison może być best-effort wysłany do sidecara;
+- brak V2 payloadu nie jest błędem terminal commit.
+
+Nie wolno przekazać niezwalidowanego V2 payloadu do schema/writera, którego błąd wpływa na `canonical_write` lub `canonical_committed()`.
+
+### 15.4. Rozdzielenie canonical truth od optional comparison
+
+Dozwolony przepływ:
+
+```text
+V1 guarded apply
+→ prepare V2 comparison locally:
+     Ready(validated bounded payload)
+     albo Skipped(reason)
+→ existing operational terminal record
+→ existing canonical ShadowTerminalTruthV2 append niezależny od V2 statusu
+→ existing cleanup i terminal notification
+```
+
+Niedozwolony przepływ:
+
+```text
+V1 guarded apply
+→ niezwalidowany V2 payload
+→ wspólny canonical append zwraca Err
+→ canonical_committed = false
+→ capacity remains reserved
+```
+
+Jeżeli istniejący operational terminal schema nie umożliwia całkowicie lokalnej degradacji optional payloadu, terminal comparison nie jest do niego dodawane. W takim przypadku:
+
+- canonical/operational terminal flow pozostaje bez pełnego V2 payloadu;
+- terminal observation idzie wyłącznie do fail-open sidecara;
+- terminal record zawiera co najwyżej prosty `v2_comparison_write_status = "skipped"`, o ile pole to samo nie może wpłynąć na canonical validation.
+
+### 15.5. Brak drugiego terminal systemu
 
 Nie powstaje:
 
 - drugi terminal writer;
 - drugi commit point;
-- nowy canonical terminal SSOT.
+- nowy canonical terminal SSOT;
+- drugi warunek capacity release.
 
-Kolejność:
-
-```text
-V1 guarded apply
-→ existing operational terminal record z optional V2 comparison
-→ existing canonical ShadowTerminalTruthV2 append
-→ existing cleanup i terminal notification
-```
-
-Błąd zapisu V2 części nie może blokować canonical terminal truth. Jeżeli schema operacyjnego recordu nie pozwala na niezależną degradację nested payloadu, record zapisuje typed `v2_comparison_write_status`, a terminal commit pozostaje kontrolowany przez istniejące reguły PR #67.
-
-### 15.3. `V1V2ComparisonRecord`
+### 15.6. `V1V2ComparisonRecord`
 
 Minimalne pola:
 
@@ -942,6 +1081,18 @@ pub(super) struct V1V2ComparisonRecord {
 ```
 
 `Vec` jest dozwolony w durable record materializowanym poza steady-state policy structem; liczba elementów jest bounded małym limitem wynikającym z quote planu.
+
+### 15.7. Obowiązkowe fault-injection tests
+
+- błąd serializacji V2 comparison -> canonical terminal commit nadal `Ok`;
+- semantic validation failure V2 -> payload `Skipped`, canonical commit bez zmian;
+- oversized V2 payload -> payload `Skipped`, canonical commit bez zmian;
+- sidecar writer failure -> pozycja usunięta i slot zwolniony zgodnie z V1;
+- brak V2 writer configuration -> canonical terminal commit bez zmian;
+- V2 schema mismatch -> canonical `ShadowTerminalTruthV2` append bez zmian;
+- `canonical_committed()` ma ten sam wynik przy HET enabled/disabled;
+- terminal cleanup i capacity release są identyczne przy HET enabled/disabled;
+- żadna V2 failure nie pozostawia `PendingTerminalCommit` tylko z powodu V2.
 
 ## 16. Konfiguracja PR A
 
@@ -990,6 +1141,14 @@ Config validation:
 - `authoritative_shadow` odrzucone w PR A;
 - config hash obejmuje wyłącznie jawne pola HET-PM V2.
 
+CrashGuard pozostaje osobnym polem `ExitPolicyV1Config`:
+
+```text
+Rust default = disabled
+aktualny main profile = observe_only
+HET-PM = nie zmienia effective mode
+```
+
 Startup record zawiera:
 
 - policy ID/version/hash;
@@ -998,10 +1157,19 @@ Startup record zawiera:
 - trajectory windows;
 - trailing hypotheses;
 - vitality hypotheses;
-- CrashGuard effective mode;
+- CrashGuard effective mode oraz jego source (`rust_default`, `toml_explicit`, inne istniejące źródło);
 - V1 authority = true;
 - V2 authority = false;
 - live = disabled.
+
+Obowiązkowe config tests:
+
+- pusty TOML -> HET disabled i CrashGuard disabled;
+- stary TOML bez HET -> HET disabled i dotychczasowy CrashGuard semantics;
+- aktualny main TOML -> HET observe-only oraz CrashGuard observe-only;
+- HET config nie zmienia V1 config hash poza jawnie uzasadnionym osobnym HET hash;
+- unknown HET mode fail-closed;
+- `authoritative_shadow` w PR A fail-startup.
 
 ## 17. Zakres PR A — observe-only
 
@@ -1015,18 +1183,16 @@ ghost-brain/src/guardian/post_buy/exit_policy_v2.rs
 ### 17.2. Minimalne rozszerzenia istniejących modułów
 
 - `config.rs` — `HetPmV2Config` i validation;
-- `engine.rs` — snapshot bundle, quote plan, anchor observer, comparison emission;
+- `engine.rs` — snapshot bundle, immutable TimeStop projection, quote plan, anchor observer, comparison emission;
 - `exit_policy_v1.rs` — tylko bezpieczne udostępnienie wspólnego base snapshot contractu, bez zmiany V1 ekonomii;
-- `events/schema` lub istniejący operational lifecycle record — optional terminal V2 comparison;
-- istniejący writer/replay infrastructure — jeden bounded observation sidecar;
+- operational event schema wyłącznie, jeśli optional terminal payload jest lokalnie degradowalny;
+- istniejący writer/replay infrastructure — jeden bounded fail-open observation sidecar;
 - testy i jeden offline analysis script.
 
 ### 17.3. Logiczne commity PR A
 
-1. `trajectory projection + snapshot bundle + pure V2 evaluator`;
-2. `executable peak anchor + quote planning + V1/V2 comparison durability`.
-
-Nie ma potrzeby tworzenia wielu proceduralnych PR-ów dla każdej klasy lub enumu.
+1. `trajectory projection + immutable TimeStop projection + snapshot bundle + pure V2 evaluator`;
+2. `executable peak anchor + quote planning + fail-open V1/V2 comparison durability`.
 
 ### 17.4. Twarde zakazy PR A
 
@@ -1040,8 +1206,11 @@ V2 nie może zmienić:
 - close reason;
 - canonical terminal truth;
 - ekonomicznego `state_revision`;
+- `TimeStopV2State`;
+- istniejących TimeStop V2 rows;
 - V1 config;
 - V1 thresholdów;
+- CrashGuard default/effective mode;
 - BUY/REJECT/TIMEOUT;
 - live execution.
 
@@ -1049,7 +1218,7 @@ V2 nie może zmienić:
 
 ### 18.1. Cel
 
-Burn-in ma odpowiedzieć, czy executable trailing i recovery-aware vitality decay poprawiają ekstrakcję istniejącego entry edge'u bez pogorszenia tail risk i bez zwiększenia problemów wykonawczych.
+Burn-in odpowiada, czy executable trailing i recovery-aware vitality decay poprawiają ekstrakcję istniejącego entry edge'u bez pogorszenia tail risk i bez zwiększenia problemów wykonawczych.
 
 ### 18.2. Obowiązkowe metryki
 
@@ -1075,7 +1244,9 @@ Burn-in ma odpowiedzieć, czy executable trailing i recovery-aware vitality deca
 - occupancy/capital-seconds;
 - false early exit proxy;
 - missed protection proxy;
-- zero duplicate action/terminal violations.
+- zero duplicate action/terminal violations;
+- TimeStop parity violations = 0;
+- terminal isolation violations = 0.
 
 ### 18.3. Kontrfaktyczne outcome
 
@@ -1089,11 +1260,11 @@ Dla każdego V2 exit candidate należy kontynuować observation path po hipotety
 - giveback uniknięty albo upside utracony;
 - route/data availability po candidate.
 
-Nie wolno używać przyszłych danych w samej decyzji. Są dozwolone wyłącznie w offline outcome attribution.
+Przyszłe dane są dozwolone wyłącznie w offline outcome attribution, nigdy w samej decyzji.
 
 ### 18.4. Segmentacja
 
-Raport musi pokazywać wynik osobno co najmniej według:
+Raport pokazuje wynik co najmniej według:
 
 - terminal reason V1;
 - trajectory quality;
@@ -1103,64 +1274,213 @@ Raport musi pokazywać wynik osobno co najmniej według:
 - entry cohort/time cohort;
 - creator/funder cohort, jeżeli stabilna tożsamość jest dostępna wyłącznie do splitu, nie do policy.
 
-Długie ścieżki nie mogą dominować wyniku tylko dlatego, że produkują więcej ticków. Jednostką podstawową jest pozycja/epoka.
+Jednostką podstawową jest pozycja/epoka, nie tick.
 
-## 19. Promotion gates przed PR B
+## 19. Deterministyczne promotion gates przed PR B
 
-Nie istnieje automatyczna promocja.
+### 19.1. Brak ręcznej promocji
 
-### Gate 1 — lifecycle integrity
-
-Wymagane:
+Nie istnieje automatyczna ani opisowa promocja typu „wynik wygląda dobrze”. PR B może rozpocząć się wyłącznie na podstawie nazwanego, machine-readable artefaktu:
 
 ```text
-duplicate action = 0
-duplicate terminal = 0
-V2 economic mutation in observe-only = 0
-V2 proposal creation = 0
-route/build authority changes = 0
+reports/het_pm_v2/het_pm_v2_promotion_gate_v1.json
 ```
 
-### Gate 2 — data coverage
+Artefakt jest tworzony przez wersjonowane narzędzie:
 
-- trajectory coverage jest zmierzona;
-- collapsed updates są raportowane;
-- anchor coverage jest wystarczająca dla oceny trailing;
-- route blockers są typed;
-- quote blocker rate jest znany;
-- brak niejawnego zamieniania braków na Hold.
+```text
+scripts/het_pm_v2_promotion_gate_v1.py
+```
 
-Nie zamrażamy arbitralnego procentu w tym planie. Raport musi jednak wykazać, że decyzja nie opiera się na małej, selektywnej podpróbie.
+lub równoważny deterministyczny binarny tool zapisany w repozytorium.
 
-### Gate 3 — quote budget
+### 19.2. Zamrożony schema kontraktu
 
-- zwykły Hold nie wykonuje quote;
-- jeden quote per identical key/tick;
-- brak cache między tickami;
-- anchor nie jest quote'owany na każdym mikropeaku;
-- quote count per position jest bounded i zaakceptowany.
+Minimalny schema:
 
-### Gate 4 — wynik ekonomiczny
+```json
+{
+  "schema_version": 1,
+  "policy_id": "het_pm_v2",
+  "policy_version": 2,
+  "het_config_hash": "...",
+  "input_manifest_hash": "...",
+  "analysis_tool_hash": "...",
+  "run_ids": ["..."],
+  "criteria": {
+    "criteria_version": 1,
+    "criteria_hash": "..."
+  },
+  "gates": {
+    "lifecycle_integrity": {
+      "passed": true,
+      "observed": {},
+      "thresholds": {}
+    },
+    "data_coverage": {
+      "passed": true,
+      "observed": {},
+      "thresholds": {}
+    },
+    "quote_budget": {
+      "passed": true,
+      "observed": {},
+      "thresholds": {}
+    },
+    "economic_result": {
+      "passed": true,
+      "observed": {},
+      "thresholds": {}
+    },
+    "stability": {
+      "passed": true,
+      "observed": {},
+      "thresholds": {}
+    }
+  },
+  "promotion_gate_passed": true
+}
+```
 
-Co najmniej:
+`promotion_gate_passed` jest czystą koniunkcją wszystkich wymaganych `gates.*.passed`. Nie może być ręcznie nadpisane.
 
-- executable trailing zmniejsza peak-to-terminal giveback;
-- vitality decay zmniejsza occupancy albo terminal loss;
-- CVaR/tail loss nie pogarsza się istotnie;
-- poprawa nie wynika wyłącznie z kilku ekstremalnych pozycji;
-- wynik pozostaje dodatni po realistycznych offline cost scenarios.
+### 19.3. Kryteria muszą zostać zamrożone przed PR B
 
-### Gate 5 — stabilność
+Progi mogą zostać wybrane na podstawie burn-inu, ale przed rozpoczęciem PR B muszą zostać zapisane w wersjonowanym, machine-readable kontrakcie, np.:
 
-- więcej niż jedna sesja/run;
-- więcej niż jeden launch cohort;
-- brak dominacji jednego twórcy/fundera;
-- stabilny kierunek efektu w głównych segmentach;
-- brak causal/data contract violations.
+```text
+PLANS/DO_REALIZACJI/HET_PM_V2_PROMOTION_CRITERIA_V1.json
+```
+
+Kontrakt zawiera:
+
+- exact nazwy metryk;
+- jednostki;
+- denominator;
+- missing-data semantics;
+- kierunek porównania;
+- wartość progu;
+- minimalne sample/run/cohort counts;
+- definicję istotnego pogorszenia;
+- definicję dominacji ekstremów;
+- definicję stabilnego kierunku;
+- hash wejściowego configu i schema.
+
+Plan nie zamraża dziś wartości ekonomicznych progów, ponieważ mają pochodzić z burn-inu. Zamraża natomiast format, obowiązek jawnego booleanu i zakaz ręcznej interpretacji.
+
+### 19.4. Gate 1 — lifecycle integrity
+
+Artefakt musi zawierać co najmniej:
+
+```text
+duplicate_action_count
+duplicate_terminal_count
+v2_economic_mutation_count
+v2_proposal_creation_count
+route_build_authority_change_count
+time_stop_parity_violation_count
+terminal_isolation_violation_count
+```
+
+Wymagane wartości dla PASS:
+
+```text
+wszystkie = 0
+```
+
+### 19.5. Gate 2 — data coverage
+
+Artefakt zawiera jawne observed/threshold fields dla:
+
+- trajectory usable coverage;
+- collapsed updates rate;
+- anchor coverage;
+- route blocker classification coverage;
+- quote blocker classification coverage;
+- missing-to-Hold violations.
+
+Brak pola, non-finite wartość, niezgodny denominator albo zbyt mała podpróba oznacza `passed = false`.
+
+### 19.6. Gate 3 — quote budget
+
+Artefakt zawiera:
+
+- quote count per position quantiles/max;
+- Hold quote count;
+- duplicate identical-key resolution count;
+- anchor quote count;
+- micropeak quote rate;
+- between-tick cache reuse violations.
+
+Twarde inwarianty:
+
+```text
+Hold quote count = 0
+duplicate same-key resolution = 0
+between-tick cache reuse violations = 0
+```
+
+Pozostałe bounded thresholds muszą być zamrożone w criteria file.
+
+### 19.7. Gate 4 — wynik ekonomiczny
+
+Artefakt zawiera exact kolumny i thresholdy dla:
+
+- peak-to-terminal giveback delta;
+- vitality occupancy/capital-seconds delta;
+- terminal loss delta;
+- CVaR/tail-loss delta;
+- cost-scenario result;
+- outlier concentration/share;
+- false-early-exit proxy;
+- missed-protection proxy.
+
+Sformułowania „nie pogarsza się istotnie”, „nie wynika z kilku ekstremów” i „pozostaje dodatni” nie są acceptance criteria bez odpowiadających im machine-readable kolumn i progów.
+
+### 19.8. Gate 5 — stabilność
+
+Artefakt zawiera exact kolumny i thresholdy dla:
+
+- liczby runów;
+- liczby launch cohorts;
+- największego udziału pojedynczego creator/funder cohort;
+- liczby głównych segmentów z zgodnym kierunkiem efektu;
+- causal/data contract violation count.
+
+Missing lub niespełniony minimalny count oznacza FAIL.
+
+### 19.9. Deterministyczność i fail-closed
+
+- identyczne input artifacts + criteria + tool version -> bitowo identyczny promotion artifact;
+- każdy input ma content hash;
+- brak inputu lub hash mismatch -> FAIL;
+- unsupported schema -> FAIL;
+- missing gate/column/threshold -> FAIL;
+- non-finite metric -> FAIL;
+- `promotion_gate_passed = true` tylko, gdy wszystkie wymagane gate'y mają `passed = true`;
+- PR B nie może rozpocząć się bez committed artifactu i criteria file.
+
+### 19.10. Obowiązkowe acceptance tests promotion artifact
+
+- golden PASS fixture -> `promotion_gate_passed = true`;
+- każdy gate osobno FAIL -> root false;
+- missing metric -> false;
+- non-finite metric -> false;
+- insufficient sample/run/cohort -> false;
+- hash mismatch -> false;
+- manual root boolean niezgodny z gate conjunction -> validation error;
+- identyczne inputs -> identyczne bytes/hash.
 
 ## 20. PR B — shadow authority cutover
 
-PR B powstaje dopiero po zaakceptowanym raporcie promocji.
+PR B powstaje dopiero, gdy:
+
+```text
+het_pm_v2_promotion_gate_v1.json
+    validates
+AND promotion_gate_passed = true
+AND criteria file jest committed i hashed
+```
 
 ### 20.1. Cutover
 
@@ -1252,13 +1572,15 @@ Wybrany kontrakt musi:
 - stale observer apply nie mutuje anchora;
 - terminalizacja V1 pomija anchor apply.
 
-### 21.4. Vitality
+### 21.4. TimeStop/Vitality isolation
 
-- Alive zeruje consecutive failures;
-- Weak zwiększa serię;
-- HeartbeatOnly zwiększa serię;
-- StaleOrUnknown nie tworzy samodzielnego exit;
-- recovery suppressuje vitality candidate;
+- `TimeStopV2State::evaluate()` jest wywołane najwyżej raz na należne okno;
+- HET-PM nie wywołuje `evaluate()`;
+- HET-PM nie zapisuje do `pos.time_stop_v2`;
+- HET disabled/enabled daje identyczne TimeStop state transitions;
+- HET disabled/enabled daje identyczne istniejące TimeStop rows;
+- Alive/Weak/Heartbeat/Stale mapping pochodzi wyłącznie z immutable projection;
+- recovery suppressuje vitality candidate bez mutacji TimeStop state;
 - nowy peak suppressuje vitality candidate;
 - zbyt młoda pozycja nie tworzy candidate;
 - brak świeżych danych daje blocker.
@@ -1288,15 +1610,32 @@ Wybrany kontrakt musi:
 
 ### 21.7. Same-tick boundary
 
-- terminalny V1 tick nadal posiada V2 comparison z pre-mutation bundle;
+- terminalny V1 tick nadal posiada precomputed V2 comparison;
 - comparison używa pre-V1 quantity i revision;
 - brak nowego V2 quote po terminalizacji;
 - V2 precomputation nie zmienia V1 guard;
-- V1 apply ma pierwszeństwo przed anchor observer apply;
-- terminal operational record może zawierać optional V2 comparison;
-- V2 write degradation nie fałszuje canonical terminal truth.
+- V1 apply ma pierwszeństwo przed anchor observer apply.
 
-### 21.8. Observe-only isolation
+### 21.8. Terminal isolation fault injection
+
+- V2 serialization failure -> canonical commit, cleanup i capacity release bez zmian;
+- V2 validation failure -> Skipped, canonical commit bez zmian;
+- V2 writer failure -> canonical commit bez zmian;
+- V2 oversized payload -> Skipped, canonical commit bez zmian;
+- V2 absent/not configured -> canonical commit bez zmian;
+- `canonical_committed()` parity HET off/on;
+- brak V2-induced `PendingTerminalCommit` retention.
+
+### 21.9. Config/default semantics
+
+- empty TOML -> CrashGuard disabled;
+- Rust default -> CrashGuard disabled;
+- active main profile -> CrashGuard observe-only;
+- HET enable nie zmienia CrashGuard mode;
+- old config compatibility;
+- PR A rejects authoritative HET mode.
+
+### 21.10. Observe-only isolation
 
 - dowolny V2 result nie zmienia quantity;
 - nie tworzy proposal;
@@ -1305,12 +1644,15 @@ Wybrany kontrakt musi:
 - nie zmienia terminal truth;
 - nie zwalnia capacity;
 - nie zwiększa economic state revision;
+- nie mutuje TimeStop state;
 - nie aktywuje live.
 
 ## 22. Testy PR B
 
 Poza wszystkimi testami PR A:
 
+- promotion artifact i criteria validate;
+- `promotion_gate_passed = true` jest wymagane przez startup/implementation gate;
 - V2 jest jedynym shadow apply ownerem;
 - V1 nie tworzy proposal;
 - V1 terminal side effects = 0;
@@ -1324,7 +1666,7 @@ Poza wszystkimi testami PR A:
 
 ## 23. Minimalne uruchomienia CI
 
-PR A i PR B muszą uruchamiać co najmniej:
+PR A i PR B uruchamiają co najmniej:
 
 ```bash
 cargo test -p ghost-brain guardian::post_buy
@@ -1340,7 +1682,11 @@ git diff --check
 
 Dodatkowo:
 
-- nowe focused trajectory/policy/anchor tests;
+- focused trajectory/policy/anchor tests;
+- TimeStop parity suite;
+- terminal fault-injection suite;
+- config/default compatibility suite;
+- promotion artifact schema/golden tests;
 - logger/replay suites;
 - Shadow V2 lifecycle suites;
 - diff-scoped Clippy dla zmienionych plików/crates;
@@ -1375,8 +1721,6 @@ Ten plan nie implementuje:
 - zmian BUY/REJECT/TIMEOUT;
 - Type-5 authority.
 
-Każdy z tych tematów jest oddzielną przyszłą inicjatywą i wymaga własnego uzasadnienia przyrostowej wartości.
-
 ## 25. Rollback
 
 ### PR A
@@ -1389,7 +1733,7 @@ Ponieważ V2 jest observe-only:
 - brak migracji pozycji;
 - brak zmiany terminal truth;
 - brak zmiany quantity;
-- sidecar może zostać po prostu wyłączony/usunięty.
+- sidecar może zostać wyłączony/usunięty.
 
 Nie należy pozostawiać połowy snapshot schema ani nieużywanych observer states.
 
@@ -1402,7 +1746,6 @@ Nie wolno utrzymywać V1 i V2 jako równoległych apply owners „na okres migra
 ## 26. Definition of Done — PR A
 
 - [ ] istnieje jeden normatywny plan HET-PM V2;
-- [ ] brak osobnych amendmentów;
 - [ ] nie powstał drugi owner/store/buffer;
 - [ ] trajectory sampling jest jawnie `latest_canonical_state_per_monitor_tick`;
 - [ ] nie istnieje `return_500ms`;
@@ -1410,7 +1753,9 @@ Nie wolno utrzymywać V1 i V2 jako równoległych apply owners „na okres migra
 - [ ] hot-path flags nie używają `Vec`;
 - [ ] proxy update/reserve fields nie są authority;
 - [ ] `TrajectoryFeaturesV1` ma wyłącznie 1.5 s / 5 s / 15 s returns, peak, drawdown, time since peak i giveback velocity;
-- [ ] `VitalityFeaturesV1` reprezentuje bieżący stan, nie sticky historyczny candidate;
+- [ ] HET-PM konsumuje immutable `TimeStopV2ProjectionV1`;
+- [ ] HET-PM nie wywołuje `TimeStopV2State::evaluate()` ani nie zapisuje do `pos.time_stop_v2`;
+- [ ] TimeStop state/rows mają parity HET off/on;
 - [ ] entry amount ma pierwszeństwo przed price × quantity;
 - [ ] snapshot V2 nie duplikuje base pól V1;
 - [ ] executable anchor powstaje wyłącznie na nowym peaku;
@@ -1418,8 +1763,11 @@ Nie wolno utrzymywać V1 i V2 jako równoległych apply owners „na okres migra
 - [ ] quote key jest jawny i deduplikowany per tick;
 - [ ] Hold nie uruchamia quote;
 - [ ] PR A nie posiada cost reserve;
+- [ ] Rust default CrashGuarda pozostaje disabled;
+- [ ] aktualny main profile zachowuje explicit observe-only;
 - [ ] V1 i V2 widzą ten sam pre-mutation bundle;
-- [ ] terminalny V1 tick zachowuje V2 comparison w existing terminal flow;
+- [ ] V2 comparison failure nie może zmienić canonical commit, cleanup ani capacity release;
+- [ ] terminal V2 payload jest lokalnie validated/degradable albo pomijany;
 - [ ] V2 nie mutuje lifecycle ani economic revision;
 - [ ] V1 pozostaje jedynym authority;
 - [ ] live pozostaje disabled;
@@ -1427,9 +1775,11 @@ Nie wolno utrzymywać V1 i V2 jako równoległych apply owners „na okres migra
 
 ## 27. Definition of Done — PR B
 
-- [ ] istnieje zaakceptowany burn-in report;
-- [ ] promotion gates są spełnione;
-- [ ] jawnie wskazano promowane gate'y;
+- [ ] istnieje committed, validated `het_pm_v2_promotion_gate_v1.json`;
+- [ ] istnieje committed, hashed promotion criteria file;
+- [ ] `promotion_gate_passed = true` wynika deterministycznie z wszystkich gate'ów;
+- [ ] każdy gate posiada jawne observed values i thresholds;
+- [ ] brak ręcznej interpretacji acceptance;
 - [ ] V2 jest jedynym shadow authority;
 - [ ] V1 jest baseline/replay only;
 - [ ] V1 nie tworzy proposal ani terminalu;
@@ -1448,11 +1798,13 @@ Po PR A Ghost posiada:
 
 ```text
 real sampled trajectory
++ immutable TimeStop-derived vitality projection
 + pure hierarchical V2 candidate policy
 + historical executable peak anchor
 + executable trailing evidence
 + recovery-aware vitality evidence
 + exact same-tick V1/V2 comparison
++ fail-open terminal comparison isolation
 + zero economic behavior change
 ```
 
@@ -1463,6 +1815,7 @@ one canonical full-position shadow manager
 + existing emergency/loss/max-hold safety
 + executable trailing
 + recovery-aware vitality decay
++ deterministic promotion proof
 + existing guarded execution lifecycle
 ```
 
