@@ -52,9 +52,9 @@ use ghost_brain::guardian::post_buy::shadow_v2::{
     SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
 };
 use ghost_brain::guardian::post_buy::{
-    validate_exit_policy_v1_config, CrashGuardMode, ExitPolicyV1Status, MonitoringEngine,
-    PositionRuntimeRouter, PostBuyGuardianConfig, ShadowPositionBook, ShadowTerminalDisposition,
-    SignalRouter,
+    validate_exit_policy_v1_config, validate_het_pm_v2_config, CrashGuardMode, ExitPolicyV1Status,
+    MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, ShadowPositionBook,
+    ShadowTerminalDisposition, SignalRouter,
 };
 use ghost_brain::quotes::{ExecutableQuoteProvider, QuoteProviderConfig};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
@@ -261,6 +261,9 @@ impl PostBuyRuntimeConfig {
     }
 
     pub fn validate(&self) -> Result<Option<ExitPolicyV1Status>, String> {
+        if let Some(guardian) = self.shadow_guardian.as_ref() {
+            validate_het_pm_v2_config(guardian).map_err(|error| error.to_string())?;
+        }
         let crash_guard_authoritative = self.shadow_guardian.as_ref().is_some_and(|guardian| {
             matches!(
                 guardian.exit_policy_v1.crash_guard_mode,
@@ -322,6 +325,7 @@ impl PostBuyRuntimeConfig {
             );
         }
 
+        validate_het_pm_v2_config(&guardian).map_err(|error| error.to_string())?;
         validate_exit_policy_v1_config(&guardian)
             .map(Some)
             .map_err(|error| error.to_string())
@@ -2449,6 +2453,9 @@ pub async fn run(
                 }
                 monitoring_engine.set_position_router(Arc::clone(&runtime_router));
                 monitoring_engine.set_shadow_lifecycle_log_path(Some(probe_lifecycle_log_path));
+                // HET-PM PR A owns one primary comparison sidecar. The probe
+                // monitor must not create a second writer or duplicate rows.
+                monitoring_engine.set_het_pm_v2_observation_log_path(None);
                 let monitoring_engine = Arc::new(monitoring_engine);
                 probe_signal_router_handle = Some(tokio::spawn(
                     SignalRouter::new_observation_only(signal_rx, runtime_router).run(),
@@ -2500,6 +2507,43 @@ pub async fn run(
             live_authority = "disabled",
             "PostBuyRuntime: effective Position Manager Lite V1 configuration"
         );
+    }
+
+    if config.execution_mode == "shadow" {
+        let guardian = build_shadow_guardian_config(&config);
+        if let Ok(status) = validate_het_pm_v2_config(&guardian) {
+            info!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                policy_id = %status.policy_id,
+                policy_version = status.policy_version,
+                schema_version = status.schema_version,
+                policy_config_hash = %status.config_hash,
+                enabled = status.enabled,
+                mode = ?status.mode,
+                sampling_mode = %status.sampling_mode,
+                trajectory_grade = %status.trajectory_grade,
+                trajectory_short_ms = status.trajectory_windows_ms[0],
+                trajectory_medium_ms = status.trajectory_windows_ms[1],
+                trajectory_long_ms = status.trajectory_windows_ms[2],
+                max_newest_sample_age_ms = status.max_newest_sample_age_ms,
+                trailing_arm_mark_return_bps = status.trailing_arm_mark_return_bps,
+                trailing_mark_candidate_drawdown_bps = status.trailing_mark_candidate_drawdown_bps,
+                trailing_executable_breach_bps = status.trailing_executable_breach_bps,
+                peak_anchor_min_step_bps = status.peak_anchor_min_step_bps,
+                peak_anchor_force_refresh_on_new_peak_after_ms = status.peak_anchor_force_refresh_on_new_peak_after_ms,
+                vitality_min_age_ms = status.vitality_min_age_ms,
+                vitality_required_non_alive_windows = status.vitality_required_non_alive_windows,
+                vitality_min_time_since_peak_ms = status.vitality_min_time_since_peak_ms,
+                vitality_recovery_return_bps = status.vitality_recovery_return_bps,
+                crash_guard_mode = ?status.crash_guard_mode,
+                crash_guard_mode_source = %status.crash_guard_mode_source,
+                v1_shadow_authority = status.v1_shadow_authority,
+                v2_shadow_authority = status.v2_shadow_authority,
+                live_authority = status.live_authority,
+                hypotheses_grade = "safe_initial_shadow_hypothesis",
+                "PostBuyRuntime: effective HET-PM V2 PR A configuration"
+            );
+        }
     }
 
     info!(
@@ -7151,6 +7195,21 @@ sys.exit(0)
         assert_eq!(direct_post_buy_handoff_capacity(3), 12);
         assert_eq!(direct_post_buy_handoff_capacity(64), 256);
         assert_eq!(direct_post_buy_handoff_capacity(1_000), 256);
+    }
+
+    #[test]
+    fn pr_a_rejects_authoritative_het_pm_v2_in_every_execution_mode() {
+        let mut guardian = PostBuyGuardianConfig::default();
+        guardian.het_pm_v2.enabled = true;
+        guardian.het_pm_v2.mode = ghost_brain::guardian::post_buy::HetPmV2Mode::AuthoritativeShadow;
+        let config = PostBuyRuntimeConfig {
+            execution_mode: "paper".to_string(),
+            shadow_guardian: Some(guardian),
+            ..PostBuyRuntimeConfig::default()
+        };
+
+        let error = config.validate().expect_err("PR A must reject authority");
+        assert!(error.contains("authoritative_shadow is forbidden in PR A"));
     }
 
     #[test]

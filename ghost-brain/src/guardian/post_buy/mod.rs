@@ -28,21 +28,27 @@
 pub mod config;
 pub mod engine;
 mod exit_policy_v1;
+mod exit_policy_v2;
 pub mod exit_replay;
 pub mod integration;
 pub mod shadow_v2;
 pub mod shadow_v2_execution;
 pub mod signals;
+mod trajectory_v1;
 
 pub use crate::events::ShadowUnresolvedReason;
 pub use config::{
-    CrashGuardMode, ExitPolicyV1Config, PostBuyGuardianConfig, ShadowExitReplayConfig,
-    TimeStopV2Config,
+    CrashGuardMode, ExitPolicyV1Config, HetPmV2Config, HetPmV2Mode, PostBuyGuardianConfig,
+    ShadowExitReplayConfig, TimeStopV2Config,
 };
-pub use engine::{MonitoringEngine, RegisteredShadowPosition, ShadowTerminalDisposition};
+pub use engine::{
+    MonitoringEngine, MonitoringEngineConfigError, RegisteredShadowPosition,
+    ShadowTerminalDisposition,
+};
 pub use exit_policy_v1::{
     validate_exit_policy_v1_config, ExitPolicyConfigError, ExitPolicyV1Status,
 };
+pub use exit_policy_v2::{validate_het_pm_v2_config, HetPmV2ConfigError, HetPmV2Status};
 pub use integration::{PositionRuntimeRouter, ShadowPositionBook, SignalRouter};
 pub use signals::{
     GuardianSignal, PositionHealth, RecommendedAction, SignalSeverity, SignalSource,

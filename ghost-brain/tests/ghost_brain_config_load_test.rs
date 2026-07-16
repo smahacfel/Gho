@@ -1,4 +1,7 @@
-use ghost_brain::{config::GhostBrainConfig, guardian::post_buy::CrashGuardMode};
+use ghost_brain::{
+    config::GhostBrainConfig,
+    guardian::post_buy::{validate_het_pm_v2_config, CrashGuardMode, HetPmV2Mode},
+};
 
 #[test]
 fn test_production_toml_loads() {
@@ -30,6 +33,28 @@ fn post_buy_guardian_lifecycle_thresholds_load_from_production_toml() {
     assert_eq!(policy.crash_min_distinct_slots, 2);
     assert_eq!(policy.crash_max_sample_age_ms, 1_500);
     assert_eq!(policy.crash_max_executable_return_pct, -20.0);
+    let het = &config.post_buy_guardian.het_pm_v2;
+    assert!(het.enabled);
+    assert_eq!(het.mode, HetPmV2Mode::ObserveOnly);
+    assert_eq!(het.trajectory_short_ms, 1_500);
+    assert_eq!(het.trajectory_medium_ms, 5_000);
+    assert_eq!(het.trajectory_long_ms, 15_000);
+    assert_eq!(het.max_newest_sample_age_ms, 1_500);
+    assert_eq!(het.trailing_arm_mark_return_bps, 2_500);
+    assert_eq!(het.trailing_mark_candidate_drawdown_bps, 1_500);
+    assert_eq!(het.trailing_executable_breach_bps, 1_800);
+    assert_eq!(het.peak_anchor_min_step_bps, 500);
+    assert_eq!(het.peak_anchor_force_refresh_on_new_peak_after_ms, 5_000);
+    assert_eq!(het.vitality_min_age_ms, 11_000);
+    assert_eq!(het.vitality_required_non_alive_windows, 3);
+    assert_eq!(het.vitality_min_time_since_peak_ms, 5_000);
+    assert_eq!(het.vitality_recovery_return_bps, 300);
+    let status = validate_het_pm_v2_config(&config.post_buy_guardian)
+        .expect("production HET-PM V2 config should validate");
+    assert!(status.v1_shadow_authority);
+    assert!(!status.v2_shadow_authority);
+    assert!(!status.live_authority);
+    assert_eq!(status.crash_guard_mode, CrashGuardMode::ObserveOnly);
     assert!(!config.post_buy_guardian.aem.enabled);
 }
 
