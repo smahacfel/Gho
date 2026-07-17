@@ -62,6 +62,7 @@ use ghost_core::shadow_ledger::ShadowLedger;
 use ghost_core::{ShadowV2PoolPhase, LAMPORTS_PER_SOL};
 use parking_lot::Mutex as ParkingMutex;
 use seer::parse_curve_from_account;
+use serde::Serialize;
 use solana_client::client_error::ClientError;
 use solana_client::nonblocking::rpc_client::RpcClient as AsyncRpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -95,6 +96,43 @@ const ENTRY_LANDED_SLOT_SOURCE_SYNTHETIC_AFTER_ENTRY_SIMULATION_RPC_SLOT: &str =
     "synthetic_next_slot_after_entry_simulation_rpc_slot";
 const ENTRY_LANDED_SLOT_SOURCE_BUY_LANDED_SLOT: &str = "buy_landed_slot";
 const SHADOW_V2_ENTRY_FEE_BPS_FALLBACK: u16 = 100;
+const POST_BUY_ADMISSION_SCHEMA_VERSION: u16 = 1;
+const POST_BUY_ADMISSION_ARTIFACT_TYPE: &str = "post_buy_admission_v1";
+
+#[derive(Debug, Serialize)]
+struct PostBuyAdmissionRecord {
+    schema_version: u16,
+    artifact_type: &'static str,
+    run_id: Option<String>,
+    candidate_id: String,
+    pool_id: String,
+    base_mint: String,
+    lane: String,
+    source: String,
+    stage: &'static str,
+    simulation_success: bool,
+    slot_reserved: bool,
+    position_slot_id: Option<String>,
+    handoff_accepted: Option<bool>,
+    handoff_reject_reason: Option<String>,
+    monitoring_registered: bool,
+    position_id: Option<String>,
+    position_epoch: Option<u64>,
+    release_status: Option<&'static str>,
+    release_reason: Option<String>,
+    timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ShadowTerminalWatcherAdmissionContext {
+    candidate_id: String,
+    pool_id: String,
+    base_mint: String,
+    run_id: Option<String>,
+    position_id: Option<String>,
+    position_epoch: Option<u64>,
+    admission_log_path: Option<PathBuf>,
+}
 
 /// Resources needed for live sell execution via launcher-owned Sender submit.
 #[derive(Clone)]
@@ -895,6 +933,72 @@ fn build_shadow_guardian_config(config: &PostBuyRuntimeConfig) -> PostBuyGuardia
 
 fn derive_shadow_exit_replay_log_path(lifecycle_log_path: &Path) -> PathBuf {
     lifecycle_log_path.with_file_name("shadow_exit_replay_v1.jsonl")
+}
+
+fn derive_post_buy_admission_log_path(lifecycle_log_path: &Path) -> PathBuf {
+    lifecycle_log_path.with_file_name("post_buy_admission_v1.jsonl")
+}
+
+fn append_post_buy_admission_record(path: Option<&Path>, record: &PostBuyAdmissionRecord) {
+    let Some(path) = path else {
+        return;
+    };
+    let write_result = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        serde_json::to_writer(&mut file, record)?;
+        file.write_all(b"\n")?;
+        file.flush()
+    })();
+    if let Err(error) = write_result {
+        warn!(
+            runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+            candidate_id = %record.candidate_id,
+            stage = record.stage,
+            error = %error,
+            "PostBuyRuntime: failed to append post-buy admission evidence"
+        );
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "admission evidence preserves exact handoff and slot identity without reconstruction"
+)]
+fn post_buy_admission_record(
+    run_id: Option<String>,
+    candidate_id: &str,
+    pool_id: &str,
+    base_mint: &str,
+    lane: &str,
+    source: &str,
+    position_slot_id: Option<PositionSlotId>,
+    stage: &'static str,
+) -> PostBuyAdmissionRecord {
+    PostBuyAdmissionRecord {
+        schema_version: POST_BUY_ADMISSION_SCHEMA_VERSION,
+        artifact_type: POST_BUY_ADMISSION_ARTIFACT_TYPE,
+        run_id,
+        candidate_id: candidate_id.to_string(),
+        pool_id: pool_id.to_string(),
+        base_mint: base_mint.to_string(),
+        lane: lane.to_string(),
+        source: source.to_string(),
+        stage,
+        simulation_success: true,
+        slot_reserved: position_slot_id.is_some(),
+        position_slot_id: position_slot_id.map(|slot_id| slot_id.to_string()),
+        handoff_accepted: None,
+        handoff_reject_reason: None,
+        monitoring_registered: false,
+        position_id: None,
+        position_epoch: None,
+        release_status: None,
+        release_reason: None,
+        timestamp_ms: now_ms(),
+    }
 }
 
 fn record_live_sell_rpc_latency(stage: &'static str, latency_ms: u64, outcome: &'static str) {
@@ -2895,6 +2999,11 @@ async fn handle_post_buy_event(
         entry_simulation_rpc_slot = ?entry_simulation_rpc_slot,
         "PostBuyRuntime: received PostBuySubmitted"
     );
+    let admission_log_path = config
+        .shadow_lifecycle_log_path
+        .as_deref()
+        .map(derive_post_buy_admission_log_path);
+    let post_buy_source_label = format!("{source:?}");
 
     if lane == "live" {
         let position_limit_tracker = config.position_limit_tracker.clone();
@@ -3052,6 +3161,19 @@ async fn handle_post_buy_event(
     }
 
     if lane == "shadow" {
+        append_post_buy_admission_record(
+            admission_log_path.as_deref(),
+            &post_buy_admission_record(
+                join_metadata.run_id.clone(),
+                &candidate_id,
+                &pool_amm_id,
+                &base_mint,
+                &lane,
+                &post_buy_source_label,
+                position_slot_id,
+                "post_buy_submitted",
+            ),
+        );
         let position_join_metadata = PositionJoinMetadata {
             ab_record_id: join_metadata.ab_record_id.clone(),
             source_ab_record_id: join_metadata.source_ab_record_id.clone(),
@@ -3083,6 +3205,50 @@ async fn handle_post_buy_event(
             position_join_metadata.clone(),
         )
         .await;
+        let mut handoff_record = post_buy_admission_record(
+            position_join_metadata.run_id.clone(),
+            &candidate_id,
+            &pool_amm_id,
+            &base_mint,
+            &lane,
+            &post_buy_source_label,
+            position_slot_id,
+            match handoff.ack {
+                DirectPostBuyHandoffAck::Accepted => "handoff_accepted",
+                DirectPostBuyHandoffAck::Rejected(_) => "handoff_rejected",
+            },
+        );
+        match handoff.ack {
+            DirectPostBuyHandoffAck::Accepted => {
+                handoff_record.handoff_accepted = Some(true);
+                handoff_record.monitoring_registered = handoff.position_id.is_some();
+                handoff_record.position_id = handoff.position_id.clone();
+                handoff_record.position_epoch = handoff.position_id.as_ref().map(|_| epoch);
+            }
+            DirectPostBuyHandoffAck::Rejected(reason) => {
+                handoff_record.handoff_accepted = Some(false);
+                handoff_record.handoff_reject_reason = Some(reason.to_string());
+            }
+        }
+        append_post_buy_admission_record(admission_log_path.as_deref(), &handoff_record);
+        if matches!(handoff.ack, DirectPostBuyHandoffAck::Accepted) && handoff.position_id.is_some()
+        {
+            let mut registered_record = post_buy_admission_record(
+                position_join_metadata.run_id.clone(),
+                &candidate_id,
+                &pool_amm_id,
+                &base_mint,
+                &lane,
+                &post_buy_source_label,
+                position_slot_id,
+                "monitoring_registered",
+            );
+            registered_record.handoff_accepted = Some(true);
+            registered_record.monitoring_registered = true;
+            registered_record.position_id = handoff.position_id.clone();
+            registered_record.position_epoch = Some(epoch);
+            append_post_buy_admission_record(admission_log_path.as_deref(), &registered_record);
+        }
         if matches!(handoff.ack, DirectPostBuyHandoffAck::Accepted) {
             maybe_emit_shadow_v2_position_created(
                 shadow_v2_harness,
@@ -3121,7 +3287,15 @@ async fn handle_post_buy_event(
                         terminal_rx,
                         tracker,
                         slot_id,
-                        candidate_id.clone(),
+                        ShadowTerminalWatcherAdmissionContext {
+                            candidate_id: candidate_id.clone(),
+                            pool_id: pool_amm_id.clone(),
+                            base_mint: base_mint.clone(),
+                            run_id: position_join_metadata.run_id.clone(),
+                            position_id: handoff.position_id.clone(),
+                            position_epoch: handoff.position_id.as_ref().map(|_| epoch),
+                            admission_log_path: admission_log_path.clone(),
+                        },
                     ));
                 } else {
                     ::metrics::counter!(
@@ -3131,6 +3305,26 @@ async fn handle_post_buy_event(
                         "reason" => "terminal_receiver_missing"
                     );
                     let _ = tracker.release(slot_id);
+                    let mut release_record = post_buy_admission_record(
+                        position_join_metadata.run_id.clone(),
+                        &candidate_id,
+                        &pool_amm_id,
+                        &base_mint,
+                        &lane,
+                        &post_buy_source_label,
+                        position_slot_id,
+                        "typed_no_het_release",
+                    );
+                    release_record.handoff_accepted = Some(true);
+                    release_record.monitoring_registered = handoff.position_id.is_some();
+                    release_record.position_id = handoff.position_id.clone();
+                    release_record.position_epoch = handoff.position_id.as_ref().map(|_| epoch);
+                    release_record.release_status = Some("released");
+                    release_record.release_reason = Some("terminal_receiver_missing".to_string());
+                    append_post_buy_admission_record(
+                        admission_log_path.as_deref(),
+                        &release_record,
+                    );
                     warn!(
                         runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                         candidate_id = %candidate_id,
@@ -3139,6 +3333,32 @@ async fn handle_post_buy_event(
                     );
                 }
             }
+        } else if let (Some(tracker), Some(slot_id)) =
+            (config.position_limit_tracker.clone(), position_slot_id)
+        {
+            let released = tracker.release(slot_id);
+            let mut release_record = post_buy_admission_record(
+                position_join_metadata.run_id.clone(),
+                &candidate_id,
+                &pool_amm_id,
+                &base_mint,
+                &lane,
+                &post_buy_source_label,
+                position_slot_id,
+                "rejection_release",
+            );
+            release_record.handoff_accepted = Some(false);
+            release_record.monitoring_registered = false;
+            release_record.release_status = Some(if released {
+                "released"
+            } else {
+                "already_released"
+            });
+            release_record.release_reason = match handoff.ack {
+                DirectPostBuyHandoffAck::Rejected(reason) => Some(reason.to_string()),
+                DirectPostBuyHandoffAck::Accepted => None,
+            };
+            append_post_buy_admission_record(admission_log_path.as_deref(), &release_record);
         }
         return finish_direct_handoff(recent_handoffs, &candidate_id, handoff.ack);
     }
@@ -4178,7 +4398,7 @@ fn spawn_shadow_terminal_watcher(
     terminal_rx: oneshot::Receiver<ShadowTerminalDisposition>,
     position_limit_tracker: PositionLimitTracker,
     slot_id: PositionSlotId,
-    candidate_id: String,
+    admission_context: ShadowTerminalWatcherAdmissionContext,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (disposition, action_id, reason) = match terminal_rx.await {
@@ -4205,7 +4425,7 @@ fn spawn_shadow_terminal_watcher(
         if !position_limit_tracker.release(slot_id) {
             warn!(
                 runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-                candidate_id = %candidate_id,
+                candidate_id = %admission_context.candidate_id,
                 slot_id = %slot_id,
                 disposition,
                 action_id = ?action_id,
@@ -4213,9 +4433,29 @@ fn spawn_shadow_terminal_watcher(
                 "PostBuyRuntime: shadow position slot already released before terminal notification"
             );
         } else {
+            let mut record = post_buy_admission_record(
+                admission_context.run_id.clone(),
+                &admission_context.candidate_id,
+                &admission_context.pool_id,
+                &admission_context.base_mint,
+                "shadow",
+                "terminal_watcher",
+                Some(slot_id),
+                "terminal_release",
+            );
+            record.handoff_accepted = Some(true);
+            record.monitoring_registered = admission_context.position_id.is_some();
+            record.position_id = admission_context.position_id.clone();
+            record.position_epoch = admission_context.position_epoch;
+            record.release_status = Some("released");
+            record.release_reason = Some(reason.clone());
+            append_post_buy_admission_record(
+                admission_context.admission_log_path.as_deref(),
+                &record,
+            );
             info!(
                 runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-                candidate_id = %candidate_id,
+                candidate_id = %admission_context.candidate_id,
                 slot_id = %slot_id,
                 disposition,
                 action_id = ?action_id,
@@ -8966,8 +9206,20 @@ sys.exit(0)
         assert_eq!(tracker.active_positions(), 1);
 
         let (terminal_tx, terminal_rx) = oneshot::channel();
-        let watcher =
-            spawn_shadow_terminal_watcher(terminal_rx, tracker.clone(), slot_id, candidate_id);
+        let watcher = spawn_shadow_terminal_watcher(
+            terminal_rx,
+            tracker.clone(),
+            slot_id,
+            ShadowTerminalWatcherAdmissionContext {
+                candidate_id,
+                pool_id: pool_amm_id,
+                base_mint,
+                run_id: Some("test-run".to_string()),
+                position_id: Some("test-position".to_string()),
+                position_epoch: Some(1),
+                admission_log_path: None,
+            },
+        );
         terminal_tx
             .send(ShadowTerminalDisposition::SimulationBlocked {
                 action_id: "shadow-action:1".to_string(),
@@ -8992,7 +9244,15 @@ sys.exit(0)
             terminal_rx,
             tracker.clone(),
             slot_id,
-            "candidate-shadow-closed".to_string(),
+            ShadowTerminalWatcherAdmissionContext {
+                candidate_id: "candidate-shadow-closed".to_string(),
+                pool_id: Pubkey::new_unique().to_string(),
+                base_mint: mint.to_string(),
+                run_id: Some("test-run".to_string()),
+                position_id: Some("test-position".to_string()),
+                position_epoch: Some(1),
+                admission_log_path: None,
+            },
         );
         terminal_tx
             .send(ShadowTerminalDisposition::SimulatedClosed {
@@ -9001,6 +9261,54 @@ sys.exit(0)
             })
             .expect("terminal receiver must remain active");
         watcher.await.expect("watcher should finish");
+        assert_eq!(tracker.active_positions(), 0);
+    }
+
+    #[tokio::test]
+    async fn shadow_terminal_watcher_writes_admission_terminal_release() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let admission_path = tmp.path().join("post_buy_admission_v1.jsonl");
+        let mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique().to_string();
+        let tracker = PositionLimitTracker::new(1);
+        let slot_id = PositionSlotId::derive(&Pubkey::new_unique(), &mint);
+        tracker
+            .register_existing(slot_id, pool.clone(), mint.to_string())
+            .expect("slot must register");
+
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let watcher = spawn_shadow_terminal_watcher(
+            terminal_rx,
+            tracker.clone(),
+            slot_id,
+            ShadowTerminalWatcherAdmissionContext {
+                candidate_id: "candidate-admission-release".to_string(),
+                pool_id: pool.clone(),
+                base_mint: mint.to_string(),
+                run_id: Some("validation-run".to_string()),
+                position_id: Some(format!("{pool}:{mint}:shadow")),
+                position_epoch: Some(42),
+                admission_log_path: Some(admission_path.clone()),
+            },
+        );
+        terminal_tx
+            .send(ShadowTerminalDisposition::SimulatedClosed {
+                action_id: "shadow-action:closed".to_string(),
+                reason: "target".to_string(),
+            })
+            .expect("terminal receiver must remain active");
+        watcher.await.expect("watcher should finish");
+
+        let content = std::fs::read_to_string(&admission_path).expect("admission jsonl");
+        let row: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("admission row"))
+                .expect("admission json");
+        assert_eq!(row["artifact_type"], "post_buy_admission_v1");
+        assert_eq!(row["stage"], "terminal_release");
+        assert_eq!(row["run_id"], "validation-run");
+        assert_eq!(row["position_epoch"], 42);
+        assert_eq!(row["release_status"], "released");
+        assert_eq!(row["release_reason"], "target");
         assert_eq!(tracker.active_positions(), 0);
     }
 
@@ -9018,7 +9326,15 @@ sys.exit(0)
             terminal_rx,
             tracker.clone(),
             slot_id,
-            "candidate-shadow-dropped".to_string(),
+            ShadowTerminalWatcherAdmissionContext {
+                candidate_id: "candidate-shadow-dropped".to_string(),
+                pool_id: Pubkey::new_unique().to_string(),
+                base_mint: mint.to_string(),
+                run_id: Some("test-run".to_string()),
+                position_id: Some("test-position".to_string()),
+                position_epoch: Some(1),
+                admission_log_path: None,
+            },
         );
         drop(terminal_tx);
         watcher.await.expect("watcher should finish");

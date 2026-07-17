@@ -1361,7 +1361,45 @@ impl PreparedHetComparisonV1 {
     }
 }
 
+fn v2_final_exit_reason_label(value: Option<&str>) -> Option<&'static str> {
+    let value = value?;
+    if value.starts_with("ExitAll { reason: Crash,") {
+        Some("crash")
+    } else if value.starts_with("ExitAll { reason: HardLoss,") {
+        Some("hard_loss")
+    } else if value.starts_with("ExitAll { reason: ExecutableTrailing,") {
+        Some("executable_trailing")
+    } else if value.starts_with("ExitAll { reason: VitalityDecay,") {
+        Some("vitality_decay")
+    } else if value.starts_with("ExitAll { reason: AbsoluteMaxHold,") {
+        Some("absolute_max_hold")
+    } else {
+        None
+    }
+}
+
 impl PreparedV1V2ComparisonCoreV1 {
+    pub(super) fn censoring_evidence(
+        &self,
+    ) -> (HetComparisonCorrelationV1, bool, Option<&'static str>) {
+        match self {
+            Self::Ready(record) => {
+                let reason = v2_final_exit_reason_label(record.v2_final.as_deref());
+                (
+                    HetComparisonCorrelationV1 {
+                        comparison_id: record.comparison_id.clone(),
+                        source_snapshot_id: record.snapshot_id.clone(),
+                        run_id: record.run_id.clone(),
+                        writer_instance_id: record.writer_instance_id.clone(),
+                    },
+                    reason.is_some(),
+                    reason,
+                )
+            }
+            Self::Skipped { correlation, .. } => (correlation.clone(), false, None),
+        }
+    }
+
     pub(super) fn prepare(record: V1V2ComparisonRecord) -> Self {
         let correlation = HetComparisonCorrelationV1 {
             comparison_id: record.comparison_id.clone(),

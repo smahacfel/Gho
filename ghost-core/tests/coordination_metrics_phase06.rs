@@ -26,8 +26,8 @@ fn fee_fp(seed: u8) -> FeeTopologyFingerprint {
         external_fee_count: seed,
         internal_fee_count: seed % 2,
         external_amount_pattern_hash: u16::from(seed) * 17,
-        has_wsol_self_flow: seed % 2 == 0,
-        has_create_ata_flow: seed % 3 == 0,
+        has_wsol_self_flow: seed.is_multiple_of(2),
+        has_create_ata_flow: seed.is_multiple_of(3),
     }
 }
 
@@ -235,7 +235,7 @@ fn ftdi_v2_widens_available_denominator_above_u8_without_changing_schema() {
 #[test]
 fn dbia_v2_requires_comparable_dev_reference_and_never_uses_create_tx_as_buy() {
     let config = CoordinationRiskConfig::default();
-    let txs = vec![
+    let txs = [
         observed_buy_tx(30, 30, 0),
         observed_buy_tx(31, 31, 0),
         observed_buy_tx(32, 32, 0),
@@ -284,7 +284,7 @@ fn dbia_v2_requires_comparable_dev_reference_and_never_uses_create_tx_as_buy() {
 #[test]
 fn dbia_v2_requires_explicit_swap_slice_and_downweights_its_confidence() {
     let config = CoordinationRiskConfig::default();
-    let txs = vec![
+    let txs = [
         observed_buy_tx(34, 34, 0),
         observed_buy_tx(35, 35, 0),
         observed_buy_tx(36, 36, 0),
@@ -666,14 +666,12 @@ fn evidence_unit_requires_frozen_decision_time_snapshot_and_keeps_sidecar_join_s
         .iter()
         .map(|entry| entry.metric)
         .collect();
-    assert_eq!(
-        skipped,
-        vec![
-            CoordinationMetricName::CapitalTemplateConcentration,
-            CoordinationMetricName::CrossPoolCohortRecurrence,
-            CoordinationMetricName::ExecutionTemplateConcentration,
-        ]
-    );
+    let expected_skipped = [
+        CoordinationMetricName::CapitalTemplateConcentration,
+        CoordinationMetricName::CrossPoolCohortRecurrence,
+        CoordinationMetricName::ExecutionTemplateConcentration,
+    ];
+    assert_eq!(skipped.as_slice(), &expected_skipped);
 
     let encoded = serde_json::to_string(&unit).expect("evidence unit should serialize");
     assert!(encoded.contains("feature_cutoff_ts_ms"));
