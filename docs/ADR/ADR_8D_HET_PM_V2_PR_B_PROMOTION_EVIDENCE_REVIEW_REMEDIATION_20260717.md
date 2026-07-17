@@ -23,6 +23,12 @@ Focused re-review PR #73 wskazał, że prerequisite promotion evidence nadal poz
 - dwa validation runy były liczone globalnie bez minimalnej per-run jakości;
 - brakowało SLA `monitoring_registered -> first HET comparison`.
 
+Dodatkowy audit przed zamknięciem remediation wskazał trzy cutover-sensitive luki, które muszą być jawnie zamrożone jako kontrakt PR B:
+
+- selective gate promotion musi współdziałać z hierarchią: non-authoritative CrashGuard nie może wykonać exit, nie może stać się Hold i nie może maskować promowanego Trailing/Vitality;
+- deploy-boundary nie może przełączyć ownership, gdy istnieje aktywny V1 `PendingExitProposal` albo pending terminal commit;
+- `AbsoluteMaxHold` po cutoverze musi pozostać hard ceilingiem nawet, gdy wyższy gate jest `Blocked`.
+
 ## D2. Zakres decyzji
 
 Decyzja dotyczy wyłącznie promotion-evidence prerequisite PR #73.
@@ -93,6 +99,12 @@ Wprowadzono następujące kontrakty:
 9. Per-run floors:
    - Gate 5 zawiera minimalną jakość per validation run, nie tylko globalną agregację.
 
+10. PR-B cutover guardrails:
+    - authority hierarchy wybiera najwyższy gate spośród gate'ów mających realne authority;
+    - non-authoritative higher gate pozostaje diagnostic-only i nie maskuje niższych promoted gates;
+    - PR B activation jest rejected/deferred, jeśli istnieje aktywny V1 pending proposal albo pending terminal commit;
+    - `AbsoluteMaxHold` musi dojść do normalnego apply albo typed unresolved/recovery zamiast zwykłego Hold.
+
 ## D5. Konsekwencje
 
 Po zmianie PR #73 nadal jest prerequisite’em, a nie cutoverem.
@@ -145,6 +157,11 @@ Zmiany obejmują:
   - Python promotion gate and launcher guard tests;
   - Rust terminal watcher admission health test.
 
+- `PLANS/DO_REALIZACJI/POSITION_MANAGER_HET_V2.md`
+  - doprecyzowanie authority hierarchy po masce `authority_eligible`;
+  - deploy-boundary drain guard dla V1 pending proposal / pending terminal commit;
+  - PR B tests/DoD dla Crash+Trailing same tick i max-hold-under-blocked.
+
 ## D7. Weryfikacja
 
 Wykonane lokalnie:
@@ -170,6 +187,7 @@ Ryzyka pozostające celowo poza tym PR:
 - finalne prospective validation runy muszą zostać uruchomione dopiero po zamrożeniu rzeczywistego runtime commit/binary/config locka;
 - aktualne r2a pozostaje calibration/diagnostic, nie final validation run;
 - authority cutover wymaga osobnego PR po `promotion_gate_passed=true`.
+- obecny PR #73 nie implementuje jeszcze PR-B runtime cutover; dopisane guardraile są acceptance contractem dla następnego PR, a nie zmianą aktywnego ownera.
 
 Następne kroki:
 

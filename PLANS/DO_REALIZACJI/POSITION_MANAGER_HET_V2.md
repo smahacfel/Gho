@@ -650,6 +650,19 @@ V1 i V2 czytają dokładnie ten sam:
 
 To jest kolejność leksykograficzna. Niższa bramka nie może przegłosować wyższej.
 
+W PR B istnieją dwie warstwy tej samej kolejności:
+
+- observation hierarchy — zapisuje, który gate był najwyższym kandydatem w pure policy;
+- authority hierarchy — wybiera najwyższy gate spośród mechanizmów mających w bieżącej konfiguracji realne authority.
+
+Gate bez authority nie może:
+
+- wykonać `Exit`;
+- zostać zmapowany na `Hold`;
+- stłumić niższego gate'u, który ma authority.
+
+Przykład normatywny: jeżeli w tym samym ticku `Crash` i `ExecutableTrailing` są kandydatami, ale `CrashGuard` ma effective mode `observe_only`, a `ExecutableTrailing` jest promowany, authority winnerem jest `ExecutableTrailing`. `Crash` pozostaje wyłącznie evidence/diagnostic row.
+
 ### 12.2. Typy
 
 ```rust
@@ -817,6 +830,13 @@ return_5s_bps >= vitality_recovery_return_bps
 ### 12.9. Gate 6 — absolute max-hold
 
 Reuse PR #68. Max-hold jest ostatnim hard occupancy ceiling, a nie inteligencją managera.
+
+Po PR B `AbsoluteMaxHold` jest hard-ceiling fallbackiem dla pozycji, której nie uratował już V1. Wyższy gate w stanie `Blocked` nie może bezterminowo maskować max-hold. Jeżeli wyższy gate nie posiada resolved executable path albo jest zablokowany danymi, implementacja PR B musi dojść do max-hold i:
+
+- wykonać normalny full-position quote/apply, jeśli route/evidence pozwala;
+- albo zakończyć przez istniejący typed unresolved/recovery contract bez fill i PnL, jeżeli sprzedaż nadal jest niemożliwa.
+
+Nie wolno redukować tego przypadku do `Hold`.
 
 ### 12.10. Gate 7 — Hold
 
@@ -1496,6 +1516,20 @@ V1 po cutoverze nie może:
 - terminalizować pozycji;
 - zwalniać capacity.
 
+Cutover nie może przejąć pozycji z aktywnym sticky V1 `PendingExitProposal` albo oczekującym terminal commit bez jawnej granicy właścicielstwa.
+
+Minimalny kontrakt deploy-boundary:
+
+```text
+if any live shadow position has V1 pending proposal / pending terminal commit:
+    PR B authority activation = rejected or deferred
+    existing V1 owner drains the pending action
+else:
+    V2 authority may start as the only shadow apply owner
+```
+
+Nie wolno konwertować V1 proposal w locie na V2 action ani utrzymywać V1 i V2 jako równoległych apply owners „na okres migracji”.
+
 ### 20.2. Gate-specific promotion
 
 PR B jawnie określa, które mechanizmy uzyskują authority:
@@ -1660,6 +1694,11 @@ Poza wszystkimi testami PR A:
 - vitality resolved quote prowadzi do jednego full exit;
 - stale/blocked quote używa istniejącego recovery contractu;
 - unresolved nie emituje fill ani PnL;
+- same-tick `Crash` + `ExecutableTrailing`, przy `CrashGuard observe_only` i promowanym Trailingu, daje authority exit Trailingiem, a Crash pozostaje diagnostic-only;
+- niepromowany wyższy gate nie mapuje się ani na `Exit`, ani na `Hold`, ani nie maskuje niższego promowanego gate'u;
+- cutover z aktywnym V1 `PendingExitProposal` albo pending terminal commit jest odrzucony lub odroczony do drainu przez V1;
+- istniejący V1 pending action nie jest konwertowany na V2 action w locie;
+- `AbsoluteMaxHold` pozostaje reachable mimo wyższego `Blocked` gate'u i kończy normalnym apply albo typed unresolved/recovery, nigdy zwykłym Hold;
 - duplicate action = 0;
 - route unsupported kończy shadow zgodnie z typed unresolved contractem;
 - rollback do V1 wymaga pełnego revertu PR B, bez dual authority.
@@ -1783,9 +1822,12 @@ Nie wolno utrzymywać V1 i V2 jako równoległych apply owners „na okres migra
 - [ ] V2 jest jedynym shadow authority;
 - [ ] V1 jest baseline/replay only;
 - [ ] V1 nie tworzy proposal ani terminalu;
+- [ ] cutover nie startuje, gdy istnieje aktywny V1 pending proposal / pending terminal commit;
 - [ ] istnieje jeden sticky action/apply owner;
 - [ ] brak duplicate action/terminal;
 - [ ] trailing i vitality używają existing quote/recovery/outcome contractu;
+- [ ] non-authoritative CrashGuard nie wykonuje exit, nie staje się Hold i nie maskuje promowanych niższych gate'ów;
+- [ ] AbsoluteMaxHold pozostaje reachable mimo wyższego typed blocker i nie jest maskowany jako Hold;
 - [ ] typed blocker nie staje się Hold;
 - [ ] unresolved nie emituje fill/PnL;
 - [ ] CrashGuard nie został niejawnie promowany;

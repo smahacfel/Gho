@@ -333,6 +333,44 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         )
         self.assertEqual([row["reason"] for row in matched], ["ExecutableTrailing"])
 
+    def test_same_tick_unpromoted_crash_does_not_block_promoted_trailing(self) -> None:
+        key = self.position_key()
+        observed, matched = gate.economic_observations(
+            {key: self.opened_position(key)},
+            {
+                key: [
+                    self.comparison_row(
+                        key=key,
+                        timestamp_ms=1_000,
+                        reason="Crash",
+                        return_bps=-500,
+                    ),
+                    self.comparison_row(
+                        key=key,
+                        timestamp_ms=1_000,
+                        reason="ExecutableTrailing",
+                        return_bps=250,
+                    ),
+                    self.comparison_row(
+                        key=key,
+                        timestamp_ms=2_000,
+                        current_executable_bps=350,
+                    ),
+                ]
+            },
+            {key: self.terminal()},
+            {key: self.replay()},
+            {},
+            self.criteria,
+        )
+        self.assertEqual(observed["matched_v2_candidate_positions"], 1)
+        self.assertEqual([row["reason"] for row in matched], ["ExecutableTrailing"])
+        self.assertEqual(observed["gate_specific_economics"]["crash"]["candidate_positions"], 1)
+        self.assertEqual(
+            observed["gate_specific_economics"]["executable_trailing"]["matched_positions"],
+            1,
+        )
+
     def test_one_position_with_trailing_and_vitality_counts_once_globally(self) -> None:
         key = self.position_key()
         observed, matched = gate.economic_observations(
