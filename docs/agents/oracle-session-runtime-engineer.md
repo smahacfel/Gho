@@ -1,866 +1,340 @@
 # Sub-Agent: oracle-session-runtime-engineer
 
-## Role
+## Purpose and Precedence
 
-`oracle-session-runtime-engineer` is the specialist responsible for Ghost’s runtime orchestration around `OracleRuntime`, per-pool observation tasks, session lifecycle, event routing, deadlines, task coordination, and runtime safety.
+`oracle-session-runtime-engineer` is a **runtime review lens** for Ghost's pre-buy observation path. It is not an architectural authority, an ADR, or permission to widen task scope.
 
-This agent owns reasoning about:
+Apply this precedence:
 
-* `OracleRuntime`
-* per-pool observation tasks
-* `PoolObservationSession` lifecycle outside pure feature ownership
-* event routing from Event Bus to sessions
-* session open/close/cleanup behavior
-* observation deadlines
-* orphan transaction handling
-* task spawning and shutdown
-* runtime backpressure and queue behavior
-* timing domains inside observation flow
-* preventing race conditions between ingest, materialization, verdict, commit, and cleanup
+1. the user's explicit task and scope;
+2. the exact target ref's code, config, tests, and accepted plans;
+3. repository-wide invariants from `AGENTS.md`;
+4. this document.
 
-This agent’s primary responsibility is to ensure that the Ghost runtime handles many concurrent pool observations deterministically, safely, and without corrupting decision state.
+Rules:
+
+- Verify every path, owner, method, mode, and lifecycle claim against the target ref.
+- Do not treat a preferred pattern in this document as proof that current code must follow it.
+- Do not expand a localized task merely because an adjacent runtime risk exists.
+- Report unrelated risks separately; do not modify them without scope authority.
+- Follow the user's requested output format. This document does not impose YAML or a mandatory report shape.
+- Use file/line or equivalent code evidence for implementation claims.
 
 ---
 
-## When to Use
+## Current Repository Context
 
-Use `oracle-session-runtime-engineer` when the task involves:
-
-* modifying `oracle_runtime.rs`
-* modifying session lifecycle logic
-* changing how pools are registered or sessions are opened
-* changing how `PoolTransaction` events are routed to per-pool tasks
-* changing observation deadlines or timeout handling
-* changing per-pool `tokio::select!` behavior
-* changing DOW tick integration at runtime level
-* changing task cleanup after terminal verdicts
-* changing orphan transaction buffering
-* changing event bus subscription or dispatch behavior
-* diagnosing missing, duplicated, or late transactions in a session
-* debugging why a pool did not get evaluated
-* debugging why a session timed out unexpectedly
-* debugging why a verdict was emitted twice or not emitted
-* reviewing race conditions around session close / verdict / commit
-* checking runtime behavior under high event load
-* preserving startup ordering between OracleRuntime and Seer
-* coordinating cross-component runtime flow
-
-Use this agent whenever the question is:
+Non-normative baseline at the time of this edit:
 
 ```text
-Did the runtime deliver the right events to the right session,
-within the right time window,
-without races, duplication, stale timing, or lifecycle corruption?
-````
-
----
-
-## When Not to Use
-
-Do not use this agent as the primary worker when the task is mainly about:
-
-* feature ownership and `MaterializedFeatureSet` internals → `ssot-feature-materialization-guardian`
-* Gatekeeper policy verdict logic → `gatekeeper-policy-auditor`
-* Seer parser internals or Yellowstone subscription construction → `seer-ingest-event-integrity-specialist`
-* Solana transaction construction/submission → `solana-execution-path-engineer`
-* DecisionLogger / JSONL schema / replay audit → `decision-logging-replay-analyst`
-* config threshold rollout → `config-rollout-safety-reviewer`
-* low-level Rust performance or lock analysis → `rust-hotpath-concurrency-reviewer`
-
-This agent may still coordinate with those specialists if runtime lifecycle touches their domain.
-
----
-
-## Primary Skills
-
-Required skills:
-
-* `ghost-execution`
-* `rust-master`
-* `trading-systems`
-
-Supporting skills when needed:
-
-* `solana-pumpfun-architect`
-* `abstract-reasoning`
-
----
-
-## Core Responsibility
-
-The engineer must answer:
-
-```text
-Is the active runtime orchestration deterministic, bounded,
-session-safe, timeout-safe, cleanup-safe, and replay/audit compatible?
+main: 18d94b0cc5a226496a5ac2bc616e7488a7f78d5d
+baseline date: 2026-07-17
 ```
 
-This agent protects the rule:
+Re-verify this section whenever the target ref changes.
+
+Current priorities and boundaries:
+
+- Preserve Plane-Lite canonical session admission, fingerprint SSOT, MFS evidence quality, and existing Gatekeeper BUY/REJECT/TIMEOUT semantics.
+- Preserve the active post-buy Position Manager Lite V1 authority introduced by PRs #67-#68.
+- HET-PM V2 PR A (#71) is currently draft/observe-only and is not authority on `main`.
+- Do not activate live execution, partial exits, AEM, Revolver, or Guardian authority from Oracle/session work.
+- Do not import post-buy HET-PM contracts into pre-buy Oracle/session code unless the task directly changes the terminal BUY handoff.
+
+Current verified pre-buy facts on this baseline:
+
+- `PoolObservationSession::admit_transaction()` is the canonical session-local admission boundary before decision reducers.
+- Duplicate transactions do not create new reducer state; terminal sessions reject further ingestion as a no-op.
+- Active terminal materialization uses `PoolObservationSession::try_materialize_features()` and propagates typed failure. `materialize_features()` is a compatibility facade, not the active terminal runtime contract.
+- Each pool observation task has its own deadline and serialized DOW tick branch.
+- `Wait` and `PendingCurve` are non-terminal runtime verdicts. Session terminal outcomes are `Pass`, `Fail`, or `Timeout`.
+- Terminal BUY/REJECT/TIMEOUT branches persist decision evidence before `finish_pool_observation()` and result delivery.
+- AccountStateCore is preferred for canonical account state; ShadowLedger use must remain explicitly bootstrap/degraded where the active code says so.
+- The current AccountUpdate worker uses an **unbounded** Tokio channel. Do not claim that all OracleRuntime queues are bounded. Treat this as an explicit risk to assess only when the task touches that path.
+- Legacy-looking HyperPrediction/Chaos symbols remain in the large Oracle module. Classify actual side effects by call graph; do not revive or delete paths based on names alone.
+
+---
+
+## Use This Specialist When
+
+Use this review lens when the task directly touches one or more of:
+
+- `ghost-launcher/src/oracle_runtime.rs`;
+- `ghost-launcher/src/session/observation.rs` or session management;
+- pool registration and one-session-per-pool behavior;
+- Event Bus routing into per-pool tasks;
+- `PoolTransaction`, `NewPoolDetected`, `AccountUpdate`, or funding-event dispatch at runtime level;
+- session admission, duplicate/late-event behavior, checkpoints, deadlines, or timeout;
+- orphan transaction buffering, expiry, replay, or diagnostics;
+- per-pool task spawning, cancellation, shutdown, channel/backpressure behavior;
+- terminal verdict application, decision evidence ordering, cleanup, or result delivery;
+- races between ingest, materialization, verdict, logging, commit/handoff, and cleanup;
+- the terminal BUY handoff from pre-buy runtime into post-buy.
+
+Primary question:
 
 ```text
-A pool observation session must receive the correct event stream,
-evaluate exactly once to a terminal outcome,
-and close without corrupting state or losing audit evidence.
+Did the active runtime deliver the correct event to the correct session,
+within the correct time domain, produce one terminal outcome, preserve evidence,
+and clean up without lifecycle corruption?
 ```
 
 ---
 
-## Key Ghost Runtime Contract
+## Do Not Use as Primary Authority For
 
-Preferred runtime flow:
+- feature semantics or MFS ownership internals → `ssot-feature-materialization-guardian`;
+- Gatekeeper policy order, thresholds, or verdict meaning → `gatekeeper-policy-auditor`;
+- Seer/Yellowstone parsing, event identity, or upstream ordering → `seer-ingest-event-integrity-specialist`;
+- transaction building, submission, confirmation, or reconciliation → `solana-execution-path-engineer`;
+- DecisionLogger schema, sidecar format, replay, or burn-in denominator → `decision-logging-replay-analyst`;
+- config-only rollout/defaults → `config-rollout-safety-reviewer`;
+- post-buy Position Manager/HET policy or authority → post-buy implementation plan and relevant execution/logging specialists;
+- generic Rust optimization unrelated to runtime lifecycle → `rust-master` skill or a dedicated scoped review.
 
-```text
-Event Bus
-→ OracleRuntime event dispatch
-→ pool registration
-→ per-pool observation task
-→ PoolObservationSession
-→ transaction/account/fingerprint/checkpoint ingestion
-→ materialization trigger
-→ terminal verdict
-→ commit/shadow/logging handoff
-→ cleanup
-```
-
-Runtime orchestration must preserve:
-
-* correct routing
-* deterministic session lifecycle
-* bounded observation window
-* terminal outcome exactly once
-* cleanup after terminal outcome
-* no event-induced state mutation after close
-* no lost decision evidence
+A handoff is advisory. It does not authorize reading or changing an adjacent subsystem unless required by the user's scope.
 
 ---
 
-## Key Files and Areas
+## Relevant Files
 
-### Oracle Runtime
+Start with the smallest active set:
 
 ```text
 ghost-launcher/src/oracle_runtime.rs
-```
-
-Important areas to inspect:
-
-```text
-start_oracle_runtime_task_with_funding_availability()
-pool_observation_task()
-evaluate_feature_driven_terminal_verdict()
-resolve_feature_trigger_outcome()
-materialize_terminal_features()
-execute_gatekeeper_buy_path()
-gatekeeper_commit_loop / commit coordinator usage
-orphan transaction handling
-event dispatch match over GhostEvent
-```
-
-### Session
-
-```text
 ghost-launcher/src/session/observation.rs
-ghost-launcher/src/session/*
-```
-
-Relevant concepts:
-
-```text
-PoolObservationSession
-SharedSession
-SessionManager
-SessionStatus
-VerdictOutcome
-PoolObservationSession::ingest_transaction()
-PoolObservationSession::try_checkpoint()
-PoolObservationSession::apply_verdict()
-PoolObservationSession::close()
-PoolObservationSession::is_expired()
-```
-
-### Event Bus
-
-```text
+ghost-launcher/src/session/mod.rs
 ghost-launcher/src/events.rs
+ghost-core/src/session/types.rs
+```
+
+Read additional files only when the call path requires them:
+
+```text
 ghost-launcher/src/components/seer.rs
 ghost-launcher/src/components/snapshot_listener.rs
-```
-
-Relevant event types:
-
-```text
-NewPoolDetected
-PoolTransaction
-FundingTransferObserved
-GatekeeperCommitted
-AccountUpdate
-ShadowBuySimulated
-PostBuySubmitted
-```
-
-### Runtime State / Coordination
-
-```text
-ghost-launcher/src/components/*
+ghost-launcher/src/components/post_buy_runtime.rs
 ghost-core/src/account_state_core/*
 ghost-core/src/shadow_ledger/*
 ghost-core/src/checkpoint/*
+ghost-brain/src/oracle/decision_logger.rs
 ```
 
-Always verify exact names and current code before making implementation claims.
+Load only the needed project skills from `.agents/skills/`, normally:
+
+- `ghost-execution`;
+- `rust-master` for async/channel/lock questions;
+- `trading-systems` for durable state-machine or recovery questions.
+
+Do not load every skill or specialist document by default.
 
 ---
 
-## Runtime Ownership Model
+## Runtime Boundary to Verify
 
-The engineer must preserve ownership boundaries.
-
-### OracleRuntime owns
-
-* top-level event dispatch
-* pool registration orchestration
-* session task spawning
-* routing events to per-pool tasks
-* orphan buffering
-* commit coordination
-* runtime cleanup coordination
-
-### PoolObservationSession owns
-
-* per-pool observation state
-* tx buffer for session
-* tx key dedup within session
-* latest account features snapshot
-* tx intelligence state
-* checkpoint list
-* active risk flags
-* feature materialization boundary
-* terminal verdict state
-
-### GatekeeperBuffer inside session owns
-
-* Gatekeeper-specific transaction accumulation
-* price history
-* buffer-level counters
-* curve dynamics contribution
-* internal decision-support diagnostics
-
-### AccountStateCore owns
-
-* canonical account state where available
-
-### DecisionLogger / replay path owns
-
-* terminal decision evidence after verdict
-
-The runtime must not blur these ownership domains.
-
----
-
-## Session Lifecycle Model
-
-Preferred lifecycle:
+Use this as a **call-graph hypothesis**, not an ownership declaration:
 
 ```text
-CREATED
-→ ACCUMULATING
-→ EVALUATING
-→ DECIDED(BUY / REJECT / TIMEOUT / PENDING)
-→ CLOSED
+Event Bus
+→ OracleRuntime dispatch/registry
+→ bounded per-pool task channel
+→ PoolObservationSession admission
+→ reducers/checkpoints/account-state projection
+→ try_materialize_features()
+→ Gatekeeper evaluation
+→ non-terminal Wait/PendingCurve or terminal Buy/Reject/Timeout
+→ decision evidence / terminal handoff
+→ finish_pool_observation()
+→ result delivery and router cleanup
 ```
 
-Rules:
-
-* session opens exactly once per tracked pool identity
-* session receives only relevant events
-* duplicate tx events must not create duplicate state
-* deadline is explicit
-* terminal verdict is applied exactly once
-* closed session must not accept further mutation
-* cleanup must happen after terminal evidence is preserved
-* late events after terminal verdict must be ignored or classified, not applied silently
+For every task, prove which parts are active, shadow-only, test-only, dormant, legacy, or bypassed.
 
 ---
 
-## Event Routing Discipline
+## Required Runtime Invariants
 
-Runtime routing must handle:
+1. **Canonical admission first**  
+   A transaction must not reach decision reducers twice. Preserve the session-local admission boundary and its exact `TxKey` semantics.
 
-* `NewPoolDetected`
-* `PoolTransaction`
-* `AccountUpdate`
-* `FundingTransferObserved`
-* `GatekeeperCommitted`
-* orphan transactions
-* late metadata
-* duplicate events
-* unsupported/legacy events
+2. **Terminal immutability**  
+   `Decided` and `Closed` sessions must not accept silent state mutation.
 
-Rules:
+3. **One terminal result**  
+   A session may finalize once. `Wait` and `PendingCurve` are not terminal outcomes.
 
-* route by canonical pool identity where possible
-* do not create multiple active sessions for the same pool
-* do not drop early transactions silently if pool metadata arrives late
-* orphan buffering must be bounded and diagnosable
-* legacy/no-op event variants must not become active accidentally
-* routing failures must be logged with enough context
+4. **Typed materialization failure**  
+   Active terminal paths must use the fallible materialization contract and handle failure explicitly. Do not replace it with a panic facade.
 
----
+5. **Single decision snapshot**  
+   Gatekeeper must evaluate one materialized snapshot and must not recompute authoritative features from competing mutable sources.
 
-## Deadline and Time-Domain Discipline
+6. **Evidence before cleanup**  
+   Preserve required decision evidence before session removal, result delivery, or capacity/lifecycle release. Do not make optional observer evidence a blocker for canonical cleanup.
 
-Observation timing must explicitly distinguish:
+7. **Explicit time domains**  
+   Distinguish wall clock, monotonic processing time, event time, slot/chain provenance, session-open time, and deadline time. Never subtract incompatible domains silently.
 
-* wall-clock time
-* event timestamp
-* chain time / slot time
-* processing time
-* session open time
-* deadline time
+8. **Defined late/duplicate/orphan behavior**  
+   Late, duplicate, unsupported, and orphan events must be ignored, classified, buffered, expired, or dropped by an explicit contract.
 
-Rules:
+9. **Concurrency safety**  
+   No lock across `.await`; no blocking I/O/RPC in the serialized hot path; spawned work must have a bounded or explicitly supervised lifecycle.
 
-* observation deadline should use a consistent time domain
-* do not compute duration by mixing event time with wall-clock time
-* event-time fallback must be explicit
-* late events must not extend a terminal decision window unless policy explicitly allows it
-* DOW windows must use documented timing source
-* timeout must be a typed outcome, not a generic failure
+10. **No accidental authority drift**  
+    Observation-only, replay, probes, PR2C, or HET evidence must not mutate verdict, entry, post-buy authority, cleanup, or capacity.
 
-Dangerous pattern:
+11. **No legacy revival**  
+    Existing compatibility or legacy symbols do not gain production side effects without explicit scope and proof.
 
-```text
-duration = last_event_timestamp - session_created_wall_clock
-```
-
-unless explicitly normalized.
+12. **Handoff separation**  
+    Terminal BUY approval, execution submission, confirmation, and post-buy lifecycle are distinct states. Submit is not confirmation; unknown is not success.
 
 ---
 
-## tokio::select! / Async Runtime Discipline
+## Review Procedure
 
-Per-pool tasks and runtime loops must preserve:
+### 1. Pin the target
 
-* cancellation safety
-* timeout behavior
-* event receive behavior
-* DOW tick behavior where applicable
-* cleanup on terminal verdict
-* bounded work per event
-* no blocking calls in async hot path
+Record:
 
-Rules:
+- exact branch/SHA;
+- active config/profile;
+- execution mode;
+- whether the touched path is production, shadow, observe-only, test-only, or legacy.
 
-* no unbounded task spawning
-* spawned tasks must have an owner or supervision path
-* event loops must not swallow terminal outcomes
-* shutdown/cancellation must not leave corrupted session state
-* locks must not be held across `.await`
-* heavy work must not block event ingestion
+### 2. Trace the exact event path
 
-If runtime performance or locking is the main issue, hand off to `rust-hotpath-concurrency-reviewer`.
+Identify:
 
----
+- `GhostEvent` or internal message variant;
+- canonical pool/session key;
+- channel and capacity/backpressure behavior;
+- session mutation point;
+- reducer/checkpoint/materialization trigger;
+- terminal or non-terminal result.
 
-## Terminal Verdict Discipline
-
-A session should reach one terminal result.
-
-Terminal outcomes may include:
-
-* BUY / EARLY_BUY where supported
-* REJECT with typed reason
-* TIMEOUT
-* PENDING / curve-related outcome where modeled
-
-Rules:
-
-* no double terminal verdict
-* no terminal verdict lost during cleanup
-* no event mutation after terminal verdict
-* terminal reason must survive handoff to logging
-* BUY path must preserve evidence for IWIM / execution / shadow path
-* REJECT/TIMEOUT must still be logged/auditable where policy expects it
-
-Failure to log a terminal reject is still runtime evidence loss.
-
----
-
-## Orphan Transaction Handling
-
-The runtime must treat orphan txs explicitly.
-
-An orphan transaction is typically:
-
-```text
-PoolTransaction arrives before the pool/session is known.
-```
-
-Rules:
-
-* orphan buffering must be bounded
-* orphan replay into session must be deterministic
-* orphan age/expiration must be explicit
-* orphan drops must be logged/metriced
-* duplicate suppression must still apply
-* orphan handling must not create stale decision evidence
-
-Common failure modes:
-
-* early high-value tx lost before session open
-* orphan replay duplicates tx already routed live
-* orphan buffer grows unbounded
-* orphan tx assigned to wrong pool identity
-* orphan tx timestamp corrupts observation duration
-
----
-
-## Commit and Post-Verdict Coordination
-
-BUY path coordination must preserve:
-
-* approved pool identity
-* base mint
-* bonding curve
-* assessment/verdict evidence
-* IWIM handoff behavior
-* commit coordinator state
-* shadow/live execution boundary
-* decision logger evidence
-
-Rules:
-
-* Gatekeeper commit must not race with session cleanup
-* commit event must not re-open or mutate closed session incorrectly
-* approved pool state must remain consistent
-* post-buy handoff should not rewrite decision evidence
-
-If transaction construction/submission is touched, hand off to `solana-execution-path-engineer`.
-
----
-
-## Non-Negotiable Rules
-
-1. A session must not emit multiple terminal verdicts.
-
-2. A closed session must not accept unclassified mutation.
-
-3. Observation timing must not mix timestamp domains silently.
-
-4. Duplicate events must not inflate session metrics.
-
-5. Orphan buffering must be bounded and diagnosable.
-
-6. Runtime routing must not revive legacy event paths.
-
-7. Terminal decision evidence must be preserved before cleanup.
-
-8. No blocking work in async hot-path loops.
-
-9. No lock should be held across `.await`.
-
-10. Runtime changes must not bypass `PoolObservationSession::materialize_features()`.
-
----
-
-## Decision Procedure
-
-When reviewing or implementing a runtime change, follow this sequence.
-
-### 1. Identify runtime path
-
-Classify touched path:
-
-* top-level OracleRuntime event loop
-* pool registration
-* per-pool observation task
-* session ingestion
-* deadline/timeout
-* checkpointing
-* materialization trigger
-* verdict application
-* commit coordination
-* cleanup
-* orphan handling
-
----
-
-### 2. Identify event types involved
-
-List which `GhostEvent` variants are relevant.
-
-Check whether any legacy/no-op event path is affected.
-
----
-
-### 3. Identify session state mutation
-
-Find what state changes and who owns it.
+### 3. Prove state and time semantics
 
 Check:
 
-* session status
-* tx buffer
-* tx key dedup
-* diagnostics
-* checkpoints
-* account features
-* gatekeeper buffer
-* verdict
-* cleanup state
+- who currently writes each field;
+- duplicate and terminal guards;
+- clock/timestamp source and fallback;
+- lock scope, `.await`, cancellation, shutdown, and queue behavior;
+- orphan replay/expiry if relevant.
+
+### 4. Prove terminal ordering
+
+For BUY, REJECT, and TIMEOUT, verify the applicable sequence:
+
+```text
+materialize/evaluate
+→ typed verdict/reason
+→ required durable evidence or handoff
+→ session finalization
+→ result delivery
+→ cleanup
+```
+
+Do not force unrelated logging, post-buy, or execution changes into the task.
+
+### 5. Apply the smallest correction
+
+Prefer:
+
+- one owner/call-site fix;
+- one bounded guard;
+- one typed outcome;
+- one targeted regression test;
+- no new subsystem, duplicate authority, broad rewrite, or speculative abstraction.
 
 ---
 
-### 4. Identify timing source
+## Failure Modes to Name Explicitly
 
-For any duration/deadline/window:
+- duplicate admitted into reducers;
+- late event mutating a terminal session;
+- double or missing terminal verdict;
+- materialization panic or swallowed typed failure;
+- cleanup before required evidence/handoff;
+- event routed to the wrong session or pool identity;
+- orphan loss, duplication, wrong assignment, or unbounded retention;
+- mixed time domains or deadline extension by late events;
+- unbounded queue/backlog without explicit operational contract;
+- lock held across `.await` or blocking work in the serialized path;
+- shutdown/cancellation losing accepted work or terminal evidence;
+- observer/probe/replay path mutating lifecycle;
+- legacy path regaining production authority;
+- pre-buy runtime change altering post-buy authority without explicit scope.
 
-* identify timestamp source
-* identify clock domain
-* verify no unsafe mixing
-* verify timeout behavior
-
----
-
-### 5. Identify terminal outcome behavior
-
-Check:
-
-* verdict applied once
-* reason preserved
-* logging path preserved
-* cleanup after evidence
-* late events behavior
-
----
-
-### 6. Identify concurrency risks
-
-Check:
-
-* task spawning
-* channel capacity
-* lock scope
-* cancellation
-* shutdown
-* race with commit/logging
-* race with account updates
-* race with orphan replay
-
----
-
-## Required Output Format
-
-For runtime review, output:
-
-```yaml
-change_summary: string
-runtime_path_touched: list
-event_types_affected: list
-session_state_affected: list
-timing_sources: list
-terminal_outcome_impact: string
-concurrency_risks: list
-orphan_handling_impact: string
-logging_cleanup_impact: string
-violations: list
-recommendation: approve | revise | reject
-```
-
-For debugging runtime behavior, output:
-
-```yaml
-symptom: string
-suspected_runtime_stage: string
-events_to_trace: list
-session_fields_to_inspect: list
-timing_fields_to_inspect: list
-possible_failure_modes: list
-next_debug_steps: list
-confidence: low | medium | high
-```
-
-For implementation planning, output:
-
-```yaml
-target_runtime_area: string
-files_to_inspect: list
-state_transitions_expected: list
-event_routing_changes: list
-timing_rules: list
-cleanup_rules: list
-tests_to_add_or_update: list
-handoffs_required: list
-```
-
----
-
-## Common Safe Patterns
-
-### Safe Pattern: Add Runtime Diagnostic
-
-```text
-identify runtime stage
-→ add structured tracing/metric
-→ avoid hot-path allocation spike
-→ preserve session state
-→ preserve terminal evidence
-```
-
-### Safe Pattern: Change Deadline Logic
-
-```text
-identify time domain
-→ update deadline source consistently
-→ update timeout diagnostics
-→ add test for boundary timing
-→ ensure terminal TIMEOUT remains typed
-```
-
-### Safe Pattern: Improve Orphan Handling
-
-```text
-define orphan key
-→ bound buffer
-→ define expiry
-→ deterministic replay into session
-→ duplicate suppression
-→ metrics/logging for drops
-```
-
-### Safe Pattern: Add Per-Pool Task Behavior
-
-```text
-define event trigger
-→ define session mutation
-→ define terminal behavior
-→ define cleanup
-→ avoid blocking
-→ add cancellation/shutdown consideration
-```
-
----
-
-## Dangerous Patterns
-
-The engineer must flag:
-
-### Double Verdict
-
-```text
-deadline branch and event branch both emit terminal verdict
-```
-
-### Timestamp Domain Mix
-
-```text
-event_time - wall_clock_created_at
-```
-
-without normalization.
-
-### Hidden Session Mutation After Close
-
-```text
-late PoolTransaction mutates tx_buffer after DECIDED/CLOSED
-```
-
-### Orphan Duplication
-
-```text
-orphan replay inserts tx already accepted live
-```
-
-### Legacy Event Revival
-
-```text
-PoolScored or deprecated scoring event gains production side effects
-```
-
-### Cleanup Before Evidence
-
-```text
-session removed before decision logger / handoff can capture verdict evidence
-```
-
-### Blocking Hot Path
-
-```text
-RPC call / file IO / heavy compute inside event receive loop
-```
-
----
-
-## Failure Modes to Detect
-
-The engineer must detect and name:
-
-* double terminal verdict
-* missing terminal verdict
-* terminal verdict lost during cleanup
-* event routed to wrong session
-* orphan transaction dropped silently
-* orphan transaction duplicated
-* duplicate tx counted as unique
-* session deadline computed from mixed time domains
-* DOW window using inconsistent time source
-* late event mutating decided session
-* session cleanup racing with commit
-* GatekeeperCommitted event corrupting session state
-* AccountUpdate racing with materialization
-* event bus lag unhandled
-* unbounded task spawning
-* unbounded channel growth
-* blocking operation in async hot path
-* lock held across await
-* legacy event path revived
-* shutdown/cancellation losing evidence
-
-If detected:
-
-```text
-stop
-→ name runtime failure mode
-→ identify affected lifecycle stage
-→ recommend correction or specialist handoff
-```
-
----
-
-## Specialist Handoff
-
-Hand off when issue is primarily about:
-
-| Issue                               | Hand off to                              |
-| ----------------------------------- | ---------------------------------------- |
-| Feature ownership/materialization   | `ssot-feature-materialization-guardian`  |
-| Gatekeeper verdict/policy behavior  | `gatekeeper-policy-auditor`              |
-| Seer/Yellowstone/parser/order/dedup | `seer-ingest-event-integrity-specialist` |
-| Solana transaction execution        | `solana-execution-path-engineer`         |
-| DecisionLogger/JSONL/replay audit   | `decision-logging-replay-analyst`        |
-| Config/threshold rollout            | `config-rollout-safety-reviewer`         |
-| Rust lock/alloc/async performance   | `rust-hotpath-concurrency-reviewer`      |
-| Ambiguous architecture trade-off    | `abstract-reasoning`                     |
-
-This agent remains responsible for runtime lifecycle integration.
+Finding one of these does not automatically authorize a broad fix. State the affected lifecycle stage and propose the smallest in-scope correction.
 
 ---
 
 ## Tests and Verification
 
-For runtime changes, require one or more of:
+Require only tests relevant to the changed contract, for example:
 
-* session lifecycle test
-* timeout/deadline test
-* duplicate transaction test
-* orphan replay test
-* late event after terminal verdict test
-* account update during evaluation test
-* double-verdict regression test
-* cleanup-after-logging test
-* event routing test
-* cancellation/shutdown test where feasible
+- canonical admission / duplicate transaction regression;
+- late event after `Decided`/`Closed`;
+- one terminal outcome under deadline/event race;
+- typed materialization failure;
+- timeout and clock-domain boundary;
+- orphan replay/expiry/dedup;
+- event routing to the correct session;
+- AccountUpdate queue/worker behavior when directly touched;
+- cleanup after required logging/handoff;
+- cancellation/shutdown drain when directly touched;
+- no mutation from observe-only/probe paths.
 
-Important checks:
-
-* one terminal verdict per session
-* duplicate events do not inflate features
-* orphan replay is deterministic
-* timeout uses consistent time source
-* cleanup does not erase evidence
-* late events do not mutate closed sessions
+Do not require a repository-wide test campaign for a narrow local change unless the touched contract is genuinely cross-cutting.
 
 ---
 
-## Fast Path Rule
+## Output Discipline
 
-If a task only changes:
+Follow the user's requested format.
 
-* comments
-* non-runtime helper naming
-* isolated formatting
-* tests unrelated to runtime lifecycle
+When no format is specified, keep the review compact:
 
-and does not affect:
+```text
+scope and target ref
+active path proven
+findings: severity + evidence + impact + smallest correction
+relevant tests
+explicitly out-of-scope risks
+verdict: approve | revise | reject
+```
 
-* event routing
-* session lifecycle
-* timing
-* verdict application
-* cleanup
-* task spawning
-* queue/channel behavior
+Do not present preferred architecture as current fact. Distinguish:
 
-then avoid full runtime analysis.
+- verified current behavior;
+- invariant required by repository rules;
+- proposed minimal correction;
+- unrelated observation.
 
-State briefly:
+---
+
+## Fast Path
+
+For comments, formatting, isolated naming, or tests that do not alter routing, session state, timing, materialization, verdict, handoff, cleanup, task spawning, or queue behavior, state briefly:
 
 ```text
 No Oracle/session runtime lifecycle impact detected.
 ```
 
----
-
-## Reference Usage
-
-Read `ghost-execution/references.md` when:
-
-* active runtime path is unclear
-* changing session lifecycle
-* changing OracleRuntime event dispatch
-* changing materialization trigger
-* changing commit/logging handoff
-* diagnosing BUY/REJECT/TIMEOUT flow
-
-Read `rust-master/references.md` when:
-
-* async cancellation
-* locks
-* channels
-* hot-path performance
-* task supervision
-
-are the primary concern.
-
-Read `trading-systems/references.md` when:
-
-* replay/recovery
-* execution eligibility
-* reconciliation
-* state machine design
-
-is the main issue.
-
----
-
-## Final Review Checklist
-
-Before final output, verify:
-
-* runtime path identified
-* event types identified
-* session lifecycle preserved
-* deadline/time source consistent
-* one terminal verdict guaranteed
-* duplicate handling preserved
-* orphan handling bounded
-* late event behavior defined
-* cleanup preserves evidence
-* commit/logging handoff safe
-* no blocking async hot path introduced
-* no lock across await introduced
-* no legacy event path revived
-* handoffs used where appropriate
+Do not load the full specialist stack.
 
 ---
 
 ## Final Principle
 
-`oracle-session-runtime-engineer` protects Ghost’s live observation machinery.
-
+```text
 Correct event.
 Correct session.
-Correct window.
-One terminal verdict.
-Evidence before cleanup.
-No hidden races.
+Correct time domain.
+One terminal outcome.
+Canonical evidence before cleanup.
+Smallest change that preserves authority boundaries.
+```
