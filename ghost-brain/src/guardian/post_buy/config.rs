@@ -35,6 +35,21 @@ pub const DEFAULT_EXIT_REPLAY_PNL_STEP_BPS: i32 = 25;
 pub const DEFAULT_EXIT_REPLAY_HEARTBEAT_MS: u64 = 1_000;
 pub const DEFAULT_EXIT_REPLAY_MAX_PATH_POINTS: usize = 512;
 pub const DEFAULT_EXIT_REPLAY_SHUTDOWN_FLUSH_BUDGET_MS: u64 = 3_000;
+pub const DEFAULT_HET_PM_V2_TRAJECTORY_SHORT_MS: u64 = 1_500;
+pub const DEFAULT_HET_PM_V2_TRAJECTORY_MEDIUM_MS: u64 = 5_000;
+pub const DEFAULT_HET_PM_V2_TRAJECTORY_LONG_MS: u64 = 15_000;
+pub const DEFAULT_HET_PM_V2_MAX_NEWEST_SAMPLE_AGE_MS: u64 = 1_500;
+pub const DEFAULT_HET_PM_V2_TRAILING_ARM_MARK_RETURN_BPS: i32 = 2_500;
+pub const DEFAULT_HET_PM_V2_TRAILING_MARK_CANDIDATE_DRAWDOWN_BPS: u32 = 1_500;
+pub const DEFAULT_HET_PM_V2_TRAILING_EXECUTABLE_BREACH_BPS: u32 = 1_800;
+pub const DEFAULT_HET_PM_V2_PEAK_ANCHOR_MIN_STEP_BPS: u32 = 500;
+pub const DEFAULT_HET_PM_V2_PEAK_ANCHOR_FORCE_REFRESH_MS: u64 = 5_000;
+pub const DEFAULT_HET_PM_V2_VITALITY_MIN_AGE_MS: u64 = 11_000;
+pub const DEFAULT_HET_PM_V2_VITALITY_REQUIRED_NON_ALIVE_WINDOWS: u32 = 3;
+pub const DEFAULT_HET_PM_V2_VITALITY_MIN_TIME_SINCE_PEAK_MS: u64 = 5_000;
+pub const DEFAULT_HET_PM_V2_VITALITY_RECOVERY_RETURN_BPS: i32 = 300;
+pub const DEFAULT_HET_PM_V2_WRITER_QUEUE_CAPACITY: usize = 256;
+pub const DEFAULT_HET_PM_V2_TERMINAL_WRITE_BUDGET_MS: u64 = 25;
 pub const DEFAULT_EXIT_REPLAY_LEVELS_BPS: [i32; 23] = [
     -5000, -3000, -2000, -1500, -1000, -700, -500, -300, -200, -100, 100, 200, 300, 400, 500, 700,
     1000, 1500, 2000, 3000, 5000, 7500, 10000,
@@ -102,6 +117,27 @@ impl Default for TimeStopV2Config {
 }
 
 impl TimeStopV2Config {
+    /// Deterministic identity of the complete TimeStop V2 evidence producer.
+    ///
+    /// HET-PM V2 consumes the projection emitted by this source, so burn-in
+    /// records must remain distinguishable when any source knob changes. The
+    /// HET policy hash intentionally stays separate from this identity.
+    pub fn projection_config_hash(&self) -> Result<String, serde_json::Error> {
+        #[derive(Serialize)]
+        struct HashInput<'a> {
+            projection_id: &'static str,
+            projection_version: u16,
+            config: &'a TimeStopV2Config,
+        }
+
+        let encoded = serde_json::to_vec(&HashInput {
+            projection_id: "post_buy_time_stop_v2_projection_v1",
+            projection_version: 1,
+            config: self,
+        })?;
+        Ok(blake3::hash(&encoded).to_hex().to_string())
+    }
+
     pub fn first_check_ms(&self) -> u64 {
         self.first_check_ms.max(1)
     }
@@ -252,6 +288,77 @@ impl ShadowExitReplayConfig {
     }
 }
 
+/// Authority mode for the Hierarchical Executable Trajectory observer.
+///
+/// PR A accepts only `ObserveOnly`. The second variant is deserializable so a
+/// premature rollout request fails with a typed startup error rather than an
+/// opaque TOML enum error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HetPmV2Mode {
+    #[default]
+    ObserveOnly,
+    AuthoritativeShadow,
+}
+
+/// Observe-only hypotheses for HET Position Manager V2 PR A.
+///
+/// An absent section remains disabled. These defaults are research starting
+/// points, not production exit authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HetPmV2Config {
+    pub enabled: bool,
+    pub mode: HetPmV2Mode,
+    pub trajectory_short_ms: u64,
+    pub trajectory_medium_ms: u64,
+    pub trajectory_long_ms: u64,
+    pub max_newest_sample_age_ms: u64,
+    pub trailing_arm_mark_return_bps: i32,
+    pub trailing_mark_candidate_drawdown_bps: u32,
+    pub trailing_executable_breach_bps: u32,
+    pub peak_anchor_min_step_bps: u32,
+    pub peak_anchor_force_refresh_on_new_peak_after_ms: u64,
+    pub vitality_min_age_ms: u64,
+    pub vitality_required_non_alive_windows: u32,
+    pub vitality_min_time_since_peak_ms: u64,
+    pub vitality_recovery_return_bps: i32,
+    /// Maximum number of pre-serialized observation rows waiting for the
+    /// single HET sidecar writer. A full queue drops observer-only rows.
+    pub writer_queue_capacity: usize,
+    /// Hard upper bound for awaiting a terminal sidecar acknowledgement.
+    /// Expiry degrades the observer payload to typed `Skipped` and canonical
+    /// V1 terminal persistence continues.
+    pub terminal_write_budget_ms: u64,
+}
+
+impl Default for HetPmV2Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: HetPmV2Mode::ObserveOnly,
+            trajectory_short_ms: DEFAULT_HET_PM_V2_TRAJECTORY_SHORT_MS,
+            trajectory_medium_ms: DEFAULT_HET_PM_V2_TRAJECTORY_MEDIUM_MS,
+            trajectory_long_ms: DEFAULT_HET_PM_V2_TRAJECTORY_LONG_MS,
+            max_newest_sample_age_ms: DEFAULT_HET_PM_V2_MAX_NEWEST_SAMPLE_AGE_MS,
+            trailing_arm_mark_return_bps: DEFAULT_HET_PM_V2_TRAILING_ARM_MARK_RETURN_BPS,
+            trailing_mark_candidate_drawdown_bps:
+                DEFAULT_HET_PM_V2_TRAILING_MARK_CANDIDATE_DRAWDOWN_BPS,
+            trailing_executable_breach_bps: DEFAULT_HET_PM_V2_TRAILING_EXECUTABLE_BREACH_BPS,
+            peak_anchor_min_step_bps: DEFAULT_HET_PM_V2_PEAK_ANCHOR_MIN_STEP_BPS,
+            peak_anchor_force_refresh_on_new_peak_after_ms:
+                DEFAULT_HET_PM_V2_PEAK_ANCHOR_FORCE_REFRESH_MS,
+            vitality_min_age_ms: DEFAULT_HET_PM_V2_VITALITY_MIN_AGE_MS,
+            vitality_required_non_alive_windows:
+                DEFAULT_HET_PM_V2_VITALITY_REQUIRED_NON_ALIVE_WINDOWS,
+            vitality_min_time_since_peak_ms: DEFAULT_HET_PM_V2_VITALITY_MIN_TIME_SINCE_PEAK_MS,
+            vitality_recovery_return_bps: DEFAULT_HET_PM_V2_VITALITY_RECOVERY_RETURN_BPS,
+            writer_queue_capacity: DEFAULT_HET_PM_V2_WRITER_QUEUE_CAPACITY,
+            terminal_write_budget_ms: DEFAULT_HET_PM_V2_TERMINAL_WRITE_BUDGET_MS,
+        }
+    }
+}
+
 /// Configuration for PostBuy Guardian real-time position monitoring.
 ///
 /// Controls tick frequency, per-module thresholds, and signal aggregation.
@@ -303,6 +410,10 @@ pub struct PostBuyGuardianConfig {
     /// Position Manager Lite V1 policy runtime settings.
     #[serde(default)]
     pub exit_policy_v1: ExitPolicyV1Config,
+
+    /// Hierarchical Executable Trajectory Position Manager V2 observer.
+    #[serde(default)]
+    pub het_pm_v2: HetPmV2Config,
 
     // ── LIGMA thresholds ────────────────────────────────────────────────
     /// Retail impact (bps) above which we emit Warning.
@@ -396,6 +507,7 @@ impl Default for PostBuyGuardianConfig {
             time_stop_v2: TimeStopV2Config::default(),
             exit_replay_v1: ShadowExitReplayConfig::default(),
             exit_policy_v1: ExitPolicyV1Config::default(),
+            het_pm_v2: HetPmV2Config::default(),
 
             // LIGMA
             ligma_warning_impact_bps: 3500.0,
@@ -599,6 +711,77 @@ mod tests {
     }
 
     #[test]
+    fn missing_het_pm_v2_section_is_disabled_and_does_not_change_crash_guard() {
+        let cfg: PostBuyGuardianConfig = toml::from_str("").unwrap();
+
+        assert!(!cfg.het_pm_v2.enabled);
+        assert_eq!(cfg.het_pm_v2.mode, HetPmV2Mode::ObserveOnly);
+        assert_eq!(
+            cfg.exit_policy_v1.crash_guard_mode,
+            CrashGuardMode::Disabled
+        );
+    }
+
+    #[test]
+    fn deserialize_het_pm_v2_nested_config_exactly() {
+        let cfg: PostBuyGuardianConfig = toml::from_str(
+            r#"
+            [het_pm_v2]
+            enabled = true
+            mode = "observe_only"
+            trajectory_short_ms = 1500
+            trajectory_medium_ms = 5000
+            trajectory_long_ms = 15000
+            max_newest_sample_age_ms = 1500
+            trailing_arm_mark_return_bps = 2500
+            trailing_mark_candidate_drawdown_bps = 1500
+            trailing_executable_breach_bps = 1800
+            peak_anchor_min_step_bps = 500
+            peak_anchor_force_refresh_on_new_peak_after_ms = 5000
+            vitality_min_age_ms = 11000
+            vitality_required_non_alive_windows = 3
+            vitality_min_time_since_peak_ms = 5000
+            vitality_recovery_return_bps = 300
+            "#,
+        )
+        .unwrap();
+
+        let het = &cfg.het_pm_v2;
+        assert!(het.enabled);
+        assert_eq!(het.mode, HetPmV2Mode::ObserveOnly);
+        assert_eq!(het.trajectory_short_ms, 1_500);
+        assert_eq!(het.trajectory_medium_ms, 5_000);
+        assert_eq!(het.trajectory_long_ms, 15_000);
+        assert_eq!(het.max_newest_sample_age_ms, 1_500);
+        assert_eq!(het.trailing_arm_mark_return_bps, 2_500);
+        assert_eq!(het.trailing_mark_candidate_drawdown_bps, 1_500);
+        assert_eq!(het.trailing_executable_breach_bps, 1_800);
+        assert_eq!(het.peak_anchor_min_step_bps, 500);
+        assert_eq!(het.peak_anchor_force_refresh_on_new_peak_after_ms, 5_000);
+        assert_eq!(het.vitality_min_age_ms, 11_000);
+        assert_eq!(het.vitality_required_non_alive_windows, 3);
+        assert_eq!(het.vitality_min_time_since_peak_ms, 5_000);
+        assert_eq!(het.vitality_recovery_return_bps, 300);
+        assert_eq!(
+            cfg.exit_policy_v1.crash_guard_mode,
+            CrashGuardMode::Disabled
+        );
+    }
+
+    #[test]
+    fn unknown_het_pm_v2_mode_is_rejected_by_deserialization() {
+        let result = toml::from_str::<PostBuyGuardianConfig>(
+            r#"
+            [het_pm_v2]
+            enabled = true
+            mode = "unknown_future_mode"
+            "#,
+        );
+
+        assert!(result.is_err(), "unknown HET-PM V2 mode must fail closed");
+    }
+
+    #[test]
     fn default_time_stop_v2_is_disabled_observe_only() {
         let cfg = PostBuyGuardianConfig::default();
 
@@ -657,5 +840,29 @@ mod tests {
         assert_eq!(cfg.time_stop_v2.max_abs_mcap_delta_pct_heartbeat, 0.9);
         assert_eq!(cfg.time_stop_v2.max_bonding_delta_pct_heartbeat, 0.2);
         assert!(!cfg.time_stop_v2.emit_window_records);
+    }
+
+    #[test]
+    fn time_stop_v2_projection_hash_covers_source_semantics() {
+        let base = TimeStopV2Config::default();
+        let same = TimeStopV2Config::default();
+        assert_eq!(
+            base.projection_config_hash().unwrap(),
+            same.projection_config_hash().unwrap()
+        );
+
+        let mut changed_window = base.clone();
+        changed_window.window_ms += 1;
+        assert_ne!(
+            base.projection_config_hash().unwrap(),
+            changed_window.projection_config_hash().unwrap()
+        );
+
+        let mut changed_vitality_threshold = base.clone();
+        changed_vitality_threshold.min_price_delta_pct_alive += 0.5;
+        assert_ne!(
+            base.projection_config_hash().unwrap(),
+            changed_vitality_threshold.projection_config_hash().unwrap()
+        );
     }
 }

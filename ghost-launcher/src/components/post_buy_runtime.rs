@@ -52,9 +52,9 @@ use ghost_brain::guardian::post_buy::shadow_v2::{
     SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
 };
 use ghost_brain::guardian::post_buy::{
-    validate_exit_policy_v1_config, CrashGuardMode, ExitPolicyV1Status, MonitoringEngine,
-    PositionRuntimeRouter, PostBuyGuardianConfig, ShadowPositionBook, ShadowTerminalDisposition,
-    SignalRouter,
+    validate_exit_policy_v1_config, validate_het_pm_v2_config, CrashGuardMode, ExitPolicyV1Status,
+    MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, ShadowPositionBook,
+    ShadowTerminalDisposition, SignalRouter,
 };
 use ghost_brain::quotes::{ExecutableQuoteProvider, QuoteProviderConfig};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
@@ -261,6 +261,15 @@ impl PostBuyRuntimeConfig {
     }
 
     pub fn validate(&self) -> Result<Option<ExitPolicyV1Status>, String> {
+        if let Some(guardian) = self.shadow_guardian.as_ref() {
+            validate_het_pm_v2_config(guardian).map_err(|error| error.to_string())?;
+            if guardian.het_pm_v2.enabled && self.account_state_core.is_none() {
+                return Err(
+                    "HET-PM V2 requires AccountStateCore route truth; route cannot be inferred from component absence"
+                        .to_string(),
+                );
+            }
+        }
         let crash_guard_authoritative = self.shadow_guardian.as_ref().is_some_and(|guardian| {
             matches!(
                 guardian.exit_policy_v1.crash_guard_mode,
@@ -322,6 +331,7 @@ impl PostBuyRuntimeConfig {
             );
         }
 
+        validate_het_pm_v2_config(&guardian).map_err(|error| error.to_string())?;
         validate_exit_policy_v1_config(&guardian)
             .map(Some)
             .map_err(|error| error.to_string())
@@ -2448,7 +2458,11 @@ pub async fn run(
                         .set_shadow_v2_validation_harness(Arc::clone(probe_shadow_v2_harness));
                 }
                 monitoring_engine.set_position_router(Arc::clone(&runtime_router));
-                monitoring_engine.set_shadow_lifecycle_log_path(Some(probe_lifecycle_log_path));
+                // HET-PM PR A owns one primary comparison sidecar. The probe
+                // monitor must not create a second writer or duplicate rows.
+                monitoring_engine.set_shadow_lifecycle_log_path_without_het_pm_v2_sidecar(Some(
+                    probe_lifecycle_log_path,
+                ));
                 let monitoring_engine = Arc::new(monitoring_engine);
                 probe_signal_router_handle = Some(tokio::spawn(
                     SignalRouter::new_observation_only(signal_rx, runtime_router).run(),
@@ -2500,6 +2514,45 @@ pub async fn run(
             live_authority = "disabled",
             "PostBuyRuntime: effective Position Manager Lite V1 configuration"
         );
+    }
+
+    if config.execution_mode == "shadow" {
+        let guardian = build_shadow_guardian_config(&config);
+        if let Ok(status) = validate_het_pm_v2_config(&guardian) {
+            info!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                policy_id = %status.policy_id,
+                policy_version = status.policy_version,
+                schema_version = status.schema_version,
+                policy_config_hash = %status.config_hash,
+                enabled = status.enabled,
+                mode = ?status.mode,
+                sampling_mode = %status.sampling_mode,
+                trajectory_grade = %status.trajectory_grade,
+                trajectory_short_ms = status.trajectory_windows_ms[0],
+                trajectory_medium_ms = status.trajectory_windows_ms[1],
+                trajectory_long_ms = status.trajectory_windows_ms[2],
+                max_newest_sample_age_ms = status.max_newest_sample_age_ms,
+                trailing_arm_mark_return_bps = status.trailing_arm_mark_return_bps,
+                trailing_mark_candidate_drawdown_bps = status.trailing_mark_candidate_drawdown_bps,
+                trailing_executable_breach_bps = status.trailing_executable_breach_bps,
+                peak_anchor_min_step_bps = status.peak_anchor_min_step_bps,
+                peak_anchor_force_refresh_on_new_peak_after_ms = status.peak_anchor_force_refresh_on_new_peak_after_ms,
+                vitality_min_age_ms = status.vitality_min_age_ms,
+                vitality_required_non_alive_windows = status.vitality_required_non_alive_windows,
+                vitality_min_time_since_peak_ms = status.vitality_min_time_since_peak_ms,
+                vitality_recovery_return_bps = status.vitality_recovery_return_bps,
+                writer_queue_capacity = status.writer_queue_capacity,
+                terminal_write_budget_ms = status.terminal_write_budget_ms,
+                crash_guard_mode = ?status.crash_guard_mode,
+                crash_guard_mode_source = %status.crash_guard_mode_source,
+                v1_shadow_authority = status.v1_shadow_authority,
+                v2_shadow_authority = status.v2_shadow_authority,
+                live_authority = status.live_authority,
+                hypotheses_grade = "safe_initial_shadow_hypothesis",
+                "PostBuyRuntime: effective HET-PM V2 PR A configuration"
+            );
+        }
     }
 
     info!(
@@ -2692,6 +2745,7 @@ pub async fn run(
     }
     if let Some(monitor) = shadow_monitor.as_ref() {
         monitor.flush_exit_replay_for_shutdown().await;
+        monitor.flush_het_pm_v2_writer_health_for_shutdown().await;
     }
     if let Some(handle) = shadow_signal_router_handle.take() {
         handle.abort();
@@ -7154,6 +7208,39 @@ sys.exit(0)
     }
 
     #[test]
+    fn pr_a_rejects_authoritative_het_pm_v2_in_every_execution_mode() {
+        let mut guardian = PostBuyGuardianConfig::default();
+        guardian.het_pm_v2.enabled = true;
+        guardian.het_pm_v2.mode = ghost_brain::guardian::post_buy::HetPmV2Mode::AuthoritativeShadow;
+        let config = PostBuyRuntimeConfig {
+            execution_mode: "paper".to_string(),
+            shadow_guardian: Some(guardian),
+            ..PostBuyRuntimeConfig::default()
+        };
+
+        let error = config.validate().expect_err("PR A must reject authority");
+        assert!(error.contains("authoritative_shadow is forbidden in PR A"));
+    }
+
+    #[test]
+    fn het_enabled_without_account_state_core_fails_startup() {
+        let mut guardian = PostBuyGuardianConfig::default();
+        guardian.het_pm_v2.enabled = true;
+        guardian.time_stop_v2.enabled = true;
+        let config = PostBuyRuntimeConfig {
+            execution_mode: "shadow".to_string(),
+            shadow_guardian: Some(guardian),
+            account_state_core: None,
+            ..PostBuyRuntimeConfig::default()
+        };
+
+        let error = config
+            .validate()
+            .expect_err("HET route truth must fail closed without AccountStateCore");
+        assert!(error.contains("requires AccountStateCore route truth"));
+    }
+
+    #[test]
     fn direct_post_buy_handoff_distinguishes_full_and_closed() {
         let event = GhostEvent::post_buy_submitted(
             Pubkey::new_unique().to_string(),
@@ -8435,19 +8522,22 @@ sys.exit(0)
             shadow_lifecycle_log_path: Some(lifecycle_log_path),
             ..PostBuyRuntimeConfig::default()
         };
-        let guardian_config = build_shadow_guardian_config(&config);
+        let mut guardian_config = build_shadow_guardian_config(&config);
+        guardian_config.target_threshold = Some(50.0);
+        guardian_config.stoploss_threshold = Some(50.0);
         let (signal_tx, _signal_rx) = mpsc::channel(guardian_config.signal_channel_buffer.max(1));
         let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             RwLock::new(ShadowPositionBook::new()),
         )));
-        let mut monitoring_engine = MonitoringEngine::new(
+        let mut monitoring_engine = MonitoringEngine::try_new(
             guardian_config,
             config
                 .shadow_ledger
                 .clone()
                 .expect("shadow ledger for canonical handoff"),
             signal_tx,
-        );
+        )
+        .expect("valid PostBuy Guardian policy config");
         monitoring_engine.set_position_router(runtime_router);
         monitoring_engine.set_event_emitter(Arc::clone(&emitter));
         monitoring_engine.set_shadow_lifecycle_log_path(config.shadow_lifecycle_log_path.clone());
@@ -8772,19 +8862,22 @@ sys.exit(0)
             max_concurrent_positions: 1,
             ..PostBuyRuntimeConfig::default()
         };
-        let guardian_config = build_shadow_guardian_config(&config);
+        let mut guardian_config = build_shadow_guardian_config(&config);
+        guardian_config.target_threshold = Some(50.0);
+        guardian_config.stoploss_threshold = Some(50.0);
         let (signal_tx, _signal_rx) = mpsc::channel(guardian_config.signal_channel_buffer.max(1));
         let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             RwLock::new(ShadowPositionBook::new()),
         )));
-        let mut monitoring_engine = MonitoringEngine::new(
+        let mut monitoring_engine = MonitoringEngine::try_new(
             guardian_config,
             config
                 .shadow_ledger
                 .clone()
                 .expect("shadow ledger for canonical handoff"),
             signal_tx,
-        );
+        )
+        .expect("valid PostBuy Guardian policy config");
         monitoring_engine.set_position_router(runtime_router);
         let monitoring_engine = Arc::new(monitoring_engine);
 
@@ -8912,19 +9005,22 @@ sys.exit(0)
             shadow_ledger: Some(Arc::new(ShadowLedger::new())),
             ..PostBuyRuntimeConfig::default()
         };
-        let guardian_config = build_shadow_guardian_config(&config);
+        let mut guardian_config = build_shadow_guardian_config(&config);
+        guardian_config.target_threshold = Some(50.0);
+        guardian_config.stoploss_threshold = Some(50.0);
         let (signal_tx, _signal_rx) = mpsc::channel(guardian_config.signal_channel_buffer.max(1));
         let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
             RwLock::new(ShadowPositionBook::new()),
         )));
-        let mut monitoring_engine = MonitoringEngine::new(
+        let mut monitoring_engine = MonitoringEngine::try_new(
             guardian_config,
             config
                 .shadow_ledger
                 .clone()
                 .expect("shadow ledger for canonical handoff"),
             signal_tx,
-        );
+        )
+        .expect("valid PostBuy Guardian policy config");
         let account_state_core = Arc::new(AccountStateReducer::new());
         monitoring_engine.set_account_state_core(Arc::clone(&account_state_core));
         monitoring_engine.set_position_router(runtime_router);

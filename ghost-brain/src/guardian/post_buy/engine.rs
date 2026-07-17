@@ -13,7 +13,12 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::mpsc::{
+    sync_channel, Receiver as StdReceiver, SyncSender, TrySendError as StdTrySendError,
+};
+use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
@@ -23,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use ghost_core::account_state_core::reducer::AccountStateReducer;
-use ghost_core::account_state_core::types::CanonicalPoolState;
+use ghost_core::account_state_core::types::{CanonicalPoolState, StatePhase};
 #[cfg(test)]
 use ghost_core::shadow_ledger::types::PriceReason;
 use ghost_core::shadow_ledger::types::PriceState;
@@ -64,6 +69,20 @@ use super::exit_policy_v1::{
     MarkEvidenceStatus, PositionSnapshotGuard, PostBuyDecisionSnapshot, PreQuoteDecision,
     QuoteEvidenceRevisionV1, EXECUTABLE_QUOTE_GRADE, EXECUTION_COST_COVERAGE_UNMODELED,
 };
+#[cfg(test)]
+use super::exit_policy_v1::{EXIT_POLICY_V1_ID, EXIT_POLICY_V1_VERSION};
+use super::exit_policy_v2::{
+    build_entry_value_contract, materialize_anchor, prequote_label, EffectiveHetPmV2Config,
+    ExecutablePeakAnchorV1, ExecutableQuoteKeyV2, ExitPolicyV2, HetComparisonCorrelationV1,
+    HetPmCandidateV2, HetPmFinalDecisionV2, HetPmQuoteFinalizationInputV2, HetPmV2ConfigError,
+    HetPmV2Status, PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2, PostBuySnapshotBundle,
+    PreparedHetComparisonV1, PreparedV1V2ComparisonCoreV1, RouteStatusV1,
+    TerminalV2ComparisonOutcomeUnknownReasonV1, TerminalV2ComparisonSkipReasonV1,
+    TimeStopV2ProjectionV1, TimeStopV2Subreason, TimeStopV2WindowStatus, V1AuthorityTickOutcomeV1,
+    V1AuthorityTickReceiptV1, V1ExitApplyStatusV1, V1TerminalCommitStatusV1, V1V2ComparisonRecord,
+    VitalityFeaturesV1, HET_PM_V2_MAX_QUOTE_CELLS, HET_PM_V2_POLICY_ID, HET_PM_V2_POLICY_VERSION,
+    HET_PM_V2_SAMPLING_MODE, HET_PM_V2_SCHEMA_VERSION, HET_PM_V2_TRAJECTORY_GRADE,
+};
 use super::exit_replay::{
     ShadowExitReplayIdentity, ShadowExitReplayRecord, ShadowExitReplayTracker,
     REASON_SHUTDOWN_BEFORE_HORIZON,
@@ -92,6 +111,7 @@ const SHADOW_TOKEN_DECIMAL_FACTOR_F64: f64 = 1_000_000.0;
 const SHADOW_V2_EXIT_FEE_BPS_DIAGNOSTIC_MODEL: u16 = 100;
 const SHADOW_V2_EXIT_SLIPPAGE_BPS_DIAGNOSTIC_MODEL: u16 = 150;
 use super::signals::*;
+use super::trajectory_v1::materialize_trajectory_v1;
 
 const SHADOW_QUOTE_RETRY_INTERVAL_MS: u64 = 500;
 
@@ -172,28 +192,6 @@ impl ShadowMarketActivityAnchor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum TimeStopV2WindowStatus {
-    Alive,
-    Weak,
-    Heartbeat,
-    StaleOrInsufficient,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum TimeStopV2Subreason {
-    AliveMeaningfulProgress,
-    LowVitalityNoMeaningfulProgress,
-    MicroTxHeartbeatNoPriceProgress,
-    StaleOrMissingMarketSample,
-    MissingMarketSample,
-    InvalidMarketSample,
-    NoNewMarketSample,
-    MixedFailedVitalityWindows,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct TimeStopV2Checkpoint {
     slot: Option<u64>,
@@ -240,6 +238,13 @@ struct TimeStopV2State {
     candidate_emitted: bool,
     candidate_ts_ms: Option<u64>,
     candidate_subreason: Option<TimeStopV2Subreason>,
+    last_window_at_ms: Option<u64>,
+    last_alive_at_ms: Option<u64>,
+    latest_window_price_delta_bps: Option<i32>,
+    latest_window_state_update_delta: Option<u64>,
+    source_window_index: Option<u32>,
+    source_checkpoint_slot: Option<u64>,
+    source_latest_slot: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -421,6 +426,19 @@ impl TimeStopV2State {
 
         self.last_status = Some(status);
         self.last_subreason = Some(subreason);
+        self.last_window_at_ms = Some(now_ms);
+        if matches!(status, TimeStopV2WindowStatus::Alive) {
+            self.last_alive_at_ms = Some(now_ms);
+        }
+        self.latest_window_price_delta_bps = price_delta_pct_window.map(|value| {
+            (value * 100.0)
+                .round()
+                .clamp(i32::MIN as f64, i32::MAX as f64) as i32
+        });
+        self.latest_window_state_update_delta = tx_delta_window;
+        self.source_window_index = Some(window_index);
+        self.source_checkpoint_slot = previous_checkpoint.and_then(|checkpoint| checkpoint.slot);
+        self.source_latest_slot = latest_checkpoint.and_then(|checkpoint| checkpoint.slot);
         if latest_checkpoint.is_some() && (fresh_latest || previous_checkpoint.is_none()) {
             self.last_checkpoint = latest_checkpoint;
         }
@@ -449,6 +467,29 @@ impl TimeStopV2State {
             checkpoint_timestamp_ms: previous_checkpoint.map(|checkpoint| checkpoint.timestamp_ms),
             latest_timestamp_ms: latest_checkpoint.map(|checkpoint| checkpoint.timestamp_ms),
         })
+    }
+
+    fn project(&self, now_ms: u64, window_ms: u64) -> TimeStopV2ProjectionV1 {
+        let quality_fresh = self
+            .last_window_at_ms
+            .is_some_and(|timestamp_ms| now_ms.saturating_sub(timestamp_ms) <= window_ms.max(1));
+        TimeStopV2ProjectionV1 {
+            current_status: self
+                .last_status
+                .unwrap_or(TimeStopV2WindowStatus::StaleOrInsufficient),
+            current_subreason: self
+                .last_subreason
+                .unwrap_or(TimeStopV2Subreason::MissingMarketSample),
+            consecutive_non_alive_windows: self.failed_windows,
+            last_window_at_ms: self.last_window_at_ms,
+            last_alive_at_ms: self.last_alive_at_ms,
+            latest_window_price_delta_bps: self.latest_window_price_delta_bps,
+            latest_window_state_update_delta: self.latest_window_state_update_delta,
+            source_window_index: self.source_window_index,
+            source_checkpoint_slot: self.source_checkpoint_slot,
+            source_latest_slot: self.source_latest_slot,
+            quality_fresh,
+        }
     }
 }
 
@@ -711,6 +752,9 @@ struct MonitoredPosition {
     shadow_market_activity: ShadowMarketActivityAnchor,
     time_stop_v2: TimeStopV2State,
     snapshot_timeline: SnapshotTimeline,
+    het_route_status: RouteStatusV1,
+    het_executable_peak_anchor: Option<ExecutablePeakAnchorV1>,
+    het_next_anchor_seq: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,6 +796,735 @@ struct PendingTerminalCommit {
     disposition: ShadowTerminalDisposition,
     last_attempt_ms: Option<u64>,
     lifecycle_jsonl_committed: bool,
+    prepared_het_comparison: Option<PreparedHetComparisonV1>,
+    het_comparison_write_status: HetComparisonWriteStatusV1,
+}
+
+const HET_PM_V2_WRITER_HEALTH_SCHEMA_VERSION: u16 = 2;
+const HET_PM_V2_WRITER_HEALTH_ARTIFACT_TYPE: &str = "het_pm_v2_writer_health";
+const HET_PM_V2_WRITER_HEALTH_COALESCE_MS: u64 = 100;
+const HET_PM_V2_WRITER_HEALTH_SHUTDOWN_BUDGET_MS: u64 = 250;
+static HET_PM_V2_WRITER_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum HetPmV2ObservationJobStateV1 {
+    Queued = 0,
+    Writing = 1,
+    Written = 2,
+    Failed = 3,
+    CancelledBeforeWrite = 4,
+}
+
+impl HetPmV2ObservationJobStateV1 {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Queued,
+            1 => Self::Writing,
+            2 => Self::Written,
+            3 => Self::Failed,
+            4 => Self::CancelledBeforeWrite,
+            _ => Self::Failed,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HetPmV2ObservationJobControlV1 {
+    state: AtomicU8,
+}
+
+impl HetPmV2ObservationJobControlV1 {
+    fn queued() -> Self {
+        Self {
+            state: AtomicU8::new(HetPmV2ObservationJobStateV1::Queued as u8),
+        }
+    }
+
+    fn start_writing(&self) -> Result<(), HetPmV2ObservationJobStateV1> {
+        self.state
+            .compare_exchange(
+                HetPmV2ObservationJobStateV1::Queued as u8,
+                HetPmV2ObservationJobStateV1::Writing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(HetPmV2ObservationJobStateV1::from_raw)
+    }
+
+    fn cancel_before_write(&self) -> Result<(), HetPmV2ObservationJobStateV1> {
+        self.state
+            .compare_exchange(
+                HetPmV2ObservationJobStateV1::Queued as u8,
+                HetPmV2ObservationJobStateV1::CancelledBeforeWrite as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(HetPmV2ObservationJobStateV1::from_raw)
+    }
+
+    fn finish(&self, success: bool) {
+        let final_state = if success {
+            HetPmV2ObservationJobStateV1::Written
+        } else {
+            HetPmV2ObservationJobStateV1::Failed
+        };
+        self.state.store(final_state as u8, Ordering::Release);
+    }
+}
+
+struct HetPmV2ObservationWriteJobV1 {
+    correlation: HetComparisonCorrelationV1,
+    encoded: Vec<u8>,
+    acknowledgement: Option<oneshot::Sender<Result<(), String>>>,
+    control: Arc<HetPmV2ObservationJobControlV1>,
+}
+
+#[derive(Debug, Default)]
+struct HetPmV2ObservationWriterStatsV1 {
+    comparison_attempts: AtomicU64,
+    comparison_ready_for_enqueue: AtomicU64,
+    core_validation_skips: AtomicU64,
+    final_validation_skips: AtomicU64,
+    serialization_skips: AtomicU64,
+    payload_oversized_skips: AtomicU64,
+    enqueue_attempts: AtomicU64,
+    enqueued: AtomicU64,
+    queue_full_drops: AtomicU64,
+    queue_closed_drops: AtomicU64,
+    writes_succeeded: AtomicU64,
+    writes_failed: AtomicU64,
+    cancelled_before_write: AtomicU64,
+    terminal_timeouts: AtomicU64,
+    terminal_outcome_unknown: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct HetPmV2ObservationWriterStatsSnapshotV1 {
+    comparison_attempts: u64,
+    comparison_ready_for_enqueue: u64,
+    core_validation_skips: u64,
+    final_validation_skips: u64,
+    serialization_skips: u64,
+    payload_oversized_skips: u64,
+    enqueue_attempts: u64,
+    enqueued: u64,
+    queue_full_drops: u64,
+    queue_closed_drops: u64,
+    writes_succeeded: u64,
+    writes_failed: u64,
+    cancelled_before_write: u64,
+    terminal_timeouts: u64,
+    terminal_outcome_unknown: u64,
+}
+
+impl HetPmV2ObservationWriterStatsV1 {
+    fn snapshot(&self) -> HetPmV2ObservationWriterStatsSnapshotV1 {
+        HetPmV2ObservationWriterStatsSnapshotV1 {
+            comparison_attempts: self.comparison_attempts.load(Ordering::Acquire),
+            comparison_ready_for_enqueue: self.comparison_ready_for_enqueue.load(Ordering::Acquire),
+            core_validation_skips: self.core_validation_skips.load(Ordering::Acquire),
+            final_validation_skips: self.final_validation_skips.load(Ordering::Acquire),
+            serialization_skips: self.serialization_skips.load(Ordering::Acquire),
+            payload_oversized_skips: self.payload_oversized_skips.load(Ordering::Acquire),
+            enqueue_attempts: self.enqueue_attempts.load(Ordering::Acquire),
+            enqueued: self.enqueued.load(Ordering::Acquire),
+            queue_full_drops: self.queue_full_drops.load(Ordering::Acquire),
+            queue_closed_drops: self.queue_closed_drops.load(Ordering::Acquire),
+            writes_succeeded: self.writes_succeeded.load(Ordering::Acquire),
+            writes_failed: self.writes_failed.load(Ordering::Acquire),
+            cancelled_before_write: self.cancelled_before_write.load(Ordering::Acquire),
+            terminal_timeouts: self.terminal_timeouts.load(Ordering::Acquire),
+            terminal_outcome_unknown: self.terminal_outcome_unknown.load(Ordering::Acquire),
+        }
+    }
+}
+
+struct HetPmV2WriterHealthContextV1 {
+    writer_instance_id: String,
+    sidecar_path: String,
+    policy_config_hash: String,
+    started_at_ms: u64,
+    revision: AtomicU64,
+    run_id: OnceLock<String>,
+    mixed_run_ids: AtomicBool,
+    shutdown_complete: AtomicBool,
+    stats: Arc<HetPmV2ObservationWriterStatsV1>,
+}
+
+impl HetPmV2WriterHealthContextV1 {
+    fn new(
+        sidecar_path: &Path,
+        policy_config_hash: String,
+        stats: Arc<HetPmV2ObservationWriterStatsV1>,
+    ) -> Self {
+        let started_at_ms = current_time_ms();
+        let sequence = HET_PM_V2_WRITER_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let identity = format!(
+            "{}:{policy_config_hash}:{started_at_ms}:{sequence}",
+            sidecar_path.display()
+        );
+        Self {
+            writer_instance_id: blake3::hash(identity.as_bytes()).to_hex().to_string(),
+            sidecar_path: sidecar_path.display().to_string(),
+            policy_config_hash,
+            started_at_ms,
+            revision: AtomicU64::new(0),
+            run_id: OnceLock::new(),
+            mixed_run_ids: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
+            stats,
+        }
+    }
+
+    fn observe_run_id(&self, run_id: &str) {
+        if let Some(existing) = self.run_id.get() {
+            if existing != run_id {
+                self.mixed_run_ids.store(true, Ordering::Release);
+            }
+            return;
+        }
+        if self.run_id.set(run_id.to_string()).is_err()
+            && self.run_id.get().is_some_and(|existing| existing != run_id)
+        {
+            self.mixed_run_ids.store(true, Ordering::Release);
+        }
+    }
+
+    fn mark_changed(&self) {
+        self.revision.fetch_add(1, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> HetPmV2WriterHealthRecordV1 {
+        HetPmV2WriterHealthRecordV1 {
+            schema_version: HET_PM_V2_WRITER_HEALTH_SCHEMA_VERSION,
+            artifact_type: HET_PM_V2_WRITER_HEALTH_ARTIFACT_TYPE,
+            writer_instance_id: self.writer_instance_id.clone(),
+            run_id: self.run_id.get().cloned(),
+            mixed_run_ids: self.mixed_run_ids.load(Ordering::Acquire),
+            shutdown_complete: self.shutdown_complete.load(Ordering::Acquire),
+            policy_id: HET_PM_V2_POLICY_ID,
+            policy_version: HET_PM_V2_POLICY_VERSION,
+            policy_config_hash: self.policy_config_hash.clone(),
+            sidecar_path: self.sidecar_path.clone(),
+            started_at_ms: self.started_at_ms,
+            snapshot_generated_at_ms: current_time_ms(),
+            revision: self.revision.load(Ordering::Acquire),
+            stats: self.stats.snapshot(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HetPmV2WriterHealthRecordV1 {
+    schema_version: u16,
+    artifact_type: &'static str,
+    writer_instance_id: String,
+    run_id: Option<String>,
+    mixed_run_ids: bool,
+    shutdown_complete: bool,
+    policy_id: &'static str,
+    policy_version: u16,
+    policy_config_hash: String,
+    sidecar_path: String,
+    started_at_ms: u64,
+    snapshot_generated_at_ms: u64,
+    revision: u64,
+    #[serde(flatten)]
+    stats: HetPmV2ObservationWriterStatsSnapshotV1,
+}
+
+enum HetPmV2ObservationEnqueueErrorV1 {
+    Full,
+    Closed,
+}
+
+enum HetPmV2ObservationIoV1 {
+    File(PathBuf),
+    #[cfg(test)]
+    Controlled {
+        path: PathBuf,
+        started: SyncSender<()>,
+        release: StdReceiver<()>,
+    },
+}
+
+impl HetPmV2ObservationIoV1 {
+    fn path(&self) -> &Path {
+        match self {
+            Self::File(path) => path,
+            #[cfg(test)]
+            Self::Controlled { path, .. } => path,
+        }
+    }
+
+    fn append(&mut self, encoded: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::File(path) => MonitoringEngine::append_prepared_jsonl_bytes(path, encoded),
+            #[cfg(test)]
+            Self::Controlled {
+                path,
+                started,
+                release,
+            } => {
+                let _ = started.try_send(());
+                release.recv().map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        format!("controlled HET writer release channel closed: {error}"),
+                    )
+                })?;
+                MonitoringEngine::append_prepared_jsonl_bytes(path, encoded)
+            }
+        }
+    }
+}
+
+struct HetPmV2ObservationWriterV1 {
+    sender: Option<SyncSender<HetPmV2ObservationWriteJobV1>>,
+    worker: Option<JoinHandle<()>>,
+    health_sender: Option<SyncSender<()>>,
+    health_worker: Option<JoinHandle<()>>,
+    health_path: Option<PathBuf>,
+    health_write_lock: Arc<Mutex<()>>,
+    stats: Arc<HetPmV2ObservationWriterStatsV1>,
+    health_context: Arc<HetPmV2WriterHealthContextV1>,
+    #[cfg(test)]
+    stalled_receiver: Option<parking_lot::Mutex<StdReceiver<HetPmV2ObservationWriteJobV1>>>,
+}
+
+impl HetPmV2ObservationWriterV1 {
+    fn health_path_for_sidecar(path: &Path, writer_instance_id: &str) -> PathBuf {
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(
+                "het_pm_v2_writer_health_v1.{writer_instance_id}.json"
+            ))
+    }
+
+    fn spawn(
+        path: PathBuf,
+        policy_config_hash: String,
+        queue_capacity: usize,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with_io(
+            HetPmV2ObservationIoV1::File(path),
+            policy_config_hash,
+            queue_capacity,
+        )
+    }
+
+    fn spawn_with_io(
+        io: HetPmV2ObservationIoV1,
+        policy_config_hash: String,
+        queue_capacity: usize,
+    ) -> std::io::Result<Self> {
+        let sidecar_path = io.path().to_path_buf();
+        let (sender, receiver) = sync_channel(queue_capacity);
+        let (health_sender, health_receiver) = sync_channel(1);
+        let health_write_lock = Arc::new(Mutex::new(()));
+        let stats = Arc::new(HetPmV2ObservationWriterStatsV1::default());
+        let health_context = Arc::new(HetPmV2WriterHealthContextV1::new(
+            &sidecar_path,
+            policy_config_hash,
+            Arc::clone(&stats),
+        ));
+        let health_path =
+            Self::health_path_for_sidecar(&sidecar_path, &health_context.writer_instance_id);
+        let health_worker_context = Arc::clone(&health_context);
+        let health_worker_write_lock = Arc::clone(&health_write_lock);
+        let health_worker = std::thread::Builder::new()
+            .name("het-pm-v2-writer-health".to_string())
+            .spawn(move || {
+                Self::run_health_reporter(
+                    health_path,
+                    health_receiver,
+                    health_worker_context,
+                    health_worker_write_lock,
+                )
+            })?;
+        let worker_stats = Arc::clone(&stats);
+        let worker_health = Arc::clone(&health_context);
+        let worker_health_sender = health_sender.clone();
+        let worker = match std::thread::Builder::new()
+            .name("het-pm-v2-sidecar".to_string())
+            .spawn(move || {
+                Self::run(
+                    io,
+                    receiver,
+                    worker_stats,
+                    worker_health,
+                    worker_health_sender,
+                )
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                drop(health_sender);
+                let _ = health_worker.join();
+                return Err(error);
+            }
+        };
+        let writer = Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            health_sender: Some(health_sender),
+            health_worker: Some(health_worker),
+            health_path: Some(Self::health_path_for_sidecar(
+                &sidecar_path,
+                &health_context.writer_instance_id,
+            )),
+            health_write_lock,
+            stats,
+            health_context,
+            #[cfg(test)]
+            stalled_receiver: None,
+        };
+        writer.notify_health();
+        Ok(writer)
+    }
+
+    fn run(
+        mut io: HetPmV2ObservationIoV1,
+        receiver: StdReceiver<HetPmV2ObservationWriteJobV1>,
+        stats: Arc<HetPmV2ObservationWriterStatsV1>,
+        health_context: Arc<HetPmV2WriterHealthContextV1>,
+        health_sender: SyncSender<()>,
+    ) {
+        while let Ok(job) = receiver.recv() {
+            if let Err(state) = job.control.start_writing() {
+                debug_assert_eq!(state, HetPmV2ObservationJobStateV1::CancelledBeforeWrite);
+                continue;
+            }
+            let result = io.append(&job.encoded).map_err(|error| error.to_string());
+            job.control.finish(result.is_ok());
+            match &result {
+                Ok(()) => {
+                    stats.writes_succeeded.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    stats.writes_failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        path = %io.path().display(),
+                        comparison_id = %job.correlation.comparison_id,
+                        source_snapshot_id = %job.correlation.source_snapshot_id,
+                        error,
+                        reason = TerminalV2ComparisonSkipReasonV1::WriterIoFailed.as_label(),
+                        "PostBuyGuardian: asynchronous HET-PM V2 sidecar write failed; V1 remains unaffected"
+                    );
+                }
+            }
+            health_context.mark_changed();
+            let _ = health_sender.try_send(());
+            if let Some(acknowledgement) = job.acknowledgement {
+                let _ = acknowledgement.send(result);
+            }
+        }
+        health_context
+            .shutdown_complete
+            .store(true, Ordering::Release);
+        health_context.mark_changed();
+        let _ = health_sender.try_send(());
+    }
+
+    fn run_health_reporter(
+        path: PathBuf,
+        receiver: StdReceiver<()>,
+        context: Arc<HetPmV2WriterHealthContextV1>,
+        write_lock: Arc<Mutex<()>>,
+    ) {
+        while receiver.recv().is_ok() {
+            std::thread::sleep(Duration::from_millis(HET_PM_V2_WRITER_HEALTH_COALESCE_MS));
+            while receiver.try_recv().is_ok() {}
+            if let Err(error) = Self::persist_health_snapshot(&path, &context, &write_lock) {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    writer_instance_id = %context.writer_instance_id,
+                    "PostBuyGuardian: HET-PM V2 writer-health snapshot failed; coverage must degrade to unknown"
+                );
+            }
+        }
+        let _ = Self::persist_health_snapshot(&path, &context, &write_lock);
+    }
+
+    fn persist_health_snapshot(
+        path: &Path,
+        context: &HetPmV2WriterHealthContextV1,
+        write_lock: &Mutex<()>,
+    ) -> std::io::Result<()> {
+        let _guard = write_lock.lock();
+        MonitoringEngine::write_het_pm_v2_writer_health(path, &context.snapshot())
+    }
+
+    fn notify_health(&self) {
+        self.health_context.mark_changed();
+        if let Some(sender) = self.health_sender.as_ref() {
+            let _ = sender.try_send(());
+        }
+    }
+
+    fn writer_instance_id(&self) -> &str {
+        &self.health_context.writer_instance_id
+    }
+
+    fn record_comparison_core_outcome(&self, core: &PreparedV1V2ComparisonCoreV1) {
+        let correlation = match core {
+            PreparedV1V2ComparisonCoreV1::Ready(record) => HetComparisonCorrelationV1 {
+                comparison_id: record.comparison_id.clone(),
+                source_snapshot_id: record.snapshot_id.clone(),
+                run_id: record.run_id.clone(),
+                writer_instance_id: record.writer_instance_id.clone(),
+            },
+            PreparedV1V2ComparisonCoreV1::Skipped { correlation, .. } => correlation.clone(),
+        };
+        self.health_context
+            .shutdown_complete
+            .store(false, Ordering::Release);
+        self.health_context.observe_run_id(&correlation.run_id);
+        self.stats
+            .comparison_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            core,
+            PreparedV1V2ComparisonCoreV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::CoreSemanticValidationFailed,
+                ..
+            }
+        ) {
+            self.stats
+                .core_validation_skips
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.notify_health();
+    }
+
+    fn record_comparison_final_outcome(&self, prepared: &PreparedHetComparisonV1) {
+        self.health_context
+            .shutdown_complete
+            .store(false, Ordering::Release);
+        self.health_context
+            .observe_run_id(&prepared.correlation().run_id);
+        match prepared {
+            PreparedHetComparisonV1::Ready { .. } => {
+                self.stats
+                    .comparison_ready_for_enqueue
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PreparedHetComparisonV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::FinalSemanticValidationFailed,
+                ..
+            } => {
+                self.stats
+                    .final_validation_skips
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PreparedHetComparisonV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::SerializationFailed,
+                ..
+            } => {
+                self.stats
+                    .serialization_skips
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PreparedHetComparisonV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::PayloadOversized,
+                ..
+            } => {
+                self.stats
+                    .payload_oversized_skips
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PreparedHetComparisonV1::Skipped { .. } => {}
+        }
+        self.notify_health();
+    }
+
+    fn try_enqueue(
+        &self,
+        correlation: HetComparisonCorrelationV1,
+        encoded: Vec<u8>,
+        acknowledgement: Option<oneshot::Sender<Result<(), String>>>,
+    ) -> Result<Arc<HetPmV2ObservationJobControlV1>, HetPmV2ObservationEnqueueErrorV1> {
+        self.health_context
+            .shutdown_complete
+            .store(false, Ordering::Release);
+        self.health_context.observe_run_id(&correlation.run_id);
+        self.stats.enqueue_attempts.fetch_add(1, Ordering::Relaxed);
+        let control = Arc::new(HetPmV2ObservationJobControlV1::queued());
+        let Some(sender) = self.sender.as_ref() else {
+            self.stats
+                .queue_closed_drops
+                .fetch_add(1, Ordering::Relaxed);
+            self.notify_health();
+            return Err(HetPmV2ObservationEnqueueErrorV1::Closed);
+        };
+        let job = HetPmV2ObservationWriteJobV1 {
+            correlation,
+            encoded,
+            acknowledgement,
+            control: Arc::clone(&control),
+        };
+        match sender.try_send(job) {
+            Ok(()) => {
+                self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                self.notify_health();
+                Ok(control)
+            }
+            Err(StdTrySendError::Full(_)) => {
+                self.stats.queue_full_drops.fetch_add(1, Ordering::Relaxed);
+                self.notify_health();
+                Err(HetPmV2ObservationEnqueueErrorV1::Full)
+            }
+            Err(StdTrySendError::Disconnected(_)) => {
+                self.stats
+                    .queue_closed_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                self.notify_health();
+                Err(HetPmV2ObservationEnqueueErrorV1::Closed)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn stalled(queue_capacity: usize, policy_config_hash: String) -> Self {
+        let (sender, receiver) = sync_channel(queue_capacity);
+        let stats = Arc::new(HetPmV2ObservationWriterStatsV1::default());
+        let health_context = Arc::new(HetPmV2WriterHealthContextV1::new(
+            Path::new("stalled-het-pm-v2-sidecar.jsonl"),
+            policy_config_hash,
+            Arc::clone(&stats),
+        ));
+        Self {
+            sender: Some(sender),
+            worker: None,
+            health_sender: None,
+            health_worker: None,
+            health_path: None,
+            health_write_lock: Arc::new(Mutex::new(())),
+            stats,
+            health_context,
+            stalled_receiver: Some(parking_lot::Mutex::new(receiver)),
+        }
+    }
+
+    #[cfg(test)]
+    fn controlled(
+        path: PathBuf,
+        policy_config_hash: String,
+        queue_capacity: usize,
+    ) -> std::io::Result<(Self, StdReceiver<()>, SyncSender<()>)> {
+        let (started_sender, started_receiver) = sync_channel(1);
+        let (release_sender, release_receiver) = sync_channel(1);
+        let writer = Self::spawn_with_io(
+            HetPmV2ObservationIoV1::Controlled {
+                path,
+                started: started_sender,
+                release: release_receiver,
+            },
+            policy_config_hash,
+            queue_capacity,
+        )?;
+        Ok((writer, started_receiver, release_sender))
+    }
+
+    #[cfg(test)]
+    fn stats_snapshot(&self) -> HetPmV2ObservationWriterStatsSnapshotV1 {
+        self.stats.snapshot()
+    }
+
+    fn counters_are_quiescent(&self) -> bool {
+        let stats = self.stats.snapshot();
+        let local_outcomes = stats.comparison_ready_for_enqueue
+            + stats.core_validation_skips
+            + stats.final_validation_skips
+            + stats.serialization_skips
+            + stats.payload_oversized_skips;
+        stats.comparison_attempts == local_outcomes
+            && stats.comparison_ready_for_enqueue == stats.enqueue_attempts
+            && stats.enqueue_attempts
+                == stats.enqueued + stats.queue_full_drops + stats.queue_closed_drops
+            && stats.enqueued
+                == stats.writes_succeeded + stats.writes_failed + stats.cancelled_before_write
+    }
+}
+
+impl Drop for HetPmV2ObservationWriterV1 {
+    fn drop(&mut self) {
+        self.sender.take();
+        #[cfg(test)]
+        self.stalled_receiver.take();
+        if let Some(worker) = self.worker.take() {
+            if worker.is_finished() {
+                if worker.join().is_err() {
+                    warn!("PostBuyGuardian: HET-PM V2 sidecar worker panicked during shutdown");
+                }
+            } else {
+                debug!(
+                    "PostBuyGuardian: HET-PM V2 sidecar worker detached on bounded shutdown; lifecycle remains fail-open"
+                );
+            }
+        }
+        self.health_sender.take();
+        if let Some(worker) = self.health_worker.take() {
+            if worker.is_finished() {
+                if worker.join().is_err() {
+                    warn!(
+                        "PostBuyGuardian: HET-PM V2 writer-health worker panicked during shutdown"
+                    );
+                }
+            } else {
+                debug!(
+                    "PostBuyGuardian: HET-PM V2 writer-health worker detached on bounded shutdown"
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HetComparisonWriteStatusV1 {
+    NotApplicable,
+    NotAttempted,
+    Written,
+    Skipped {
+        reason: TerminalV2ComparisonSkipReasonV1,
+        detail: String,
+    },
+    OutcomeUnknown {
+        reason: TerminalV2ComparisonOutcomeUnknownReasonV1,
+        detail: String,
+    },
+}
+
+impl HetComparisonWriteStatusV1 {
+    const fn as_label(&self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::NotAttempted => "not_attempted",
+            Self::Written => "written",
+            Self::Skipped { .. } => "skipped",
+            Self::OutcomeUnknown { .. } => "outcome_unknown",
+        }
+    }
+
+    const fn skip_reason(&self) -> Option<TerminalV2ComparisonSkipReasonV1> {
+        match self {
+            Self::Skipped { reason, .. } => Some(*reason),
+            Self::NotApplicable
+            | Self::NotAttempted
+            | Self::Written
+            | Self::OutcomeUnknown { .. } => None,
+        }
+    }
+
+    const fn outcome_unknown_reason(&self) -> Option<TerminalV2ComparisonOutcomeUnknownReasonV1> {
+        match self {
+            Self::OutcomeUnknown { reason, .. } => Some(*reason),
+            Self::NotApplicable | Self::NotAttempted | Self::Written | Self::Skipped { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -779,6 +1552,72 @@ impl TerminalCommitReceipt {
 struct ExecutableQuoteFailure {
     kind: ExecutableQuoteFailureKind,
     evidence: PriceTruthEvidence,
+}
+
+#[derive(Debug, Clone)]
+struct HetPmV2QuoteCell {
+    key: ExecutableQuoteKeyV2,
+    outcome: Result<ShadowExitTruth, ExecutableQuoteFailure>,
+}
+
+#[derive(Debug, Default)]
+struct HetPmV2QuotePlan {
+    cells: Vec<(ExecutableQuoteKeyV2, MarketSnapshot)>,
+}
+
+impl HetPmV2QuotePlan {
+    fn add(
+        &mut self,
+        mut key: ExecutableQuoteKeyV2,
+        sample: &MarketSnapshot,
+    ) -> ExecutableQuoteKeyV2 {
+        key.sample_slot = sample.slot;
+        key.sample_timestamp_ms = Some(sample.timestamp_ms);
+        if !self.cells.iter().any(|(existing, _)| existing == &key) {
+            if self.cells.len() >= HET_PM_V2_MAX_QUOTE_CELLS {
+                error!(
+                    quote_cell_count = self.cells.len(),
+                    "HET-PM V2 quote plan rejected a cell beyond its static bound"
+                );
+                return key;
+            }
+            self.cells.push((key.clone(), sample.clone()));
+        }
+        key
+    }
+
+    fn into_cells(self) -> Vec<(ExecutableQuoteKeyV2, MarketSnapshot)> {
+        self.cells
+    }
+}
+
+#[derive(Debug)]
+struct PreparedHetPmV2Tick {
+    comparison_core: PreparedV1V2ComparisonCoreV1,
+    quote_cells: Vec<HetPmV2QuoteCell>,
+    anchor_request: PeakAnchorPreQuoteDecisionV1,
+}
+
+struct HetPmV2TickInput<'a> {
+    bundle: &'a PostBuySnapshotBundle,
+    latest_snapshot: Option<&'a MarketSnapshot>,
+    raw_canonical_snapshot: Option<&'a MarketSnapshot>,
+    v1_prequote: &'a PreQuoteDecision,
+    crash_prequote: &'a CrashGuardPreQuoteDecision,
+    v1_policy: &'a EffectiveExitPolicyV1Config,
+    het_policy: &'a EffectiveHetPmV2Config,
+    now_ms: u64,
+}
+
+struct V1AuthorityTickInput<'a> {
+    snapshot: &'a PostBuyDecisionSnapshot,
+    latest_snapshot: Option<&'a MarketSnapshot>,
+    crash_evidence_snapshot: Option<&'a MarketSnapshot>,
+    authoritative_prequote: &'a PreQuoteDecision,
+    crash_prequote: &'a CrashGuardPreQuoteDecision,
+    pre_resolved_quotes: &'a [HetPmV2QuoteCell],
+    policy: &'a EffectiveExitPolicyV1Config,
+    now_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1094,6 +1933,18 @@ struct ShadowLifecycleRecord {
     source_snapshot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     action_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    het_pm_v2_comparison_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    het_pm_v2_writer_instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    het_pm_v2_source_snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    het_pm_v2_comparison_write_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    het_pm_v2_comparison_skip_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    het_pm_v2_comparison_outcome_unknown_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal_reason_v2: Option<TerminalReasonV2>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1533,11 +2384,23 @@ fn shadow_v2_pnl_bps_from_lifecycle(record: &ShadowLifecycleRecord) -> Option<i3
 /// - `positions` behind `RwLock` — read-heavy, write-rare.
 /// - `signal_tx` is `mpsc::Sender` (clone-safe).
 /// - `shadow_ledger` is `Arc<ShadowLedger>` (shared across system).
+#[derive(Debug, thiserror::Error)]
+pub enum MonitoringEngineConfigError {
+    #[error(transparent)]
+    ExitPolicyV1(#[from] ExitPolicyConfigError),
+    #[error(transparent)]
+    HetPmV2(#[from] HetPmV2ConfigError),
+    #[error("TimeStop V2 projection config could not be serialized for hashing")]
+    TimeStopV2ConfigHashSerialization,
+}
+
 pub struct MonitoringEngine {
     config: PostBuyGuardianConfig,
     shadow_ledger: Arc<ShadowLedger>,
     account_state_core: Option<Arc<AccountStateReducer>>,
     exit_policy_v1: Option<EffectiveExitPolicyV1Config>,
+    het_pm_v2: Option<EffectiveHetPmV2Config>,
+    time_stop_v2_config_hash: String,
     positions: Arc<RwLock<HashMap<Pubkey, MonitoredPosition>>>,
     signal_tx: mpsc::Sender<GuardianSignal>,
     /// Optional lane-aware position-management router.
@@ -1557,6 +2420,12 @@ pub struct MonitoringEngine {
     shadow_lifecycle_log_path: Option<PathBuf>,
     /// Compact research-only exit replay sidecar log.
     shadow_exit_replay_log_path: Option<PathBuf>,
+    /// Single bounded observe-only HET V2 comparison writer. Filesystem I/O
+    /// runs outside the Tokio authority task and never owns terminal truth.
+    het_pm_v2_observation_writer: Option<HetPmV2ObservationWriterV1>,
+    /// Preserves a typed startup failure when the optional writer thread could
+    /// not be created. V1 remains active and HET rows degrade to `Skipped`.
+    het_pm_v2_observation_writer_start_error: Option<String>,
     /// Optional Shadow V2 validation harness. Logging-only evidence sink; never consumed by policy.
     shadow_v2_validation_harness: Option<Arc<Mutex<ShadowV2ValidationHarness>>>,
     /// Passive replay trackers keyed by mint; independent from active position lifecycle.
@@ -1570,6 +2439,7 @@ impl MonitoringEngine {
     /// - `config` — Guardian-specific thresholds and intervals.
     /// - `shadow_ledger` — Shared ShadowLedger for market data.
     /// - `signal_tx` — Channel sender for emitting GuardianSignals.
+    #[cfg(test)]
     pub fn new(
         config: PostBuyGuardianConfig,
         shadow_ledger: Arc<ShadowLedger>,
@@ -1579,11 +2449,36 @@ impl MonitoringEngine {
             (Some(_), Some(_)) => EffectiveExitPolicyV1Config::from_guardian(&config).ok(),
             _ => None,
         };
+        let het_pm_v2 = EffectiveHetPmV2Config::from_guardian(&config).ok();
+        let time_stop_v2_config_hash = config
+            .time_stop_v2
+            .projection_config_hash()
+            .expect("TimeStop V2 test config must be serializable");
+        Self::from_effective_configs(
+            config,
+            shadow_ledger,
+            signal_tx,
+            exit_policy_v1,
+            het_pm_v2,
+            time_stop_v2_config_hash,
+        )
+    }
+
+    fn from_effective_configs(
+        config: PostBuyGuardianConfig,
+        shadow_ledger: Arc<ShadowLedger>,
+        signal_tx: mpsc::Sender<GuardianSignal>,
+        exit_policy_v1: Option<EffectiveExitPolicyV1Config>,
+        het_pm_v2: Option<EffectiveHetPmV2Config>,
+        time_stop_v2_config_hash: String,
+    ) -> Self {
         Self {
             config,
             shadow_ledger,
             account_state_core: None,
             exit_policy_v1,
+            het_pm_v2,
+            time_stop_v2_config_hash,
             positions: Arc::new(RwLock::new(HashMap::new())),
             signal_tx,
             position_router: None,
@@ -1594,6 +2489,8 @@ impl MonitoringEngine {
             event_emitter_secondary: None,
             shadow_lifecycle_log_path: None,
             shadow_exit_replay_log_path: None,
+            het_pm_v2_observation_writer: None,
+            het_pm_v2_observation_writer_start_error: None,
             shadow_v2_validation_harness: None,
             exit_replay_trackers: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -1605,17 +2502,33 @@ impl MonitoringEngine {
         config: PostBuyGuardianConfig,
         shadow_ledger: Arc<ShadowLedger>,
         signal_tx: mpsc::Sender<GuardianSignal>,
-    ) -> Result<Self, ExitPolicyConfigError> {
+    ) -> Result<Self, MonitoringEngineConfigError> {
         let exit_policy_v1 = EffectiveExitPolicyV1Config::from_guardian(&config)?;
-        let mut engine = Self::new(config, shadow_ledger, signal_tx);
-        engine.exit_policy_v1 = Some(exit_policy_v1);
-        Ok(engine)
+        let het_pm_v2 = EffectiveHetPmV2Config::from_guardian(&config)?;
+        let time_stop_v2_config_hash = config
+            .time_stop_v2
+            .projection_config_hash()
+            .map_err(|_| MonitoringEngineConfigError::TimeStopV2ConfigHashSerialization)?;
+        Ok(Self::from_effective_configs(
+            config,
+            shadow_ledger,
+            signal_tx,
+            Some(exit_policy_v1),
+            Some(het_pm_v2),
+            time_stop_v2_config_hash,
+        ))
     }
 
     pub fn exit_policy_v1_status(&self) -> Option<super::ExitPolicyV1Status> {
         self.exit_policy_v1
             .as_ref()
             .map(EffectiveExitPolicyV1Config::status)
+    }
+
+    pub fn het_pm_v2_status(&self) -> Option<HetPmV2Status> {
+        self.het_pm_v2
+            .as_ref()
+            .map(|policy| policy.status(self.config.exit_policy_v1.crash_guard_mode))
     }
 
     /// Attach the lane-aware position-management router shared with SignalRouter/AEM.
@@ -1688,7 +2601,93 @@ impl MonitoringEngine {
     }
 
     pub fn set_shadow_lifecycle_log_path(&mut self, shadow_lifecycle_log_path: Option<PathBuf>) {
+        let het_pm_v2_observation_log_path = shadow_lifecycle_log_path.as_ref().map(|path| {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("het_pm_v2_observations_v1.jsonl")
+        });
+        self.set_het_pm_v2_observation_log_path(het_pm_v2_observation_log_path);
         self.shadow_lifecycle_log_path = shadow_lifecycle_log_path;
+    }
+
+    /// Configure the probe lifecycle sink without constructing a second HET
+    /// sidecar worker. The primary shadow monitor remains the sole producer.
+    pub fn set_shadow_lifecycle_log_path_without_het_pm_v2_sidecar(
+        &mut self,
+        shadow_lifecycle_log_path: Option<PathBuf>,
+    ) {
+        self.set_het_pm_v2_observation_log_path(None);
+        self.shadow_lifecycle_log_path = shadow_lifecycle_log_path;
+    }
+
+    pub fn set_het_pm_v2_observation_log_path(&mut self, path: Option<PathBuf>) {
+        self.het_pm_v2_observation_writer = None;
+        self.het_pm_v2_observation_writer_start_error = None;
+        let Some(path) = path else {
+            return;
+        };
+        let Some(policy) = self.het_pm_v2.as_ref().filter(|policy| policy.enabled()) else {
+            return;
+        };
+        match HetPmV2ObservationWriterV1::spawn(
+            path.clone(),
+            policy.config_hash().to_string(),
+            policy.writer_queue_capacity(),
+        ) {
+            Ok(writer) => {
+                self.het_pm_v2_observation_writer = Some(writer);
+            }
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "PostBuyGuardian: HET-PM V2 sidecar worker could not start; V1 remains active"
+                );
+                self.het_pm_v2_observation_writer_start_error = Some(error.to_string());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_stalled_het_pm_v2_observation_writer(&mut self, queue_capacity: usize) {
+        let policy_config_hash = self
+            .het_pm_v2
+            .as_ref()
+            .map(|policy| policy.config_hash().to_string())
+            .unwrap_or_else(|| "het-pm-v2-test-config-unavailable".to_string());
+        self.het_pm_v2_observation_writer = Some(HetPmV2ObservationWriterV1::stalled(
+            queue_capacity,
+            policy_config_hash,
+        ));
+        self.het_pm_v2_observation_writer_start_error = None;
+    }
+
+    #[cfg(test)]
+    fn set_controlled_het_pm_v2_observation_writer(
+        &mut self,
+        path: PathBuf,
+        queue_capacity: usize,
+    ) -> (StdReceiver<()>, SyncSender<()>) {
+        let policy_config_hash = self
+            .het_pm_v2
+            .as_ref()
+            .map(|policy| policy.config_hash().to_string())
+            .unwrap_or_else(|| "het-pm-v2-test-config-unavailable".to_string());
+        let (writer, started, release) =
+            HetPmV2ObservationWriterV1::controlled(path, policy_config_hash, queue_capacity)
+                .expect("controlled HET-PM V2 writer");
+        self.het_pm_v2_observation_writer = Some(writer);
+        self.het_pm_v2_observation_writer_start_error = None;
+        (started, release)
+    }
+
+    #[cfg(test)]
+    fn het_pm_v2_observation_writer_stats(
+        &self,
+    ) -> Option<HetPmV2ObservationWriterStatsSnapshotV1> {
+        self.het_pm_v2_observation_writer
+            .as_ref()
+            .map(HetPmV2ObservationWriterV1::stats_snapshot)
     }
 
     pub fn set_shadow_exit_replay_log_path(
@@ -1773,6 +2772,13 @@ impl MonitoringEngine {
             .max(self.config.signal_aggregation_window_ms.saturating_mul(2))
             .max(self.config.aem.derived_time_windows().outcome_horizon_ms)
             .max(self.shadow_position_time_stop_ms())
+            .max(
+                self.het_pm_v2
+                    .as_ref()
+                    .filter(|policy| policy.enabled())
+                    .map(EffectiveHetPmV2Config::trajectory_long_ms)
+                    .unwrap_or(0),
+            )
             .saturating_add(self.config.tick_interval_ms.saturating_mul(2))
     }
 
@@ -2028,22 +3034,77 @@ impl MonitoringEngine {
             .cloned()
     }
 
-    fn materialize_post_buy_decision_snapshot(
+    fn materialize_post_buy_snapshot_bundle(
         &self,
         base_mint: &Pubkey,
         now_ms: u64,
     ) -> Option<(
-        PostBuyDecisionSnapshot,
+        PostBuySnapshotBundle,
         Option<MarketSnapshot>,
         Option<MarketSnapshot>,
     )> {
         let policy = self.exit_policy_v1.as_ref()?;
+        let het_policy = self.het_pm_v2.as_ref()?;
         let positions = self.positions.read();
         let pos = positions.get(base_mint)?;
         if !matches!(pos.lane, Lane::Shadow) {
             return None;
         }
+        let (snapshot, latest_snapshot, crash_evidence_snapshot) =
+            self.materialize_post_buy_base_from_position(pos, now_ms, policy);
+        let trajectory = materialize_trajectory_v1(
+            &pos.snapshot_timeline.snapshots,
+            now_ms,
+            self.config.tick_interval_ms,
+            het_policy.trajectory_short_ms(),
+            het_policy.trajectory_medium_ms(),
+            het_policy.trajectory_long_ms(),
+            het_policy.max_newest_sample_age_ms(),
+        );
+        let time_stop_projection = pos
+            .time_stop_v2
+            .project(now_ms, self.config.time_stop_v2.window_ms());
+        let vitality = VitalityFeaturesV1::from(&time_stop_projection);
+        let (entry_value_quote_raw, entry_value_source, entry_value_authoritative_for_shadow) =
+            build_entry_value_contract(
+                pos.entry_size_lamports,
+                pos.entry_price_sol,
+                pos.entry_token_amount_raw,
+            );
+        let extras = PostBuyDecisionExtrasV2 {
+            run_id: pos
+                .join_metadata
+                .run_id
+                .clone()
+                .unwrap_or_else(|| "unknown_run".to_string()),
+            trajectory,
+            vitality,
+            route_status: pos.het_route_status,
+            executable_peak_anchor: pos.het_executable_peak_anchor.clone(),
+            entry_value_quote_raw,
+            entry_value_source,
+            entry_value_authoritative_for_shadow,
+        };
+        Some((
+            PostBuySnapshotBundle {
+                base: snapshot,
+                v2: extras,
+            },
+            latest_snapshot,
+            crash_evidence_snapshot,
+        ))
+    }
 
+    fn materialize_post_buy_base_from_position(
+        &self,
+        pos: &MonitoredPosition,
+        now_ms: u64,
+        policy: &EffectiveExitPolicyV1Config,
+    ) -> (
+        PostBuyDecisionSnapshot,
+        Option<MarketSnapshot>,
+        Option<MarketSnapshot>,
+    ) {
         let latest_snapshot = pos.last_shadow_snapshot.clone();
         let (mark_price_sol, mut mark_evidence_status, sample_slot, sample_timestamp_ms) =
             match latest_snapshot.as_ref() {
@@ -2114,7 +3175,8 @@ impl MonitoringEngine {
             sample_timestamp_ms,
         );
         let crash_vector = Self::materialize_crash_vector(pos, now_ms, policy);
-        let crash_evidence_snapshot = Self::crash_evidence_snapshot(pos, &crash_vector);
+        let crash_evidence_snapshot = Self::crash_evidence_snapshot(pos, &crash_vector)
+            .or_else(|| pos.snapshot_timeline.latest().cloned());
         let snapshot = PostBuyDecisionSnapshot::new(
             guard,
             pos.lane,
@@ -2140,7 +3202,25 @@ impl MonitoringEngine {
             pos.pending_exit_proposal.is_some(),
             policy.config_hash().to_string(),
         );
-        Some((snapshot, latest_snapshot, crash_evidence_snapshot))
+        (snapshot, latest_snapshot, crash_evidence_snapshot)
+    }
+
+    fn materialize_post_buy_decision_snapshot(
+        &self,
+        base_mint: &Pubkey,
+        now_ms: u64,
+    ) -> Option<(
+        PostBuyDecisionSnapshot,
+        Option<MarketSnapshot>,
+        Option<MarketSnapshot>,
+    )> {
+        let policy = self.exit_policy_v1.as_ref()?;
+        let positions = self.positions.read();
+        let pos = positions.get(base_mint)?;
+        if !matches!(pos.lane, Lane::Shadow) {
+            return None;
+        }
+        Some(self.materialize_post_buy_base_from_position(pos, now_ms, policy))
     }
 
     fn validate_snapshot_guard(
@@ -2579,6 +3659,15 @@ impl MonitoringEngine {
         let max_snapshots = self.snapshot_history_max_snapshots();
         let mut positions = self.positions.write();
         let pos = positions.get_mut(base_mint)?;
+        pos.het_route_status = match canonical_state.state_phase {
+            StatePhase::Canonical if !canonical_state.is_complete => {
+                RouteStatusV1::PumpCurveSupported
+            }
+            StatePhase::Canonical | StatePhase::Migrated => {
+                RouteStatusV1::CurveCompletePumpSwapUnsupported
+            }
+            StatePhase::Bootstrap | StatePhase::PendingConfirmation => RouteStatusV1::Unknown,
+        };
         pos.snapshot_timeline
             .ingest_canonical_state(&canonical_state, max_snapshots, retention_ms);
         let timeline = pos.snapshot_timeline.clone_snapshots();
@@ -2637,6 +3726,265 @@ impl MonitoringEngine {
         serde_json::to_writer(&mut file, value)?;
         file.write_all(b"\n")?;
         file.flush()
+    }
+
+    fn append_prepared_jsonl_bytes(path: &Path, encoded: &[u8]) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(encoded)?;
+        file.write_all(b"\n")?;
+        file.flush()
+    }
+
+    fn write_het_pm_v2_writer_health(
+        path: &Path,
+        record: &HetPmV2WriterHealthRecordV1,
+    ) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let encoded = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+        let temporary_path = path.with_extension("json.tmp");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary_path)?;
+        file.write_all(&encoded)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        drop(file);
+        std::fs::rename(temporary_path, path)
+    }
+
+    fn het_pm_v2_writer_instance_id_for_record(&self) -> String {
+        self.het_pm_v2_observation_writer
+            .as_ref()
+            .map(HetPmV2ObservationWriterV1::writer_instance_id)
+            .unwrap_or("writer_unavailable")
+            .to_string()
+    }
+
+    fn record_het_pm_v2_comparison_core_outcome(&self, core: &PreparedV1V2ComparisonCoreV1) {
+        if let Some(writer) = self.het_pm_v2_observation_writer.as_ref() {
+            writer.record_comparison_core_outcome(core);
+        }
+    }
+
+    fn record_het_pm_v2_comparison_final_outcome(&self, prepared: &PreparedHetComparisonV1) {
+        if let Some(writer) = self.het_pm_v2_observation_writer.as_ref() {
+            writer.record_comparison_final_outcome(prepared);
+        }
+    }
+
+    fn enqueue_prepared_het_pm_v2_comparison(
+        &self,
+        prepared: &PreparedHetComparisonV1,
+        acknowledgement: Option<oneshot::Sender<Result<(), String>>>,
+    ) -> Result<Arc<HetPmV2ObservationJobControlV1>, HetComparisonWriteStatusV1> {
+        let correlation = prepared.correlation();
+        let encoded = match prepared {
+            PreparedHetComparisonV1::Ready { encoded, .. } => encoded,
+            PreparedHetComparisonV1::Skipped { reason, detail, .. } => {
+                warn!(
+                    comparison_id = %correlation.comparison_id,
+                    source_snapshot_id = %correlation.source_snapshot_id,
+                    reason = reason.as_label(),
+                    detail,
+                    "PostBuyGuardian: HET-PM V2 comparison locally degraded to typed Skipped"
+                );
+                return Err(HetComparisonWriteStatusV1::Skipped {
+                    reason: *reason,
+                    detail: detail.clone(),
+                });
+            }
+        };
+        let Some(writer) = self.het_pm_v2_observation_writer.as_ref() else {
+            let (reason, detail) = self
+                .het_pm_v2_observation_writer_start_error
+                .as_ref()
+                .map(|detail| {
+                    (
+                        TerminalV2ComparisonSkipReasonV1::WriterUnavailable,
+                        detail.clone(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        TerminalV2ComparisonSkipReasonV1::WriterNotConfigured,
+                        "het_pm_v2_observation_writer_missing".to_string(),
+                    )
+                });
+            debug!(
+                comparison_id = %correlation.comparison_id,
+                source_snapshot_id = %correlation.source_snapshot_id,
+                reason = reason.as_label(),
+                "PostBuyGuardian: HET-PM V2 sidecar unavailable; V1 remains unaffected"
+            );
+            return Err(HetComparisonWriteStatusV1::Skipped { reason, detail });
+        };
+        match writer.try_enqueue(correlation.clone(), encoded.clone(), acknowledgement) {
+            Ok(control) => Ok(control),
+            Err(HetPmV2ObservationEnqueueErrorV1::Full) => {
+                warn!(
+                    comparison_id = %correlation.comparison_id,
+                    source_snapshot_id = %correlation.source_snapshot_id,
+                    reason = TerminalV2ComparisonSkipReasonV1::WriterQueueFull.as_label(),
+                    "PostBuyGuardian: bounded HET-PM V2 sidecar queue is full; observer row dropped"
+                );
+                Err(HetComparisonWriteStatusV1::Skipped {
+                    reason: TerminalV2ComparisonSkipReasonV1::WriterQueueFull,
+                    detail: "het_pm_v2_observation_writer_queue_full".to_string(),
+                })
+            }
+            Err(HetPmV2ObservationEnqueueErrorV1::Closed) => {
+                warn!(
+                    comparison_id = %correlation.comparison_id,
+                    source_snapshot_id = %correlation.source_snapshot_id,
+                    reason = TerminalV2ComparisonSkipReasonV1::WriterQueueClosed.as_label(),
+                    "PostBuyGuardian: HET-PM V2 sidecar queue is closed; observer row dropped"
+                );
+                Err(HetComparisonWriteStatusV1::Skipped {
+                    reason: TerminalV2ComparisonSkipReasonV1::WriterQueueClosed,
+                    detail: "het_pm_v2_observation_writer_queue_closed".to_string(),
+                })
+            }
+        }
+    }
+
+    fn enqueue_nonterminal_het_pm_v2_comparison(&self, prepared: &PreparedHetComparisonV1) {
+        if let Err(status) = self.enqueue_prepared_het_pm_v2_comparison(prepared, None) {
+            debug!(
+                comparison_id = %prepared.correlation().comparison_id,
+                source_snapshot_id = %prepared.correlation().source_snapshot_id,
+                write_status = status.as_label(),
+                skip_reason = status.skip_reason().map(TerminalV2ComparisonSkipReasonV1::as_label),
+                "PostBuyGuardian: nonterminal HET-PM V2 observation dropped without delaying V1"
+            );
+        }
+    }
+
+    async fn persist_terminal_het_pm_v2_comparison(
+        &self,
+        prepared: &PreparedHetComparisonV1,
+    ) -> HetComparisonWriteStatusV1 {
+        let (acknowledgement, receiver) = oneshot::channel();
+        let control =
+            match self.enqueue_prepared_het_pm_v2_comparison(prepared, Some(acknowledgement)) {
+                Ok(control) => control,
+                Err(status) => return status,
+            };
+        let budget_ms = self
+            .het_pm_v2
+            .as_ref()
+            .map(EffectiveHetPmV2Config::terminal_write_budget_ms)
+            .unwrap_or(1);
+        match tokio::time::timeout(Duration::from_millis(budget_ms), receiver).await {
+            Ok(Ok(Ok(()))) => HetComparisonWriteStatusV1::Written,
+            Ok(Ok(Err(detail))) => HetComparisonWriteStatusV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::WriterIoFailed,
+                detail,
+            },
+            Ok(Err(error)) => self.terminal_status_after_writer_ack_loss(
+                &control,
+                false,
+                format!("writer_ack_channel_closed:{error}"),
+            ),
+            Err(_) => self.terminal_status_after_writer_ack_loss(
+                &control,
+                true,
+                format!("terminal_het_write_budget_exhausted:{budget_ms}ms"),
+            ),
+        }
+    }
+
+    fn terminal_status_after_writer_ack_loss(
+        &self,
+        control: &HetPmV2ObservationJobControlV1,
+        timed_out: bool,
+        detail: String,
+    ) -> HetComparisonWriteStatusV1 {
+        let writer = self.het_pm_v2_observation_writer.as_ref();
+        if timed_out {
+            if let Some(writer) = writer {
+                writer
+                    .stats
+                    .terminal_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                writer.notify_health();
+            }
+        }
+        match control.cancel_before_write() {
+            Ok(()) => {
+                if let Some(writer) = writer {
+                    writer
+                        .stats
+                        .cancelled_before_write
+                        .fetch_add(1, Ordering::Relaxed);
+                    writer.notify_health();
+                }
+                HetComparisonWriteStatusV1::Skipped {
+                    reason: if timed_out {
+                        TerminalV2ComparisonSkipReasonV1::WriterTimedOutBeforeWrite
+                    } else {
+                        TerminalV2ComparisonSkipReasonV1::WriterQueueClosed
+                    },
+                    detail,
+                }
+            }
+            Err(HetPmV2ObservationJobStateV1::Written) => HetComparisonWriteStatusV1::Written,
+            Err(HetPmV2ObservationJobStateV1::Failed) => HetComparisonWriteStatusV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::WriterIoFailed,
+                detail: format!("writer_failed_before_ack_observed:{detail}"),
+            },
+            Err(HetPmV2ObservationJobStateV1::CancelledBeforeWrite) => {
+                HetComparisonWriteStatusV1::Skipped {
+                    reason: if timed_out {
+                        TerminalV2ComparisonSkipReasonV1::WriterTimedOutBeforeWrite
+                    } else {
+                        TerminalV2ComparisonSkipReasonV1::WriterQueueClosed
+                    },
+                    detail,
+                }
+            }
+            Err(HetPmV2ObservationJobStateV1::Writing) => {
+                if let Some(writer) = writer {
+                    writer
+                        .stats
+                        .terminal_outcome_unknown
+                        .fetch_add(1, Ordering::Relaxed);
+                    writer.notify_health();
+                }
+                warn!(
+                    timed_out,
+                    detail,
+                    "PostBuyGuardian: terminal HET-PM V2 writer outcome is unknown; canonical terminal flow continues"
+                );
+                HetComparisonWriteStatusV1::OutcomeUnknown {
+                    reason: if timed_out {
+                        TerminalV2ComparisonOutcomeUnknownReasonV1::WriterAckTimedOut
+                    } else {
+                        TerminalV2ComparisonOutcomeUnknownReasonV1::WriterAckChannelClosed
+                    },
+                    detail,
+                }
+            }
+            Err(HetPmV2ObservationJobStateV1::Queued) => {
+                if let Some(writer) = writer {
+                    writer
+                        .stats
+                        .terminal_outcome_unknown
+                        .fetch_add(1, Ordering::Relaxed);
+                    writer.notify_health();
+                }
+                HetComparisonWriteStatusV1::OutcomeUnknown {
+                    reason: TerminalV2ComparisonOutcomeUnknownReasonV1::WriterAckChannelClosed,
+                    detail: format!("queued_state_cancellation_race:{detail}"),
+                }
+            }
+        }
     }
 
     fn executable_dynamic_exit_sidecar_settings(
@@ -3471,6 +4819,44 @@ impl MonitoringEngine {
         envelope.measurement_grade = MeasurementGrade::MarkPriceReplay;
         envelope.quality = "TERMINAL_TRUTH_DERIVED_FROM_LEGACY_LIFECYCLE".to_string();
         envelope.source_refs.push(terminal_source.replace('.', ":"));
+        if let Some(comparison_id) = record.het_pm_v2_comparison_id.as_deref() {
+            envelope
+                .source_refs
+                .push(format!("het_pm_v2:comparison_id:{comparison_id}"));
+            if let Some(writer_instance_id) = record.het_pm_v2_writer_instance_id.as_deref() {
+                envelope
+                    .source_refs
+                    .push(format!("het_pm_v2:writer_instance_id:{writer_instance_id}"));
+            }
+            if let Some(snapshot_id) = record.het_pm_v2_source_snapshot_id.as_deref() {
+                envelope
+                    .source_refs
+                    .push(format!("het_pm_v2:source_snapshot_id:{snapshot_id}"));
+            }
+            if let Some(action_id) = record.action_id.as_deref() {
+                envelope
+                    .source_refs
+                    .push(format!("het_pm_v2:v1_action_id:{action_id}"));
+            }
+            if let Some(status) = record.het_pm_v2_comparison_write_status.as_deref() {
+                envelope
+                    .source_refs
+                    .push(format!("het_pm_v2:comparison_write_status:{status}"));
+            }
+            if let Some(reason) = record.het_pm_v2_comparison_skip_reason.as_deref() {
+                envelope
+                    .source_refs
+                    .push(format!("het_pm_v2:comparison_skip_reason:{reason}"));
+            }
+            if let Some(reason) = record
+                .het_pm_v2_comparison_outcome_unknown_reason
+                .as_deref()
+            {
+                envelope.source_refs.push(format!(
+                    "het_pm_v2:comparison_outcome_unknown_reason:{reason}"
+                ));
+            }
+        }
         envelope
             .limitations
             .push("TERMINAL_TRUTH_MARK_PATH_ONLY_NOT_EXECUTABLE_FILL".to_string());
@@ -3810,6 +5196,59 @@ impl MonitoringEngine {
         self.flush_due_exit_replay_trackers(now_ms, Some(REASON_SHUTDOWN_BEFORE_HORIZON));
     }
 
+    /// Finalizes the independent HET-PM V2 writer-health denominator without
+    /// putting filesystem I/O back on an authority tick or terminal path.
+    /// A timeout leaves `shutdown_complete=false`, forcing offline coverage to
+    /// degrade to unknown instead of claiming complete evidence.
+    pub async fn flush_het_pm_v2_writer_health_for_shutdown(&self) {
+        let Some(writer) = self.het_pm_v2_observation_writer.as_ref() else {
+            return;
+        };
+        let Some(path) = writer.health_path.clone() else {
+            return;
+        };
+        let budget = Duration::from_millis(HET_PM_V2_WRITER_HEALTH_SHUTDOWN_BUDGET_MS);
+        let deadline = tokio::time::Instant::now() + budget;
+        while !writer.counters_are_quiescent() {
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    path = %path.display(),
+                    budget_ms = HET_PM_V2_WRITER_HEALTH_SHUTDOWN_BUDGET_MS,
+                    "PostBuyGuardian: HET-PM V2 writer-health shutdown drain timed out; coverage remains unknown"
+                );
+                writer.notify_health();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        writer
+            .health_context
+            .shutdown_complete
+            .store(true, Ordering::Release);
+        writer.health_context.mark_changed();
+        let context = Arc::clone(&writer.health_context);
+        let write_lock = Arc::clone(&writer.health_write_lock);
+        let write = tokio::task::spawn_blocking(move || {
+            HetPmV2ObservationWriterV1::persist_health_snapshot(&path, &context, &write_lock)
+        });
+        match tokio::time::timeout(budget, write).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => warn!(
+                error = %error,
+                "PostBuyGuardian: final HET-PM V2 writer-health snapshot failed; coverage remains unknown"
+            ),
+            Ok(Err(error)) => warn!(
+                error = %error,
+                "PostBuyGuardian: final HET-PM V2 writer-health task failed; coverage remains unknown"
+            ),
+            Err(_) => warn!(
+                budget_ms = HET_PM_V2_WRITER_HEALTH_SHUTDOWN_BUDGET_MS,
+                "PostBuyGuardian: final HET-PM V2 writer-health snapshot timed out; coverage remains unknown"
+            ),
+        }
+    }
+
     fn time_stop_v2_evidence(
         source: PriceTruthSource,
         latest: Option<&MarketSnapshot>,
@@ -3977,6 +5416,12 @@ impl MonitoringEngine {
                 .as_ref()
                 .map(|proposal| proposal.action_id.clone())
                 .or_else(|| pos.last_applied_action_id.clone()),
+            het_pm_v2_comparison_id: None,
+            het_pm_v2_writer_instance_id: None,
+            het_pm_v2_source_snapshot_id: None,
+            het_pm_v2_comparison_write_status: None,
+            het_pm_v2_comparison_skip_reason: None,
+            het_pm_v2_comparison_outcome_unknown_reason: None,
             terminal_reason_v2: None,
             exit_policy_reason_code: pos.last_force_exit_reason_code.clone(),
             terminal_disposition: None,
@@ -4518,6 +5963,12 @@ impl MonitoringEngine {
             shadow_market_activity,
             time_stop_v2,
             snapshot_timeline,
+            // Absence of route truth is not evidence of PumpCurve support.
+            // Canonical AccountStateCore refresh is the only producer allowed
+            // to promote this value out of Unknown.
+            het_route_status: RouteStatusV1::Unknown,
+            het_executable_peak_anchor: None,
+            het_next_anchor_seq: 1,
         };
 
         let exit_replay_tracker = self.build_exit_replay_tracker(&position);
@@ -5973,7 +7424,380 @@ impl MonitoringEngine {
             })
     }
 
+    fn prepare_het_pm_v2_tick(&self, input: HetPmV2TickInput<'_>) -> PreparedHetPmV2Tick {
+        let HetPmV2TickInput {
+            bundle,
+            latest_snapshot,
+            raw_canonical_snapshot,
+            v1_prequote,
+            crash_prequote,
+            v1_policy,
+            het_policy,
+            now_ms,
+        } = input;
+        let view = bundle.view();
+        let v2_prequote =
+            ExitPolicyV2::evaluate_prequote(view, v1_prequote, crash_prequote, het_policy);
+        let anchor_request = ExitPolicyV2::evaluate_anchor_request(view, now_ms, het_policy);
+
+        let mut quote_plan = HetPmV2QuotePlan::default();
+
+        let baseline_quote_required = matches!(v1_prequote, PreQuoteDecision::QuoteRequired { .. });
+        let crash_quote_required = matches!(
+            crash_prequote,
+            CrashGuardPreQuoteDecision::QuoteRequired { .. }
+        );
+        if baseline_quote_required || crash_quote_required {
+            let crash_is_authoritative = crash_quote_required
+                && matches!(
+                    v1_policy.crash_guard_mode(),
+                    CrashGuardMode::AuthoritativeShadow
+                );
+            let source = if crash_is_authoritative || !baseline_quote_required {
+                raw_canonical_snapshot.or(latest_snapshot)
+            } else {
+                latest_snapshot.or(raw_canonical_snapshot)
+            };
+            if let Some(source) = source {
+                let _ = quote_plan.add(ExecutableQuoteKeyV2::from_view(view), source);
+            }
+        }
+
+        let v2_quote_required = matches!(v2_prequote.candidate, HetPmCandidateV2::QuoteRequired(_));
+        let anchor_quote_required = matches!(
+            anchor_request,
+            PeakAnchorPreQuoteDecisionV1::QuoteRequired { .. }
+        );
+        if v2_quote_required || anchor_quote_required {
+            if let Some(source) = raw_canonical_snapshot.or(latest_snapshot) {
+                let _ = quote_plan.add(ExecutableQuoteKeyV2::from_view(view), source);
+            }
+        }
+
+        let planned_cells = quote_plan.into_cells();
+        let mut quote_cells = Vec::with_capacity(planned_cells.len());
+        let mut quote_keys = Vec::with_capacity(planned_cells.len());
+        let mut quote_statuses = Vec::with_capacity(planned_cells.len());
+        for (key, source) in planned_cells {
+            quote_keys.push(key.stable_label());
+            let evidence_source = bundle.base.mark_source();
+            let outcome = self.resolve_shadow_exit_truth_for_policy(
+                &bundle.base,
+                Some(&source),
+                key.remaining_quantity_raw,
+                now_ms,
+                evidence_source,
+            );
+            match &outcome {
+                Ok(_) => quote_statuses.push("resolved".to_string()),
+                Err(failure) => quote_statuses.push(format!("blocked:{:?}", failure.kind)),
+            }
+            quote_cells.push(HetPmV2QuoteCell { key, outcome });
+        }
+
+        let raw_key = raw_canonical_snapshot.or(latest_snapshot).map(|source| {
+            let mut key = ExecutableQuoteKeyV2::from_view(view);
+            key.sample_slot = source.slot;
+            key.sample_timestamp_ms = Some(source.timestamp_ms);
+            key
+        });
+        let v2_cell = raw_key
+            .as_ref()
+            .and_then(|key| quote_cells.iter().find(|cell| &cell.key == key));
+        let v2_truth = v2_cell.and_then(|cell| cell.outcome.as_ref().ok());
+        let v2_quote = v2_truth.map(|truth| {
+            ExecutableExitQuote::new(
+                truth.exit_token_amount_raw,
+                truth.exit_price_sol,
+                truth.exit_value_sol,
+                truth.gross_pnl_sol,
+                truth.pnl_pct,
+            )
+        });
+        let v2_quote_evidence = v2_truth.map(|truth| {
+            QuoteEvidenceRevisionV1::new(
+                truth.evidence.slot,
+                truth.evidence.timestamp_ms,
+                truth.evidence.age_ms,
+            )
+        });
+        let v2_crash_requirement = matches!(
+            v2_prequote.candidate,
+            HetPmCandidateV2::QuoteRequired(super::exit_policy_v2::HetPmExitReasonV2::Crash)
+        )
+        .then(|| ExitPolicyV1::crash_guard_quote_requirement(&bundle.base))
+        .flatten();
+        let v2_final = ExitPolicyV2::finalize_with_quote(
+            view,
+            &v2_prequote,
+            HetPmQuoteFinalizationInputV2 {
+                quote: v2_quote.as_ref(),
+                quote_key: v2_truth.and(v2_cell).map(|cell| &cell.key),
+                quote_evidence: v2_quote_evidence,
+                crash_requirement: v2_crash_requirement.as_ref(),
+            },
+            v1_policy,
+            het_policy,
+        );
+        let v2_crash_quote_decision = match &v2_final {
+            HetPmFinalDecisionV2::ExitAll {
+                reason: super::exit_policy_v2::HetPmExitReasonV2::Crash,
+                ..
+            } => Some(CrashGuardQuoteDecision::Confirmed),
+            HetPmFinalDecisionV2::CrashRejectedByQuote { reason } => {
+                Some(CrashGuardQuoteDecision::RejectedByQuote { reason: *reason })
+            }
+            HetPmFinalDecisionV2::CrashBlockedByData => {
+                Some(CrashGuardQuoteDecision::BlockedByData)
+            }
+            _ => None,
+        };
+        let current_executable_value_sol = v2_truth.map(|truth| truth.exit_value_sol);
+        let current_executable_gross_return_bps = v2_truth.map(|truth| {
+            (truth.pnl_pct * 100.0)
+                .round()
+                .clamp(i32::MIN as f64, i32::MAX as f64) as i32
+        });
+        let known_estimated_costs_sol = v2_truth.map(|truth| truth.estimated_costs_sol);
+
+        let anchor_request_label = match &anchor_request {
+            PeakAnchorPreQuoteDecisionV1::NoChange => None,
+            PeakAnchorPreQuoteDecisionV1::QuoteRequired { .. } => {
+                Some("quote_required_on_new_canonical_peak".to_string())
+            }
+            PeakAnchorPreQuoteDecisionV1::Blocked { reason } => Some(format!("blocked:{reason:?}")),
+        };
+
+        let comparison_identity_material = format!(
+            "{}:{}:{}:{}:{}",
+            bundle.base.guard().position_id(),
+            bundle.base.guard().position_epoch(),
+            bundle.base.guard().state_revision(),
+            bundle.base.snapshot_id(),
+            now_ms
+        );
+        let comparison_id = format!(
+            "het_pm_v2:{}",
+            blake3::hash(comparison_identity_material.as_bytes()).to_hex()
+        );
+        let writer_instance_id = self.het_pm_v2_writer_instance_id_for_record();
+        let record = V1V2ComparisonRecord {
+            schema_version: HET_PM_V2_SCHEMA_VERSION,
+            comparison_id,
+            policy_id: HET_PM_V2_POLICY_ID.to_string(),
+            policy_version: HET_PM_V2_POLICY_VERSION,
+            policy_config_hash: het_policy.config_hash().to_string(),
+            v1_policy_id: v1_policy.policy_id().to_string(),
+            v1_policy_version: v1_policy.policy_version(),
+            v1_policy_config_hash: v1_policy.config_hash().to_string(),
+            time_stop_v2_config_hash: self.time_stop_v2_config_hash.clone(),
+            run_id: bundle.v2.run_id.clone(),
+            writer_instance_id,
+            lane: bundle.base.lane(),
+            position_id: bundle.base.guard().position_id().to_string(),
+            position_epoch: bundle.base.guard().position_epoch(),
+            state_revision: bundle.base.guard().state_revision(),
+            remaining_quantity_raw: bundle.base.remaining_token_amount_raw(),
+            snapshot_id: bundle.base.snapshot_id().to_string(),
+            observation_timestamp_ms: now_ms,
+            terminal_tick: false,
+            trajectory_sampling_mode: HET_PM_V2_SAMPLING_MODE.to_string(),
+            trajectory_measurement_grade: HET_PM_V2_TRAJECTORY_GRADE.to_string(),
+            monitor_tick_ms: self.config.tick_interval_ms,
+            v1_prequote: prequote_label(v1_prequote),
+            v1_crash_prequote: format!("{crash_prequote:?}"),
+            v1_final: None,
+            v1_authority_receipt: None,
+            v2_prequote: format!("{:?}", v2_prequote.candidate),
+            v2_final: Some(format!("{v2_final:?}")),
+            v2_crash_quote_decision,
+            v2_winning_gate: v2_prequote.winning_gate,
+            v2_suppressed_gates_mask: v2_prequote.suppressed_gates_mask,
+            consumed_by_policy: false,
+            v1_shadow_authority: true,
+            v2_shadow_authority: false,
+            live_authority: false,
+            v2_economic_mutation: false,
+            v2_proposal_created: false,
+            v2_time_stop_mutation: false,
+            duplicate_action_observed: false,
+            route_build_authority_changed: false,
+            terminal_isolation_violation: false,
+            trajectory: bundle.v2.trajectory.clone(),
+            vitality: bundle.v2.vitality.clone(),
+            route_status: bundle.v2.route_status,
+            entry_value_quote_raw: bundle.v2.entry_value_quote_raw,
+            entry_value_source: bundle.v2.entry_value_source,
+            entry_value_authoritative_for_shadow: bundle.v2.entry_value_authoritative_for_shadow,
+            anchor_before: bundle.v2.executable_peak_anchor.clone(),
+            anchor_request: anchor_request_label,
+            anchor_applied: false,
+            quote_keys,
+            quote_resolution_count: quote_statuses.len() as u8,
+            quote_statuses,
+            current_executable_value_sol,
+            current_executable_gross_return_bps,
+            known_estimated_costs_sol,
+        };
+
+        let comparison_core = PreparedV1V2ComparisonCoreV1::prepare(record);
+        self.record_het_pm_v2_comparison_core_outcome(&comparison_core);
+
+        PreparedHetPmV2Tick {
+            comparison_core,
+            quote_cells,
+            anchor_request,
+        }
+    }
+
+    fn apply_het_pm_v2_anchor_after_v1(
+        &self,
+        base_mint: &Pubkey,
+        request: &PeakAnchorPreQuoteDecisionV1,
+        quote_cells: &[HetPmV2QuoteCell],
+        entry_value_quote_raw: Option<u64>,
+        policy_config_hash: &str,
+        now_ms: u64,
+    ) -> bool {
+        let PeakAnchorPreQuoteDecisionV1::QuoteRequired { key, .. } = request else {
+            return false;
+        };
+        let Some(cell) = quote_cells.iter().find(|cell| &cell.key == key) else {
+            return false;
+        };
+        let Ok(truth) = &cell.outcome else {
+            return false;
+        };
+        let quote = ExecutableExitQuote::new(
+            truth.exit_token_amount_raw,
+            truth.exit_price_sol,
+            truth.exit_value_sol,
+            truth.gross_pnl_sol,
+            truth.pnl_pct,
+        );
+        let mut positions = self.positions.write();
+        let Some(pos) = positions.get_mut(base_mint) else {
+            return false;
+        };
+        if pos.position_id != key.position_id
+            || pos.position_epoch != key.position_epoch
+            || pos.state_revision != key.state_revision
+            || pos.remaining_token_amount_raw != key.remaining_quantity_raw
+            || pos.last_shadow_outcome.is_some()
+            || pos.het_route_status.route_id() != key.route_id
+        {
+            return false;
+        }
+        let Ok(anchor) = materialize_anchor(
+            request,
+            &quote,
+            entry_value_quote_raw,
+            pos.het_next_anchor_seq,
+            now_ms,
+            policy_config_hash,
+        ) else {
+            return false;
+        };
+        if pos
+            .het_executable_peak_anchor
+            .as_ref()
+            .is_some_and(|existing| existing.peak_mark_price_sol >= anchor.peak_mark_price_sol)
+        {
+            return false;
+        }
+        pos.het_next_anchor_seq = pos.het_next_anchor_seq.saturating_add(1);
+        pos.het_executable_peak_anchor = Some(anchor);
+        true
+    }
+
     async fn run_shadow_runtime_tick(
+        &self,
+        base_mint: &Pubkey,
+        latest: Option<&MarketSnapshot>,
+        now_ms: u64,
+    ) {
+        let Some(het_policy) = self.het_pm_v2.as_ref().filter(|policy| policy.enabled()) else {
+            self.prepare_and_run_shadow_runtime_tick_v1(base_mint, latest, now_ms)
+                .await;
+            return;
+        };
+        if self.has_pending_terminal_commit(base_mint) {
+            self.retry_pending_terminal_commit(base_mint, now_ms).await;
+            return;
+        }
+        let Some(v1_policy) = self.exit_policy_v1.as_ref() else {
+            return;
+        };
+        if let Some(latest) = latest {
+            self.remember_shadow_snapshot(base_mint, latest);
+        }
+        let Some((bundle, latest_snapshot, raw_canonical_snapshot)) =
+            self.materialize_post_buy_snapshot_bundle(base_mint, now_ms)
+        else {
+            return;
+        };
+        let v1_prequote = ExitPolicyV1::evaluate_prequote(&bundle.base, v1_policy);
+        let crash_prequote = ExitPolicyV1::evaluate_crash_guard_prequote(&bundle.base, v1_policy);
+        let prepared = self.prepare_het_pm_v2_tick(HetPmV2TickInput {
+            bundle: &bundle,
+            latest_snapshot: latest_snapshot.as_ref(),
+            raw_canonical_snapshot: raw_canonical_snapshot.as_ref(),
+            v1_prequote: &v1_prequote,
+            crash_prequote: &crash_prequote,
+            v1_policy,
+            het_policy,
+            now_ms,
+        });
+
+        let receipt = self
+            .run_shadow_runtime_tick_v1(
+                base_mint,
+                V1AuthorityTickInput {
+                    snapshot: &bundle.base,
+                    latest_snapshot: latest_snapshot.as_ref(),
+                    crash_evidence_snapshot: raw_canonical_snapshot.as_ref(),
+                    authoritative_prequote: &v1_prequote,
+                    crash_prequote: &crash_prequote,
+                    pre_resolved_quotes: &prepared.quote_cells,
+                    policy: v1_policy,
+                    now_ms,
+                },
+            )
+            .await;
+        let anchor_applied = self.apply_het_pm_v2_anchor_after_v1(
+            base_mint,
+            &prepared.anchor_request,
+            &prepared.quote_cells,
+            bundle.v2.entry_value_quote_raw,
+            het_policy.config_hash(),
+            now_ms,
+        );
+        let prepared_comparison = prepared.comparison_core.finalize(receipt, anchor_applied);
+        self.record_het_pm_v2_comparison_final_outcome(&prepared_comparison);
+        if self.has_pending_terminal_commit(base_mint) {
+            match self
+                .attach_prepared_het_comparison_to_pending_terminal(base_mint, prepared_comparison)
+            {
+                Ok(()) => {}
+                Err(unattached) => {
+                    let status = self
+                        .persist_terminal_het_pm_v2_comparison(&unattached)
+                        .await;
+                    error!(
+                        base_mint = %base_mint,
+                        comparison_id = %unattached.correlation().comparison_id,
+                        write_status = status.as_label(),
+                        "PostBuyGuardian: terminal comparison could not attach to pending commit; persisted before fail-open canonical retry"
+                    );
+                }
+            }
+            self.retry_pending_terminal_commit(base_mint, now_ms).await;
+        } else {
+            self.enqueue_nonterminal_het_pm_v2_comparison(&prepared_comparison);
+        }
+    }
+
+    async fn prepare_and_run_shadow_runtime_tick_v1(
         &self,
         base_mint: &Pubkey,
         latest: Option<&MarketSnapshot>,
@@ -5989,132 +7813,198 @@ impl MonitoringEngine {
         if let Some(latest) = latest {
             self.remember_shadow_snapshot(base_mint, latest);
         }
-
         let Some((snapshot, latest_snapshot, crash_evidence_snapshot)) =
             self.materialize_post_buy_decision_snapshot(base_mint, now_ms)
         else {
             return;
         };
         let authoritative_prequote = ExitPolicyV1::evaluate_prequote(&snapshot, policy);
-        let baseline_candidate = match &authoritative_prequote {
-            PreQuoteDecision::QuoteRequired { candidate } => Some(candidate.clone()),
-            PreQuoteDecision::Hold | PreQuoteDecision::UnknownEvidence { .. } => None,
-        };
         let crash_prequote = ExitPolicyV1::evaluate_crash_guard_prequote(&snapshot, policy);
-        let crash_prequote_evidence = Self::crash_guard_prequote_evidence(&snapshot, policy);
-
-        if let CrashGuardPreQuoteDecision::NotTriggered { reason } = &crash_prequote {
-            self.maybe_record_crash_guard_observation(
+        let _ = self
+            .run_shadow_runtime_tick_v1(
                 base_mint,
-                &snapshot,
-                CrashGuardObservationState::NotTriggered,
-                Some(*reason),
-                None,
-                &authoritative_prequote,
-                &crash_prequote,
-                &crash_prequote_evidence,
-                policy,
-                now_ms,
-            );
-        }
-
-        let crash_candidate = matches!(
-            &crash_prequote,
-            CrashGuardPreQuoteDecision::QuoteRequired { .. }
-        );
-        let prequote_crash_requirement = crash_candidate
-            .then(|| ExitPolicyV1::crash_guard_quote_requirement(&snapshot))
-            .flatten();
-        if crash_candidate {
-            self.maybe_record_crash_guard_observation(
-                base_mint,
-                &snapshot,
-                CrashGuardObservationState::Candidate,
-                None,
-                None,
-                &authoritative_prequote,
-                &crash_prequote,
-                &crash_prequote_evidence,
-                policy,
-                now_ms,
-            );
-        }
-        let observe_crash_candidate =
-            matches!(policy.crash_guard_mode(), CrashGuardMode::ObserveOnly) && crash_candidate;
-        let mut action = if snapshot.has_pending_proposal() {
-            match self.prepare_pending_quote_retry(base_mint, snapshot.guard(), now_ms) {
-                Ok(Some(action)) => Some(action),
-                Ok(None) => return,
-                Err(PositionApplyError::StaleRevision) => return,
-                Err(error) => {
-                    debug!(
-                        base_mint = %base_mint,
-                        error = %error,
-                        "PostBuyGuardian: pending exit proposal could not be retried"
-                    );
-                    return;
-                }
-            }
-        } else {
-            let selected = match (&crash_prequote, &authoritative_prequote) {
-                (CrashGuardPreQuoteDecision::QuoteRequired { candidate }, _)
-                    if matches!(
-                        policy.crash_guard_mode(),
-                        CrashGuardMode::AuthoritativeShadow
-                    ) =>
-                {
-                    let Some(requirement) = prequote_crash_requirement.clone() else {
-                        error!(
-                            base_mint = %base_mint,
-                            "PostBuyGuardian: CrashGuard candidate lacked immutable quote provenance"
-                        );
-                        return;
-                    };
-                    Some((candidate, Some(requirement)))
-                }
-                (_, _) => baseline_candidate
-                    .as_ref()
-                    .map(|candidate| (candidate, None)),
-            };
-            match selected {
-                Some((candidate, crash_guard_quote_requirement)) => match self.begin_exit_proposal(
-                    base_mint,
-                    snapshot.guard(),
-                    candidate,
-                    snapshot.snapshot_id(),
-                    snapshot.inactivity_age_ms(),
-                    crash_guard_quote_requirement,
+                V1AuthorityTickInput {
+                    snapshot: &snapshot,
+                    latest_snapshot: latest_snapshot.as_ref(),
+                    crash_evidence_snapshot: crash_evidence_snapshot.as_ref(),
+                    authoritative_prequote: &authoritative_prequote,
+                    crash_prequote: &crash_prequote,
+                    pre_resolved_quotes: &[],
+                    policy,
                     now_ms,
-                ) {
-                    Ok(action) => Some(action),
-                    Err(PositionApplyError::StaleRevision) => return,
+                },
+            )
+            .await;
+        if self.has_pending_terminal_commit(base_mint) {
+            self.retry_pending_terminal_commit(base_mint, now_ms).await;
+        }
+    }
+
+    async fn run_shadow_runtime_tick_v1(
+        &self,
+        base_mint: &Pubkey,
+        input: V1AuthorityTickInput<'_>,
+    ) -> V1AuthorityTickReceiptV1 {
+        let V1AuthorityTickInput {
+            snapshot,
+            latest_snapshot,
+            crash_evidence_snapshot,
+            authoritative_prequote,
+            crash_prequote,
+            pre_resolved_quotes,
+            policy,
+            now_ms,
+        } = input;
+        let mut receipt_outcome = V1AuthorityTickOutcomeV1::Hold;
+        let mut receipt_action_id = None;
+        let mut receipt_reason = None;
+        let mut receipt_crash_quote_decision = None;
+        let mut exit_applied = false;
+
+        if let PreQuoteDecision::UnknownEvidence { reason } = authoritative_prequote {
+            receipt_outcome = V1AuthorityTickOutcomeV1::Blocked;
+            receipt_reason = Some(format!("prequote_unknown:{reason:?}"));
+        }
+
+        'authority_tick: {
+            let baseline_candidate = match authoritative_prequote {
+                PreQuoteDecision::QuoteRequired { candidate } => Some(candidate.clone()),
+                PreQuoteDecision::Hold | PreQuoteDecision::UnknownEvidence { .. } => None,
+            };
+            let crash_prequote_evidence = Self::crash_guard_prequote_evidence(snapshot, policy);
+
+            if let CrashGuardPreQuoteDecision::NotTriggered { reason } = crash_prequote {
+                self.maybe_record_crash_guard_observation(
+                    base_mint,
+                    snapshot,
+                    CrashGuardObservationState::NotTriggered,
+                    Some(*reason),
+                    None,
+                    authoritative_prequote,
+                    crash_prequote,
+                    &crash_prequote_evidence,
+                    policy,
+                    now_ms,
+                );
+            }
+
+            let crash_candidate = matches!(
+                crash_prequote,
+                CrashGuardPreQuoteDecision::QuoteRequired { .. }
+            );
+            let prequote_crash_requirement = crash_candidate
+                .then(|| ExitPolicyV1::crash_guard_quote_requirement(snapshot))
+                .flatten();
+            if crash_candidate {
+                self.maybe_record_crash_guard_observation(
+                    base_mint,
+                    snapshot,
+                    CrashGuardObservationState::Candidate,
+                    None,
+                    None,
+                    authoritative_prequote,
+                    crash_prequote,
+                    &crash_prequote_evidence,
+                    policy,
+                    now_ms,
+                );
+            }
+            let observe_crash_candidate =
+                matches!(policy.crash_guard_mode(), CrashGuardMode::ObserveOnly) && crash_candidate;
+            let mut action = if snapshot.has_pending_proposal() {
+                match self.prepare_pending_quote_retry(base_mint, snapshot.guard(), now_ms) {
+                    Ok(Some(action)) => Some(action),
+                    Ok(None) => break 'authority_tick,
+                    Err(PositionApplyError::StaleRevision) => {
+                        receipt_outcome = V1AuthorityTickOutcomeV1::ApplyRejected;
+                        receipt_reason = Some("pending_retry_stale_revision".to_string());
+                        break 'authority_tick;
+                    }
                     Err(error) => {
+                        receipt_outcome = V1AuthorityTickOutcomeV1::ApplyRejected;
+                        receipt_reason = Some(format!("pending_retry_rejected:{error}"));
                         debug!(
                             base_mint = %base_mint,
                             error = %error,
-                            "PostBuyGuardian: exit proposal rejected by guarded apply"
+                            "PostBuyGuardian: pending exit proposal could not be retried"
                         );
-                        return;
+                        break 'authority_tick;
                     }
-                },
-                None => None,
+                }
+            } else {
+                let selected = match (crash_prequote, authoritative_prequote) {
+                    (CrashGuardPreQuoteDecision::QuoteRequired { candidate }, _)
+                        if matches!(
+                            policy.crash_guard_mode(),
+                            CrashGuardMode::AuthoritativeShadow
+                        ) =>
+                    {
+                        let Some(requirement) = prequote_crash_requirement.clone() else {
+                            error!(
+                                base_mint = %base_mint,
+                                "PostBuyGuardian: CrashGuard candidate lacked immutable quote provenance"
+                            );
+                            break 'authority_tick;
+                        };
+                        Some((candidate, Some(requirement)))
+                    }
+                    (_, _) => baseline_candidate
+                        .as_ref()
+                        .map(|candidate| (candidate, None)),
+                };
+                match selected {
+                    Some((candidate, crash_guard_quote_requirement)) => match self
+                        .begin_exit_proposal(
+                            base_mint,
+                            snapshot.guard(),
+                            candidate,
+                            snapshot.snapshot_id(),
+                            snapshot.inactivity_age_ms(),
+                            crash_guard_quote_requirement,
+                            now_ms,
+                        ) {
+                        Ok(action) => Some(action),
+                        Err(PositionApplyError::StaleRevision) => {
+                            receipt_outcome = V1AuthorityTickOutcomeV1::ApplyRejected;
+                            receipt_reason = Some("proposal_stale_revision".to_string());
+                            break 'authority_tick;
+                        }
+                        Err(error) => {
+                            receipt_outcome = V1AuthorityTickOutcomeV1::ApplyRejected;
+                            receipt_reason = Some(format!("proposal_rejected:{error}"));
+                            debug!(
+                                base_mint = %base_mint,
+                                error = %error,
+                                "PostBuyGuardian: exit proposal rejected by guarded apply"
+                            );
+                            break 'authority_tick;
+                        }
+                    },
+                    None => None,
+                }
+            };
+            if let Some(action) = action.as_ref() {
+                receipt_outcome = V1AuthorityTickOutcomeV1::ProposalStarted;
+                receipt_action_id = Some(action.action_id.clone());
+                receipt_reason = Some(format!("{:?}", action.reason));
             }
-        };
 
-        let crash_action_owned = action
-            .as_ref()
-            .is_some_and(|action| matches!(action.reason, ExitCandidateReason::CrashGuard));
-        let crash_quote_requirement = if crash_action_owned {
-            action
+            let crash_action_owned = action
                 .as_ref()
-                .and_then(|action| action.crash_guard_quote_requirement.clone())
-        } else if observe_crash_candidate {
-            prequote_crash_requirement
-        } else {
-            None
-        };
-        if crash_action_owned && crash_quote_requirement.is_none() {
-            let failure = ExecutableQuoteFailure {
+                .is_some_and(|action| matches!(action.reason, ExitCandidateReason::CrashGuard));
+            let crash_quote_requirement = if crash_action_owned {
+                action
+                    .as_ref()
+                    .and_then(|action| action.crash_guard_quote_requirement.clone())
+            } else if observe_crash_candidate {
+                prequote_crash_requirement
+            } else {
+                None
+            };
+            if crash_action_owned && crash_quote_requirement.is_none() {
+                receipt_outcome = V1AuthorityTickOutcomeV1::Blocked;
+                receipt_reason = Some("crash_quote_requirement_missing".to_string());
+                let failure = ExecutableQuoteFailure {
                 kind: ExecutableQuoteFailureKind::SemanticViolation,
                 evidence: PriceTruthEvidence {
                     source: crash_prequote_evidence.source,
@@ -6130,169 +8020,206 @@ impl MonitoringEngine {
                     price_reason: crash_prequote_evidence.price_reason,
                 },
             };
-            if let Some(action) = action {
-                self.handle_shadow_quote_failure(action, failure, now_ms)
-                    .await;
-            }
-            return;
-        }
-
-        if action.is_none() && crash_quote_requirement.is_none() {
-            return;
-        }
-
-        let expected_quantity = action
-            .as_ref()
-            .map(|action| action.expected_remaining_quantity)
-            .unwrap_or_else(|| snapshot.remaining_token_amount_raw());
-        let evidence_source = self.snapshot_source_for_position(base_mint);
-        // A CrashGuard-owned action must use the raw canonical sample that
-        // proved the path. A baseline-owned action deliberately keeps the
-        // PR1 runtime projection even when CrashGuard is observing the same
-        // tick: observation must not alter a TP/SL/inactivity/max-hold fill.
-        // The one local resolution is still shared; the CrashGuard result is
-        // then either confirmed/rejected or blocked by its provenance check.
-        let quote_snapshot = if crash_action_owned || action.is_none() {
-            crash_evidence_snapshot
-                .as_ref()
-                .or(latest_snapshot.as_ref())
-        } else {
-            latest_snapshot.as_ref()
-        };
-        let truth = match self.resolve_shadow_exit_truth_for_policy(
-            &snapshot,
-            quote_snapshot,
-            expected_quantity,
-            now_ms,
-            evidence_source,
-        ) {
-            Ok(truth) => truth,
-            Err(failure) => {
-                if crash_quote_requirement.is_some() {
-                    self.maybe_record_crash_guard_observation(
-                        base_mint,
-                        &snapshot,
-                        CrashGuardObservationState::BlockedByData,
-                        None,
-                        None,
-                        &authoritative_prequote,
-                        &crash_prequote,
-                        &failure.evidence,
-                        policy,
-                        now_ms,
-                    );
-                }
                 if let Some(action) = action {
                     self.handle_shadow_quote_failure(action, failure, now_ms)
                         .await;
                 }
-                return;
-            }
-        };
-        let quote = ExecutableExitQuote::new(
-            truth.exit_token_amount_raw,
-            truth.exit_price_sol,
-            truth.exit_value_sol,
-            truth.gross_pnl_sol,
-            truth.pnl_pct,
-        );
-        let quote_evidence = QuoteEvidenceRevisionV1::new(
-            truth.evidence.slot,
-            truth.evidence.timestamp_ms,
-            truth.evidence.age_ms,
-        );
-        let crash_quote_decision = crash_quote_requirement.as_ref().map(|requirement| {
-            ExitPolicyV1::evaluate_crash_guard_quote(
-                &snapshot,
-                &quote,
-                quote_evidence,
-                requirement,
-                policy,
-            )
-        });
-        if let Some(crash_quote_decision) = crash_quote_decision {
-            match crash_quote_decision {
-                CrashGuardQuoteDecision::Confirmed => self.maybe_record_crash_guard_observation(
-                    base_mint,
-                    &snapshot,
-                    CrashGuardObservationState::Confirmed,
-                    None,
-                    None,
-                    &authoritative_prequote,
-                    &crash_prequote,
-                    &truth.evidence,
-                    policy,
-                    now_ms,
-                ),
-                CrashGuardQuoteDecision::RejectedByQuote { reason } => {
-                    self.maybe_record_crash_guard_observation(
-                        base_mint,
-                        &snapshot,
-                        CrashGuardObservationState::RejectedByQuote,
-                        None,
-                        Some(reason),
-                        &authoritative_prequote,
-                        &crash_prequote,
-                        &truth.evidence,
-                        policy,
-                        now_ms,
-                    );
-                }
-                CrashGuardQuoteDecision::BlockedByData => self
-                    .maybe_record_crash_guard_observation(
-                        base_mint,
-                        &snapshot,
-                        CrashGuardObservationState::BlockedByData,
-                        None,
-                        None,
-                        &authoritative_prequote,
-                        &crash_prequote,
-                        &truth.evidence,
-                        policy,
-                        now_ms,
-                    ),
+                break 'authority_tick;
             }
 
-            if crash_action_owned {
-                match crash_quote_decision {
-                    CrashGuardQuoteDecision::Confirmed => {}
-                    CrashGuardQuoteDecision::RejectedByQuote { .. } => {
-                        let Some(action_handle) = action.as_ref() else {
-                            return;
-                        };
-                        if let Some(fallback_candidate) = baseline_candidate.as_ref() {
-                            match self.retarget_shadow_proposal_after_crash_rejection(
-                                action_handle,
-                                fallback_candidate,
-                                snapshot.inactivity_age_ms(),
-                            ) {
-                                Ok(retargeted) => action = Some(retargeted),
-                                Err(error) => {
-                                    debug!(
-                                        action_id = %action_handle.action_id,
-                                        error = %error,
-                                        "PostBuyGuardian: CrashGuard rejection could not preserve baseline proposal"
-                                    );
-                                    return;
-                                }
-                            }
-                        } else if let Err(error) =
-                            self.cancel_shadow_proposal_after_crash_rejection(action_handle)
-                        {
-                            debug!(
-                                action_id = %action_handle.action_id,
-                                error = %error,
-                                "PostBuyGuardian: CrashGuard quote rejection could not clear proposal"
-                            );
-                            return;
-                        }
-                        if baseline_candidate.is_none() {
-                            return;
-                        }
+            if action.is_none() && crash_quote_requirement.is_none() {
+                break 'authority_tick;
+            }
+
+            let expected_quantity = action
+                .as_ref()
+                .map(|action| action.expected_remaining_quantity)
+                .unwrap_or_else(|| snapshot.remaining_token_amount_raw());
+            let evidence_source = self.snapshot_source_for_position(base_mint);
+            // A CrashGuard-owned action must use the raw canonical sample that
+            // proved the path. A baseline-owned action deliberately keeps the
+            // PR1 runtime projection even when CrashGuard is observing the same
+            // tick: observation must not alter a TP/SL/inactivity/max-hold fill.
+            // The one local resolution is still shared; the CrashGuard result is
+            // then either confirmed/rejected or blocked by its provenance check.
+            let quote_snapshot = if crash_action_owned || action.is_none() {
+                crash_evidence_snapshot.or(latest_snapshot)
+            } else {
+                latest_snapshot
+            };
+            let pre_resolved_outcome = quote_snapshot.and_then(|quote_snapshot| {
+                pre_resolved_quotes
+                    .iter()
+                    .find(|cell| {
+                        cell.key.position_id == snapshot.guard().position_id()
+                            && cell.key.position_epoch == snapshot.guard().position_epoch()
+                            && cell.key.state_revision == snapshot.guard().state_revision()
+                            && cell.key.remaining_quantity_raw == expected_quantity
+                            && cell.key.sample_slot == quote_snapshot.slot
+                            && cell.key.sample_timestamp_ms == Some(quote_snapshot.timestamp_ms)
+                    })
+                    .map(|cell| cell.outcome.clone())
+            });
+            let truth_result = pre_resolved_outcome.unwrap_or_else(|| {
+                self.resolve_shadow_exit_truth_for_policy(
+                    snapshot,
+                    quote_snapshot,
+                    expected_quantity,
+                    now_ms,
+                    evidence_source,
+                )
+            });
+            let truth = match truth_result {
+                Ok(truth) => truth,
+                Err(failure) => {
+                    receipt_outcome = if action.is_some() {
+                        V1AuthorityTickOutcomeV1::PendingRecovery
+                    } else {
+                        V1AuthorityTickOutcomeV1::Blocked
+                    };
+                    receipt_reason = Some(format!("quote_blocked:{:?}", failure.kind));
+                    if crash_quote_requirement.is_some() {
+                        self.maybe_record_crash_guard_observation(
+                            base_mint,
+                            snapshot,
+                            CrashGuardObservationState::BlockedByData,
+                            None,
+                            None,
+                            authoritative_prequote,
+                            crash_prequote,
+                            &failure.evidence,
+                            policy,
+                            now_ms,
+                        );
                     }
-                    CrashGuardQuoteDecision::BlockedByData => {
-                        if let Some(action) = action {
-                            let failure = ExecutableQuoteFailure {
+                    if let Some(action) = action {
+                        self.handle_shadow_quote_failure(action, failure, now_ms)
+                            .await;
+                    }
+                    break 'authority_tick;
+                }
+            };
+            let quote = ExecutableExitQuote::new(
+                truth.exit_token_amount_raw,
+                truth.exit_price_sol,
+                truth.exit_value_sol,
+                truth.gross_pnl_sol,
+                truth.pnl_pct,
+            );
+            let quote_evidence = QuoteEvidenceRevisionV1::new(
+                truth.evidence.slot,
+                truth.evidence.timestamp_ms,
+                truth.evidence.age_ms,
+            );
+            let crash_quote_decision = crash_quote_requirement.as_ref().map(|requirement| {
+                ExitPolicyV1::evaluate_crash_guard_quote(
+                    snapshot,
+                    &quote,
+                    quote_evidence,
+                    requirement,
+                    policy,
+                )
+            });
+            if let Some(crash_quote_decision) = crash_quote_decision {
+                receipt_crash_quote_decision = Some(crash_quote_decision);
+                if matches!(crash_quote_decision, CrashGuardQuoteDecision::BlockedByData)
+                    && action.is_none()
+                {
+                    receipt_outcome = V1AuthorityTickOutcomeV1::Blocked;
+                    receipt_reason = Some("crash_quote_blocked_by_data".to_string());
+                }
+                match crash_quote_decision {
+                    CrashGuardQuoteDecision::Confirmed => self
+                        .maybe_record_crash_guard_observation(
+                            base_mint,
+                            snapshot,
+                            CrashGuardObservationState::Confirmed,
+                            None,
+                            None,
+                            authoritative_prequote,
+                            crash_prequote,
+                            &truth.evidence,
+                            policy,
+                            now_ms,
+                        ),
+                    CrashGuardQuoteDecision::RejectedByQuote { reason } => {
+                        self.maybe_record_crash_guard_observation(
+                            base_mint,
+                            snapshot,
+                            CrashGuardObservationState::RejectedByQuote,
+                            None,
+                            Some(reason),
+                            authoritative_prequote,
+                            crash_prequote,
+                            &truth.evidence,
+                            policy,
+                            now_ms,
+                        );
+                    }
+                    CrashGuardQuoteDecision::BlockedByData => self
+                        .maybe_record_crash_guard_observation(
+                            base_mint,
+                            snapshot,
+                            CrashGuardObservationState::BlockedByData,
+                            None,
+                            None,
+                            authoritative_prequote,
+                            crash_prequote,
+                            &truth.evidence,
+                            policy,
+                            now_ms,
+                        ),
+                }
+
+                if crash_action_owned {
+                    match crash_quote_decision {
+                        CrashGuardQuoteDecision::Confirmed => {}
+                        CrashGuardQuoteDecision::RejectedByQuote { .. } => {
+                            let Some(action_handle) = action.as_ref() else {
+                                break 'authority_tick;
+                            };
+                            if let Some(fallback_candidate) = baseline_candidate.as_ref() {
+                                match self.retarget_shadow_proposal_after_crash_rejection(
+                                    action_handle,
+                                    fallback_candidate,
+                                    snapshot.inactivity_age_ms(),
+                                ) {
+                                    Ok(retargeted) => action = Some(retargeted),
+                                    Err(error) => {
+                                        receipt_outcome = V1AuthorityTickOutcomeV1::ApplyRejected;
+                                        receipt_reason = Some(format!(
+                                            "crash_fallback_retarget_rejected:{error}"
+                                        ));
+                                        debug!(
+                                            action_id = %action_handle.action_id,
+                                            error = %error,
+                                            "PostBuyGuardian: CrashGuard rejection could not preserve baseline proposal"
+                                        );
+                                        break 'authority_tick;
+                                    }
+                                }
+                            } else if let Err(error) =
+                                self.cancel_shadow_proposal_after_crash_rejection(action_handle)
+                            {
+                                receipt_outcome = V1AuthorityTickOutcomeV1::ApplyRejected;
+                                receipt_reason =
+                                    Some(format!("crash_proposal_cancel_rejected:{error}"));
+                                debug!(
+                                    action_id = %action_handle.action_id,
+                                    error = %error,
+                                    "PostBuyGuardian: CrashGuard quote rejection could not clear proposal"
+                                );
+                                break 'authority_tick;
+                            }
+                            if baseline_candidate.is_none() {
+                                break 'authority_tick;
+                            }
+                        }
+                        CrashGuardQuoteDecision::BlockedByData => {
+                            receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery;
+                            receipt_reason = Some("crash_quote_blocked_by_data".to_string());
+                            if let Some(action) = action {
+                                let failure = ExecutableQuoteFailure {
                                 kind: ExecutableQuoteFailureKind::SemanticViolation,
                                 evidence: PriceTruthEvidence {
                                     source: truth.evidence.source,
@@ -6308,34 +8235,80 @@ impl MonitoringEngine {
                                     price_reason: truth.evidence.price_reason,
                                 },
                             };
-                            self.handle_shadow_quote_failure(action, failure, now_ms)
-                                .await;
+                                self.handle_shadow_quote_failure(action, failure, now_ms)
+                                    .await;
+                            }
+                            break 'authority_tick;
                         }
-                        return;
                     }
                 }
             }
-        }
 
-        let Some(action) = action else {
-            // Observation-only CrashGuard has completed its one lazy quote.
-            return;
-        };
-        let candidate = ExitCandidate::from_reason(action.reason);
-        match ExitPolicyV1::finalize_with_quote(&snapshot, &candidate, &quote, policy) {
-            FinalPolicyDecision::Exit { intent } => {
-                if intent.quantity_raw() != action.expected_remaining_quantity
-                    || intent.reason() != action.reason
-                {
+            let Some(action) = action else {
+                // Observation-only CrashGuard has completed its one lazy quote.
+                break 'authority_tick;
+            };
+            let candidate = ExitCandidate::from_reason(action.reason);
+            match ExitPolicyV1::finalize_with_quote(snapshot, &candidate, &quote, policy) {
+                FinalPolicyDecision::Exit { intent } => {
+                    if intent.quantity_raw() != action.expected_remaining_quantity
+                        || intent.reason() != action.reason
+                    {
+                        let failure = ExecutableQuoteFailure {
+                            kind: ExecutableQuoteFailureKind::QuantityMismatch,
+                            evidence: PriceTruthEvidence {
+                                source: truth.evidence.source,
+                                status: PriceTruthStatus::SemanticViolation,
+                                detail: Some(
+                                    "pure exit intent disagreed with guarded pending proposal"
+                                        .to_string(),
+                                ),
+                                slot: truth.evidence.slot,
+                                timestamp_ms: truth.evidence.timestamp_ms,
+                                age_ms: truth.evidence.age_ms,
+                                price_state: truth.evidence.price_state,
+                                price_reason: truth.evidence.price_reason,
+                            },
+                        };
+                        self.handle_shadow_quote_failure(action, failure, now_ms)
+                            .await;
+                        receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery;
+                        receipt_reason = Some("final_intent_mismatch".to_string());
+                        break 'authority_tick;
+                    }
+                    if let Err(error) = self.apply_shadow_quote_outcome(&action, snapshot, &truth) {
+                        receipt_outcome = V1AuthorityTickOutcomeV1::ApplyRejected;
+                        receipt_reason = Some(format!("resolved_quote_apply_rejected:{error}"));
+                        debug!(
+                            action_id = %action.action_id,
+                            error = %error,
+                            "PostBuyGuardian: resolved quote rejected by guarded apply"
+                        );
+                        break 'authority_tick;
+                    }
+
+                    let exit = super::integration::ShadowExitExecution {
+                        position_id: action.position_id.clone(),
+                        position_epoch: action.position_epoch,
+                        fraction_bps: 10_000,
+                        remaining_fraction_bps: 0,
+                        fill_price: truth.exit_price_sol,
+                    };
+                    self.emit_shadow_exit_for_action(&action, &exit, &truth, now_ms);
+                    exit_applied = true;
+                    receipt_action_id = Some(action.action_id.clone());
+                    receipt_reason = Some(format!("{:?}", action.reason));
+                    self.finish_resolved_shadow_position(action, now_ms);
+                }
+                FinalPolicyDecision::UnknownEvidence { reason } => {
+                    receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery;
+                    receipt_reason = Some(format!("final_policy_unknown:{reason:?}"));
                     let failure = ExecutableQuoteFailure {
-                        kind: ExecutableQuoteFailureKind::QuantityMismatch,
+                        kind: ExecutableQuoteFailureKind::SemanticViolation,
                         evidence: PriceTruthEvidence {
                             source: truth.evidence.source,
                             status: PriceTruthStatus::SemanticViolation,
-                            detail: Some(
-                                "pure exit intent disagreed with guarded pending proposal"
-                                    .to_string(),
-                            ),
+                            detail: Some(format!("exit quote rejected by policy: {reason:?}")),
                             slot: truth.evidence.slot,
                             timestamp_ms: truth.evidence.timestamp_ms,
                             age_ms: truth.evidence.age_ms,
@@ -6345,45 +8318,53 @@ impl MonitoringEngine {
                     };
                     self.handle_shadow_quote_failure(action, failure, now_ms)
                         .await;
-                    return;
                 }
-                if let Err(error) = self.apply_shadow_quote_outcome(&action, &snapshot, &truth) {
-                    debug!(
-                        action_id = %action.action_id,
-                        error = %error,
-                        "PostBuyGuardian: resolved quote rejected by guarded apply"
-                    );
-                    return;
-                }
+                FinalPolicyDecision::Hold => {}
+            }
+        }
 
-                let exit = super::integration::ShadowExitExecution {
-                    position_id: action.position_id.clone(),
-                    position_epoch: action.position_epoch,
-                    fraction_bps: 10_000,
-                    remaining_fraction_bps: 0,
-                    fill_price: truth.exit_price_sol,
-                };
-                self.emit_shadow_exit_for_action(&action, &exit, &truth, now_ms);
-                self.finish_resolved_shadow_position(action, now_ms).await;
+        let position_state = self.positions.read().get(base_mint).map(|pos| {
+            (
+                pos.pending_exit_proposal.is_some(),
+                pos.pending_terminal_commit.is_some(),
+            )
+        });
+        let terminal_commit_status = match position_state {
+            None => V1TerminalCommitStatusV1::Committed,
+            Some((_, true)) => V1TerminalCommitStatusV1::Pending,
+            Some(_) => V1TerminalCommitStatusV1::NotRequired,
+        };
+        match position_state {
+            None if exit_applied => receipt_outcome = V1AuthorityTickOutcomeV1::ExitApplied,
+            None => receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery,
+            Some((_, true)) if exit_applied => {
+                receipt_outcome = V1AuthorityTickOutcomeV1::ExitApplied;
             }
-            FinalPolicyDecision::UnknownEvidence { reason } => {
-                let failure = ExecutableQuoteFailure {
-                    kind: ExecutableQuoteFailureKind::SemanticViolation,
-                    evidence: PriceTruthEvidence {
-                        source: truth.evidence.source,
-                        status: PriceTruthStatus::SemanticViolation,
-                        detail: Some(format!("exit quote rejected by policy: {reason:?}")),
-                        slot: truth.evidence.slot,
-                        timestamp_ms: truth.evidence.timestamp_ms,
-                        age_ms: truth.evidence.age_ms,
-                        price_state: truth.evidence.price_state,
-                        price_reason: truth.evidence.price_reason,
-                    },
-                };
-                self.handle_shadow_quote_failure(action, failure, now_ms)
-                    .await;
+            Some((_, true)) => receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery,
+            Some((true, false))
+                if !matches!(receipt_outcome, V1AuthorityTickOutcomeV1::ApplyRejected) =>
+            {
+                receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery;
             }
-            FinalPolicyDecision::Hold => {}
+            Some(_) => {}
+        }
+
+        V1AuthorityTickReceiptV1 {
+            snapshot_id: snapshot.snapshot_id().to_string(),
+            state_revision: snapshot.guard().state_revision(),
+            remaining_quantity_raw: snapshot.remaining_token_amount_raw(),
+            outcome: receipt_outcome,
+            exit_apply_status: if exit_applied {
+                V1ExitApplyStatusV1::Applied
+            } else if matches!(receipt_outcome, V1AuthorityTickOutcomeV1::ApplyRejected) {
+                V1ExitApplyStatusV1::Rejected
+            } else {
+                V1ExitApplyStatusV1::NotApplied
+            },
+            terminal_commit_status,
+            action_id: receipt_action_id,
+            reason: receipt_reason,
+            crash_quote_decision: receipt_crash_quote_decision,
         }
     }
 
@@ -6421,13 +8402,7 @@ impl MonitoringEngine {
                     action_id: action.action_id.clone(),
                     reason: unresolved_reason,
                 };
-                if self
-                    .stage_terminal_commit(&action, terminal, disposition)
-                    .is_ok()
-                {
-                    self.retry_pending_terminal_commit(&action.base_mint, now_ms)
-                        .await;
-                }
+                let _ = self.stage_terminal_commit(&action, terminal, disposition);
             }
             Err(PositionApplyError::StaleRevision) => {}
             Err(error) => debug!(
@@ -6467,7 +8442,7 @@ impl MonitoringEngine {
         );
     }
 
-    async fn finish_resolved_shadow_position(&self, action: ShadowExitActionHandle, now_ms: u64) {
+    fn finish_resolved_shadow_position(&self, action: ShadowExitActionHandle, now_ms: u64) {
         let terminal = {
             let positions = self.positions.read();
             let Some(pos) = positions.get(&action.base_mint) else {
@@ -6493,13 +8468,7 @@ impl MonitoringEngine {
             action_id: action.action_id.clone(),
             reason: action.reason.reason_code().to_string(),
         };
-        if self
-            .stage_terminal_commit(&action, terminal, disposition)
-            .is_ok()
-        {
-            self.retry_pending_terminal_commit(&action.base_mint, now_ms)
-                .await;
-        }
+        let _ = self.stage_terminal_commit(&action, terminal, disposition);
     }
 
     fn has_pending_terminal_commit(&self, base_mint: &Pubkey) -> bool {
@@ -6537,12 +8506,69 @@ impl MonitoringEngine {
             disposition,
             last_attempt_ms: None,
             lifecycle_jsonl_committed: false,
+            prepared_het_comparison: None,
+            het_comparison_write_status: HetComparisonWriteStatusV1::NotApplicable,
         });
         Ok(())
     }
 
+    fn apply_het_comparison_status_to_terminal_record(
+        record: &mut ShadowLifecycleRecord,
+        prepared: &PreparedHetComparisonV1,
+        status: &HetComparisonWriteStatusV1,
+    ) {
+        let correlation = prepared.correlation();
+        record.het_pm_v2_comparison_id = Some(correlation.comparison_id.clone());
+        record.het_pm_v2_writer_instance_id = Some(correlation.writer_instance_id.clone());
+        record.het_pm_v2_source_snapshot_id = Some(correlation.source_snapshot_id.clone());
+        record.het_pm_v2_comparison_write_status = Some(status.as_label().to_string());
+        record.het_pm_v2_comparison_skip_reason = status
+            .skip_reason()
+            .map(|reason| reason.as_label().to_string());
+        record.het_pm_v2_comparison_outcome_unknown_reason = status
+            .outcome_unknown_reason()
+            .map(|reason| reason.as_label().to_string());
+    }
+
+    fn attach_prepared_het_comparison_to_pending_terminal(
+        &self,
+        base_mint: &Pubkey,
+        prepared: PreparedHetComparisonV1,
+    ) -> Result<(), Box<PreparedHetComparisonV1>> {
+        let Some(action_id) = prepared.action_id().map(str::to_string) else {
+            return Err(Box::new(prepared));
+        };
+        let initial_status = match &prepared {
+            PreparedHetComparisonV1::Ready { .. } => HetComparisonWriteStatusV1::NotAttempted,
+            PreparedHetComparisonV1::Skipped { reason, detail, .. } => {
+                HetComparisonWriteStatusV1::Skipped {
+                    reason: *reason,
+                    detail: detail.clone(),
+                }
+            }
+        };
+        let mut positions = self.positions.write();
+        let Some(pos) = positions.get_mut(base_mint) else {
+            return Err(Box::new(prepared));
+        };
+        let Some(pending) = pos.pending_terminal_commit.as_mut() else {
+            return Err(Box::new(prepared));
+        };
+        if pending.action_id != action_id || pending.prepared_het_comparison.is_some() {
+            return Err(Box::new(prepared));
+        }
+        Self::apply_het_comparison_status_to_terminal_record(
+            &mut pending.record,
+            &prepared,
+            &initial_status,
+        );
+        pending.prepared_het_comparison = Some(prepared);
+        pending.het_comparison_write_status = initial_status;
+        Ok(())
+    }
+
     async fn retry_pending_terminal_commit(&self, base_mint: &Pubkey, now_ms: u64) {
-        let pending = {
+        let mut pending = {
             let mut positions = self.positions.write();
             let Some(pos) = positions.get_mut(base_mint) else {
                 return;
@@ -6559,6 +8585,40 @@ impl MonitoringEngine {
             pending.last_attempt_ms = Some(now_ms);
             pending.clone()
         };
+
+        if matches!(
+            pending.het_comparison_write_status,
+            HetComparisonWriteStatusV1::NotAttempted
+        ) {
+            if let Some(prepared) = pending.prepared_het_comparison.as_ref() {
+                let write_status = self.persist_terminal_het_pm_v2_comparison(prepared).await;
+                let mut positions = self.positions.write();
+                let Some(pos) = positions.get_mut(base_mint) else {
+                    return;
+                };
+                let Some(current) = pos.pending_terminal_commit.as_mut() else {
+                    return;
+                };
+                if current.action_id != pending.action_id
+                    || !matches!(
+                        current.het_comparison_write_status,
+                        HetComparisonWriteStatusV1::NotAttempted
+                    )
+                {
+                    return;
+                }
+                let Some(current_prepared) = current.prepared_het_comparison.clone() else {
+                    return;
+                };
+                Self::apply_het_comparison_status_to_terminal_record(
+                    &mut current.record,
+                    &current_prepared,
+                    &write_status,
+                );
+                current.het_comparison_write_status = write_status;
+                pending = current.clone();
+            }
+        }
 
         let receipt =
             self.append_shadow_record(&pending.record, !pending.lifecycle_jsonl_committed);
@@ -7331,6 +9391,65 @@ mod tests {
             .collect()
     }
 
+    async fn wait_for_jsonl_rows(path: &Path, minimum_rows: usize) -> Vec<Value> {
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let rows = read_jsonl_rows(path);
+                if rows.len() >= minimum_rows {
+                    return rows;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("bounded wait for asynchronous HET sidecar writer")
+    }
+
+    async fn wait_for_writer_health<F>(directory: &Path, predicate: F) -> Value
+    where
+        F: Fn(&Value) -> bool,
+    {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(entries) = std::fs::read_dir(directory) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                            continue;
+                        };
+                        if !name.starts_with("het_pm_v2_writer_health_v1.")
+                            || path.extension().and_then(|extension| extension.to_str())
+                                != Some("json")
+                        {
+                            continue;
+                        }
+                        let Ok(encoded) = std::fs::read_to_string(&path) else {
+                            continue;
+                        };
+                        let Ok(record) = serde_json::from_str::<Value>(&encoded) else {
+                            continue;
+                        };
+                        if predicate(&record) {
+                            return record;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("bounded wait for HET-PM V2 writer-health artifact")
+    }
+
+    fn terminal_het_source_ref<'a>(terminal: &'a Value, field: &str) -> Option<&'a str> {
+        let prefix = format!("het_pm_v2:{field}:");
+        terminal["payload"]["record"]["envelope"]["source_refs"]
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .find_map(|value| value.strip_prefix(&prefix))
+    }
+
     fn shadow_v2_harness_config_for_dir(path: &Path) -> ShadowV2ValidationHarnessConfig {
         ShadowV2ValidationHarnessConfig::new(
             "shadow-v2-pr18-test",
@@ -7410,6 +9529,133 @@ mod tests {
         let harness = ShadowV2ValidationHarness::new(shadow_v2_harness_config_for_dir(path))
             .expect("terminal truth harness");
         engine.set_shadow_v2_validation_harness(Arc::new(Mutex::new(harness)));
+    }
+
+    struct HetTerminalTestContext {
+        engine: Arc<MonitoringEngine>,
+        mint: Pubkey,
+        terminal_rx: oneshot::Receiver<ShadowTerminalDisposition>,
+        snapshot: MarketSnapshot,
+        tick_ms: u64,
+        sidecar_path: PathBuf,
+        lifecycle_path: PathBuf,
+        canonical_path: PathBuf,
+    }
+
+    fn setup_het_terminal_exit(
+        tmp: &TempDir,
+        fail_canonical_terminal: bool,
+        fail_sidecar: bool,
+    ) -> HetTerminalTestContext {
+        setup_het_terminal_exit_with_writer(tmp, fail_canonical_terminal, fail_sidecar, None)
+    }
+
+    fn setup_het_terminal_exit_with_writer(
+        tmp: &TempDir,
+        fail_canonical_terminal: bool,
+        fail_sidecar: bool,
+        stalled_writer_capacity: Option<usize>,
+    ) -> HetTerminalTestContext {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        config.het_pm_v2.terminal_write_budget_ms = if stalled_writer_capacity.is_some() {
+            10
+        } else {
+            100
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid HET terminal test config");
+        let lifecycle_path = tmp.path().join("shadow_lifecycle.jsonl");
+        let sidecar_path = tmp.path().join("het_pm_v2_observations_v1.jsonl");
+        let canonical_path = tmp.path().join("shadow_position_event_v2.jsonl");
+        enable_terminal_truth_harness(&mut engine, tmp.path());
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_path.clone()));
+        if let Some(capacity) = stalled_writer_capacity {
+            engine.set_stalled_het_pm_v2_observation_writer(capacity);
+        }
+        if fail_canonical_terminal {
+            std::fs::create_dir(&canonical_path).expect("canonical writer fault directory");
+        }
+        if fail_sidecar {
+            std::fs::create_dir(&sidecar_path).expect("sidecar writer fault directory");
+        }
+
+        let mint = Pubkey::new_unique();
+        let registered = engine
+            .register_shadow_position_with_terminal(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000_000),
+                Some(1_000_000),
+                PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("het-terminal-boundary".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "het-terminal-boundary".to_string(),
+                    entry_order_id: "het-terminal-boundary-entry".to_string(),
+                    quote_id: "het-terminal-boundary-quote".to_string(),
+                    slot: Some(10),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:het-terminal-boundary".to_string()),
+                    position_epoch: Some(11),
+                    opened_at_ms: Some(1_000),
+                },
+            )
+            .expect("valid HET terminal test registration");
+        let snapshot = MarketSnapshot {
+            slot: Some(11),
+            timestamp_ms: 2_000,
+            price_sol_per_token: 10.0,
+            price_state: PriceState::Valid,
+            market_cap_sol: 10.0,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 10.0,
+            ..MarketSnapshot::default()
+        };
+
+        HetTerminalTestContext {
+            engine: Arc::new(engine),
+            mint,
+            terminal_rx: registered.terminal_rx,
+            snapshot,
+            tick_ms: 2_000,
+            sidecar_path,
+            lifecycle_path,
+            canonical_path,
+        }
+    }
+
+    async fn complete_het_terminal_retry(tmp: &TempDir) -> (HetTerminalTestContext, Value, Value) {
+        let context = setup_het_terminal_exit(tmp, true, false);
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+        let comparison = read_jsonl_rows(&context.sidecar_path)
+            .into_iter()
+            .next()
+            .expect("pre-canonical HET comparison");
+        std::fs::remove_dir(&context.canonical_path).expect("repair canonical writer");
+        context
+            .engine
+            .run_shadow_runtime_tick(
+                &context.mint,
+                None,
+                context
+                    .tick_ms
+                    .saturating_add(SHADOW_QUOTE_RETRY_INTERVAL_MS),
+            )
+            .await;
+        let terminal = read_jsonl_rows(&context.canonical_path)
+            .into_iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("canonical terminal outcome");
+        (context, comparison, terminal)
     }
 
     #[test]
@@ -9976,6 +12222,120 @@ mod tests {
         assert_eq!(engine.shadow_position_time_stop_ms(), 12_345);
     }
 
+    #[test]
+    fn invalid_het_config_fails_every_non_test_constructor() {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = false;
+        let (tx, _rx) = mpsc::channel(4);
+
+        assert!(matches!(
+            MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx),
+            Err(MonitoringEngineConfigError::HetPmV2(
+                HetPmV2ConfigError::VitalitySourceDisabled
+            ))
+        ));
+    }
+
+    #[test]
+    fn authoritative_shadow_never_degrades_to_disabled() {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        config.het_pm_v2.mode = super::super::config::HetPmV2Mode::AuthoritativeShadow;
+        let (tx, _rx) = mpsc::channel(4);
+
+        assert!(matches!(
+            MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx),
+            Err(MonitoringEngineConfigError::HetPmV2(
+                HetPmV2ConfigError::AuthoritativeModeForbidden
+            ))
+        ));
+    }
+
+    #[test]
+    fn invalid_het_config_cannot_disable_v1_snapshot_or_authority() {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = false;
+        let (tx, _rx) = mpsc::channel(4);
+        let engine = MonitoringEngine::new(config, Arc::new(ShadowLedger::new()), tx);
+        assert!(engine.exit_policy_v1_status().is_some());
+        assert!(engine.het_pm_v2_status().is_none());
+
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(100),
+                Some(1_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
+                    candidate_id: "invalid-het-v1-intact".to_string(),
+                    entry_order_id: "invalid-het-v1-intact-entry".to_string(),
+                    quote_id: "invalid-het-v1-intact-quote".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:invalid-het-v1-intact".to_string()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("V1 position registration remains available");
+
+        assert!(engine
+            .materialize_post_buy_decision_snapshot(&mint, 1_500)
+            .is_some());
+        assert!(engine
+            .materialize_post_buy_snapshot_bundle(&mint, 1_500)
+            .is_none());
+    }
+
+    #[test]
+    fn route_defaults_to_unknown_without_canonical_account_state_evidence() {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        let (tx, _rx) = mpsc::channel(4);
+        let engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid HET config");
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(100),
+                Some(1_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
+                    candidate_id: "route-unknown".to_string(),
+                    entry_order_id: "route-unknown-entry".to_string(),
+                    quote_id: "route-unknown-quote".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:route-unknown".to_string()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("shadow registration");
+
+        assert_eq!(
+            engine
+                .positions
+                .read()
+                .get(&mint)
+                .expect("registered position")
+                .het_route_status,
+            RouteStatusV1::Unknown
+        );
+    }
+
     fn time_stop_v2_test_snapshot(
         slot: u64,
         timestamp_ms: u64,
@@ -10148,6 +12508,191 @@ mod tests {
                     != Some(&Value::String("position_closed".to_string()))),
             "observe-only V2 must not emit position_closed: {rows:?}"
         );
+    }
+
+    #[test]
+    fn active_profile_produces_vitality_windows_and_max_hold_remains_reachable() {
+        let mut config = pr2_guardian_config(true, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        // The TimeStop fixture carries synthetic reserve magnitudes used by
+        // its vitality windows. Keep TP out of this gate-reachability test.
+        config.target_threshold = Some(1_000_000.0);
+        // Keep the legacy inactivity gate later than AbsoluteMaxHold so this
+        // test isolates reachability of the V2 hierarchy's max-hold gate.
+        config.wait_for_timestop = Some(180_000);
+        config.het_pm_v2.vitality_min_age_ms = 11_000;
+        let (tx, _rx) = mpsc::channel(4);
+        let engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("active HET profile requires a valid vitality source");
+
+        let mint = Pubkey::new_unique();
+        let opened_at_ms = 1_000;
+        let initial = time_stop_v2_test_snapshot(1, opened_at_ms, 1.0, 100.0, 10.0, 0, 0.0);
+        register_time_stop_v2_shadow_position(
+            &engine,
+            mint,
+            opened_at_ms,
+            &initial,
+            PositionJoinMetadata::default(),
+        );
+
+        let samples = [
+            time_stop_v2_test_snapshot(2, 106_000, 1.04, 104.0, 11.0, 2, 0.2),
+            time_stop_v2_test_snapshot(3, 116_000, 1.08, 108.0, 12.0, 4, 0.4),
+            time_stop_v2_test_snapshot(4, 119_500, 1.12, 112.0, 13.0, 6, 0.6),
+            time_stop_v2_test_snapshot(5, 120_500, 1.16, 116.0, 14.0, 8, 0.8),
+            time_stop_v2_test_snapshot(6, 121_001, 1.20, 120.0, 15.0, 10, 1.0),
+        ];
+        for sample in &samples {
+            engine.remember_shadow_snapshot(&mint, sample);
+            engine.evaluate_time_stop_v2_observe_only(&mint, Some(sample), sample.timestamp_ms);
+        }
+        let mut trajectory_samples = vec![initial.clone()];
+        trajectory_samples.extend(samples.iter().cloned());
+        let history_max = engine.snapshot_history_max_snapshots();
+        let history_retention_ms = engine.snapshot_history_retention_ms();
+        {
+            let mut positions = engine.positions.write();
+            let pos = positions.get_mut(&mint).expect("registered position");
+            pos.snapshot_timeline.replace_with(
+                trajectory_samples,
+                history_max,
+                history_retention_ms,
+            );
+            // Test-injected explicit route evidence; production promotion is
+            // performed only by AccountStateCore refresh.
+            pos.het_route_status = RouteStatusV1::PumpCurveSupported;
+        }
+
+        let (bundle, _, _) = engine
+            .materialize_post_buy_snapshot_bundle(&mint, 121_001)
+            .expect("active HET bundle");
+        assert!(bundle.v2.vitality.quality_fresh);
+        assert_eq!(
+            bundle.v2.vitality.current_state,
+            super::super::exit_policy_v2::VitalityStateV1::Alive
+        );
+        assert!(bundle.v2.vitality.last_window_at_ms.is_some());
+        assert!(
+            matches!(
+                bundle.v2.trajectory.quality,
+                super::super::trajectory_v1::TrajectoryQualityV1::PartialHistory
+                    | super::super::trajectory_v1::TrajectoryQualityV1::Usable
+            ),
+            "max-hold fixture requires admissible trajectory evidence, got {:?}",
+            bundle.v2.trajectory.quality
+        );
+
+        let v1_policy = engine.exit_policy_v1.as_ref().expect("V1 policy");
+        let het_policy = engine.het_pm_v2.as_ref().expect("HET policy");
+        let v1_prequote = ExitPolicyV1::evaluate_prequote(&bundle.base, v1_policy);
+        assert!(
+            matches!(
+                &v1_prequote,
+                PreQuoteDecision::QuoteRequired { candidate }
+                    if candidate.reason() == ExitCandidateReason::AbsoluteMaxHold
+            ),
+            "expected AbsoluteMaxHold after fresh vitality windows, got {v1_prequote:?}"
+        );
+        let v2_prequote = ExitPolicyV2::evaluate_prequote(
+            bundle.view(),
+            &v1_prequote,
+            &CrashGuardPreQuoteDecision::Disabled,
+            het_policy,
+        );
+        assert_eq!(
+            v2_prequote.winning_gate,
+            super::super::exit_policy_v2::HetPmGateV2::AbsoluteMaxHold,
+            "expected max-hold after fresh vitality/trajectory evidence, got {:?}",
+            v2_prequote.candidate
+        );
+    }
+
+    #[test]
+    fn het_enabled_and_disabled_preserve_time_stop_state_and_rows() {
+        let tmp = TempDir::new().expect("tempdir");
+        let off_log = tmp.path().join("off.jsonl");
+        let on_log = tmp.path().join("on.jsonl");
+        let mut base_config = PostBuyGuardianConfig::default();
+        base_config.time_stop_v2.enabled = true;
+        base_config.time_stop_v2.first_check_ms = 3_000;
+        base_config.time_stop_v2.window_ms = 4_000;
+        base_config.time_stop_v2.failed_windows_to_signal = 3;
+        base_config.time_stop_v2.min_age_before_signal_ms = 11_000;
+
+        let mut off_config = base_config.clone();
+        off_config.het_pm_v2.enabled = false;
+        let mut on_config = base_config;
+        on_config.het_pm_v2.enabled = true;
+        let (off_tx, _off_rx) = mpsc::channel(4);
+        let (on_tx, _on_rx) = mpsc::channel(4);
+        let mut off = MonitoringEngine::new(off_config, Arc::new(ShadowLedger::new()), off_tx);
+        let mut on = MonitoringEngine::new(on_config, Arc::new(ShadowLedger::new()), on_tx);
+        off.set_shadow_lifecycle_log_path(Some(off_log.clone()));
+        on.set_shadow_lifecycle_log_path(Some(on_log.clone()));
+
+        let mint = Pubkey::new_unique();
+        let opened_at_ms = 1_000;
+        let initial = time_stop_v2_test_snapshot(1, opened_at_ms, 1.0, 100.0, 10.0, 0, 0.0);
+        register_time_stop_v2_shadow_position(
+            &off,
+            mint,
+            opened_at_ms,
+            &initial,
+            PositionJoinMetadata::default(),
+        );
+        register_time_stop_v2_shadow_position(
+            &on,
+            mint,
+            opened_at_ms,
+            &initial,
+            PositionJoinMetadata::default(),
+        );
+
+        for snapshot in [
+            time_stop_v2_test_snapshot(2, 4_000, 1.001, 100.05, 10.01, 1, 0.01),
+            time_stop_v2_test_snapshot(3, 8_000, 1.002, 100.10, 10.02, 2, 0.02),
+            time_stop_v2_test_snapshot(4, 12_000, 1.003, 100.15, 10.03, 3, 0.03),
+        ] {
+            off.evaluate_time_stop_v2_observe_only(&mint, Some(&snapshot), snapshot.timestamp_ms);
+            on.evaluate_time_stop_v2_observe_only(&mint, Some(&snapshot), snapshot.timestamp_ms);
+        }
+
+        let state_contract = |engine: &MonitoringEngine| {
+            let positions = engine.positions.read();
+            let state = &positions.get(&mint).expect("position").time_stop_v2;
+            (
+                state.next_window_index,
+                state.failed_windows,
+                state.last_status,
+                state.last_subreason,
+                state.candidate_emitted,
+                state.candidate_ts_ms,
+                state.candidate_subreason,
+                state.source_window_index,
+                state.source_checkpoint_slot,
+                state.source_latest_slot,
+            )
+        };
+        assert_eq!(state_contract(&off), state_contract(&on));
+
+        let row_contract = |path: &Path| {
+            read_jsonl_rows(path)
+                .into_iter()
+                .map(|row| {
+                    (
+                        row["time_stop_v2_window_index"].clone(),
+                        row["time_stop_v2_status"].clone(),
+                        row["time_stop_v2_subreason"].clone(),
+                        row["time_stop_v2_failed_windows"].clone(),
+                        row["time_stop_v2_candidate"].clone(),
+                        row["time_stop_v2_tx_delta_window"].clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(row_contract(&off_log), row_contract(&on_log));
     }
 
     #[test]
@@ -11531,6 +14076,803 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn het_exit_tick_persists_original_pre_mutation_comparison() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut context = setup_het_terminal_exit(&tmp, false, false);
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        let comparison_rows = read_jsonl_rows(&context.sidecar_path);
+        assert_eq!(comparison_rows.len(), 1);
+        let comparison = &comparison_rows[0];
+        assert_eq!(comparison["terminal_tick"], true);
+        assert_eq!(comparison["v1_final"], "ExitApplied");
+        assert_eq!(
+            comparison["v1_authority_receipt"]["exit_apply_status"],
+            "applied"
+        );
+        assert_eq!(
+            comparison["v1_authority_receipt"]["terminal_commit_status"],
+            "pending"
+        );
+        assert_eq!(
+            comparison["snapshot_id"],
+            comparison["v1_authority_receipt"]["snapshot_id"]
+        );
+        assert_eq!(
+            comparison["state_revision"],
+            comparison["v1_authority_receipt"]["state_revision"]
+        );
+        assert_eq!(
+            comparison["remaining_quantity_raw"],
+            comparison["v1_authority_receipt"]["remaining_quantity_raw"]
+        );
+
+        let terminal_rows = read_jsonl_rows(&context.canonical_path);
+        let terminal = terminal_rows
+            .iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("canonical terminal truth");
+        assert_eq!(
+            terminal_het_source_ref(terminal, "comparison_id"),
+            comparison["comparison_id"].as_str()
+        );
+        assert_eq!(
+            terminal_het_source_ref(terminal, "source_snapshot_id"),
+            comparison["snapshot_id"].as_str()
+        );
+        assert_eq!(
+            terminal_het_source_ref(terminal, "comparison_write_status"),
+            Some("written")
+        );
+        assert_eq!(
+            terminal_het_source_ref(terminal, "v1_action_id"),
+            comparison["v1_authority_receipt"]["action_id"].as_str()
+        );
+        assert_eq!(context.engine.active_position_count(), 0);
+        assert!(matches!(
+            context.terminal_rx.try_recv(),
+            Ok(ShadowTerminalDisposition::SimulatedClosed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn het_terminal_retry_uses_original_comparison_without_v2_reevaluation() {
+        let tmp = TempDir::new().expect("tempdir");
+        let context = setup_het_terminal_exit(&tmp, true, false);
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+        let before_retry = read_jsonl_rows(&context.sidecar_path);
+        assert_eq!(before_retry.len(), 1);
+        let comparison_id = before_retry[0]["comparison_id"].clone();
+        let snapshot_id = before_retry[0]["snapshot_id"].clone();
+        {
+            let positions = context.engine.positions.read();
+            let pending = positions[&context.mint]
+                .pending_terminal_commit
+                .as_ref()
+                .expect("retained terminal commit");
+            assert!(matches!(
+                pending.het_comparison_write_status,
+                HetComparisonWriteStatusV1::Written
+            ));
+            let prepared = pending
+                .prepared_het_comparison
+                .as_ref()
+                .expect("retained original comparison");
+            assert_eq!(prepared.correlation().comparison_id, comparison_id);
+            assert_eq!(prepared.correlation().source_snapshot_id, snapshot_id);
+        }
+
+        std::fs::remove_dir(&context.canonical_path).expect("repair canonical writer");
+        context
+            .engine
+            .run_shadow_runtime_tick(
+                &context.mint,
+                None,
+                context
+                    .tick_ms
+                    .saturating_add(SHADOW_QUOTE_RETRY_INTERVAL_MS),
+            )
+            .await;
+
+        let after_retry = read_jsonl_rows(&context.sidecar_path);
+        assert_eq!(
+            after_retry.len(),
+            1,
+            "retry must not reevaluate or rewrite V2"
+        );
+        assert_eq!(after_retry[0]["comparison_id"], comparison_id);
+        assert_eq!(after_retry[0]["snapshot_id"], snapshot_id);
+        let terminal = read_jsonl_rows(&context.canonical_path)
+            .into_iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("terminal truth after retry");
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_id"),
+            comparison_id.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn het_terminal_retry_success_emits_exactly_one_terminal_outcome_for_original_action() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (mut context, comparison, terminal) = complete_het_terminal_retry(&tmp).await;
+        let canonical_rows = read_jsonl_rows(&context.canonical_path);
+        assert_eq!(
+            canonical_rows
+                .iter()
+                .filter(|row| row["event_kind"] == "TERMINAL_TRUTH")
+                .count(),
+            1
+        );
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_id"),
+            comparison["comparison_id"].as_str()
+        );
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "v1_action_id"),
+            comparison["v1_authority_receipt"]["action_id"].as_str()
+        );
+        assert_eq!(context.engine.active_position_count(), 0);
+        assert!(matches!(
+            context.terminal_rx.try_recv(),
+            Ok(ShadowTerminalDisposition::SimulatedClosed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn exit_applied_with_terminal_commit_pending_is_not_labeled_generic_pending_recovery() {
+        let tmp = TempDir::new().expect("tempdir");
+        let context = setup_het_terminal_exit(&tmp, true, false);
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        let comparison = read_jsonl_rows(&context.sidecar_path)
+            .into_iter()
+            .next()
+            .expect("exit comparison");
+        assert_eq!(comparison["v1_final"], "ExitApplied");
+        assert_eq!(
+            comparison["v1_authority_receipt"]["outcome"],
+            "exit_applied"
+        );
+        assert_eq!(
+            comparison["v1_authority_receipt"]["exit_apply_status"],
+            "applied"
+        );
+        assert_eq!(
+            comparison["v1_authority_receipt"]["terminal_commit_status"],
+            "pending"
+        );
+        assert!(context.engine.has_pending_terminal_commit(&context.mint));
+    }
+
+    #[tokio::test]
+    async fn process_boundary_after_canonical_commit_cannot_silently_erase_exit_comparison() {
+        let tmp = TempDir::new().expect("tempdir");
+        let context = setup_het_terminal_exit(&tmp, true, false);
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        let comparison_rows = read_jsonl_rows(&context.sidecar_path);
+        assert_eq!(comparison_rows.len(), 1);
+        assert!(context.canonical_path.is_dir());
+        assert!(context.engine.has_pending_terminal_commit(&context.mint));
+        let lifecycle_rows = read_jsonl_rows(&context.lifecycle_path);
+        let closed = lifecycle_rows
+            .iter()
+            .find(|row| row["record_type"] == "position_closed")
+            .expect("operational terminal record");
+        assert_eq!(closed["het_pm_v2_comparison_write_status"], "written");
+        assert_eq!(
+            closed["het_pm_v2_comparison_id"],
+            comparison_rows[0]["comparison_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_sidecar_failure_records_typed_skipped_without_blocking_capacity_release() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut context = setup_het_terminal_exit(&tmp, false, true);
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        assert_eq!(context.engine.active_position_count(), 0);
+        assert!(!context.engine.has_pending_terminal_commit(&context.mint));
+        assert!(matches!(
+            context.terminal_rx.try_recv(),
+            Ok(ShadowTerminalDisposition::SimulatedClosed { .. })
+        ));
+        let lifecycle_rows = read_jsonl_rows(&context.lifecycle_path);
+        let closed = lifecycle_rows
+            .iter()
+            .find(|row| row["record_type"] == "position_closed")
+            .expect("operational terminal record");
+        assert_eq!(closed["het_pm_v2_comparison_write_status"], "skipped");
+        assert_eq!(
+            closed["het_pm_v2_comparison_skip_reason"],
+            "writer_io_failed"
+        );
+        let terminal = read_jsonl_rows(&context.canonical_path)
+            .into_iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("canonical terminal truth");
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_write_status"),
+            Some("skipped")
+        );
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_skip_reason"),
+            Some("writer_io_failed")
+        );
+    }
+
+    fn setup_stalled_nonterminal_het_engine(
+        queue_capacity: usize,
+    ) -> (Arc<MonitoringEngine>, Pubkey) {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        config.het_pm_v2.writer_queue_capacity = queue_capacity;
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid HET-PM stalled-writer config");
+        engine.set_stalled_het_pm_v2_observation_writer(queue_capacity);
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000),
+                Some(1_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("het-stalled-nonterminal-writer".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "het-stalled-nonterminal-writer".to_string(),
+                    entry_order_id: "het-stalled-nonterminal-writer-entry".to_string(),
+                    quote_id: "het-stalled-nonterminal-writer-quote".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:het-stalled-nonterminal-writer".to_string()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("valid shadow registration");
+        (Arc::new(engine), mint)
+    }
+
+    #[tokio::test]
+    async fn slow_nonterminal_het_writer_does_not_delay_next_v1_tick() {
+        let (engine, mint) = setup_stalled_nonterminal_het_engine(1);
+        engine.run_shadow_runtime_tick(&mint, None, 1_500).await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            engine.run_shadow_runtime_tick(&mint, None, 1_600),
+        )
+        .await
+        .expect("full observer queue must not delay the next V1 tick");
+
+        let stats = engine
+            .het_pm_v2_observation_writer_stats()
+            .expect("stalled writer stats");
+        assert_eq!(stats.enqueue_attempts, 2);
+        assert_eq!(stats.enqueued, 1);
+        assert_eq!(stats.queue_full_drops, 1);
+    }
+
+    #[tokio::test]
+    async fn full_het_writer_queue_does_not_block_v1_evaluation() {
+        let (engine, mint) = setup_stalled_nonterminal_het_engine(1);
+        engine.run_shadow_runtime_tick(&mint, None, 1_500).await;
+        engine.run_shadow_runtime_tick(&mint, None, 1_600).await;
+
+        let stats = engine
+            .het_pm_v2_observation_writer_stats()
+            .expect("stalled writer stats");
+        assert_eq!(stats.enqueue_attempts, 2);
+        assert_eq!(stats.queue_full_drops, 1);
+        assert!(
+            engine.positions.read().contains_key(&mint),
+            "observer backpressure must not mutate or remove the V1 position"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_writer_cannot_trigger_missed_authority_tick() {
+        let (engine, mint) = setup_stalled_nonterminal_het_engine(1);
+        tokio::time::timeout(Duration::from_millis(150), async {
+            let mut interval = tokio::time::interval(Duration::from_millis(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            for offset in 0..5 {
+                interval.tick().await;
+                engine
+                    .run_shadow_runtime_tick(&mint, None, 1_500 + offset)
+                    .await;
+            }
+        })
+        .await
+        .expect("stalled sidecar must not overrun the authority cadence");
+
+        let stats = engine
+            .het_pm_v2_observation_writer_stats()
+            .expect("stalled writer stats");
+        assert_eq!(stats.enqueue_attempts, 5);
+        assert_eq!(stats.enqueued, 1);
+        assert_eq!(stats.queue_full_drops, 4);
+    }
+
+    #[tokio::test]
+    async fn terminal_het_writer_timeout_marks_skipped_and_continues_canonical_commit() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut context = setup_het_terminal_exit_with_writer(&tmp, false, false, Some(1));
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        assert_eq!(context.engine.active_position_count(), 0);
+        assert!(!context.engine.has_pending_terminal_commit(&context.mint));
+        assert!(matches!(
+            context.terminal_rx.try_recv(),
+            Ok(ShadowTerminalDisposition::SimulatedClosed { .. })
+        ));
+        let closed = read_jsonl_rows(&context.lifecycle_path)
+            .into_iter()
+            .find(|row| row["record_type"] == "position_closed")
+            .expect("operational terminal record");
+        assert_eq!(closed["het_pm_v2_comparison_write_status"], "skipped");
+        assert_eq!(
+            closed["het_pm_v2_comparison_skip_reason"],
+            "writer_timed_out_before_write"
+        );
+        assert!(read_jsonl_rows(&context.canonical_path)
+            .iter()
+            .any(|row| row["event_kind"] == "TERMINAL_TRUTH"));
+    }
+
+    #[tokio::test]
+    async fn terminal_het_writer_timeout_does_not_delay_capacity_beyond_configured_budget() {
+        let tmp = TempDir::new().expect("tempdir");
+        let context = setup_het_terminal_exit_with_writer(&tmp, false, false, Some(1));
+        let started = Instant::now();
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            context.engine.run_shadow_runtime_tick(
+                &context.mint,
+                Some(&context.snapshot),
+                context.tick_ms,
+            ),
+        )
+        .await
+        .expect("terminal must finish within the 10ms HET budget plus test tolerance");
+
+        assert!(
+            started.elapsed() <= Duration::from_millis(250),
+            "capacity release exceeded the configured writer budget plus tolerance"
+        );
+        assert_eq!(context.engine.active_position_count(), 0);
+        let stats = context
+            .engine
+            .het_pm_v2_observation_writer_stats()
+            .expect("stalled writer stats");
+        assert_eq!(stats.terminal_timeouts, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_writer_timeout_preserves_comparison_id_and_typed_skip_reason() {
+        let tmp = TempDir::new().expect("tempdir");
+        let context = setup_het_terminal_exit_with_writer(&tmp, false, false, Some(1));
+
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        let closed = read_jsonl_rows(&context.lifecycle_path)
+            .into_iter()
+            .find(|row| row["record_type"] == "position_closed")
+            .expect("operational terminal record");
+        let comparison_id = closed["het_pm_v2_comparison_id"]
+            .as_str()
+            .expect("comparison correlation ID");
+        assert!(!comparison_id.is_empty());
+        assert_eq!(
+            closed["het_pm_v2_comparison_skip_reason"],
+            "writer_timed_out_before_write"
+        );
+        let terminal = read_jsonl_rows(&context.canonical_path)
+            .into_iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("canonical terminal truth");
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_id"),
+            Some(comparison_id)
+        );
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_write_status"),
+            Some("skipped")
+        );
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_skip_reason"),
+            Some("writer_timed_out_before_write")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_timeout_after_writer_started_is_not_reported_as_skipped() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut context = setup_het_terminal_exit_with_writer(&tmp, false, false, Some(1));
+        let (writer_started, release_writer) = Arc::get_mut(&mut context.engine)
+            .expect("test owns the only engine reference")
+            .set_controlled_het_pm_v2_observation_writer(context.sidecar_path.clone(), 1);
+        let engine = Arc::clone(&context.engine);
+        let mint = context.mint;
+        let snapshot = context.snapshot.clone();
+        let tick_ms = context.tick_ms;
+        let tick = tokio::spawn(async move {
+            engine
+                .run_shadow_runtime_tick(&mint, Some(&snapshot), tick_ms)
+                .await;
+        });
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                match writer_started.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => panic!("controlled writer start channel failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("worker must start I/O before the terminal budget expires");
+        tick.await.expect("terminal tick task");
+
+        assert_eq!(context.engine.active_position_count(), 0);
+        assert!(!context.engine.has_pending_terminal_commit(&context.mint));
+        assert!(matches!(
+            context.terminal_rx.try_recv(),
+            Ok(ShadowTerminalDisposition::SimulatedClosed { .. })
+        ));
+        let closed = read_jsonl_rows(&context.lifecycle_path)
+            .into_iter()
+            .find(|row| row["record_type"] == "position_closed")
+            .expect("operational terminal record");
+        assert_eq!(
+            closed["het_pm_v2_comparison_write_status"],
+            "outcome_unknown"
+        );
+        assert_eq!(
+            closed["het_pm_v2_comparison_outcome_unknown_reason"],
+            "writer_ack_timed_out"
+        );
+        assert!(closed["het_pm_v2_comparison_skip_reason"].is_null());
+        let terminal = read_jsonl_rows(&context.canonical_path)
+            .into_iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("canonical terminal truth");
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_write_status"),
+            Some("outcome_unknown")
+        );
+        assert_eq!(
+            terminal_het_source_ref(&terminal, "comparison_outcome_unknown_reason"),
+            Some("writer_ack_timed_out")
+        );
+
+        release_writer.send(()).expect("release controlled writer");
+        let comparisons = wait_for_jsonl_rows(&context.sidecar_path, 1).await;
+        assert_eq!(
+            comparisons[0]["comparison_id"], closed["het_pm_v2_comparison_id"],
+            "late successful write remains correlated without contradicting OutcomeUnknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_health_artifact_durably_exposes_nonterminal_queue_drops() {
+        let tmp = TempDir::new().expect("tempdir");
+        let sidecar_path = tmp.path().join("het_pm_v2_observations_v1.jsonl");
+        let (mut engine, mint) = setup_stalled_nonterminal_het_engine(1);
+        let (writer_started, release_writer) = Arc::get_mut(&mut engine)
+            .expect("test owns the only engine reference")
+            .set_controlled_het_pm_v2_observation_writer(sidecar_path.clone(), 1);
+
+        engine.run_shadow_runtime_tick(&mint, None, 1_500).await;
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                match writer_started.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => panic!("controlled writer start channel failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("first comparison must enter writer I/O");
+        engine.run_shadow_runtime_tick(&mint, None, 1_600).await;
+        engine.run_shadow_runtime_tick(&mint, None, 1_700).await;
+
+        let health = wait_for_writer_health(tmp.path(), |record| {
+            record["enqueue_attempts"] == 3 && record["queue_full_drops"] == 1
+        })
+        .await;
+        assert_eq!(health["run_id"], "het-stalled-nonterminal-writer");
+        assert_eq!(health["comparison_attempts"], 3);
+        assert_eq!(health["comparison_ready_for_enqueue"], 3);
+        assert_eq!(health["core_validation_skips"], 0);
+        assert_eq!(health["final_validation_skips"], 0);
+        assert_eq!(health["serialization_skips"], 0);
+        assert_eq!(health["payload_oversized_skips"], 0);
+        assert_eq!(health["enqueued"], 2);
+        assert_eq!(health["writes_succeeded"], 0);
+        assert_eq!(health["shutdown_complete"], false);
+
+        release_writer.send(()).expect("release first write");
+        wait_for_jsonl_rows(&sidecar_path, 1).await;
+        release_writer.send(()).expect("release second write");
+        wait_for_jsonl_rows(&sidecar_path, 2).await;
+        engine.flush_het_pm_v2_writer_health_for_shutdown().await;
+
+        let final_health = wait_for_writer_health(tmp.path(), |record| {
+            record["shutdown_complete"] == true && record["writes_succeeded"] == 2
+        })
+        .await;
+        assert_eq!(final_health["comparison_attempts"], 3);
+        assert_eq!(final_health["comparison_ready_for_enqueue"], 3);
+        assert_eq!(final_health["enqueue_attempts"], 3);
+        assert_eq!(final_health["queue_full_drops"], 1);
+        assert_eq!(final_health["writes_failed"], 0);
+        let rows = read_jsonl_rows(&sidecar_path);
+        let writer_instance_id = final_health["writer_instance_id"]
+            .as_str()
+            .expect("writer instance id");
+        assert!(
+            rows.iter()
+                .all(|row| row["writer_instance_id"].as_str() == Some(writer_instance_id)),
+            "every comparison row must bind to the durable writer-health instance"
+        );
+        drop(engine);
+    }
+
+    #[tokio::test]
+    async fn actual_v1_receipt_and_v2_record_share_exact_snapshot_id_revision_quantity() {
+        let tmp = TempDir::new().expect("tempdir");
+        let sidecar_path = tmp.path().join("het_pm_v2_observations_v1.jsonl");
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        let expected_time_stop_v2_hash = config
+            .time_stop_v2
+            .projection_config_hash()
+            .expect("serializable TimeStop V2 config");
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid HET-PM runtime config");
+        let expected_v1_hash = engine
+            .exit_policy_v1
+            .as_ref()
+            .expect("V1 policy")
+            .config_hash()
+            .to_string();
+        engine.set_het_pm_v2_observation_log_path(Some(sidecar_path.clone()));
+        let engine = Arc::new(engine);
+
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000),
+                Some(1_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("exact-shared-bundle".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "exact-shared-bundle".to_string(),
+                    entry_order_id: "exact-shared-bundle-entry".to_string(),
+                    quote_id: "exact-shared-bundle-quote".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:exact-shared-bundle".to_string()),
+                    position_epoch: Some(3),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("valid shadow registration");
+
+        engine.run_shadow_runtime_tick(&mint, None, 1_500).await;
+
+        let rows = wait_for_jsonl_rows(&sidecar_path, 1).await;
+        assert_eq!(rows.len(), 1, "one comparison row per HET tick");
+        let row = &rows[0];
+        let receipt = row["v1_authority_receipt"]
+            .as_object()
+            .expect("typed V1 authority receipt");
+        assert_eq!(receipt.get("snapshot_id"), row.get("snapshot_id"));
+        assert_eq!(receipt.get("state_revision"), row.get("state_revision"));
+        assert_eq!(
+            receipt.get("remaining_quantity_raw"),
+            row.get("remaining_quantity_raw")
+        );
+        assert_eq!(
+            receipt.get("outcome"),
+            Some(&Value::String("blocked".into()))
+        );
+        assert_eq!(row["v1_policy_id"], EXIT_POLICY_V1_ID);
+        assert_eq!(row["v1_policy_version"], EXIT_POLICY_V1_VERSION);
+        assert_eq!(row["v1_policy_config_hash"], expected_v1_hash);
+        assert_eq!(row["time_stop_v2_config_hash"], expected_time_stop_v2_hash);
+    }
+
+    #[tokio::test]
+    async fn v1_unknown_prequote_is_receipted_as_blocked_not_hold() {
+        let tmp = TempDir::new().expect("tempdir");
+        let sidecar_path = tmp.path().join("het_pm_v2_observations_v1.jsonl");
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid HET-PM runtime config");
+        engine.set_het_pm_v2_observation_log_path(Some(sidecar_path.clone()));
+        let engine = Arc::new(engine);
+
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000),
+                Some(1_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("v1-unknown-receipt".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "v1-unknown-receipt".to_string(),
+                    entry_order_id: "v1-unknown-receipt-entry".to_string(),
+                    quote_id: "v1-unknown-receipt-quote".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:v1-unknown-receipt".to_string()),
+                    position_epoch: Some(4),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("valid shadow registration");
+
+        let stale = MarketSnapshot {
+            slot: Some(2),
+            timestamp_ms: 1_000,
+            price_sol_per_token: 1.0,
+            price_state: PriceState::Valid,
+            market_cap_sol: 1.0,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 1.0,
+            ..MarketSnapshot::default()
+        };
+        engine
+            .run_shadow_runtime_tick(&mint, Some(&stale), 10_000)
+            .await;
+
+        let rows = wait_for_jsonl_rows(&sidecar_path, 1).await;
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["v1_prequote"], "unknown:MarkStale");
+        assert_eq!(row["v1_final"], "Blocked");
+        assert_eq!(row["v1_authority_receipt"]["outcome"], "blocked");
+        assert_eq!(
+            row["v1_authority_receipt"]["reason"],
+            "prequote_unknown:MarkStale"
+        );
+        assert!(engine.positions.read().contains_key(&mint));
+    }
+
+    #[tokio::test]
+    async fn het_sidecar_writer_failure_cannot_retain_v1_terminal_or_capacity() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
+        let sidecar_path = tmp.path().join("het_pm_v2_observations_v1.jsonl");
+        std::fs::create_dir(&sidecar_path).expect("fault injection sidecar directory");
+
+        let mut config = PostBuyGuardianConfig::default();
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::new(config, Arc::new(ShadowLedger::new()), tx);
+        enable_baseline_exit_policy(&mut engine);
+        enable_terminal_truth_harness(&mut engine, tmp.path());
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_log));
+        engine.set_het_pm_v2_observation_log_path(Some(sidecar_path));
+        let engine = Arc::new(engine);
+
+        let mint = Pubkey::new_unique();
+        let registered = engine
+            .register_shadow_position_with_terminal(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000),
+                Some(1_000),
+                PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("het-sidecar-writer-fault".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "het-sidecar-writer-fault".to_string(),
+                    entry_order_id: "het-sidecar-writer-fault-entry".to_string(),
+                    quote_id: "het-sidecar-writer-fault-quote".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:het-sidecar-writer-fault".to_string()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1_000),
+                },
+            )
+            .expect("valid shadow registration");
+        let mut terminal_rx = registered.terminal_rx;
+
+        let trigger_ms = 1_000 + SHADOW_POSITION_TIME_STOP_MS + 1;
+        engine
+            .run_shadow_runtime_tick(&mint, None, trigger_ms)
+            .await;
+        engine
+            .run_shadow_runtime_tick(&mint, None, trigger_ms + 5_000)
+            .await;
+
+        assert_eq!(engine.active_position_count(), 0);
+        assert!(!engine.has_pending_terminal_commit(&mint));
+        assert!(matches!(
+            terminal_rx.try_recv(),
+            Ok(ShadowTerminalDisposition::SimulationBlocked {
+                reason: ShadowUnresolvedReason::BlockedByData,
+                ..
+            })
+        ));
+        let canonical_rows = read_jsonl_rows(&tmp.path().join("shadow_position_event_v2.jsonl"));
+        assert_eq!(
+            canonical_rows
+                .iter()
+                .filter(|row| row["event_kind"] == "TERMINAL_TRUTH")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn shadow_runtime_stale_price_does_not_create_price_triggered_proposal() {
         let tmp = TempDir::new().expect("tempdir");
         let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
@@ -11598,5 +14940,215 @@ mod tests {
             MarkEvidenceStatus::Stale
         );
         assert!(!decision_snapshot.has_pending_proposal());
+    }
+
+    #[test]
+    fn het_anchor_apply_is_observer_only_guarded_and_never_moves_down() {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        let policy = EffectiveHetPmV2Config::from_guardian(&config).expect("HET config");
+        let (tx, _rx) = mpsc::channel(4);
+        let engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("monitoring engine");
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000_000),
+                Some(1_000_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
+                    candidate_id: "het-anchor".to_string(),
+                    entry_order_id: "het-anchor-entry".to_string(),
+                    quote_id: "het-anchor-quote".to_string(),
+                    slot: Some(10),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:het-anchor".to_string()),
+                    position_epoch: Some(3),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("position");
+        let (state_revision, quantity) = {
+            let mut positions = engine.positions.write();
+            let position = positions.get_mut(&mint).expect("position state");
+            // Anchor materialization requires explicit route evidence. In
+            // production only AccountStateCore promotes this status.
+            position.het_route_status = RouteStatusV1::PumpCurveSupported;
+            (position.state_revision, position.remaining_token_amount_raw)
+        };
+        let key = ExecutableQuoteKeyV2 {
+            position_id: "shadow:het-anchor".to_string(),
+            position_epoch: 3,
+            state_revision,
+            remaining_quantity_raw: quantity,
+            route_id: "pump_curve".to_string(),
+            quote_model_id: "price_truth_resolver_shadow_curve_v1".to_string(),
+            sample_slot: Some(11),
+            sample_timestamp_ms: Some(2_000),
+        };
+        let request = PeakAnchorPreQuoteDecisionV1::QuoteRequired {
+            key: key.clone(),
+            peak_mark_price_sol: 1.2,
+            source_snapshot_id: "snapshot:peak".to_string(),
+        };
+        let truth = ShadowExitTruth {
+            exit_price_sol: 1.1,
+            exit_token_amount_raw: quantity,
+            entry_value_sol: 1.0,
+            exit_value_sol: 1.1,
+            gross_pnl_sol: 0.1,
+            net_pnl_sol: 0.1,
+            estimated_costs_sol: 0.0,
+            pnl_pct: 10.0,
+            evidence: PriceTruthEvidence {
+                source: PriceTruthSource::CanonicalAccountStateSnapshot,
+                status: PriceTruthStatus::Resolved,
+                detail: None,
+                slot: Some(11),
+                timestamp_ms: Some(2_000),
+                age_ms: Some(0),
+                price_state: Some(PriceState::Valid),
+                price_reason: None,
+            },
+        };
+        let cells = vec![HetPmV2QuoteCell {
+            key: key.clone(),
+            outcome: Ok(truth),
+        }];
+
+        assert!(engine.apply_het_pm_v2_anchor_after_v1(
+            &mint,
+            &request,
+            &cells,
+            Some(1_000_000_000),
+            policy.config_hash(),
+            2_000,
+        ));
+        {
+            let positions = engine.positions.read();
+            let position = positions.get(&mint).expect("position state");
+            assert_eq!(position.state_revision, state_revision);
+            assert_eq!(
+                position
+                    .het_executable_peak_anchor
+                    .as_ref()
+                    .map(|anchor| anchor.peak_mark_price_sol),
+                Some(1.2)
+            );
+        }
+        assert!(
+            !engine.apply_het_pm_v2_anchor_after_v1(
+                &mint,
+                &request,
+                &cells,
+                Some(1_000_000_000),
+                policy.config_hash(),
+                2_500,
+            ),
+            "the same or lower peak cannot replace the historical anchor"
+        );
+
+        {
+            let mut positions = engine.positions.write();
+            positions.get_mut(&mint).expect("position").state_revision += 1;
+        }
+        let stale_request = PeakAnchorPreQuoteDecisionV1::QuoteRequired {
+            key,
+            peak_mark_price_sol: 1.3,
+            source_snapshot_id: "snapshot:stale".to_string(),
+        };
+        assert!(
+            !engine.apply_het_pm_v2_anchor_after_v1(
+                &mint,
+                &stale_request,
+                &cells,
+                Some(1_000_000_000),
+                policy.config_hash(),
+                3_000,
+            ),
+            "stale observer guard must not mutate the anchor"
+        );
+    }
+
+    #[test]
+    fn het_quote_plan_deduplicates_exact_keys_and_preserves_full_quantity_and_provenance() {
+        let base_key = ExecutableQuoteKeyV2 {
+            position_id: "shadow:quote-plan".to_string(),
+            position_epoch: 4,
+            state_revision: 9,
+            remaining_quantity_raw: 777,
+            route_id: "pump_curve".to_string(),
+            quote_model_id: "price_truth_resolver_shadow_curve_v1".to_string(),
+            sample_slot: None,
+            sample_timestamp_ms: None,
+        };
+        let projected = MarketSnapshot {
+            timestamp_ms: 10_000,
+            slot: Some(100),
+            ..MarketSnapshot::default()
+        };
+        let raw = MarketSnapshot {
+            timestamp_ms: 10_500,
+            slot: Some(101),
+            ..MarketSnapshot::default()
+        };
+
+        let hold_plan = HetPmV2QuotePlan::default();
+        assert!(
+            hold_plan.cells.is_empty(),
+            "Hold must not allocate a quote cell"
+        );
+
+        let mut plan = HetPmV2QuotePlan::default();
+        let projected_key = plan.add(base_key.clone(), &projected);
+        let duplicate_key = plan.add(base_key.clone(), &projected);
+        assert_eq!(projected_key, duplicate_key);
+        assert_eq!(plan.cells.len(), 1, "the same key resolves at most once");
+        assert_eq!(projected_key.remaining_quantity_raw, 777);
+
+        let raw_key = plan.add(base_key, &raw);
+        assert_ne!(projected_key, raw_key);
+        assert_eq!(plan.cells.len(), HET_PM_V2_MAX_QUOTE_CELLS);
+        assert_eq!(raw_key.sample_slot, Some(101));
+        assert_eq!(raw_key.sample_timestamp_ms, Some(10_500));
+
+        let next_tick = HetPmV2QuotePlan::default();
+        assert!(
+            next_tick.cells.is_empty(),
+            "the quote plan must not cache cells between monitor ticks"
+        );
+    }
+
+    #[test]
+    fn timestop_projection_is_immutable_and_does_not_advance_window_state() {
+        let initial = time_stop_v2_test_snapshot(1, 1_000, 1.0, 100.0, 10.0, 1, 1.0);
+        let latest = time_stop_v2_test_snapshot(2, 4_000, 1.1, 110.0, 11.0, 2, 2.0);
+        let cfg = TimeStopV2Config {
+            enabled: true,
+            ..TimeStopV2Config::default()
+        };
+        let mut state = TimeStopV2State::from_registration(Some(&initial));
+        state
+            .evaluate(&cfg, 1_000, Some(1.0), Some(&latest), 4_000)
+            .expect("due window");
+        let index_before = state.next_window_index;
+        let failed_before = state.failed_windows;
+        let first = state.project(4_000, cfg.window_ms());
+        let second = state.project(4_000, cfg.window_ms());
+
+        assert_eq!(state.next_window_index, index_before);
+        assert_eq!(state.failed_windows, failed_before);
+        assert_eq!(first.current_status, second.current_status);
+        assert_eq!(first.current_subreason, second.current_subreason);
+        assert_eq!(
+            first.consecutive_non_alive_windows,
+            second.consecutive_non_alive_windows
+        );
+        assert_eq!(first.source_window_index, second.source_window_index);
     }
 }
