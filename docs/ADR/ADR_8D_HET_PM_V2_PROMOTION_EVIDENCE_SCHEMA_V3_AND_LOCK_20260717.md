@@ -4,7 +4,11 @@ Data: 2026-07-17
 
 Typ: ADR-8D / PR #73 promotion-evidence prerequisite / observe-only telemetry
 
-Status: Accepted for implementation; template criteria remains intentionally non-promotable until `lock-criteria` materializes the reviewed release contract.
+Status: Accepted and materialized. Contract został zablokowany po buildzie reviewed
+release binary z `7e162a9d1ebd8e62f0079a21897cbd3bfec84057`; criteria zapisują jej
+SHA-256 `8f38ee7879f4c8ce58b43c3757b4fe1cd09d4b398a07e56d99165c690e6a3804`.
+Pozostaje niepromowalny wyłącznie dlatego, że nie istnieją jeszcze dwa wymagane
+prospective validation runy ani source-recomputed promotion artifact.
 
 ## D1. Problem
 
@@ -25,7 +29,7 @@ Poza zakresem pozostają:
 - authority cutover PR B;
 - jakakolwiek zmiana V1 proposal/apply/terminal/capacity ownership;
 - interpretowanie obecnego r2a jako finalnego validation runu;
-- uruchomienie prospective runu przed materializacją locka.
+- uruchomienie prospective runu i jakakolwiek promocja authority.
 
 ## D3. Root cause
 
@@ -75,7 +79,8 @@ Pełny SHA-256 pliku konfiguracji jest celowo wrażliwy na operational fields (r
 - Rzeczywiste same-tick Crash + Trailing jest mierzalne jednym payloadem i nie wymaga sztucznego duplikowania comparison rows.
 - Późniejszy PR B może wybierać authoritative winnera z pełnej lattice po odfiltrowaniu gate'ów bez authority, bez niejawnej promocji CrashGuarda.
 - Stare r2a/schema-V2 pozostaje diagnostic/calibration i nie może przejść production evidence evaluation.
-- Criteria template sam z siebie nie może udawać frozen/prospective contractu.
+- Zablokowane criteria wiążą konkretny reviewed source commit, binarkę,
+  brain config, dwa exact run-configi i wspólny behavioural contract.
 - Writer timeout nie blokuje shutdown, lecz brak durable health pozostaje fail-closed dla Gate 1.
 
 ## D6. Implementacja
@@ -107,7 +112,11 @@ Test Rust materializuje prawdziwy CrashGuard prequote z V1 i prawdziwy Trailing 
 
 ## D8. Ryzyka i następne kroki
 
-1. Po tym PR należy najpierw zbudować release binary z reviewed source commit.
-2. Następnie trzeba wykonać `lock-criteria` na dwóch nowych, prospective run-configach; wynikowy locked criteria file ma zostać committed.
-3. Dopiero wtedy można uruchomić dwa niezależne validation runy bez dalszego strojenia.
-4. PR B nadal wymaga osobnego implementation review dla deploy drain, `PendingExitProposal`/pending terminal, selective hierarchy i AbsoluteMaxHold ponad blocked gate.
+1. Release binary z reviewed source i `lock-criteria` zostały już materializowane
+   oraz committed w PR #73; ich identities są polami criteria, a nie opisem
+   operatorskim.
+2. Następnym krokiem są dokładnie dwa nowe, niezależne prospective validation
+   runy bez dalszego strojenia.
+3. PR B nadal wymaga osobnego implementation review dla deploy drain,
+   `PendingExitProposal`/pending terminal, selective hierarchy i
+   `AbsoluteMaxHold` ponad blocked gate.
