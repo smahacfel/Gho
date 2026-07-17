@@ -109,14 +109,51 @@ def fixture() -> dict:
     }
 
 
+def writer_health_fixture() -> dict:
+    return {
+        "schema_version": 1,
+        "artifact_type": "het_pm_v2_writer_health",
+        "writer_instance_id": "writer-1",
+        "run_id": "run-1",
+        "mixed_run_ids": False,
+        "shutdown_complete": True,
+        "policy_id": "hierarchical_executable_trajectory_pm_v2",
+        "policy_version": 2,
+        "policy_config_hash": "config-hash-1",
+        "sidecar_path": "het_pm_v2_observations_v1.jsonl",
+        "started_at_ms": 1_000,
+        "snapshot_generated_at_ms": 20_000,
+        "revision": 3,
+        "enqueue_attempts": 1,
+        "enqueued": 1,
+        "queue_full_drops": 0,
+        "queue_closed_drops": 0,
+        "writes_succeeded": 1,
+        "writes_failed": 0,
+        "cancelled_before_write": 0,
+        "terminal_timeouts": 0,
+        "terminal_outcome_unknown": 0,
+    }
+
+
 class AnalysisContractTest(unittest.TestCase):
     def test_identical_input_produces_identical_report(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "input.jsonl"
+            health_path = Path(temp_dir) / "writer-health.json"
             path.write_text(json.dumps(fixture(), sort_keys=True) + "\n", encoding="utf-8")
+            health_path.write_text(
+                json.dumps(writer_health_fixture(), sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
             records, inputs = MODULE.load_records([path])
-            first = MODULE.canonical_json(MODULE.analyze(records, inputs, 0.0005))
-            second = MODULE.canonical_json(MODULE.analyze(records, inputs, 0.0005))
+            health_records, health_inputs = MODULE.load_writer_health([health_path])
+            first = MODULE.canonical_json(
+                MODULE.analyze(records, inputs, 0.0005, health_records, health_inputs)
+            )
+            second = MODULE.canonical_json(
+                MODULE.analyze(records, inputs, 0.0005, health_records, health_inputs)
+            )
             self.assertEqual(first, second)
             report = json.loads(first)
             self.assertEqual(report["position_count"], 1)
@@ -146,6 +183,71 @@ class AnalysisContractTest(unittest.TestCase):
                 report["independently_measured_integrity"]["status"],
                 "not_evaluated_requires_lifecycle_reconciliation_artifact",
             )
+            self.assertEqual(
+                report["coverage"]["writer_health"]["writer_health_evidence_status"],
+                "complete",
+            )
+            self.assertEqual(
+                report["coverage"]["writer_health"]["capture_ratio"], 1.0
+            )
+            self.assertTrue(
+                report["coverage"]["writer_health"][
+                    "promotion_evidence_available"
+                ]
+            )
+
+    def test_missing_writer_health_marks_coverage_unknown(self) -> None:
+        report = MODULE.analyze([fixture()], [], 0.0005)
+
+        health = report["coverage"]["writer_health"]
+        self.assertEqual(health["writer_health_evidence_status"], "missing")
+        self.assertTrue(health["coverage_unknown"])
+        self.assertFalse(health["promotion_evidence_available"])
+
+    def test_writer_health_exposes_dropped_denominator(self) -> None:
+        health_record = writer_health_fixture()
+        health_record.update(
+            {
+                "enqueue_attempts": 3,
+                "enqueued": 1,
+                "queue_full_drops": 2,
+            }
+        )
+
+        report = MODULE.analyze([fixture()], [], 0.0005, [health_record], [])
+
+        health = report["coverage"]["writer_health"]
+        self.assertFalse(health["coverage_unknown"])
+        self.assertEqual(
+            health["writer_health_evidence_status"],
+            "complete_with_observation_loss",
+        )
+        self.assertAlmostEqual(health["capture_ratio"], 1.0 / 3.0)
+        self.assertAlmostEqual(health["drop_ratio"], 2.0 / 3.0)
+        self.assertFalse(health["promotion_evidence_available"])
+
+    def test_unclean_writer_health_cannot_support_promotion(self) -> None:
+        health_record = writer_health_fixture()
+        health_record["shutdown_complete"] = False
+
+        report = MODULE.analyze([fixture()], [], 0.0005, [health_record], [])
+
+        health = report["coverage"]["writer_health"]
+        self.assertTrue(health["coverage_unknown"])
+        self.assertFalse(health["all_writers_shutdown_cleanly"])
+        self.assertFalse(health["promotion_evidence_available"])
+
+    def test_invalid_writer_health_counters_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "writer-health.json"
+            row = writer_health_fixture()
+            row["writes_succeeded"] = 2
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                MODULE.ContractError, "completion counters exceed enqueued"
+            ):
+                MODULE.load_writer_health([path])
 
     def test_v1_owned_quote_is_not_misattributed_to_v2_hold(self) -> None:
         row = fixture()

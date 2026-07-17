@@ -2745,6 +2745,7 @@ pub async fn run(
     }
     if let Some(monitor) = shadow_monitor.as_ref() {
         monitor.flush_exit_replay_for_shutdown().await;
+        monitor.flush_het_pm_v2_writer_health_for_shutdown().await;
     }
     if let Some(handle) = shadow_signal_router_handle.take() {
         handle.abort();

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Deterministic offline summary for HET-PM V2 PR A observations.
 
-The tool consumes only `het_pm_v2_observations_v1.jsonl`. It never edits
-runtime artifacts and never promotes V2. Its denominator is the immutable
-`(position_id, position_epoch)` identity, not the number of ticks.
+The tool consumes comparison JSONL plus an independent writer-health artifact.
+It never edits runtime artifacts and never promotes V2. Its position denominator
+is the immutable `(position_id, position_epoch)` identity, while writer capture
+uses durable enqueue-attempt counters rather than surviving rows alone.
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ V1_POLICY_ID = "position_manager_lite_exit_policy_v1"
 V1_POLICY_VERSION = 1
 SAMPLING_MODE = "latest_canonical_state_per_monitor_tick"
 TRAJECTORY_GRADE = "online_non_lookahead_sampled_trajectory"
+WRITER_HEALTH_SCHEMA_VERSION = 1
+WRITER_HEALTH_ARTIFACT_TYPE = "het_pm_v2_writer_health"
 COLLAPSED_CANONICAL_UPDATES = 1 << 3
 SAME_SLOT_ONLY = 1 << 4
 ROUTES = {"pump_curve_supported", "curve_complete_pump_swap_unsupported", "unknown"}
@@ -85,6 +88,17 @@ QUOTE_FAILURE_KINDS = {
     "MissingSnapshot", "StaleSnapshot", "InvalidReserves", "InvalidNormalization",
     "QuantityMismatch", "ZeroOutput", "SemanticViolation", "InternalFailure",
 }
+WRITER_HEALTH_COUNTERS = (
+    "enqueue_attempts",
+    "enqueued",
+    "queue_full_drops",
+    "queue_closed_drops",
+    "writes_succeeded",
+    "writes_failed",
+    "cancelled_before_write",
+    "terminal_timeouts",
+    "terminal_outcome_unknown",
+)
 
 
 class ContractError(ValueError):
@@ -506,6 +520,111 @@ def load_records(paths: Iterable[Path]) -> tuple[list[dict[str, Any]], list[dict
     return records, inputs
 
 
+def validate_writer_health(record: dict[str, Any], source: str) -> None:
+    reject_non_finite(record, source)
+    if require(record, "schema_version", int) != WRITER_HEALTH_SCHEMA_VERSION:
+        raise ContractError(f"{source}: unsupported writer-health schema_version")
+    if require(record, "artifact_type", str) != WRITER_HEALTH_ARTIFACT_TYPE:
+        raise ContractError(f"{source}: unexpected writer-health artifact_type")
+    if not require(record, "writer_instance_id", str):
+        raise ContractError(f"{source}: empty writer_instance_id")
+    if not require(record, "run_id", str):
+        raise ContractError(f"{source}: empty writer-health run_id")
+    if require(record, "mixed_run_ids", bool):
+        raise ContractError(f"{source}: writer-health reports mixed run IDs")
+    require(record, "shutdown_complete", bool)
+    if require(record, "policy_id", str) != POLICY_ID:
+        raise ContractError(f"{source}: unexpected writer-health policy_id")
+    if require(record, "policy_version", int) != POLICY_VERSION:
+        raise ContractError(f"{source}: unsupported writer-health policy_version")
+    if not require(record, "policy_config_hash", str):
+        raise ContractError(f"{source}: empty writer-health policy_config_hash")
+    if not require(record, "sidecar_path", str):
+        raise ContractError(f"{source}: empty writer-health sidecar_path")
+    require(record, "started_at_ms", int)
+    require(record, "snapshot_generated_at_ms", int)
+    require(record, "revision", int)
+    for name in WRITER_HEALTH_COUNTERS:
+        if require(record, name, int) < 0:
+            raise ContractError(f"{source}: negative writer-health counter: {name}")
+    attempts = record["enqueue_attempts"]
+    enqueue_outcomes = (
+        record["enqueued"]
+        + record["queue_full_drops"]
+        + record["queue_closed_drops"]
+    )
+    if enqueue_outcomes > attempts:
+        raise ContractError(f"{source}: writer-health enqueue counters exceed attempts")
+    completed = (
+        record["writes_succeeded"]
+        + record["writes_failed"]
+        + record["cancelled_before_write"]
+    )
+    if completed > record["enqueued"]:
+        raise ContractError(f"{source}: writer-health completion counters exceed enqueued")
+
+
+def load_writer_health(
+    paths: Iterable[Path],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    records: list[dict[str, Any]] = []
+    inputs: list[dict[str, Any]] = []
+    for path in sorted(paths, key=lambda item: str(item)):
+        if not path.is_file():
+            raise ContractError(f"writer-health input does not exist: {path}")
+        try:
+            record = json.loads(
+                path.read_text(encoding="utf-8"),
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON constant: {value}")
+                ),
+            )
+        except (json.JSONDecodeError, ValueError) as error:
+            raise ContractError(f"{path}: invalid writer-health JSON: {error}") from error
+        if not isinstance(record, dict):
+            raise ContractError(f"{path}: writer-health artifact is not an object")
+        validate_writer_health(record, str(path))
+        records.append(record)
+        inputs.append(
+            {
+                "path": str(path),
+                "sha256": sha256(path),
+                "schema_version": record["schema_version"],
+                "writer_instance_id": record["writer_instance_id"],
+                "run_id": record["run_id"],
+                "policy_config_hash": record["policy_config_hash"],
+                "sidecar_path": record["sidecar_path"],
+                "shutdown_complete": record["shutdown_complete"],
+                "snapshot_generated_at_ms": record["snapshot_generated_at_ms"],
+                "revision": record["revision"],
+                "enqueue_attempts": record["enqueue_attempts"],
+                "writes_succeeded": record["writes_succeeded"],
+                "queue_full_drops": record["queue_full_drops"],
+                "queue_closed_drops": record["queue_closed_drops"],
+                "writes_failed": record["writes_failed"],
+                "terminal_timeouts": record["terminal_timeouts"],
+                "terminal_outcome_unknown": record["terminal_outcome_unknown"],
+            }
+        )
+    if not records:
+        raise ContractError("no HET-PM V2 writer-health artifacts found")
+    writer_ids = [record["writer_instance_id"] for record in records]
+    if len(writer_ids) != len(set(writer_ids)):
+        raise ContractError("duplicate writer_instance_id is forbidden")
+    contracts = {
+        (
+            record["schema_version"],
+            record["policy_id"],
+            record["policy_version"],
+            record["policy_config_hash"],
+        )
+        for record in records
+    }
+    if len(contracts) != 1:
+        raise ContractError("mixed writer-health contracts are forbidden in one report")
+    return records, inputs
+
+
 def ratio(numerator: int, denominator: int) -> float:
     return numerator / denominator if denominator else 0.0
 
@@ -523,7 +642,117 @@ def quantile(values: list[int], q: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
-def analyze(records: list[dict[str, Any]], inputs: list[dict[str, Any]], fixed_floor_sol: float) -> dict[str, Any]:
+def summarize_writer_health(
+    records: list[dict[str, Any]],
+    writer_health_records: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    if not writer_health_records:
+        return {
+            "writer_health_evidence_status": "missing",
+            "coverage_unknown": True,
+            "run_identity_match": False,
+            "config_identity_match": False,
+            "counter_consistency": False,
+            "all_writers_shutdown_cleanly": False,
+            "sidecar_record_count_match": False,
+            "enqueue_attempts": None,
+            "enqueued": None,
+            "successfully_written": None,
+            "queue_full_drop_count": None,
+            "queue_closed_drop_count": None,
+            "io_failure_count": None,
+            "cancelled_before_write_count": None,
+            "pending_or_inflight_count": None,
+            "capture_ratio": None,
+            "drop_ratio": None,
+            "io_failure_ratio": None,
+            "terminal_timeout_count": None,
+            "terminal_outcome_unknown_count": None,
+            "promotion_evidence_available": False,
+        }
+
+    totals = {
+        name: sum(record[name] for record in writer_health_records)
+        for name in WRITER_HEALTH_COUNTERS
+    }
+    record_run_ids = {record["run_id"] for record in records}
+    health_run_ids = {record["run_id"] for record in writer_health_records}
+    record_hashes = {record["policy_config_hash"] for record in records}
+    health_hashes = {record["policy_config_hash"] for record in writer_health_records}
+    run_identity_match = record_run_ids == health_run_ids
+    config_identity_match = record_hashes == health_hashes
+    enqueue_outcomes = (
+        totals["enqueued"]
+        + totals["queue_full_drops"]
+        + totals["queue_closed_drops"]
+    )
+    completed = (
+        totals["writes_succeeded"]
+        + totals["writes_failed"]
+        + totals["cancelled_before_write"]
+    )
+    counter_consistency = (
+        enqueue_outcomes == totals["enqueue_attempts"]
+        and completed <= totals["enqueued"]
+    )
+    all_writers_shutdown_cleanly = all(
+        record["shutdown_complete"] for record in writer_health_records
+    )
+    pending_or_inflight = max(0, totals["enqueued"] - completed)
+    sidecar_record_count_match = totals["writes_succeeded"] == len(records)
+    coverage_unknown = not (
+        run_identity_match
+        and config_identity_match
+        and counter_consistency
+        and all_writers_shutdown_cleanly
+        and pending_or_inflight == 0
+        and sidecar_record_count_match
+    )
+    dropped = totals["queue_full_drops"] + totals["queue_closed_drops"]
+    observation_loss = (
+        dropped
+        + totals["writes_failed"]
+        + totals["cancelled_before_write"]
+        + totals["terminal_outcome_unknown"]
+    )
+    if coverage_unknown:
+        status = "incomplete_or_inconsistent"
+    elif observation_loss:
+        status = "complete_with_observation_loss"
+    else:
+        status = "complete"
+    return {
+        "writer_health_evidence_status": status,
+        "coverage_unknown": coverage_unknown,
+        "run_identity_match": run_identity_match,
+        "config_identity_match": config_identity_match,
+        "counter_consistency": counter_consistency,
+        "all_writers_shutdown_cleanly": all_writers_shutdown_cleanly,
+        "sidecar_record_count_match": sidecar_record_count_match,
+        "enqueue_attempts": totals["enqueue_attempts"],
+        "enqueued": totals["enqueued"],
+        "successfully_written": totals["writes_succeeded"],
+        "queue_full_drop_count": totals["queue_full_drops"],
+        "queue_closed_drop_count": totals["queue_closed_drops"],
+        "io_failure_count": totals["writes_failed"],
+        "cancelled_before_write_count": totals["cancelled_before_write"],
+        "pending_or_inflight_count": pending_or_inflight,
+        "capture_ratio": ratio(totals["writes_succeeded"], totals["enqueue_attempts"]),
+        "drop_ratio": ratio(dropped, totals["enqueue_attempts"]),
+        "io_failure_ratio": ratio(totals["writes_failed"], totals["enqueue_attempts"]),
+        "terminal_timeout_count": totals["terminal_timeouts"],
+        "terminal_outcome_unknown_count": totals["terminal_outcome_unknown"],
+        "promotion_evidence_available": status == "complete",
+    }
+
+
+def analyze(
+    records: list[dict[str, Any]],
+    inputs: list[dict[str, Any]],
+    fixed_floor_sol: float,
+    writer_health_records: list[dict[str, Any]] | None = None,
+    writer_health_inputs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     positions: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     terminal_seen: Counter[tuple[str, int]] = Counter()
     quote_counts: Counter[tuple[str, int]] = Counter()
@@ -608,11 +837,22 @@ def analyze(records: list[dict[str, Any]], inputs: list[dict[str, Any]], fixed_f
     duplicate_actions = sum(bool(record.get("duplicate_action_observed")) for record in records)
     duplicate_terminals = sum(max(0, count - 1) for count in terminal_seen.values())
 
+    writer_health = summarize_writer_health(records, writer_health_records)
+    evidence_contract = evidence_contract_manifest(records[0])
+    evidence_contract["writer_health"] = {
+        "schema_version": WRITER_HEALTH_SCHEMA_VERSION,
+        "artifact_type": WRITER_HEALTH_ARTIFACT_TYPE,
+        "required": True,
+        "complete_coverage_requires_clean_shutdown": True,
+        "promotion_requires_zero_observation_loss": True,
+    }
+
     return {
         "tool_id": TOOL_ID,
         "schema_version": SCHEMA_VERSION,
-        "evidence_contract": evidence_contract_manifest(records[0]),
+        "evidence_contract": evidence_contract,
         "inputs": inputs,
+        "writer_health_inputs": writer_health_inputs or [],
         "denominator_contract": "unique_position_id_position_epoch",
         "record_count": len(records),
         "position_count": position_count,
@@ -651,6 +891,7 @@ def analyze(records: list[dict[str, Any]], inputs: list[dict[str, Any]], fixed_f
             "sidecar_internal_duplicate_terminal_count": duplicate_terminals,
         },
         "coverage": {
+            "writer_health": writer_health,
             "trajectory_usable_record_count": usable,
             "trajectory_usable_rate": ratio(usable, len(records)),
             "collapsed_updates_record_count": collapsed,
@@ -698,6 +939,7 @@ def analyze(records: list[dict[str, Any]], inputs: list[dict[str, Any]], fixed_f
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", action="append", type=Path, required=True)
+    parser.add_argument("--writer-health", action="append", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--fixed-floor-sol", type=float, default=0.0005)
     args = parser.parse_args()
@@ -705,7 +947,14 @@ def main() -> int:
         parser.error("--fixed-floor-sol must be finite and non-negative")
     try:
         records, inputs = load_records(args.input)
-        report = analyze(records, inputs, args.fixed_floor_sol)
+        writer_health_records, writer_health_inputs = load_writer_health(args.writer_health)
+        report = analyze(
+            records,
+            inputs,
+            args.fixed_floor_sol,
+            writer_health_records,
+            writer_health_inputs,
+        )
         encoded = canonical_json(report)
     except (ContractError, ValueError) as error:
         parser.error(str(error))

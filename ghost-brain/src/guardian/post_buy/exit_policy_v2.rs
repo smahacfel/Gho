@@ -1260,6 +1260,7 @@ pub(super) struct V1V2ComparisonRecord {
 pub(super) struct HetComparisonCorrelationV1 {
     pub(super) comparison_id: String,
     pub(super) source_snapshot_id: String,
+    pub(super) run_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1273,7 +1274,7 @@ pub(super) enum TerminalV2ComparisonSkipReasonV1 {
     WriterUnavailable,
     WriterQueueFull,
     WriterQueueClosed,
-    WriterTimedOut,
+    WriterTimedOutBeforeWrite,
     WriterIoFailed,
 }
 
@@ -1288,7 +1289,7 @@ impl TerminalV2ComparisonSkipReasonV1 {
             Self::WriterUnavailable => "writer_unavailable",
             Self::WriterQueueFull => "writer_queue_full",
             Self::WriterQueueClosed => "writer_queue_closed",
-            Self::WriterTimedOut => "writer_timed_out",
+            Self::WriterTimedOutBeforeWrite => "writer_timed_out_before_write",
             Self::WriterIoFailed => "writer_io_failed",
         }
     }
@@ -1299,6 +1300,22 @@ impl TerminalV2ComparisonSkipReasonV1 {
             "comparison_payload_oversized" => Self::PayloadOversized,
             _ if core => Self::CoreSemanticValidationFailed,
             _ => Self::FinalSemanticValidationFailed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TerminalV2ComparisonOutcomeUnknownReasonV1 {
+    WriterAckTimedOut,
+    WriterAckChannelClosed,
+}
+
+impl TerminalV2ComparisonOutcomeUnknownReasonV1 {
+    pub(super) const fn as_label(self) -> &'static str {
+        match self {
+            Self::WriterAckTimedOut => "writer_ack_timed_out",
+            Self::WriterAckChannelClosed => "writer_ack_channel_closed",
         }
     }
 }
@@ -1347,6 +1364,7 @@ impl PreparedV1V2ComparisonCoreV1 {
         let correlation = HetComparisonCorrelationV1 {
             comparison_id: record.comparison_id.clone(),
             source_snapshot_id: record.snapshot_id.clone(),
+            run_id: record.run_id.clone(),
         };
         match record.validate_core() {
             Ok(()) => Self::Ready(Box::new(record)),
@@ -1370,6 +1388,7 @@ impl PreparedV1V2ComparisonCoreV1 {
                 let correlation = HetComparisonCorrelationV1 {
                     comparison_id: record.comparison_id.clone(),
                     source_snapshot_id: record.snapshot_id.clone(),
+                    run_id: record.run_id.clone(),
                 };
                 record.terminal_tick =
                     matches!(receipt.exit_apply_status, V1ExitApplyStatusV1::Applied)
