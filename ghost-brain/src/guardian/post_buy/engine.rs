@@ -7658,7 +7658,7 @@ impl MonitoringEngine {
             HetPmQuoteFinalizationInputV2 {
                 quote: v2_quote.as_ref(),
                 quote_key: v2_truth.and(v2_cell).map(|cell| &cell.key),
-                quote_evidence: v2_quote_evidence.clone(),
+                quote_evidence: v2_quote_evidence,
                 crash_requirement: v2_crash_requirement.as_ref(),
             },
             v1_policy,
@@ -7706,7 +7706,7 @@ impl MonitoringEngine {
                         HetPmQuoteFinalizationInputV2 {
                             quote: v2_quote.as_ref(),
                             quote_key: v2_truth.and(v2_cell).map(|cell| &cell.key),
-                            quote_evidence: v2_quote_evidence.clone(),
+                            quote_evidence: v2_quote_evidence,
                             crash_requirement: v2_crash_requirement.as_ref(),
                         },
                         v1_policy,
