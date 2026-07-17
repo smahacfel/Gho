@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 TOOL_ID = "het_pm_v2_analysis_v1"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 POLICY_ID = "hierarchical_executable_trajectory_pm_v2"
 POLICY_VERSION = 2
 V1_POLICY_ID = "position_manager_lite_exit_policy_v1"
@@ -72,6 +72,13 @@ CRASH_NOT_TRIGGERED_REASONS = {
 }
 V2_EXIT_REASONS = {
     "Crash", "HardLoss", "ExecutableTrailing", "VitalityDecay", "AbsoluteMaxHold"
+}
+V2_GATE_EVALUATION_ORDER = (
+    "crash", "hard_loss", "executable_trailing", "vitality_decay", "absolute_max_hold"
+)
+V2_GATE_QUOTE_STATUSES = {
+    "not_required", "pending", "blocked_pre_quote", "quote_unavailable", "resolved",
+    "rejected_by_quote", "blocked_by_data", "blocked_after_quote",
 }
 V2_UNKNOWN_REASONS = {
     "PolicyDisabled", "InvalidPositionContract", "EntryCapitalUnavailable",
@@ -287,6 +294,42 @@ def validate_quote_status(value: str, source: str) -> None:
     raise ContractError(f"{source}: invalid quote status enum label")
 
 
+def validate_v2_gate_evaluations(value: Any, source: str) -> None:
+    if not isinstance(value, list) or len(value) != len(V2_GATE_EVALUATION_ORDER):
+        raise ContractError(f"{source}: gate-evaluation lattice cardinality mismatch")
+    for expected_gate, evaluation in zip(V2_GATE_EVALUATION_ORDER, value):
+        if not isinstance(evaluation, dict):
+            raise ContractError(f"{source}: invalid gate-evaluation row")
+        if require(evaluation, "gate", str) != expected_gate:
+            raise ContractError(f"{source}: gate-evaluation order or identity mismatch")
+        prequote = require(evaluation, "prequote", dict)
+        kind = require(prequote, "kind", str)
+        if kind not in {"hold", "pending", "blocked", "quote_required"}:
+            raise ContractError(f"{source}: invalid gate-evaluation prequote kind")
+        if kind == "quote_required" and require(prequote, "detail", str) != expected_gate:
+            raise ContractError(f"{source}: gate-evaluation quote-required reason mismatch")
+        final = require(evaluation, "final_decision", dict)
+        final_kind = require(final, "kind", str)
+        if final_kind not in {
+            "hold", "pending", "blocked", "crash_rejected_by_quote", "crash_blocked_by_data", "exit_all"
+        }:
+            raise ContractError(f"{source}: invalid gate-evaluation final kind")
+        if final_kind == "exit_all":
+            detail = require(final, "detail", dict)
+            if require(detail, "reason", str) != expected_gate:
+                raise ContractError(f"{source}: gate-evaluation exit reason mismatch")
+            if require(detail, "quantity_raw", int) <= 0:
+                raise ContractError(f"{source}: gate-evaluation exit quantity invalid")
+            if require(detail, "executable_gross_return_bps", int) != require(
+                evaluation, "executable_gross_return_bps", int
+            ):
+                raise ContractError(f"{source}: gate-evaluation executable return mismatch")
+        elif evaluation.get("executable_gross_return_bps") is not None:
+            raise ContractError(f"{source}: non-exit gate evaluation carries executable return")
+        if require(evaluation, "quote_status", str) not in V2_GATE_QUOTE_STATUSES:
+            raise ContractError(f"{source}: invalid gate-evaluation quote status")
+
+
 def validate_anchor_request(value: str | None, source: str) -> None:
     if value is None or value == "quote_required_on_new_canonical_peak":
         return
@@ -396,6 +439,7 @@ def validate_record(record: dict[str, Any], source: str) -> None:
     if require(record, "v2_winning_gate", str) not in WINNING_GATES:
         raise ContractError(f"{source}: invalid v2_winning_gate")
     require(record, "v2_suppressed_gates_mask", int)
+    validate_v2_gate_evaluations(require(record, "v2_gate_evaluations", list), source)
     if require(record, "consumed_by_policy", bool):
         raise ContractError(f"{source}: consumed_by_policy must be false")
     if not require(record, "v1_shadow_authority", bool):

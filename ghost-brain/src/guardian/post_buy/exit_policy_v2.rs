@@ -21,7 +21,10 @@ use super::trajectory_v1::{TrajectoryFeaturesV1, TrajectoryQualityV1};
 
 pub(super) const HET_PM_V2_POLICY_ID: &str = "hierarchical_executable_trajectory_pm_v2";
 pub(super) const HET_PM_V2_POLICY_VERSION: u16 = 2;
-pub(super) const HET_PM_V2_SCHEMA_VERSION: u16 = 2;
+/// Schema V3 adds an additive, per-gate candidate lattice.  This changes the
+/// observer payload, not the V2 pure-policy semantics nor its authority (V1
+/// remains the only apply owner).
+pub(super) const HET_PM_V2_SCHEMA_VERSION: u16 = 3;
 pub(super) const HET_PM_V2_SAMPLING_MODE: &str = "latest_canonical_state_per_monitor_tick";
 pub(super) const HET_PM_V2_TRAJECTORY_GRADE: &str = "online_non_lookahead_sampled_trajectory";
 pub(super) const HET_PM_V2_PUMP_ROUTE_ID: &str = "pump_curve";
@@ -569,6 +572,38 @@ pub(super) struct HetPmPreQuoteEvaluationV2 {
     pub(super) suppressed_gates_mask: u16,
 }
 
+/// Pure pre-quote result for one exit gate in the same immutable decision
+/// snapshot.  It deliberately records lower-priority candidates too: an
+/// observe-only higher gate must not erase the evidence needed to assess a
+/// selectively promoted lower gate later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HetPmGatePreQuoteEvidenceV2 {
+    pub(super) reason: HetPmExitReasonV2,
+    pub(super) candidate: HetPmCandidateV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HetPmGateQuoteStatusV2 {
+    NotRequired,
+    Pending,
+    BlockedPreQuote,
+    QuoteUnavailable,
+    Resolved,
+    RejectedByQuote,
+    BlockedByData,
+    BlockedAfterQuote,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct HetPmGateEvaluationV2 {
+    pub(super) gate: HetPmExitReasonV2,
+    pub(super) prequote: HetPmCandidateV2,
+    pub(super) final_decision: HetPmFinalDecisionV2,
+    pub(super) quote_status: HetPmGateQuoteStatusV2,
+    pub(super) executable_gross_return_bps: Option<i32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) struct ExecutableQuoteKeyV2 {
     pub(super) position_id: String,
@@ -868,6 +903,200 @@ impl ExitPolicyV2 {
         finish(HetPmCandidateV2::Hold, HetPmGateV2::Hold, suppressed)
     }
 
+    /// Materialize the pure result of every exit gate from one snapshot.
+    ///
+    /// `evaluate_prequote` intentionally returns only the hierarchy winner for
+    /// the PR-A observer.  Promotion evidence needs a second, non-authoritative
+    /// view: when e.g. Crash and ExecutableTrailing are both candidates, the
+    /// latter must remain observable even though Crash is the observed winner.
+    /// No quote is requested here and this function has no mutation surface.
+    pub(super) fn evaluate_gate_lattice(
+        view: PostBuyDecisionViewV2<'_>,
+        v1_prequote: &PreQuoteDecision,
+        crash_prequote: &CrashGuardPreQuoteDecision,
+        config: &EffectiveHetPmV2Config,
+    ) -> Vec<HetPmGatePreQuoteEvidenceV2> {
+        let global = if !config.enabled() {
+            Some(HetPmCandidateV2::Blocked(
+                HetPmUnknownReasonV2::PolicyDisabled,
+            ))
+        } else if view.base.has_pending_proposal() {
+            Some(HetPmCandidateV2::Pending)
+        } else if !matches!(view.base.lane(), Lane::Shadow)
+            || view.base.remaining_token_amount_raw() == 0
+            || view.base.entry_token_amount_raw() == 0
+        {
+            Some(HetPmCandidateV2::Blocked(
+                HetPmUnknownReasonV2::InvalidPositionContract,
+            ))
+        } else if view.extras.entry_value_quote_raw.is_none() {
+            Some(HetPmCandidateV2::Blocked(
+                HetPmUnknownReasonV2::EntryCapitalUnavailable,
+            ))
+        } else if matches!(
+            view.extras.route_status,
+            RouteStatusV1::CurveCompletePumpSwapUnsupported
+        ) {
+            Some(HetPmCandidateV2::Blocked(
+                HetPmUnknownReasonV2::RouteUnsupported,
+            ))
+        } else if matches!(view.extras.route_status, RouteStatusV1::Unknown) {
+            Some(HetPmCandidateV2::Blocked(
+                HetPmUnknownReasonV2::RouteUnknown,
+            ))
+        } else {
+            match view.base.mark_evidence_status() {
+                MarkEvidenceStatus::Available => match view.extras.trajectory.quality {
+                    TrajectoryQualityV1::Invalid => Some(HetPmCandidateV2::Blocked(
+                        HetPmUnknownReasonV2::TrajectoryInvalid,
+                    )),
+                    TrajectoryQualityV1::Stale => Some(HetPmCandidateV2::Blocked(
+                        HetPmUnknownReasonV2::TrajectoryStale,
+                    )),
+                    TrajectoryQualityV1::Unavailable | TrajectoryQualityV1::InsufficientSamples => {
+                        Some(HetPmCandidateV2::Blocked(
+                            HetPmUnknownReasonV2::TrajectoryUnavailable,
+                        ))
+                    }
+                    TrajectoryQualityV1::PartialHistory | TrajectoryQualityV1::Usable => None,
+                },
+                MarkEvidenceStatus::Unavailable => Some(HetPmCandidateV2::Blocked(
+                    HetPmUnknownReasonV2::MarkUnavailable,
+                )),
+                MarkEvidenceStatus::Stale => {
+                    Some(HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::MarkStale))
+                }
+                MarkEvidenceStatus::Invalid => {
+                    Some(HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::MarkInvalid))
+                }
+            }
+        };
+        let reasons = [
+            HetPmExitReasonV2::Crash,
+            HetPmExitReasonV2::HardLoss,
+            HetPmExitReasonV2::ExecutableTrailing,
+            HetPmExitReasonV2::VitalityDecay,
+            HetPmExitReasonV2::AbsoluteMaxHold,
+        ];
+        if let Some(candidate) = global {
+            return reasons
+                .into_iter()
+                .map(|reason| HetPmGatePreQuoteEvidenceV2 {
+                    reason,
+                    candidate: candidate.clone(),
+                })
+                .collect();
+        }
+
+        let crash = if matches!(
+            crash_prequote,
+            CrashGuardPreQuoteDecision::QuoteRequired { .. }
+        ) {
+            HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::Crash)
+        } else {
+            HetPmCandidateV2::Hold
+        };
+        let hard_loss = if matches!(
+            v1_prequote,
+            PreQuoteDecision::QuoteRequired { candidate }
+                if matches!(candidate.reason(), ExitCandidateReason::StopLoss)
+        ) {
+            HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::HardLoss)
+        } else {
+            HetPmCandidateV2::Hold
+        };
+        let entry_price = view.base.entry_price_sol().unwrap_or_default();
+        let current_mark = view.base.mark_price_sol().unwrap_or_default();
+        let mark_return_bps = if entry_price > 0.0 {
+            (10_000.0 * (current_mark / entry_price - 1.0)).round() as i32
+        } else {
+            i32::MIN
+        };
+        let trailing = if mark_return_bps >= config.trailing_arm_mark_return_bps
+            && view
+                .extras
+                .trajectory
+                .drawdown_from_peak_bps
+                .is_some_and(|value| value >= config.trailing_mark_candidate_drawdown_bps as i32)
+        {
+            if view.extras.executable_peak_anchor.is_none() {
+                HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::AnchorUnavailable)
+            } else {
+                HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::ExecutableTrailing)
+            }
+        } else {
+            HetPmCandidateV2::Hold
+        };
+        let vitality = &view.extras.vitality;
+        let vitality_state_candidate = view.base.absolute_age_ms() >= config.vitality_min_age_ms
+            && matches!(
+                vitality.current_state,
+                VitalityStateV1::Weak | VitalityStateV1::HeartbeatOnly
+            )
+            && vitality.consecutive_non_alive_windows >= config.vitality_required_non_alive_windows;
+        let vitality_decay = if vitality_state_candidate {
+            if !vitality.quality_fresh
+                || view.extras.trajectory.time_since_peak_ms.is_none()
+                || view.extras.trajectory.return_5s_bps.is_none()
+            {
+                HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::VitalityEvidenceStale)
+            } else {
+                let recovered = view
+                    .extras
+                    .trajectory
+                    .return_5s_bps
+                    .is_some_and(|value| value >= config.vitality_recovery_return_bps);
+                let peak_too_recent = view
+                    .extras
+                    .trajectory
+                    .time_since_peak_ms
+                    .is_some_and(|value| value < config.vitality_min_time_since_peak_ms);
+                if !recovered && !peak_too_recent {
+                    HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::VitalityDecay)
+                } else {
+                    HetPmCandidateV2::Hold
+                }
+            }
+        } else if matches!(vitality.current_state, VitalityStateV1::StaleOrUnknown)
+            && view.base.absolute_age_ms() >= config.vitality_min_age_ms
+        {
+            HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::VitalityEvidenceStale)
+        } else {
+            HetPmCandidateV2::Hold
+        };
+        let absolute_max_hold = if matches!(
+            v1_prequote,
+            PreQuoteDecision::QuoteRequired { candidate }
+                if matches!(candidate.reason(), ExitCandidateReason::AbsoluteMaxHold)
+        ) {
+            HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::AbsoluteMaxHold)
+        } else {
+            HetPmCandidateV2::Hold
+        };
+        vec![
+            HetPmGatePreQuoteEvidenceV2 {
+                reason: HetPmExitReasonV2::Crash,
+                candidate: crash,
+            },
+            HetPmGatePreQuoteEvidenceV2 {
+                reason: HetPmExitReasonV2::HardLoss,
+                candidate: hard_loss,
+            },
+            HetPmGatePreQuoteEvidenceV2 {
+                reason: HetPmExitReasonV2::ExecutableTrailing,
+                candidate: trailing,
+            },
+            HetPmGatePreQuoteEvidenceV2 {
+                reason: HetPmExitReasonV2::VitalityDecay,
+                candidate: vitality_decay,
+            },
+            HetPmGatePreQuoteEvidenceV2 {
+                reason: HetPmExitReasonV2::AbsoluteMaxHold,
+                candidate: absolute_max_hold,
+            },
+        ]
+    }
+
     pub(super) fn evaluate_anchor_request(
         view: PostBuyDecisionViewV2<'_>,
         now_ms: u64,
@@ -1031,6 +1260,31 @@ impl ExitPolicyV2 {
                         as i32,
                 }
             }
+        }
+    }
+
+    pub(super) const fn gate_quote_status(
+        prequote: &HetPmCandidateV2,
+        final_decision: &HetPmFinalDecisionV2,
+    ) -> HetPmGateQuoteStatusV2 {
+        match prequote {
+            HetPmCandidateV2::Hold => HetPmGateQuoteStatusV2::NotRequired,
+            HetPmCandidateV2::Pending => HetPmGateQuoteStatusV2::Pending,
+            HetPmCandidateV2::Blocked(_) => HetPmGateQuoteStatusV2::BlockedPreQuote,
+            HetPmCandidateV2::QuoteRequired(_) => match final_decision {
+                HetPmFinalDecisionV2::ExitAll { .. } | HetPmFinalDecisionV2::Hold => {
+                    HetPmGateQuoteStatusV2::Resolved
+                }
+                HetPmFinalDecisionV2::CrashRejectedByQuote { .. } => {
+                    HetPmGateQuoteStatusV2::RejectedByQuote
+                }
+                HetPmFinalDecisionV2::CrashBlockedByData => HetPmGateQuoteStatusV2::BlockedByData,
+                HetPmFinalDecisionV2::Blocked(HetPmUnknownReasonV2::QuoteUnavailable) => {
+                    HetPmGateQuoteStatusV2::QuoteUnavailable
+                }
+                HetPmFinalDecisionV2::Blocked(_) => HetPmGateQuoteStatusV2::BlockedAfterQuote,
+                HetPmFinalDecisionV2::Pending => HetPmGateQuoteStatusV2::Pending,
+            },
         }
     }
 }
@@ -1230,6 +1484,10 @@ pub(super) struct V1V2ComparisonRecord {
     pub(super) v2_crash_quote_decision: Option<CrashGuardQuoteDecision>,
     pub(super) v2_winning_gate: HetPmGateV2,
     pub(super) v2_suppressed_gates_mask: u16,
+    /// Additive Schema V3 lattice: one pure evaluation for each exit gate on
+    /// this exact snapshot and quote cell.  `v2_winning_gate` remains the
+    /// observed pure-hierarchy winner used by PR-A diagnostics.
+    pub(super) v2_gate_evaluations: Vec<HetPmGateEvaluationV2>,
     pub(super) consumed_by_policy: bool,
     pub(super) v1_shadow_authority: bool,
     pub(super) v2_shadow_authority: bool,
@@ -1526,6 +1784,31 @@ impl V1V2ComparisonRecord {
             || self.quote_resolution_count as usize != self.quote_statuses.len()
         {
             return Err("quote_plan_cardinality_mismatch");
+        }
+        let expected = [
+            HetPmExitReasonV2::Crash,
+            HetPmExitReasonV2::HardLoss,
+            HetPmExitReasonV2::ExecutableTrailing,
+            HetPmExitReasonV2::VitalityDecay,
+            HetPmExitReasonV2::AbsoluteMaxHold,
+        ];
+        if self.v2_gate_evaluations.len() != expected.len()
+            || self
+                .v2_gate_evaluations
+                .iter()
+                .zip(expected)
+                .any(|(evaluation, reason)| evaluation.gate != reason)
+        {
+            return Err("comparison_gate_lattice_contract_mismatch");
+        }
+        if self.v2_gate_evaluations.iter().any(|evaluation| {
+            evaluation.executable_gross_return_bps.is_some()
+                != matches!(
+                    evaluation.final_decision,
+                    HetPmFinalDecisionV2::ExitAll { .. }
+                )
+        }) {
+            return Err("comparison_gate_lattice_return_contract_mismatch");
         }
         let anchor_non_finite = self.anchor_before.as_ref().is_some_and(|anchor| {
             !anchor.peak_mark_price_sol.is_finite() || !anchor.executable_value_sol.is_finite()
@@ -1899,6 +2182,22 @@ mod tests {
             v2_crash_quote_decision: None,
             v2_winning_gate: HetPmGateV2::Hold,
             v2_suppressed_gates_mask: 0,
+            v2_gate_evaluations: [
+                HetPmExitReasonV2::Crash,
+                HetPmExitReasonV2::HardLoss,
+                HetPmExitReasonV2::ExecutableTrailing,
+                HetPmExitReasonV2::VitalityDecay,
+                HetPmExitReasonV2::AbsoluteMaxHold,
+            ]
+            .into_iter()
+            .map(|gate| HetPmGateEvaluationV2 {
+                gate,
+                prequote: HetPmCandidateV2::Hold,
+                final_decision: HetPmFinalDecisionV2::Hold,
+                quote_status: HetPmGateQuoteStatusV2::NotRequired,
+                executable_gross_return_bps: None,
+            })
+            .collect(),
             consumed_by_policy: false,
             v1_shadow_authority: true,
             v2_shadow_authority: false,
@@ -2395,6 +2694,127 @@ mod tests {
         );
         assert_eq!(hold.winning_gate, HetPmGateV2::Hold);
         assert_eq!(hold.candidate, HetPmCandidateV2::Hold);
+    }
+
+    #[test]
+    fn same_snapshot_gate_lattice_retains_trailing_beneath_observed_crash() {
+        let config = effective();
+        let v1_config = crash_v1_config(-20.0);
+        let crash_vector = CrashVectorV1::new(
+            1.5,
+            Some(CrashSampleV1::new(1.4, 19, 15_000)),
+            Some(CrashSampleV1::new(1.2, 19, 15_500)),
+            Some(CrashSampleV1::new(0.9, 20, 16_000)),
+            Some(0),
+            2,
+            Some(0.35),
+            Some(0.40),
+            true,
+            true,
+        );
+        let snapshot = bundle_with_crash_vector(
+            false,
+            20_000,
+            1.3,
+            RouteStatusV1::PumpCurveSupported,
+            usable_trajectory(),
+            vitality(VitalityStateV1::Alive, 0),
+            Some(anchor(&config)),
+            crash_vector,
+            v1_config.config_hash(),
+        );
+        let crash = ExitPolicyV1::evaluate_crash_guard_prequote(&snapshot.base, &v1_config);
+        assert!(matches!(
+            crash,
+            CrashGuardPreQuoteDecision::QuoteRequired { .. }
+        ));
+
+        // The legacy observed projection remains hierarchy-only: Crash is the
+        // single winner.  Promotion evidence must nevertheless retain the
+        // independently evaluated lower Trailing candidate from this exact
+        // immutable snapshot, rather than fabricate a second monitor row.
+        let observed = ExitPolicyV2::evaluate_prequote(
+            snapshot.view(),
+            &PreQuoteDecision::Hold,
+            &crash,
+            &config,
+        );
+        assert_eq!(observed.winning_gate, HetPmGateV2::Crash);
+
+        let lattice = ExitPolicyV2::evaluate_gate_lattice(
+            snapshot.view(),
+            &PreQuoteDecision::Hold,
+            &crash,
+            &config,
+        );
+        assert_eq!(lattice.len(), 5);
+        assert!(matches!(
+            lattice[0],
+            HetPmGatePreQuoteEvidenceV2 {
+                reason: HetPmExitReasonV2::Crash,
+                candidate: HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::Crash),
+            }
+        ));
+        assert!(matches!(
+            lattice[2],
+            HetPmGatePreQuoteEvidenceV2 {
+                reason: HetPmExitReasonV2::ExecutableTrailing,
+                candidate: HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::ExecutableTrailing),
+            }
+        ));
+
+        let quote = ExecutableExitQuote::new(100, 0.75, 0.75, -0.25, -25.0);
+        let quote_key = ExecutableQuoteKeyV2::from_view(snapshot.view());
+        let quote_evidence = QuoteEvidenceRevisionV1::new(Some(20), Some(16_000), Some(0));
+        let crash_requirement = ExitPolicyV1::crash_guard_quote_requirement(&snapshot.base)
+            .expect("real Crash prequote must carry a full-position requirement");
+        let mut prepared = comparison_record();
+        prepared.v2_gate_evaluations = lattice
+            .into_iter()
+            .map(|evaluation| {
+                let prequote = HetPmPreQuoteEvaluationV2 {
+                    candidate: evaluation.candidate,
+                    winning_gate: match evaluation.reason {
+                        HetPmExitReasonV2::Crash => HetPmGateV2::Crash,
+                        HetPmExitReasonV2::HardLoss => HetPmGateV2::HardLoss,
+                        HetPmExitReasonV2::ExecutableTrailing => HetPmGateV2::ExecutableTrailing,
+                        HetPmExitReasonV2::VitalityDecay => HetPmGateV2::VitalityDecay,
+                        HetPmExitReasonV2::AbsoluteMaxHold => HetPmGateV2::AbsoluteMaxHold,
+                    },
+                    suppressed_gates_mask: 0,
+                };
+                let final_decision = ExitPolicyV2::finalize_with_quote(
+                    snapshot.view(),
+                    &prequote,
+                    HetPmQuoteFinalizationInputV2 {
+                        quote: Some(&quote),
+                        quote_key: Some(&quote_key),
+                        quote_evidence: Some(quote_evidence),
+                        crash_requirement: Some(&crash_requirement),
+                    },
+                    &v1_config,
+                    &config,
+                );
+                let executable_gross_return_bps = match &final_decision {
+                    HetPmFinalDecisionV2::ExitAll {
+                        executable_gross_return_bps,
+                        ..
+                    } => Some(*executable_gross_return_bps),
+                    _ => None,
+                };
+                HetPmGateEvaluationV2 {
+                    gate: evaluation.reason,
+                    quote_status: ExitPolicyV2::gate_quote_status(
+                        &prequote.candidate,
+                        &final_decision,
+                    ),
+                    prequote: prequote.candidate,
+                    final_decision,
+                    executable_gross_return_bps,
+                }
+            })
+            .collect();
+        assert!(prepared.validate_and_serialize().is_ok());
     }
 
     #[test]

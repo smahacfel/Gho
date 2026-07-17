@@ -18,6 +18,7 @@ separate measurement classes.
 from __future__ import annotations
 
 import argparse
+import copy
 import glob
 import hashlib
 import importlib.util
@@ -25,6 +26,7 @@ import json
 import math
 import re
 import sys
+import tomllib
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +76,11 @@ V2_REASON_KEYS = {
     "VitalityDecay": "vitality_decay",
     "AbsoluteMaxHold": "absolute_max_hold",
 }
+V2_REASONS_BY_KEY = {wire_key: reason for reason, wire_key in V2_REASON_KEYS.items()}
+LEGACY_V2_EXIT_RE = re.compile(
+    r"ExitAll \{ reason: ([A-Za-z]+), quantity_raw: ([0-9]+), "
+    r"executable_gross_return_bps: (-?[0-9]+) \}"
+)
 V2_POLICY_HIERARCHY = {
     "Crash": 0,
     "HardLoss": 1,
@@ -104,12 +111,15 @@ GATE_SPECIFIC_ECONOMIC_THRESHOLD_NAMES = (
     "false_early_exit_proxy_rate_max",
     "candidate_executable_continuation_coverage_min",
     "route_availability_after_candidate_min",
+    "per_run_min_matched_positions_min",
+    "per_run_worst_mean_peak_to_terminal_giveback_delta_bps_min",
+    "per_run_worst_tail_loss_p10_delta_bps_min",
+    "per_run_worst_cvar_20_delta_bps_min",
+    "per_run_worst_cost_scenario_mean_delta_bps_min",
+    "per_run_max_false_early_exit_proxy_rate_max",
+    "per_run_min_candidate_executable_continuation_coverage_min",
     "candidate_bearing_censored_count_max",
     "promoted_candidate_economic_join_failure_count_max",
-)
-V2_EXIT_RE = re.compile(
-    r"ExitAll \{ reason: ([A-Za-z]+), quantity_raw: ([0-9]+), "
-    r"executable_gross_return_bps: (-?[0-9]+) \}"
 )
 
 
@@ -262,6 +272,105 @@ def launcher_status_passed(report: dict[str, Any], field: str) -> bool:
     return isinstance(nested, dict) and nested.get("status") == "PASS"
 
 
+# Exact run identity deliberately remains in the manifest.  This projection is
+# the separately frozen behavioural contract shared by prospective runs: it
+# excludes only operational names/locations that cannot affect entry, HET/V1,
+# quote, replay, capacity or sampling semantics.
+NON_BEHAVIORAL_CONFIG_KEYS = {
+    "run_id", "session_id", "namespace", "port", "ports", "output_path",
+    "output_dir", "events_output_path", "log_path", "lifecycle_log_path",
+    "report_path", "manifest_path", "scope_root_path", "pid_file", "socket_path",
+    "run_name", "file_name", "filename", "file_path", "entry_log_path", "selection_log_path",
+    "skip_log_path", "transport_log_path", "oracle_log_path", "decision_log_path",
+    "wal_dir", "snapshot_dir",
+}
+
+
+def normalized_config_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: normalized_config_value(nested)
+            for key, nested in sorted(value.items())
+            if key.lower() not in NON_BEHAVIORAL_CONFIG_KEYS
+        }
+    if isinstance(value, list):
+        return [normalized_config_value(item) for item in value]
+    return value
+
+
+def normalized_behavioral_config_hash(
+    *, brain_config_path: Path, run_config_path: Path
+) -> str:
+    try:
+        brain = tomllib.loads(brain_config_path.read_text(encoding="utf-8"))
+        run = tomllib.loads(run_config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ContractError(f"cannot normalize behavioural config: {error}") from error
+    return hash_bytes(canonical_json({
+        "normalization_version": 1,
+        "brain_config": normalized_config_value(brain),
+        "run_config": normalized_config_value(run),
+    }))
+
+
+def lock_criteria_template(
+    *,
+    criteria_template: dict[str, Any],
+    runtime_commit_sha: str,
+    release_binary: Path,
+    brain_config: Path,
+    run_configs: dict[str, Path],
+) -> dict[str, Any]:
+    """Materialize the prospective two-run contract before either run starts.
+
+    The checked-in criteria is intentionally a non-promotable template: a
+    release binary does not exist until the reviewed code is committed and
+    built.  This operation binds the template to that exact binary, source
+    revision, brain config, normalized behaviour, both distinct run configs,
+    and both analysis tools in one canonical immutable document.
+    """
+    validate_criteria(criteria_template)
+    if criteria_template["contract_state"] != "calibration_pending":
+        raise ContractError("criteria lock requires a calibration_pending template")
+    if not re.fullmatch(r"[0-9a-f]{40}", runtime_commit_sha) or set(runtime_commit_sha) == {"0"}:
+        raise ContractError("criteria lock requires a non-placeholder runtime commit SHA")
+    if not release_binary.is_file():
+        raise ContractError(f"criteria lock release binary missing: {release_binary}")
+    if not brain_config.is_file():
+        raise ContractError(f"criteria lock brain config missing: {brain_config}")
+    if len(run_configs) < 2 or any(not run_id or not path.is_file() for run_id, path in run_configs.items()):
+        raise ContractError("criteria lock requires two existing, uniquely named run configs")
+
+    normalized_hashes = {
+        normalized_behavioral_config_hash(
+            brain_config_path=brain_config,
+            run_config_path=run_config,
+        )
+        for run_config in run_configs.values()
+    }
+    if len(normalized_hashes) != 1:
+        raise ContractError(
+            "prospective run configs do not share one normalized behavioural contract"
+        )
+
+    locked = copy.deepcopy(criteria_template)
+    locked.update({
+        "contract_state": "locked",
+        "expected_runtime_commit_sha": runtime_commit_sha,
+        "expected_release_binary_sha256": sha256(release_binary),
+        "expected_brain_config_content_hash": sha256(brain_config),
+        "expected_normalized_behavioral_config_hash": normalized_hashes.pop(),
+        "allowed_exact_run_config_hashes": {
+            run_id: sha256(path)
+            for run_id, path in sorted(run_configs.items())
+        },
+        "expected_promotion_tool_hash": sha256(Path(__file__).resolve()),
+        "expected_pr_a_analyzer_hash": sha256(pr_a_analyzer_path()),
+    })
+    validate_criteria(locked)
+    return locked
+
+
 def build_launcher_proof(
     *,
     report: dict[str, Any],
@@ -313,13 +422,9 @@ def build_launcher_proof(
         "release_binary_sha256": release_binary_sha256,
         "run_config_sha256": artifacts["run_config"][0]["sha256"],
         "brain_config_sha256": artifacts["brain_config"][0]["sha256"],
-        "normalized_entry_cohort_hash": hash_bytes(
-            canonical_json(
-                {
-                    "brain_config_sha256": artifacts["brain_config"][0]["sha256"],
-                    "run_config_sha256": artifacts["run_config"][0]["sha256"],
-                }
-            )
+        "normalized_behavioral_config_hash": normalized_behavioral_config_hash(
+            brain_config_path=repo_root / artifacts["brain_config"][0]["path"],
+            run_config_path=repo_root / artifacts["run_config"][0]["path"],
         ),
         "build_started_at": build_started_at,
         "runtime_started_at": runtime_started_at,
@@ -391,6 +496,8 @@ def build_run_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "run_id": args.run_id,
         "launch_cohort_id": args.launch_cohort_id,
         "run_role": args.run_role,
+        "policy_id": first["policy_id"],
+        "policy_version": first["policy_version"],
         "comparison_schema_version": first["schema_version"],
         "writer_health_schema_version": health_schema_versions.pop(),
         "het_config_hash": first["policy_config_hash"],
@@ -418,6 +525,7 @@ def validate_run_manifest_shape(manifest: dict[str, Any], source: Path) -> None:
         "run_id",
         "launch_cohort_id",
         "run_role",
+        "policy_id",
         "het_config_hash",
         "v1_config_hash",
         "time_stop_v2_config_hash",
@@ -429,6 +537,7 @@ def validate_run_manifest_shape(manifest: dict[str, Any], source: Path) -> None:
     if manifest["run_role"] not in {"calibration", "validation"}:
         raise ContractError(f"invalid run_role: {source}")
     require(manifest, "comparison_schema_version", int)
+    require(manifest, "policy_version", int)
     require(manifest, "writer_health_schema_version", int)
     artifacts = require(manifest, "artifacts", dict)
     if set(artifacts) != set(REQUIRED_ARTIFACT_CLASSES):
@@ -466,7 +575,7 @@ def validate_run_manifest_shape(manifest: dict[str, Any], source: Path) -> None:
         "release_binary_sha256",
         "run_config_sha256",
         "brain_config_sha256",
-        "normalized_entry_cohort_hash",
+        "normalized_behavioral_config_hash",
         "build_started_at",
         "runtime_started_at",
         "runtime_ended_at",
@@ -485,8 +594,8 @@ def validate_run_manifest_shape(manifest: dict[str, Any], source: Path) -> None:
         raise ContractError(f"launcher proof run config hash mismatch: {source}")
     if proof["brain_config_sha256"] != manifest["brain_config_content_hash"]:
         raise ContractError(f"launcher proof brain config hash mismatch: {source}")
-    if not re.fullmatch(r"[0-9a-f]{64}", proof["normalized_entry_cohort_hash"]):
-        raise ContractError(f"launcher proof normalized cohort hash invalid: {source}")
+    if not re.fullmatch(r"[0-9a-f]{64}", proof["normalized_behavioral_config_hash"]):
+        raise ContractError(f"launcher proof normalized behavioural config hash invalid: {source}")
     if proof["shutdown_signal"] != "SIGINT" or proof["shutdown_result"] != "clean":
         raise ContractError(f"launcher proof shutdown contract failed: {source}")
     for field in (
@@ -570,6 +679,8 @@ def reconstruct_run_manifest_from_sources(
         "run_id": manifest["run_id"],
         "launch_cohort_id": manifest["launch_cohort_id"],
         "run_role": manifest["run_role"],
+        "policy_id": first["policy_id"],
+        "policy_version": first["policy_version"],
         "comparison_schema_version": first["schema_version"],
         "writer_health_schema_version": health_schema_versions.pop(),
         "het_config_hash": first["policy_config_hash"],
@@ -606,29 +717,43 @@ def validate_criteria(criteria: dict[str, Any]) -> None:
         "expected_het_config_hash",
         "expected_v1_config_hash",
         "expected_time_stop_v2_config_hash",
-        "expected_runtime_commit_sha",
-        "expected_release_binary_sha256",
-        "expected_brain_config_content_hash",
-        "expected_run_config_content_hash",
-        "expected_normalized_entry_cohort_hash",
-        "expected_promotion_tool_hash",
-        "expected_pr_a_analyzer_hash",
+        "contract_state",
         "position_denominator",
         "missing_data_semantics",
     ):
         if not require(criteria, field, str):
             raise ContractError(f"empty criteria field: {field}")
-    for field in (
+    contract_state = criteria["contract_state"]
+    if contract_state not in {"calibration_pending", "locked"}:
+        raise ContractError("criteria contract_state must be calibration_pending or locked")
+    frozen_fields = (
         "expected_runtime_commit_sha",
         "expected_release_binary_sha256",
         "expected_brain_config_content_hash",
-        "expected_run_config_content_hash",
-        "expected_normalized_entry_cohort_hash",
+        "expected_normalized_behavioral_config_hash",
         "expected_promotion_tool_hash",
         "expected_pr_a_analyzer_hash",
-    ):
+    )
+    for field in frozen_fields:
+        if not isinstance(criteria.get(field), str):
+            raise ContractError(f"criteria frozen field must be a string: {field}")
+    if contract_state == "locked":
+        for field in frozen_fields:
+            if not criteria[field] or set(criteria[field]) == {"0"}:
+                raise ContractError(f"locked criteria contains placeholder digest: {field}")
+    for field in frozen_fields:
+        if contract_state != "locked" and criteria[field] == "unlocked":
+            continue
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", criteria[field]):
             raise ContractError(f"criteria field must be a frozen hex digest: {field}")
+    allowed_run_hashes = require(criteria, "allowed_exact_run_config_hashes", dict)
+    for run_id, digest in allowed_run_hashes.items():
+        if not isinstance(run_id, str) or not run_id or not isinstance(digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", digest
+        ) or set(digest) == {"0"}:
+            raise ContractError("invalid allowed exact run-config hash")
+    if contract_state == "locked" and len(allowed_run_hashes) < 2:
+        raise ContractError("locked criteria requires exact run-config hashes for two prospective runs")
     require(criteria, "policy_version", int)
     require(criteria, "comparison_schema_version", int)
     require(criteria, "writer_health_schema_version", int)
@@ -890,6 +1015,19 @@ def gate_specific_observed_aliases(
     aliases["promoted_candidate_economic_join_failure_count"] = observed.get(
         "economic_join_failure_count"
     )
+    # Per-run × per-gate stability is deliberately stored beside the
+    # gate-specific economics (rather than in the combined-policy summary),
+    # so surface it to the same threshold evaluator explicitly.
+    for field in (
+        "per_run_min_matched_positions",
+        "per_run_worst_mean_peak_to_terminal_giveback_delta_bps",
+        "per_run_worst_tail_loss_p10_delta_bps",
+        "per_run_worst_cvar_20_delta_bps",
+        "per_run_worst_cost_scenario_mean_delta_bps",
+        "per_run_max_false_early_exit_proxy_rate",
+        "per_run_min_candidate_executable_continuation_coverage",
+    ):
+        aliases[field] = observed.get(field)
     return aliases
 
 
@@ -1249,14 +1387,41 @@ def terminal_comparison_exactly_correlated(
 
 
 def v2_candidates(rows: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str, int]]:
+    """Return every executable gate candidate from one real comparison tick.
+
+    Schema V3 carries the complete same-tick lattice.  Do not infer lower
+    gates from `v2_suppressed_gates_mask`: the bitmask has no quote result or
+    executable return and therefore cannot support a promotion counterfactual.
+    """
     parsed: list[tuple[dict[str, Any], str, int]] = []
     for row in sorted(rows, key=lambda item: item["observation_timestamp_ms"]):
-        final = row.get("v2_final")
-        if not isinstance(final, str):
+        evaluations = row.get("v2_gate_evaluations")
+        if not isinstance(evaluations, list):
+            # Unit fixtures that model the pre-Schema-V3 wire shape remain
+            # useful for economic arithmetic.  Production rows cannot reach
+            # this branch because the structural analyzer requires schema 3.
+            if row.get("schema_version") == 3:
+                raise ContractError("comparison row lacks Schema-V3 gate-evaluation lattice")
+            legacy = row.get("v2_final")
+            if isinstance(legacy, str):
+                match = LEGACY_V2_EXIT_RE.fullmatch(legacy)
+                if match:
+                    parsed.append((row, match.group(1), int(match.group(3))))
             continue
-        match = V2_EXIT_RE.fullmatch(final)
-        if match:
-            parsed.append((row, match.group(1), int(match.group(3))))
+        for evaluation in evaluations:
+            if not isinstance(evaluation, dict):
+                raise ContractError("invalid gate-evaluation lattice row")
+            final = evaluation.get("final_decision")
+            if not isinstance(final, dict) or final.get("kind") != "exit_all":
+                continue
+            detail = final.get("detail")
+            if not isinstance(detail, dict):
+                raise ContractError("gate-evaluation exit lacks detail")
+            reason = V2_REASONS_BY_KEY.get(detail.get("reason"))
+            return_bps = detail.get("executable_gross_return_bps")
+            if reason not in V2_EXIT_REASONS or not isinstance(return_bps, int):
+                raise ContractError("invalid gate-evaluation executable exit")
+            parsed.append((row, reason, return_bps))
     return parsed
 
 
@@ -1507,6 +1672,54 @@ def economic_observations(
     }
     for key in V2_REASON_KEYS.values():
         gate_summaries.setdefault(key, economic_summary([], contracts))
+    validation_run_ids = sorted({key[0] for key in positions})
+    gate_per_run_summaries: dict[str, dict[str, Any]] = {}
+    for gate_key in V2_REASON_KEYS.values():
+        by_run = {
+            run_id: economic_summary(
+                [row for row in matched_by_reason[gate_key] if row["run_id"] == run_id],
+                contracts,
+            )
+            for run_id in validation_run_ids
+        }
+        def finite_min(field: str) -> float | int | None:
+            values = [
+                summary[field]
+                for summary in by_run.values()
+                if isinstance(summary.get(field), (int, float))
+                and not isinstance(summary[field], bool)
+                and math.isfinite(float(summary[field]))
+            ]
+            return min(values) if values else None
+        def finite_max(field: str) -> float | int | None:
+            values = [
+                summary[field]
+                for summary in by_run.values()
+                if isinstance(summary.get(field), (int, float))
+                and not isinstance(summary[field], bool)
+                and math.isfinite(float(summary[field]))
+            ]
+            return max(values) if values else None
+        gate_per_run_summaries[gate_key] = {
+            "per_run": by_run,
+            "per_run_min_matched_positions": min(
+                (summary["matched_positions"] for summary in by_run.values()), default=0
+            ),
+            "per_run_worst_mean_peak_to_terminal_giveback_delta_bps": finite_min(
+                "mean_peak_to_terminal_giveback_delta_bps"
+            ),
+            "per_run_worst_tail_loss_p10_delta_bps": finite_min("tail_loss_p10_delta_bps"),
+            "per_run_worst_cvar_20_delta_bps": finite_min("cvar_20_delta_bps"),
+            "per_run_worst_cost_scenario_mean_delta_bps": finite_min(
+                "worst_cost_scenario_mean_delta_bps"
+            ),
+            "per_run_max_false_early_exit_proxy_rate": finite_max(
+                "false_early_exit_proxy_rate"
+            ),
+            "per_run_min_candidate_executable_continuation_coverage": finite_min(
+                "candidate_executable_continuation_coverage"
+            ),
+        }
     observed = {
         "matched_v2_candidate_positions": len(combined_matched),
         "executable_trailing_candidate_positions": candidate_positions_by_reason[
@@ -1583,6 +1796,7 @@ def economic_observations(
                 "per_run_matched_positions": dict(
                     Counter(row["run_id"] for row in matched_by_reason[key])
                 ),
+                **gate_per_run_summaries[key],
                 **{
                     metric: gate_summaries[key].get(metric)
                     for metric in (
@@ -1668,6 +1882,8 @@ def evaluate(
     criteria: dict[str, Any],
     manifests: list[tuple[Path, dict[str, Any], dict[str, list[Path]]]],
 ) -> dict[str, Any]:
+    if criteria.get("contract_state") != "locked":
+        raise ContractError("promotion evaluation requires a locked prospective validation contract")
     analyzer = load_pr_a_analyzer()
     all_comparison_paths: list[Path] = []
     all_health_paths: list[Path] = []
@@ -1701,6 +1917,11 @@ def evaluate(
         if manifest["comparison_schema_version"] != criteria["comparison_schema_version"]:
             raise ContractError(f"comparison schema mismatch: {manifest_path}")
         if (
+            manifest["policy_id"] != criteria["policy_id"]
+            or manifest["policy_version"] != criteria["policy_version"]
+        ):
+            raise ContractError(f"policy identity mismatch: {manifest_path}")
+        if (
             manifest["writer_health_schema_version"]
             != criteria["writer_health_schema_version"]
         ):
@@ -1710,15 +1931,17 @@ def evaluate(
             ("v1_config_hash", "expected_v1_config_hash"),
             ("time_stop_v2_config_hash", "expected_time_stop_v2_config_hash"),
             ("brain_config_content_hash", "expected_brain_config_content_hash"),
-            ("run_config_content_hash", "expected_run_config_content_hash"),
         ):
             if manifest[manifest_field] != criteria[criteria_field]:
                 raise ContractError(f"config identity mismatch: {manifest_path}:{manifest_field}")
+        expected_exact_run_hash = criteria["allowed_exact_run_config_hashes"].get(run_id)
+        if expected_exact_run_hash != manifest["run_config_content_hash"]:
+            raise ContractError(f"exact run-config contract mismatch: {manifest_path}")
         launcher_proof = manifest["launcher_proof"]
         for proof_field, criteria_field in (
             ("git_commit_sha", "expected_runtime_commit_sha"),
             ("release_binary_sha256", "expected_release_binary_sha256"),
-            ("normalized_entry_cohort_hash", "expected_normalized_entry_cohort_hash"),
+            ("normalized_behavioral_config_hash", "expected_normalized_behavioral_config_hash"),
         ):
             if launcher_proof[proof_field] != criteria[criteria_field]:
                 raise ContractError(f"validation runtime contract mismatch: {manifest_path}:{proof_field}")
@@ -2415,6 +2638,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
     manifest = subparsers.add_parser("manifest")
     add_manifest_arguments(manifest)
+    lock_parser = subparsers.add_parser("lock-criteria")
+    lock_parser.add_argument("--criteria-template", type=Path, required=True)
+    lock_parser.add_argument("--runtime-commit-sha", required=True)
+    lock_parser.add_argument("--release-binary", type=Path, required=True)
+    lock_parser.add_argument("--brain-config", type=Path, required=True)
+    lock_parser.add_argument(
+        "--run-config",
+        action="append",
+        required=True,
+        metavar="RUN_ID=PATH",
+        help="exact prospective run config; repeat for each independent run",
+    )
+    lock_parser.add_argument("--output", type=Path, required=True)
     evaluate_parser = subparsers.add_parser("evaluate")
     evaluate_parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     evaluate_parser.add_argument("--criteria", type=Path, required=True)
@@ -2438,6 +2674,23 @@ def main(argv: list[str] | None = None) -> int:
             value = build_run_manifest(args)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_bytes(canonical_json(value))
+            return 0
+        if args.command == "lock-criteria":
+            run_configs: dict[str, Path] = {}
+            for item in args.run_config:
+                run_id, separator, raw_path = item.partition("=")
+                if not separator or not run_id or not raw_path or run_id in run_configs:
+                    raise ContractError("--run-config must be a unique RUN_ID=PATH mapping")
+                run_configs[run_id] = Path(raw_path)
+            locked = lock_criteria_template(
+                criteria_template=read_json(args.criteria_template),
+                runtime_commit_sha=args.runtime_commit_sha,
+                release_binary=args.release_binary,
+                brain_config=args.brain_config,
+                run_configs=run_configs,
+            )
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_bytes(canonical_json(locked))
             return 0
         criteria = read_json(args.criteria)
         validate_criteria(criteria)

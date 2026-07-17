@@ -74,8 +74,9 @@ use super::exit_policy_v1::{EXIT_POLICY_V1_ID, EXIT_POLICY_V1_VERSION};
 use super::exit_policy_v2::{
     build_entry_value_contract, materialize_anchor, prequote_label, EffectiveHetPmV2Config,
     ExecutablePeakAnchorV1, ExecutableQuoteKeyV2, ExitPolicyV2, HetComparisonCorrelationV1,
-    HetPmCandidateV2, HetPmFinalDecisionV2, HetPmQuoteFinalizationInputV2, HetPmV2ConfigError,
-    HetPmV2Status, PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2, PostBuySnapshotBundle,
+    HetPmCandidateV2, HetPmFinalDecisionV2, HetPmGateEvaluationV2, HetPmGateV2,
+    HetPmPreQuoteEvaluationV2, HetPmQuoteFinalizationInputV2, HetPmV2ConfigError, HetPmV2Status,
+    PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2, PostBuySnapshotBundle,
     PreparedHetComparisonV1, PreparedV1V2ComparisonCoreV1, RouteStatusV1,
     TerminalV2ComparisonOutcomeUnknownReasonV1, TerminalV2ComparisonSkipReasonV1,
     TimeStopV2ProjectionV1, TimeStopV2Subreason, TimeStopV2WindowStatus, V1AuthorityTickOutcomeV1,
@@ -7657,7 +7658,7 @@ impl MonitoringEngine {
             HetPmQuoteFinalizationInputV2 {
                 quote: v2_quote.as_ref(),
                 quote_key: v2_truth.and(v2_cell).map(|cell| &cell.key),
-                quote_evidence: v2_quote_evidence,
+                quote_evidence: v2_quote_evidence.clone(),
                 crash_requirement: v2_crash_requirement.as_ref(),
             },
             v1_policy,
@@ -7676,6 +7677,60 @@ impl MonitoringEngine {
             }
             _ => None,
         };
+        let v2_gate_evaluations =
+            ExitPolicyV2::evaluate_gate_lattice(view, v1_prequote, crash_prequote, het_policy)
+                .into_iter()
+                .map(|gate_prequote| {
+                    let prequote = HetPmPreQuoteEvaluationV2 {
+                        candidate: gate_prequote.candidate.clone(),
+                        winning_gate: match gate_prequote.reason {
+                            super::exit_policy_v2::HetPmExitReasonV2::Crash => HetPmGateV2::Crash,
+                            super::exit_policy_v2::HetPmExitReasonV2::HardLoss => {
+                                HetPmGateV2::HardLoss
+                            }
+                            super::exit_policy_v2::HetPmExitReasonV2::ExecutableTrailing => {
+                                HetPmGateV2::ExecutableTrailing
+                            }
+                            super::exit_policy_v2::HetPmExitReasonV2::VitalityDecay => {
+                                HetPmGateV2::VitalityDecay
+                            }
+                            super::exit_policy_v2::HetPmExitReasonV2::AbsoluteMaxHold => {
+                                HetPmGateV2::AbsoluteMaxHold
+                            }
+                        },
+                        suppressed_gates_mask: 0,
+                    };
+                    let final_decision = ExitPolicyV2::finalize_with_quote(
+                        view,
+                        &prequote,
+                        HetPmQuoteFinalizationInputV2 {
+                            quote: v2_quote.as_ref(),
+                            quote_key: v2_truth.and(v2_cell).map(|cell| &cell.key),
+                            quote_evidence: v2_quote_evidence.clone(),
+                            crash_requirement: v2_crash_requirement.as_ref(),
+                        },
+                        v1_policy,
+                        het_policy,
+                    );
+                    let executable_gross_return_bps = match final_decision {
+                        HetPmFinalDecisionV2::ExitAll {
+                            executable_gross_return_bps,
+                            ..
+                        } => Some(executable_gross_return_bps),
+                        _ => None,
+                    };
+                    HetPmGateEvaluationV2 {
+                        gate: gate_prequote.reason,
+                        prequote: gate_prequote.candidate.clone(),
+                        quote_status: ExitPolicyV2::gate_quote_status(
+                            &gate_prequote.candidate,
+                            &final_decision,
+                        ),
+                        final_decision,
+                        executable_gross_return_bps,
+                    }
+                })
+                .collect();
         let current_executable_value_sol = v2_truth.map(|truth| truth.exit_value_sol);
         let current_executable_gross_return_bps = v2_truth.map(|truth| {
             (truth.pnl_pct * 100.0)
@@ -7737,6 +7792,7 @@ impl MonitoringEngine {
             v2_crash_quote_decision,
             v2_winning_gate: v2_prequote.winning_gate,
             v2_suppressed_gates_mask: v2_prequote.suppressed_gates_mask,
+            v2_gate_evaluations,
             consumed_by_policy: false,
             v1_shadow_authority: true,
             v2_shadow_authority: false,

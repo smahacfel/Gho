@@ -104,6 +104,7 @@ const POST_BUY_ADMISSION_ARTIFACT_TYPE: &str = "post_buy_admission_v1";
 const POST_BUY_ADMISSION_HEALTH_SCHEMA_VERSION: u16 = 1;
 const POST_BUY_ADMISSION_HEALTH_ARTIFACT_TYPE: &str = "post_buy_admission_health_v1";
 const POST_BUY_ADMISSION_QUEUE_CAPACITY: usize = 4096;
+const POST_BUY_ADMISSION_SHUTDOWN_BUDGET_MS: u64 = 100;
 
 #[derive(Debug, Serialize)]
 struct PostBuyAdmissionRecord {
@@ -1118,12 +1119,25 @@ impl PostBuyAdmissionWriterRuntime {
         self.writer.clone()
     }
 
-    fn shutdown(mut self) {
+    async fn shutdown(mut self) {
         self.writer.take();
         let (summary, shutdown_complete) = match self.handle.take() {
-            Some(handle) => match handle.join() {
-                Ok(summary) => (summary, true),
-                Err(_) => (PostBuyAdmissionWriterSummary::default(), false),
+            Some(handle) => match tokio::time::timeout(
+                Duration::from_millis(POST_BUY_ADMISSION_SHUTDOWN_BUDGET_MS),
+                tokio::task::spawn_blocking(move || handle.join()),
+            )
+            .await
+            {
+                Ok(Ok(Ok(summary))) => (summary, true),
+                Ok(Ok(Err(_))) | Ok(Err(_)) => (PostBuyAdmissionWriterSummary::default(), false),
+                Err(_) => {
+                    warn!(
+                        runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                        budget_ms = POST_BUY_ADMISSION_SHUTDOWN_BUDGET_MS,
+                        "PostBuyRuntime: admission writer shutdown budget elapsed; evidence is incomplete"
+                    );
+                    (PostBuyAdmissionWriterSummary::default(), false)
+                }
             },
             None => (PostBuyAdmissionWriterSummary::default(), false),
         };
@@ -1139,24 +1153,28 @@ impl PostBuyAdmissionWriterRuntime {
             shutdown_complete,
             timestamp_ms: now_ms(),
         };
-        let write_result = (|| -> std::io::Result<()> {
-            if let Some(parent) = self.health_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&self.health_path)?;
-            serde_json::to_writer(&mut file, &record)?;
-            file.write_all(b"\n")?;
-            file.flush()
-        })();
-        if let Err(error) = write_result {
+        let health_path = self.health_path.clone();
+        let write_result = tokio::time::timeout(
+            Duration::from_millis(POST_BUY_ADMISSION_SHUTDOWN_BUDGET_MS),
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                if let Some(parent) = health_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&health_path)?;
+                serde_json::to_writer(&mut file, &record)?;
+                file.write_all(b"\n")?;
+                file.flush()
+            }),
+        )
+        .await;
+        if !matches!(write_result, Ok(Ok(Ok(())))) {
             warn!(
                 runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-                error = %error,
-                "PostBuyRuntime: failed to write post-buy admission health evidence"
+                "PostBuyRuntime: admission health artifact was not durably completed within budget"
             );
         }
     }
@@ -3124,7 +3142,7 @@ pub async fn run(
 
     drop(admission_writer);
     if let Some(runtime) = admission_writer_runtime.take() {
-        runtime.shutdown();
+        runtime.shutdown().await;
     }
 
     if let Err(e) = emitter.flush() {
@@ -9530,7 +9548,7 @@ sys.exit(0)
             })
             .expect("terminal receiver must remain active");
         watcher.await.expect("watcher should finish");
-        runtime.shutdown();
+        runtime.shutdown().await;
 
         let content = std::fs::read_to_string(&admission_path).expect("admission jsonl");
         let row: serde_json::Value =

@@ -35,6 +35,86 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         self.criteria = json.loads(CRITERIA_PATH.read_text(encoding="utf-8"))
         self.observed = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
         gate.validate_criteria(self.criteria)
+        # Arithmetic fixtures predate the prospective sample-size contract.
+        # Keep their narrow assertions independent of the production release
+        # thresholds; dedicated tests below assert that the checked-in values
+        # are non-vacuous.
+        self.criteria["contract_state"] = "locked"
+        economic = self.criteria["gates"]["economic_result"]["thresholds"]
+        economic.update({
+            "min_matched_v2_candidate_positions": 50,
+            "min_executable_trailing_candidate_positions": 5,
+            "min_executable_trailing_matched_positions": 3,
+            "min_vitality_candidate_positions": 5,
+            "min_vitality_matched_positions": 3,
+            "min_mfe_capture_positions": 30,
+            "min_missed_protection_eligible_positions": 30,
+            "mean_peak_to_terminal_giveback_delta_bps_min": -1000,
+            "mean_mfe_capture_ratio_delta_min": -1.0,
+            "mean_terminal_loss_delta_bps_min": -1000,
+            "tail_loss_p10_delta_bps_min": -1500,
+            "cvar_20_delta_bps_min": -1500,
+            "worst_cost_scenario_mean_delta_bps_min": -1500,
+            "top_k_positive_improvement_share_max": 1.0,
+            "trimmed_mean_delta_bps_min": -1000,
+            "false_early_exit_proxy_rate_max": 1.0,
+            "missed_protection_proxy_rate_max": 1.0,
+        })
+        self.criteria["gates"]["data_coverage"]["thresholds"].update({
+            "candidate_executable_continuation_coverage_min": 0.0,
+            "route_availability_after_candidate_min": 0.0,
+        })
+        self.criteria["gates"]["stability"]["thresholds"].update({
+            "per_run_min_primary_positions_min": 0,
+            "per_run_min_matched_v2_candidate_positions_min": 0,
+            "per_run_min_executable_trailing_matched_positions_min": 0,
+            "per_run_min_vitality_matched_positions_min": 0,
+            "per_run_min_candidate_executable_continuation_coverage_min": 0.0,
+            "per_run_worst_mean_delta_bps_min": -2_000,
+            "per_run_worst_tail_loss_p10_delta_bps_min": -2_000,
+            "per_run_worst_cost_scenario_mean_delta_bps_min": -2_000,
+        })
+        for gate_key in ("executable_trailing", "vitality_decay"):
+            # The historical arithmetic golden fixture predates the
+            # per-run-by-gate projection.  Supply its deterministic legacy
+            # equivalent only in this fixture; production criteria require the
+            # runtime-generated values and fail closed when they are absent.
+            self.observed["economic_result"]["gate_specific_economics"][gate_key].update({
+                "per_run_min_matched_positions": 3,
+                "per_run_worst_mean_peak_to_terminal_giveback_delta_bps": -1_000,
+                "per_run_worst_tail_loss_p10_delta_bps": -1_500,
+                "per_run_worst_cvar_20_delta_bps": -1_500,
+                "per_run_worst_cost_scenario_mean_delta_bps": -1_500,
+                "per_run_max_false_early_exit_proxy_rate": 1.0,
+                "per_run_min_candidate_executable_continuation_coverage": 0.0,
+            })
+        for gate_key, candidate_name, matched_name in (
+            ("executable_trailing", "executable_trailing_candidate_positions_min", "executable_trailing_matched_positions_min"),
+            ("vitality_decay", "vitality_candidate_positions_min", "vitality_matched_positions_min"),
+        ):
+            thresholds = self.criteria["gate_specific_thresholds"][gate_key]["thresholds"]
+            thresholds.update({
+                candidate_name: 5,
+                matched_name: 3,
+                "mean_peak_to_terminal_giveback_delta_bps_min": -1000,
+                "mean_mfe_capture_ratio_delta_min": -1.0,
+                "mean_terminal_loss_delta_bps_min": -1000,
+                "tail_loss_p10_delta_bps_min": -1500,
+                "cvar_20_delta_bps_min": -1500,
+                "worst_cost_scenario_mean_delta_bps_min": -1500,
+                "top_k_positive_improvement_share_max": 1.0,
+                "trimmed_mean_delta_bps_min": -1000,
+                "false_early_exit_proxy_rate_max": 1.0,
+                "candidate_executable_continuation_coverage_min": 0.0,
+                "route_availability_after_candidate_min": 0.8,
+                "per_run_min_matched_positions_min": 0,
+                "per_run_worst_mean_peak_to_terminal_giveback_delta_bps_min": -2000,
+                "per_run_worst_tail_loss_p10_delta_bps_min": -2000,
+                "per_run_worst_cvar_20_delta_bps_min": -2000,
+                "per_run_worst_cost_scenario_mean_delta_bps_min": -2000,
+                "per_run_max_false_early_exit_proxy_rate_max": 1.0,
+                "per_run_min_candidate_executable_continuation_coverage_min": 0.0,
+            })
 
     def evaluate(self, observed: dict | None = None) -> dict:
         source = observed or self.observed
@@ -142,6 +222,59 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
             "anchor_applied": False,
         }
 
+    def schema_v3_lattice_row(
+        self,
+        *,
+        key: tuple[str, str, int],
+        timestamp_ms: int,
+        exits: dict[str, int],
+        current_executable_bps: int | None = None,
+    ) -> dict:
+        """Build one producer-shaped Schema-V3 comparison tick.
+
+        A real HET record carries every gate evaluation in one row.  Tests of
+        selective promotion must use that shape; two same-timestamp legacy
+        rows would not prove that the analyzer can see a suppressed lower gate
+        from the runtime's actual evidence surface.
+        """
+        row = self.comparison_row(
+            key=key,
+            timestamp_ms=timestamp_ms,
+            current_executable_bps=current_executable_bps,
+        )
+        row["schema_version"] = 3
+        row["v2_gate_evaluations"] = []
+        for gate_key, reason in gate.V2_REASON_KEYS.items():
+            if reason in exits:
+                return_bps = exits[reason]
+                row["v2_gate_evaluations"].append(
+                    {
+                        "gate": reason,
+                        "prequote": {"kind": "quote_required", "detail": reason},
+                        "quote_status": "resolved",
+                        "final_decision": {
+                            "kind": "exit_all",
+                            "detail": {
+                                "reason": reason,
+                                "quantity_raw": 1,
+                                "executable_gross_return_bps": return_bps,
+                            },
+                        },
+                        "executable_gross_return_bps": return_bps,
+                    }
+                )
+            else:
+                row["v2_gate_evaluations"].append(
+                    {
+                        "gate": reason,
+                        "prequote": {"kind": "hold"},
+                        "quote_status": "not_required",
+                        "final_decision": {"kind": "hold"},
+                        "executable_gross_return_bps": None,
+                    }
+                )
+        return row
+
     def terminal(self) -> dict:
         return {
             "executable_gross_return_pct": 0.5,
@@ -161,6 +294,71 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         self.assertTrue(all(result["passed"] for result in gates.values()))
         artifact = self.artifact(gates, True)
         gate.validate_promotion_artifact(artifact, self.criteria)
+
+    def test_checked_in_template_keeps_runtime_policy_identity_and_non_vacuous_floors(self) -> None:
+        production = json.loads(CRITERIA_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(production["policy_version"], 2)
+        self.assertEqual(production["comparison_schema_version"], 3)
+        self.assertEqual(production["contract_state"], "calibration_pending")
+        for gate_key, prefix in (("executable_trailing", "executable_trailing"), ("vitality_decay", "vitality")):
+            thresholds = production["gate_specific_thresholds"][gate_key]["thresholds"]
+            self.assertGreaterEqual(thresholds[f"{prefix}_candidate_positions_min"], 100)
+            self.assertGreaterEqual(thresholds[f"{prefix}_matched_positions_min"], 80)
+            self.assertGreater(thresholds["candidate_executable_continuation_coverage_min"], 0.0)
+            self.assertLess(thresholds["false_early_exit_proxy_rate_max"], 1.0)
+            self.assertLess(thresholds["top_k_positive_improvement_share_max"], 1.0)
+
+    def test_criteria_lock_normalizes_operational_paths_but_binds_exact_run_configs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain = root / "brain.toml"
+            first = root / "first.toml"
+            second = root / "second.toml"
+            binary = root / "ghost-launcher"
+            brain.write_text("[post_buy_guardian.het_pm_v2]\nenabled = true\n", encoding="utf-8")
+            first.write_text(
+                "[p37_shadow_probe]\nrun_id = 'validation-v1a'\n"
+                "session_id = 'a'\nselection_log_path = '/tmp/a.jsonl'\n"
+                "sampling_version = 'frozen-v1'\nmax_probes_per_run = 100\n",
+                encoding="utf-8",
+            )
+            second.write_text(
+                "[p37_shadow_probe]\nrun_id = 'validation-v1b'\n"
+                "session_id = 'b'\nselection_log_path = '/tmp/b.jsonl'\n"
+                "sampling_version = 'frozen-v1'\nmax_probes_per_run = 100\n",
+                encoding="utf-8",
+            )
+            binary.write_bytes(b"release-binary")
+            locked = gate.lock_criteria_template(
+                criteria_template=json.loads(CRITERIA_PATH.read_text(encoding="utf-8")),
+                runtime_commit_sha="a" * 40,
+                release_binary=binary,
+                brain_config=brain,
+                run_configs={"validation-v1a": first, "validation-v1b": second},
+            )
+            self.assertEqual(locked["contract_state"], "locked")
+            self.assertEqual(
+                set(locked["allowed_exact_run_config_hashes"]),
+                {"validation-v1a", "validation-v1b"},
+            )
+            self.assertNotEqual(
+                locked["allowed_exact_run_config_hashes"]["validation-v1a"],
+                locked["allowed_exact_run_config_hashes"]["validation-v1b"],
+            )
+            self.assertNotEqual(locked["expected_normalized_behavioral_config_hash"], "unlocked")
+
+            second.write_text(
+                second.read_text(encoding="utf-8").replace("max_probes_per_run = 100", "max_probes_per_run = 101"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(gate.ContractError, "normalized behavioural contract"):
+                gate.lock_criteria_template(
+                    criteria_template=json.loads(CRITERIA_PATH.read_text(encoding="utf-8")),
+                    runtime_commit_sha="a" * 40,
+                    release_binary=binary,
+                    brain_config=brain,
+                    run_configs={"validation-v1a": first, "validation-v1b": second},
+                )
 
     def test_each_gate_can_fail_and_forces_root_false(self) -> None:
         failing_fields = {
@@ -339,17 +537,10 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
             {key: self.opened_position(key)},
             {
                 key: [
-                    self.comparison_row(
+                    self.schema_v3_lattice_row(
                         key=key,
                         timestamp_ms=1_000,
-                        reason="Crash",
-                        return_bps=-500,
-                    ),
-                    self.comparison_row(
-                        key=key,
-                        timestamp_ms=1_000,
-                        reason="ExecutableTrailing",
-                        return_bps=250,
+                        exits={"crash": -500, "executable_trailing": 250},
                     ),
                     self.comparison_row(
                         key=key,
