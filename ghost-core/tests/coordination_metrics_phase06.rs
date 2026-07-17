@@ -210,6 +210,29 @@ fn ftdi_v2_does_not_compute_clean_value_on_partial_fingerprint_sample() {
 }
 
 #[test]
+fn ftdi_v2_widens_available_denominator_above_u8_without_changing_schema() {
+    let config = CoordinationRiskConfig::default();
+    let mut txs = Vec::new();
+    for signer_seed in 0..=u8::MAX {
+        let mut tx = observed_buy_tx(signer_seed, u64::from(signer_seed).saturating_add(1), 0);
+        tx.fee_topology_fp = Some(fee_fp(signer_seed));
+        txs.push(tx);
+    }
+
+    let result = compute_ftdi_v2(&txs, &config);
+
+    assert_eq!(
+        result.evidence.breakdown.unique_buyer_count,
+        u8::MAX,
+        "the durable schema remains saturated u8"
+    );
+    assert_approx_eq(result.evidence.breakdown.fingerprint_coverage, 1.0);
+    assert_eq!(result.evidence.breakdown.topology_counts.len(), 256);
+    assert_eq!(result.evidence.evidence_status, MetricEvidenceStatus::Clean);
+    assert!(result.value.is_some());
+}
+
+#[test]
 fn dbia_v2_requires_comparable_dev_reference_and_never_uses_create_tx_as_buy() {
     let config = CoordinationRiskConfig::default();
     let txs = vec![

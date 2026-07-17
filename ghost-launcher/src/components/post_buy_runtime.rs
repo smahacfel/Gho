@@ -2704,25 +2704,73 @@ pub async fn run(
                         .as_ref()
                         .map(|monitor| monitor.active_position_count())
                         .unwrap_or(0);
-                    if active_shadow_positions == 0 && active_probe_positions == 0 {
-                        info!(
-                            runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-                            "PostBuyRuntime shutdown drain elapsed; stopping subscriber"
-                        );
-                        break;
-                    }
-                    debug!(
+                    info!(
                         runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                         active_shadow_positions,
                         active_probe_positions,
-                        "PostBuyRuntime shutdown drain elapsed but canonical shadow closeout is still active; waiting for shadow lifecycle completion"
+                        shutdown_closeout = if active_shadow_positions == 0
+                            && active_probe_positions == 0
+                        {
+                            "all_positions_terminal"
+                        } else {
+                            "remaining_positions_censored_administratively"
+                        },
+                        "PostBuyRuntime shutdown drain elapsed; stopping subscriber"
                     );
+                    break;
                 }
             }
         }
     }
 
-    // Wait for all in-flight lifecycle tasks to complete before flushing.
+    // Stop ticks before taking final replay and writer-health snapshots.
+    // Remaining positions are censored at the process boundary; they must not
+    // keep terminal watchers or capacity alive and must never become fabricated
+    // economic terminal records.
+    if let Some(handle) = shadow_runtime_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(monitor) = shadow_monitor.as_ref() {
+        monitor.flush_exit_replay_for_shutdown().await;
+        monitor.flush_het_pm_v2_writer_health_for_shutdown().await;
+        let removed = monitor.remove_all_positions_administratively();
+        if removed > 0 {
+            info!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                removed_positions = removed,
+                economic_terminal_emitted = false,
+                "PostBuyRuntime: administratively censored remaining shadow positions at shutdown"
+            );
+        }
+    }
+    if let Some(handle) = shadow_signal_router_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = probe_runtime_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(monitor) = probe_monitor.as_ref() {
+        let removed = monitor.remove_all_positions_administratively();
+        if removed > 0 {
+            info!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                removed_positions = removed,
+                economic_terminal_emitted = false,
+                "PostBuyRuntime: administratively censored remaining probe positions at shutdown"
+            );
+        }
+    }
+    if let Some(handle) = probe_signal_router_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // Terminal watchers unblock when administrative shutdown drops their
+    // senders. Await them only after monitor teardown; the inverse ordering can
+    // deadlock shutdown while any shadow position is still open.
     if !lifecycle_handles.is_empty() {
         info!(
             runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
@@ -2737,27 +2785,6 @@ pub async fn run(
                 );
             }
         }
-    }
-
-    if let Some(handle) = shadow_runtime_handle.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    if let Some(monitor) = shadow_monitor.as_ref() {
-        monitor.flush_exit_replay_for_shutdown().await;
-        monitor.flush_het_pm_v2_writer_health_for_shutdown().await;
-    }
-    if let Some(handle) = shadow_signal_router_handle.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    if let Some(handle) = probe_runtime_handle.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    if let Some(handle) = probe_signal_router_handle.take() {
-        handle.abort();
-        let _ = handle.await;
     }
 
     if let Err(e) = emitter.flush() {

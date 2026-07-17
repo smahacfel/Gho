@@ -3007,7 +3007,12 @@ impl MonitoringEngine {
             oldest,
             previous_distinct_slot,
             latest_in_window,
-            (latest.timestamp_ms() <= now_ms).then_some(now_ms - latest.timestamp_ms()),
+            // `bool::then_some` evaluates its argument eagerly. A canonical
+            // sample can legitimately be a few milliseconds ahead of the
+            // local wall clock, so subtracting before checking the predicate
+            // used to panic the entire monitoring task. Preserve that state as
+            // typed unavailable chronology evidence instead.
+            (latest.timestamp_ms() <= now_ms).then(|| now_ms.saturating_sub(latest.timestamp_ms())),
             distinct_slots,
             short_window_drop_fraction,
             peak_drawdown_fraction,
@@ -6019,6 +6024,21 @@ impl MonitoringEngine {
                 pos.recent_signals.len()
             );
         }
+    }
+
+    /// Drain every observer-owned position during controlled process shutdown.
+    ///
+    /// This is deliberately not an economic terminal path: no proposal, fill,
+    /// PnL, lifecycle terminal, or capacity decision is fabricated. Dropping
+    /// the per-position terminal sender unblocks the launcher's shutdown-only
+    /// watcher after the authority loop has already been stopped.
+    pub fn remove_all_positions_administratively(&self) -> usize {
+        let active_mints = self.active_mints();
+        let removed = active_mints.len();
+        for base_mint in active_mints {
+            self.remove_position_administratively(&base_mint);
+        }
+        removed
     }
 
     /// Returns the number of currently monitored positions.
@@ -9659,6 +9679,61 @@ mod tests {
     }
 
     #[test]
+    fn crash_vector_future_sample_is_invalid_evidence_not_monitor_panic() {
+        let config = pr2_guardian_config(false, CrashGuardMode::ObserveOnly);
+        let (tx, _rx) = mpsc::channel(4);
+        let engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid crash-guard config");
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000_000),
+                Some(1_000_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
+                    candidate_id: "future-crash-sample".to_string(),
+                    entry_order_id: "future-crash-entry".to_string(),
+                    quote_id: "future-crash-quote".to_string(),
+                    slot: Some(10),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:future-crash-sample".to_string()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("valid registration");
+
+        let future_sample = MarketSnapshot {
+            slot: Some(11),
+            timestamp_ms: 2_001,
+            price_sol_per_token: 0.5,
+            price_state: PriceState::Valid,
+            market_cap_sol: 0.5,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 10.0,
+            ..MarketSnapshot::default()
+        };
+        {
+            let mut positions = engine.positions.write();
+            let pos = positions.get_mut(&mint).expect("registered position");
+            pos.snapshot_timeline
+                .replace_with(vec![future_sample], 8, 10_000);
+        }
+
+        let positions = engine.positions.read();
+        let pos = positions.get(&mint).expect("registered position");
+        let policy = engine.exit_policy_v1.as_ref().expect("V1 policy");
+        let vector = MonitoringEngine::materialize_crash_vector(pos, 2_000, policy);
+
+        assert_eq!(vector.latest_sample_age_ms(), None);
+        assert!(!vector.ordering_valid());
+    }
+
+    #[test]
     fn shadow_registration_rejects_invalid_immutable_contract_before_open_event() {
         let tmp = TempDir::new().expect("tempdir");
         let events_dir = tmp.path().join("events");
@@ -9763,6 +9838,51 @@ mod tests {
         assert_eq!(
             failure.kind.unresolved_reason(),
             ShadowUnresolvedReason::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn administrative_shutdown_removes_all_positions_without_terminal_disposition() {
+        let config = PostBuyGuardianConfig::default();
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, shadow_ledger, tx);
+        enable_baseline_exit_policy(&mut engine);
+
+        let mint = Pubkey::new_unique();
+        let registered = engine
+            .register_shadow_position_with_terminal(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(0.0000001),
+                Some(7_000_000),
+                Some(7_000_000_000),
+                PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("administrative-shutdown-test".to_string()),
+                        ..Default::default()
+                    },
+                    candidate_id: "administrative-shutdown-candidate".to_string(),
+                    entry_order_id: "shadow-entry-administrative-shutdown".to_string(),
+                    quote_id: "shadow-quote-administrative-shutdown".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("pool:mint:administrative-shutdown".to_string()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1),
+                },
+            )
+            .expect("register shutdown-only position");
+        let (_, terminal_rx) = registered.into_parts();
+
+        assert_eq!(engine.active_position_count(), 1);
+        assert_eq!(engine.remove_all_positions_administratively(), 1);
+        assert_eq!(engine.active_position_count(), 0);
+        assert_eq!(engine.remove_all_positions_administratively(), 0);
+        assert!(
+            terminal_rx.await.is_err(),
+            "administrative shutdown must drop the sender without fabricating an economic terminal"
         );
     }
 

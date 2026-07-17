@@ -115,6 +115,21 @@ def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path)
     }
 
 
+def build_preflight_command(launcher: Path, config_path: Path) -> list[str]:
+    """Use the same release artifact for preflight and the guarded runtime."""
+    return [str(launcher), "--config", str(config_path), "--preflight"]
+
+
+def build_runtime_timeout_prefix(runtime_timeout_seconds: int | None) -> str:
+    """Request controlled Ctrl+C shutdown, with a hard bounded backstop."""
+    if runtime_timeout_seconds is None or runtime_timeout_seconds <= 0:
+        return ""
+    return (
+        "timeout --signal=INT --kill-after=120s "
+        f"{int(runtime_timeout_seconds)}s "
+    )
+
+
 def validate_scope_contract(
     *,
     scope: str,
@@ -193,16 +208,14 @@ def start_tmux_session(
     runtime_timeout_seconds: int | None,
 ) -> dict[str, Any]:
     runtime_log.parent.mkdir(parents=True, exist_ok=True)
-    timeout_prefix = ""
-    if runtime_timeout_seconds is not None and runtime_timeout_seconds > 0:
-        timeout_prefix = f"timeout {int(runtime_timeout_seconds)}s "
+    timeout_prefix = build_runtime_timeout_prefix(runtime_timeout_seconds)
     command = (
         f"cd {shlex.quote(str(root))} && "
-        "set -a && [ -f ./.env ] && . ./.env && set +a && "
+        "set -a; if [ -f ./.env ]; then . ./.env; fi; set +a; "
         'if [ -z "${NLN_API_KEY:-}" ] && [ -n "${GHOST_SEER_GRPC_X_TOKEN:-}" ]; then '
         'export NLN_API_KEY="$GHOST_SEER_GRPC_X_TOKEN"; '
         "fi && "
-        f"RUST_LOG=info {timeout_prefix}{shlex.quote(str(launcher))} "
+        f"RUST_LOG=info RUST_BACKTRACE=1 {timeout_prefix}{shlex.quote(str(launcher))} "
         f"--config {shlex.quote(str(config_path))} "
         f">> {shlex.quote(str(runtime_log))} 2>&1"
     )
@@ -516,18 +529,7 @@ def main(argv: list[str] | None = None) -> int:
         report["errors"].append("static guard failed")
         return finish(report, output_dir, FAIL_CONFIG_CONTRACT)
 
-    preflight_cmd = [
-        "cargo",
-        "run",
-        "-p",
-        "ghost-launcher",
-        "--bin",
-        "ghost-launcher",
-        "--",
-        "--config",
-        str(resolved_config),
-        "--preflight",
-    ]
+    preflight_cmd = build_preflight_command(launcher, resolved_config)
     preflight = run_command(preflight_cmd, cwd=root, log_path=output_dir / "commands" / "preflight.log")
     report["preflight"] = {
         "status": PASS_STATUS if preflight["exit_code"] == 0 else "FAIL",
