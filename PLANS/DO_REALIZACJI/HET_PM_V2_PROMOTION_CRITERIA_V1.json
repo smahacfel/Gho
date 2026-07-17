@@ -8,8 +8,8 @@
   "expected_v1_config_hash": "6da505da191cb8977d705423c34fa9e05a626f6649cd59e7efd5f3452a4739a7",
   "expected_time_stop_v2_config_hash": "d52cd958811e74e9c47f216993df8beedd752d2d010f0daa5ec6705cb643dd47",
   "contract_state": "locked",
-  "expected_runtime_commit_sha": "e54b36c1dc2ce7ea1265513dbe64b4781d7396fa",
-  "expected_release_binary_sha256": "7cdadc836024dc3aa4d9568958486b8a49761d829e9781bd608d46f2b16c9001",
+  "expected_runtime_commit_sha": "7e162a9d1ebd8e62f0079a21897cbd3bfec84057",
+  "expected_release_binary_sha256": "8f38ee7879f4c8ce58b43c3757b4fe1cd09d4b398a07e56d99165c690e6a3804",
   "expected_brain_config_content_hash": "7fc14662d1433872978dcb8d5be0413c7f7769905b6b84f36f6bc46f7e9a2028",
   "expected_normalized_behavioral_config_hash": "bfa1a00497ab9b4babe4cc8198ade4d424e52ff70f38c882cfcee0939ef6ceac",
   "allowed_exact_run_config_hashes": {
