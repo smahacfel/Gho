@@ -310,8 +310,12 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
             [
                 "--scope",
                 "r37",
+                "--launch-cohort-id",
+                "cohort-r37",
                 "--config",
                 "configs/rollout/r37.toml",
+                "--run-role",
+                "validation",
                 "--tmux-session",
                 "r37",
                 "--allow-zero-buy-lifecycle-proof",

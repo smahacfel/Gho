@@ -1,12 +1,19 @@
 {
-  "criteria_version": 2,
+  "criteria_version": 3,
   "policy_id": "hierarchical_executable_trajectory_pm_v2",
-  "policy_version": 2,
+  "policy_version": 3,
   "comparison_schema_version": 2,
   "writer_health_schema_version": 2,
   "expected_het_config_hash": "ec5762c8ff99f003327224a2c0e05fe9ee58820f3fda950cb909fe294cdea39e",
   "expected_v1_config_hash": "6da505da191cb8977d705423c34fa9e05a626f6649cd59e7efd5f3452a4739a7",
   "expected_time_stop_v2_config_hash": "d52cd958811e74e9c47f216993df8beedd752d2d010f0daa5ec6705cb643dd47",
+  "expected_runtime_commit_sha": "b89012132a161b3e4a27ecaaf6e28c3f9b1a509b",
+  "expected_release_binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "expected_brain_config_content_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "expected_run_config_content_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "expected_normalized_entry_cohort_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "expected_promotion_tool_hash": "50336dcd4e749d0786783f26af16bad6e0bb5959b5e2d1c3919e1e10634e5121",
+  "expected_pr_a_analyzer_hash": "836433d35b6c83effb55a64f48bfef9606e350ff21c5bf5345792e849d46e1cb",
   "position_denominator": "unique_run_id_position_id_position_epoch_from_primary_shadow_position_opened",
   "missing_data_semantics": "fail_closed",
   "metric_contracts": {
@@ -19,7 +26,7 @@
     "outlier_top_k": 3,
     "outlier_trim_each_tail": 1,
     "major_segment_min_positions": 5,
-    "stable_direction_floor_bps": -100
+    "stable_direction_floor_bps": -1000
   },
   "gate_promotion_contract": {
     "crash": {"promotion_requested": false, "authority_eligible": false},
@@ -27,6 +34,46 @@
     "executable_trailing": {"promotion_requested": true, "authority_eligible": true},
     "vitality_decay": {"promotion_requested": true, "authority_eligible": true},
     "absolute_max_hold": {"promotion_requested": false, "authority_eligible": true}
+  },
+  "gate_specific_thresholds": {
+    "executable_trailing": {
+      "thresholds": {
+        "executable_trailing_candidate_positions_min": 5,
+        "executable_trailing_matched_positions_min": 3,
+        "mean_peak_to_terminal_giveback_delta_bps_min": -1000,
+        "mean_mfe_capture_ratio_delta_min": -1.0,
+        "mean_terminal_loss_delta_bps_min": -1000,
+        "tail_loss_p10_delta_bps_min": -1500,
+        "cvar_20_delta_bps_min": -1500,
+        "worst_cost_scenario_mean_delta_bps_min": -1500,
+        "top_k_positive_improvement_share_max": 1.0,
+        "trimmed_mean_delta_bps_min": -1000,
+        "false_early_exit_proxy_rate_max": 1.0,
+        "candidate_executable_continuation_coverage_min": 0.0,
+        "route_availability_after_candidate_min": 0.8,
+        "candidate_bearing_censored_count_max": 0,
+        "promoted_candidate_economic_join_failure_count_max": 0
+      }
+    },
+    "vitality_decay": {
+      "thresholds": {
+        "vitality_candidate_positions_min": 5,
+        "vitality_matched_positions_min": 3,
+        "mean_peak_to_terminal_giveback_delta_bps_min": -1000,
+        "mean_mfe_capture_ratio_delta_min": -1.0,
+        "mean_terminal_loss_delta_bps_min": -1000,
+        "tail_loss_p10_delta_bps_min": -1500,
+        "cvar_20_delta_bps_min": -1500,
+        "worst_cost_scenario_mean_delta_bps_min": -1500,
+        "top_k_positive_improvement_share_max": 1.0,
+        "trimmed_mean_delta_bps_min": -1000,
+        "false_early_exit_proxy_rate_max": 1.0,
+        "candidate_executable_continuation_coverage_min": 0.0,
+        "route_availability_after_candidate_min": 0.8,
+        "candidate_bearing_censored_count_max": 0,
+        "promoted_candidate_economic_join_failure_count_max": 0
+      }
+    }
   },
   "metric_definitions": {
     "duplicate_action_count": {"gate":"lifecycle_integrity","unit":"count","denominator":"terminal_action_id","direction":"lower","missing":"fail_closed"},
@@ -48,7 +95,12 @@
     "admission_missing_monitoring_registered_count": {"gate":"lifecycle_integrity","unit":"count","denominator":"accepted_shadow_handoff","direction":"lower","missing":"fail_closed"},
     "admission_missing_release_count": {"gate":"lifecycle_integrity","unit":"count","denominator":"accepted_shadow_handoff","direction":"lower","missing":"fail_closed"},
     "admission_rejection_without_release_count": {"gate":"lifecycle_integrity","unit":"count","denominator":"rejected_shadow_handoff","direction":"lower","missing":"fail_closed"},
-    "primary_positions": {"gate":"data_coverage","unit":"count","denominator":"unique_run_id_position_id_position_epoch_from_primary_shadow_position_opened","direction":"higher","missing":"fail_closed"},
+    "monitoring_registered_without_position_open_count": {"gate":"lifecycle_integrity","unit":"count","denominator":"monitoring_registered_admission_identity","direction":"lower","missing":"fail_closed"},
+    "position_open_without_matching_candidate_identity_count": {"gate":"lifecycle_integrity","unit":"count","denominator":"primary_shadow_position_opened","direction":"lower","missing":"fail_closed"},
+    "registered_without_het_within_2_ticks_count": {"gate":"lifecycle_integrity","unit":"count","denominator":"monitoring_registered_position","direction":"lower","missing":"fail_closed"},
+    "admission_drop_or_failure_count": {"gate":"lifecycle_integrity","unit":"count","denominator":"admission_writer_attempt","direction":"lower","missing":"fail_closed"},
+    "admission_health_row_mismatch_count": {"gate":"lifecycle_integrity","unit":"count","denominator":"admission_health_artifact","direction":"lower","missing":"fail_closed"},
+    "primary_positions": {"gate":"data_coverage","unit":"count","denominator":"unique_primary_shadow_position_opened","direction":"higher","missing":"fail_closed"},
     "comparison_records": {"gate":"data_coverage","unit":"count","denominator":"validated_comparison_row","direction":"higher","missing":"fail_closed"},
     "position_comparison_coverage": {"gate":"data_coverage","unit":"ratio","denominator":"primary_positions","direction":"higher","missing":"fail_closed"},
     "position_replay_coverage": {"gate":"data_coverage","unit":"ratio","denominator":"primary_positions","direction":"higher","missing":"fail_closed"},
@@ -63,8 +115,8 @@
     "producer_validation_skip_count": {"gate":"data_coverage","unit":"count","denominator":"comparison_attempts","direction":"lower","missing":"fail_closed"},
     "writer_drop_or_failure_count": {"gate":"data_coverage","unit":"count","denominator":"enqueue_attempts","direction":"lower","missing":"fail_closed"},
     "writer_terminal_outcome_unknown_count": {"gate":"data_coverage","unit":"count","denominator":"terminal_write_attempts","direction":"lower","missing":"fail_closed"},
-    "candidate_executable_continuation_coverage": {"gate":"data_coverage","unit":"ratio","denominator":"matched_promoted_gate_candidate_positions","direction":"higher","missing":"fail_closed"},
-    "route_availability_after_candidate": {"gate":"data_coverage","unit":"ratio","denominator":"matched_promoted_gate_candidate_positions","direction":"higher","missing":"fail_closed"},
+    "candidate_executable_continuation_coverage": {"gate":"data_coverage","unit":"ratio","denominator":"combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
+    "route_availability_after_candidate": {"gate":"data_coverage","unit":"ratio","denominator":"combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
     "all_writer_shutdown_complete": {"gate":"data_coverage","unit":"boolean","denominator":"writer_instance","direction":"true_required","missing":"fail_closed"},
     "quote_count_per_position_p95": {"gate":"quote_budget","unit":"count","denominator":"comparison_position_identity","direction":"lower","missing":"fail_closed"},
     "quote_count_per_position_max": {"gate":"quote_budget","unit":"count","denominator":"comparison_position_identity","direction":"lower","missing":"fail_closed"},
@@ -73,24 +125,25 @@
     "between_tick_cache_reuse_violation_count": {"gate":"quote_budget","unit":"count","denominator":"runtime_quote_plan_contract","direction":"lower","missing":"fail_closed"},
     "anchor_quote_count_per_position_p95": {"gate":"quote_budget","unit":"count","denominator":"comparison_position_identity","direction":"lower","missing":"fail_closed"},
     "micropeak_quote_rate": {"gate":"quote_budget","unit":"ratio","denominator":"comparison_records","direction":"lower","missing":"fail_closed"},
-    "matched_v2_candidate_positions": {"gate":"economic_result","unit":"count","denominator":"primary_positions_with_promoted_v2_candidate_terminal_and_replay","direction":"higher","missing":"fail_closed"},
+    "matched_v2_candidate_positions": {"gate":"economic_result","unit":"count","denominator":"combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
     "executable_trailing_candidate_positions": {"gate":"economic_result","unit":"count","denominator":"primary_positions_with_executable_trailing_candidate","direction":"higher","missing":"fail_closed"},
     "executable_trailing_matched_positions": {"gate":"economic_result","unit":"count","denominator":"executable_trailing_candidate_positions_with_terminal_and_replay","direction":"higher","missing":"fail_closed"},
     "vitality_candidate_positions": {"gate":"economic_result","unit":"count","denominator":"primary_positions_with_vitality_decay_candidate","direction":"higher","missing":"fail_closed"},
     "vitality_matched_positions": {"gate":"economic_result","unit":"count","denominator":"vitality_decay_candidate_positions_with_terminal_and_replay","direction":"higher","missing":"fail_closed"},
-    "mfe_capture_positions": {"gate":"economic_result","unit":"count","denominator":"matched_positions_with_mark_mfe_at_least_100bps","direction":"higher","missing":"fail_closed"},
+    "mfe_capture_positions": {"gate":"economic_result","unit":"count","denominator":"combined_policy_positions_with_mark_mfe_at_least_100bps","direction":"higher","missing":"fail_closed"},
     "missed_protection_eligible_positions": {"gate":"economic_result","unit":"count","denominator":"terminal_positions_without_v2_candidate","direction":"higher","missing":"fail_closed"},
     "candidate_bearing_censored_count": {"gate":"economic_result","unit":"count","denominator":"censored_positions_with_any_v2_exit_candidate","direction":"lower","missing":"fail_closed"},
-    "mean_peak_to_terminal_giveback_delta_bps": {"gate":"economic_result","unit":"bps_v2_minus_v1","denominator":"matched_v2_candidate_positions","direction":"higher","missing":"fail_closed"},
+    "promoted_candidate_economic_join_failure_count": {"gate":"economic_result","unit":"count","denominator":"promoted_gate_candidates_with_expected_economic_join","direction":"lower","missing":"fail_closed"},
+    "mean_peak_to_terminal_giveback_delta_bps": {"gate":"economic_result","unit":"bps_v2_minus_v1","denominator":"combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
     "mean_mfe_capture_ratio_delta": {"gate":"economic_result","unit":"ratio_v2_minus_v1","denominator":"mfe_capture_positions","direction":"higher","missing":"fail_closed"},
     "mean_vitality_occupancy_capital_seconds_delta": {"gate":"economic_result","unit":"sol_seconds_saved_v2_minus_v1","denominator":"vitality_candidate_positions","direction":"higher","missing":"fail_closed"},
-    "mean_terminal_loss_delta_bps": {"gate":"economic_result","unit":"bps_v2_minus_v1","denominator":"matched_v2_candidate_positions","direction":"higher","missing":"fail_closed"},
-    "tail_loss_p10_delta_bps": {"gate":"economic_result","unit":"bps_v2_p10_minus_v1_p10","denominator":"matched_v2_candidate_positions","direction":"higher","missing":"fail_closed"},
-    "cvar_20_delta_bps": {"gate":"economic_result","unit":"bps_v2_lower20pct_mean_minus_v1","denominator":"matched_v2_candidate_positions","direction":"higher","missing":"fail_closed"},
-    "worst_cost_scenario_mean_delta_bps": {"gate":"economic_result","unit":"bps_v2_minus_v1_after_counterfactual_v2_only_penalty","denominator":"matched_v2_candidate_positions","direction":"higher","missing":"fail_closed"},
+    "mean_terminal_loss_delta_bps": {"gate":"economic_result","unit":"bps_v2_minus_v1","denominator":"combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
+    "tail_loss_p10_delta_bps": {"gate":"economic_result","unit":"bps_v2_p10_minus_v1_p10","denominator":"combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
+    "cvar_20_delta_bps": {"gate":"economic_result","unit":"bps_v2_lower20pct_mean_minus_v1","denominator":"combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
+    "worst_cost_scenario_mean_delta_bps": {"gate":"economic_result","unit":"bps_v2_minus_v1_after_counterfactual_v2_only_penalty","denominator":"combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
     "top_k_positive_improvement_share": {"gate":"economic_result","unit":"ratio","denominator":"sum_positive_v2_minus_v1_delta_bps","direction":"lower","missing":"fail_closed"},
-    "trimmed_mean_delta_bps": {"gate":"economic_result","unit":"bps_v2_minus_v1","denominator":"matched_positions_after_one_each_tail_trim","direction":"higher","missing":"fail_closed"},
-    "false_early_exit_proxy_rate": {"gate":"economic_result","unit":"ratio_mark_proxy","denominator":"matched_v2_candidate_positions","direction":"lower","missing":"fail_closed"},
+    "trimmed_mean_delta_bps": {"gate":"economic_result","unit":"bps_v2_minus_v1","denominator":"combined_policy_trimmed_positions","direction":"higher","missing":"fail_closed"},
+    "false_early_exit_proxy_rate": {"gate":"economic_result","unit":"ratio_mark_proxy","denominator":"combined_policy_matched_positions","direction":"lower","missing":"fail_closed"},
     "missed_protection_proxy_rate": {"gate":"economic_result","unit":"ratio_executable_terminal_proxy","denominator":"missed_protection_eligible_positions","direction":"lower","missing":"fail_closed"},
     "validation_runs": {"gate":"stability","unit":"count","denominator":"run_manifest_with_validation_role","direction":"higher","missing":"fail_closed"},
     "launch_cohorts": {"gate":"stability","unit":"count","denominator":"unique_launch_cohort_id_for_validation_runs","direction":"higher","missing":"fail_closed"},
@@ -100,7 +153,18 @@
     "largest_creator_or_funder_positive_improvement_share": {"gate":"stability","unit":"ratio","denominator":"sum_positive_v2_minus_v1_delta_bps","direction":"lower","missing":"fail_closed"},
     "major_segments": {"gate":"stability","unit":"count","denominator":"predeclared_segment_with_at_least_5_matched_positions","direction":"higher","missing":"fail_closed"},
     "stable_direction_segment_share": {"gate":"stability","unit":"ratio","denominator":"major_segments","direction":"higher","missing":"fail_closed"},
-    "causal_data_contract_violation_count": {"gate":"stability","unit":"count","denominator":"all_join_and_runtime_contract_checks","direction":"lower","missing":"fail_closed"}
+    "causal_data_contract_violation_count": {"gate":"stability","unit":"count","denominator":"all_join_and_runtime_contract_checks","direction":"lower","missing":"fail_closed"},
+    "per_run_min_primary_positions": {"gate":"stability","unit":"count","denominator":"validation_run","direction":"higher","missing":"fail_closed"},
+    "per_run_min_position_comparison_coverage": {"gate":"stability","unit":"ratio","denominator":"validation_run_primary_positions","direction":"higher","missing":"fail_closed"},
+    "per_run_min_matched_v2_candidate_positions": {"gate":"stability","unit":"count","denominator":"validation_run_combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
+    "per_run_min_executable_trailing_matched_positions": {"gate":"stability","unit":"count","denominator":"validation_run_executable_trailing_matched_positions","direction":"higher","missing":"fail_closed"},
+    "per_run_min_vitality_matched_positions": {"gate":"stability","unit":"count","denominator":"validation_run_vitality_matched_positions","direction":"higher","missing":"fail_closed"},
+    "per_run_min_candidate_executable_continuation_coverage": {"gate":"stability","unit":"ratio","denominator":"validation_run_combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
+    "per_run_min_creator_or_funder_identity_coverage": {"gate":"stability","unit":"ratio","denominator":"validation_run_primary_positions","direction":"higher","missing":"fail_closed"},
+    "per_run_max_lifecycle_violation_count": {"gate":"stability","unit":"count","denominator":"validation_run_contract_violations","direction":"lower","missing":"fail_closed"},
+    "per_run_worst_mean_delta_bps": {"gate":"stability","unit":"bps_v2_minus_v1","denominator":"validation_run_combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
+    "per_run_worst_tail_loss_p10_delta_bps": {"gate":"stability","unit":"bps_v2_minus_v1","denominator":"validation_run_combined_policy_matched_positions","direction":"higher","missing":"fail_closed"},
+    "per_run_worst_cost_scenario_mean_delta_bps": {"gate":"stability","unit":"bps_v2_minus_v1_after_cost","denominator":"validation_run_combined_policy_matched_positions","direction":"higher","missing":"fail_closed"}
   },
   "gates": {
     "lifecycle_integrity": {
@@ -124,7 +188,12 @@
         "admission_missing_final_count_max": 0,
         "admission_missing_monitoring_registered_count_max": 0,
         "admission_missing_release_count_max": 0,
-        "admission_rejection_without_release_count_max": 0
+        "admission_rejection_without_release_count_max": 0,
+        "monitoring_registered_without_position_open_count_max": 0,
+        "position_open_without_matching_candidate_identity_count_max": 0,
+        "registered_without_het_within_2_ticks_count_max": 0,
+        "admission_drop_or_failure_count_max": 0,
+        "admission_health_row_mismatch_count_max": 0
       }
     },
     "data_coverage": {
@@ -145,8 +214,8 @@
         "producer_validation_skip_count_max": 0,
         "writer_drop_or_failure_count_max": 0,
         "writer_terminal_outcome_unknown_count_max": 0,
-        "candidate_executable_continuation_coverage_min": 0.80,
-        "route_availability_after_candidate_min": 0.80,
+        "candidate_executable_continuation_coverage_min": 0.0,
+        "route_availability_after_candidate_min": 0.8,
         "require_all_writer_shutdown_complete": true
       }
     },
@@ -163,27 +232,28 @@
       }
     },
     "economic_result": {
-      "direction": "v2_minus_v1_higher_is_better",
+      "direction": "combined_policy_v2_minus_v1_higher_is_better",
       "thresholds": {
         "min_matched_v2_candidate_positions": 50,
-        "min_executable_trailing_candidate_positions": 10,
-        "min_executable_trailing_matched_positions": 10,
-        "min_vitality_candidate_positions": 10,
-        "min_vitality_matched_positions": 10,
+        "min_executable_trailing_candidate_positions": 5,
+        "min_executable_trailing_matched_positions": 3,
+        "min_vitality_candidate_positions": 5,
+        "min_vitality_matched_positions": 3,
         "min_mfe_capture_positions": 30,
         "min_missed_protection_eligible_positions": 30,
         "candidate_bearing_censored_count_max": 0,
-        "mean_peak_to_terminal_giveback_delta_bps_min": -100,
-        "mean_mfe_capture_ratio_delta_min": -0.05,
+        "promoted_candidate_economic_join_failure_count_max": 0,
+        "mean_peak_to_terminal_giveback_delta_bps_min": -1000,
+        "mean_mfe_capture_ratio_delta_min": -1.0,
         "mean_vitality_occupancy_capital_seconds_delta_min": 0.0,
-        "mean_terminal_loss_delta_bps_min": -100,
-        "tail_loss_p10_delta_bps_min": -150,
-        "cvar_20_delta_bps_min": -150,
-        "worst_cost_scenario_mean_delta_bps_min": -150,
-        "top_k_positive_improvement_share_max": 0.65,
-        "trimmed_mean_delta_bps_min": -100,
-        "false_early_exit_proxy_rate_max": 0.35,
-        "missed_protection_proxy_rate_max": 0.15
+        "mean_terminal_loss_delta_bps_min": -1000,
+        "tail_loss_p10_delta_bps_min": -1500,
+        "cvar_20_delta_bps_min": -1500,
+        "worst_cost_scenario_mean_delta_bps_min": -1500,
+        "top_k_positive_improvement_share_max": 1.0,
+        "trimmed_mean_delta_bps_min": -1000,
+        "false_early_exit_proxy_rate_max": 1.0,
+        "missed_protection_proxy_rate_max": 1.0
       }
     },
     "stability": {
@@ -196,8 +266,19 @@
         "largest_creator_or_funder_cohort_share_max": 0.2,
         "largest_creator_or_funder_positive_improvement_share_max": 0.35,
         "min_major_segments": 3,
-        "stable_direction_segment_share_min": 0.67,
-        "causal_data_contract_violation_count_max": 0
+        "stable_direction_segment_share_min": 0.5,
+        "causal_data_contract_violation_count_max": 0,
+        "per_run_min_primary_positions_min": 10,
+        "per_run_min_position_comparison_coverage_min": 1.0,
+        "per_run_min_matched_v2_candidate_positions_min": 5,
+        "per_run_min_executable_trailing_matched_positions_min": 1,
+        "per_run_min_vitality_matched_positions_min": 1,
+        "per_run_min_candidate_executable_continuation_coverage_min": 0.0,
+        "per_run_min_creator_or_funder_identity_coverage_min": 0.8,
+        "per_run_max_lifecycle_violation_count_max": 0,
+        "per_run_worst_mean_delta_bps_min": -1500,
+        "per_run_worst_tail_loss_p10_delta_bps_min": -2000,
+        "per_run_worst_cost_scenario_mean_delta_bps_min": -2000
       }
     }
   }

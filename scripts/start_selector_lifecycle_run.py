@@ -312,6 +312,8 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
         f"- claim: `{payload.get('claim')}`",
         f"- run_state: `{payload.get('run_state')}`",
         f"- scope: `{payload.get('scope')}`",
+        f"- run_role: `{payload.get('run_role')}`",
+        f"- launch_cohort_id: `{payload.get('launch_cohort_id')}`",
         f"- config: `{payload.get('config')}`",
         f"- tmux_session: `{payload.get('tmux_session')}`",
         f"- allow_zero_buy_lifecycle_proof: `{payload.get('allow_zero_buy_lifecycle_proof')}`",
@@ -389,7 +391,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Start a selector dataset run only after lifecycle safety gates.")
     parser.add_argument("--root", type=Path, default=REPO_ROOT)
     parser.add_argument("--scope", required=True)
-    parser.add_argument("--launch-cohort-id")
+    parser.add_argument("--launch-cohort-id", required=True)
+    parser.add_argument(
+        "--run-role",
+        choices=("calibration", "validation"),
+        required=True,
+        help="Immutable run role recorded before runtime start and verified by promotion manifests.",
+    )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--tmux-session", required=True)
     parser.add_argument("--output-dir", type=Path)
@@ -444,6 +452,7 @@ def main(argv: list[str] | None = None) -> int:
         "launcher_invocation": sys.argv if argv is None else [sys.argv[0], *argv],
         "scope": args.scope,
         "launch_cohort_id": args.launch_cohort_id,
+        "run_role": args.run_role,
         "config": str(config_path),
         "tmux_session": args.tmux_session,
         "runtime_timeout_seconds": args.runtime_timeout_seconds,

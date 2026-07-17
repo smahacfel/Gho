@@ -32,11 +32,11 @@ from typing import Any, Iterable
 
 
 TOOL_ID = "het_pm_v2_promotion_gate_v1"
-TOOL_VERSION = 2
-PROMOTION_SCHEMA_VERSION = 2
-RUN_MANIFEST_SCHEMA_VERSION = 2
+TOOL_VERSION = 3
+PROMOTION_SCHEMA_VERSION = 3
+RUN_MANIFEST_SCHEMA_VERSION = 3
 RUN_MANIFEST_TYPE = "het_pm_v2_run_input_manifest"
-CRITERIA_VERSION = 2
+CRITERIA_VERSION = 3
 REQUIRED_ARTIFACT_CLASSES = (
     "brain_config",
     "run_config",
@@ -48,6 +48,7 @@ REQUIRED_ARTIFACT_CLASSES = (
     "position_events",
     "position_censored",
     "admission",
+    "admission_health",
     "gatekeeper_buys",
     "runtime_log",
 )
@@ -73,6 +74,39 @@ V2_REASON_KEYS = {
     "VitalityDecay": "vitality_decay",
     "AbsoluteMaxHold": "absolute_max_hold",
 }
+V2_POLICY_HIERARCHY = {
+    "Crash": 0,
+    "HardLoss": 1,
+    "ExecutableTrailing": 2,
+    "VitalityDecay": 3,
+    "AbsoluteMaxHold": 4,
+}
+EXECUTABLE_ROUTE_STATUSES = {"pump_curve_supported"}
+GATE_SPECIFIC_SAMPLE_THRESHOLD_NAMES = {
+    "executable_trailing": (
+        "executable_trailing_candidate_positions_min",
+        "executable_trailing_matched_positions_min",
+    ),
+    "vitality_decay": (
+        "vitality_candidate_positions_min",
+        "vitality_matched_positions_min",
+    ),
+}
+GATE_SPECIFIC_ECONOMIC_THRESHOLD_NAMES = (
+    "mean_peak_to_terminal_giveback_delta_bps_min",
+    "mean_mfe_capture_ratio_delta_min",
+    "mean_terminal_loss_delta_bps_min",
+    "tail_loss_p10_delta_bps_min",
+    "cvar_20_delta_bps_min",
+    "worst_cost_scenario_mean_delta_bps_min",
+    "top_k_positive_improvement_share_max",
+    "trimmed_mean_delta_bps_min",
+    "false_early_exit_proxy_rate_max",
+    "candidate_executable_continuation_coverage_min",
+    "route_availability_after_candidate_min",
+    "candidate_bearing_censored_count_max",
+    "promoted_candidate_economic_join_failure_count_max",
+)
 V2_EXIT_RE = re.compile(
     r"ExitAll \{ reason: ([A-Za-z]+), quantity_raw: ([0-9]+), "
     r"executable_gross_return_bps: (-?[0-9]+) \}"
@@ -240,6 +274,8 @@ def build_launcher_proof(
         raise ContractError("launcher proof scope/run_id mismatch")
     if report.get("launch_cohort_id") != args.launch_cohort_id:
         raise ContractError("launcher proof launch_cohort_id mismatch")
+    if report.get("run_role") != args.run_role:
+        raise ContractError("launcher proof run_role mismatch")
     git_head_at_build = require(report, "git_head_at_build", str)
     git_head_at_launch = require(report, "git_head_at_launch", str)
     if git_head_at_build != git_head_at_launch:
@@ -272,10 +308,19 @@ def build_launcher_proof(
     proof = {
         "run_id": args.run_id,
         "launch_cohort_id": args.launch_cohort_id,
+        "run_role": args.run_role,
         "git_commit_sha": git_head_at_launch,
         "release_binary_sha256": release_binary_sha256,
         "run_config_sha256": artifacts["run_config"][0]["sha256"],
         "brain_config_sha256": artifacts["brain_config"][0]["sha256"],
+        "normalized_entry_cohort_hash": hash_bytes(
+            canonical_json(
+                {
+                    "brain_config_sha256": artifacts["brain_config"][0]["sha256"],
+                    "run_config_sha256": artifacts["run_config"][0]["sha256"],
+                }
+            )
+        ),
         "build_started_at": build_started_at,
         "runtime_started_at": runtime_started_at,
         "runtime_ended_at": runtime_ended_at,
@@ -416,10 +461,12 @@ def validate_run_manifest_shape(manifest: dict[str, Any], source: Path) -> None:
     for field in (
         "run_id",
         "launch_cohort_id",
+        "run_role",
         "git_commit_sha",
         "release_binary_sha256",
         "run_config_sha256",
         "brain_config_sha256",
+        "normalized_entry_cohort_hash",
         "build_started_at",
         "runtime_started_at",
         "runtime_ended_at",
@@ -432,10 +479,14 @@ def validate_run_manifest_shape(manifest: dict[str, Any], source: Path) -> None:
             raise ContractError(f"empty launcher_proof.{field}: {source}")
     if proof["run_id"] != manifest["run_id"] or proof["launch_cohort_id"] != manifest["launch_cohort_id"]:
         raise ContractError(f"launcher proof identity mismatch: {source}")
+    if proof["run_role"] != manifest["run_role"]:
+        raise ContractError(f"launcher proof role mismatch: {source}")
     if proof["run_config_sha256"] != manifest["run_config_content_hash"]:
         raise ContractError(f"launcher proof run config hash mismatch: {source}")
     if proof["brain_config_sha256"] != manifest["brain_config_content_hash"]:
         raise ContractError(f"launcher proof brain config hash mismatch: {source}")
+    if not re.fullmatch(r"[0-9a-f]{64}", proof["normalized_entry_cohort_hash"]):
+        raise ContractError(f"launcher proof normalized cohort hash invalid: {source}")
     if proof["shutdown_signal"] != "SIGINT" or proof["shutdown_result"] != "clean":
         raise ContractError(f"launcher proof shutdown contract failed: {source}")
     for field in (
@@ -475,6 +526,78 @@ def verify_manifest_artifacts(
     return resolved
 
 
+def reconstruct_run_manifest_from_sources(
+    manifest: dict[str, Any],
+    paths: dict[str, list[Path]],
+    repo_root: Path,
+) -> dict[str, Any]:
+    artifacts = artifact_entries(
+        [path for entries in paths.values() for path in entries],
+        repo_root,
+    )
+    by_path = {entry["path"]: entry for entry in artifacts}
+    reconstructed_artifacts: dict[str, list[dict[str, Any]]] = {
+        artifact_class: [by_path[normalize_repo_path(path, repo_root)] for path in entries]
+        for artifact_class, entries in paths.items()
+    }
+    args = argparse.Namespace(
+        repo_root=repo_root,
+        run_id=manifest["run_id"],
+        launch_cohort_id=manifest["launch_cohort_id"],
+        run_role=manifest["run_role"],
+    )
+    analyzer = load_pr_a_analyzer()
+    comparison_records, _ = analyzer.load_records(paths["comparison"])
+    first = comparison_records[0]
+    comparison_run_ids = {record["run_id"] for record in comparison_records}
+    if comparison_run_ids != {manifest["run_id"]}:
+        raise ContractError("manifest reconstruction comparison run ID mismatch")
+    health_records, _ = analyzer.load_writer_health(paths["writer_health"])
+    health_schema_versions = {record["schema_version"] for record in health_records}
+    if len(health_schema_versions) != 1:
+        raise ContractError("manifest reconstruction writer-health schema mismatch")
+    launcher_report = read_json(paths["launcher_proof"][0])
+    launcher_proof = build_launcher_proof(
+        report=launcher_report,
+        args=args,
+        artifacts=reconstructed_artifacts,
+        runtime_paths=paths["runtime_log"],
+        repo_root=repo_root,
+    )
+    reconstructed = {
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "artifact_type": RUN_MANIFEST_TYPE,
+        "run_id": manifest["run_id"],
+        "launch_cohort_id": manifest["launch_cohort_id"],
+        "run_role": manifest["run_role"],
+        "comparison_schema_version": first["schema_version"],
+        "writer_health_schema_version": health_schema_versions.pop(),
+        "het_config_hash": first["policy_config_hash"],
+        "v1_config_hash": first["v1_policy_config_hash"],
+        "time_stop_v2_config_hash": first["time_stop_v2_config_hash"],
+        "brain_config_content_hash": reconstructed_artifacts["brain_config"][0]["sha256"],
+        "run_config_content_hash": reconstructed_artifacts["run_config"][0]["sha256"],
+        "launcher_proof": launcher_proof,
+        "analysis_dependency_hashes": {
+            "promotion_tool": sha256(Path(__file__).resolve()),
+            "pr_a_analyzer": sha256(pr_a_analyzer_path()),
+        },
+        "artifacts": reconstructed_artifacts,
+    }
+    reject_non_finite(reconstructed)
+    return reconstructed
+
+
+def validate_run_manifest_against_sources(
+    manifest: dict[str, Any],
+    paths: dict[str, list[Path]],
+    repo_root: Path,
+) -> None:
+    reconstructed = reconstruct_run_manifest_from_sources(manifest, paths, repo_root)
+    if canonical_json(reconstructed) != canonical_json(manifest):
+        raise ContractError("run manifest bytes do not match source reconstruction")
+
+
 def validate_criteria(criteria: dict[str, Any]) -> None:
     if require(criteria, "criteria_version", int) != CRITERIA_VERSION:
         raise ContractError("unsupported criteria version")
@@ -483,11 +606,29 @@ def validate_criteria(criteria: dict[str, Any]) -> None:
         "expected_het_config_hash",
         "expected_v1_config_hash",
         "expected_time_stop_v2_config_hash",
+        "expected_runtime_commit_sha",
+        "expected_release_binary_sha256",
+        "expected_brain_config_content_hash",
+        "expected_run_config_content_hash",
+        "expected_normalized_entry_cohort_hash",
+        "expected_promotion_tool_hash",
+        "expected_pr_a_analyzer_hash",
         "position_denominator",
         "missing_data_semantics",
     ):
         if not require(criteria, field, str):
             raise ContractError(f"empty criteria field: {field}")
+    for field in (
+        "expected_runtime_commit_sha",
+        "expected_release_binary_sha256",
+        "expected_brain_config_content_hash",
+        "expected_run_config_content_hash",
+        "expected_normalized_entry_cohort_hash",
+        "expected_promotion_tool_hash",
+        "expected_pr_a_analyzer_hash",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", criteria[field]):
+            raise ContractError(f"criteria field must be a frozen hex digest: {field}")
     require(criteria, "policy_version", int)
     require(criteria, "comparison_schema_version", int)
     require(criteria, "writer_health_schema_version", int)
@@ -521,6 +662,22 @@ def validate_criteria(criteria: dict[str, Any]) -> None:
         require(contract, "authority_eligible", bool)
     if gate_contract["crash"]["promotion_requested"] or gate_contract["crash"]["authority_eligible"]:
         raise ContractError("Crash must remain ineligible without separate authority proof")
+    gate_specific_thresholds = require(criteria, "gate_specific_thresholds", dict)
+    requested_gate_keys = {
+        gate_key
+        for gate_key, contract in gate_contract.items()
+        if contract["promotion_requested"]
+    }
+    if set(gate_specific_thresholds) != requested_gate_keys:
+        raise ContractError("gate_specific_thresholds must cover exactly requested promotion gates")
+    for gate_key, thresholds in gate_specific_thresholds.items():
+        threshold_set = require(thresholds, "thresholds", dict)
+        required_names = set(GATE_SPECIFIC_ECONOMIC_THRESHOLD_NAMES) | set(
+            GATE_SPECIFIC_SAMPLE_THRESHOLD_NAMES[gate_key]
+        )
+        if set(threshold_set) != required_names:
+            raise ContractError(f"gate-specific thresholds are incomplete: {gate_key}")
+        reject_non_finite(threshold_set, f"criteria.gate_specific_thresholds.{gate_key}")
     gates = require(criteria, "gates", dict)
     if set(gates) != set(GATE_NAMES):
         raise ContractError("criteria gates must use the exact Gate 1-5 contract")
@@ -589,6 +746,151 @@ def cvar_lower(values: list[float], alpha: float) -> float | None:
         return None
     count = max(1, math.ceil(len(values) * alpha))
     return mean(sorted(values)[:count])
+
+
+def numeric_or_none(value: Any) -> float | None:
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    ):
+        return float(value)
+    return None
+
+
+def economic_summary(rows: list[dict[str, Any]], contracts: dict[str, Any]) -> dict[str, Any]:
+    deltas = [float(row["delta_bps"]) for row in rows]
+    v2_returns = [float(row["v2_return_bps"]) for row in rows]
+    v1_returns = [float(row["v1_return_bps"]) for row in rows]
+    loss_deltas = [
+        min(0.0, float(row["v2_return_bps"])) - min(0.0, float(row["v1_return_bps"]))
+        for row in rows
+    ]
+    capture_deltas = [
+        float(row["mfe_capture_ratio_delta"])
+        for row in rows
+        if row["mfe_capture_ratio_delta"] is not None
+    ]
+    positive = sorted((value for value in deltas if value > 0.0), reverse=True)
+    top_k = int(contracts["outlier_top_k"])
+    positive_share = ratio(sum(positive[:top_k]), sum(positive)) if positive else 1.0
+    trim = int(contracts["outlier_trim_each_tail"])
+    ordered = sorted(deltas)
+    trimmed = ordered[trim : len(ordered) - trim] if len(ordered) > trim * 2 else []
+    cost_means = {
+        str(cost_bps): mean([row["delta_bps"] - cost_bps for row in rows])
+        for cost_bps in contracts["cost_scenarios_bps"]
+    }
+    later_executable_upside = [
+        float(row["max_later_executable_upside_bps"])
+        for row in rows
+        if row["max_later_executable_upside_bps"] is not None
+    ]
+    later_executable_downside = [
+        float(row["max_later_executable_downside_bps"])
+        for row in rows
+        if row["max_later_executable_downside_bps"] is not None
+    ]
+    return {
+        "matched_positions": len(rows),
+        "mfe_capture_positions": len(capture_deltas),
+        "candidate_executable_continuation_coverage": ratio(
+            sum(1 for row in rows if row["candidate_executable_continuation_sample_count"] > 0),
+            len(rows),
+        ),
+        "later_candidate_recurrence_rate": ratio(
+            sum(1 for row in rows if row["later_candidate_recurrence_count"] > 0),
+            len(rows),
+        ),
+        "max_later_executable_upside_bps": max(later_executable_upside)
+        if later_executable_upside
+        else None,
+        "max_later_executable_downside_bps": min(later_executable_downside)
+        if later_executable_downside
+        else None,
+        "route_availability_after_candidate": ratio(
+            sum(1 for row in rows if row["route_available_after_candidate"]), len(rows)
+        ),
+        "mean_peak_to_terminal_giveback_delta_bps": mean(deltas),
+        "mean_mfe_capture_ratio_delta": mean(capture_deltas),
+        "mean_terminal_loss_delta_bps": mean(loss_deltas),
+        "tail_loss_p10_delta_bps": (
+            None
+            if not rows
+            else float(quantile(v2_returns, contracts["tail_quantile"]))
+            - float(quantile(v1_returns, contracts["tail_quantile"]))
+        ),
+        "cvar_20_delta_bps": (
+            None
+            if not rows
+            else float(cvar_lower(v2_returns, contracts["cvar_alpha"]))
+            - float(cvar_lower(v1_returns, contracts["cvar_alpha"]))
+        ),
+        "cost_scenario_mean_delta_bps": cost_means,
+        "worst_cost_scenario_mean_delta_bps": (
+            min(value for value in cost_means.values() if value is not None)
+            if any(value is not None for value in cost_means.values())
+            else None
+        ),
+        "top_k_positive_improvement_share": positive_share,
+        "trimmed_mean_delta_bps": mean(trimmed),
+        "false_early_exit_proxy_rate": ratio(
+            sum(1 for row in rows if row["false_early_exit_proxy"]), len(rows)
+        ),
+    }
+
+
+def evaluate_threshold_checks(
+    observed: dict[str, Any],
+    thresholds: dict[str, Any],
+) -> dict[str, bool]:
+    checks: dict[str, bool] = {}
+    for threshold_name, threshold in thresholds.items():
+        field = (
+            threshold_name.removeprefix("min_")
+            if threshold_name.startswith("min_")
+            else threshold_name.removesuffix("_min")
+            if threshold_name.endswith("_min")
+            else threshold_name.removesuffix("_max")
+            if threshold_name.endswith("_max")
+            else threshold_name
+        )
+        value = observed.get(field)
+        present = (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+        if threshold_name.startswith("min_") or threshold_name.endswith("_min"):
+            checks[field] = present and value >= threshold
+        elif threshold_name.endswith("_max"):
+            checks[field] = present and value <= threshold
+        else:
+            checks[field] = observed.get(field) is threshold
+    return checks
+
+
+def gate_specific_observed_aliases(
+    gate_key: str, observed: dict[str, Any]
+) -> dict[str, Any]:
+    """Expose a gate-specific economic row under threshold-friendly names."""
+
+    aliases = dict(observed)
+    if gate_key == "executable_trailing":
+        aliases["executable_trailing_candidate_positions"] = observed.get(
+            "candidate_positions"
+        )
+        aliases["executable_trailing_matched_positions"] = observed.get(
+            "matched_positions"
+        )
+    elif gate_key == "vitality_decay":
+        aliases["vitality_candidate_positions"] = observed.get("candidate_positions")
+        aliases["vitality_matched_positions"] = observed.get("matched_positions")
+    aliases["candidate_bearing_censored_count"] = observed.get("censor_count")
+    aliases["promoted_candidate_economic_join_failure_count"] = observed.get(
+        "economic_join_failure_count"
+    )
+    return aliases
 
 
 def identity(run_id: str, position_id: str, position_epoch: int) -> tuple[str, str, int]:
@@ -675,6 +977,34 @@ def load_admission(run_id: str, paths: list[Path]) -> list[dict[str, Any]]:
     return rows
 
 
+def load_admission_health(run_id: str, paths: list[Path]) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    for path in paths:
+        record = read_json(path)
+        if record.get("artifact_type") != "post_buy_admission_health_v1":
+            raise ContractError(f"unsupported admission health artifact: {path}")
+        run_ids = record.get("run_ids")
+        if not isinstance(run_ids, list) or run_id not in run_ids:
+            raise ContractError(f"admission health missing run_id {run_id}: {path}")
+        records.append(record)
+    if len(records) != 1:
+        raise ContractError(f"run requires exactly one admission health artifact: {run_id}")
+    record = records[0]
+    for field in (
+        "admission_attempts",
+        "admission_enqueued",
+        "admission_written",
+        "admission_dropped",
+        "admission_failed",
+    ):
+        value = require(record, field, int)
+        if value < 0:
+            raise ContractError(f"negative admission health counter: {field}")
+    if require(record, "shutdown_complete", bool) is not True:
+        raise ContractError(f"admission writer shutdown incomplete: {run_id}")
+    return record
+
+
 def summarize_admission(rows: list[dict[str, Any]]) -> dict[str, Any]:
     by_candidate: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -716,6 +1046,8 @@ def reconcile_admission_with_opened_positions(
     rows: list[dict[str, Any]],
     opened: dict[tuple[str, str, int], dict[str, Any]],
     summary: dict[str, Any],
+    comparisons: dict[tuple[str, str, int], list[dict[str, Any]]],
+    monitor_tick_ms: int | None,
 ) -> dict[str, Any]:
     """Fail-closed reconciliation from admission rows to opened positions.
 
@@ -749,7 +1081,19 @@ def reconcile_admission_with_opened_positions(
         and isinstance(row.get("position_epoch"), int)
         and not isinstance(row.get("position_epoch"), bool)
     }
+    registered_rows_by_identity = {
+        identity(row["run_id"], row["position_id"], row["position_epoch"]): row
+        for row in shadow_rows
+        if row.get("stage") == "monitoring_registered"
+        and isinstance(row.get("run_id"), str)
+        and isinstance(row.get("position_id"), str)
+        and isinstance(row.get("position_epoch"), int)
+        and not isinstance(row.get("position_epoch"), bool)
+    }
     reconciled = dict(summary)
+    reconciled.setdefault("monitoring_registered_without_position_open_count", 0)
+    reconciled.setdefault("position_open_without_matching_candidate_identity_count", 0)
+    reconciled.setdefault("registered_without_het_within_2_ticks_count", 0)
     for key, opened_row in opened.items():
         if opened_row["candidate_id"] not in submitted_candidates:
             reconciled["admission_missing_final_count"] += 1
@@ -757,6 +1101,36 @@ def reconcile_admission_with_opened_positions(
             reconciled["admission_missing_monitoring_registered_count"] += 1
         if key not in released_positions:
             reconciled["admission_missing_release_count"] += 1
+        registered = registered_rows_by_identity.get(key)
+        if registered is not None:
+            if (
+                registered.get("candidate_id") != opened_row["candidate_id"]
+                or registered.get("pool_id") != opened_row["pool_id"]
+                or registered.get("base_mint") != opened_row["base_mint"]
+            ):
+                reconciled["position_open_without_matching_candidate_identity_count"] += 1
+            comparison_rows = comparisons.get(key, [])
+            first_het = min(
+                (
+                    int(row["observation_timestamp_ms"])
+                    for row in comparison_rows
+                    if isinstance(row.get("observation_timestamp_ms"), int)
+                    and not isinstance(row.get("observation_timestamp_ms"), bool)
+                ),
+                default=None,
+            )
+            registered_ts = registered.get("timestamp_ms")
+            if (
+                first_het is None
+                or monitor_tick_ms is None
+                or not isinstance(registered_ts, int)
+                or isinstance(registered_ts, bool)
+                or first_het - registered_ts > monitor_tick_ms * 2
+            ):
+                reconciled["registered_without_het_within_2_ticks_count"] += 1
+    for key, registered in registered_rows_by_identity.items():
+        if key not in opened:
+            reconciled["monitoring_registered_without_position_open_count"] += 1
     return reconciled
 
 
@@ -922,23 +1296,129 @@ def economic_observations(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     contracts = criteria["metric_contracts"]
     gate_contract = criteria["gate_promotion_contract"]
-    promotion_requested = {
+    authority_eligible = {
         reason
         for reason, key in V2_REASON_KEYS.items()
-        if gate_contract[key]["promotion_requested"]
+        if gate_contract[key]["authority_eligible"]
     }
-    matched: list[dict[str, Any]] = []
+    promotion_requested = {
+        reason for reason, key in V2_REASON_KEYS.items() if gate_contract[key]["promotion_requested"]
+    }
+    combined_matched: list[dict[str, Any]] = []
     matched_by_reason: dict[str, list[dict[str, Any]]] = defaultdict(list)
     candidate_positions_by_reason: Counter[str] = Counter()
-    false_early = 0
     no_candidate_terminal = 0
     missed_protection = 0
-    continuation_covered = 0
-    later_candidate_recurrences = 0
-    route_available_after_candidate = 0
-    later_executable_upside: list[float] = []
-    later_executable_downside: list[float] = []
     candidate_bearing_censored = 0
+    promoted_candidate_economic_join_failure_count = 0
+    gate_join_failures: Counter[str] = Counter()
+
+    def build_matched_row(
+        *,
+        key: tuple[str, str, int],
+        position_rows: list[dict[str, Any]],
+        candidates: list[tuple[dict[str, Any], str, int]],
+        candidate: tuple[dict[str, Any], str, int],
+        terminal: dict[str, Any],
+        replay: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        candidate_row, reason, v2_return_bps = candidate
+        candidate_timestamp_ms = int(candidate_row["observation_timestamp_ms"])
+        later_rows = [
+            row
+            for row in position_rows
+            if int(row["observation_timestamp_ms"]) > candidate_timestamp_ms
+        ]
+        later_candidate_returns = [
+            float(return_bps)
+            for row, _, return_bps in candidates
+            if int(row["observation_timestamp_ms"]) > candidate_timestamp_ms
+        ]
+        later_executable_returns = [
+            float(row["current_executable_gross_return_bps"])
+            for row in later_rows
+            if numeric_or_none(row.get("current_executable_gross_return_bps")) is not None
+        ]
+        terminal_pct = numeric_or_none(terminal.get("executable_gross_return_pct"))
+        mfe_bps = numeric_or_none(replay.get("mfe_bps"))
+        entry_ts_ms = numeric_or_none(replay.get("entry_ts_ms"))
+        observation_ts_ms = numeric_or_none(candidate_row.get("observation_timestamp_ms"))
+        absolute_age_ms = numeric_or_none(terminal.get("absolute_age_ms"))
+        entry_raw = numeric_or_none(candidate_row.get("entry_value_quote_raw"))
+        if any(
+            value is None
+            for value in (
+                terminal_pct,
+                mfe_bps,
+                entry_ts_ms,
+                observation_ts_ms,
+                absolute_age_ms,
+                entry_raw,
+            )
+        ):
+            return None
+        v1_return_bps = float(terminal_pct) * 100.0
+        delta_bps = float(v2_return_bps) - v1_return_bps
+        candidate_age_ms = max(0, int(observation_ts_ms) - int(entry_ts_ms))
+        v1_age_ms = max(0, int(absolute_age_ms))
+        entry_sol = int(entry_raw) / 1_000_000_000.0
+        occupancy_delta = entry_sol * max(0.0, (v1_age_ms - candidate_age_ms) / 1000.0)
+        capture_delta: float | None = None
+        if int(mfe_bps) >= contracts["mfe_capture_min_positive_mfe_bps"]:
+            capture_delta = (float(v2_return_bps) - v1_return_bps) / float(mfe_bps)
+        path = replay.get("path_bps")
+        false_early_flag = False
+        if isinstance(path, list):
+            mark_at_candidate = replay_mark_at(path, candidate_age_ms)
+            future_values = [
+                point[1]
+                for point in path
+                if isinstance(point, list)
+                and len(point) == 2
+                and isinstance(point[0], int)
+                and isinstance(point[1], int)
+                and point[0] > candidate_age_ms
+            ]
+            if mark_at_candidate is not None and future_values:
+                false_early_flag = (
+                    max(future_values) - mark_at_candidate
+                    >= contracts["false_early_recovery_bps"]
+                )
+        return {
+            "identity": list(key),
+            "run_id": key[0],
+            "reason": reason,
+            "v2_return_bps": float(v2_return_bps),
+            "v1_return_bps": v1_return_bps,
+            "delta_bps": delta_bps,
+            "mfe_bps_mark_replay": int(mfe_bps),
+            "mfe_capture_ratio_delta": capture_delta,
+            "occupancy_capital_seconds_delta": occupancy_delta,
+            "false_early_exit_proxy": false_early_flag,
+            "later_candidate_recurrence_count": len(later_candidate_returns),
+            "candidate_executable_continuation_sample_count": len(later_executable_returns),
+            "max_later_executable_upside_bps": (
+                max(later_executable_returns) - float(v2_return_bps)
+                if later_executable_returns
+                else None
+            ),
+            "max_later_executable_downside_bps": (
+                min(later_executable_returns) - float(v2_return_bps)
+                if later_executable_returns
+                else None
+            ),
+            "route_available_after_candidate": any(
+                row.get("route_status") in EXECUTABLE_ROUTE_STATUSES for row in later_rows
+            ),
+            "terminal_reason": terminal.get("close_reason", "unknown"),
+            "trajectory_quality": candidate_row["trajectory"].get("quality", "unknown"),
+            "anchor_covered": bool(candidate_row.get("anchor_before"))
+            or bool(candidate_row.get("anchor_applied")),
+            "route_status": candidate_row.get("route_status", "unknown"),
+            "age_bucket": age_bucket(candidate_age_ms),
+            "entry_hour_utc": (int(positions[key]["event_time_ms"]) // 3_600_000) % 24,
+        }
+
     for key in sorted(positions):
         position_rows = sorted(
             comparisons.get(key, []), key=lambda item: item["observation_timestamp_ms"]
@@ -962,152 +1442,73 @@ def economic_observations(
                     if float(terminal_pct) * 100.0 <= contracts["missed_protection_terminal_loss_bps"]:
                         missed_protection += 1
             continue
-        if terminal is None or replay is None or key in censored:
+        if key in censored:
             continue
+        if terminal is None or replay is None:
+            failed_promoted_reasons: set[str] = set()
+            for reason in first_candidate_by_reason:
+                if reason in promotion_requested:
+                    promoted_candidate_economic_join_failure_count += 1
+                    gate_join_failures[V2_REASON_KEYS[reason]] += 1
+                    failed_promoted_reasons.add(reason)
+            continue
+        failed_promoted_reasons = set()
         for reason, candidate in first_candidate_by_reason.items():
-            candidate_row, _, v2_return_bps = candidate
-            candidate_timestamp_ms = int(candidate_row["observation_timestamp_ms"])
-            later_rows = [
-                row
-                for row in position_rows
-                if int(row["observation_timestamp_ms"]) > candidate_timestamp_ms
-            ]
-            later_candidate_returns = [
-                float(return_bps)
-                for row, _, return_bps in candidates
-                if int(row["observation_timestamp_ms"]) > candidate_timestamp_ms
-            ]
-            later_executable_returns = [
-                float(row["current_executable_gross_return_bps"])
-                for row in later_rows
-                if isinstance(row.get("current_executable_gross_return_bps"), (int, float))
-                and not isinstance(row.get("current_executable_gross_return_bps"), bool)
-                and math.isfinite(float(row["current_executable_gross_return_bps"]))
-            ]
-            terminal_pct = terminal.get("executable_gross_return_pct")
-            mfe_bps = replay.get("mfe_bps")
-            entry_ts_ms = replay.get("entry_ts_ms")
-            observation_ts_ms = candidate_row.get("observation_timestamp_ms")
-            absolute_age_ms = terminal.get("absolute_age_ms")
-            entry_raw = candidate_row.get("entry_value_quote_raw")
-            if not all(
-                isinstance(value, (int, float)) and not isinstance(value, bool)
-                for value in (
-                    terminal_pct,
-                    mfe_bps,
-                    entry_ts_ms,
-                    observation_ts_ms,
-                    absolute_age_ms,
-                    entry_raw,
-                )
-            ):
+            row = build_matched_row(
+                key=key,
+                position_rows=position_rows,
+                candidates=candidates,
+                candidate=candidate,
+                terminal=terminal,
+                replay=replay,
+            )
+            if row is None:
+                if reason in promotion_requested and reason not in failed_promoted_reasons:
+                    promoted_candidate_economic_join_failure_count += 1
+                    gate_join_failures[V2_REASON_KEYS[reason]] += 1
+                    failed_promoted_reasons.add(reason)
                 continue
-            v1_return_bps = float(terminal_pct) * 100.0
-            delta_bps = float(v2_return_bps) - v1_return_bps
-            candidate_age_ms = max(0, int(observation_ts_ms) - int(entry_ts_ms))
-            v1_age_ms = max(0, int(absolute_age_ms))
-            entry_sol = int(entry_raw) / 1_000_000_000.0
-            occupancy_delta = entry_sol * max(0.0, (v1_age_ms - candidate_age_ms) / 1000.0)
-            capture_delta: float | None = None
-            if int(mfe_bps) >= contracts["mfe_capture_min_positive_mfe_bps"]:
-                capture_delta = (float(v2_return_bps) - v1_return_bps) / float(mfe_bps)
-            path = replay.get("path_bps")
-            false_early_flag = False
-            if isinstance(path, list):
-                mark_at_candidate = replay_mark_at(path, candidate_age_ms)
-                future_values = [
-                    point[1]
-                    for point in path
-                    if isinstance(point, list)
-                    and len(point) == 2
-                    and isinstance(point[0], int)
-                    and isinstance(point[1], int)
-                    and point[0] > candidate_age_ms
-                ]
-                if mark_at_candidate is not None and future_values:
-                    false_early_flag = (
-                        max(future_values) - mark_at_candidate
-                        >= contracts["false_early_recovery_bps"]
-                    )
-            row = {
-                "identity": list(key),
-                "run_id": key[0],
-                "reason": reason,
-                "v2_return_bps": float(v2_return_bps),
-                "v1_return_bps": v1_return_bps,
-                "delta_bps": delta_bps,
-                "mfe_bps_mark_replay": int(mfe_bps),
-                "mfe_capture_ratio_delta": capture_delta,
-                "occupancy_capital_seconds_delta": occupancy_delta,
-                "false_early_exit_proxy": false_early_flag,
-                "later_candidate_recurrence_count": len(later_candidate_returns),
-                "candidate_executable_continuation_sample_count": len(later_executable_returns),
-                "max_later_executable_upside_bps": (
-                    max(later_executable_returns) - float(v2_return_bps)
-                    if later_executable_returns
-                    else None
-                ),
-                "max_later_executable_downside_bps": (
-                    min(later_executable_returns) - float(v2_return_bps)
-                    if later_executable_returns
-                    else None
-                ),
-                "route_available_after_candidate": any(
-                    row.get("route_status") != "unknown" for row in later_rows
-                ),
-                "terminal_reason": terminal.get("close_reason", "unknown"),
-                "trajectory_quality": candidate_row["trajectory"].get("quality", "unknown"),
-                "anchor_covered": bool(candidate_row.get("anchor_before"))
-                or bool(candidate_row.get("anchor_applied")),
-                "route_status": candidate_row.get("route_status", "unknown"),
-                "age_bucket": age_bucket(candidate_age_ms),
-                "entry_hour_utc": (int(positions[key]["event_time_ms"]) // 3_600_000) % 24,
-            }
             matched_by_reason[V2_REASON_KEYS[reason]].append(row)
-            if reason in promotion_requested:
-                false_early += int(false_early_flag)
-                continuation_covered += int(bool(later_executable_returns))
-                later_candidate_recurrences += int(bool(later_candidate_returns))
-                route_available_after_candidate += int(row["route_available_after_candidate"])
-                if row["max_later_executable_upside_bps"] is not None:
-                    later_executable_upside.append(row["max_later_executable_upside_bps"])
-                if row["max_later_executable_downside_bps"] is not None:
-                    later_executable_downside.append(row["max_later_executable_downside_bps"])
-                matched.append(row)
+        eligible_candidates = [
+            candidate
+            for candidate in first_candidate_by_reason.values()
+            if candidate[1] in authority_eligible
+        ]
+        if eligible_candidates:
+            selected = min(
+                eligible_candidates,
+                key=lambda item: (
+                    int(item[0]["observation_timestamp_ms"]),
+                    V2_POLICY_HIERARCHY[item[1]],
+                ),
+            )
+            row = build_matched_row(
+                key=key,
+                position_rows=position_rows,
+                candidates=candidates,
+                candidate=selected,
+                terminal=terminal,
+                replay=replay,
+            )
+            if row is None:
+                if (
+                    selected[1] in promotion_requested
+                    and selected[1] not in failed_promoted_reasons
+                ):
+                    promoted_candidate_economic_join_failure_count += 1
+                    gate_join_failures[V2_REASON_KEYS[selected[1]]] += 1
+            else:
+                combined_matched.append(row)
 
-    deltas = [row["delta_bps"] for row in matched]
-    v2_returns = [row["v2_return_bps"] for row in matched]
-    v1_returns = [row["v1_return_bps"] for row in matched]
-    loss_deltas = [
-        min(0.0, row["v2_return_bps"]) - min(0.0, row["v1_return_bps"])
-        for row in matched
-    ]
-    capture_deltas = [
-        row["mfe_capture_ratio_delta"]
-        for row in matched
-        if row["mfe_capture_ratio_delta"] is not None
-    ]
-    positive = sorted((value for value in deltas if value > 0.0), reverse=True)
-    top_k = int(contracts["outlier_top_k"])
-    positive_share = ratio(sum(positive[:top_k]), sum(positive)) if positive else 1.0
-    trim = int(contracts["outlier_trim_each_tail"])
-    ordered = sorted(deltas)
-    trimmed = ordered[trim : len(ordered) - trim] if len(ordered) > trim * 2 else []
-    cost_means = {
-        str(cost_bps): mean(
-            [
-                # V1 and V2 each execute one full exit. The scenario is a
-                # conservative extra penalty applied only to the unexecuted
-                # V2 counterfactual; subtracting it from both legs would
-                # cancel and provide no sensitivity test.
-                row["delta_bps"] - cost_bps
-                for row in matched
-            ]
-        )
-        for cost_bps in contracts["cost_scenarios_bps"]
+    combined_summary = economic_summary(combined_matched, contracts)
+    gate_summaries = {
+        key: economic_summary(rows, contracts)
+        for key, rows in matched_by_reason.items()
     }
+    for key in V2_REASON_KEYS.values():
+        gate_summaries.setdefault(key, economic_summary([], contracts))
     observed = {
-        "matched_v2_candidate_positions": len(matched),
+        "matched_v2_candidate_positions": len(combined_matched),
         "executable_trailing_candidate_positions": candidate_positions_by_reason[
             "executable_trailing"
         ],
@@ -1116,48 +1517,43 @@ def economic_observations(
         ),
         "vitality_candidate_positions": candidate_positions_by_reason["vitality_decay"],
         "vitality_matched_positions": len(matched_by_reason["vitality_decay"]),
-        "mfe_capture_positions": len(capture_deltas),
+        "mfe_capture_positions": combined_summary["mfe_capture_positions"],
         "missed_protection_eligible_positions": no_candidate_terminal,
-        "candidate_executable_continuation_coverage": ratio(
-            continuation_covered, len(matched)
-        ),
-        "later_candidate_recurrence_rate": ratio(later_candidate_recurrences, len(matched)),
-        "max_later_executable_upside_bps": max(later_executable_upside)
-        if later_executable_upside
-        else None,
-        "max_later_executable_downside_bps": min(later_executable_downside)
-        if later_executable_downside
-        else None,
-        "route_availability_after_candidate": ratio(route_available_after_candidate, len(matched)),
+        "candidate_executable_continuation_coverage": combined_summary[
+            "candidate_executable_continuation_coverage"
+        ],
+        "later_candidate_recurrence_rate": combined_summary["later_candidate_recurrence_rate"],
+        "max_later_executable_upside_bps": combined_summary["max_later_executable_upside_bps"],
+        "max_later_executable_downside_bps": combined_summary["max_later_executable_downside_bps"],
+        "route_availability_after_candidate": combined_summary[
+            "route_availability_after_candidate"
+        ],
         "censored_position_count": len(censored),
         "candidate_bearing_censored_count": candidate_bearing_censored,
-        "mean_peak_to_terminal_giveback_delta_bps": mean(deltas),
-        "mean_mfe_capture_ratio_delta": mean(capture_deltas),
+        "promoted_candidate_economic_join_failure_count": promoted_candidate_economic_join_failure_count,
+        "mean_peak_to_terminal_giveback_delta_bps": combined_summary[
+            "mean_peak_to_terminal_giveback_delta_bps"
+        ],
+        "mean_mfe_capture_ratio_delta": combined_summary["mean_mfe_capture_ratio_delta"],
         "mean_vitality_occupancy_capital_seconds_delta": mean(
-            [row["occupancy_capital_seconds_delta"] for row in matched if row["reason"] == "VitalityDecay"]
+            [
+                row["occupancy_capital_seconds_delta"]
+                for row in combined_matched
+                if row["reason"] == "VitalityDecay"
+            ]
         ),
-        "mean_terminal_loss_delta_bps": mean(loss_deltas),
-        "tail_loss_p10_delta_bps": (
-            None
-            if not matched
-            else float(quantile(v2_returns, contracts["tail_quantile"]))
-            - float(quantile(v1_returns, contracts["tail_quantile"]))
-        ),
-        "cvar_20_delta_bps": (
-            None
-            if not matched
-            else float(cvar_lower(v2_returns, contracts["cvar_alpha"]))
-            - float(cvar_lower(v1_returns, contracts["cvar_alpha"]))
-        ),
-        "cost_scenario_mean_delta_bps": cost_means,
-        "worst_cost_scenario_mean_delta_bps": (
-            min(value for value in cost_means.values() if value is not None)
-            if any(value is not None for value in cost_means.values())
-            else None
-        ),
-        "top_k_positive_improvement_share": positive_share,
-        "trimmed_mean_delta_bps": mean(trimmed),
-        "false_early_exit_proxy_rate": ratio(false_early, len(matched)),
+        "mean_terminal_loss_delta_bps": combined_summary["mean_terminal_loss_delta_bps"],
+        "tail_loss_p10_delta_bps": combined_summary["tail_loss_p10_delta_bps"],
+        "cvar_20_delta_bps": combined_summary["cvar_20_delta_bps"],
+        "cost_scenario_mean_delta_bps": combined_summary["cost_scenario_mean_delta_bps"],
+        "worst_cost_scenario_mean_delta_bps": combined_summary[
+            "worst_cost_scenario_mean_delta_bps"
+        ],
+        "top_k_positive_improvement_share": combined_summary[
+            "top_k_positive_improvement_share"
+        ],
+        "trimmed_mean_delta_bps": combined_summary["trimmed_mean_delta_bps"],
+        "false_early_exit_proxy_rate": combined_summary["false_early_exit_proxy_rate"],
         "missed_protection_proxy_rate": (
             ratio(missed_protection, no_candidate_terminal)
             if no_candidate_terminal
@@ -1178,14 +1574,36 @@ def economic_observations(
                 "authority_eligible": gate_contract[key]["authority_eligible"],
                 "candidate_positions": candidate_positions_by_reason[key],
                 "matched_positions": len(matched_by_reason[key]),
-                "mean_delta_bps": mean(
-                    [row["delta_bps"] for row in matched_by_reason[key]]
+                "economic_join_failure_count": gate_join_failures[key],
+                "censor_count": sum(
+                    1
+                    for censored_row in censored.values()
+                    if censored_row.get("candidate_gate") == key
                 ),
+                "per_run_matched_positions": dict(
+                    Counter(row["run_id"] for row in matched_by_reason[key])
+                ),
+                **{
+                    metric: gate_summaries[key].get(metric)
+                    for metric in (
+                        "mean_peak_to_terminal_giveback_delta_bps",
+                        "mean_mfe_capture_ratio_delta",
+                        "mean_terminal_loss_delta_bps",
+                        "tail_loss_p10_delta_bps",
+                        "cvar_20_delta_bps",
+                        "worst_cost_scenario_mean_delta_bps",
+                        "top_k_positive_improvement_share",
+                        "trimmed_mean_delta_bps",
+                        "false_early_exit_proxy_rate",
+                        "candidate_executable_continuation_coverage",
+                        "route_availability_after_candidate",
+                    )
+                },
             }
             for key in V2_REASON_KEYS.values()
         },
     }
-    return observed, matched
+    return observed, combined_matched
 
 
 def all_numeric_present(observed: dict[str, Any], fields: Iterable[str]) -> bool:
@@ -1223,6 +1641,24 @@ def evaluate_gate(
     return {
         "passed": bool(checks) and all(checks.values()),
         "observed": observed,
+        "thresholds": thresholds,
+        "checks": checks,
+    }
+
+
+def evaluate_gate_specific_promotion(
+    gate_key: str,
+    observed: dict[str, Any],
+    criteria: dict[str, Any],
+) -> dict[str, Any]:
+    if gate_key not in criteria["gate_specific_thresholds"]:
+        raise ContractError(f"missing gate-specific promotion thresholds: {gate_key}")
+    thresholds = criteria["gate_specific_thresholds"][gate_key]["thresholds"]
+    alias_observed = gate_specific_observed_aliases(gate_key, observed)
+    checks = evaluate_threshold_checks(alias_observed, thresholds)
+    return {
+        "passed": bool(checks) and all(checks.values()),
+        "observed": alias_observed,
         "thresholds": thresholds,
         "checks": checks,
     }
@@ -1273,11 +1709,39 @@ def evaluate(
             ("het_config_hash", "expected_het_config_hash"),
             ("v1_config_hash", "expected_v1_config_hash"),
             ("time_stop_v2_config_hash", "expected_time_stop_v2_config_hash"),
+            ("brain_config_content_hash", "expected_brain_config_content_hash"),
+            ("run_config_content_hash", "expected_run_config_content_hash"),
         ):
             if manifest[manifest_field] != criteria[criteria_field]:
                 raise ContractError(f"config identity mismatch: {manifest_path}:{manifest_field}")
+        launcher_proof = manifest["launcher_proof"]
+        for proof_field, criteria_field in (
+            ("git_commit_sha", "expected_runtime_commit_sha"),
+            ("release_binary_sha256", "expected_release_binary_sha256"),
+            ("normalized_entry_cohort_hash", "expected_normalized_entry_cohort_hash"),
+        ):
+            if launcher_proof[proof_field] != criteria[criteria_field]:
+                raise ContractError(f"validation runtime contract mismatch: {manifest_path}:{proof_field}")
+        dependency_hashes = manifest["analysis_dependency_hashes"]
+        if dependency_hashes["promotion_tool"] != criteria["expected_promotion_tool_hash"]:
+            raise ContractError(f"promotion tool hash mismatch: {manifest_path}")
+        if dependency_hashes["pr_a_analyzer"] != criteria["expected_pr_a_analyzer_hash"]:
+            raise ContractError(f"PR A analyzer hash mismatch: {manifest_path}")
         all_comparison_paths.extend(paths["comparison"])
         all_health_paths.extend(paths["writer_health"])
+        run_comparison_records, _ = analyzer.load_records(paths["comparison"])
+        run_comparisons: dict[tuple[str, str, int], list[dict[str, Any]]] = defaultdict(list)
+        run_monitor_ticks = [
+            record.get("monitor_tick_ms")
+            for record in run_comparison_records
+            if isinstance(record.get("monitor_tick_ms"), int)
+            and not isinstance(record.get("monitor_tick_ms"), bool)
+        ]
+        run_monitor_tick_ms = max(run_monitor_ticks) if run_monitor_ticks else None
+        for record in run_comparison_records:
+            run_comparisons[
+                identity(record["run_id"], record["position_id"], record["position_epoch"])
+            ].append(record)
         opened, duplicate_opens = load_position_events(run_id, paths["position_events"])
         duplicate_position_open_count += duplicate_opens
         overlap = set(positions).intersection(opened)
@@ -1293,10 +1757,28 @@ def evaluate(
             raise ContractError(f"duplicate censored identities between manifests: {sorted(censor_overlap)[:1]}")
         censored_by_identity.update(censor_rows)
         admission_rows = load_admission(run_id, paths["admission"])
+        admission_health = load_admission_health(run_id, paths["admission_health"])
         admission_summary = reconcile_admission_with_opened_positions(
             admission_rows,
             opened,
             summarize_admission(admission_rows),
+            run_comparisons,
+            run_monitor_tick_ms,
+        )
+        if admission_health["admission_written"] != len(admission_rows):
+            admission_summary["admission_health_row_mismatch_count"] = (
+                admission_summary.get("admission_health_row_mismatch_count", 0) + 1
+            )
+        if admission_health["admission_attempts"] != admission_health["admission_enqueued"]:
+            admission_summary["admission_drop_or_failure_count"] = (
+                admission_summary.get("admission_drop_or_failure_count", 0)
+                + admission_health["admission_attempts"]
+                - admission_health["admission_enqueued"]
+            )
+        admission_summary["admission_drop_or_failure_count"] = (
+            admission_summary.get("admission_drop_or_failure_count", 0)
+            + admission_health["admission_dropped"]
+            + admission_health["admission_failed"]
         )
         admission_totals.update(admission_summary)
         buy_cohorts = load_buy_cohorts(run_id, paths["gatekeeper_buys"])
@@ -1403,6 +1885,21 @@ def evaluate(
         "admission_missing_release_count": admission_totals["admission_missing_release_count"],
         "admission_rejection_without_release_count": admission_totals[
             "admission_rejection_without_release_count"
+        ],
+        "monitoring_registered_without_position_open_count": admission_totals[
+            "monitoring_registered_without_position_open_count"
+        ],
+        "position_open_without_matching_candidate_identity_count": admission_totals[
+            "position_open_without_matching_candidate_identity_count"
+        ],
+        "registered_without_het_within_2_ticks_count": admission_totals[
+            "registered_without_het_within_2_ticks_count"
+        ],
+        "admission_drop_or_failure_count": admission_totals[
+            "admission_drop_or_failure_count"
+        ],
+        "admission_health_row_mismatch_count": admission_totals[
+            "admission_health_row_mismatch_count"
         ],
     }
 
@@ -1553,9 +2050,81 @@ def evaluate(
         + admission_totals["admission_missing_monitoring_registered_count"]
         + admission_totals["admission_missing_release_count"]
         + admission_totals["admission_rejection_without_release_count"]
+        + admission_totals["monitoring_registered_without_position_open_count"]
+        + admission_totals["position_open_without_matching_candidate_identity_count"]
+        + admission_totals["registered_without_het_within_2_ticks_count"]
+        + admission_totals["admission_drop_or_failure_count"]
+        + admission_totals["admission_health_row_mismatch_count"]
         + economic_observed["candidate_bearing_censored_count"]
+        + economic_observed["promoted_candidate_economic_join_failure_count"]
     )
     positive_improvement_total = sum(positive_improvement_by_cohort.values())
+    per_run_summaries: list[dict[str, Any]] = []
+    for run_id in sorted(validation_run_ids):
+        run_positions = {key for key in position_keys if key[0] == run_id}
+        run_matched = [row for row in matched if row["run_id"] == run_id]
+        run_summary = economic_summary(run_matched, criteria["metric_contracts"])
+        run_cohort_known = sum(
+            1 for key in run_positions if cohorts_by_identity.get(key) is not None
+        )
+        run_lifecycle_violations = (
+            len(run_positions - comparison_keys)
+            + len(run_positions - replay_keys)
+            + len(run_positions - (set(terminals) | censored_keys))
+            + len({key for key in comparison_without_position if key[0] == run_id})
+            + len({key for key in censored_keys if key[0] == run_id})
+        )
+        per_run_summaries.append(
+            {
+                "run_id": run_id,
+                "primary_positions": len(run_positions),
+                "position_comparison_coverage": ratio(
+                    len(run_positions & comparison_keys), len(run_positions)
+                ),
+                "matched_v2_candidate_positions": len(run_matched),
+                "executable_trailing_matched_positions": sum(
+                    1 for row in run_matched if row["reason"] == "ExecutableTrailing"
+                ),
+                "vitality_matched_positions": sum(
+                    1 for row in run_matched if row["reason"] == "VitalityDecay"
+                ),
+                "candidate_executable_continuation_coverage": run_summary[
+                    "candidate_executable_continuation_coverage"
+                ],
+                "creator_or_funder_identity_coverage": ratio(
+                    run_cohort_known, len(run_positions)
+                ),
+                "lifecycle_violation_count": run_lifecycle_violations,
+                "mean_peak_to_terminal_giveback_delta_bps": run_summary[
+                    "mean_peak_to_terminal_giveback_delta_bps"
+                ],
+                "tail_loss_p10_delta_bps": run_summary["tail_loss_p10_delta_bps"],
+                "worst_cost_scenario_mean_delta_bps": run_summary[
+                    "worst_cost_scenario_mean_delta_bps"
+                ],
+            }
+        )
+
+    def min_numeric(field: str, default: float | int = 0) -> float | int:
+        values = [
+            item[field]
+            for item in per_run_summaries
+            if isinstance(item.get(field), (int, float))
+            and not isinstance(item.get(field), bool)
+            and math.isfinite(float(item[field]))
+        ]
+        return min(values) if values else default
+
+    def max_numeric(field: str, default: float | int = 0) -> float | int:
+        values = [
+            item[field]
+            for item in per_run_summaries
+            if isinstance(item.get(field), (int, float))
+            and not isinstance(item.get(field), bool)
+            and math.isfinite(float(item[field]))
+        ]
+        return max(values) if values else default
+
     stability_observed = {
         "validation_runs": len(validation_run_ids),
         "launch_cohorts": len(launch_cohorts),
@@ -1575,6 +2144,38 @@ def evaluate(
         "major_segments": len(major_segments),
         "stable_direction_segment_share": ratio(stable_segments, len(major_segments)),
         "causal_data_contract_violation_count": causal_violations,
+        "per_run_min_primary_positions": min_numeric("primary_positions"),
+        "per_run_min_position_comparison_coverage": min_numeric(
+            "position_comparison_coverage"
+        ),
+        "per_run_min_matched_v2_candidate_positions": min_numeric(
+            "matched_v2_candidate_positions"
+        ),
+        "per_run_min_executable_trailing_matched_positions": min_numeric(
+            "executable_trailing_matched_positions"
+        ),
+        "per_run_min_vitality_matched_positions": min_numeric(
+            "vitality_matched_positions"
+        ),
+        "per_run_min_candidate_executable_continuation_coverage": min_numeric(
+            "candidate_executable_continuation_coverage"
+        ),
+        "per_run_min_creator_or_funder_identity_coverage": min_numeric(
+            "creator_or_funder_identity_coverage"
+        ),
+        "per_run_max_lifecycle_violation_count": max_numeric(
+            "lifecycle_violation_count"
+        ),
+        "per_run_worst_mean_delta_bps": min_numeric(
+            "mean_peak_to_terminal_giveback_delta_bps"
+        ),
+        "per_run_worst_tail_loss_p10_delta_bps": min_numeric(
+            "tail_loss_p10_delta_bps"
+        ),
+        "per_run_worst_cost_scenario_mean_delta_bps": min_numeric(
+            "worst_cost_scenario_mean_delta_bps"
+        ),
+        "per_run_details": per_run_summaries,
         "major_segment_details": major_segments,
         "creator_or_funder_cohort_effects": cohort_segment_details,
         "creator_or_funder_cohort_counts": dict(sorted(cohort_counts.items())),
@@ -1596,31 +2197,28 @@ def evaluate(
         for name in GATE_NAMES
     }
     gate_specific = economic_observed["gate_specific_economics"]
-    economic_checks = gates["economic_result"]["checks"]
+    requested_gate_results: dict[str, dict[str, Any]] = {}
     gate_eligibility: dict[str, Any] = {}
     for gate_key, contract in criteria["gate_promotion_contract"].items():
-        if gate_key == "executable_trailing":
-            gate_passed: bool | None = bool(
-                economic_checks.get("executable_trailing_candidate_positions")
-                and economic_checks.get("executable_trailing_matched_positions")
+        gate_result = None
+        gate_passed: bool | None = None
+        if contract["promotion_requested"]:
+            gate_result = evaluate_gate_specific_promotion(
+                gate_key, gate_specific[gate_key], criteria
             )
-        elif gate_key == "vitality_decay":
-            gate_passed = bool(
-                economic_checks.get("vitality_candidate_positions")
-                and economic_checks.get("vitality_matched_positions")
-            )
-        elif contract["promotion_requested"]:
-            gate_passed = gates["economic_result"]["passed"]
-        else:
-            gate_passed = None
+            requested_gate_results[gate_key] = gate_result
+            gate_passed = gate_result["passed"]
         gate_eligibility[gate_key] = {
             "promotion_requested": contract["promotion_requested"],
             "authority_eligible": contract["authority_eligible"],
             "promotion_gate_passed": gate_passed,
             "candidate_positions": gate_specific[gate_key]["candidate_positions"],
             "matched_positions": gate_specific[gate_key]["matched_positions"],
+            "economic_checks": gate_result["checks"] if gate_result is not None else None,
         }
-    promotion_passed = all(gate["passed"] for gate in gates.values())
+    promotion_passed = all(gate["passed"] for gate in gates.values()) and all(
+        result["passed"] for result in requested_gate_results.values()
+    )
     tool_path = Path(__file__).resolve()
     criteria_hash = hash_bytes(canonical_json(criteria))
     input_manifest_hash = hash_bytes(
@@ -1692,6 +2290,18 @@ def validate_promotion_artifact(
     gate_eligibility = require(artifact, "gate_eligibility", dict)
     if set(gate_eligibility) != set(criteria["gate_promotion_contract"]):
         raise ContractError("promotion artifact gate eligibility set mismatch")
+    economic_gate = artifact.get("gates", {}).get("economic_result")
+    economic_observed = (
+        economic_gate.get("observed")
+        if isinstance(economic_gate, dict)
+        else {}
+    )
+    gate_specific_economics = (
+        economic_observed.get("gate_specific_economics")
+        if isinstance(economic_observed, dict)
+        else {}
+    )
+    requested_gate_conjunction = True
     for gate_key, contract in criteria["gate_promotion_contract"].items():
         row = require(gate_eligibility, gate_key, dict)
         if require(row, "promotion_requested", bool) != contract["promotion_requested"]:
@@ -1702,8 +2312,21 @@ def validate_promotion_artifact(
         if contract["promotion_requested"]:
             if not isinstance(gate_passed, bool):
                 raise ContractError(f"promotion gate result missing: {gate_key}")
+            if not isinstance(gate_specific_economics, dict) or gate_key not in gate_specific_economics:
+                raise ContractError(f"promotion artifact lacks gate-specific economics: {gate_key}")
+            expected_gate = evaluate_gate_specific_promotion(
+                gate_key, gate_specific_economics[gate_key], criteria
+            )
+            if (
+                gate_passed != expected_gate["passed"]
+                or row.get("economic_checks") != expected_gate["checks"]
+            ):
+                raise ContractError(f"gate-specific promotion result mismatch: {gate_key}")
+            requested_gate_conjunction = requested_gate_conjunction and gate_passed
         elif gate_passed is not None:
             raise ContractError(f"non-promoted gate cannot pass promotion: {gate_key}")
+        elif row.get("economic_checks") is not None:
+            raise ContractError(f"non-promoted gate cannot carry promotion checks: {gate_key}")
         for field in ("candidate_positions", "matched_positions"):
             value = require(row, field, int)
             if value < 0:
@@ -1726,8 +2349,8 @@ def validate_promotion_artifact(
             raise ContractError(f"promotion artifact gate result mismatch: {gate_name}")
         conjunction = conjunction and passed
     root = require(artifact, "promotion_gate_passed", bool)
-    if root != conjunction:
-        raise ContractError("manual root boolean disagrees with Gate 1-5 conjunction")
+    if root != (conjunction and requested_gate_conjunction):
+        raise ContractError("manual root boolean disagrees with Gate 1-5 and gate-specific conjunction")
 
 
 def add_manifest_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1764,9 +2387,9 @@ def load_verified_run_manifests(
             )
         seen_runs.add(manifest["run_id"])
         seen_cohorts.add(manifest["launch_cohort_id"])
-        manifests.append(
-            (manifest_path, manifest, verify_manifest_artifacts(manifest, repo_root))
-        )
+        paths = verify_manifest_artifacts(manifest, repo_root)
+        validate_run_manifest_against_sources(manifest, paths, repo_root)
+        manifests.append((manifest_path, manifest, paths))
     manifests.sort(key=lambda item: item[1]["run_id"])
     return manifests
 

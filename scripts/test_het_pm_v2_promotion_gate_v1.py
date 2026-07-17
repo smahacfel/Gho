@@ -50,23 +50,16 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
     def gate_eligibility(self, gates: dict) -> dict:
         economic = gates["economic_result"]
         observed = economic["observed"]
-        checks = economic["checks"]
+        gate_specific = observed["gate_specific_economics"]
         result = {}
         for gate_key, contract in self.criteria["gate_promotion_contract"].items():
-            if gate_key == "executable_trailing":
-                gate_passed = bool(
-                    checks.get("executable_trailing_candidate_positions")
-                    and checks.get("executable_trailing_matched_positions")
+            gate_result = None
+            gate_passed = None
+            if contract["promotion_requested"]:
+                gate_result = gate.evaluate_gate_specific_promotion(
+                    gate_key, gate_specific[gate_key], self.criteria
                 )
-            elif gate_key == "vitality_decay":
-                gate_passed = bool(
-                    checks.get("vitality_candidate_positions")
-                    and checks.get("vitality_matched_positions")
-                )
-            elif contract["promotion_requested"]:
-                gate_passed = economic["passed"]
-            else:
-                gate_passed = None
+                gate_passed = gate_result["passed"]
             metric_prefix = "vitality" if gate_key == "vitality_decay" else gate_key
             result[gate_key] = {
                 "promotion_requested": contract["promotion_requested"],
@@ -74,6 +67,7 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                 "promotion_gate_passed": gate_passed,
                 "candidate_positions": observed.get(f"{metric_prefix}_candidate_positions", 0),
                 "matched_positions": observed.get(f"{metric_prefix}_matched_positions", 0),
+                "economic_checks": gate_result["checks"] if gate_result is not None else None,
             }
         return result
 
@@ -128,7 +122,7 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         reason: str | None = None,
         return_bps: int = 100,
         current_executable_bps: int | None = None,
-        route_status: str = "PumpCurveSupported",
+        route_status: str = "pump_curve_supported",
     ) -> dict:
         return {
             "run_id": key[0],
@@ -275,6 +269,12 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         observed = copy.deepcopy(self.observed)
         observed["economic_result"]["executable_trailing_candidate_positions"] = 0
         observed["economic_result"]["executable_trailing_matched_positions"] = 0
+        observed["economic_result"]["gate_specific_economics"]["executable_trailing"][
+            "candidate_positions"
+        ] = 0
+        observed["economic_result"]["gate_specific_economics"]["executable_trailing"][
+            "matched_positions"
+        ] = 0
         gates = self.evaluate(observed)
         self.assertFalse(gates["economic_result"]["checks"]["executable_trailing_candidate_positions"])
         self.assertFalse(gates["economic_result"]["checks"]["executable_trailing_matched_positions"])
@@ -285,6 +285,12 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         observed["economic_result"]["matched_v2_candidate_positions"] = 50
         observed["economic_result"]["executable_trailing_candidate_positions"] = 0
         observed["economic_result"]["executable_trailing_matched_positions"] = 0
+        observed["economic_result"]["gate_specific_economics"]["executable_trailing"][
+            "candidate_positions"
+        ] = 0
+        observed["economic_result"]["gate_specific_economics"]["executable_trailing"][
+            "matched_positions"
+        ] = 0
         observed["economic_result"]["vitality_candidate_positions"] = 50
         observed["economic_result"]["vitality_matched_positions"] = 50
         gates = self.evaluate(observed)
@@ -327,6 +333,108 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         )
         self.assertEqual([row["reason"] for row in matched], ["ExecutableTrailing"])
 
+    def test_one_position_with_trailing_and_vitality_counts_once_globally(self) -> None:
+        key = self.position_key()
+        observed, matched = gate.economic_observations(
+            {key: self.opened_position(key)},
+            {
+                key: [
+                    self.comparison_row(
+                        key=key,
+                        timestamp_ms=1_000,
+                        reason="VitalityDecay",
+                        return_bps=50,
+                    ),
+                    self.comparison_row(
+                        key=key,
+                        timestamp_ms=2_000,
+                        reason="ExecutableTrailing",
+                        return_bps=250,
+                    ),
+                    self.comparison_row(
+                        key=key,
+                        timestamp_ms=3_000,
+                        current_executable_bps=300,
+                    ),
+                ]
+            },
+            {key: self.terminal()},
+            {key: self.replay()},
+            {},
+            self.criteria,
+        )
+        self.assertEqual(observed["matched_v2_candidate_positions"], 1)
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["reason"], "VitalityDecay")
+        self.assertEqual(
+            observed["gate_specific_economics"]["vitality_decay"]["matched_positions"],
+            1,
+        )
+        self.assertEqual(
+            observed["gate_specific_economics"]["executable_trailing"]["matched_positions"],
+            1,
+        )
+
+    def test_same_tick_trailing_and_vitality_follow_hierarchy(self) -> None:
+        key = self.position_key()
+        _, matched = gate.economic_observations(
+            {key: self.opened_position(key)},
+            {
+                key: [
+                    self.comparison_row(
+                        key=key,
+                        timestamp_ms=1_000,
+                        reason="VitalityDecay",
+                        return_bps=50,
+                    ),
+                    self.comparison_row(
+                        key=key,
+                        timestamp_ms=1_000,
+                        reason="ExecutableTrailing",
+                        return_bps=250,
+                    ),
+                ]
+            },
+            {key: self.terminal()},
+            {key: self.replay()},
+            {},
+            self.criteria,
+        )
+        self.assertEqual([row["reason"] for row in matched], ["ExecutableTrailing"])
+
+    def test_good_trailing_cannot_rescue_bad_vitality(self) -> None:
+        observed = copy.deepcopy(self.observed)
+        observed["economic_result"]["gate_specific_economics"]["vitality_decay"][
+            "cvar_20_delta_bps"
+        ] = -2000
+        gates = self.evaluate(observed)
+        self.assertTrue(gates["economic_result"]["passed"])
+        eligibility = self.gate_eligibility(gates)
+        self.assertTrue(eligibility["executable_trailing"]["promotion_gate_passed"])
+        self.assertFalse(eligibility["vitality_decay"]["promotion_gate_passed"])
+        gate.validate_promotion_artifact(self.artifact(gates, False), self.criteria)
+
+    def test_good_vitality_cannot_rescue_bad_trailing(self) -> None:
+        observed = copy.deepcopy(self.observed)
+        observed["economic_result"]["gate_specific_economics"]["executable_trailing"][
+            "worst_cost_scenario_mean_delta_bps"
+        ] = -2000
+        gates = self.evaluate(observed)
+        self.assertTrue(gates["economic_result"]["passed"])
+        eligibility = self.gate_eligibility(gates)
+        self.assertFalse(eligibility["executable_trailing"]["promotion_gate_passed"])
+        self.assertTrue(eligibility["vitality_decay"]["promotion_gate_passed"])
+        gate.validate_promotion_artifact(self.artifact(gates, False), self.criteria)
+
+    def test_root_cannot_pass_when_one_requested_gate_fails_economics(self) -> None:
+        observed = copy.deepcopy(self.observed)
+        observed["economic_result"]["gate_specific_economics"]["vitality_decay"][
+            "tail_loss_p10_delta_bps"
+        ] = -2000
+        gates = self.evaluate(observed)
+        with self.assertRaisesRegex(gate.ContractError, "manual root boolean"):
+            gate.validate_promotion_artifact(self.artifact(gates, True), self.criteria)
+
     def test_later_candidate_recurrence_is_not_executable_continuation(self) -> None:
         key = self.position_key()
         observed, _ = gate.economic_observations(
@@ -354,6 +462,60 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         )
         self.assertEqual(observed["later_candidate_recurrence_rate"], 1.0)
         self.assertEqual(observed["candidate_executable_continuation_coverage"], 0.0)
+
+    def test_unsupported_route_is_not_available_after_candidate(self) -> None:
+        key = self.position_key()
+        observed, _ = gate.economic_observations(
+            {key: self.opened_position(key)},
+            {
+                key: [
+                    self.comparison_row(
+                        key=key,
+                        timestamp_ms=1_000,
+                        reason="ExecutableTrailing",
+                        return_bps=100,
+                    ),
+                    self.comparison_row(
+                        key=key,
+                        timestamp_ms=2_000,
+                        current_executable_bps=120,
+                        route_status="curve_complete_pump_swap_unsupported",
+                    ),
+                ]
+            },
+            {key: self.terminal()},
+            {key: self.replay()},
+            {},
+            self.criteria,
+        )
+        self.assertEqual(observed["candidate_executable_continuation_coverage"], 1.0)
+        self.assertEqual(observed["route_availability_after_candidate"], 0.0)
+
+    def test_promoted_candidate_missing_economic_field_is_join_failure(self) -> None:
+        key = self.position_key()
+        row = self.comparison_row(
+            key=key,
+            timestamp_ms=1_000,
+            reason="ExecutableTrailing",
+            return_bps=100,
+        )
+        row.pop("entry_value_quote_raw")
+        observed, matched = gate.economic_observations(
+            {key: self.opened_position(key)},
+            {key: [row]},
+            {key: self.terminal()},
+            {key: self.replay()},
+            {},
+            self.criteria,
+        )
+        self.assertEqual(matched, [])
+        self.assertEqual(observed["promoted_candidate_economic_join_failure_count"], 1)
+        self.assertEqual(
+            observed["gate_specific_economics"]["executable_trailing"][
+                "economic_join_failure_count"
+            ],
+            1,
+        )
 
     def test_candidate_bearing_censored_count_fails_economic_gate(self) -> None:
         observed = copy.deepcopy(self.observed)
@@ -415,7 +577,9 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         key = self.position_key()
         opened = {key: self.opened_position(key)}
         empty_summary = gate.summarize_admission([])
-        reconciled = gate.reconcile_admission_with_opened_positions([], opened, empty_summary)
+        reconciled = gate.reconcile_admission_with_opened_positions(
+            [], opened, empty_summary, {}, 1_000
+        )
         self.assertEqual(reconciled["admission_missing_final_count"], 1)
         self.assertEqual(reconciled["admission_missing_monitoring_registered_count"], 1)
         self.assertEqual(reconciled["admission_missing_release_count"], 1)
@@ -448,6 +612,7 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                 "position_id": key[1],
                 "position_epoch": key[2],
                 "handoff_accepted": True,
+                "timestamp_ms": 1_000,
             },
             {
                 "run_id": key[0],
@@ -465,10 +630,68 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
             complete_rows,
             opened,
             gate.summarize_admission(complete_rows),
+            {key: [self.comparison_row(key=key, timestamp_ms=2_000)]},
+            1_000,
         )
         self.assertEqual(complete["admission_missing_final_count"], 0)
         self.assertEqual(complete["admission_missing_monitoring_registered_count"], 0)
         self.assertEqual(complete["admission_missing_release_count"], 0)
+
+    def test_admission_reconciliation_is_bidirectional_and_has_first_het_sla(self) -> None:
+        key = self.position_key()
+        opened = {key: self.opened_position(key)}
+        registered_only = [
+            {
+                "run_id": key[0],
+                "candidate_id": opened[key]["candidate_id"],
+                "pool_id": opened[key]["pool_id"],
+                "base_mint": opened[key]["base_mint"],
+                "lane": "shadow",
+                "stage": "post_buy_submitted",
+            },
+            {
+                "run_id": key[0],
+                "candidate_id": opened[key]["candidate_id"],
+                "pool_id": opened[key]["pool_id"],
+                "base_mint": opened[key]["base_mint"],
+                "lane": "shadow",
+                "stage": "monitoring_registered",
+                "position_id": key[1],
+                "position_epoch": key[2],
+                "timestamp_ms": 1_000,
+            },
+            {
+                "run_id": key[0],
+                "candidate_id": "candidate-orphan",
+                "pool_id": "pool-orphan",
+                "base_mint": "mint-orphan",
+                "lane": "shadow",
+                "stage": "post_buy_submitted",
+            },
+            {
+                "run_id": key[0],
+                "candidate_id": "candidate-orphan",
+                "pool_id": "pool-orphan",
+                "base_mint": "mint-orphan",
+                "lane": "shadow",
+                "stage": "monitoring_registered",
+                "position_id": "pool-orphan:mint-orphan:shadow",
+                "position_epoch": 99,
+                "timestamp_ms": 1_000,
+            }
+        ]
+        reconciled = gate.reconcile_admission_with_opened_positions(
+            registered_only,
+            opened,
+            gate.summarize_admission(registered_only),
+            {key: [self.comparison_row(key=key, timestamp_ms=10_000)]},
+            1_000,
+        )
+        self.assertEqual(
+            reconciled["monitoring_registered_without_position_open_count"],
+            1,
+        )
+        self.assertEqual(reconciled["registered_without_het_within_2_ticks_count"], 1)
 
 
 if __name__ == "__main__":
