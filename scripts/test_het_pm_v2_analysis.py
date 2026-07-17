@@ -16,7 +16,7 @@ SPEC.loader.exec_module(MODULE)
 
 def fixture() -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "comparison_id": "comparison-1",
         "policy_id": "hierarchical_executable_trajectory_pm_v2",
         "policy_version": 2,
@@ -26,6 +26,7 @@ def fixture() -> dict:
         "v1_policy_config_hash": "v1-config-hash-1",
         "time_stop_v2_config_hash": "time-stop-config-hash-1",
         "run_id": "run-1",
+        "writer_instance_id": "writer-1",
         "lane": "shadow",
         "position_id": "position-1",
         "position_epoch": 1,
@@ -109,9 +110,19 @@ def fixture() -> dict:
     }
 
 
+def fixture_for(index: int, *, writer: str = "writer-1", run: str = "run-1") -> dict:
+    row = fixture()
+    row["comparison_id"] = f"comparison-{index}"
+    row["snapshot_id"] = f"snapshot-{index}"
+    row["v1_authority_receipt"]["snapshot_id"] = f"snapshot-{index}"
+    row["writer_instance_id"] = writer
+    row["run_id"] = run
+    return row
+
+
 def writer_health_fixture() -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_type": "het_pm_v2_writer_health",
         "writer_instance_id": "writer-1",
         "run_id": "run-1",
@@ -124,6 +135,12 @@ def writer_health_fixture() -> dict:
         "started_at_ms": 1_000,
         "snapshot_generated_at_ms": 20_000,
         "revision": 3,
+        "comparison_attempts": 1,
+        "comparison_ready_for_enqueue": 1,
+        "core_validation_skips": 0,
+        "final_validation_skips": 0,
+        "serialization_skips": 0,
+        "payload_oversized_skips": 0,
         "enqueue_attempts": 1,
         "enqueued": 1,
         "queue_full_drops": 0,
@@ -136,14 +153,35 @@ def writer_health_fixture() -> dict:
     }
 
 
+def writer_health_for(
+    *,
+    writer: str = "writer-1",
+    run: str = "run-1",
+    comparison_attempts: int = 1,
+    ready: int = 1,
+    writes: int = 1,
+) -> dict:
+    health = writer_health_fixture()
+    health["writer_instance_id"] = writer
+    health["run_id"] = run
+    health["comparison_attempts"] = comparison_attempts
+    health["comparison_ready_for_enqueue"] = ready
+    health["enqueue_attempts"] = ready
+    health["enqueued"] = ready
+    health["writes_succeeded"] = writes
+    return health
+
+
 class AnalysisContractTest(unittest.TestCase):
     def test_identical_input_produces_identical_report(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "input.jsonl"
             health_path = Path(temp_dir) / "writer-health.json"
             path.write_text(json.dumps(fixture(), sort_keys=True) + "\n", encoding="utf-8")
+            health_record = writer_health_fixture()
+            health_record["sidecar_path"] = str(path)
             health_path.write_text(
-                json.dumps(writer_health_fixture(), sort_keys=True) + "\n",
+                json.dumps(health_record, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
             records, inputs = MODULE.load_records([path])
@@ -208,6 +246,8 @@ class AnalysisContractTest(unittest.TestCase):
         health_record = writer_health_fixture()
         health_record.update(
             {
+                "comparison_attempts": 3,
+                "comparison_ready_for_enqueue": 3,
                 "enqueue_attempts": 3,
                 "enqueued": 1,
                 "queue_full_drops": 2,
@@ -225,6 +265,164 @@ class AnalysisContractTest(unittest.TestCase):
         self.assertAlmostEqual(health["capture_ratio"], 1.0 / 3.0)
         self.assertAlmostEqual(health["drop_ratio"], 2.0 / 3.0)
         self.assertFalse(health["promotion_evidence_available"])
+
+    def test_core_validation_skip_is_included_in_producer_denominator(self) -> None:
+        health_record = writer_health_for(comparison_attempts=10, ready=9, writes=9)
+        health_record["core_validation_skips"] = 1
+
+        report = MODULE.analyze(
+            [fixture_for(index) for index in range(1, 10)],
+            [],
+            0.0005,
+            [health_record],
+            [],
+        )
+
+        health = report["coverage"]["writer_health"]
+        self.assertFalse(health["coverage_unknown"])
+        self.assertEqual(
+            health["writer_health_evidence_status"],
+            "complete_with_observation_loss",
+        )
+        self.assertEqual(health["comparison_attempts"], 10)
+        self.assertEqual(health["core_validation_skip_count"], 1)
+        self.assertAlmostEqual(health["producer_validity_ratio"], 0.9)
+        self.assertAlmostEqual(health["end_to_end_capture_ratio"], 0.9)
+        self.assertFalse(health["promotion_evidence_available"])
+
+    def test_final_validation_skip_is_included_in_producer_denominator(self) -> None:
+        health_record = writer_health_for(comparison_attempts=4, ready=3, writes=3)
+        health_record["final_validation_skips"] = 1
+
+        report = MODULE.analyze(
+            [fixture_for(index) for index in range(1, 4)],
+            [],
+            0.0005,
+            [health_record],
+            [],
+        )
+
+        health = report["coverage"]["writer_health"]
+        self.assertEqual(
+            health["writer_health_evidence_status"],
+            "complete_with_observation_loss",
+        )
+        self.assertEqual(health["final_validation_skip_count"], 1)
+        self.assertAlmostEqual(health["capture_ratio"], 0.75)
+        self.assertFalse(health["promotion_evidence_available"])
+
+    def test_serialization_or_oversized_skip_prevents_complete_health_status(self) -> None:
+        for field, report_field in (
+            ("serialization_skips", "serialization_skip_count"),
+            ("payload_oversized_skips", "payload_oversized_skip_count"),
+        ):
+            with self.subTest(field=field):
+                health_record = writer_health_for(comparison_attempts=2, ready=1, writes=1)
+                health_record[field] = 1
+
+                report = MODULE.analyze(
+                    [fixture_for(1)],
+                    [],
+                    0.0005,
+                    [health_record],
+                    [],
+                )
+
+                health = report["coverage"]["writer_health"]
+                self.assertEqual(
+                    health["writer_health_evidence_status"],
+                    "complete_with_observation_loss",
+                )
+                self.assertEqual(health[report_field], 1)
+                self.assertFalse(health["promotion_evidence_available"])
+
+    def test_end_to_end_capture_ratio_uses_all_comparison_attempts(self) -> None:
+        health_record = writer_health_for(comparison_attempts=5, ready=4, writes=3)
+        health_record["core_validation_skips"] = 1
+        health_record["enqueued"] = 4
+        health_record["queue_full_drops"] = 0
+        health_record["writes_failed"] = 1
+
+        report = MODULE.analyze(
+            [fixture_for(index) for index in range(1, 4)],
+            [],
+            0.0005,
+            [health_record],
+            [],
+        )
+
+        health = report["coverage"]["writer_health"]
+        self.assertAlmostEqual(health["writer_capture_ratio"], 3.0 / 4.0)
+        self.assertAlmostEqual(health["end_to_end_capture_ratio"], 3.0 / 5.0)
+        self.assertAlmostEqual(health["capture_ratio"], 3.0 / 5.0)
+        self.assertEqual(
+            health["writer_health_evidence_status"],
+            "complete_with_observation_loss",
+        )
+
+    def test_writer_health_cannot_compensate_missing_rows_between_runs(self) -> None:
+        rows = [
+            fixture_for(1, writer="writer-a", run="run-a"),
+            fixture_for(2, writer="writer-b", run="run-b"),
+        ]
+        health_a = writer_health_for(
+            writer="writer-a", run="run-a", comparison_attempts=0, ready=0, writes=0
+        )
+        health_b = writer_health_for(
+            writer="writer-b", run="run-b", comparison_attempts=2, ready=2, writes=2
+        )
+
+        report = MODULE.analyze(rows, [], 0.0005, [health_a, health_b], [])
+
+        health = report["coverage"]["writer_health"]
+        self.assertTrue(health["coverage_unknown"])
+        self.assertFalse(health["sidecar_record_count_match"])
+        self.assertEqual(
+            health["writer_health_evidence_status"],
+            "incomplete_or_inconsistent",
+        )
+        self.assertFalse(health["promotion_evidence_available"])
+
+    def test_writer_health_cannot_compensate_missing_rows_between_instances(self) -> None:
+        rows = [fixture_for(1, writer="writer-a"), fixture_for(2, writer="writer-b")]
+        health_a = writer_health_for(writer="writer-a", comparison_attempts=0, ready=0, writes=0)
+        health_b = writer_health_for(writer="writer-b", comparison_attempts=2, ready=2, writes=2)
+
+        report = MODULE.analyze(rows, [], 0.0005, [health_a, health_b], [])
+
+        health = report["coverage"]["writer_health"]
+        self.assertTrue(health["coverage_unknown"])
+        self.assertFalse(health["sidecar_record_count_match"])
+        self.assertFalse(health["promotion_evidence_available"])
+
+    def test_health_artifact_for_another_sidecar_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sidecar_path = Path(temp_dir) / "het_pm_v2_observations_v1.jsonl"
+            other_path = Path(temp_dir) / "other_het_pm_v2_observations_v1.jsonl"
+            sidecar_path.write_text(json.dumps(fixture()) + "\n", encoding="utf-8")
+            other_path.write_text("", encoding="utf-8")
+            health = writer_health_fixture()
+            health["sidecar_path"] = str(other_path)
+
+            records, inputs = MODULE.load_records([sidecar_path])
+            report = MODULE.analyze(records, inputs, 0.0005, [health], [])
+
+            writer_health = report["coverage"]["writer_health"]
+            self.assertTrue(writer_health["coverage_unknown"])
+            self.assertFalse(writer_health["sidecar_file_identity_match"])
+            self.assertFalse(writer_health["promotion_evidence_available"])
+
+    def test_every_comparison_row_requires_exact_writer_instance_match(self) -> None:
+        row = fixture()
+        health = writer_health_fixture()
+        health["writer_instance_id"] = "writer-2"
+
+        report = MODULE.analyze([row], [], 0.0005, [health], [])
+
+        writer_health = report["coverage"]["writer_health"]
+        self.assertTrue(writer_health["coverage_unknown"])
+        self.assertFalse(writer_health["per_writer_identity_match"])
+        self.assertFalse(writer_health["promotion_evidence_available"])
 
     def test_unclean_writer_health_cannot_support_promotion(self) -> None:
         health_record = writer_health_fixture()
@@ -264,7 +462,7 @@ class AnalysisContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "input.jsonl"
             row = fixture()
-            row["schema_version"] = 2
+            row["schema_version"] = 999
             path.write_text(json.dumps(row) + "\n", encoding="utf-8")
             with self.assertRaises(MODULE.ContractError):
                 MODULE.load_records([path])

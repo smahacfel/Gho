@@ -800,7 +800,7 @@ struct PendingTerminalCommit {
     het_comparison_write_status: HetComparisonWriteStatusV1,
 }
 
-const HET_PM_V2_WRITER_HEALTH_SCHEMA_VERSION: u16 = 1;
+const HET_PM_V2_WRITER_HEALTH_SCHEMA_VERSION: u16 = 2;
 const HET_PM_V2_WRITER_HEALTH_ARTIFACT_TYPE: &str = "het_pm_v2_writer_health";
 const HET_PM_V2_WRITER_HEALTH_COALESCE_MS: u64 = 100;
 const HET_PM_V2_WRITER_HEALTH_SHUTDOWN_BUDGET_MS: u64 = 250;
@@ -884,6 +884,12 @@ struct HetPmV2ObservationWriteJobV1 {
 
 #[derive(Debug, Default)]
 struct HetPmV2ObservationWriterStatsV1 {
+    comparison_attempts: AtomicU64,
+    comparison_ready_for_enqueue: AtomicU64,
+    core_validation_skips: AtomicU64,
+    final_validation_skips: AtomicU64,
+    serialization_skips: AtomicU64,
+    payload_oversized_skips: AtomicU64,
     enqueue_attempts: AtomicU64,
     enqueued: AtomicU64,
     queue_full_drops: AtomicU64,
@@ -897,6 +903,12 @@ struct HetPmV2ObservationWriterStatsV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 struct HetPmV2ObservationWriterStatsSnapshotV1 {
+    comparison_attempts: u64,
+    comparison_ready_for_enqueue: u64,
+    core_validation_skips: u64,
+    final_validation_skips: u64,
+    serialization_skips: u64,
+    payload_oversized_skips: u64,
     enqueue_attempts: u64,
     enqueued: u64,
     queue_full_drops: u64,
@@ -911,6 +923,12 @@ struct HetPmV2ObservationWriterStatsSnapshotV1 {
 impl HetPmV2ObservationWriterStatsV1 {
     fn snapshot(&self) -> HetPmV2ObservationWriterStatsSnapshotV1 {
         HetPmV2ObservationWriterStatsSnapshotV1 {
+            comparison_attempts: self.comparison_attempts.load(Ordering::Acquire),
+            comparison_ready_for_enqueue: self.comparison_ready_for_enqueue.load(Ordering::Acquire),
+            core_validation_skips: self.core_validation_skips.load(Ordering::Acquire),
+            final_validation_skips: self.final_validation_skips.load(Ordering::Acquire),
+            serialization_skips: self.serialization_skips.load(Ordering::Acquire),
+            payload_oversized_skips: self.payload_oversized_skips.load(Ordering::Acquire),
             enqueue_attempts: self.enqueue_attempts.load(Ordering::Acquire),
             enqueued: self.enqueued.load(Ordering::Acquire),
             queue_full_drops: self.queue_full_drops.load(Ordering::Acquire),
@@ -1247,6 +1265,82 @@ impl HetPmV2ObservationWriterV1 {
         }
     }
 
+    fn writer_instance_id(&self) -> &str {
+        &self.health_context.writer_instance_id
+    }
+
+    fn record_comparison_core_outcome(&self, core: &PreparedV1V2ComparisonCoreV1) {
+        let correlation = match core {
+            PreparedV1V2ComparisonCoreV1::Ready(record) => HetComparisonCorrelationV1 {
+                comparison_id: record.comparison_id.clone(),
+                source_snapshot_id: record.snapshot_id.clone(),
+                run_id: record.run_id.clone(),
+                writer_instance_id: record.writer_instance_id.clone(),
+            },
+            PreparedV1V2ComparisonCoreV1::Skipped { correlation, .. } => correlation.clone(),
+        };
+        self.health_context
+            .shutdown_complete
+            .store(false, Ordering::Release);
+        self.health_context.observe_run_id(&correlation.run_id);
+        self.stats
+            .comparison_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            core,
+            PreparedV1V2ComparisonCoreV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::CoreSemanticValidationFailed,
+                ..
+            }
+        ) {
+            self.stats
+                .core_validation_skips
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.notify_health();
+    }
+
+    fn record_comparison_final_outcome(&self, prepared: &PreparedHetComparisonV1) {
+        self.health_context
+            .shutdown_complete
+            .store(false, Ordering::Release);
+        self.health_context
+            .observe_run_id(&prepared.correlation().run_id);
+        match prepared {
+            PreparedHetComparisonV1::Ready { .. } => {
+                self.stats
+                    .comparison_ready_for_enqueue
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PreparedHetComparisonV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::FinalSemanticValidationFailed,
+                ..
+            } => {
+                self.stats
+                    .final_validation_skips
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PreparedHetComparisonV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::SerializationFailed,
+                ..
+            } => {
+                self.stats
+                    .serialization_skips
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PreparedHetComparisonV1::Skipped {
+                reason: TerminalV2ComparisonSkipReasonV1::PayloadOversized,
+                ..
+            } => {
+                self.stats
+                    .payload_oversized_skips
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PreparedHetComparisonV1::Skipped { .. } => {}
+        }
+        self.notify_health();
+    }
+
     fn try_enqueue(
         &self,
         correlation: HetComparisonCorrelationV1,
@@ -1342,7 +1436,15 @@ impl HetPmV2ObservationWriterV1 {
 
     fn counters_are_quiescent(&self) -> bool {
         let stats = self.stats.snapshot();
-        stats.enqueue_attempts == stats.enqueued + stats.queue_full_drops + stats.queue_closed_drops
+        let local_outcomes = stats.comparison_ready_for_enqueue
+            + stats.core_validation_skips
+            + stats.final_validation_skips
+            + stats.serialization_skips
+            + stats.payload_oversized_skips;
+        stats.comparison_attempts == local_outcomes
+            && stats.comparison_ready_for_enqueue == stats.enqueue_attempts
+            && stats.enqueue_attempts
+                == stats.enqueued + stats.queue_full_drops + stats.queue_closed_drops
             && stats.enqueued
                 == stats.writes_succeeded + stats.writes_failed + stats.cancelled_before_write
     }
@@ -1833,6 +1935,8 @@ struct ShadowLifecycleRecord {
     action_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     het_pm_v2_comparison_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    het_pm_v2_writer_instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     het_pm_v2_source_snapshot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3655,6 +3759,26 @@ impl MonitoringEngine {
         std::fs::rename(temporary_path, path)
     }
 
+    fn het_pm_v2_writer_instance_id_for_record(&self) -> String {
+        self.het_pm_v2_observation_writer
+            .as_ref()
+            .map(HetPmV2ObservationWriterV1::writer_instance_id)
+            .unwrap_or("writer_unavailable")
+            .to_string()
+    }
+
+    fn record_het_pm_v2_comparison_core_outcome(&self, core: &PreparedV1V2ComparisonCoreV1) {
+        if let Some(writer) = self.het_pm_v2_observation_writer.as_ref() {
+            writer.record_comparison_core_outcome(core);
+        }
+    }
+
+    fn record_het_pm_v2_comparison_final_outcome(&self, prepared: &PreparedHetComparisonV1) {
+        if let Some(writer) = self.het_pm_v2_observation_writer.as_ref() {
+            writer.record_comparison_final_outcome(prepared);
+        }
+    }
+
     fn enqueue_prepared_het_pm_v2_comparison(
         &self,
         prepared: &PreparedHetComparisonV1,
@@ -4699,6 +4823,11 @@ impl MonitoringEngine {
             envelope
                 .source_refs
                 .push(format!("het_pm_v2:comparison_id:{comparison_id}"));
+            if let Some(writer_instance_id) = record.het_pm_v2_writer_instance_id.as_deref() {
+                envelope
+                    .source_refs
+                    .push(format!("het_pm_v2:writer_instance_id:{writer_instance_id}"));
+            }
             if let Some(snapshot_id) = record.het_pm_v2_source_snapshot_id.as_deref() {
                 envelope
                     .source_refs
@@ -5288,6 +5417,7 @@ impl MonitoringEngine {
                 .map(|proposal| proposal.action_id.clone())
                 .or_else(|| pos.last_applied_action_id.clone()),
             het_pm_v2_comparison_id: None,
+            het_pm_v2_writer_instance_id: None,
             het_pm_v2_source_snapshot_id: None,
             het_pm_v2_comparison_write_status: None,
             het_pm_v2_comparison_skip_reason: None,
@@ -7450,6 +7580,7 @@ impl MonitoringEngine {
             "het_pm_v2:{}",
             blake3::hash(comparison_identity_material.as_bytes()).to_hex()
         );
+        let writer_instance_id = self.het_pm_v2_writer_instance_id_for_record();
         let record = V1V2ComparisonRecord {
             schema_version: HET_PM_V2_SCHEMA_VERSION,
             comparison_id,
@@ -7461,6 +7592,7 @@ impl MonitoringEngine {
             v1_policy_config_hash: v1_policy.config_hash().to_string(),
             time_stop_v2_config_hash: self.time_stop_v2_config_hash.clone(),
             run_id: bundle.v2.run_id.clone(),
+            writer_instance_id,
             lane: bundle.base.lane(),
             position_id: bundle.base.guard().position_id().to_string(),
             position_epoch: bundle.base.guard().position_epoch(),
@@ -7508,8 +7640,11 @@ impl MonitoringEngine {
             known_estimated_costs_sol,
         };
 
+        let comparison_core = PreparedV1V2ComparisonCoreV1::prepare(record);
+        self.record_het_pm_v2_comparison_core_outcome(&comparison_core);
+
         PreparedHetPmV2Tick {
-            comparison_core: PreparedV1V2ComparisonCoreV1::prepare(record),
+            comparison_core,
             quote_cells,
             anchor_request,
         }
@@ -7638,6 +7773,7 @@ impl MonitoringEngine {
             now_ms,
         );
         let prepared_comparison = prepared.comparison_core.finalize(receipt, anchor_applied);
+        self.record_het_pm_v2_comparison_final_outcome(&prepared_comparison);
         if self.has_pending_terminal_commit(base_mint) {
             match self
                 .attach_prepared_het_comparison_to_pending_terminal(base_mint, prepared_comparison)
@@ -8383,6 +8519,7 @@ impl MonitoringEngine {
     ) {
         let correlation = prepared.correlation();
         record.het_pm_v2_comparison_id = Some(correlation.comparison_id.clone());
+        record.het_pm_v2_writer_instance_id = Some(correlation.writer_instance_id.clone());
         record.het_pm_v2_source_snapshot_id = Some(correlation.source_snapshot_id.clone());
         record.het_pm_v2_comparison_write_status = Some(status.as_label().to_string());
         record.het_pm_v2_comparison_skip_reason = status
@@ -8397,9 +8534,9 @@ impl MonitoringEngine {
         &self,
         base_mint: &Pubkey,
         prepared: PreparedHetComparisonV1,
-    ) -> Result<(), PreparedHetComparisonV1> {
+    ) -> Result<(), Box<PreparedHetComparisonV1>> {
         let Some(action_id) = prepared.action_id().map(str::to_string) else {
-            return Err(prepared);
+            return Err(Box::new(prepared));
         };
         let initial_status = match &prepared {
             PreparedHetComparisonV1::Ready { .. } => HetComparisonWriteStatusV1::NotAttempted,
@@ -8412,13 +8549,13 @@ impl MonitoringEngine {
         };
         let mut positions = self.positions.write();
         let Some(pos) = positions.get_mut(base_mint) else {
-            return Err(prepared);
+            return Err(Box::new(prepared));
         };
         let Some(pending) = pos.pending_terminal_commit.as_mut() else {
-            return Err(prepared);
+            return Err(Box::new(prepared));
         };
         if pending.action_id != action_id || pending.prepared_het_comparison.is_some() {
-            return Err(prepared);
+            return Err(Box::new(prepared));
         }
         Self::apply_het_comparison_status_to_terminal_record(
             &mut pending.record,
@@ -14487,6 +14624,12 @@ mod tests {
         })
         .await;
         assert_eq!(health["run_id"], "het-stalled-nonterminal-writer");
+        assert_eq!(health["comparison_attempts"], 3);
+        assert_eq!(health["comparison_ready_for_enqueue"], 3);
+        assert_eq!(health["core_validation_skips"], 0);
+        assert_eq!(health["final_validation_skips"], 0);
+        assert_eq!(health["serialization_skips"], 0);
+        assert_eq!(health["payload_oversized_skips"], 0);
         assert_eq!(health["enqueued"], 2);
         assert_eq!(health["writes_succeeded"], 0);
         assert_eq!(health["shutdown_complete"], false);
@@ -14501,9 +14644,20 @@ mod tests {
             record["shutdown_complete"] == true && record["writes_succeeded"] == 2
         })
         .await;
+        assert_eq!(final_health["comparison_attempts"], 3);
+        assert_eq!(final_health["comparison_ready_for_enqueue"], 3);
         assert_eq!(final_health["enqueue_attempts"], 3);
         assert_eq!(final_health["queue_full_drops"], 1);
         assert_eq!(final_health["writes_failed"], 0);
+        let rows = read_jsonl_rows(&sidecar_path);
+        let writer_instance_id = final_health["writer_instance_id"]
+            .as_str()
+            .expect("writer instance id");
+        assert!(
+            rows.iter()
+                .all(|row| row["writer_instance_id"].as_str() == Some(writer_instance_id)),
+            "every comparison row must bind to the durable writer-health instance"
+        );
         drop(engine);
     }
 

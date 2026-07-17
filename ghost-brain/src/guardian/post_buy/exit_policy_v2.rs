@@ -21,7 +21,7 @@ use super::trajectory_v1::{TrajectoryFeaturesV1, TrajectoryQualityV1};
 
 pub(super) const HET_PM_V2_POLICY_ID: &str = "hierarchical_executable_trajectory_pm_v2";
 pub(super) const HET_PM_V2_POLICY_VERSION: u16 = 2;
-pub(super) const HET_PM_V2_SCHEMA_VERSION: u16 = 1;
+pub(super) const HET_PM_V2_SCHEMA_VERSION: u16 = 2;
 pub(super) const HET_PM_V2_SAMPLING_MODE: &str = "latest_canonical_state_per_monitor_tick";
 pub(super) const HET_PM_V2_TRAJECTORY_GRADE: &str = "online_non_lookahead_sampled_trajectory";
 pub(super) const HET_PM_V2_PUMP_ROUTE_ID: &str = "pump_curve";
@@ -1209,6 +1209,7 @@ pub(super) struct V1V2ComparisonRecord {
     pub(super) v1_policy_config_hash: String,
     pub(super) time_stop_v2_config_hash: String,
     pub(super) run_id: String,
+    pub(super) writer_instance_id: String,
     pub(super) lane: Lane,
     pub(super) position_id: String,
     pub(super) position_epoch: u64,
@@ -1261,6 +1262,7 @@ pub(super) struct HetComparisonCorrelationV1 {
     pub(super) comparison_id: String,
     pub(super) source_snapshot_id: String,
     pub(super) run_id: String,
+    pub(super) writer_instance_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1365,6 +1367,7 @@ impl PreparedV1V2ComparisonCoreV1 {
             comparison_id: record.comparison_id.clone(),
             source_snapshot_id: record.snapshot_id.clone(),
             run_id: record.run_id.clone(),
+            writer_instance_id: record.writer_instance_id.clone(),
         };
         match record.validate_core() {
             Ok(()) => Self::Ready(Box::new(record)),
@@ -1389,6 +1392,7 @@ impl PreparedV1V2ComparisonCoreV1 {
                     comparison_id: record.comparison_id.clone(),
                     source_snapshot_id: record.snapshot_id.clone(),
                     run_id: record.run_id.clone(),
+                    writer_instance_id: record.writer_instance_id.clone(),
                 };
                 record.terminal_tick =
                     matches!(receipt.exit_apply_status, V1ExitApplyStatusV1::Applied)
@@ -1449,6 +1453,7 @@ impl V1V2ComparisonRecord {
         }
         if self.comparison_id.is_empty()
             || self.run_id.is_empty()
+            || self.writer_instance_id.is_empty()
             || self.position_id.is_empty()
             || self.snapshot_id.is_empty()
             || self.remaining_quantity_raw == 0
@@ -1825,6 +1830,7 @@ mod tests {
             v1_policy_config_hash: "v1-hash".to_string(),
             time_stop_v2_config_hash: "time-stop-hash".to_string(),
             run_id: "run".to_string(),
+            writer_instance_id: "writer".to_string(),
             lane: Lane::Shadow,
             position_id: "position".to_string(),
             position_epoch: 1,

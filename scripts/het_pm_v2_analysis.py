@@ -4,7 +4,8 @@
 The tool consumes comparison JSONL plus an independent writer-health artifact.
 It never edits runtime artifacts and never promotes V2. Its position denominator
 is the immutable `(position_id, position_epoch)` identity, while writer capture
-uses durable enqueue-attempt counters rather than surviving rows alone.
+uses durable producer-attempt and enqueue-attempt counters rather than surviving
+rows alone.
 """
 
 from __future__ import annotations
@@ -19,14 +20,14 @@ from pathlib import Path
 from typing import Any, Iterable
 
 TOOL_ID = "het_pm_v2_analysis_v1"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 POLICY_ID = "hierarchical_executable_trajectory_pm_v2"
 POLICY_VERSION = 2
 V1_POLICY_ID = "position_manager_lite_exit_policy_v1"
 V1_POLICY_VERSION = 1
 SAMPLING_MODE = "latest_canonical_state_per_monitor_tick"
 TRAJECTORY_GRADE = "online_non_lookahead_sampled_trajectory"
-WRITER_HEALTH_SCHEMA_VERSION = 1
+WRITER_HEALTH_SCHEMA_VERSION = 2
 WRITER_HEALTH_ARTIFACT_TYPE = "het_pm_v2_writer_health"
 COLLAPSED_CANONICAL_UPDATES = 1 << 3
 SAME_SLOT_ONLY = 1 << 4
@@ -89,6 +90,12 @@ QUOTE_FAILURE_KINDS = {
     "QuantityMismatch", "ZeroOutput", "SemanticViolation", "InternalFailure",
 }
 WRITER_HEALTH_COUNTERS = (
+    "comparison_attempts",
+    "comparison_ready_for_enqueue",
+    "core_validation_skips",
+    "final_validation_skips",
+    "serialization_skips",
+    "payload_oversized_skips",
     "enqueue_attempts",
     "enqueued",
     "queue_full_drops",
@@ -311,6 +318,8 @@ def validate_record(record: dict[str, Any], source: str) -> None:
         raise ContractError(f"{source}: empty time_stop_v2_config_hash")
     if not require(record, "run_id", str):
         raise ContractError(f"{source}: empty run_id")
+    if not require(record, "writer_instance_id", str):
+        raise ContractError(f"{source}: empty writer_instance_id")
     if require(record, "lane", str) != "shadow":
         raise ContractError(f"{source}: lane must be shadow")
     if not require(record, "position_id", str):
@@ -489,6 +498,7 @@ def load_records(paths: Iterable[Path]) -> tuple[list[dict[str, Any]], list[dict
                 if not isinstance(record, dict):
                     raise ContractError(f"{path}:{line_number}: row is not an object")
                 validate_record(record, f"{path}:{line_number}")
+                record["_source_path"] = str(path)
                 records.append(record)
         input_records = records[input_start:]
         if not input_records:
@@ -547,6 +557,22 @@ def validate_writer_health(record: dict[str, Any], source: str) -> None:
     for name in WRITER_HEALTH_COUNTERS:
         if require(record, name, int) < 0:
             raise ContractError(f"{source}: negative writer-health counter: {name}")
+    comparison_attempts = record["comparison_attempts"]
+    local_outcomes = (
+        record["comparison_ready_for_enqueue"]
+        + record["core_validation_skips"]
+        + record["final_validation_skips"]
+        + record["serialization_skips"]
+        + record["payload_oversized_skips"]
+    )
+    if local_outcomes > comparison_attempts:
+        raise ContractError(
+            f"{source}: writer-health producer counters exceed comparison attempts"
+        )
+    if record["enqueue_attempts"] > record["comparison_ready_for_enqueue"]:
+        raise ContractError(
+            f"{source}: writer-health enqueue attempts exceed ready comparisons"
+        )
     attempts = record["enqueue_attempts"]
     enqueue_outcomes = (
         record["enqueued"]
@@ -597,6 +623,12 @@ def load_writer_health(
                 "shutdown_complete": record["shutdown_complete"],
                 "snapshot_generated_at_ms": record["snapshot_generated_at_ms"],
                 "revision": record["revision"],
+                "comparison_attempts": record["comparison_attempts"],
+                "comparison_ready_for_enqueue": record["comparison_ready_for_enqueue"],
+                "core_validation_skips": record["core_validation_skips"],
+                "final_validation_skips": record["final_validation_skips"],
+                "serialization_skips": record["serialization_skips"],
+                "payload_oversized_skips": record["payload_oversized_skips"],
                 "enqueue_attempts": record["enqueue_attempts"],
                 "writes_succeeded": record["writes_succeeded"],
                 "queue_full_drops": record["queue_full_drops"],
@@ -642,8 +674,19 @@ def quantile(values: list[int], q: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
+def comparable_path(value: str) -> str:
+    path = Path(value)
+    try:
+        if path.exists():
+            return str(path.resolve())
+    except OSError:
+        pass
+    return value
+
+
 def summarize_writer_health(
     records: list[dict[str, Any]],
+    inputs: list[dict[str, Any]],
     writer_health_records: list[dict[str, Any]] | None,
 ) -> dict[str, Any]:
     if not writer_health_records:
@@ -655,6 +698,16 @@ def summarize_writer_health(
             "counter_consistency": False,
             "all_writers_shutdown_cleanly": False,
             "sidecar_record_count_match": False,
+            "sidecar_file_identity_match": False,
+            "per_writer_identity_match": False,
+            "producer_denominator_consistency": False,
+            "ready_enqueue_consistency": False,
+            "comparison_attempts": None,
+            "comparison_ready_for_enqueue": None,
+            "core_validation_skip_count": None,
+            "final_validation_skip_count": None,
+            "serialization_skip_count": None,
+            "payload_oversized_skip_count": None,
             "enqueue_attempts": None,
             "enqueued": None,
             "successfully_written": None,
@@ -664,6 +717,9 @@ def summarize_writer_health(
             "cancelled_before_write_count": None,
             "pending_or_inflight_count": None,
             "capture_ratio": None,
+            "producer_validity_ratio": None,
+            "writer_capture_ratio": None,
+            "end_to_end_capture_ratio": None,
             "drop_ratio": None,
             "io_failure_ratio": None,
             "terminal_timeout_count": None,
@@ -675,42 +731,112 @@ def summarize_writer_health(
         name: sum(record[name] for record in writer_health_records)
         for name in WRITER_HEALTH_COUNTERS
     }
-    record_run_ids = {record["run_id"] for record in records}
-    health_run_ids = {record["run_id"] for record in writer_health_records}
-    record_hashes = {record["policy_config_hash"] for record in records}
-    health_hashes = {record["policy_config_hash"] for record in writer_health_records}
-    run_identity_match = record_run_ids == health_run_ids
-    config_identity_match = record_hashes == health_hashes
+    row_groups: Counter[tuple[str, str, str]] = Counter()
+    row_group_sources: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+    for record in records:
+        key = (
+            record["writer_instance_id"],
+            record["run_id"],
+            record["policy_config_hash"],
+        )
+        row_groups[key] += 1
+        if "_source_path" in record:
+            row_group_sources[key].add(comparable_path(record["_source_path"]))
+
+    health_by_writer = {
+        record["writer_instance_id"]: record for record in writer_health_records
+    }
+    run_identity_match = True
+    config_identity_match = True
+    sidecar_record_count_match = True
+    sidecar_file_identity_match = True
+    per_writer_identity_match = True
+    for key, row_count in row_groups.items():
+        writer_instance_id, run_id, policy_config_hash = key
+        health = health_by_writer.get(writer_instance_id)
+        if health is None:
+            per_writer_identity_match = False
+            sidecar_record_count_match = False
+            continue
+        if health["run_id"] != run_id:
+            run_identity_match = False
+            per_writer_identity_match = False
+        if health["policy_config_hash"] != policy_config_hash:
+            config_identity_match = False
+            per_writer_identity_match = False
+        if health["writes_succeeded"] != row_count:
+            sidecar_record_count_match = False
+        source_paths = row_group_sources.get(key, set())
+        if source_paths:
+            health_sidecar = comparable_path(health["sidecar_path"])
+            if source_paths != {health_sidecar}:
+                sidecar_file_identity_match = False
+                per_writer_identity_match = False
+
+    row_writer_ids = {key[0] for key in row_groups}
+    for health in writer_health_records:
+        key = (
+            health["writer_instance_id"],
+            health["run_id"],
+            health["policy_config_hash"],
+        )
+        if key not in row_groups:
+            per_writer_identity_match = False
+            sidecar_record_count_match = False
+        if health["writer_instance_id"] not in row_writer_ids:
+            per_writer_identity_match = False
+
     enqueue_outcomes = (
         totals["enqueued"]
         + totals["queue_full_drops"]
         + totals["queue_closed_drops"]
+    )
+    producer_outcomes = (
+        totals["comparison_ready_for_enqueue"]
+        + totals["core_validation_skips"]
+        + totals["final_validation_skips"]
+        + totals["serialization_skips"]
+        + totals["payload_oversized_skips"]
     )
     completed = (
         totals["writes_succeeded"]
         + totals["writes_failed"]
         + totals["cancelled_before_write"]
     )
+    producer_denominator_consistency = producer_outcomes == totals["comparison_attempts"]
+    ready_enqueue_consistency = (
+        totals["comparison_ready_for_enqueue"] == totals["enqueue_attempts"]
+    )
     counter_consistency = (
-        enqueue_outcomes == totals["enqueue_attempts"]
+        producer_denominator_consistency
+        and ready_enqueue_consistency
+        and enqueue_outcomes == totals["enqueue_attempts"]
         and completed <= totals["enqueued"]
     )
     all_writers_shutdown_cleanly = all(
         record["shutdown_complete"] for record in writer_health_records
     )
     pending_or_inflight = max(0, totals["enqueued"] - completed)
-    sidecar_record_count_match = totals["writes_succeeded"] == len(records)
     coverage_unknown = not (
         run_identity_match
         and config_identity_match
+        and per_writer_identity_match
+        and sidecar_file_identity_match
         and counter_consistency
         and all_writers_shutdown_cleanly
         and pending_or_inflight == 0
         and sidecar_record_count_match
     )
+    local_skips = (
+        totals["core_validation_skips"]
+        + totals["final_validation_skips"]
+        + totals["serialization_skips"]
+        + totals["payload_oversized_skips"]
+    )
     dropped = totals["queue_full_drops"] + totals["queue_closed_drops"]
     observation_loss = (
-        dropped
+        local_skips
+        + dropped
         + totals["writes_failed"]
         + totals["cancelled_before_write"]
         + totals["terminal_outcome_unknown"]
@@ -729,6 +855,16 @@ def summarize_writer_health(
         "counter_consistency": counter_consistency,
         "all_writers_shutdown_cleanly": all_writers_shutdown_cleanly,
         "sidecar_record_count_match": sidecar_record_count_match,
+        "sidecar_file_identity_match": sidecar_file_identity_match,
+        "per_writer_identity_match": per_writer_identity_match,
+        "producer_denominator_consistency": producer_denominator_consistency,
+        "ready_enqueue_consistency": ready_enqueue_consistency,
+        "comparison_attempts": totals["comparison_attempts"],
+        "comparison_ready_for_enqueue": totals["comparison_ready_for_enqueue"],
+        "core_validation_skip_count": totals["core_validation_skips"],
+        "final_validation_skip_count": totals["final_validation_skips"],
+        "serialization_skip_count": totals["serialization_skips"],
+        "payload_oversized_skip_count": totals["payload_oversized_skips"],
         "enqueue_attempts": totals["enqueue_attempts"],
         "enqueued": totals["enqueued"],
         "successfully_written": totals["writes_succeeded"],
@@ -737,7 +873,14 @@ def summarize_writer_health(
         "io_failure_count": totals["writes_failed"],
         "cancelled_before_write_count": totals["cancelled_before_write"],
         "pending_or_inflight_count": pending_or_inflight,
-        "capture_ratio": ratio(totals["writes_succeeded"], totals["enqueue_attempts"]),
+        "capture_ratio": ratio(totals["writes_succeeded"], totals["comparison_attempts"]),
+        "producer_validity_ratio": ratio(
+            totals["comparison_ready_for_enqueue"], totals["comparison_attempts"]
+        ),
+        "writer_capture_ratio": ratio(totals["writes_succeeded"], totals["enqueue_attempts"]),
+        "end_to_end_capture_ratio": ratio(
+            totals["writes_succeeded"], totals["comparison_attempts"]
+        ),
         "drop_ratio": ratio(dropped, totals["enqueue_attempts"]),
         "io_failure_ratio": ratio(totals["writes_failed"], totals["enqueue_attempts"]),
         "terminal_timeout_count": totals["terminal_timeouts"],
@@ -837,13 +980,16 @@ def analyze(
     duplicate_actions = sum(bool(record.get("duplicate_action_observed")) for record in records)
     duplicate_terminals = sum(max(0, count - 1) for count in terminal_seen.values())
 
-    writer_health = summarize_writer_health(records, writer_health_records)
+    writer_health = summarize_writer_health(records, inputs, writer_health_records)
     evidence_contract = evidence_contract_manifest(records[0])
     evidence_contract["writer_health"] = {
         "schema_version": WRITER_HEALTH_SCHEMA_VERSION,
         "artifact_type": WRITER_HEALTH_ARTIFACT_TYPE,
         "required": True,
+        "producer_denominator_boundary": "before_core_final_serialization_validation",
+        "join_key": "writer_instance_id+run_id+policy_config_hash",
         "complete_coverage_requires_clean_shutdown": True,
+        "complete_coverage_requires_per_writer_row_count_match": True,
         "promotion_requires_zero_observation_loss": True,
     }
 
