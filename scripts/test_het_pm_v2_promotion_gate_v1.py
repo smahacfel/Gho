@@ -296,15 +296,36 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         for field in (
             "expected_runtime_commit_sha",
             "expected_release_binary_sha256",
+            "expected_cargo_lock_sha256",
+            "expected_rust_toolchain_sha256",
+            "expected_cargo_config_sha256",
+            "expected_rustc_verbose_sha256",
+            "expected_cargo_version_sha256",
+            "expected_native_target_cfg_sha256",
             "expected_brain_config_content_hash",
             "expected_normalized_behavioral_config_hash",
             "expected_promotion_tool_hash",
             "expected_pr_a_analyzer_hash",
         ):
             template[field] = "unlocked"
+        template["expected_release_build_command"] = ["unlocked"]
+        template["expected_release_clean_command"] = ["unlocked"]
         template["allowed_exact_run_config_hashes"] = {}
         gate.validate_criteria(template)
         return template
+
+    def runtime_build_contract(self) -> dict:
+        return {
+            "cargo_lock_sha256": "1" * 64,
+            "rust_toolchain_sha256": "2" * 64,
+            "cargo_config_sha256": "3" * 64,
+            "rustc_verbose_sha256": "4" * 64,
+            "cargo_version_sha256": "5" * 64,
+            "native_target_cfg_sha256": "6" * 64,
+            "build_command": list(gate.RELEASE_BUILD_COMMAND),
+            "clean_command": list(gate.RELEASE_CLEAN_COMMAND),
+            "worktree_clean": True,
+        }
 
     def write_lock_inputs(self, root: Path) -> tuple[Path, Path, Path, Path]:
         brain = root / "brain.toml"
@@ -336,6 +357,9 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         )
         return result.stdout.strip()
 
+    def current_runtime_commit(self) -> str:
+        return self.git(ROOT, "rev-parse", "HEAD")
+
     def test_golden_pass_fixture_sets_root_true(self) -> None:
         gates = self.evaluate()
         self.assertTrue(all(result["passed"] for result in gates.values()))
@@ -346,14 +370,28 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         production = json.loads(CRITERIA_PATH.read_text(encoding="utf-8"))
         self.assertEqual(production["policy_version"], 2)
         self.assertEqual(production["comparison_schema_version"], 3)
-        self.assertEqual(production["contract_state"], "locked")
-        self.assertEqual(
-            gate.canonicalize_runtime_commit_sha(
+        self.assertIn(production["contract_state"], {"calibration_pending", "locked"})
+        if production["contract_state"] == "locked":
+            self.assertEqual(
+                gate.canonicalize_runtime_commit_sha(
+                    production["expected_runtime_commit_sha"],
+                    ROOT,
+                ),
                 production["expected_runtime_commit_sha"],
-                ROOT,
-            ),
-            production["expected_runtime_commit_sha"],
-        )
+            )
+            self.assertEqual(
+                production["expected_release_build_command"],
+                list(gate.RELEASE_BUILD_COMMAND),
+            )
+            self.assertEqual(
+                production["expected_release_clean_command"],
+                list(gate.RELEASE_CLEAN_COMMAND),
+            )
+            self.assertTrue(production["require_clean_runtime_build_worktree"])
+        else:
+            self.assertEqual(production["expected_runtime_commit_sha"], "unlocked")
+            self.assertEqual(production["expected_release_build_command"], ["unlocked"])
+            self.assertEqual(production["expected_release_clean_command"], ["unlocked"])
         for gate_key, prefix in (("executable_trailing", "executable_trailing"), ("vitality_decay", "vitality")):
             thresholds = production["gate_specific_thresholds"][gate_key]["thresholds"]
             self.assertGreaterEqual(thresholds[f"{prefix}_candidate_positions_min"], 100)
@@ -366,13 +404,14 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             brain, first, second, binary = self.write_lock_inputs(root)
-            runtime_commit = self.criteria["expected_runtime_commit_sha"]
+            runtime_commit = self.current_runtime_commit()
             locked = gate.lock_criteria_template(
                 criteria_template=self.criteria_template(),
                 runtime_commit_sha=runtime_commit,
                 release_binary=binary,
                 brain_config=brain,
                 run_configs={"validation-v1a": first, "validation-v1b": second},
+                runtime_build_contract=self.runtime_build_contract(),
                 repo_root=ROOT,
             )
             self.assertEqual(locked["contract_state"], "locked")
@@ -386,6 +425,19 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                 locked["allowed_exact_run_config_hashes"]["validation-v1b"],
             )
             self.assertNotEqual(locked["expected_normalized_behavioral_config_hash"], "unlocked")
+            self.assertEqual(
+                locked["expected_cargo_lock_sha256"],
+                self.runtime_build_contract()["cargo_lock_sha256"],
+            )
+            self.assertEqual(
+                locked["expected_release_build_command"],
+                list(gate.RELEASE_BUILD_COMMAND),
+            )
+            self.assertEqual(
+                locked["expected_release_clean_command"],
+                list(gate.RELEASE_CLEAN_COMMAND),
+            )
+            self.assertTrue(locked["require_clean_runtime_build_worktree"])
 
             second.write_text(
                 second.read_text(encoding="utf-8").replace("max_probes_per_run = 100", "max_probes_per_run = 101"),
@@ -398,6 +450,41 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                     release_binary=binary,
                     brain_config=brain,
                     run_configs={"validation-v1a": first, "validation-v1b": second},
+                    runtime_build_contract=self.runtime_build_contract(),
+                    repo_root=ROOT,
+                )
+
+    def test_criteria_lock_rejects_dirty_runtime_build_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain, first, second, binary = self.write_lock_inputs(root)
+            dirty = self.runtime_build_contract()
+            dirty["worktree_clean"] = False
+            with self.assertRaisesRegex(gate.ContractError, "worktree must be clean"):
+                gate.lock_criteria_template(
+                    criteria_template=self.criteria_template(),
+                    runtime_commit_sha=self.current_runtime_commit(),
+                    release_binary=binary,
+                    brain_config=brain,
+                    run_configs={"validation-v1a": first, "validation-v1b": second},
+                    runtime_build_contract=dirty,
+                    repo_root=ROOT,
+                )
+
+    def test_criteria_lock_rejects_unlocked_release_build_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain, first, second, binary = self.write_lock_inputs(root)
+            contract = self.runtime_build_contract()
+            contract["build_command"] = ["cargo", "build", "--release"]
+            with self.assertRaisesRegex(gate.ContractError, "frozen locked release command"):
+                gate.lock_criteria_template(
+                    criteria_template=self.criteria_template(),
+                    runtime_commit_sha=self.current_runtime_commit(),
+                    release_binary=binary,
+                    brain_config=brain,
+                    run_configs={"validation-v1a": first, "validation-v1b": second},
+                    runtime_build_contract=contract,
                     repo_root=ROOT,
                 )
 
@@ -412,6 +499,7 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                     release_binary=binary,
                     brain_config=brain,
                     run_configs={"validation-v1a": first, "validation-v1b": second},
+                    runtime_build_contract=self.runtime_build_contract(),
                     repo_root=ROOT,
                 )
 
@@ -419,13 +507,14 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             brain, first, second, binary = self.write_lock_inputs(root)
-            runtime_commit = self.criteria["expected_runtime_commit_sha"]
+            runtime_commit = self.current_runtime_commit()
             locked = gate.lock_criteria_template(
                 criteria_template=self.criteria_template(),
                 runtime_commit_sha=runtime_commit[:12],
                 release_binary=binary,
                 brain_config=brain,
                 run_configs={"validation-v1a": first, "validation-v1b": second},
+                runtime_build_contract=self.runtime_build_contract(),
                 repo_root=ROOT,
             )
             self.assertEqual(locked["expected_runtime_commit_sha"], runtime_commit)
@@ -449,6 +538,7 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                     release_binary=binary,
                     brain_config=brain,
                     run_configs={"validation-v1a": first, "validation-v1b": second},
+                    runtime_build_contract=self.runtime_build_contract(),
                     repo_root=repo,
                 )
 

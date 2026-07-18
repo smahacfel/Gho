@@ -1473,6 +1473,15 @@ Missing lub niespełniony minimalny count oznacza FAIL.
 
 - identyczne input artifacts + criteria + tool version -> bitowo identyczny promotion artifact;
 - każdy input ma content hash;
+- prospective runtime binary jest budowana wyłącznie z clean detached worktree
+  na zamrożonym commicie przez ograniczony package clean
+  `cargo clean -p ghost-brain -p ghost-launcher`, a następnie
+  `cargo build --release --locked -p ghost-launcher`;
+- tracked `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`, pełny `rustc`,
+  `cargo` oraz effective native target cfg mają osobne hashe w criteria i launcher proof;
+- brak zgodności któregokolwiek build identity albo dirty worktree przed/po buildzie -> FAIL;
+- canonical binary SHA musi zostać odtworzone przez dwa niezależne clean buildy
+  przed pierwszym prospective runem;
 - brak inputu lub hash mismatch -> FAIL;
 - unsupported schema -> FAIL;
 - missing gate/column/threshold -> FAIL;
@@ -1816,6 +1825,8 @@ Nie wolno utrzymywać V1 i V2 jako równoległych apply owners „na okres migra
 
 - [ ] istnieje committed, validated `het_pm_v2_promotion_gate_v1.json`;
 - [ ] istnieje committed, hashed promotion criteria file;
+- [ ] criteria i oba launcher proofs mają identyczny tracked lockfile/toolchain/build/native-target contract;
+- [ ] release binary SHA zostało odtworzone przez dwa niezależne clean locked buildy;
 - [ ] `promotion_gate_passed = true` wynika deterministycznie z wszystkich gate'ów;
 - [ ] każdy gate posiada jawne observed values i thresholds;
 - [ ] brak ręcznej interpretacji acceptance;

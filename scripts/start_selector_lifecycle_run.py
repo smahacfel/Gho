@@ -35,6 +35,22 @@ INCONCLUSIVE_ENV_OR_CONFIG = "INCONCLUSIVE_ENV_OR_CONFIG"
 RUN_STATE_RUNNING = "RUN_LEFT_RUNNING_AFTER_LIFECYCLE_PROOF"
 RUN_STATE_EVENT_ONLY = "RUN_LEFT_RUNNING_AFTER_EVENT_CANARY_ZERO_BUY_LIFECYCLE_ALLOWED"
 RUN_STATE_KILLED = "RUN_KILLED_AFTER_FAILED_CANARY"
+RELEASE_CLEAN_COMMAND = [
+    "cargo",
+    "clean",
+    "-p",
+    "ghost-brain",
+    "-p",
+    "ghost-launcher",
+]
+RELEASE_BUILD_COMMAND = [
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "-p",
+    "ghost-launcher",
+]
 
 
 def utc_timestamp() -> str:
@@ -98,21 +114,95 @@ def sha256_file(path: Path) -> str | None:
     return digest.hexdigest()
 
 
+def command_stdout(command: list[str], *, cwd: Path) -> str | None:
+    proc = subprocess.run(
+        command,
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def sha256_command_stdout(command: list[str], *, cwd: Path) -> str | None:
+    value = command_stdout(command, cwd=cwd)
+    if value is None:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def git_worktree_is_clean(root: Path) -> bool:
+    status = command_stdout(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=root,
+    )
+    return status == ""
+
+
+def tracked_file_sha256(root: Path, relative_path: Path) -> str | None:
+    tracked = command_stdout(
+        ["git", "ls-files", "--error-unmatch", str(relative_path)],
+        cwd=root,
+    )
+    if not tracked:
+        return None
+    return sha256_file(root / relative_path)
+
+
 def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path) -> dict[str, Any]:
+    worktree_clean_before_build = git_worktree_is_clean(root)
+    cargo_lock_sha256 = tracked_file_sha256(root, Path("Cargo.lock"))
+    rust_toolchain_sha256 = tracked_file_sha256(root, Path("rust-toolchain.toml"))
+    cargo_config_sha256 = tracked_file_sha256(root, Path(".cargo/config.toml"))
+    rustc_verbose_sha256 = sha256_command_stdout(["rustc", "-vV"], cwd=root)
+    cargo_version_sha256 = sha256_command_stdout(["cargo", "-V"], cwd=root)
+    native_target_cfg_sha256 = sha256_command_stdout(
+        ["rustc", "--print", "cfg", "-C", "target-cpu=native"],
+        cwd=root,
+    )
     started_at = datetime.now(timezone.utc)
+    clean_result = run_command(
+        RELEASE_CLEAN_COMMAND,
+        cwd=root,
+        log_path=output_dir / "commands" / "cargo_clean_release_provenance_packages.log",
+    )
     result = run_command(
-        ["cargo", "build", "--release", "-p", "ghost-launcher"],
+        RELEASE_BUILD_COMMAND,
         cwd=root,
         log_path=output_dir / "commands" / "cargo_build_release_ghost_launcher.log",
     )
     finished_at = datetime.now(timezone.utc)
+    worktree_clean_after_build = git_worktree_is_clean(root)
     # Cargo may legitimately no-op when the release binary is already up to date.
     # The freshness contract is that this launcher ran Cargo successfully before
     # start and the expected release binary exists; binary_mtime is provenance,
     # not a rebuild-required gate.
-    build_fresh = result["exit_code"] == 0 and launcher.exists()
+    build_fresh = (
+        clean_result["exit_code"] == 0
+        and result["exit_code"] == 0
+        and launcher.exists()
+        and worktree_clean_before_build
+        and worktree_clean_after_build
+        and all(
+            value is not None
+            for value in (
+                cargo_lock_sha256,
+                rust_toolchain_sha256,
+                cargo_config_sha256,
+                rustc_verbose_sha256,
+                cargo_version_sha256,
+                native_target_cfg_sha256,
+            )
+        )
+    )
     return {
         "status": PASS_STATUS if build_fresh else INCONCLUSIVE_ENV_OR_CONFIG,
+        "clean_command": clean_result["command"],
+        "clean_exit_code": clean_result["exit_code"],
+        "clean_log_path": clean_result["log_path"],
         "command": result["command"],
         "exit_code": result["exit_code"],
         "log_path": result["log_path"],
@@ -121,6 +211,14 @@ def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path)
         "runtime_binary": str(launcher),
         "binary_exists": launcher.exists(),
         "release_binary_sha256": sha256_file(launcher),
+        "cargo_lock_sha256": cargo_lock_sha256,
+        "rust_toolchain_sha256": rust_toolchain_sha256,
+        "cargo_config_sha256": cargo_config_sha256,
+        "rustc_verbose_sha256": rustc_verbose_sha256,
+        "cargo_version_sha256": cargo_version_sha256,
+        "native_target_cfg_sha256": native_target_cfg_sha256,
+        "worktree_clean_before_build": worktree_clean_before_build,
+        "worktree_clean_after_build": worktree_clean_after_build,
         "binary_mtime_utc": mtime_utc(launcher),
         "git_head_at_build": git_head(root),
         "build_freshness_status": PASS_STATUS if build_fresh else "FAIL_STALE_OR_MISSING_BINARY",

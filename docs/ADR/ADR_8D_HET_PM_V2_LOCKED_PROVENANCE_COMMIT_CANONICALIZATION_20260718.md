@@ -4,7 +4,10 @@ Data: 2026-07-18
 
 Typ: ADR-8D / PR #73 promotion-evidence prerequisite / locked provenance
 
-Status: Accepted
+Status: Superseded in binary-build provenance scope by
+`ADR_8D_HET_PM_V2_REPRODUCIBLE_RELEASE_PROVENANCE_20260718.md`. Canonicalizacja
+Git SHA pozostaje obowiązująca, lecz opisany poniżej binary SHA został wycofany
+przed uruchomieniem prospective validation.
 
 ## D1. Problem
 

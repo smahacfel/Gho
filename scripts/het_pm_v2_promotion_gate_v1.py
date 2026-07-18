@@ -35,11 +35,27 @@ from typing import Any, Iterable
 
 
 TOOL_ID = "het_pm_v2_promotion_gate_v1"
-TOOL_VERSION = 3
-PROMOTION_SCHEMA_VERSION = 3
-RUN_MANIFEST_SCHEMA_VERSION = 3
+TOOL_VERSION = 4
+PROMOTION_SCHEMA_VERSION = 4
+RUN_MANIFEST_SCHEMA_VERSION = 4
 RUN_MANIFEST_TYPE = "het_pm_v2_run_input_manifest"
-CRITERIA_VERSION = 3
+CRITERIA_VERSION = 4
+RELEASE_CLEAN_COMMAND = (
+    "cargo",
+    "clean",
+    "-p",
+    "ghost-brain",
+    "-p",
+    "ghost-launcher",
+)
+RELEASE_BUILD_COMMAND = (
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "-p",
+    "ghost-launcher",
+)
 REQUIRED_ARTIFACT_CLASSES = (
     "brain_config",
     "run_config",
@@ -145,6 +161,147 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def command_stdout(command: list[str], *, cwd: Path, label: str) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError as error:
+        raise ContractError(f"cannot inspect {label}: {error}") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ContractError(
+            f"cannot inspect {label}"
+            + (f": {detail}" if detail else "")
+        )
+    return result.stdout.strip()
+
+
+def git_worktree_is_clean(repo_root: Path) -> bool:
+    return not command_stdout(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repo_root,
+        label="runtime worktree status",
+    )
+
+
+def validate_runtime_build_contract(contract: dict[str, Any]) -> None:
+    for field in (
+        "cargo_lock_sha256",
+        "rust_toolchain_sha256",
+        "cargo_config_sha256",
+        "rustc_verbose_sha256",
+        "cargo_version_sha256",
+        "native_target_cfg_sha256",
+    ):
+        value = require(contract, field, str)
+        if not re.fullmatch(r"[0-9a-f]{64}", value) or set(value) == {"0"}:
+            raise ContractError(f"invalid runtime build contract digest: {field}")
+    command = require(contract, "build_command", list)
+    if command != list(RELEASE_BUILD_COMMAND):
+        raise ContractError("runtime build command is not the frozen locked release command")
+    clean_command = require(contract, "clean_command", list)
+    if clean_command != list(RELEASE_CLEAN_COMMAND):
+        raise ContractError("runtime clean command is not the frozen provenance rebuild command")
+    if require(contract, "worktree_clean", bool) is not True:
+        raise ContractError("runtime build worktree must be clean")
+
+
+def inspect_runtime_build_contract(runtime_source_root: Path) -> dict[str, Any]:
+    runtime_source_root = runtime_source_root.resolve()
+    required_files = {
+        "cargo_lock_sha256": runtime_source_root / "Cargo.lock",
+        "rust_toolchain_sha256": runtime_source_root / "rust-toolchain.toml",
+        "cargo_config_sha256": runtime_source_root / ".cargo" / "config.toml",
+    }
+    for field, path in required_files.items():
+        if not path.is_file():
+            raise ContractError(f"runtime build contract file missing: {path}")
+        tracked = command_stdout(
+            ["git", "ls-files", "--error-unmatch", str(path.relative_to(runtime_source_root))],
+            cwd=runtime_source_root,
+            label=f"tracked {field}",
+        )
+        if not tracked:
+            raise ContractError(f"runtime build contract file is not tracked: {path}")
+    contract = {
+        field: sha256(path)
+        for field, path in required_files.items()
+    }
+    contract.update({
+        "rustc_verbose_sha256": hash_bytes(
+            command_stdout(
+                ["rustc", "-vV"],
+                cwd=runtime_source_root,
+                label="rustc identity",
+            ).encode("utf-8")
+        ),
+        "cargo_version_sha256": hash_bytes(
+            command_stdout(
+                ["cargo", "-V"],
+                cwd=runtime_source_root,
+                label="cargo identity",
+            ).encode("utf-8")
+        ),
+        "native_target_cfg_sha256": hash_bytes(
+            command_stdout(
+                ["rustc", "--print", "cfg", "-C", "target-cpu=native"],
+                cwd=runtime_source_root,
+                label="native target cfg",
+            ).encode("utf-8")
+        ),
+        "build_command": list(RELEASE_BUILD_COMMAND),
+        "clean_command": list(RELEASE_CLEAN_COMMAND),
+        "worktree_clean": git_worktree_is_clean(runtime_source_root),
+    })
+    validate_runtime_build_contract(contract)
+    return contract
+
+
+def materialize_runtime_release_build(
+    *,
+    runtime_source_root: Path,
+    runtime_commit_sha: str,
+    release_binary: Path,
+) -> dict[str, Any]:
+    runtime_source_root = runtime_source_root.resolve()
+    actual_head = command_stdout(
+        ["git", "rev-parse", "HEAD"],
+        cwd=runtime_source_root,
+        label="runtime source HEAD",
+    ).lower()
+    if actual_head != runtime_commit_sha:
+        raise ContractError("runtime source worktree HEAD does not match locked commit")
+    expected_binary = (runtime_source_root / "target" / "release" / "ghost-launcher").resolve()
+    if release_binary.resolve() != expected_binary:
+        raise ContractError("release binary must be the runtime worktree release artifact")
+    contract = inspect_runtime_build_contract(runtime_source_root)
+    try:
+        clean = subprocess.run(
+            list(RELEASE_CLEAN_COMMAND),
+            cwd=runtime_source_root,
+            check=False,
+        )
+        if clean.returncode != 0:
+            raise ContractError("canonical provenance package clean failed")
+        build = subprocess.run(
+            list(RELEASE_BUILD_COMMAND),
+            cwd=runtime_source_root,
+            check=False,
+        )
+    except OSError as error:
+        raise ContractError(f"cannot execute locked release build: {error}") from error
+    if build.returncode != 0 or not release_binary.is_file():
+        raise ContractError("locked release build failed or did not produce ghost-launcher")
+    if not git_worktree_is_clean(runtime_source_root):
+        raise ContractError("runtime worktree became dirty during release build")
+    return contract
 
 
 def mtime_utc(path: Path) -> str:
@@ -381,6 +538,7 @@ def lock_criteria_template(
     release_binary: Path,
     brain_config: Path,
     run_configs: dict[str, Path],
+    runtime_build_contract: dict[str, Any],
     repo_root: Path | None = None,
 ) -> dict[str, Any]:
     """Materialize the prospective two-run contract before either run starts.
@@ -404,6 +562,7 @@ def lock_criteria_template(
         raise ContractError(f"criteria lock brain config missing: {brain_config}")
     if len(run_configs) < 2 or any(not run_id or not path.is_file() for run_id, path in run_configs.items()):
         raise ContractError("criteria lock requires two existing, uniquely named run configs")
+    validate_runtime_build_contract(runtime_build_contract)
 
     normalized_hashes = {
         normalized_behavioral_config_hash(
@@ -422,6 +581,15 @@ def lock_criteria_template(
         "contract_state": "locked",
         "expected_runtime_commit_sha": canonical_runtime_commit,
         "expected_release_binary_sha256": sha256(release_binary),
+        "expected_cargo_lock_sha256": runtime_build_contract["cargo_lock_sha256"],
+        "expected_rust_toolchain_sha256": runtime_build_contract["rust_toolchain_sha256"],
+        "expected_cargo_config_sha256": runtime_build_contract["cargo_config_sha256"],
+        "expected_rustc_verbose_sha256": runtime_build_contract["rustc_verbose_sha256"],
+        "expected_cargo_version_sha256": runtime_build_contract["cargo_version_sha256"],
+        "expected_native_target_cfg_sha256": runtime_build_contract["native_target_cfg_sha256"],
+        "expected_release_build_command": runtime_build_contract["build_command"],
+        "expected_release_clean_command": runtime_build_contract["clean_command"],
+        "require_clean_runtime_build_worktree": runtime_build_contract["worktree_clean"],
         "expected_brain_config_content_hash": sha256(brain_config),
         "expected_normalized_behavioral_config_hash": normalized_hashes.pop(),
         "allowed_exact_run_config_hashes": {
@@ -460,6 +628,19 @@ def build_launcher_proof(
         raise ContractError("launcher proof release binary hash is invalid")
     build = require(report, "build_freshness", dict)
     build_started_at = require(build, "started_at_utc", str)
+    runtime_build_contract = {
+        "cargo_lock_sha256": require(build, "cargo_lock_sha256", str),
+        "rust_toolchain_sha256": require(build, "rust_toolchain_sha256", str),
+        "cargo_config_sha256": require(build, "cargo_config_sha256", str),
+        "rustc_verbose_sha256": require(build, "rustc_verbose_sha256", str),
+        "cargo_version_sha256": require(build, "cargo_version_sha256", str),
+        "native_target_cfg_sha256": require(build, "native_target_cfg_sha256", str),
+        "build_command": require(build, "command", list),
+        "clean_command": require(build, "clean_command", list),
+        "worktree_clean": require(build, "worktree_clean_before_build", bool)
+        and require(build, "worktree_clean_after_build", bool),
+    }
+    validate_runtime_build_contract(runtime_build_contract)
     runtime_started_at = require(report, "runtime_started_at_utc", str)
     runtime_health = scan_runtime_health(runtime_paths)
     shutdown_result = (
@@ -484,6 +665,15 @@ def build_launcher_proof(
         "run_role": args.run_role,
         "git_commit_sha": git_head_at_launch,
         "release_binary_sha256": release_binary_sha256,
+        "cargo_lock_sha256": runtime_build_contract["cargo_lock_sha256"],
+        "rust_toolchain_sha256": runtime_build_contract["rust_toolchain_sha256"],
+        "cargo_config_sha256": runtime_build_contract["cargo_config_sha256"],
+        "rustc_verbose_sha256": runtime_build_contract["rustc_verbose_sha256"],
+        "cargo_version_sha256": runtime_build_contract["cargo_version_sha256"],
+        "native_target_cfg_sha256": runtime_build_contract["native_target_cfg_sha256"],
+        "release_build_command": runtime_build_contract["build_command"],
+        "release_clean_command": runtime_build_contract["clean_command"],
+        "build_worktree_clean": runtime_build_contract["worktree_clean"],
         "run_config_sha256": artifacts["run_config"][0]["sha256"],
         "brain_config_sha256": artifacts["brain_config"][0]["sha256"],
         "normalized_behavioral_config_hash": normalized_behavioral_config_hash(
@@ -637,6 +827,12 @@ def validate_run_manifest_shape(manifest: dict[str, Any], source: Path) -> None:
         "run_role",
         "git_commit_sha",
         "release_binary_sha256",
+        "cargo_lock_sha256",
+        "rust_toolchain_sha256",
+        "cargo_config_sha256",
+        "rustc_verbose_sha256",
+        "cargo_version_sha256",
+        "native_target_cfg_sha256",
         "run_config_sha256",
         "brain_config_sha256",
         "normalized_behavioral_config_hash",
@@ -658,6 +854,12 @@ def validate_run_manifest_shape(manifest: dict[str, Any], source: Path) -> None:
         raise ContractError(f"launcher proof run config hash mismatch: {source}")
     if proof["brain_config_sha256"] != manifest["brain_config_content_hash"]:
         raise ContractError(f"launcher proof brain config hash mismatch: {source}")
+    if require(proof, "release_build_command", list) != list(RELEASE_BUILD_COMMAND):
+        raise ContractError(f"launcher proof release build command mismatch: {source}")
+    if require(proof, "release_clean_command", list) != list(RELEASE_CLEAN_COMMAND):
+        raise ContractError(f"launcher proof release clean command mismatch: {source}")
+    if require(proof, "build_worktree_clean", bool) is not True:
+        raise ContractError(f"launcher proof runtime build worktree is not clean: {source}")
     if not re.fullmatch(r"[0-9a-f]{64}", proof["normalized_behavioral_config_hash"]):
         raise ContractError(f"launcher proof normalized behavioural config hash invalid: {source}")
     if proof["shutdown_signal"] != "SIGINT" or proof["shutdown_result"] != "clean":
@@ -793,6 +995,12 @@ def validate_criteria(criteria: dict[str, Any]) -> None:
     frozen_fields = (
         "expected_runtime_commit_sha",
         "expected_release_binary_sha256",
+        "expected_cargo_lock_sha256",
+        "expected_rust_toolchain_sha256",
+        "expected_cargo_config_sha256",
+        "expected_rustc_verbose_sha256",
+        "expected_cargo_version_sha256",
+        "expected_native_target_cfg_sha256",
         "expected_brain_config_content_hash",
         "expected_normalized_behavioral_config_hash",
         "expected_promotion_tool_hash",
@@ -814,6 +1022,19 @@ def validate_criteria(criteria: dict[str, Any]) -> None:
         r"[0-9a-f]{40}", criteria["expected_runtime_commit_sha"]
     ):
         raise ContractError("locked criteria runtime commit must be a 40-character SHA")
+    build_command = require(criteria, "expected_release_build_command", list)
+    if contract_state == "locked" and build_command != list(RELEASE_BUILD_COMMAND):
+        raise ContractError("locked criteria release build command is not canonical")
+    if contract_state != "locked" and build_command != ["unlocked"]:
+        raise ContractError("pending criteria release build command must be unlocked")
+    clean_command = require(criteria, "expected_release_clean_command", list)
+    if contract_state == "locked" and clean_command != list(RELEASE_CLEAN_COMMAND):
+        raise ContractError("locked criteria release clean command is not canonical")
+    if contract_state != "locked" and clean_command != ["unlocked"]:
+        raise ContractError("pending criteria release clean command must be unlocked")
+    clean_build_required = require(criteria, "require_clean_runtime_build_worktree", bool)
+    if contract_state == "locked" and not clean_build_required:
+        raise ContractError("locked criteria must require a clean runtime build worktree")
     allowed_run_hashes = require(criteria, "allowed_exact_run_config_hashes", dict)
     for run_id, digest in allowed_run_hashes.items():
         if not isinstance(run_id, str) or not run_id or not isinstance(digest, str) or not re.fullmatch(
@@ -2009,10 +2230,24 @@ def evaluate(
         for proof_field, criteria_field in (
             ("git_commit_sha", "expected_runtime_commit_sha"),
             ("release_binary_sha256", "expected_release_binary_sha256"),
+            ("cargo_lock_sha256", "expected_cargo_lock_sha256"),
+            ("rust_toolchain_sha256", "expected_rust_toolchain_sha256"),
+            ("cargo_config_sha256", "expected_cargo_config_sha256"),
+            ("rustc_verbose_sha256", "expected_rustc_verbose_sha256"),
+            ("cargo_version_sha256", "expected_cargo_version_sha256"),
+            ("native_target_cfg_sha256", "expected_native_target_cfg_sha256"),
             ("normalized_behavioral_config_hash", "expected_normalized_behavioral_config_hash"),
         ):
             if launcher_proof[proof_field] != criteria[criteria_field]:
                 raise ContractError(f"validation runtime contract mismatch: {manifest_path}:{proof_field}")
+        if launcher_proof["release_build_command"] != criteria["expected_release_build_command"]:
+            raise ContractError(f"validation runtime build command mismatch: {manifest_path}")
+        if launcher_proof["release_clean_command"] != criteria["expected_release_clean_command"]:
+            raise ContractError(f"validation runtime clean command mismatch: {manifest_path}")
+        if launcher_proof["build_worktree_clean"] is not criteria[
+            "require_clean_runtime_build_worktree"
+        ]:
+            raise ContractError(f"validation runtime clean-build contract mismatch: {manifest_path}")
         dependency_hashes = manifest["analysis_dependency_hashes"]
         if dependency_hashes["promotion_tool"] != criteria["expected_promotion_tool_hash"]:
             raise ContractError(f"promotion tool hash mismatch: {manifest_path}")
@@ -2710,6 +2945,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     lock_parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     lock_parser.add_argument("--criteria-template", type=Path, required=True)
     lock_parser.add_argument("--runtime-commit-sha", required=True)
+    lock_parser.add_argument(
+        "--runtime-source-root",
+        type=Path,
+        required=True,
+        help="clean detached worktree at the reviewed runtime commit",
+    )
     lock_parser.add_argument("--release-binary", type=Path, required=True)
     lock_parser.add_argument("--brain-config", type=Path, required=True)
     lock_parser.add_argument(
@@ -2751,12 +2992,22 @@ def main(argv: list[str] | None = None) -> int:
                 if not separator or not run_id or not raw_path or run_id in run_configs:
                     raise ContractError("--run-config must be a unique RUN_ID=PATH mapping")
                 run_configs[run_id] = Path(raw_path)
+            canonical_runtime_commit = canonicalize_runtime_commit_sha(
+                args.runtime_commit_sha,
+                args.repo_root.resolve(),
+            )
+            runtime_build_contract = materialize_runtime_release_build(
+                runtime_source_root=args.runtime_source_root,
+                runtime_commit_sha=canonical_runtime_commit,
+                release_binary=args.release_binary,
+            )
             locked = lock_criteria_template(
                 criteria_template=read_json(args.criteria_template),
-                runtime_commit_sha=args.runtime_commit_sha,
+                runtime_commit_sha=canonical_runtime_commit,
                 release_binary=args.release_binary,
                 brain_config=args.brain_config,
                 run_configs=run_configs,
+                runtime_build_contract=runtime_build_contract,
                 repo_root=args.repo_root,
             )
             args.output.parent.mkdir(parents=True, exist_ok=True)
