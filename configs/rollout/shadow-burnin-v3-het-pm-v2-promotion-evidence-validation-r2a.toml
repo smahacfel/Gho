@@ -106,7 +106,7 @@ live_exit_stop_loss_pct = 0.60
 [trigger.shadow_run]
 enabled = true
 shadow_rpc_url = "https://spectrum-02.simplystaking.xyz/YnliYXR3cG4tYWRkMTBlODU/1Lo9F06L4a_tRg/solana/mn/900/shared/pruned/rpc/"
-payer_strategy = "ephemeral"
+payer_strategy = "configured"
 commitment = "processed"
 sig_verify = false
 replace_recent_blockhash = true

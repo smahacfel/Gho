@@ -4,8 +4,8 @@ Data: 2026-07-18
 
 Typ: ADR-8D / PR #73 promotion-evidence prerequisite / release provenance
 
-Status: Accepted and materialized; canonical criteria zostały zablokowane po
-dwóch zgodnych release buildach self-contained shadow payer contractu.
+Status: Accepted source amendment; criteria wróciły do `calibration_pending`
+po potwierdzeniu restore-guard contractu dla lifecycle-capable payera.
 
 ## D1. Problem
 
@@ -118,9 +118,10 @@ wcześniejszy artefakt z inną wartością embedded `GIT_WORKTREE_CLEAN`.
    runtime z jawnego `GHOST_WORKSPACE_ROOT`, następnie z położenia release
    binary, a ostatecznie z bieżącego katalogu. Zachowuje to dostęp do static i
    config files bez wprowadzania lokalnej ścieżki builda do ELF.
-9. Oba prospective shadow-only run configs używają
-   `payer_strategy="ephemeral"`. Nie wymagają zewnętrznego wallet secretu, a
-   wybór strategii pozostaje częścią exact i normalized config hash.
+9. Oba prospective lifecycle-capable shadow run configs zachowują
+   `payer_strategy="configured"`. Restore guard wymaga finansowanego,
+   chain-visible payera, a launcher preflight weryfikuje keypair i minimalne
+   saldo przed startem.
 10. Preflight pomija odczyt keypaira i balance probe wyłącznie dla
     `trigger.enabled + shadow_only + shadow_run.enabled + ephemeral`. Live,
     live-and-shadow oraz configured shadow payer zachowują dotychczasowy
@@ -235,13 +236,16 @@ validation-v1b exact config SHA-256 = 2715ff34ae8204b48c2c3e3a113217d227e379c016
 Oba worktree wykonały canonical release clean (`Removed 55 files, 431.8 MiB`)
 i przeszły boundary wymagającą nieobecności starej binarki przed buildem. ELF i
 criteria są identyczne bajtowo pomiędzy worktrees; lokalne source paths są
-nieobecne. Locked run configs jawnie kodują `payer_strategy="ephemeral"`.
+nieobecne. Ten lock został wycofany przed runtime, ponieważ restore lifecycle
+guard prawidłowo wymaga `configured` payera dla lifecycle-capable simulation.
 
 ## D8. Następne kroki
 
-1. Zacommitować canonical locked criteria i ostateczny proof.
-2. Wykonać fail-closed launcher dry-run z dokładnym `validation-v1a` configiem.
-3. Po pozytywnym dry-runie uruchomić `validation-v1a`, następnie niezależne
+1. Zacommitować configured-payer source contract i pending criteria.
+2. Zweryfikować paper-burnin keypair przez realny launcher preflight.
+3. Ponownie wykonać dwa canonical buildy i criteria lock.
+4. Wykonać fail-closed launcher dry-run z dokładnym `validation-v1a` configiem.
+5. Po pozytywnym dry-runie uruchomić `validation-v1a`, następnie niezależne
    `validation-v1b`, bez strojenia pomiędzy runami.
 5. Authority cutover pozostaje zabroniony do czasu source-recomputed
    `promotion_gate_passed=true`.
