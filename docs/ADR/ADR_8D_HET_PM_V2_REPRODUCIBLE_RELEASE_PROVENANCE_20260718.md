@@ -4,8 +4,8 @@ Data: 2026-07-18
 
 Typ: ADR-8D / PR #73 promotion-evidence prerequisite / release provenance
 
-Status: Accepted source amendment; criteria wróciły do `calibration_pending`
-po potwierdzeniu restore-guard contractu dla lifecycle-capable payera.
+Status: Accepted and materialized; canonical criteria zostały zablokowane po
+dwóch zgodnych release buildach lifecycle-capable configured-payer contractu.
 
 ## D1. Problem
 
@@ -239,13 +239,32 @@ criteria są identyczne bajtowo pomiędzy worktrees; lokalne source paths są
 nieobecne. Ten lock został wycofany przed runtime, ponieważ restore lifecycle
 guard prawidłowo wymaga `configured` payera dla lifecycle-capable simulation.
 
+Ostateczny lifecycle-capable configured-payer proof:
+
+```text
+runtime source commit = 095f9d2996d25cb408d0ff1f6e3faf53d65ae5c1
+clean build A SHA-256 = 89d2dbb58be7cc291d4316698ad13cb6fc83ba22c7ccfc0db370f87515a20f40
+clean build B SHA-256 = 89d2dbb58be7cc291d4316698ad13cb6fc83ba22c7ccfc0db370f87515a20f40
+canonical criteria SHA-256 = 604dfb2ce838b362dcf54f5144d67fd0dddb316174b0d02199e7bd46cd510b6a
+promotion tool SHA-256 = 18b25934a7849b81982ff79f67c3f0afe8b22cfeb6d0a3176f400d7489a59491
+PR-A analyzer SHA-256 = 5e26d19b10ea2613f0da9c4e532d60cc9a646ee000289befdd98f4f6f9e1faa0
+brain config SHA-256 = 7fc14662d1433872978dcb8d5be0413c7f7769905b6b84f36f6bc46f7e9a2028
+normalized behavioral config SHA-256 = bfa1a00497ab9b4babe4cc8198ade4d424e52ff70f38c882cfcee0939ef6ceac
+validation-v1a exact config SHA-256 = 3f82e27ae67b7afa443d58926de8c6901147bc9c1a788e778d1c91a90555ecbd
+validation-v1b exact config SHA-256 = 8121c4b4bd6a538639e6b42df14ffc51cff93a2537f88c85b4a421c1ca359e72
+```
+
+Oba worktree wykonały aktywny canonical clean (`Removed 55 files, 431.8 MiB`)
+i odtworzyły identyczne bajty ELF/criteria bez lokalnych source paths. Osobny
+realny preflight z paper-burnin keypairem potwierdził poprawny keypair, wymagane
+saldo oraz wszystkie endpoint checks bez typed failure. Nie użyto live walleta.
+
 ## D8. Następne kroki
 
-1. Zacommitować configured-payer source contract i pending criteria.
-2. Zweryfikować paper-burnin keypair przez realny launcher preflight.
-3. Ponownie wykonać dwa canonical buildy i criteria lock.
-4. Wykonać fail-closed launcher dry-run z dokładnym `validation-v1a` configiem.
-5. Po pozytywnym dry-runie uruchomić `validation-v1a`, następnie niezależne
+1. Zacommitować canonical locked criteria i ostateczny configured-payer proof.
+2. Wykonać fail-closed launcher dry-run z dokładnym `validation-v1a` configiem
+   i zweryfikowanym paper-burnin env.
+3. Po pozytywnym dry-runie uruchomić `validation-v1a`, następnie niezależne
    `validation-v1b`, bez strojenia pomiędzy runami.
 5. Authority cutover pozostaje zabroniony do czasu source-recomputed
    `promotion_gate_passed=true`.
