@@ -4,8 +4,8 @@ Data: 2026-07-18
 
 Typ: ADR-8D / PR #73 promotion-evidence prerequisite / release provenance
 
-Status: Accepted source amendment; criteria wróciły do `calibration_pending`
-po wykryciu mismatchu clean/build env i wymagają finalnego relocku.
+Status: Accepted and materialized; canonical criteria zostały zablokowane po
+dwóch zgodnych release buildach finalnego source commita.
 
 ## D1. Problem
 
@@ -173,18 +173,37 @@ normalized behavioral config SHA-256 = bfa1a00497ab9b4babe4cc8198ade4d424e52ff70
 criteria. `strings` nie znalazł lokalnej ścieżki żadnego detached worktree w
 odpowiadającej mu binarce.
 
-Ten wynik potwierdza usunięcie path entropy, ale nie jest finalnym prospective
+Ten wynik potwierdził usunięcie path entropy, ale nie był finalnym prospective
 lockiem: późniejszy audyt wykazał `Removed 0 files` przy clean uruchomionym bez
-canonical rustflags env. Criteria zostały świadomie cofnięte do pending, a
-finalny source commit musi zostać ponownie zbudowany i zablokowany.
+canonical rustflags env i profilu `--release`. Criteria zostały świadomie
+cofnięte do pending przed finalnym source amendmentem.
+
+Finalny materialized proof:
+
+```text
+runtime source commit = a620765d7fdf6bda8f015398e57fb359b25a692e
+clean build A SHA-256 = 5d5a79a7c4c63be3006edf6570414d3b968cfa9a0915da92563e95a083979220
+clean build B SHA-256 = 5d5a79a7c4c63be3006edf6570414d3b968cfa9a0915da92563e95a083979220
+canonical criteria SHA-256 = 6d6d5a153ca61a87eebef6af16fc621fc08b408769f607dcd38843afabe6ab7c
+promotion tool SHA-256 = 18b25934a7849b81982ff79f67c3f0afe8b22cfeb6d0a3176f400d7489a59491
+PR-A analyzer SHA-256 = 5e26d19b10ea2613f0da9c4e532d60cc9a646ee000289befdd98f4f6f9e1faa0
+brain config SHA-256 = 7fc14662d1433872978dcb8d5be0413c7f7769905b6b84f36f6bc46f7e9a2028
+normalized behavioral config SHA-256 = bfa1a00497ab9b4babe4cc8198ade4d424e52ff70f38c882cfcee0939ef6ceac
+validation-v1a exact config SHA-256 = 3f82e27ae67b7afa443d58926de8c6901147bc9c1a788e778d1c91a90555ecbd
+validation-v1b exact config SHA-256 = 8121c4b4bd6a538639e6b42df14ffc51cff93a2537f88c85b4a421c1ca359e72
+```
+
+Build A startował po niezależnie potwierdzonym braku release binary. Build B
+wykonał canonical clean `Removed 55 files, 431.8 MiB`, po którym guard również
+potwierdził brak binarki. Porównanie bajtowe obu ELF i obu criteria zwróciło
+zgodność; w żadnym ELF nie znaleziono lokalnej ścieżki source worktree. Exact
+config map używa pełnych runtime run IDs, a nie skrótów administracyjnych.
 
 ## D8. Następne kroki
 
-1. Zacommitować finalny source contract w stanie `calibration_pending`.
-2. Potwierdzić, że clean z canonical env rzeczywiście usuwa provenance packages.
-3. Ponownie odtworzyć identyczną binarkę w dwóch detached worktrees i wykonać
-   canonical `lock-criteria` z pełnymi runtime run IDs.
-4. Po commicie criteria i launcher dry-run uruchomić `validation-v1a`, następnie niezależne
+1. Zacommitować canonical locked criteria i ten finalny proof.
+2. Wykonać fail-closed launcher dry-run z dokładnym `validation-v1a` configiem.
+3. Po pozytywnym dry-runie uruchomić `validation-v1a`, następnie niezależne
    `validation-v1b`, bez strojenia pomiędzy runami.
 5. Authority cutover pozostaje zabroniony do czasu source-recomputed
    `promotion_gate_passed=true`.
