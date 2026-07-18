@@ -74,8 +74,9 @@ use super::exit_policy_v1::{EXIT_POLICY_V1_ID, EXIT_POLICY_V1_VERSION};
 use super::exit_policy_v2::{
     build_entry_value_contract, materialize_anchor, prequote_label, EffectiveHetPmV2Config,
     ExecutablePeakAnchorV1, ExecutableQuoteKeyV2, ExitPolicyV2, HetComparisonCorrelationV1,
-    HetPmCandidateV2, HetPmFinalDecisionV2, HetPmQuoteFinalizationInputV2, HetPmV2ConfigError,
-    HetPmV2Status, PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2, PostBuySnapshotBundle,
+    HetPmCandidateV2, HetPmFinalDecisionV2, HetPmGateEvaluationV2, HetPmGateV2,
+    HetPmPreQuoteEvaluationV2, HetPmQuoteFinalizationInputV2, HetPmV2ConfigError, HetPmV2Status,
+    PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2, PostBuySnapshotBundle,
     PreparedHetComparisonV1, PreparedV1V2ComparisonCoreV1, RouteStatusV1,
     TerminalV2ComparisonOutcomeUnknownReasonV1, TerminalV2ComparisonSkipReasonV1,
     TimeStopV2ProjectionV1, TimeStopV2Subreason, TimeStopV2WindowStatus, V1AuthorityTickOutcomeV1,
@@ -755,6 +756,9 @@ struct MonitoredPosition {
     het_route_status: RouteStatusV1,
     het_executable_peak_anchor: Option<ExecutablePeakAnchorV1>,
     het_next_anchor_seq: u64,
+    last_het_pm_v2_comparison_id: Option<String>,
+    last_het_pm_v2_candidate_gate: Option<String>,
+    last_het_pm_v2_candidate_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -805,6 +809,28 @@ const HET_PM_V2_WRITER_HEALTH_ARTIFACT_TYPE: &str = "het_pm_v2_writer_health";
 const HET_PM_V2_WRITER_HEALTH_COALESCE_MS: u64 = 100;
 const HET_PM_V2_WRITER_HEALTH_SHUTDOWN_BUDGET_MS: u64 = 250;
 static HET_PM_V2_WRITER_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const POSITION_CENSORED_SCHEMA_VERSION: u16 = 1;
+const POSITION_CENSORED_ARTIFACT_TYPE: &str = "position_censored_v1";
+
+#[derive(Debug, Serialize)]
+struct ShadowPositionCensoredRecord {
+    schema_version: u16,
+    artifact_type: &'static str,
+    run_id: Option<String>,
+    position_id: String,
+    position_epoch: u64,
+    candidate_id: String,
+    pool_id: String,
+    base_mint: String,
+    lane: Lane,
+    age_ms: u64,
+    reason: &'static str,
+    had_v2_candidate: bool,
+    candidate_gate: Option<String>,
+    comparison_id: Option<String>,
+    replay_status: &'static str,
+    timestamp_ms: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -2420,6 +2446,8 @@ pub struct MonitoringEngine {
     shadow_lifecycle_log_path: Option<PathBuf>,
     /// Compact research-only exit replay sidecar log.
     shadow_exit_replay_log_path: Option<PathBuf>,
+    /// Identity-level shutdown censoring evidence for promotion denominators.
+    position_censored_log_path: Option<PathBuf>,
     /// Single bounded observe-only HET V2 comparison writer. Filesystem I/O
     /// runs outside the Tokio authority task and never owns terminal truth.
     het_pm_v2_observation_writer: Option<HetPmV2ObservationWriterV1>,
@@ -2489,6 +2517,7 @@ impl MonitoringEngine {
             event_emitter_secondary: None,
             shadow_lifecycle_log_path: None,
             shadow_exit_replay_log_path: None,
+            position_censored_log_path: None,
             het_pm_v2_observation_writer: None,
             het_pm_v2_observation_writer_start_error: None,
             shadow_v2_validation_harness: None,
@@ -2606,6 +2635,11 @@ impl MonitoringEngine {
                 .unwrap_or_else(|| Path::new("."))
                 .join("het_pm_v2_observations_v1.jsonl")
         });
+        self.position_censored_log_path = shadow_lifecycle_log_path.as_ref().map(|path| {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("position_censored_v1.jsonl")
+        });
         self.set_het_pm_v2_observation_log_path(het_pm_v2_observation_log_path);
         self.shadow_lifecycle_log_path = shadow_lifecycle_log_path;
     }
@@ -2617,6 +2651,11 @@ impl MonitoringEngine {
         shadow_lifecycle_log_path: Option<PathBuf>,
     ) {
         self.set_het_pm_v2_observation_log_path(None);
+        self.position_censored_log_path = shadow_lifecycle_log_path.as_ref().map(|path| {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("position_censored_v1.jsonl")
+        });
         self.shadow_lifecycle_log_path = shadow_lifecycle_log_path;
     }
 
@@ -3007,7 +3046,12 @@ impl MonitoringEngine {
             oldest,
             previous_distinct_slot,
             latest_in_window,
-            (latest.timestamp_ms() <= now_ms).then_some(now_ms - latest.timestamp_ms()),
+            // `bool::then_some` evaluates its argument eagerly. A canonical
+            // sample can legitimately be a few milliseconds ahead of the
+            // local wall clock, so subtracting before checking the predicate
+            // used to panic the entire monitoring task. Preserve that state as
+            // typed unavailable chronology evidence instead.
+            (latest.timestamp_ms() <= now_ms).then(|| now_ms.saturating_sub(latest.timestamp_ms())),
             distinct_slots,
             short_window_drop_fraction,
             peak_drawdown_fraction,
@@ -3767,6 +3811,24 @@ impl MonitoringEngine {
             .to_string()
     }
 
+    fn record_het_pm_v2_censoring_evidence(
+        &self,
+        base_mint: &Pubkey,
+        core: &PreparedV1V2ComparisonCoreV1,
+        now_ms: u64,
+    ) {
+        let (correlation, had_candidate, candidate_gate) = core.censoring_evidence();
+        let mut positions = self.positions.write();
+        let Some(pos) = positions.get_mut(base_mint) else {
+            return;
+        };
+        pos.last_het_pm_v2_comparison_id = Some(correlation.comparison_id);
+        if had_candidate {
+            pos.last_het_pm_v2_candidate_gate = candidate_gate.map(str::to_string);
+            pos.last_het_pm_v2_candidate_at_ms = Some(now_ms);
+        }
+    }
+
     fn record_het_pm_v2_comparison_core_outcome(&self, core: &PreparedV1V2ComparisonCoreV1) {
         if let Some(writer) = self.het_pm_v2_observation_writer.as_ref() {
             writer.record_comparison_core_outcome(core);
@@ -3776,6 +3838,20 @@ impl MonitoringEngine {
     fn record_het_pm_v2_comparison_final_outcome(&self, prepared: &PreparedHetComparisonV1) {
         if let Some(writer) = self.het_pm_v2_observation_writer.as_ref() {
             writer.record_comparison_final_outcome(prepared);
+        }
+    }
+
+    fn append_position_censored_record(&self, record: &ShadowPositionCensoredRecord) {
+        let Some(path) = self.position_censored_log_path.as_deref() else {
+            return;
+        };
+        if let Err(error) = Self::append_jsonl_record(path, record) {
+            warn!(
+                position_id = %record.position_id,
+                position_epoch = record.position_epoch,
+                error = %error,
+                "PostBuyGuardian: failed to append shutdown censoring evidence"
+            );
         }
     }
 
@@ -5969,6 +6045,9 @@ impl MonitoringEngine {
             het_route_status: RouteStatusV1::Unknown,
             het_executable_peak_anchor: None,
             het_next_anchor_seq: 1,
+            last_het_pm_v2_comparison_id: None,
+            last_het_pm_v2_candidate_gate: None,
+            last_het_pm_v2_candidate_at_ms: None,
         };
 
         let exit_replay_tracker = self.build_exit_replay_tracker(&position);
@@ -6005,13 +6084,44 @@ impl MonitoringEngine {
     /// Administrative removal for shutdown/tests. It deliberately emits no
     /// economic terminal event and therefore cannot masquerade as a fill.
     pub fn remove_position_administratively(&self, base_mint: &Pubkey) {
-        let mut positions = self.positions.write();
-        if let Some(pos) = positions.remove(base_mint) {
+        let pos = {
+            let mut positions = self.positions.write();
+            positions.remove(base_mint)
+        };
+        if let Some(pos) = pos {
+            let now_ms = current_time_ms();
+            let replay_status = if !self.config.exit_replay_v1.enabled
+                || self.shadow_exit_replay_log_path.is_none()
+            {
+                "disabled"
+            } else if self.exit_replay_trackers.read().contains_key(base_mint) {
+                "active_at_censor"
+            } else {
+                "flushed_or_not_active"
+            };
+            self.append_position_censored_record(&ShadowPositionCensoredRecord {
+                schema_version: POSITION_CENSORED_SCHEMA_VERSION,
+                artifact_type: POSITION_CENSORED_ARTIFACT_TYPE,
+                run_id: pos.join_metadata.run_id.clone(),
+                position_id: pos.position_id.clone(),
+                position_epoch: pos.position_epoch,
+                candidate_id: pos.candidate_id.clone(),
+                pool_id: pos.pool_amm_id.to_string(),
+                base_mint: pos.base_mint.to_string(),
+                lane: pos.lane,
+                age_ms: now_ms.saturating_sub(pos.entry_unix_ms),
+                reason: "controlled_runtime_horizon",
+                had_v2_candidate: pos.last_het_pm_v2_candidate_gate.is_some(),
+                candidate_gate: pos.last_het_pm_v2_candidate_gate.clone(),
+                comparison_id: pos.last_het_pm_v2_comparison_id.clone(),
+                replay_status,
+                timestamp_ms: now_ms,
+            });
             if let Some(ref runtime) = self.aem_runtime {
                 let mut rt = runtime.lock();
                 let _ = rt.unregister_position(&pos.position_id);
             }
-            let duration_ms = current_time_ms().saturating_sub(pos.entry_unix_ms);
+            let duration_ms = now_ms.saturating_sub(pos.entry_unix_ms);
             info!(
                 "🛡️ PostBuyGuardian: Stopped monitoring mint={} (held {:.1}s, signals={})",
                 base_mint,
@@ -6019,6 +6129,21 @@ impl MonitoringEngine {
                 pos.recent_signals.len()
             );
         }
+    }
+
+    /// Drain every observer-owned position during controlled process shutdown.
+    ///
+    /// This is deliberately not an economic terminal path: no proposal, fill,
+    /// PnL, lifecycle terminal, or capacity decision is fabricated. Dropping
+    /// the per-position terminal sender unblocks the launcher's shutdown-only
+    /// watcher after the authority loop has already been stopped.
+    pub fn remove_all_positions_administratively(&self) -> usize {
+        let active_mints = self.active_mints();
+        let removed = active_mints.len();
+        for base_mint in active_mints {
+            self.remove_position_administratively(&base_mint);
+        }
+        removed
     }
 
     /// Returns the number of currently monitored positions.
@@ -7552,6 +7677,60 @@ impl MonitoringEngine {
             }
             _ => None,
         };
+        let v2_gate_evaluations =
+            ExitPolicyV2::evaluate_gate_lattice(view, v1_prequote, crash_prequote, het_policy)
+                .into_iter()
+                .map(|gate_prequote| {
+                    let prequote = HetPmPreQuoteEvaluationV2 {
+                        candidate: gate_prequote.candidate.clone(),
+                        winning_gate: match gate_prequote.reason {
+                            super::exit_policy_v2::HetPmExitReasonV2::Crash => HetPmGateV2::Crash,
+                            super::exit_policy_v2::HetPmExitReasonV2::HardLoss => {
+                                HetPmGateV2::HardLoss
+                            }
+                            super::exit_policy_v2::HetPmExitReasonV2::ExecutableTrailing => {
+                                HetPmGateV2::ExecutableTrailing
+                            }
+                            super::exit_policy_v2::HetPmExitReasonV2::VitalityDecay => {
+                                HetPmGateV2::VitalityDecay
+                            }
+                            super::exit_policy_v2::HetPmExitReasonV2::AbsoluteMaxHold => {
+                                HetPmGateV2::AbsoluteMaxHold
+                            }
+                        },
+                        suppressed_gates_mask: 0,
+                    };
+                    let final_decision = ExitPolicyV2::finalize_with_quote(
+                        view,
+                        &prequote,
+                        HetPmQuoteFinalizationInputV2 {
+                            quote: v2_quote.as_ref(),
+                            quote_key: v2_truth.and(v2_cell).map(|cell| &cell.key),
+                            quote_evidence: v2_quote_evidence,
+                            crash_requirement: v2_crash_requirement.as_ref(),
+                        },
+                        v1_policy,
+                        het_policy,
+                    );
+                    let executable_gross_return_bps = match final_decision {
+                        HetPmFinalDecisionV2::ExitAll {
+                            executable_gross_return_bps,
+                            ..
+                        } => Some(executable_gross_return_bps),
+                        _ => None,
+                    };
+                    HetPmGateEvaluationV2 {
+                        gate: gate_prequote.reason,
+                        prequote: gate_prequote.candidate.clone(),
+                        quote_status: ExitPolicyV2::gate_quote_status(
+                            &gate_prequote.candidate,
+                            &final_decision,
+                        ),
+                        final_decision,
+                        executable_gross_return_bps,
+                    }
+                })
+                .collect();
         let current_executable_value_sol = v2_truth.map(|truth| truth.exit_value_sol);
         let current_executable_gross_return_bps = v2_truth.map(|truth| {
             (truth.pnl_pct * 100.0)
@@ -7613,6 +7792,7 @@ impl MonitoringEngine {
             v2_crash_quote_decision,
             v2_winning_gate: v2_prequote.winning_gate,
             v2_suppressed_gates_mask: v2_prequote.suppressed_gates_mask,
+            v2_gate_evaluations,
             consumed_by_policy: false,
             v1_shadow_authority: true,
             v2_shadow_authority: false,
@@ -7748,6 +7928,7 @@ impl MonitoringEngine {
             het_policy,
             now_ms,
         });
+        self.record_het_pm_v2_censoring_evidence(base_mint, &prepared.comparison_core, now_ms);
 
         let receipt = self
             .run_shadow_runtime_tick_v1(
@@ -9659,6 +9840,61 @@ mod tests {
     }
 
     #[test]
+    fn crash_vector_future_sample_is_invalid_evidence_not_monitor_panic() {
+        let config = pr2_guardian_config(false, CrashGuardMode::ObserveOnly);
+        let (tx, _rx) = mpsc::channel(4);
+        let engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid crash-guard config");
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000_000),
+                Some(1_000_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
+                    candidate_id: "future-crash-sample".to_string(),
+                    entry_order_id: "future-crash-entry".to_string(),
+                    quote_id: "future-crash-quote".to_string(),
+                    slot: Some(10),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:future-crash-sample".to_string()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("valid registration");
+
+        let future_sample = MarketSnapshot {
+            slot: Some(11),
+            timestamp_ms: 2_001,
+            price_sol_per_token: 0.5,
+            price_state: PriceState::Valid,
+            market_cap_sol: 0.5,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 10.0,
+            ..MarketSnapshot::default()
+        };
+        {
+            let mut positions = engine.positions.write();
+            let pos = positions.get_mut(&mint).expect("registered position");
+            pos.snapshot_timeline
+                .replace_with(vec![future_sample], 8, 10_000);
+        }
+
+        let positions = engine.positions.read();
+        let pos = positions.get(&mint).expect("registered position");
+        let policy = engine.exit_policy_v1.as_ref().expect("V1 policy");
+        let vector = MonitoringEngine::materialize_crash_vector(pos, 2_000, policy);
+
+        assert_eq!(vector.latest_sample_age_ms(), None);
+        assert!(!vector.ordering_valid());
+    }
+
+    #[test]
     fn shadow_registration_rejects_invalid_immutable_contract_before_open_event() {
         let tmp = TempDir::new().expect("tempdir");
         let events_dir = tmp.path().join("events");
@@ -9764,6 +10000,70 @@ mod tests {
             failure.kind.unresolved_reason(),
             ShadowUnresolvedReason::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn administrative_shutdown_removes_all_positions_without_terminal_disposition() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
+        let censor_log = tmp.path().join("position_censored_v1.jsonl");
+        let config = PostBuyGuardianConfig::default();
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, shadow_ledger, tx);
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_log));
+        enable_baseline_exit_policy(&mut engine);
+
+        let mint = Pubkey::new_unique();
+        let registered = engine
+            .register_shadow_position_with_terminal(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(0.0000001),
+                Some(7_000_000),
+                Some(7_000_000_000),
+                PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("administrative-shutdown-test".to_string()),
+                        ..Default::default()
+                    },
+                    candidate_id: "administrative-shutdown-candidate".to_string(),
+                    entry_order_id: "shadow-entry-administrative-shutdown".to_string(),
+                    quote_id: "shadow-quote-administrative-shutdown".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("pool:mint:administrative-shutdown".to_string()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1),
+                },
+            )
+            .expect("register shutdown-only position");
+        let (_, terminal_rx) = registered.into_parts();
+
+        assert_eq!(engine.active_position_count(), 1);
+        assert_eq!(engine.remove_all_positions_administratively(), 1);
+        assert_eq!(engine.active_position_count(), 0);
+        assert_eq!(engine.remove_all_positions_administratively(), 0);
+        assert!(
+            terminal_rx.await.is_err(),
+            "administrative shutdown must drop the sender without fabricating an economic terminal"
+        );
+        let censor_rows = read_jsonl_rows(&censor_log);
+        assert_eq!(censor_rows.len(), 1);
+        assert_eq!(
+            censor_rows[0]["artifact_type"],
+            POSITION_CENSORED_ARTIFACT_TYPE
+        );
+        assert_eq!(censor_rows[0]["run_id"], "administrative-shutdown-test");
+        assert_eq!(
+            censor_rows[0]["position_id"],
+            "pool:mint:administrative-shutdown"
+        );
+        assert_eq!(censor_rows[0]["position_epoch"], 1);
+        assert_eq!(censor_rows[0]["reason"], "controlled_runtime_horizon");
+        assert_eq!(censor_rows[0]["had_v2_candidate"], false);
+        assert_eq!(censor_rows[0]["candidate_gate"], Value::Null);
     }
 
     fn apply_test_canonical_update(

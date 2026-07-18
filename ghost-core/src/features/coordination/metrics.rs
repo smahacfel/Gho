@@ -108,8 +108,13 @@ pub fn compute_ftdi_v2(
         }
     }
 
-    let available_count: u8 = counts.values().copied().sum();
-    breakdown.fingerprint_coverage = coverage(usize::from(available_count), unique_count);
+    // The durable breakdown stores each bucket count as a saturated u8, but
+    // the denominator is allowed to exceed 255 in a permissive observation
+    // run. Summing those buckets in u8 panicked on large, valid BUY windows.
+    // Keep the exported bucket schema unchanged and widen only the local
+    // denominator used for coverage/evidence classification.
+    let available_count: usize = counts.values().map(|count| usize::from(*count)).sum();
+    breakdown.fingerprint_coverage = coverage(available_count, unique_count);
     breakdown.topology_counts = counts
         .into_iter()
         .map(|(fingerprint, count)| FeeTopologyCount { fingerprint, count })

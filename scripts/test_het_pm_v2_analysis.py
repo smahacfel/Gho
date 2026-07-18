@@ -16,7 +16,7 @@ SPEC.loader.exec_module(MODULE)
 
 def fixture() -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "comparison_id": "comparison-1",
         "policy_id": "hierarchical_executable_trajectory_pm_v2",
         "policy_version": 2,
@@ -85,6 +85,22 @@ def fixture() -> dict:
         "v2_prequote": "Hold",
         "v2_final": "Hold",
         "v2_crash_quote_decision": None,
+        "v2_gate_evaluations": [
+            {
+                "gate": gate,
+                "prequote": {"kind": "hold"},
+                "quote_status": "not_required",
+                "final_decision": {"kind": "hold"},
+                "executable_gross_return_bps": None,
+            }
+            for gate in (
+                "crash",
+                "hard_loss",
+                "executable_trailing",
+                "vitality_decay",
+                "absolute_max_hold",
+            )
+        ],
         "consumed_by_policy": False,
         "v1_shadow_authority": True,
         "v2_shadow_authority": False,
@@ -542,6 +558,15 @@ class AnalysisContractTest(unittest.TestCase):
             del row["trajectory_measurement_grade"]
             path.write_text(json.dumps(row) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(MODULE.ContractError, "missing required field"):
+                MODULE.load_records([path])
+
+    def test_schema_v3_row_without_same_tick_gate_lattice_is_rejected(self) -> None:
+        row = fixture()
+        row.pop("v2_gate_evaluations")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "input.jsonl"
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.ContractError, "v2_gate_evaluations"):
                 MODULE.load_records([path])
 
     def test_unknown_decision_enum_label_is_rejected(self) -> None:

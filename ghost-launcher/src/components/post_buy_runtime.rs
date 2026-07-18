@@ -62,6 +62,7 @@ use ghost_core::shadow_ledger::ShadowLedger;
 use ghost_core::{ShadowV2PoolPhase, LAMPORTS_PER_SOL};
 use parking_lot::Mutex as ParkingMutex;
 use seer::parse_curve_from_account;
+use serde::Serialize;
 use solana_client::client_error::ClientError;
 use solana_client::nonblocking::rpc_client::RpcClient as AsyncRpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -69,12 +70,15 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::VersionedTransaction;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tracing::{debug, info, warn};
@@ -95,6 +99,95 @@ const ENTRY_LANDED_SLOT_SOURCE_SYNTHETIC_AFTER_ENTRY_SIMULATION_RPC_SLOT: &str =
     "synthetic_next_slot_after_entry_simulation_rpc_slot";
 const ENTRY_LANDED_SLOT_SOURCE_BUY_LANDED_SLOT: &str = "buy_landed_slot";
 const SHADOW_V2_ENTRY_FEE_BPS_FALLBACK: u16 = 100;
+const POST_BUY_ADMISSION_SCHEMA_VERSION: u16 = 1;
+const POST_BUY_ADMISSION_ARTIFACT_TYPE: &str = "post_buy_admission_v1";
+const POST_BUY_ADMISSION_HEALTH_SCHEMA_VERSION: u16 = 1;
+const POST_BUY_ADMISSION_HEALTH_ARTIFACT_TYPE: &str = "post_buy_admission_health_v1";
+const POST_BUY_ADMISSION_QUEUE_CAPACITY: usize = 4096;
+const POST_BUY_ADMISSION_SHUTDOWN_BUDGET_MS: u64 = 100;
+
+#[derive(Debug, Serialize)]
+struct PostBuyAdmissionRecord {
+    schema_version: u16,
+    artifact_type: &'static str,
+    run_id: Option<String>,
+    candidate_id: String,
+    pool_id: String,
+    base_mint: String,
+    lane: String,
+    source: String,
+    stage: &'static str,
+    simulation_success: bool,
+    slot_reserved: bool,
+    position_slot_id: Option<String>,
+    handoff_accepted: Option<bool>,
+    handoff_reject_reason: Option<String>,
+    monitoring_registered: bool,
+    position_id: Option<String>,
+    position_epoch: Option<u64>,
+    release_status: Option<&'static str>,
+    release_reason: Option<String>,
+    timestamp_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PostBuyAdmissionHealthRecord {
+    schema_version: u16,
+    artifact_type: &'static str,
+    run_ids: Vec<String>,
+    admission_attempts: u64,
+    admission_enqueued: u64,
+    admission_written: u64,
+    admission_dropped: u64,
+    admission_failed: u64,
+    shutdown_complete: bool,
+    timestamp_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct PostBuyAdmissionWriterCounters {
+    admission_attempts: AtomicU64,
+    admission_enqueued: AtomicU64,
+    admission_written: AtomicU64,
+    admission_dropped: AtomicU64,
+    admission_failed: AtomicU64,
+}
+
+#[derive(Debug)]
+struct PostBuyAdmissionWriteJob {
+    encoded: Vec<u8>,
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PostBuyAdmissionWriterSummary {
+    run_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PostBuyAdmissionWriter {
+    sender: SyncSender<PostBuyAdmissionWriteJob>,
+    counters: Arc<PostBuyAdmissionWriterCounters>,
+}
+
+#[derive(Debug)]
+struct PostBuyAdmissionWriterRuntime {
+    writer: Option<PostBuyAdmissionWriter>,
+    counters: Arc<PostBuyAdmissionWriterCounters>,
+    handle: Option<JoinHandle<PostBuyAdmissionWriterSummary>>,
+    health_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ShadowTerminalWatcherAdmissionContext {
+    candidate_id: String,
+    pool_id: String,
+    base_mint: String,
+    run_id: Option<String>,
+    position_id: Option<String>,
+    position_epoch: Option<u64>,
+    admission_writer: Option<PostBuyAdmissionWriter>,
+}
 
 /// Resources needed for live sell execution via launcher-owned Sender submit.
 #[derive(Clone)]
@@ -895,6 +988,243 @@ fn build_shadow_guardian_config(config: &PostBuyRuntimeConfig) -> PostBuyGuardia
 
 fn derive_shadow_exit_replay_log_path(lifecycle_log_path: &Path) -> PathBuf {
     lifecycle_log_path.with_file_name("shadow_exit_replay_v1.jsonl")
+}
+
+fn derive_post_buy_admission_log_path(lifecycle_log_path: &Path) -> PathBuf {
+    lifecycle_log_path.with_file_name("post_buy_admission_v1.jsonl")
+}
+
+fn derive_post_buy_admission_health_path(lifecycle_log_path: &Path) -> PathBuf {
+    lifecycle_log_path.with_file_name("post_buy_admission_health_v1.json")
+}
+
+fn write_post_buy_admission_row(path: &Path, encoded: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(encoded)?;
+    file.write_all(b"\n")?;
+    file.flush()
+}
+
+impl PostBuyAdmissionWriter {
+    fn enqueue(&self, record: &PostBuyAdmissionRecord) {
+        self.counters
+            .admission_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let encoded = match serde_json::to_vec(record) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.counters
+                    .admission_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                    candidate_id = %record.candidate_id,
+                    stage = record.stage,
+                    error = %error,
+                    "PostBuyRuntime: failed to serialize post-buy admission evidence"
+                );
+                return;
+            }
+        };
+        let job = PostBuyAdmissionWriteJob {
+            encoded,
+            run_id: record.run_id.clone(),
+        };
+        match self.sender.try_send(job) {
+            Ok(()) => {
+                self.counters
+                    .admission_enqueued
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Full(_)) => {
+                self.counters
+                    .admission_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                    candidate_id = %record.candidate_id,
+                    stage = record.stage,
+                    reason = "queue_full",
+                    "PostBuyRuntime: dropped post-buy admission evidence without blocking runtime"
+                );
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.counters
+                    .admission_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                    candidate_id = %record.candidate_id,
+                    stage = record.stage,
+                    reason = "queue_closed",
+                    "PostBuyRuntime: dropped post-buy admission evidence without blocking runtime"
+                );
+            }
+        }
+    }
+}
+
+impl PostBuyAdmissionWriterRuntime {
+    fn start(admission_log_path: PathBuf, health_path: PathBuf) -> std::io::Result<Self> {
+        let counters = Arc::new(PostBuyAdmissionWriterCounters::default());
+        let (sender, receiver) =
+            sync_channel::<PostBuyAdmissionWriteJob>(POST_BUY_ADMISSION_QUEUE_CAPACITY);
+        let worker_counters = Arc::clone(&counters);
+        let worker_path = admission_log_path.clone();
+        let handle = thread::Builder::new()
+            .name("post-buy-admission-writer".to_string())
+            .spawn(move || {
+                let mut summary = PostBuyAdmissionWriterSummary::default();
+                for job in receiver {
+                    if let Some(run_id) = job.run_id {
+                        if !run_id.is_empty() {
+                            summary.run_ids.insert(run_id);
+                        }
+                    }
+                    match write_post_buy_admission_row(&worker_path, &job.encoded) {
+                        Ok(()) => {
+                            worker_counters
+                                .admission_written
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(error) => {
+                            worker_counters
+                                .admission_failed
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                                error = %error,
+                                "PostBuyRuntime: post-buy admission writer failed"
+                            );
+                        }
+                    }
+                }
+                summary
+            })?;
+        Ok(Self {
+            writer: Some(PostBuyAdmissionWriter {
+                sender,
+                counters: Arc::clone(&counters),
+            }),
+            counters,
+            handle: Some(handle),
+            health_path,
+        })
+    }
+
+    fn writer(&self) -> Option<PostBuyAdmissionWriter> {
+        self.writer.clone()
+    }
+
+    async fn shutdown(mut self) {
+        self.writer.take();
+        let (summary, shutdown_complete) = match self.handle.take() {
+            Some(handle) => match tokio::time::timeout(
+                Duration::from_millis(POST_BUY_ADMISSION_SHUTDOWN_BUDGET_MS),
+                tokio::task::spawn_blocking(move || handle.join()),
+            )
+            .await
+            {
+                Ok(Ok(Ok(summary))) => (summary, true),
+                Ok(Ok(Err(_))) | Ok(Err(_)) => (PostBuyAdmissionWriterSummary::default(), false),
+                Err(_) => {
+                    warn!(
+                        runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                        budget_ms = POST_BUY_ADMISSION_SHUTDOWN_BUDGET_MS,
+                        "PostBuyRuntime: admission writer shutdown budget elapsed; evidence is incomplete"
+                    );
+                    (PostBuyAdmissionWriterSummary::default(), false)
+                }
+            },
+            None => (PostBuyAdmissionWriterSummary::default(), false),
+        };
+        let record = PostBuyAdmissionHealthRecord {
+            schema_version: POST_BUY_ADMISSION_HEALTH_SCHEMA_VERSION,
+            artifact_type: POST_BUY_ADMISSION_HEALTH_ARTIFACT_TYPE,
+            run_ids: summary.run_ids.into_iter().collect(),
+            admission_attempts: self.counters.admission_attempts.load(Ordering::Relaxed),
+            admission_enqueued: self.counters.admission_enqueued.load(Ordering::Relaxed),
+            admission_written: self.counters.admission_written.load(Ordering::Relaxed),
+            admission_dropped: self.counters.admission_dropped.load(Ordering::Relaxed),
+            admission_failed: self.counters.admission_failed.load(Ordering::Relaxed),
+            shutdown_complete,
+            timestamp_ms: now_ms(),
+        };
+        let health_path = self.health_path.clone();
+        let write_result = tokio::time::timeout(
+            Duration::from_millis(POST_BUY_ADMISSION_SHUTDOWN_BUDGET_MS),
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                if let Some(parent) = health_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&health_path)?;
+                serde_json::to_writer(&mut file, &record)?;
+                file.write_all(b"\n")?;
+                file.flush()
+            }),
+        )
+        .await;
+        if !matches!(write_result, Ok(Ok(Ok(())))) {
+            warn!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                "PostBuyRuntime: admission health artifact was not durably completed within budget"
+            );
+        }
+    }
+}
+
+fn append_post_buy_admission_record(
+    writer: Option<&PostBuyAdmissionWriter>,
+    record: &PostBuyAdmissionRecord,
+) {
+    if let Some(writer) = writer {
+        writer.enqueue(record);
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "admission evidence preserves exact handoff and slot identity without reconstruction"
+)]
+fn post_buy_admission_record(
+    run_id: Option<String>,
+    candidate_id: &str,
+    pool_id: &str,
+    base_mint: &str,
+    lane: &str,
+    source: &str,
+    position_slot_id: Option<PositionSlotId>,
+    stage: &'static str,
+) -> PostBuyAdmissionRecord {
+    PostBuyAdmissionRecord {
+        schema_version: POST_BUY_ADMISSION_SCHEMA_VERSION,
+        artifact_type: POST_BUY_ADMISSION_ARTIFACT_TYPE,
+        run_id,
+        candidate_id: candidate_id.to_string(),
+        pool_id: pool_id.to_string(),
+        base_mint: base_mint.to_string(),
+        lane: lane.to_string(),
+        source: source.to_string(),
+        stage,
+        simulation_success: true,
+        slot_reserved: position_slot_id.is_some(),
+        position_slot_id: position_slot_id.map(|slot_id| slot_id.to_string()),
+        handoff_accepted: None,
+        handoff_reject_reason: None,
+        monitoring_registered: false,
+        position_id: None,
+        position_epoch: None,
+        release_status: None,
+        release_reason: None,
+        timestamp_ms: now_ms(),
+    }
 }
 
 fn record_live_sell_rpc_latency(stage: &'static str, latency_ms: u64, outcome: &'static str) {
@@ -2555,6 +2885,27 @@ pub async fn run(
         }
     }
 
+    let mut admission_writer_runtime = config.shadow_lifecycle_log_path.as_deref().and_then(
+        |lifecycle_log_path| {
+            let admission_log_path = derive_post_buy_admission_log_path(lifecycle_log_path);
+            let health_path = derive_post_buy_admission_health_path(lifecycle_log_path);
+            match PostBuyAdmissionWriterRuntime::start(admission_log_path, health_path) {
+                Ok(runtime) => Some(runtime),
+                Err(error) => {
+                    warn!(
+                        runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                        error = %error,
+                        "PostBuyRuntime: failed to start post-buy admission writer; runtime continues but promotion evidence will be incomplete"
+                    );
+                    None
+                }
+            }
+        },
+    );
+    let admission_writer = admission_writer_runtime
+        .as_ref()
+        .and_then(PostBuyAdmissionWriterRuntime::writer);
+
     info!(
         runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
         "PostBuyRuntime adapter started (mode={}, run_id={}, live_sell={}, shadow_guardian={}, probe_guardian={})",
@@ -2635,6 +2986,7 @@ pub async fn run(
                             &mut lifecycle_handles,
                             &mut recent_handoffs,
                             &shadow_v2_harness,
+                            admission_writer.as_ref(),
                         )
                         .await;
                     }
@@ -2676,6 +3028,7 @@ pub async fn run(
                             &mut lifecycle_handles,
                             &mut recent_handoffs,
                             &shadow_v2_harness,
+                            admission_writer.as_ref(),
                         )
                         .await;
                         if let Some(ack_tx) = ack_tx {
@@ -2704,25 +3057,73 @@ pub async fn run(
                         .as_ref()
                         .map(|monitor| monitor.active_position_count())
                         .unwrap_or(0);
-                    if active_shadow_positions == 0 && active_probe_positions == 0 {
-                        info!(
-                            runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-                            "PostBuyRuntime shutdown drain elapsed; stopping subscriber"
-                        );
-                        break;
-                    }
-                    debug!(
+                    info!(
                         runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                         active_shadow_positions,
                         active_probe_positions,
-                        "PostBuyRuntime shutdown drain elapsed but canonical shadow closeout is still active; waiting for shadow lifecycle completion"
+                        shutdown_closeout = if active_shadow_positions == 0
+                            && active_probe_positions == 0
+                        {
+                            "all_positions_terminal"
+                        } else {
+                            "remaining_positions_censored_administratively"
+                        },
+                        "PostBuyRuntime shutdown drain elapsed; stopping subscriber"
                     );
+                    break;
                 }
             }
         }
     }
 
-    // Wait for all in-flight lifecycle tasks to complete before flushing.
+    // Stop ticks before taking final replay and writer-health snapshots.
+    // Remaining positions are censored at the process boundary; they must not
+    // keep terminal watchers or capacity alive and must never become fabricated
+    // economic terminal records.
+    if let Some(handle) = shadow_runtime_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(monitor) = shadow_monitor.as_ref() {
+        monitor.flush_exit_replay_for_shutdown().await;
+        monitor.flush_het_pm_v2_writer_health_for_shutdown().await;
+        let removed = monitor.remove_all_positions_administratively();
+        if removed > 0 {
+            info!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                removed_positions = removed,
+                economic_terminal_emitted = false,
+                "PostBuyRuntime: administratively censored remaining shadow positions at shutdown"
+            );
+        }
+    }
+    if let Some(handle) = shadow_signal_router_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = probe_runtime_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(monitor) = probe_monitor.as_ref() {
+        let removed = monitor.remove_all_positions_administratively();
+        if removed > 0 {
+            info!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                removed_positions = removed,
+                economic_terminal_emitted = false,
+                "PostBuyRuntime: administratively censored remaining probe positions at shutdown"
+            );
+        }
+    }
+    if let Some(handle) = probe_signal_router_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // Terminal watchers unblock when administrative shutdown drops their
+    // senders. Await them only after monitor teardown; the inverse ordering can
+    // deadlock shutdown while any shadow position is still open.
     if !lifecycle_handles.is_empty() {
         info!(
             runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
@@ -2739,25 +3140,9 @@ pub async fn run(
         }
     }
 
-    if let Some(handle) = shadow_runtime_handle.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    if let Some(monitor) = shadow_monitor.as_ref() {
-        monitor.flush_exit_replay_for_shutdown().await;
-        monitor.flush_het_pm_v2_writer_health_for_shutdown().await;
-    }
-    if let Some(handle) = shadow_signal_router_handle.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    if let Some(handle) = probe_runtime_handle.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    if let Some(handle) = probe_signal_router_handle.take() {
-        handle.abort();
-        let _ = handle.await;
+    drop(admission_writer);
+    if let Some(runtime) = admission_writer_runtime.take() {
+        runtime.shutdown().await;
     }
 
     if let Err(e) = emitter.flush() {
@@ -2816,6 +3201,7 @@ async fn handle_post_buy_event(
     lifecycle_handles: &mut Vec<tokio::task::JoinHandle<()>>,
     recent_handoffs: &mut RecentPostBuyCache,
     shadow_v2_harness: &Option<Arc<ParkingMutex<ShadowV2ValidationHarness>>>,
+    admission_writer: Option<&PostBuyAdmissionWriter>,
 ) -> DirectPostBuyHandoffAck {
     let GhostEvent::PostBuySubmitted {
         candidate_id,
@@ -2868,6 +3254,7 @@ async fn handle_post_buy_event(
         entry_simulation_rpc_slot = ?entry_simulation_rpc_slot,
         "PostBuyRuntime: received PostBuySubmitted"
     );
+    let post_buy_source_label = format!("{source:?}");
 
     if lane == "live" {
         let position_limit_tracker = config.position_limit_tracker.clone();
@@ -3025,6 +3412,19 @@ async fn handle_post_buy_event(
     }
 
     if lane == "shadow" {
+        append_post_buy_admission_record(
+            admission_writer,
+            &post_buy_admission_record(
+                join_metadata.run_id.clone(),
+                &candidate_id,
+                &pool_amm_id,
+                &base_mint,
+                &lane,
+                &post_buy_source_label,
+                position_slot_id,
+                "post_buy_submitted",
+            ),
+        );
         let position_join_metadata = PositionJoinMetadata {
             ab_record_id: join_metadata.ab_record_id.clone(),
             source_ab_record_id: join_metadata.source_ab_record_id.clone(),
@@ -3056,6 +3456,50 @@ async fn handle_post_buy_event(
             position_join_metadata.clone(),
         )
         .await;
+        let mut handoff_record = post_buy_admission_record(
+            position_join_metadata.run_id.clone(),
+            &candidate_id,
+            &pool_amm_id,
+            &base_mint,
+            &lane,
+            &post_buy_source_label,
+            position_slot_id,
+            match handoff.ack {
+                DirectPostBuyHandoffAck::Accepted => "handoff_accepted",
+                DirectPostBuyHandoffAck::Rejected(_) => "handoff_rejected",
+            },
+        );
+        match handoff.ack {
+            DirectPostBuyHandoffAck::Accepted => {
+                handoff_record.handoff_accepted = Some(true);
+                handoff_record.monitoring_registered = handoff.position_id.is_some();
+                handoff_record.position_id = handoff.position_id.clone();
+                handoff_record.position_epoch = handoff.position_id.as_ref().map(|_| epoch);
+            }
+            DirectPostBuyHandoffAck::Rejected(reason) => {
+                handoff_record.handoff_accepted = Some(false);
+                handoff_record.handoff_reject_reason = Some(reason.to_string());
+            }
+        }
+        append_post_buy_admission_record(admission_writer, &handoff_record);
+        if matches!(handoff.ack, DirectPostBuyHandoffAck::Accepted) && handoff.position_id.is_some()
+        {
+            let mut registered_record = post_buy_admission_record(
+                position_join_metadata.run_id.clone(),
+                &candidate_id,
+                &pool_amm_id,
+                &base_mint,
+                &lane,
+                &post_buy_source_label,
+                position_slot_id,
+                "monitoring_registered",
+            );
+            registered_record.handoff_accepted = Some(true);
+            registered_record.monitoring_registered = true;
+            registered_record.position_id = handoff.position_id.clone();
+            registered_record.position_epoch = Some(epoch);
+            append_post_buy_admission_record(admission_writer, &registered_record);
+        }
         if matches!(handoff.ack, DirectPostBuyHandoffAck::Accepted) {
             maybe_emit_shadow_v2_position_created(
                 shadow_v2_harness,
@@ -3094,7 +3538,15 @@ async fn handle_post_buy_event(
                         terminal_rx,
                         tracker,
                         slot_id,
-                        candidate_id.clone(),
+                        ShadowTerminalWatcherAdmissionContext {
+                            candidate_id: candidate_id.clone(),
+                            pool_id: pool_amm_id.clone(),
+                            base_mint: base_mint.clone(),
+                            run_id: position_join_metadata.run_id.clone(),
+                            position_id: handoff.position_id.clone(),
+                            position_epoch: handoff.position_id.as_ref().map(|_| epoch),
+                            admission_writer: admission_writer.cloned(),
+                        },
                     ));
                 } else {
                     ::metrics::counter!(
@@ -3104,6 +3556,23 @@ async fn handle_post_buy_event(
                         "reason" => "terminal_receiver_missing"
                     );
                     let _ = tracker.release(slot_id);
+                    let mut release_record = post_buy_admission_record(
+                        position_join_metadata.run_id.clone(),
+                        &candidate_id,
+                        &pool_amm_id,
+                        &base_mint,
+                        &lane,
+                        &post_buy_source_label,
+                        position_slot_id,
+                        "typed_no_het_release",
+                    );
+                    release_record.handoff_accepted = Some(true);
+                    release_record.monitoring_registered = handoff.position_id.is_some();
+                    release_record.position_id = handoff.position_id.clone();
+                    release_record.position_epoch = handoff.position_id.as_ref().map(|_| epoch);
+                    release_record.release_status = Some("released");
+                    release_record.release_reason = Some("terminal_receiver_missing".to_string());
+                    append_post_buy_admission_record(admission_writer, &release_record);
                     warn!(
                         runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                         candidate_id = %candidate_id,
@@ -3112,6 +3581,32 @@ async fn handle_post_buy_event(
                     );
                 }
             }
+        } else if let (Some(tracker), Some(slot_id)) =
+            (config.position_limit_tracker.clone(), position_slot_id)
+        {
+            let released = tracker.release(slot_id);
+            let mut release_record = post_buy_admission_record(
+                position_join_metadata.run_id.clone(),
+                &candidate_id,
+                &pool_amm_id,
+                &base_mint,
+                &lane,
+                &post_buy_source_label,
+                position_slot_id,
+                "rejection_release",
+            );
+            release_record.handoff_accepted = Some(false);
+            release_record.monitoring_registered = false;
+            release_record.release_status = Some(if released {
+                "released"
+            } else {
+                "already_released"
+            });
+            release_record.release_reason = match handoff.ack {
+                DirectPostBuyHandoffAck::Rejected(reason) => Some(reason.to_string()),
+                DirectPostBuyHandoffAck::Accepted => None,
+            };
+            append_post_buy_admission_record(admission_writer, &release_record);
         }
         return finish_direct_handoff(recent_handoffs, &candidate_id, handoff.ack);
     }
@@ -4151,7 +4646,7 @@ fn spawn_shadow_terminal_watcher(
     terminal_rx: oneshot::Receiver<ShadowTerminalDisposition>,
     position_limit_tracker: PositionLimitTracker,
     slot_id: PositionSlotId,
-    candidate_id: String,
+    admission_context: ShadowTerminalWatcherAdmissionContext,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (disposition, action_id, reason) = match terminal_rx.await {
@@ -4178,7 +4673,7 @@ fn spawn_shadow_terminal_watcher(
         if !position_limit_tracker.release(slot_id) {
             warn!(
                 runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-                candidate_id = %candidate_id,
+                candidate_id = %admission_context.candidate_id,
                 slot_id = %slot_id,
                 disposition,
                 action_id = ?action_id,
@@ -4186,9 +4681,26 @@ fn spawn_shadow_terminal_watcher(
                 "PostBuyRuntime: shadow position slot already released before terminal notification"
             );
         } else {
+            let mut record = post_buy_admission_record(
+                admission_context.run_id.clone(),
+                &admission_context.candidate_id,
+                &admission_context.pool_id,
+                &admission_context.base_mint,
+                "shadow",
+                "terminal_watcher",
+                Some(slot_id),
+                "terminal_release",
+            );
+            record.handoff_accepted = Some(true);
+            record.monitoring_registered = admission_context.position_id.is_some();
+            record.position_id = admission_context.position_id.clone();
+            record.position_epoch = admission_context.position_epoch;
+            record.release_status = Some("released");
+            record.release_reason = Some(reason.clone());
+            append_post_buy_admission_record(admission_context.admission_writer.as_ref(), &record);
             info!(
                 runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-                candidate_id = %candidate_id,
+                candidate_id = %admission_context.candidate_id,
                 slot_id = %slot_id,
                 disposition,
                 action_id = ?action_id,
@@ -8739,6 +9251,7 @@ sys.exit(0)
             &mut lifecycle_handles,
             &mut recent_handoffs,
             &shadow_v2_harness,
+            None,
         )
         .await;
 
@@ -8939,8 +9452,20 @@ sys.exit(0)
         assert_eq!(tracker.active_positions(), 1);
 
         let (terminal_tx, terminal_rx) = oneshot::channel();
-        let watcher =
-            spawn_shadow_terminal_watcher(terminal_rx, tracker.clone(), slot_id, candidate_id);
+        let watcher = spawn_shadow_terminal_watcher(
+            terminal_rx,
+            tracker.clone(),
+            slot_id,
+            ShadowTerminalWatcherAdmissionContext {
+                candidate_id,
+                pool_id: pool_amm_id,
+                base_mint,
+                run_id: Some("test-run".to_string()),
+                position_id: Some("test-position".to_string()),
+                position_epoch: Some(1),
+                admission_writer: None,
+            },
+        );
         terminal_tx
             .send(ShadowTerminalDisposition::SimulationBlocked {
                 action_id: "shadow-action:1".to_string(),
@@ -8965,7 +9490,15 @@ sys.exit(0)
             terminal_rx,
             tracker.clone(),
             slot_id,
-            "candidate-shadow-closed".to_string(),
+            ShadowTerminalWatcherAdmissionContext {
+                candidate_id: "candidate-shadow-closed".to_string(),
+                pool_id: Pubkey::new_unique().to_string(),
+                base_mint: mint.to_string(),
+                run_id: Some("test-run".to_string()),
+                position_id: Some("test-position".to_string()),
+                position_epoch: Some(1),
+                admission_writer: None,
+            },
         );
         terminal_tx
             .send(ShadowTerminalDisposition::SimulatedClosed {
@@ -8974,6 +9507,66 @@ sys.exit(0)
             })
             .expect("terminal receiver must remain active");
         watcher.await.expect("watcher should finish");
+        assert_eq!(tracker.active_positions(), 0);
+    }
+
+    #[tokio::test]
+    async fn shadow_terminal_watcher_writes_admission_terminal_release() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let admission_path = tmp.path().join("post_buy_admission_v1.jsonl");
+        let health_path = tmp.path().join("post_buy_admission_health_v1.json");
+        let runtime =
+            PostBuyAdmissionWriterRuntime::start(admission_path.clone(), health_path.clone())
+                .expect("start admission writer");
+        let mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique().to_string();
+        let tracker = PositionLimitTracker::new(1);
+        let slot_id = PositionSlotId::derive(&Pubkey::new_unique(), &mint);
+        tracker
+            .register_existing(slot_id, pool.clone(), mint.to_string())
+            .expect("slot must register");
+
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let watcher = spawn_shadow_terminal_watcher(
+            terminal_rx,
+            tracker.clone(),
+            slot_id,
+            ShadowTerminalWatcherAdmissionContext {
+                candidate_id: "candidate-admission-release".to_string(),
+                pool_id: pool.clone(),
+                base_mint: mint.to_string(),
+                run_id: Some("validation-run".to_string()),
+                position_id: Some(format!("{pool}:{mint}:shadow")),
+                position_epoch: Some(42),
+                admission_writer: runtime.writer(),
+            },
+        );
+        terminal_tx
+            .send(ShadowTerminalDisposition::SimulatedClosed {
+                action_id: "shadow-action:closed".to_string(),
+                reason: "target".to_string(),
+            })
+            .expect("terminal receiver must remain active");
+        watcher.await.expect("watcher should finish");
+        runtime.shutdown().await;
+
+        let content = std::fs::read_to_string(&admission_path).expect("admission jsonl");
+        let row: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("admission row"))
+                .expect("admission json");
+        assert_eq!(row["artifact_type"], "post_buy_admission_v1");
+        assert_eq!(row["stage"], "terminal_release");
+        assert_eq!(row["run_id"], "validation-run");
+        assert_eq!(row["position_epoch"], 42);
+        assert_eq!(row["release_status"], "released");
+        assert_eq!(row["release_reason"], "target");
+        let health: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&health_path).expect("admission health"))
+                .expect("admission health json");
+        assert_eq!(health["artifact_type"], "post_buy_admission_health_v1");
+        assert_eq!(health["admission_attempts"], 1);
+        assert_eq!(health["admission_written"], 1);
+        assert_eq!(health["admission_dropped"], 0);
         assert_eq!(tracker.active_positions(), 0);
     }
 
@@ -8991,7 +9584,15 @@ sys.exit(0)
             terminal_rx,
             tracker.clone(),
             slot_id,
-            "candidate-shadow-dropped".to_string(),
+            ShadowTerminalWatcherAdmissionContext {
+                candidate_id: "candidate-shadow-dropped".to_string(),
+                pool_id: Pubkey::new_unique().to_string(),
+                base_mint: mint.to_string(),
+                run_id: Some("test-run".to_string()),
+                position_id: Some("test-position".to_string()),
+                position_epoch: Some(1),
+                admission_writer: None,
+            },
         );
         drop(terminal_tx);
         watcher.await.expect("watcher should finish");

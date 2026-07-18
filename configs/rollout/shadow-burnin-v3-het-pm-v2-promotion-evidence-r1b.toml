@@ -1,0 +1,208 @@
+# HET_PM_V2_PROMOTION_EVIDENCE_R1B.
+# Purpose: collect an independent HET-PM V2 promotion evidence burn-in scope with a
+# 66000ms Gatekeeper observation window, TimeStop V2 observe-only windows,
+# and exit replay.
+#
+# HET-PM V2 promotion evidence burn-in intentionally derives from the R50
+# logging-only lifecycle/replay profile and adds the accepted PR A HET config:
+# configs/rollout/ghost_brain_het_pm_v2_promotion_evidence_v1.toml
+#
+# This is a data-collection run. It keeps shadow-only execution, FSC disabled
+# by the referenced brain config, and a 60/60 post-run business
+# outcome contract for exit replay collection.
+#
+# Non-goals:
+# - no brain threshold changes
+# - no execution/send-path change
+# - no runtime threshold tuning after start
+# - no active close or shadow_close_only
+# - no production promotion
+
+mode = "production"
+ghost_brain_config_path = "../../configs/rollout/ghost_brain_het_pm_v2_promotion_evidence_v1.toml"
+
+[session]
+active_buy_route_evidence_wait_ms = 1000
+active_buy_route_manifest_cache_enabled = true
+active_buy_route_manifest_cache_ttl_ms = 120000
+
+[selector.simcov.state_readiness_latch]
+enabled = true
+mode = "shadow_only"
+max_wait_ms = 25
+poll_interval_ms = 1
+fail_closed = true
+allow_rpc = false
+
+[seer]
+enabled = true
+source_mode = "grpc"
+commitment = "processed"
+stream_mode = "single_global"
+tx_filter_strategy = "per_pool"
+funding_lane_mode = "disabled"
+grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
+grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+grpc_auth_header = "x-api-key"
+rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"
+enable_pumpfun = true
+enable_bonkfun = false
+enable_raydium = false
+
+[seer.program_streams]
+enabled = true
+endpoint = "events.nln.clr3.org:443"
+auth_header = "x-api-key"
+api_key_env = "NLN_API_KEY"
+api_key_env_fallback = "GHOST_NLN_API_KEY"
+eventstream_policy_header = '{"version":1,"allowed_programs":"all","allowed_topics":["solana.pump_fun.buy","solana.pump_fun.buy_exact_sol_in"]}'
+format = "JSON"
+max_streams = 2
+quota_policy = "fail_fast"
+enabled_topics = [
+  "solana.pump_fun.buy",
+  "solana.pump_fun.buy_exact_sol_in",
+]
+optional_topics = []
+disabled_optional_topics = [
+  "prod.rpc.solana.pumpfun.create",
+  "prod.rpc.solana.pumpfun.transaction",
+  "prod.rpc.solana.program.swaps",
+  "prod.rpc.solana.program.swaps-partitionless",
+]
+disabled_streams = [
+  "prod.rpc.solana.pumpfun.trade",
+  "prod.rpc.solana.system.transfers",
+]
+pumpfun_create_topic = "prod.rpc.solana.pumpfun.create"
+pumpfun_trade_topic = "prod.rpc.solana.pumpfun.trade"
+pumpfun_buy_topic = "solana.pump_fun.buy"
+pumpfun_buy_exact_sol_in_topic = "solana.pump_fun.buy_exact_sol_in"
+system_transfers_topic = "prod.rpc.solana.system.transfers"
+trade_resolver_ttl_ms = 30000
+trade_resolver_per_mint_cap = 256
+trade_resolver_global_cap = 50000
+trade_dedupe_ttl_ms = 300000
+trade_dedupe_max_entries = 250000
+transfer_dedupe_ttl_ms = 300000
+transfer_dedupe_max_entries = 500000
+artifact_capture_enabled = false
+artifact_queue_capacity = 65536
+artifact_flush_interval_ms = 1000
+artifact_transfer_sample_rate = 100
+
+[trigger]
+enabled = true
+rpc_url = "https://spectrum-02.simplystaking.xyz/YnliYXR3cG4tYWRkMTBlODU/1Lo9F06L4a_tRg/solana/mn/900/shared/pruned/rpc/"
+entry_mode = "shadow_only"
+max_concurrent_positions = 64
+max_position_size_sol = 0.007
+emergency_floor_sol = 0.0001
+position_size_buffer_sol = 0.0001
+slippage_tolerance = 0.20
+live_exit_take_profit_pct = 0.60
+live_exit_stop_loss_pct = 0.60
+
+[trigger.shadow_run]
+enabled = true
+shadow_rpc_url = "https://spectrum-02.simplystaking.xyz/YnliYXR3cG4tYWRkMTBlODU/1Lo9F06L4a_tRg/solana/mn/900/shared/pruned/rpc/"
+payer_strategy = "configured"
+commitment = "processed"
+sig_verify = false
+replace_recent_blockhash = true
+timeout_ms = 5000
+max_retries = 1
+max_concurrent = 1
+output_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b-buys.jsonl"
+emit_event_bus = true
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+tx_build_compensation_ms = 200
+max_quote_age_ms = 1500
+entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/shadow_lifecycle.jsonl"
+timing_model = "prepared_entry_mirror"
+stale_policy = "emit_warning"
+
+[execution.events]
+output_dir = "../../datasets/events/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b"
+rotation_interval_ms = 300000
+flush_interval_ms = 1000
+max_file_size_bytes = 50000000
+enable_aem_ticks = true
+enable_optional_events = false
+
+[p37_shadow_probe]
+enabled = true
+namespace = "shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b"
+dispatch_source = "counterfactual_shadow_probe"
+p37_execution_builder_mode = "route_resolver"
+sample_source = "v3_mfs_decision_rows"
+sample_mode = "deterministic_hash_mod"
+sample_modulus = 1
+sample_threshold = 1
+sampling_version = "het-pm-v2-promotion-evidence-r1b-v1"
+run_id = "shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b"
+session_id = "het-pm-v2-promotion-evidence-r1b"
+max_probes_per_run = 100000
+max_probes_per_minute = 500
+max_concurrent = 16
+max_scan_concurrent = 64
+max_probe_candidates_scanned_per_run = 150000
+include_verdict_types = ["BUY", "REJECT", "TIMEOUT", "PENDING"]
+exclude_active_buy_rows = false
+enable_eligibility_precheck = true
+require_ab_record_id = true
+require_materialized_feature_set = true
+require_v3_replay_payload = true
+require_v3_feature_snapshot_hash = true
+require_v3_policy_config_hash = true
+require_execution_route_identity = true
+require_curve_account_state = true
+dedupe_by_probe_id = true
+emit_event_bus = false
+event_bus_mode = "disabled"
+probe_amount_source = "fixed_lamports"
+probe_amount_lamports = 7000000
+probe_slippage_bps = 2000
+probe_quote_age_max_ms = 1500
+probe_curve_age_max_ms = 1500
+probe_wait_for_execution_accounts_ms = 1500
+append = true
+require_unique_namespace = true
+selection_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/probe_selection.jsonl"
+skip_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/probe_skips.jsonl"
+transport_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/probe_shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/probe_shadow_lifecycle.jsonl"
+
+[oracle]
+decision_log_path = "../../logs/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/decisions"
+
+[durability]
+wal_enabled = false
+wal_dir = "../../data/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/wal"
+snapshot_dir = "../../data/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/snapshots"
+
+[metrics]
+enabled = true
+bind = "0.0.0.0"
+port = 9137
+
+[gui_backend]
+enabled = false
+bind_address = "127.0.0.1"
+port = 8837
+
+[logging]
+level = "info"
+console_enabled = true
+json_format = false
+file_enabled = true
+file_path = "../../logs/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/system.log"
+oracle_log_enabled = true
+oracle_log_path = "../../logs/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-r1b/oracle.log"
+oracle_json_format = false

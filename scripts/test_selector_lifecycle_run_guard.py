@@ -17,6 +17,30 @@ import guard_restore_shadow_lifecycle as restore_guard
 
 
 class SelectorLifecycleRunGuardTests(unittest.TestCase):
+    def test_preflight_uses_the_exact_guarded_release_binary(self) -> None:
+        command = launcher.build_preflight_command(
+            Path("/tmp/target/release/ghost-launcher"),
+            Path("/tmp/config.toml"),
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "/tmp/target/release/ghost-launcher",
+                "--config",
+                "/tmp/config.toml",
+                "--preflight",
+            ],
+        )
+        self.assertNotIn("cargo", command)
+
+    def test_runtime_timeout_requests_controlled_launcher_shutdown(self) -> None:
+        self.assertEqual(
+            "timeout --signal=INT --kill-after=120s 5400s ",
+            launcher.build_runtime_timeout_prefix(5400),
+        )
+        self.assertEqual("", launcher.build_runtime_timeout_prefix(None))
+
     def test_event_canary_requires_feature_events_and_diag(self) -> None:
         status, errors = canary.validate_event_canary(
             {
@@ -232,9 +256,14 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
 
         self.assertEqual(0, result["exit_code"])
         tmux_payload = captured["command"][-1]
-        self.assertIn("set -a && [ -f ./.env ] && . ./.env && set +a", tmux_payload)
+        self.assertIn("if [ -f ./.env ]; then . ./.env; fi", tmux_payload)
+        self.assertNotIn("[ -f ./.env ] && . ./.env", tmux_payload)
         self.assertIn('export NLN_API_KEY="$GHOST_SEER_GRPC_X_TOKEN"', tmux_payload)
-        self.assertIn("timeout 5400s", tmux_payload)
+        self.assertIn(
+            "timeout --signal=INT --kill-after=120s 5400s",
+            tmux_payload,
+        )
+        self.assertIn("RUST_BACKTRACE=1", tmux_payload)
         self.assertNotIn("sk_live_", tmux_payload)
 
     def test_launcher_zero_buy_lifecycle_allowance_has_distinct_pass_claim(self) -> None:
@@ -281,8 +310,12 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
             [
                 "--scope",
                 "r37",
+                "--launch-cohort-id",
+                "cohort-r37",
                 "--config",
                 "configs/rollout/r37.toml",
+                "--run-role",
+                "validation",
                 "--tmux-session",
                 "r37",
                 "--allow-zero-buy-lifecycle-proof",

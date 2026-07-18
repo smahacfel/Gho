@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -87,6 +88,16 @@ def mtime_utc(path: Path) -> str | None:
     return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
 
 
+def sha256_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path) -> dict[str, Any]:
     started_at = datetime.now(timezone.utc)
     result = run_command(
@@ -109,10 +120,26 @@ def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path)
         "finished_at_utc": finished_at.isoformat(),
         "runtime_binary": str(launcher),
         "binary_exists": launcher.exists(),
+        "release_binary_sha256": sha256_file(launcher),
         "binary_mtime_utc": mtime_utc(launcher),
         "git_head_at_build": git_head(root),
         "build_freshness_status": PASS_STATUS if build_fresh else "FAIL_STALE_OR_MISSING_BINARY",
     }
+
+
+def build_preflight_command(launcher: Path, config_path: Path) -> list[str]:
+    """Use the same release artifact for preflight and the guarded runtime."""
+    return [str(launcher), "--config", str(config_path), "--preflight"]
+
+
+def build_runtime_timeout_prefix(runtime_timeout_seconds: int | None) -> str:
+    """Request controlled Ctrl+C shutdown, with a hard bounded backstop."""
+    if runtime_timeout_seconds is None or runtime_timeout_seconds <= 0:
+        return ""
+    return (
+        "timeout --signal=INT --kill-after=120s "
+        f"{int(runtime_timeout_seconds)}s "
+    )
 
 
 def validate_scope_contract(
@@ -193,16 +220,14 @@ def start_tmux_session(
     runtime_timeout_seconds: int | None,
 ) -> dict[str, Any]:
     runtime_log.parent.mkdir(parents=True, exist_ok=True)
-    timeout_prefix = ""
-    if runtime_timeout_seconds is not None and runtime_timeout_seconds > 0:
-        timeout_prefix = f"timeout {int(runtime_timeout_seconds)}s "
+    timeout_prefix = build_runtime_timeout_prefix(runtime_timeout_seconds)
     command = (
         f"cd {shlex.quote(str(root))} && "
-        "set -a && [ -f ./.env ] && . ./.env && set +a && "
+        "set -a; if [ -f ./.env ]; then . ./.env; fi; set +a; "
         'if [ -z "${NLN_API_KEY:-}" ] && [ -n "${GHOST_SEER_GRPC_X_TOKEN:-}" ]; then '
         'export NLN_API_KEY="$GHOST_SEER_GRPC_X_TOKEN"; '
         "fi && "
-        f"RUST_LOG=info {timeout_prefix}{shlex.quote(str(launcher))} "
+        f"RUST_LOG=info RUST_BACKTRACE=1 {timeout_prefix}{shlex.quote(str(launcher))} "
         f"--config {shlex.quote(str(config_path))} "
         f">> {shlex.quote(str(runtime_log))} 2>&1"
     )
@@ -287,6 +312,8 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
         f"- claim: `{payload.get('claim')}`",
         f"- run_state: `{payload.get('run_state')}`",
         f"- scope: `{payload.get('scope')}`",
+        f"- run_role: `{payload.get('run_role')}`",
+        f"- launch_cohort_id: `{payload.get('launch_cohort_id')}`",
         f"- config: `{payload.get('config')}`",
         f"- tmux_session: `{payload.get('tmux_session')}`",
         f"- allow_zero_buy_lifecycle_proof: `{payload.get('allow_zero_buy_lifecycle_proof')}`",
@@ -309,6 +336,7 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
             f"- git_head_at_build: `{payload.get('git_head_at_build')}`",
             f"- git_head_at_launch: `{payload.get('git_head_at_launch')}`",
             f"- binary_mtime_utc: `{payload.get('binary_mtime_utc')}`",
+            f"- release_binary_sha256: `{payload.get('release_binary_sha256')}`",
         ]
     )
     errors = payload.get("errors") or []
@@ -363,6 +391,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Start a selector dataset run only after lifecycle safety gates.")
     parser.add_argument("--root", type=Path, default=REPO_ROOT)
     parser.add_argument("--scope", required=True)
+    parser.add_argument("--launch-cohort-id", required=True)
+    parser.add_argument(
+        "--run-role",
+        choices=("calibration", "validation"),
+        required=True,
+        help="Immutable run role recorded before runtime start and verified by promotion manifests.",
+    )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--tmux-session", required=True)
     parser.add_argument("--output-dir", type=Path)
@@ -414,7 +449,10 @@ def main(argv: list[str] | None = None) -> int:
         "claim": "SELECTOR_LIFECYCLE_RUN_START_INCOMPLETE",
         "run_state": "NOT_STARTED",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "launcher_invocation": sys.argv if argv is None else [sys.argv[0], *argv],
         "scope": args.scope,
+        "launch_cohort_id": args.launch_cohort_id,
+        "run_role": args.run_role,
         "config": str(config_path),
         "tmux_session": args.tmux_session,
         "runtime_timeout_seconds": args.runtime_timeout_seconds,
@@ -426,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
         "git_head_at_build": None,
         "git_head_at_launch": None,
         "binary_mtime_utc": mtime_utc(launcher),
+        "release_binary_sha256": sha256_file(launcher),
         "build_freshness": {},
         "storage": {},
         "config_contract": {},
@@ -455,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
         report["build_freshness_status"] = build_report["build_freshness_status"]
         report["git_head_at_build"] = build_report.get("git_head_at_build")
         report["binary_mtime_utc"] = build_report.get("binary_mtime_utc")
+        report["release_binary_sha256"] = build_report.get("release_binary_sha256")
         if build_report["status"] != PASS_STATUS:
             report["errors"].append("release build freshness check failed")
             return finish(report, output_dir, INCONCLUSIVE_ENV_OR_CONFIG)
@@ -463,6 +503,7 @@ def main(argv: list[str] | None = None) -> int:
         report["errors"].append(f"launcher binary missing: {launcher}")
         return finish(report, output_dir, INCONCLUSIVE_ENV_OR_CONFIG)
     report["binary_mtime_utc"] = mtime_utc(launcher)
+    report["release_binary_sha256"] = sha256_file(launcher)
     if not args.build_release_before_start:
         report["build_freshness_status"] = "NOT_REQUESTED"
 
@@ -516,18 +557,7 @@ def main(argv: list[str] | None = None) -> int:
         report["errors"].append("static guard failed")
         return finish(report, output_dir, FAIL_CONFIG_CONTRACT)
 
-    preflight_cmd = [
-        "cargo",
-        "run",
-        "-p",
-        "ghost-launcher",
-        "--bin",
-        "ghost-launcher",
-        "--",
-        "--config",
-        str(resolved_config),
-        "--preflight",
-    ]
+    preflight_cmd = build_preflight_command(launcher, resolved_config)
     preflight = run_command(preflight_cmd, cwd=root, log_path=output_dir / "commands" / "preflight.log")
     report["preflight"] = {
         "status": PASS_STATUS if preflight["exit_code"] == 0 else "FAIL",
@@ -573,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime_timeout_seconds=args.runtime_timeout_seconds,
     )
     report["tmux_start"] = start
+    report["runtime_started_at_utc"] = datetime.now(timezone.utc).isoformat()
     if start["exit_code"] != 0:
         report["errors"].append(start.get("stderr") or "tmux start failed")
         return finish(report, output_dir, FAIL_TMUX)
