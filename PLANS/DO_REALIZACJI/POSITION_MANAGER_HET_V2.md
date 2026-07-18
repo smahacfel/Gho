@@ -1494,6 +1494,12 @@ Missing lub niespełniony minimalny count oznacza FAIL.
   paths są rozwiązywane w runtime (`GHOST_WORKSPACE_ROOT` -> położenie binarki
   -> current directory), ponieważ compile-time env literals nie podlegają
   rustc path remapping;
+- prospective shadow-only run configs używają jawnego `payer_strategy =
+  "ephemeral"`; niezahashowana tożsamość configured walleta nie może wejść do
+  zamrożonego validation contractu przez environment override;
+- preflight keypair/balance probe pozostaje wymagany dla live i configured
+  payera, lecz nie może odrzucać dokładnej kombinacji `shadow_only +
+  shadow_run.enabled + ephemeral`;
 - brak zgodności któregokolwiek build identity albo dirty worktree przed/po buildzie -> FAIL;
 - canonical binary SHA musi zostać odtworzone przez dwa niezależne clean buildy
   przed pierwszym prospective runem;

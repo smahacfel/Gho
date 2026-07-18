@@ -48,6 +48,7 @@ use ghost_launcher::{
     components::wallet_scanner::scan_wallet_positions,
     config::{
         redact_endpoint_for_logs, AppMode, ExecutionMode, LauncherConfig, ResolvedDurabilityConfig,
+        TriggerEntryMode, TriggerShadowPayerStrategy,
     },
     events::create_event_bus,
     events::{GhostEvent, PostBuySource},
@@ -927,24 +928,33 @@ async fn run_preflight(
         }
     }
 
-    let payer = match config.trigger.keypair_path.as_deref() {
-        Some(path) => match read_keypair_file(path) {
-            Ok(keypair) => {
-                println!("[ok] trigger.keypair: {} ({})", path, keypair.pubkey());
-                Some(keypair.pubkey())
-            }
-            Err(err) => {
-                let message = format!("failed to read keypair at {path}: {err}");
+    let uses_ephemeral_shadow_payer = config.trigger.enabled
+        && config.trigger.entry_mode == TriggerEntryMode::ShadowOnly
+        && config.trigger.shadow_run.enabled
+        && config.trigger.shadow_run.payer_strategy == TriggerShadowPayerStrategy::Ephemeral;
+    let payer = if uses_ephemeral_shadow_payer {
+        println!("[ok] trigger.keypair: not required for shadow_only ephemeral payer");
+        None
+    } else {
+        match config.trigger.keypair_path.as_deref() {
+            Some(path) => match read_keypair_file(path) {
+                Ok(keypair) => {
+                    println!("[ok] trigger.keypair: {} ({})", path, keypair.pubkey());
+                    Some(keypair.pubkey())
+                }
+                Err(err) => {
+                    let message = format!("failed to read keypair at {path}: {err}");
+                    eprintln!("[fail] trigger.keypair: {message}");
+                    failures.push(format!("trigger.keypair: {message}"));
+                    None
+                }
+            },
+            None => {
+                let message = "trigger.keypair_path is not configured".to_string();
                 eprintln!("[fail] trigger.keypair: {message}");
                 failures.push(format!("trigger.keypair: {message}"));
                 None
             }
-        },
-        None => {
-            let message = "trigger.keypair_path is not configured".to_string();
-            eprintln!("[fail] trigger.keypair: {message}");
-            failures.push(format!("trigger.keypair: {message}"));
-            None
         }
     };
 
@@ -4119,6 +4129,25 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         .await
         .unwrap_err();
         assert!(err.to_string().contains("trigger.keypair"));
+    }
+
+    #[tokio::test]
+    async fn test_run_preflight_accepts_shadow_only_ephemeral_without_keypair() {
+        let rpc_url = spawn_mock_rpc_server(1_000_000_000).await;
+        let base_dir = tempdir().expect("base dir");
+        let mut config = base_preflight_config(rpc_url, base_dir.path());
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
+        config.trigger.keypair_path = None;
+
+        run_preflight(
+            &config,
+            Path::new("shadow-ephemeral-config.toml"),
+            &pr1_metric_contract_foundation(),
+        )
+        .await
+        .expect("shadow-only ephemeral preflight must not require a configured keypair");
     }
 
     #[tokio::test]

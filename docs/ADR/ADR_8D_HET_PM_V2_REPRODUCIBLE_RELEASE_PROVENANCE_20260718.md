@@ -4,8 +4,8 @@ Data: 2026-07-18
 
 Typ: ADR-8D / PR #73 promotion-evidence prerequisite / release provenance
 
-Status: Accepted and materialized; canonical criteria zostały zablokowane po
-dwóch zgodnych release buildach finalnego source commita.
+Status: Accepted source amendment; criteria wróciły do `calibration_pending`
+po fail-closed preflightcie payer provenance i wymagają finalnego relocku.
 
 ## D1. Problem
 
@@ -63,6 +63,14 @@ Poza zakresem pozostają:
    wybiera artefakty/fingerprint także przez effective flags i profil, więc
    clean raportował `Removed 0 files` i nie gwarantował fresh provenance
    rebuilda.
+9. Pierwszy launcher dry-run przeszedł static lifecycle guard, lecz preflight
+   odrzucił `payer_strategy="configured"` bez jawnego keypair contractu.
+   Podstawienie walleta przez niehashowany environment override zmieniałoby
+   runtime identity poza zamrożonym exact/normalized configiem.
+10. Po zmianie configu na `ephemeral` preflight nadal bezwarunkowo wykonywał
+    configured-keypair check. Była to niespójność z istniejącym
+    `validate_trigger_payer_contract()`, który prawidłowo dopuszcza ten dokładny
+    shadow-only profil bez keypaira.
 
 ## D4. Decyzja
 
@@ -110,6 +118,13 @@ wcześniejszy artefakt z inną wartością embedded `GIT_WORKTREE_CLEAN`.
    runtime z jawnego `GHOST_WORKSPACE_ROOT`, następnie z położenia release
    binary, a ostatecznie z bieżącego katalogu. Zachowuje to dostęp do static i
    config files bez wprowadzania lokalnej ścieżki builda do ELF.
+9. Oba prospective shadow-only run configs używają
+   `payer_strategy="ephemeral"`. Nie wymagają zewnętrznego wallet secretu, a
+   wybór strategii pozostaje częścią exact i normalized config hash.
+10. Preflight pomija odczyt keypaira i balance probe wyłącznie dla
+    `trigger.enabled + shadow_only + shadow_run.enabled + ephemeral`. Live,
+    live-and-shadow oraz configured shadow payer zachowują dotychczasowy
+    fail-closed check.
 
 ## D5. Konsekwencje
 
@@ -198,12 +213,16 @@ wykonał canonical clean `Removed 55 files, 431.8 MiB`, po którym guard równie
 potwierdził brak binarki. Porównanie bajtowe obu ELF i obu criteria zwróciło
 zgodność; w żadnym ELF nie znaleziono lokalnej ścieżki source worktree. Exact
 config map używa pełnych runtime run IDs, a nie skrótów administracyjnych.
+Ten proof został następnie wycofany jako finalny lock, ponieważ launcher
+preflight wykrył niezahashowaną zależność od configured payera. Nie rozpoczęto
+runtime ani tmuxa.
 
 ## D8. Następne kroki
 
-1. Zacommitować canonical locked criteria i ten finalny proof.
-2. Wykonać fail-closed launcher dry-run z dokładnym `validation-v1a` configiem.
-3. Po pozytywnym dry-runie uruchomić `validation-v1a`, następnie niezależne
+1. Zacommitować symetryczny ephemeral-payer config i pending criteria.
+2. Ponownie wykonać dwa canonical buildy i criteria lock.
+3. Wykonać fail-closed launcher dry-run z dokładnym `validation-v1a` configiem.
+4. Po pozytywnym dry-runie uruchomić `validation-v1a`, następnie niezależne
    `validation-v1b`, bez strojenia pomiędzy runami.
 5. Authority cutover pozostaje zabroniony do czasu source-recomputed
    `promotion_gate_passed=true`.
