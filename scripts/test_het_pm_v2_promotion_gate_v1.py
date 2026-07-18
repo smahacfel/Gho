@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import math
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -289,6 +290,52 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
             "path_bps": [[0, 0], [1_000, 100], [3_000, 200]],
         }
 
+    def criteria_template(self) -> dict:
+        template = json.loads(CRITERIA_PATH.read_text(encoding="utf-8"))
+        template["contract_state"] = "calibration_pending"
+        for field in (
+            "expected_runtime_commit_sha",
+            "expected_release_binary_sha256",
+            "expected_brain_config_content_hash",
+            "expected_normalized_behavioral_config_hash",
+            "expected_promotion_tool_hash",
+            "expected_pr_a_analyzer_hash",
+        ):
+            template[field] = "unlocked"
+        template["allowed_exact_run_config_hashes"] = {}
+        gate.validate_criteria(template)
+        return template
+
+    def write_lock_inputs(self, root: Path) -> tuple[Path, Path, Path, Path]:
+        brain = root / "brain.toml"
+        first = root / "first.toml"
+        second = root / "second.toml"
+        binary = root / "ghost-launcher"
+        brain.write_text("[post_buy_guardian.het_pm_v2]\nenabled = true\n", encoding="utf-8")
+        first.write_text(
+            "[p37_shadow_probe]\nrun_id = 'validation-v1a'\n"
+            "session_id = 'a'\nselection_log_path = '/tmp/a.jsonl'\n"
+            "sampling_version = 'frozen-v1'\nmax_probes_per_run = 100\n",
+            encoding="utf-8",
+        )
+        second.write_text(
+            "[p37_shadow_probe]\nrun_id = 'validation-v1b'\n"
+            "session_id = 'b'\nselection_log_path = '/tmp/b.jsonl'\n"
+            "sampling_version = 'frozen-v1'\nmax_probes_per_run = 100\n",
+            encoding="utf-8",
+        )
+        binary.write_bytes(b"release-binary")
+        return brain, first, second, binary
+
+    def git(self, repo: Path, *args: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
     def test_golden_pass_fixture_sets_root_true(self) -> None:
         gates = self.evaluate()
         self.assertTrue(all(result["passed"] for result in gates.values()))
@@ -299,7 +346,14 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         production = json.loads(CRITERIA_PATH.read_text(encoding="utf-8"))
         self.assertEqual(production["policy_version"], 2)
         self.assertEqual(production["comparison_schema_version"], 3)
-        self.assertEqual(production["contract_state"], "calibration_pending")
+        self.assertEqual(production["contract_state"], "locked")
+        self.assertEqual(
+            gate.canonicalize_runtime_commit_sha(
+                production["expected_runtime_commit_sha"],
+                ROOT,
+            ),
+            production["expected_runtime_commit_sha"],
+        )
         for gate_key, prefix in (("executable_trailing", "executable_trailing"), ("vitality_decay", "vitality")):
             thresholds = production["gate_specific_thresholds"][gate_key]["thresholds"]
             self.assertGreaterEqual(thresholds[f"{prefix}_candidate_positions_min"], 100)
@@ -311,32 +365,18 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
     def test_criteria_lock_normalizes_operational_paths_but_binds_exact_run_configs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            brain = root / "brain.toml"
-            first = root / "first.toml"
-            second = root / "second.toml"
-            binary = root / "ghost-launcher"
-            brain.write_text("[post_buy_guardian.het_pm_v2]\nenabled = true\n", encoding="utf-8")
-            first.write_text(
-                "[p37_shadow_probe]\nrun_id = 'validation-v1a'\n"
-                "session_id = 'a'\nselection_log_path = '/tmp/a.jsonl'\n"
-                "sampling_version = 'frozen-v1'\nmax_probes_per_run = 100\n",
-                encoding="utf-8",
-            )
-            second.write_text(
-                "[p37_shadow_probe]\nrun_id = 'validation-v1b'\n"
-                "session_id = 'b'\nselection_log_path = '/tmp/b.jsonl'\n"
-                "sampling_version = 'frozen-v1'\nmax_probes_per_run = 100\n",
-                encoding="utf-8",
-            )
-            binary.write_bytes(b"release-binary")
+            brain, first, second, binary = self.write_lock_inputs(root)
+            runtime_commit = self.criteria["expected_runtime_commit_sha"]
             locked = gate.lock_criteria_template(
-                criteria_template=json.loads(CRITERIA_PATH.read_text(encoding="utf-8")),
-                runtime_commit_sha="a" * 40,
+                criteria_template=self.criteria_template(),
+                runtime_commit_sha=runtime_commit,
                 release_binary=binary,
                 brain_config=brain,
                 run_configs={"validation-v1a": first, "validation-v1b": second},
+                repo_root=ROOT,
             )
             self.assertEqual(locked["contract_state"], "locked")
+            self.assertEqual(locked["expected_runtime_commit_sha"], runtime_commit)
             self.assertEqual(
                 set(locked["allowed_exact_run_config_hashes"]),
                 {"validation-v1a", "validation-v1b"},
@@ -353,11 +393,63 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
             )
             with self.assertRaisesRegex(gate.ContractError, "normalized behavioural contract"):
                 gate.lock_criteria_template(
-                    criteria_template=json.loads(CRITERIA_PATH.read_text(encoding="utf-8")),
-                    runtime_commit_sha="a" * 40,
+                    criteria_template=self.criteria_template(),
+                    runtime_commit_sha=runtime_commit,
                     release_binary=binary,
                     brain_config=brain,
                     run_configs={"validation-v1a": first, "validation-v1b": second},
+                    repo_root=ROOT,
+                )
+
+    def test_criteria_lock_rejects_nonexistent_runtime_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain, first, second, binary = self.write_lock_inputs(root)
+            with self.assertRaisesRegex(gate.ContractError, "does not resolve to a commit"):
+                gate.lock_criteria_template(
+                    criteria_template=self.criteria_template(),
+                    runtime_commit_sha="f" * 40,
+                    release_binary=binary,
+                    brain_config=brain,
+                    run_configs={"validation-v1a": first, "validation-v1b": second},
+                    repo_root=ROOT,
+                )
+
+    def test_criteria_lock_canonicalizes_short_commit_sha(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain, first, second, binary = self.write_lock_inputs(root)
+            runtime_commit = self.criteria["expected_runtime_commit_sha"]
+            locked = gate.lock_criteria_template(
+                criteria_template=self.criteria_template(),
+                runtime_commit_sha=runtime_commit[:12],
+                release_binary=binary,
+                brain_config=brain,
+                run_configs={"validation-v1a": first, "validation-v1b": second},
+                repo_root=ROOT,
+            )
+            self.assertEqual(locked["expected_runtime_commit_sha"], runtime_commit)
+
+    def test_locked_runtime_commit_must_be_ancestor_of_pr_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", str(repo)], check=True, capture_output=True, text=True)
+            self.git(repo, "-c", "user.name=Ghost", "-c", "user.email=ghost@example.invalid", "commit", "--allow-empty", "-m", "main")
+            non_head_commit = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "checkout", "--orphan", "other")
+            self.git(repo, "-c", "user.name=Ghost", "-c", "user.email=ghost@example.invalid", "commit", "--allow-empty", "-m", "other")
+            brain, first, second, binary = self.write_lock_inputs(root)
+
+            with self.assertRaisesRegex(gate.ContractError, "ancestor of the current PR head"):
+                gate.lock_criteria_template(
+                    criteria_template=self.criteria_template(),
+                    runtime_commit_sha=non_head_commit,
+                    release_binary=binary,
+                    brain_config=brain,
+                    run_configs={"validation-v1a": first, "validation-v1b": second},
+                    repo_root=repo,
                 )
 
     def test_each_gate_can_fail_and_forces_root_false(self) -> None:

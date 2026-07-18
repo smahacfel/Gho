@@ -25,6 +25,7 @@ import importlib.util
 import json
 import math
 import re
+import subprocess
 import sys
 import tomllib
 from collections import Counter, defaultdict
@@ -313,6 +314,66 @@ def normalized_behavioral_config_hash(
     }))
 
 
+def canonicalize_runtime_commit_sha(runtime_commit_sha: str, repo_root: Path) -> str:
+    candidate = runtime_commit_sha.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{7,40}", candidate) or set(candidate) == {"0"}:
+        raise ContractError(
+            "criteria lock requires a non-placeholder runtime commit SHA"
+        )
+
+    try:
+        resolved = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "rev-parse",
+                "--verify",
+                f"{candidate}^{{commit}}",
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError as error:
+        raise ContractError(f"cannot verify runtime commit SHA: {error}") from error
+
+    if resolved.returncode != 0:
+        detail = resolved.stderr.strip() or resolved.stdout.strip()
+        raise ContractError(
+            f"runtime commit SHA does not resolve to a commit: {candidate}: {detail}"
+        )
+    canonical = resolved.stdout.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", canonical):
+        raise ContractError("git returned a non-canonical runtime commit SHA")
+
+    try:
+        ancestor = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "merge-base",
+                "--is-ancestor",
+                canonical,
+                "HEAD",
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError as error:
+        raise ContractError(f"cannot verify runtime commit ancestry: {error}") from error
+    if ancestor.returncode != 0:
+        detail = ancestor.stderr.strip() or ancestor.stdout.strip()
+        raise ContractError(
+            "runtime commit SHA must be an ancestor of the current PR head"
+            + (f": {detail}" if detail else "")
+        )
+
+    return canonical
+
+
 def lock_criteria_template(
     *,
     criteria_template: dict[str, Any],
@@ -320,6 +381,7 @@ def lock_criteria_template(
     release_binary: Path,
     brain_config: Path,
     run_configs: dict[str, Path],
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     """Materialize the prospective two-run contract before either run starts.
 
@@ -332,8 +394,10 @@ def lock_criteria_template(
     validate_criteria(criteria_template)
     if criteria_template["contract_state"] != "calibration_pending":
         raise ContractError("criteria lock requires a calibration_pending template")
-    if not re.fullmatch(r"[0-9a-f]{40}", runtime_commit_sha) or set(runtime_commit_sha) == {"0"}:
-        raise ContractError("criteria lock requires a non-placeholder runtime commit SHA")
+    canonical_runtime_commit = canonicalize_runtime_commit_sha(
+        runtime_commit_sha,
+        (repo_root or Path.cwd()).resolve(),
+    )
     if not release_binary.is_file():
         raise ContractError(f"criteria lock release binary missing: {release_binary}")
     if not brain_config.is_file():
@@ -356,7 +420,7 @@ def lock_criteria_template(
     locked = copy.deepcopy(criteria_template)
     locked.update({
         "contract_state": "locked",
-        "expected_runtime_commit_sha": runtime_commit_sha,
+        "expected_runtime_commit_sha": canonical_runtime_commit,
         "expected_release_binary_sha256": sha256(release_binary),
         "expected_brain_config_content_hash": sha256(brain_config),
         "expected_normalized_behavioral_config_hash": normalized_hashes.pop(),
@@ -746,6 +810,10 @@ def validate_criteria(criteria: dict[str, Any]) -> None:
             continue
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", criteria[field]):
             raise ContractError(f"criteria field must be a frozen hex digest: {field}")
+    if contract_state == "locked" and not re.fullmatch(
+        r"[0-9a-f]{40}", criteria["expected_runtime_commit_sha"]
+    ):
+        raise ContractError("locked criteria runtime commit must be a 40-character SHA")
     allowed_run_hashes = require(criteria, "allowed_exact_run_config_hashes", dict)
     for run_id, digest in allowed_run_hashes.items():
         if not isinstance(run_id, str) or not run_id or not isinstance(digest, str) or not re.fullmatch(
@@ -2639,6 +2707,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     manifest = subparsers.add_parser("manifest")
     add_manifest_arguments(manifest)
     lock_parser = subparsers.add_parser("lock-criteria")
+    lock_parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     lock_parser.add_argument("--criteria-template", type=Path, required=True)
     lock_parser.add_argument("--runtime-commit-sha", required=True)
     lock_parser.add_argument("--release-binary", type=Path, required=True)
@@ -2688,6 +2757,7 @@ def main(argv: list[str] | None = None) -> int:
                 release_binary=args.release_binary,
                 brain_config=args.brain_config,
                 run_configs=run_configs,
+                repo_root=args.repo_root,
             )
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_bytes(canonical_json(locked))

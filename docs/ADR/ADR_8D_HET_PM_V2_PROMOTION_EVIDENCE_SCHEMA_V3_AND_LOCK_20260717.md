@@ -5,7 +5,7 @@ Data: 2026-07-17
 Typ: ADR-8D / PR #73 promotion-evidence prerequisite / observe-only telemetry
 
 Status: Accepted and materialized. Contract został zablokowany po buildzie reviewed
-release binary z `7e162a9d1ebd8e62f0079a21897cbd3bfec84057`; criteria zapisują jej
+release binary z `7e162a90846a0425cc3ed01f90bcf2fb52d39c71`; criteria zapisują jej
 SHA-256 `8f38ee7879f4c8ce58b43c3757b4fe1cd09d4b398a07e56d99165c690e6a3804`.
 Pozostaje niepromowalny wyłącznie dlatego, że nie istnieją jeszcze dwa wymagane
 prospective validation runy ani source-recomputed promotion artifact.
@@ -54,12 +54,14 @@ Pełny SHA-256 pliku konfiguracji jest celowo wrażliwy na operational fields (r
    - wspólny `normalized_behavioral_config_hash` obejmujący konfigurację wpływającą na entry/HET/V1/TimeStop/Crash/quote/replay/capacity/sampling.
 
 4. `lock-criteria` jest jedynym dozwolonym sposobem zmiany template z `calibration_pending` na `locked`. Komenda wymaga:
-   - pełnego reviewed commit SHA;
+   - reviewed commit SHA lub jego jednoznacznego skrótu, kanonizowanego przez Git
+     do pełnego commita;
    - istniejącej release binary i jej SHA-256;
    - brain configu;
    - co najmniej dwóch konkretnych run configów;
    - identycznego znormalizowanego behavioural hash;
    - dwóch różnych exact run-config hashy.
+   - potwierdzenia, że commit istnieje i jest ancestor aktualnego PR head.
 
    `evaluate` i source-recomputing `validate` odmawiają pracy z criteria niebędącym `locked`.
 
