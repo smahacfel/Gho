@@ -1484,6 +1484,10 @@ Missing lub niespełniony minimalny count oznacza FAIL.
   checkout/`OUT_DIR` paths nie zmieniały bytes pomiędzy detached worktrees;
 - criteria i launcher proof utrwalają stabilny rustflags/remap contract, a nie
   lokalną ścieżkę checkoutu;
+- produkcyjne komponenty nie osadzają `CARGO_MANIFEST_DIR`; workspace/static
+  paths są rozwiązywane w runtime (`GHOST_WORKSPACE_ROOT` -> położenie binarki
+  -> current directory), ponieważ compile-time env literals nie podlegają
+  rustc path remapping;
 - brak zgodności któregokolwiek build identity albo dirty worktree przed/po buildzie -> FAIL;
 - canonical binary SHA musi zostać odtworzone przez dwa niezależne clean buildy
   przed pierwszym prospective runem;

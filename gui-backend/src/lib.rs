@@ -36,6 +36,7 @@ pub mod server;
 pub mod state;
 pub mod ui_config;
 pub mod websocket;
+mod workspace;
 
 pub use config::GuiBackendConfig;
 pub use portfolio::{PortfolioConfig, PortfolioState, PortfolioTracker, TokenPosition};

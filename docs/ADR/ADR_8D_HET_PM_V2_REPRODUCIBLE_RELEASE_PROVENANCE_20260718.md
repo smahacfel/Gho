@@ -54,6 +54,10 @@ Poza zakresem pozostają:
    różne SHA, ponieważ kod wygenerowany przez protobuf zawierał absolutny
    `OUT_DIR` zależny od ścieżki detached worktree. Sam lockfile i toolchain nie
    usuwają checkout-path entropy z wynikowego ELF.
+7. Po remapowaniu rustc pozostała jeszcze absolutna wartość
+   `env!("CARGO_MANIFEST_DIR")` w produkcyjnym `gui-backend`. Literały z makr
+   środowiskowych nie podlegają `--remap-path-prefix`, więc wymagały runtime
+   workspace discovery zamiast compile-time source path.
 
 ## D4. Decyzja
 
@@ -93,6 +97,10 @@ wcześniejszy artefakt z inną wartością embedded `GIT_WORKTREE_CLEAN`.
    runtime authority, bo proces validation nie zostaje uruchomiony.
 7. Criteria/tool/promotion/run-manifest schema przechodzą na wersję 4; HET
    policy version 2 i comparison schema version 3 pozostają bez zmian.
+8. `gui-backend` nie osadza source checkout path. Workspace jest wykrywany w
+   runtime z jawnego `GHOST_WORKSPACE_ROOT`, następnie z położenia release
+   binary, a ostatecznie z bieżącego katalogu. Zachowuje to dostęp do static i
+   config files bez wprowadzania lokalnej ścieżki builda do ELF.
 
 ## D5. Konsekwencje
 
@@ -113,6 +121,7 @@ Zmiany obejmują:
 - `rust-toolchain.toml`;
 - `scripts/start_selector_lifecycle_run.py`;
 - `scripts/het_pm_v2_promotion_gate_v1.py`;
+- `gui-backend/src/workspace.rs` i trzy istniejące GUI call sites;
 - testy obu narzędzi;
 - `PLANS/DO_REALIZACJI/HET_PM_V2_PROMOTION_CRITERIA_V1.json`.
 

@@ -7,6 +7,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use toml_edit::{value, DocumentMut, Item, Table};
 
+use crate::workspace::detect_workspace_root;
+
 const ROOT_CONFIG_FILE: &str = "config.toml";
 const GHOST_BRAIN_CONFIG_FILE: &str = "ghost-brain/ghost_brain_config.toml";
 const DEFAULT_SECRET_ENV_FILE: &str = ".env";
@@ -169,14 +171,6 @@ impl UiConfigStore {
             .parse::<DocumentMut>()
             .with_context(|| format!("Failed to parse TOML {}", path.display()))
     }
-}
-
-fn detect_workspace_root() -> PathBuf {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| manifest_dir.to_path_buf())
 }
 
 fn load_secret_env(config_dir: &Path) -> Result<LoadedSecretEnv> {

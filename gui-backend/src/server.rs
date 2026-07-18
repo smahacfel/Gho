@@ -20,6 +20,7 @@ use crate::api::{
 use crate::config::GuiBackendConfig;
 use crate::state::AppState;
 use crate::websocket::websocket_handler;
+use crate::workspace::detect_workspace_root;
 
 /// GUI Backend server
 pub struct GuiBackend {
@@ -52,7 +53,7 @@ impl GuiBackend {
     /// Build the router with all endpoints
     fn build_router(&self) -> Router {
         // Create static file service
-        let static_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static");
+        let static_dir = detect_workspace_root().join("gui-backend/static");
         let serve_dir = ServeDir::new(static_dir);
 
         Router::new()

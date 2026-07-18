@@ -2,8 +2,10 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::process::Command;
+
+use crate::workspace::detect_workspace_root;
 
 const DEFAULT_SESSION_NAME: &str = "ghost_launcher";
 
@@ -141,14 +143,6 @@ impl ProcessController {
         }
         Ok(())
     }
-}
-
-fn detect_workspace_root() -> PathBuf {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| manifest_dir.to_path_buf())
 }
 
 fn shell_escape_string(input: &str) -> String {
