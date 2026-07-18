@@ -83,6 +83,8 @@ stabilną postać
 `--remap-path-prefix=<runtime-source-root>=/workspace/ghost`.
 Ten sam encoded rustflags env obowiązuje clean i build, a clean jawnie wybiera
 profil `--release`; rozdzielenie środowisk albo profili jest błędem kontraktu.
+Po udanym cleanie zarówno criteria locker, jak i launcher wymagają, aby
+`target/release/ghost-launcher` nie istniał przed rozpoczęciem builda.
 
 Package clean jest wymagany, ponieważ no-op Cargo build mógłby zachować
 wcześniejszy artefakt z inną wartością embedded `GIT_WORKTREE_CLEAN`.

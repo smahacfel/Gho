@@ -375,6 +375,13 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
             }
             completed = subprocess.CompletedProcess(args=[], returncode=0)
 
+            def run_command(command: list[str], **_: object) -> subprocess.CompletedProcess:
+                if command == list(gate.RELEASE_CLEAN_COMMAND):
+                    binary.unlink()
+                elif command == list(gate.RELEASE_BUILD_COMMAND):
+                    binary.write_bytes(b"rebuilt-release-binary")
+                return completed
+
             with (
                 mock.patch.object(
                     gate, "command_stdout", return_value=runtime_commit
@@ -391,7 +398,7 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                 mock.patch.object(
                     gate.subprocess,
                     "run",
-                    side_effect=[completed, completed],
+                    side_effect=run_command,
                 ) as run,
             ):
                 gate.materialize_runtime_release_build(
@@ -403,6 +410,36 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
             self.assertEqual(2, run.call_count)
             self.assertEqual(canonical_env, run.call_args_list[0].kwargs["env"])
             self.assertEqual(canonical_env, run.call_args_list[1].kwargs["env"])
+
+    def test_materialized_release_rejects_clean_that_leaves_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "target" / "release" / "ghost-launcher"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"stale-release-binary")
+            runtime_commit = "a" * 40
+            completed = subprocess.CompletedProcess(args=[], returncode=0)
+
+            with (
+                mock.patch.object(
+                    gate, "command_stdout", return_value=runtime_commit
+                ),
+                mock.patch.object(
+                    gate, "inspect_runtime_build_contract", return_value={}
+                ),
+                mock.patch.object(
+                    gate, "canonical_release_build_env", return_value={}
+                ),
+                mock.patch.object(gate.subprocess, "run", return_value=completed),
+            ):
+                with self.assertRaisesRegex(
+                    gate.ContractError, "clean left release binary"
+                ):
+                    gate.materialize_runtime_release_build(
+                        runtime_source_root=root,
+                        runtime_commit_sha=runtime_commit,
+                        release_binary=binary,
+                    )
 
     def test_golden_pass_fixture_sets_root_true(self) -> None:
         gates = self.evaluate()

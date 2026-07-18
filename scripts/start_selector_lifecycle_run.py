@@ -189,6 +189,7 @@ def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path)
         log_path=output_dir / "commands" / "cargo_clean_release_provenance_packages.log",
         env=build_env,
     )
+    binary_absent_after_clean = not launcher.exists()
     result = run_command(
         RELEASE_BUILD_COMMAND,
         cwd=root,
@@ -197,12 +198,12 @@ def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path)
     )
     finished_at = datetime.now(timezone.utc)
     worktree_clean_after_build = git_worktree_is_clean(root)
-    # Cargo may legitimately no-op when the release binary is already up to date.
-    # The freshness contract is that this launcher ran Cargo successfully before
-    # start and the expected release binary exists; binary_mtime is provenance,
-    # not a rebuild-required gate.
+    # Freshness requires the canonical clean to remove any prior launcher before
+    # the canonical build recreates it.  Binary mtime remains provenance rather
+    # than an independent acceptance gate.
     build_fresh = (
         clean_result["exit_code"] == 0
+        and binary_absent_after_clean
         and result["exit_code"] == 0
         and launcher.exists()
         and worktree_clean_before_build
@@ -224,6 +225,7 @@ def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path)
         "clean_command": clean_result["command"],
         "clean_exit_code": clean_result["exit_code"],
         "clean_log_path": clean_result["log_path"],
+        "binary_absent_after_clean": binary_absent_after_clean,
         "command": result["command"],
         "exit_code": result["exit_code"],
         "log_path": result["log_path"],

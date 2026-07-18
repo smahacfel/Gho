@@ -24,6 +24,20 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
             launcher_path.parent.mkdir(parents=True)
             launcher_path.write_bytes(b"binary")
             output_dir = root / "reports" / "run"
+
+            def run_command(command: list[str], **_: object) -> dict[str, object]:
+                if command == list(launcher.RELEASE_CLEAN_COMMAND):
+                    launcher_path.unlink()
+                    label = "clean"
+                else:
+                    launcher_path.write_bytes(b"rebuilt-binary")
+                    label = "build"
+                return {
+                    "command": command,
+                    "exit_code": 0,
+                    "log_path": str(output_dir / f"{label}.log"),
+                }
+
             with (
                 mock.patch.object(launcher, "git_worktree_is_clean", side_effect=[True, True]),
                 mock.patch.object(launcher, "tracked_file_sha256", side_effect=["1" * 64, "2" * 64, "3" * 64]),
@@ -31,18 +45,7 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
                 mock.patch.object(
                     launcher,
                     "run_command",
-                    side_effect=[
-                        {
-                            "command": list(launcher.RELEASE_CLEAN_COMMAND),
-                            "exit_code": 0,
-                            "log_path": str(output_dir / "clean.log"),
-                        },
-                        {
-                            "command": list(launcher.RELEASE_BUILD_COMMAND),
-                            "exit_code": 0,
-                            "log_path": str(output_dir / "build.log"),
-                        },
-                    ],
+                    side_effect=run_command,
                 ) as run_build,
             ):
                 report = launcher.run_release_build_before_start(
@@ -53,6 +56,7 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
         self.assertEqual(list(launcher.RELEASE_BUILD_COMMAND), report["command"])
         self.assertTrue(report["worktree_clean_before_build"])
         self.assertTrue(report["worktree_clean_after_build"])
+        self.assertTrue(report["binary_absent_after_clean"])
         self.assertEqual(2, run_build.call_count)
         self.assertEqual(
             list(launcher.RELEASE_CLEAN_COMMAND),
@@ -108,6 +112,46 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
 
         self.assertEqual(launcher.INCONCLUSIVE_ENV_OR_CONFIG, report["status"])
         self.assertFalse(report["worktree_clean_before_build"])
+
+    def test_release_build_rejects_clean_that_leaves_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher_path = root / "target" / "release" / "ghost-launcher"
+            launcher_path.parent.mkdir(parents=True)
+            launcher_path.write_bytes(b"stale-binary")
+            with (
+                mock.patch.object(
+                    launcher, "git_worktree_is_clean", side_effect=[True, True]
+                ),
+                mock.patch.object(
+                    launcher, "tracked_file_sha256", return_value="1" * 64
+                ),
+                mock.patch.object(
+                    launcher, "sha256_command_stdout", return_value="2" * 64
+                ),
+                mock.patch.object(
+                    launcher,
+                    "run_command",
+                    side_effect=[
+                        {
+                            "command": list(launcher.RELEASE_CLEAN_COMMAND),
+                            "exit_code": 0,
+                            "log_path": str(root / "clean.log"),
+                        },
+                        {
+                            "command": list(launcher.RELEASE_BUILD_COMMAND),
+                            "exit_code": 0,
+                            "log_path": str(root / "build.log"),
+                        },
+                    ],
+                ),
+            ):
+                report = launcher.run_release_build_before_start(
+                    root, root / "reports", launcher_path
+                )
+
+        self.assertEqual(launcher.INCONCLUSIVE_ENV_OR_CONFIG, report["status"])
+        self.assertFalse(report["binary_absent_after_clean"])
 
     def test_preflight_uses_the_exact_guarded_release_binary(self) -> None:
         command = launcher.build_preflight_command(

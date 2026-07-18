@@ -1486,6 +1486,8 @@ Missing lub niespełniony minimalny count oznacza FAIL.
   rustflags env co build i jawnie wybiera profil `--release`; `Removed 0 files`
   spowodowane innym profilem/fingerprintem nie może udawać fresh provenance
   rebuilda;
+- launcher i criteria locker wymagają nieobecności release binary bezpośrednio
+  po cleanie i przed buildem;
 - criteria i launcher proof utrwalają stabilny rustflags/remap contract, a nie
   lokalną ścieżkę checkoutu;
 - produkcyjne komponenty nie osadzają `CARGO_MANIFEST_DIR`; workspace/static

@@ -315,6 +315,8 @@ def materialize_runtime_release_build(
         )
         if clean.returncode != 0:
             raise ContractError("canonical provenance package clean failed")
+        if release_binary.exists():
+            raise ContractError("canonical provenance package clean left release binary")
         build = subprocess.run(
             list(RELEASE_BUILD_COMMAND),
             cwd=runtime_source_root,
