@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -361,6 +362,47 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
 
     def current_runtime_commit(self) -> str:
         return self.git(ROOT, "rev-parse", "HEAD")
+
+    def test_materialized_release_clean_and_build_share_canonical_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "target" / "release" / "ghost-launcher"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"release-binary")
+            runtime_commit = "a" * 40
+            canonical_env = {
+                "CARGO_ENCODED_RUSTFLAGS": "-C\x1ftarget-cpu=native"
+            }
+            completed = subprocess.CompletedProcess(args=[], returncode=0)
+
+            with (
+                mock.patch.object(
+                    gate, "command_stdout", return_value=runtime_commit
+                ),
+                mock.patch.object(
+                    gate, "inspect_runtime_build_contract", return_value={}
+                ),
+                mock.patch.object(
+                    gate,
+                    "canonical_release_build_env",
+                    return_value=canonical_env,
+                ),
+                mock.patch.object(gate, "git_worktree_is_clean", return_value=True),
+                mock.patch.object(
+                    gate.subprocess,
+                    "run",
+                    side_effect=[completed, completed],
+                ) as run,
+            ):
+                gate.materialize_runtime_release_build(
+                    runtime_source_root=root,
+                    runtime_commit_sha=runtime_commit,
+                    release_binary=binary,
+                )
+
+            self.assertEqual(2, run.call_count)
+            self.assertEqual(canonical_env, run.call_args_list[0].kwargs["env"])
+            self.assertEqual(canonical_env, run.call_args_list[1].kwargs["env"])
 
     def test_golden_pass_fixture_sets_root_true(self) -> None:
         gates = self.evaluate()

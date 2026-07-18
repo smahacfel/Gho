@@ -59,6 +59,10 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
             run_build.call_args_list[0].args[0],
         )
         self.assertEqual(
+            launcher.canonical_release_build_env(root)["CARGO_ENCODED_RUSTFLAGS"],
+            run_build.call_args_list[0].kwargs["env"]["CARGO_ENCODED_RUSTFLAGS"],
+        )
+        self.assertEqual(
             list(launcher.RELEASE_BUILD_COMMAND),
             run_build.call_args_list[1].args[0],
         )

@@ -180,17 +180,19 @@ def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path)
         ["rustc", "--print", "cfg", "-C", "target-cpu=native"],
         cwd=root,
     )
+    build_env = canonical_release_build_env(root)
     started_at = datetime.now(timezone.utc)
     clean_result = run_command(
         RELEASE_CLEAN_COMMAND,
         cwd=root,
         log_path=output_dir / "commands" / "cargo_clean_release_provenance_packages.log",
+        env=build_env,
     )
     result = run_command(
         RELEASE_BUILD_COMMAND,
         cwd=root,
         log_path=output_dir / "commands" / "cargo_build_release_ghost_launcher.log",
-        env=canonical_release_build_env(root),
+        env=build_env,
     )
     finished_at = datetime.now(timezone.utc)
     worktree_clean_after_build = git_worktree_is_clean(root)

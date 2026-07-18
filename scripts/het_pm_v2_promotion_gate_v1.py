@@ -304,11 +304,13 @@ def materialize_runtime_release_build(
     if release_binary.resolve() != expected_binary:
         raise ContractError("release binary must be the runtime worktree release artifact")
     contract = inspect_runtime_build_contract(runtime_source_root)
+    build_env = canonical_release_build_env(runtime_source_root)
     try:
         clean = subprocess.run(
             list(RELEASE_CLEAN_COMMAND),
             cwd=runtime_source_root,
             check=False,
+            env=build_env,
         )
         if clean.returncode != 0:
             raise ContractError("canonical provenance package clean failed")
@@ -316,7 +318,7 @@ def materialize_runtime_release_build(
             list(RELEASE_BUILD_COMMAND),
             cwd=runtime_source_root,
             check=False,
-            env=canonical_release_build_env(runtime_source_root),
+            env=build_env,
         )
     except OSError as error:
         raise ContractError(f"cannot execute locked release build: {error}") from error

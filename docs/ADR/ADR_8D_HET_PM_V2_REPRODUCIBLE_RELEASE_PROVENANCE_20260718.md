@@ -4,8 +4,8 @@ Data: 2026-07-18
 
 Typ: ADR-8D / PR #73 promotion-evidence prerequisite / release provenance
 
-Status: Accepted and materialized; canonical criteria lock został zapisany po
-dwóch zgodnych clean buildach commita runtime.
+Status: Accepted source amendment; criteria wróciły do `calibration_pending`
+po wykryciu mismatchu clean/build env i wymagają finalnego relocku.
 
 ## D1. Problem
 
@@ -58,6 +58,10 @@ Poza zakresem pozostają:
    `env!("CARGO_MANIFEST_DIR")` w produkcyjnym `gui-backend`. Literały z makr
    środowiskowych nie podlegają `--remap-path-prefix`, więc wymagały runtime
    workspace discovery zamiast compile-time source path.
+8. Canonical package clean początkowo nie otrzymywał tego samego
+   `CARGO_ENCODED_RUSTFLAGS` co build. Cargo wybiera artefakty/fingerprint także
+   przez effective flags, więc clean raportował `Removed 0 files` i nie
+   gwarantował fresh provenance rebuilda.
 
 ## D4. Decyzja
 
@@ -76,6 +80,8 @@ CARGO_ENCODED_RUSTFLAGS='-C<US>target-cpu=native<US>--remap-path-prefix=<runtime
 Rzeczywista ścieżka source root jest dynamiczna, ale trwały kontrakt przechowuje
 stabilną postać
 `--remap-path-prefix=<runtime-source-root>=/workspace/ghost`.
+Ten sam encoded rustflags env obowiązuje clean i build; rozdzielenie środowisk
+jest błędem kontraktu.
 
 Package clean jest wymagany, ponieważ no-op Cargo build mógłby zachować
 wcześniejszy artefakt z inną wartością embedded `GIT_WORKTREE_CLEAN`.
@@ -149,7 +155,7 @@ criteria expected_release_binary_sha256 == clean build SHA-256
 launcher proof release/build identities == criteria
 ```
 
-Zmaterializowany wynik:
+Dowód reprodukowalności uzyskany przed finalnym clean-env amendmentem:
 
 ```text
 runtime source commit = 4617024ff49ac59c80b7b5e6a47fb5a8577c5556
@@ -164,13 +170,18 @@ normalized behavioral config SHA-256 = bfa1a00497ab9b4babe4cc8198ade4d424e52ff70
 criteria. `strings` nie znalazł lokalnej ścieżki żadnego detached worktree w
 odpowiadającej mu binarce.
 
+Ten wynik potwierdza usunięcie path entropy, ale nie jest finalnym prospective
+lockiem: późniejszy audyt wykazał `Removed 0 files` przy clean uruchomionym bez
+canonical rustflags env. Criteria zostały świadomie cofnięte do pending, a
+finalny source commit musi zostać ponownie zbudowany i zablokowany.
+
 ## D8. Następne kroki
 
-1. Source contract został zacommitowany w stanie `calibration_pending`.
-2. Dwa clean detached worktrees odtworzyły identyczną binarkę.
-3. Canonical `lock-criteria` został zmaterializowany; pozostaje commit criteria
-   i launcher dry-run.
-4. Po tych kontrolach uruchomić `validation-v1a`, następnie niezależne
+1. Zacommitować finalny source contract w stanie `calibration_pending`.
+2. Potwierdzić, że clean z canonical env rzeczywiście usuwa provenance packages.
+3. Ponownie odtworzyć identyczną binarkę w dwóch detached worktrees i wykonać
+   canonical `lock-criteria` z pełnymi runtime run IDs.
+4. Po commicie criteria i launcher dry-run uruchomić `validation-v1a`, następnie niezależne
    `validation-v1b`, bez strojenia pomiędzy runami.
 5. Authority cutover pozostaje zabroniony do czasu source-recomputed
    `promotion_gate_passed=true`.

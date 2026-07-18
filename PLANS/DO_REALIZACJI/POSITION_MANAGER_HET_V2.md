@@ -1482,6 +1482,9 @@ Missing lub niespełniony minimalny count oznacza FAIL.
 - canonical release build ustawia `CARGO_ENCODED_RUSTFLAGS` z `target-cpu=native`
   oraz `--remap-path-prefix=<runtime-source-root>=/workspace/ghost`, aby absolutne
   checkout/`OUT_DIR` paths nie zmieniały bytes pomiędzy detached worktrees;
+- canonical package clean jest uruchamiany z dokładnie tym samym encoded
+  rustflags env co build; `Removed 0 files` spowodowane innym fingerprintem nie
+  może udawać fresh provenance rebuilda;
 - criteria i launcher proof utrwalają stabilny rustflags/remap contract, a nie
   lokalną ścieżkę checkoutu;
 - produkcyjne komponenty nie osadzają `CARGO_MANIFEST_DIR`; workspace/static
