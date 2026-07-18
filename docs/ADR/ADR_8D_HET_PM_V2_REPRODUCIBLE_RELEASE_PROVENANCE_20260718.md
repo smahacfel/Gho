@@ -4,8 +4,8 @@ Data: 2026-07-18
 
 Typ: ADR-8D / PR #73 promotion-evidence prerequisite / release provenance
 
-Status: Accepted source amendment; criteria wróciły do `calibration_pending`
-po fail-closed preflightcie payer provenance i wymagają finalnego relocku.
+Status: Accepted and materialized; canonical criteria zostały zablokowane po
+dwóch zgodnych release buildach self-contained shadow payer contractu.
 
 ## D1. Problem
 
@@ -217,12 +217,31 @@ Ten proof został następnie wycofany jako finalny lock, ponieważ launcher
 preflight wykrył niezahashowaną zależność od configured payera. Nie rozpoczęto
 runtime ani tmuxa.
 
+Ostateczny self-contained proof:
+
+```text
+runtime source commit = 868ab2a7cffbc54cca26267667fe5ac59ab6a918
+clean build A SHA-256 = 7e81263d8a8b49bae82a00a5f20ada2a7922674a95abd18f13816d17a5457b89
+clean build B SHA-256 = 7e81263d8a8b49bae82a00a5f20ada2a7922674a95abd18f13816d17a5457b89
+canonical criteria SHA-256 = 999e6d646b763664e8a7f2f6a3c5ccd3915329208e77806952983008724228b3
+promotion tool SHA-256 = 18b25934a7849b81982ff79f67c3f0afe8b22cfeb6d0a3176f400d7489a59491
+PR-A analyzer SHA-256 = 5e26d19b10ea2613f0da9c4e532d60cc9a646ee000289befdd98f4f6f9e1faa0
+brain config SHA-256 = 7fc14662d1433872978dcb8d5be0413c7f7769905b6b84f36f6bc46f7e9a2028
+normalized behavioral config SHA-256 = c88bdb599b678ba45e70ac616487049d2d93e64197d9af251fb907cf556c2027
+validation-v1a exact config SHA-256 = c5b868ded6881de1a531e931610dcd6054fd2b512bb43c8fd86f4781b629fca0
+validation-v1b exact config SHA-256 = 2715ff34ae8204b48c2c3e3a113217d227e379c016513e158c530688fd6550b6
+```
+
+Oba worktree wykonały canonical release clean (`Removed 55 files, 431.8 MiB`)
+i przeszły boundary wymagającą nieobecności starej binarki przed buildem. ELF i
+criteria są identyczne bajtowo pomiędzy worktrees; lokalne source paths są
+nieobecne. Locked run configs jawnie kodują `payer_strategy="ephemeral"`.
+
 ## D8. Następne kroki
 
-1. Zacommitować symetryczny ephemeral-payer config i pending criteria.
-2. Ponownie wykonać dwa canonical buildy i criteria lock.
-3. Wykonać fail-closed launcher dry-run z dokładnym `validation-v1a` configiem.
-4. Po pozytywnym dry-runie uruchomić `validation-v1a`, następnie niezależne
+1. Zacommitować canonical locked criteria i ostateczny proof.
+2. Wykonać fail-closed launcher dry-run z dokładnym `validation-v1a` configiem.
+3. Po pozytywnym dry-runie uruchomić `validation-v1a`, następnie niezależne
    `validation-v1b`, bez strojenia pomiędzy runami.
 5. Authority cutover pozostaje zabroniony do czasu source-recomputed
    `promotion_gate_passed=true`.
