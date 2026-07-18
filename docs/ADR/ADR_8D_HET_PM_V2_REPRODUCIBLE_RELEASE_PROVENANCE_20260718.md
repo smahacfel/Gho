@@ -4,8 +4,8 @@ Data: 2026-07-18
 
 Typ: ADR-8D / PR #73 promotion-evidence prerequisite / release provenance
 
-Status: Accepted; canonical criteria lock zostanie zmaterializowany dopiero po
-commicie niniejszego source contractu i dwóch zgodnych clean buildach.
+Status: Accepted and materialized; canonical criteria lock został zapisany po
+dwóch zgodnych clean buildach commita runtime.
 
 ## D1. Problem
 
@@ -149,13 +149,28 @@ criteria expected_release_binary_sha256 == clean build SHA-256
 launcher proof release/build identities == criteria
 ```
 
+Zmaterializowany wynik:
+
+```text
+runtime source commit = 4617024ff49ac59c80b7b5e6a47fb5a8577c5556
+clean build A SHA-256 = 530e7b157a725d4b869fa0e88fac639a397febb53b582a044faae773617a7656
+clean build B SHA-256 = 530e7b157a725d4b869fa0e88fac639a397febb53b582a044faae773617a7656
+canonical criteria SHA-256 = 77e3ab706952d2c1490017d2e5a5137c561814da800a9a651dbb726ef4c1f851
+brain config SHA-256 = 7fc14662d1433872978dcb8d5be0413c7f7769905b6b84f36f6bc46f7e9a2028
+normalized behavioral config SHA-256 = bfa1a00497ab9b4babe4cc8198ade4d424e52ff70f38c882cfcee0939ef6ceac
+```
+
+`cmp` potwierdził identyczne bytes obu binarek i obu niezależnie wygenerowanych
+criteria. `strings` nie znalazł lokalnej ścieżki żadnego detached worktree w
+odpowiadającej mu binarce.
+
 ## D8. Następne kroki
 
-1. Zacommitować source contract w stanie `calibration_pending`.
-2. Zbudować dwa razy z clean detached worktree na tym samym commicie.
-3. Jeżeli SHA są identyczne, wykonać canonical `lock-criteria` i zacommitować
-   materialized criteria.
-4. Dopiero wtedy uruchomić `validation-v1a`, następnie niezależne
+1. Source contract został zacommitowany w stanie `calibration_pending`.
+2. Dwa clean detached worktrees odtworzyły identyczną binarkę.
+3. Canonical `lock-criteria` został zmaterializowany; pozostaje commit criteria
+   i launcher dry-run.
+4. Po tych kontrolach uruchomić `validation-v1a`, następnie niezależne
    `validation-v1b`, bez strojenia pomiędzy runami.
 5. Authority cutover pozostaje zabroniony do czasu source-recomputed
    `promotion_gate_passed=true`.
