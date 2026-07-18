@@ -59,9 +59,10 @@ Poza zakresem pozostają:
    środowiskowych nie podlegają `--remap-path-prefix`, więc wymagały runtime
    workspace discovery zamiast compile-time source path.
 8. Canonical package clean początkowo nie otrzymywał tego samego
-   `CARGO_ENCODED_RUSTFLAGS` co build. Cargo wybiera artefakty/fingerprint także
-   przez effective flags, więc clean raportował `Removed 0 files` i nie
-   gwarantował fresh provenance rebuilda.
+   `CARGO_ENCODED_RUSTFLAGS` co build ani jawnego profilu `--release`. Cargo
+   wybiera artefakty/fingerprint także przez effective flags i profil, więc
+   clean raportował `Removed 0 files` i nie gwarantował fresh provenance
+   rebuilda.
 
 ## D4. Decyzja
 
@@ -71,7 +72,7 @@ Poza zakresem pozostają:
    zawierają/osadzają provenance, a następnie buduje locked release:
 
 ```text
-cargo clean -p ghost-brain -p ghost-launcher
+cargo clean --release -p ghost-brain -p ghost-launcher
 CARGO_ENCODED_RUSTFLAGS='-C<US>target-cpu=native<US>--remap-path-prefix=<runtime-source-root>=/workspace/ghost' \
   cargo build --release --locked -p ghost-launcher
 ```
@@ -80,8 +81,8 @@ CARGO_ENCODED_RUSTFLAGS='-C<US>target-cpu=native<US>--remap-path-prefix=<runtime
 Rzeczywista ścieżka source root jest dynamiczna, ale trwały kontrakt przechowuje
 stabilną postać
 `--remap-path-prefix=<runtime-source-root>=/workspace/ghost`.
-Ten sam encoded rustflags env obowiązuje clean i build; rozdzielenie środowisk
-jest błędem kontraktu.
+Ten sam encoded rustflags env obowiązuje clean i build, a clean jawnie wybiera
+profil `--release`; rozdzielenie środowisk albo profili jest błędem kontraktu.
 
 Package clean jest wymagany, ponieważ no-op Cargo build mógłby zachować
 wcześniejszy artefakt z inną wartością embedded `GIT_WORKTREE_CLEAN`.
@@ -142,7 +143,7 @@ python3 scripts/test_selector_lifecycle_run_guard.py
 python3 scripts/test_het_pm_v2_promotion_gate_v1.py
 python3 scripts/test_het_pm_v2_analysis.py
 python3 -m py_compile scripts/start_selector_lifecycle_run.py scripts/het_pm_v2_promotion_gate_v1.py
-cargo clean -p ghost-brain -p ghost-launcher
+cargo clean --release -p ghost-brain -p ghost-launcher
 CARGO_ENCODED_RUSTFLAGS='-C<US>target-cpu=native<US>--remap-path-prefix=<runtime-source-root>=/workspace/ghost' \
   cargo build --release --locked -p ghost-launcher
 ```

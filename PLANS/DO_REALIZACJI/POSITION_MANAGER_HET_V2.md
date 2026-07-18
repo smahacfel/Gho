@@ -1475,7 +1475,7 @@ Missing lub niespełniony minimalny count oznacza FAIL.
 - każdy input ma content hash;
 - prospective runtime binary jest budowana wyłącznie z clean detached worktree
   na zamrożonym commicie przez ograniczony package clean
-  `cargo clean -p ghost-brain -p ghost-launcher`, a następnie
+  `cargo clean --release -p ghost-brain -p ghost-launcher`, a następnie
   `cargo build --release --locked -p ghost-launcher`;
 - tracked `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`, pełny `rustc`,
   `cargo` oraz effective native target cfg mają osobne hashe w criteria i launcher proof;
@@ -1483,8 +1483,9 @@ Missing lub niespełniony minimalny count oznacza FAIL.
   oraz `--remap-path-prefix=<runtime-source-root>=/workspace/ghost`, aby absolutne
   checkout/`OUT_DIR` paths nie zmieniały bytes pomiędzy detached worktrees;
 - canonical package clean jest uruchamiany z dokładnie tym samym encoded
-  rustflags env co build; `Removed 0 files` spowodowane innym fingerprintem nie
-  może udawać fresh provenance rebuilda;
+  rustflags env co build i jawnie wybiera profil `--release`; `Removed 0 files`
+  spowodowane innym profilem/fingerprintem nie może udawać fresh provenance
+  rebuilda;
 - criteria i launcher proof utrwalają stabilny rustflags/remap contract, a nie
   lokalną ścieżkę checkoutu;
 - produkcyjne komponenty nie osadzają `CARGO_MANIFEST_DIR`; workspace/static

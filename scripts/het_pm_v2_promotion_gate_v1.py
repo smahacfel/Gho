@@ -44,6 +44,7 @@ CRITERIA_VERSION = 4
 RELEASE_CLEAN_COMMAND = (
     "cargo",
     "clean",
+    "--release",
     "-p",
     "ghost-brain",
     "-p",

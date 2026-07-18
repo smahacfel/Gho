@@ -412,6 +412,7 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
 
     def test_checked_in_template_keeps_runtime_policy_identity_and_non_vacuous_floors(self) -> None:
         production = json.loads(CRITERIA_PATH.read_text(encoding="utf-8"))
+        self.assertIn("--release", gate.RELEASE_CLEAN_COMMAND)
         self.assertEqual(production["policy_version"], 2)
         self.assertEqual(production["comparison_schema_version"], 3)
         self.assertIn(production["contract_state"], {"calibration_pending", "locked"})

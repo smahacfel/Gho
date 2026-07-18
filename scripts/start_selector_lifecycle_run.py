@@ -38,6 +38,7 @@ RUN_STATE_KILLED = "RUN_KILLED_AFTER_FAILED_CANARY"
 RELEASE_CLEAN_COMMAND = [
     "cargo",
     "clean",
+    "--release",
     "-p",
     "ghost-brain",
     "-p",
