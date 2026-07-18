@@ -18,6 +18,7 @@
   "expected_native_target_cfg_sha256": "unlocked",
   "expected_release_clean_command": ["unlocked"],
   "expected_release_build_command": ["unlocked"],
+  "expected_release_rustflags_contract": ["unlocked"],
   "require_clean_runtime_build_worktree": true,
   "expected_brain_config_content_hash": "unlocked",
   "expected_normalized_behavioral_config_hash": "unlocked",

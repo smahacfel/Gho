@@ -50,6 +50,10 @@ Poza zakresem pozostają:
    runtime worktree i nie wykonywał canonical locked builda.
 5. Stan dirty/clean wpływa na bytes przez `GIT_WORKTREE_CLEAN`, ale nie był
    elementem launch proofu.
+6. Dwa pierwsze clean buildy z identycznego commita i toolchainu nadal dawały
+   różne SHA, ponieważ kod wygenerowany przez protobuf zawierał absolutny
+   `OUT_DIR` zależny od ścieżki detached worktree. Sam lockfile i toolchain nie
+   usuwają checkout-path entropy z wynikowego ELF.
 
 ## D4. Decyzja
 
@@ -60,8 +64,14 @@ Poza zakresem pozostają:
 
 ```text
 cargo clean -p ghost-brain -p ghost-launcher
-cargo build --release --locked -p ghost-launcher
+CARGO_ENCODED_RUSTFLAGS='-C<US>target-cpu=native<US>--remap-path-prefix=<runtime-source-root>=/workspace/ghost' \
+  cargo build --release --locked -p ghost-launcher
 ```
+
+`<US>` oznacza separator `0x1f` wymagany przez `CARGO_ENCODED_RUSTFLAGS`.
+Rzeczywista ścieżka source root jest dynamiczna, ale trwały kontrakt przechowuje
+stabilną postać
+`--remap-path-prefix=<runtime-source-root>=/workspace/ghost`.
 
 Package clean jest wymagany, ponieważ no-op Cargo build mógłby zachować
 wcześniejszy artefakt z inną wartością embedded `GIT_WORKTREE_CLEAN`.
@@ -77,6 +87,7 @@ wcześniejszy artefakt z inną wartością embedded `GIT_WORKTREE_CLEAN`.
    - hash `cargo -V`;
    - hash `rustc --print cfg -C target-cpu=native`;
    - canonical build command;
+   - canonical native-codegen/source-path-remap rustflags contract;
    - potwierdzenie clean worktree przed i po buildzie.
 6. Jakakolwiek niezgodność degraduje start/evidence fail-closed. Nie wpływa na
    runtime authority, bo proces validation nie zostaje uruchomiony.
@@ -88,7 +99,7 @@ wcześniejszy artefakt z inną wartością embedded `GIT_WORKTREE_CLEAN`.
 - Fresh dependency resolution nie może cicho zmienić validation binary.
 - Dirty source checkout nie może wyprodukować kwalifikowanego launcher proofu.
 - Dwa runy muszą używać tego samego source, lockfile'a, toolchainu, native
-  target contractu, build command i wynikowej binarki.
+  target contractu, remap contractu, build command i wynikowej binarki.
 - Zmiana toolchainu, CPU targetu, Cargo.lock albo build flags wymaga nowej wersji
   criteria i dwóch nowych prospective runów.
 - Poprzedni locked SHA zostaje wycofany jako nieodtwarzalny; nie daje evidence
@@ -117,7 +128,8 @@ python3 scripts/test_het_pm_v2_promotion_gate_v1.py
 python3 scripts/test_het_pm_v2_analysis.py
 python3 -m py_compile scripts/start_selector_lifecycle_run.py scripts/het_pm_v2_promotion_gate_v1.py
 cargo clean -p ghost-brain -p ghost-launcher
-cargo build --release --locked -p ghost-launcher
+CARGO_ENCODED_RUSTFLAGS='-C<US>target-cpu=native<US>--remap-path-prefix=<runtime-source-root>=/workspace/ghost' \
+  cargo build --release --locked -p ghost-launcher
 ```
 
 Dodatkowy dowód materializacyjny:

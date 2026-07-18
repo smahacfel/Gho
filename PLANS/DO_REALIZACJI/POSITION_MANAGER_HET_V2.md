@@ -1479,6 +1479,11 @@ Missing lub niespełniony minimalny count oznacza FAIL.
   `cargo build --release --locked -p ghost-launcher`;
 - tracked `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`, pełny `rustc`,
   `cargo` oraz effective native target cfg mają osobne hashe w criteria i launcher proof;
+- canonical release build ustawia `CARGO_ENCODED_RUSTFLAGS` z `target-cpu=native`
+  oraz `--remap-path-prefix=<runtime-source-root>=/workspace/ghost`, aby absolutne
+  checkout/`OUT_DIR` paths nie zmieniały bytes pomiędzy detached worktrees;
+- criteria i launcher proof utrwalają stabilny rustflags/remap contract, a nie
+  lokalną ścieżkę checkoutu;
 - brak zgodności któregokolwiek build identity albo dirty worktree przed/po buildzie -> FAIL;
 - canonical binary SHA musi zostać odtworzone przez dwa niezależne clean buildy
   przed pierwszym prospective runem;
@@ -1826,6 +1831,7 @@ Nie wolno utrzymywać V1 i V2 jako równoległych apply owners „na okres migra
 - [ ] istnieje committed, validated `het_pm_v2_promotion_gate_v1.json`;
 - [ ] istnieje committed, hashed promotion criteria file;
 - [ ] criteria i oba launcher proofs mają identyczny tracked lockfile/toolchain/build/native-target contract;
+- [ ] criteria i oba launcher proofs mają identyczny canonical source-path-remap contract;
 - [ ] release binary SHA zostało odtworzone przez dwa niezależne clean locked buildy;
 - [ ] `promotion_gate_passed = true` wynika deterministycznie z wszystkich gate'ów;
 - [ ] każdy gate posiada jawne observed values i thresholds;

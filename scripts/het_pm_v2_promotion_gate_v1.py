@@ -24,6 +24,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -55,6 +56,11 @@ RELEASE_BUILD_COMMAND = (
     "--locked",
     "-p",
     "ghost-launcher",
+)
+RELEASE_RUSTFLAGS_CONTRACT = (
+    "-C",
+    "target-cpu=native",
+    "--remap-path-prefix=<runtime-source-root>=/workspace/ghost",
 )
 REQUIRED_ARTIFACT_CLASSES = (
     "brain_config",
@@ -191,6 +197,18 @@ def git_worktree_is_clean(repo_root: Path) -> bool:
     )
 
 
+def canonical_release_build_env(runtime_source_root: Path) -> dict[str, str]:
+    """Freeze native codegen while removing checkout paths from release bytes."""
+    env = os.environ.copy()
+    rustflags = (
+        "-C",
+        "target-cpu=native",
+        f"--remap-path-prefix={runtime_source_root.resolve()}=/workspace/ghost",
+    )
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(rustflags)
+    return env
+
+
 def validate_runtime_build_contract(contract: dict[str, Any]) -> None:
     for field in (
         "cargo_lock_sha256",
@@ -209,6 +227,9 @@ def validate_runtime_build_contract(contract: dict[str, Any]) -> None:
     clean_command = require(contract, "clean_command", list)
     if clean_command != list(RELEASE_CLEAN_COMMAND):
         raise ContractError("runtime clean command is not the frozen provenance rebuild command")
+    rustflags_contract = require(contract, "rustflags_contract", list)
+    if rustflags_contract != list(RELEASE_RUSTFLAGS_CONTRACT):
+        raise ContractError("runtime release rustflags contract is not canonical")
     if require(contract, "worktree_clean", bool) is not True:
         raise ContractError("runtime build worktree must be clean")
 
@@ -258,6 +279,7 @@ def inspect_runtime_build_contract(runtime_source_root: Path) -> dict[str, Any]:
         ),
         "build_command": list(RELEASE_BUILD_COMMAND),
         "clean_command": list(RELEASE_CLEAN_COMMAND),
+        "rustflags_contract": list(RELEASE_RUSTFLAGS_CONTRACT),
         "worktree_clean": git_worktree_is_clean(runtime_source_root),
     })
     validate_runtime_build_contract(contract)
@@ -294,6 +316,7 @@ def materialize_runtime_release_build(
             list(RELEASE_BUILD_COMMAND),
             cwd=runtime_source_root,
             check=False,
+            env=canonical_release_build_env(runtime_source_root),
         )
     except OSError as error:
         raise ContractError(f"cannot execute locked release build: {error}") from error
@@ -589,6 +612,7 @@ def lock_criteria_template(
         "expected_native_target_cfg_sha256": runtime_build_contract["native_target_cfg_sha256"],
         "expected_release_build_command": runtime_build_contract["build_command"],
         "expected_release_clean_command": runtime_build_contract["clean_command"],
+        "expected_release_rustflags_contract": runtime_build_contract["rustflags_contract"],
         "require_clean_runtime_build_worktree": runtime_build_contract["worktree_clean"],
         "expected_brain_config_content_hash": sha256(brain_config),
         "expected_normalized_behavioral_config_hash": normalized_hashes.pop(),
@@ -637,6 +661,7 @@ def build_launcher_proof(
         "native_target_cfg_sha256": require(build, "native_target_cfg_sha256", str),
         "build_command": require(build, "command", list),
         "clean_command": require(build, "clean_command", list),
+        "rustflags_contract": require(build, "rustflags_contract", list),
         "worktree_clean": require(build, "worktree_clean_before_build", bool)
         and require(build, "worktree_clean_after_build", bool),
     }
@@ -673,6 +698,7 @@ def build_launcher_proof(
         "native_target_cfg_sha256": runtime_build_contract["native_target_cfg_sha256"],
         "release_build_command": runtime_build_contract["build_command"],
         "release_clean_command": runtime_build_contract["clean_command"],
+        "release_rustflags_contract": runtime_build_contract["rustflags_contract"],
         "build_worktree_clean": runtime_build_contract["worktree_clean"],
         "run_config_sha256": artifacts["run_config"][0]["sha256"],
         "brain_config_sha256": artifacts["brain_config"][0]["sha256"],
@@ -858,6 +884,10 @@ def validate_run_manifest_shape(manifest: dict[str, Any], source: Path) -> None:
         raise ContractError(f"launcher proof release build command mismatch: {source}")
     if require(proof, "release_clean_command", list) != list(RELEASE_CLEAN_COMMAND):
         raise ContractError(f"launcher proof release clean command mismatch: {source}")
+    if require(proof, "release_rustflags_contract", list) != list(
+        RELEASE_RUSTFLAGS_CONTRACT
+    ):
+        raise ContractError(f"launcher proof release rustflags contract mismatch: {source}")
     if require(proof, "build_worktree_clean", bool) is not True:
         raise ContractError(f"launcher proof runtime build worktree is not clean: {source}")
     if not re.fullmatch(r"[0-9a-f]{64}", proof["normalized_behavioral_config_hash"]):
@@ -1032,6 +1062,11 @@ def validate_criteria(criteria: dict[str, Any]) -> None:
         raise ContractError("locked criteria release clean command is not canonical")
     if contract_state != "locked" and clean_command != ["unlocked"]:
         raise ContractError("pending criteria release clean command must be unlocked")
+    rustflags_contract = require(criteria, "expected_release_rustflags_contract", list)
+    if contract_state == "locked" and rustflags_contract != list(RELEASE_RUSTFLAGS_CONTRACT):
+        raise ContractError("locked criteria release rustflags contract is not canonical")
+    if contract_state != "locked" and rustflags_contract != ["unlocked"]:
+        raise ContractError("pending criteria release rustflags contract must be unlocked")
     clean_build_required = require(criteria, "require_clean_runtime_build_worktree", bool)
     if contract_state == "locked" and not clean_build_required:
         raise ContractError("locked criteria must require a clean runtime build worktree")
@@ -2244,6 +2279,10 @@ def evaluate(
             raise ContractError(f"validation runtime build command mismatch: {manifest_path}")
         if launcher_proof["release_clean_command"] != criteria["expected_release_clean_command"]:
             raise ContractError(f"validation runtime clean command mismatch: {manifest_path}")
+        if launcher_proof["release_rustflags_contract"] != criteria[
+            "expected_release_rustflags_contract"
+        ]:
+            raise ContractError(f"validation runtime rustflags contract mismatch: {manifest_path}")
         if launcher_proof["build_worktree_clean"] is not criteria[
             "require_clean_runtime_build_worktree"
         ]:

@@ -310,6 +310,7 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
             template[field] = "unlocked"
         template["expected_release_build_command"] = ["unlocked"]
         template["expected_release_clean_command"] = ["unlocked"]
+        template["expected_release_rustflags_contract"] = ["unlocked"]
         template["allowed_exact_run_config_hashes"] = {}
         gate.validate_criteria(template)
         return template
@@ -324,6 +325,7 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
             "native_target_cfg_sha256": "6" * 64,
             "build_command": list(gate.RELEASE_BUILD_COMMAND),
             "clean_command": list(gate.RELEASE_CLEAN_COMMAND),
+            "rustflags_contract": list(gate.RELEASE_RUSTFLAGS_CONTRACT),
             "worktree_clean": True,
         }
 
@@ -387,11 +389,18 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                 production["expected_release_clean_command"],
                 list(gate.RELEASE_CLEAN_COMMAND),
             )
+            self.assertEqual(
+                production["expected_release_rustflags_contract"],
+                list(gate.RELEASE_RUSTFLAGS_CONTRACT),
+            )
             self.assertTrue(production["require_clean_runtime_build_worktree"])
         else:
             self.assertEqual(production["expected_runtime_commit_sha"], "unlocked")
             self.assertEqual(production["expected_release_build_command"], ["unlocked"])
             self.assertEqual(production["expected_release_clean_command"], ["unlocked"])
+            self.assertEqual(
+                production["expected_release_rustflags_contract"], ["unlocked"]
+            )
         for gate_key, prefix in (("executable_trailing", "executable_trailing"), ("vitality_decay", "vitality")):
             thresholds = production["gate_specific_thresholds"][gate_key]["thresholds"]
             self.assertGreaterEqual(thresholds[f"{prefix}_candidate_positions_min"], 100)
@@ -436,6 +445,10 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
             self.assertEqual(
                 locked["expected_release_clean_command"],
                 list(gate.RELEASE_CLEAN_COMMAND),
+            )
+            self.assertEqual(
+                locked["expected_release_rustflags_contract"],
+                list(gate.RELEASE_RUSTFLAGS_CONTRACT),
             )
             self.assertTrue(locked["require_clean_runtime_build_worktree"])
 

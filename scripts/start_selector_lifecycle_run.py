@@ -51,6 +51,11 @@ RELEASE_BUILD_COMMAND = [
     "-p",
     "ghost-launcher",
 ]
+RELEASE_RUSTFLAGS_CONTRACT = [
+    "-C",
+    "target-cpu=native",
+    "--remap-path-prefix=<runtime-source-root>=/workspace/ghost",
+]
 
 
 def utc_timestamp() -> str:
@@ -152,6 +157,18 @@ def tracked_file_sha256(root: Path, relative_path: Path) -> str | None:
     return sha256_file(root / relative_path)
 
 
+def canonical_release_build_env(root: Path) -> dict[str, str]:
+    """Apply the frozen native-codegen and source-path remap contract."""
+    env = os.environ.copy()
+    rustflags = [
+        "-C",
+        "target-cpu=native",
+        f"--remap-path-prefix={root.resolve()}=/workspace/ghost",
+    ]
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(rustflags)
+    return env
+
+
 def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path) -> dict[str, Any]:
     worktree_clean_before_build = git_worktree_is_clean(root)
     cargo_lock_sha256 = tracked_file_sha256(root, Path("Cargo.lock"))
@@ -173,6 +190,7 @@ def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path)
         RELEASE_BUILD_COMMAND,
         cwd=root,
         log_path=output_dir / "commands" / "cargo_build_release_ghost_launcher.log",
+        env=canonical_release_build_env(root),
     )
     finished_at = datetime.now(timezone.utc)
     worktree_clean_after_build = git_worktree_is_clean(root)
@@ -217,6 +235,7 @@ def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path)
         "rustc_verbose_sha256": rustc_verbose_sha256,
         "cargo_version_sha256": cargo_version_sha256,
         "native_target_cfg_sha256": native_target_cfg_sha256,
+        "rustflags_contract": RELEASE_RUSTFLAGS_CONTRACT,
         "worktree_clean_before_build": worktree_clean_before_build,
         "worktree_clean_after_build": worktree_clean_after_build,
         "binary_mtime_utc": mtime_utc(launcher),
@@ -276,12 +295,19 @@ def validate_scope_contract(
     return (PASS_STATUS if not errors else FAIL_CONFIG_CONTRACT), errors
 
 
-def run_command(command: list[str], *, cwd: Path, log_path: Path) -> dict[str, Any]:
+def run_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    log_path: Path,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8", errors="ignore") as log_fh:
         proc = subprocess.run(
             command,
             cwd=cwd,
+            env=env,
             check=False,
             text=True,
             stdout=log_fh,

@@ -62,6 +62,14 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
             list(launcher.RELEASE_BUILD_COMMAND),
             run_build.call_args_list[1].args[0],
         )
+        self.assertEqual(
+            launcher.canonical_release_build_env(root)["CARGO_ENCODED_RUSTFLAGS"],
+            run_build.call_args_list[1].kwargs["env"]["CARGO_ENCODED_RUSTFLAGS"],
+        )
+        self.assertEqual(
+            launcher.RELEASE_RUSTFLAGS_CONTRACT,
+            report["rustflags_contract"],
+        )
 
     def test_dirty_runtime_worktree_cannot_pass_release_build_freshness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
