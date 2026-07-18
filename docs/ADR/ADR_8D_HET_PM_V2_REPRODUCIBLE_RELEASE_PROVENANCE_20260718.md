@@ -259,6 +259,31 @@ i odtworzyły identyczne bajty ELF/criteria bez lokalnych source paths. Osobny
 realny preflight z paper-burnin keypairem potwierdził poprawny keypair, wymagane
 saldo oraz wszystkie endpoint checks bez typed failure. Nie użyto live walleta.
 
+## D8. Superseding relock: lifecycle JSONL serialization
+
+Po zakończeniu pierwszego `validation-v1a` manifest promotion wykrył
+przeplecione rekordy w `shadow_lifecycle.jsonl`. Historyczny run został
+odrzucony jako diagnosticzny, a poprawka serializacji lifecycle sinku zmieniła
+runtime source i release binary. Poprzedni lifecycle-capable lock z commita
+`095f9d2...` nie jest więc używany dla żadnego kolejnego prospective runu.
+
+Nowy canonical relock wykonany z clean detached worktree:
+
+```text
+runtime source commit = 0a3b045c09d5a1fd8e2785668298e0dd147428d0
+clean build SHA-256 = b5c493666e8674eda1e6c781fac05999b1fdaa561da862ea91b4e595bf12ced3
+canonical criteria SHA-256 = 16b38e982357c80d7234ea6f98f4f06bfdb73a14993af58956fcadcc0ff9f970
+promotion tool SHA-256 = 18b25934a7849b81982ff79f67c3f0afe8b22cfeb6d0a3176f400d7489a59491
+PR-A analyzer SHA-256 = 5e26d19b10ea2613f0da9c4e532d60cc9a646ee000289befdd98f4f6f9e1faa0
+```
+
+Lock tool wykonał ponownie canonical package clean oraz `cargo build --release
+--locked -p ghost-launcher`, a następnie potwierdził czysty runtime worktree.
+Hashy behavioral configu, brain configu, narzędzi i exact configów `v1a`/`v1b`
+nie zmieniano; zmieniły się wyłącznie source commit oraz wynikająca z niego
+binarka. W chwili tego relocka nowy prospective run nie został jeszcze
+uruchomiony.
+
 ## D8. Następne kroki
 
 1. Zacommitować canonical locked criteria i ostateczny configured-payer proof.
