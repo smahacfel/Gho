@@ -31,6 +31,7 @@ mod exit_policy_v1;
 mod exit_policy_v2;
 pub mod exit_replay;
 pub mod integration;
+pub mod lifecycle_jsonl;
 pub mod shadow_v2;
 pub mod shadow_v2_execution;
 pub mod signals;

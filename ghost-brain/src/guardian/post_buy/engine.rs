@@ -2444,10 +2444,6 @@ pub struct MonitoringEngine {
     event_emitter_secondary: Option<Arc<EventEmitter>>,
     /// Canonical shadow lifecycle/PnL proof log.
     shadow_lifecycle_log_path: Option<PathBuf>,
-    /// Serializes a complete lifecycle JSONL record across concurrent guardian
-    /// tasks. A JSON payload and its trailing newline must be appended as one
-    /// logical record, never interleaved with another lifecycle emission.
-    shadow_lifecycle_jsonl_write_lock: Arc<Mutex<()>>,
     /// Compact research-only exit replay sidecar log.
     shadow_exit_replay_log_path: Option<PathBuf>,
     /// Identity-level shutdown censoring evidence for promotion denominators.
@@ -2520,7 +2516,6 @@ impl MonitoringEngine {
             event_emitter: None,
             event_emitter_secondary: None,
             shadow_lifecycle_log_path: None,
-            shadow_lifecycle_jsonl_write_lock: Arc::new(Mutex::new(())),
             shadow_exit_replay_log_path: None,
             position_censored_log_path: None,
             het_pm_v2_observation_writer: None,
@@ -3777,19 +3772,6 @@ impl MonitoringEngine {
         file.flush()
     }
 
-    /// Appends one complete JSONL record while holding the ownership lock for
-    /// its sink. `OpenOptions::append` only protects individual writes; it
-    /// does not prevent two `serde_json::to_writer` calls from interleaving
-    /// their payloads before either writer appends its newline.
-    fn append_jsonl_record_with_lock(
-        write_lock: &Mutex<()>,
-        path: &Path,
-        value: &impl Serialize,
-    ) -> std::io::Result<()> {
-        let _guard = write_lock.lock();
-        Self::append_jsonl_record(path, value)
-    }
-
     fn append_prepared_jsonl_bytes(path: &Path, encoded: &[u8]) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -4205,11 +4187,7 @@ impl MonitoringEngine {
             self.shadow_lifecycle_log_path.as_deref(),
         ) {
             (false, _) => TerminalWriteStatus::NotRequired,
-            (true, Some(path)) => match Self::append_jsonl_record_with_lock(
-                self.shadow_lifecycle_jsonl_write_lock.as_ref(),
-                path,
-                record,
-            ) {
+            (true, Some(path)) => match super::lifecycle_jsonl::append_jsonl_record(path, record) {
                 Ok(()) => TerminalWriteStatus::Ok,
                 Err(error) => {
                     error!(
@@ -9598,14 +9576,12 @@ mod tests {
     fn concurrent_lifecycle_jsonl_appends_preserve_record_boundaries() {
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("shadow_lifecycle.jsonl");
-        let write_lock = Arc::new(Mutex::new(()));
         const WRITER_COUNT: usize = 16;
         const ROWS_PER_WRITER: usize = 32;
 
         std::thread::scope(|scope| {
             for writer_id in 0..WRITER_COUNT {
                 let path = path.clone();
-                let write_lock = Arc::clone(&write_lock);
                 scope.spawn(move || {
                     for row_id in 0..ROWS_PER_WRITER {
                         let record = serde_json::json!({
@@ -9613,10 +9589,8 @@ mod tests {
                             "row_id": row_id,
                             "payload": "x".repeat(8 * 1024),
                         });
-                        MonitoringEngine::append_jsonl_record_with_lock(
-                            write_lock.as_ref(),
-                            &path,
-                            &record,
+                        crate::guardian::post_buy::lifecycle_jsonl::append_jsonl_record(
+                            &path, &record,
                         )
                         .expect("serialized lifecycle append");
                     }

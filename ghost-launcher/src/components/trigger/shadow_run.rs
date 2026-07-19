@@ -1034,18 +1034,13 @@ pub async fn append_shadow_dispatch_lifecycle_record(
     log_path: &Path,
     record: &ShadowDispatchLifecycleRecord,
 ) -> Result<()> {
-    if let Some(parent) = log_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .await?;
-    let json = serde_json::to_string(record)?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, json.as_bytes()).await?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, b"\n").await?;
-    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    let path = log_path.to_path_buf();
+    let record = record.clone();
+    tokio::task::spawn_blocking(move || {
+        ghost_brain::guardian::post_buy::lifecycle_jsonl::append_jsonl_record(&path, &record)
+    })
+    .await
+    .map_err(|error| anyhow!("shadow lifecycle append worker failed: {error}"))??;
     Ok(())
 }
 
@@ -1527,6 +1522,89 @@ mod tests {
         assert_eq!(row["dispatch_attempted"], false);
         assert_eq!(row["simulation_attempted"], false);
         assert_eq!(row["execution_feasibility_status"], "not_executable_route");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_lifecycle_sink_serializes_dispatch_and_guardian_writers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lifecycle_path = temp.path().join("shadow_lifecycle.jsonl");
+        const ROWS_PER_WRITER: usize = 32;
+
+        let mut dispatch_writers = Vec::new();
+        let mut guardian_writers = Vec::new();
+        for index in 0..ROWS_PER_WRITER {
+            let path = lifecycle_path.clone();
+            dispatch_writers.push(tokio::spawn(async move {
+                let record = ShadowDispatchLifecycleRecord {
+                    join_metadata: ExecutionJoinMetadata::default(),
+                    account_diagnostics: ShadowSimulationAccountDiagnostics::default(),
+                    record_type: "shadow_dispatch".to_string(),
+                    dispatch_id: format!("dispatch-{index}"),
+                    idempotency_key: format!("dispatch-key-{index}"),
+                    dispatch_status: ShadowDispatchStatus::Closed,
+                    classification: "simulation_completed".to_string(),
+                    simulation_outcome: "closed".to_string(),
+                    candidate_id: format!("candidate-{index}"),
+                    pool_id: format!("pool-{index}"),
+                    mint_id: format!("mint-{index}"),
+                    join_key: format!("pool-{index}:mint-{index}:1"),
+                    rollout_profile: "shared-lifecycle-sink-test".to_string(),
+                    entry_mode: "shadow_only".to_string(),
+                    decision_ts_ms: index as u64,
+                    timestamp_ms: index as u64,
+                    error_class: None,
+                    error_code: None,
+                    error_detail_class: None,
+                    err: None,
+                };
+                append_shadow_dispatch_lifecycle_record(&path, &record).await
+            }));
+
+            let path = lifecycle_path.clone();
+            guardian_writers.push(tokio::task::spawn_blocking(move || {
+                let record = serde_json::json!({
+                    "record_type": "guardian_evidence",
+                    "guardian_row_id": index,
+                    "payload": "x".repeat(8 * 1024),
+                });
+                ghost_brain::guardian::post_buy::lifecycle_jsonl::append_jsonl_record(
+                    &path, &record,
+                )
+            }));
+        }
+
+        for writer in dispatch_writers {
+            writer
+                .await
+                .expect("dispatch writer task")
+                .expect("dispatch lifecycle append");
+        }
+        for writer in guardian_writers {
+            writer
+                .await
+                .expect("guardian writer task")
+                .expect("guardian lifecycle append");
+        }
+
+        let rows = std::fs::read_to_string(&lifecycle_path)
+            .expect("read lifecycle JSONL")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSONL"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), ROWS_PER_WRITER * 2);
+        let dispatch_ids = rows
+            .iter()
+            .filter_map(|row| row.get("dispatch_id").and_then(serde_json::Value::as_str))
+            .collect::<std::collections::BTreeSet<_>>();
+        let guardian_ids = rows
+            .iter()
+            .filter_map(|row| {
+                row.get("guardian_row_id")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(dispatch_ids.len(), ROWS_PER_WRITER);
+        assert_eq!(guardian_ids.len(), ROWS_PER_WRITER);
     }
 
     #[test]

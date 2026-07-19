@@ -1510,6 +1510,41 @@ Missing lub niespełniony minimalny count oznacza FAIL.
 - `promotion_gate_passed = true` tylko, gdy wszystkie wymagane gate'y mają `passed = true`;
 - PR B nie może rozpocząć się bez committed artifactu i criteria file.
 
+### 19.9a. Wiążąca decyzja właściciela — horyzont prospective validation
+
+Decyzją właściciela projektu z `2026-07-18` oba prospective runy evidence
+`validation-v1a` i `validation-v1b` mają maksymalny horyzont runtime równy
+`3600` sekund (jedna godzina). Dla każdego nowego uruchomienia launcher musi
+otrzymać jawne:
+
+```text
+--runtime-timeout-seconds 3600
+```
+
+co skutkuje kontrolowanym `SIGINT` i istniejącym bounded hard backstopem
+launchera. Wartość musi pozostać widoczna w
+`RUN_LIFECYCLE_LAUNCHER_REPORT.json` oraz exact launcher invocation danego
+runu.
+
+Historyczny `validation-v1a` rozpoczęty przed tą decyzją z launcherowym
+limitem `10800` sekund nie spełnił tej dyspozycji: zewnętrzny scheduler nie
+dostarczył oczekiwanego `SIGINT`, a runtime zakończył się dopiero na swoim
+oryginalnym trzygodzinnym timeoutcie. Ten run jest **invalid promotion
+evidence**. Nie wolno naprawiać ani reużywać jego artefaktów.
+
+Ponowiony `validation-v1a` i późniejszy `validation-v1b` muszą mieć od startu
+native launcherowy `--runtime-timeout-seconds 3600`, nowy `run_id`, nowy
+`launch_cohort_id` oraz osobne namespace'y i ścieżki artefaktów. Zewnętrzny
+timer/tmux nie jest dopuszczalnym mechanizmem skracania prospective runu.
+
+Skrócenie horyzontu nie zmienia ani HET/V1/TimeStop config identity, ani
+zamrożonych progów Gate 1--5, ani minimów kandydatów/matched positions. Run,
+który w jednej godzinie nie dostarczy wymaganej próby lub kompletności
+evidence, kończy się fail-closed i nie może uzasadniać promotion.
+
+Pełne uzasadnienie, zakres oraz procedura weryfikacji są zapisane w:
+`docs/ADR/ADR_8D_HET_PM_V2_OWNER_BOUND_ONE_HOUR_VALIDATION_HORIZON_20260718.md`.
+
 ### 19.10. Obowiązkowe acceptance tests promotion artifact
 
 - golden PASS fixture -> `promotion_gate_passed = true`;
