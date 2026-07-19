@@ -689,6 +689,18 @@ def build_launcher_proof(
     expected_config_path = (repo_root / artifacts["run_config"][0]["path"]).resolve()
     if config_path != expected_config_path:
         raise ContractError("launcher proof run config path mismatch")
+    raw_output_dir = Path(require(report, "output_dir", str))
+    output_dir = (
+        raw_output_dir
+        if raw_output_dir.is_absolute()
+        else repo_root / raw_output_dir
+    ).resolve()
+    try:
+        output_dir.relative_to(repo_root)
+    except ValueError as error:
+        raise ContractError("launcher proof output directory escapes runtime root") from error
+    if report.get("output_dir_contract") != "inside_runtime_root":
+        raise ContractError("launcher proof lacks validation output-root contract")
     proof = {
         "run_id": args.run_id,
         "launch_cohort_id": args.launch_cohort_id,
@@ -720,6 +732,7 @@ def build_launcher_proof(
         "lifecycle_canary_passed": launcher_status_passed(report, "lifecycle_canary"),
         "static_guard_passed": launcher_status_passed(report, "static_guard"),
         "preflight_passed": launcher_status_passed(report, "preflight"),
+        "output_dir_inside_runtime_root": True,
         "exact_launcher_invocation": require(report, "launcher_invocation", list),
         "launcher_claim": require(report, "claim", str),
         "launcher_status": require(report, "status", str),
@@ -899,6 +912,8 @@ def validate_run_manifest_shape(manifest: dict[str, Any], source: Path) -> None:
         raise ContractError(f"launcher proof normalized behavioural config hash invalid: {source}")
     if proof["shutdown_signal"] != "SIGINT" or proof["shutdown_result"] != "clean":
         raise ContractError(f"launcher proof shutdown contract failed: {source}")
+    if require(proof, "output_dir_inside_runtime_root", bool) is not True:
+        raise ContractError(f"launcher proof output root contract failed: {source}")
     for field in (
         "event_canary_passed",
         "lifecycle_canary_passed",
@@ -2313,6 +2328,10 @@ def evaluate(
                 identity(record["run_id"], record["position_id"], record["position_epoch"])
             ].append(record)
         opened, duplicate_opens = load_position_events(run_id, paths["position_events"])
+        if not opened:
+            raise ContractError(
+                f"position-events contain no durable shadow PositionOpened rows: {manifest_path}"
+            )
         duplicate_position_open_count += duplicate_opens
         overlap = set(positions).intersection(opened)
         if overlap:

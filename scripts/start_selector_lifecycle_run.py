@@ -85,6 +85,28 @@ def output_dir_default(root: Path, scope: str) -> Path:
     return root / "reports" / "selector" / scope / f"run_lifecycle_guard_{utc_timestamp()}"
 
 
+def validate_output_dir_contract(root: Path, output_dir: Path, run_role: str) -> str | None:
+    """Keep prospective-validation evidence under the reviewed runtime root.
+
+    A promotion manifest verifies every input relative to one immutable runtime
+    worktree.  Letting the validation launcher place its report or runtime log
+    in another checkout makes that proof structurally impossible, even if both
+    files happen to exist.  Calibration runs retain the historical flexibility
+    to write elsewhere; prospective validation does not.
+    """
+
+    if run_role != "validation":
+        return None
+    try:
+        output_dir.relative_to(root)
+    except ValueError:
+        return (
+            "validation output directory must reside inside --root "
+            f"(root={root}, output_dir={output_dir})"
+        )
+    return None
+
+
 def free_gb(path: Path) -> float:
     usage = shutil.disk_usage(path)
     return usage.free / (1024**3)
@@ -568,6 +590,10 @@ def main(argv: list[str] | None = None) -> int:
     config_path = resolve_repo_path(root, args.config)
     launcher = resolve_repo_path(root, args.launcher_binary)
     output_dir = resolve_repo_path(root, args.output_dir) if args.output_dir else output_dir_default(root, args.scope)
+    output_dir_error = validate_output_dir_contract(root, output_dir, args.run_role)
+    if output_dir_error is not None:
+        print(f"selector lifecycle launcher: {output_dir_error}", file=sys.stderr)
+        return 2
     output_dir.mkdir(parents=True, exist_ok=True)
     baseline_path = output_dir / "baseline_before_start.json"
     runtime_log = output_dir / "runtime.log"
@@ -587,6 +613,9 @@ def main(argv: list[str] | None = None) -> int:
         "runtime_timeout_seconds": args.runtime_timeout_seconds,
         "allow_zero_buy_lifecycle_proof": args.allow_zero_buy_lifecycle_proof,
         "output_dir": str(output_dir),
+        "output_dir_contract": (
+            "inside_runtime_root" if args.run_role == "validation" else "not_required"
+        ),
         "runtime_binary": str(launcher),
         "build_release_before_start": args.build_release_before_start,
         "build_freshness_status": "NOT_REQUESTED",

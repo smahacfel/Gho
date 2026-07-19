@@ -1141,6 +1141,92 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         self.assertEqual(complete["admission_missing_monitoring_registered_count"], 0)
         self.assertEqual(complete["admission_missing_release_count"], 0)
 
+    def test_execution_event_position_opened_is_primary_denominator_evidence(self) -> None:
+        key = self.position_key()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "exec_launcher_test.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "envelope": {
+                            "run_id": "launcher-private-id",
+                            "lane": "shadow",
+                            "candidate_id": self.opened_position(key)["candidate_id"],
+                            "position_id": key[1],
+                            "position_epoch": key[2],
+                            "event_time_ms": 1_000,
+                            "order_id": "shadow-entry-candidate-1",
+                        },
+                        "kind": {"type": "PositionOpened", "payload": {}},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            opened, duplicates = gate.load_position_events(key[0], [path])
+
+        self.assertEqual(duplicates, 0)
+        self.assertEqual(
+            opened,
+            {
+                key: self.opened_position(key)
+                | {"order_id": "shadow-entry-candidate-1"}
+            },
+        )
+
+    def test_launcher_proof_rejects_validation_output_outside_runtime_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runtime"
+            root.mkdir()
+            (root / "run.toml").write_text("[run]\n", encoding="utf-8")
+            (root / "brain.toml").write_text("[brain]\n", encoding="utf-8")
+            build = {
+                "started_at_utc": "2026-07-19T00:00:00+00:00",
+                "cargo_lock_sha256": "1" * 64,
+                "rust_toolchain_sha256": "2" * 64,
+                "cargo_config_sha256": "3" * 64,
+                "rustc_verbose_sha256": "4" * 64,
+                "cargo_version_sha256": "5" * 64,
+                "native_target_cfg_sha256": "6" * 64,
+                "command": list(gate.RELEASE_BUILD_COMMAND),
+                "clean_command": list(gate.RELEASE_CLEAN_COMMAND),
+                "rustflags_contract": list(gate.RELEASE_RUSTFLAGS_CONTRACT),
+                "worktree_clean_before_build": True,
+                "worktree_clean_after_build": True,
+            }
+            report = {
+                "scope": "validation-run",
+                "launch_cohort_id": "cohort",
+                "run_role": "validation",
+                "git_head_at_build": "a" * 40,
+                "git_head_at_launch": "a" * 40,
+                "release_binary_sha256": "b" * 64,
+                "build_freshness": build,
+                "runtime_started_at_utc": "2026-07-19T00:01:00+00:00",
+                "config": str(root / "run.toml"),
+                "output_dir": str(Path(tmp) / "other-root" / "reports"),
+                "output_dir_contract": "inside_runtime_root",
+            }
+            artifacts = {
+                "run_config": [{"path": "run.toml", "sha256": "c" * 64}],
+                "brain_config": [{"path": "brain.toml", "sha256": "d" * 64}],
+            }
+            args = gate.argparse.Namespace(
+                run_id="validation-run",
+                launch_cohort_id="cohort",
+                run_role="validation",
+            )
+            with self.assertRaisesRegex(
+                gate.ContractError, "output directory escapes runtime root"
+            ):
+                gate.build_launcher_proof(
+                    report=report,
+                    args=args,
+                    artifacts=artifacts,
+                    runtime_paths=[],
+                    repo_root=root,
+                )
+
     def test_admission_reconciliation_is_bidirectional_and_has_first_het_sla(self) -> None:
         key = self.position_key()
         opened = {key: self.opened_position(key)}

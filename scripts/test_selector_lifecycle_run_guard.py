@@ -177,6 +177,24 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
         )
         self.assertEqual("", launcher.build_runtime_timeout_prefix(None))
 
+    def test_validation_output_dir_must_stay_inside_runtime_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runtime"
+            root.mkdir()
+            contained = root / "reports" / "selector" / "run"
+            outside = Path(tmp) / "other-checkout" / "reports" / "run"
+
+            self.assertIsNone(
+                launcher.validate_output_dir_contract(root, contained, "validation")
+            )
+            self.assertIn(
+                "must reside inside --root",
+                launcher.validate_output_dir_contract(root, outside, "validation") or "",
+            )
+            self.assertIsNone(
+                launcher.validate_output_dir_contract(root, outside, "calibration")
+            )
+
     def test_event_canary_requires_feature_events_and_diag(self) -> None:
         status, errors = canary.validate_event_canary(
             {
