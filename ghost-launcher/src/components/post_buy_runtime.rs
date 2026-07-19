@@ -4670,7 +4670,30 @@ fn spawn_shadow_terminal_watcher(
             "disposition" => disposition,
             "reason" => reason.clone()
         );
-        if !position_limit_tracker.release(slot_id) {
+        let release_status = if position_limit_tracker.release(slot_id) {
+            "released"
+        } else {
+            "already_released"
+        };
+        let mut record = post_buy_admission_record(
+            admission_context.run_id.clone(),
+            &admission_context.candidate_id,
+            &admission_context.pool_id,
+            &admission_context.base_mint,
+            "shadow",
+            "terminal_watcher",
+            Some(slot_id),
+            "terminal_release",
+        );
+        record.handoff_accepted = Some(true);
+        record.monitoring_registered = admission_context.position_id.is_some();
+        record.position_id = admission_context.position_id.clone();
+        record.position_epoch = admission_context.position_epoch;
+        record.release_status = Some(release_status);
+        record.release_reason = Some(reason.clone());
+        append_post_buy_admission_record(admission_context.admission_writer.as_ref(), &record);
+
+        if release_status == "already_released" {
             warn!(
                 runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                 candidate_id = %admission_context.candidate_id,
@@ -4681,23 +4704,6 @@ fn spawn_shadow_terminal_watcher(
                 "PostBuyRuntime: shadow position slot already released before terminal notification"
             );
         } else {
-            let mut record = post_buy_admission_record(
-                admission_context.run_id.clone(),
-                &admission_context.candidate_id,
-                &admission_context.pool_id,
-                &admission_context.base_mint,
-                "shadow",
-                "terminal_watcher",
-                Some(slot_id),
-                "terminal_release",
-            );
-            record.handoff_accepted = Some(true);
-            record.monitoring_registered = admission_context.position_id.is_some();
-            record.position_id = admission_context.position_id.clone();
-            record.position_epoch = admission_context.position_epoch;
-            record.release_status = Some("released");
-            record.release_reason = Some(reason.clone());
-            append_post_buy_admission_record(admission_context.admission_writer.as_ref(), &record);
             info!(
                 runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                 candidate_id = %admission_context.candidate_id,
@@ -9567,6 +9573,58 @@ sys.exit(0)
         assert_eq!(health["admission_attempts"], 1);
         assert_eq!(health["admission_written"], 1);
         assert_eq!(health["admission_dropped"], 0);
+        assert_eq!(tracker.active_positions(), 0);
+    }
+
+    #[tokio::test]
+    async fn shadow_terminal_watcher_writes_admission_already_released_terminal_release() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let admission_path = tmp.path().join("post_buy_admission_v1.jsonl");
+        let health_path = tmp.path().join("post_buy_admission_health_v1.json");
+        let runtime =
+            PostBuyAdmissionWriterRuntime::start(admission_path.clone(), health_path.clone())
+                .expect("start admission writer");
+        let mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique().to_string();
+        let tracker = PositionLimitTracker::new(1);
+        let slot_id = PositionSlotId::derive(&Pubkey::new_unique(), &mint);
+        tracker
+            .register_existing(slot_id, pool.clone(), mint.to_string())
+            .expect("slot must register");
+        assert!(tracker.release(slot_id), "pre-release must succeed");
+
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let watcher = spawn_shadow_terminal_watcher(
+            terminal_rx,
+            tracker.clone(),
+            slot_id,
+            ShadowTerminalWatcherAdmissionContext {
+                candidate_id: "candidate-admission-already-released".to_string(),
+                pool_id: pool.clone(),
+                base_mint: mint.to_string(),
+                run_id: Some("validation-run".to_string()),
+                position_id: Some(format!("{pool}:{mint}:shadow")),
+                position_epoch: Some(42),
+                admission_writer: runtime.writer(),
+            },
+        );
+        terminal_tx
+            .send(ShadowTerminalDisposition::SimulationBlocked {
+                action_id: "shadow-action:blocked".to_string(),
+                reason: ShadowUnresolvedReason::BlockedByData,
+            })
+            .expect("terminal receiver must remain active");
+        watcher.await.expect("watcher should finish");
+        runtime.shutdown().await;
+
+        let content = std::fs::read_to_string(&admission_path).expect("admission jsonl");
+        let row: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("admission row"))
+                .expect("admission json");
+        assert_eq!(row["stage"], "terminal_release");
+        assert_eq!(row["release_status"], "already_released");
+        assert_eq!(row["release_reason"], "blocked_by_data");
+        assert_eq!(row["position_epoch"], 42);
         assert_eq!(tracker.active_positions(), 0);
     }
 

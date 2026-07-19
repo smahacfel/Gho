@@ -1535,11 +1535,13 @@ prospective pair, ponieważ przed tą korektą jego manifest wskazywał
 `PositionOpened`, a launcher report znajdował się poza clean runtime root.
 Nie naprawia się tych artefaktów po fakcie.
 
-Nowe prospective runy muszą mieć od startu native launcherowy
+Po zakończonym diagnostycznym `validation-v1a-30m` z ujawnioną luką
+`terminal_release`, jego replacement pair musi mieć od startu native launcherowy
 `--runtime-timeout-seconds 1800`, nowe `run_id`, `launch_cohort_id`, namespace
-i ścieżki: `validation-v1a-30m` oraz `validation-v1b-30m`. Przed ich startem
-trzeba ponownie zablokować criteria/provenance dla nowego commita, binarki i
-obu exact run-config hashes.
+i ścieżki: `validation-v1a-30m-r2` oraz `validation-v1b-30m-r2`. Przed ich
+startem trzeba ponownie zablokować criteria/provenance dla nowego commita,
+binarki i obu exact run-config hashes. Historyczny scope `validation-v1a-30m`
+pozostaje diagnostic-only i nie może zostać podany jako manifest finalnej pary.
 
 Dla validation launcher wymusza, aby `output_dir` (a zatem launcher report,
 runtime log, static guard i canaries) pozostawał pod jednym clean runtime

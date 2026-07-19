@@ -1545,6 +1545,11 @@ def reconcile_admission_with_opened_positions(
         for row in shadow_rows
         if row.get("stage") == "post_buy_submitted"
     }
+    accepted_candidates = {
+        row["candidate_id"]
+        for row in shadow_rows
+        if row.get("handoff_accepted") is True
+    }
     registered_positions = {
         identity(row["run_id"], row["position_id"], row["position_epoch"])
         for row in shadow_rows
@@ -1579,9 +1584,20 @@ def reconcile_admission_with_opened_positions(
     for key, opened_row in opened.items():
         if opened_row["candidate_id"] not in submitted_candidates:
             reconciled["admission_missing_final_count"] += 1
-        if key not in registered_positions:
+        # `summarize_admission()` has already counted an accepted candidate
+        # that never registered or released.  The position-side pass must add
+        # only a distinct absence (for example, a durable PositionOpened with
+        # no accepted admission candidate), otherwise one missing terminal
+        # row is reported twice under two reconciliation views.
+        if (
+            key not in registered_positions
+            and opened_row["candidate_id"] not in accepted_candidates
+        ):
             reconciled["admission_missing_monitoring_registered_count"] += 1
-        if key not in released_positions:
+        if (
+            key not in released_positions
+            and opened_row["candidate_id"] not in accepted_candidates
+        ):
             reconciled["admission_missing_release_count"] += 1
         registered = registered_rows_by_identity.get(key)
         if registered is not None:
@@ -2629,7 +2645,6 @@ def evaluate(
         + len(comparison_without_position)
         + len(position_without_replay)
         + terminal_correlation_violations
-        + len(censored_keys)
         + producer_skips
         + writer_loss
         + int(writer.get("terminal_outcome_unknown_count") or 0)
@@ -2661,7 +2676,6 @@ def evaluate(
             + len(run_positions - replay_keys)
             + len(run_positions - (set(terminals) | censored_keys))
             + len({key for key in comparison_without_position if key[0] == run_id})
-            + len({key for key in censored_keys if key[0] == run_id})
         )
         per_run_summaries.append(
             {

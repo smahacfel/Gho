@@ -1028,6 +1028,25 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         self.assertFalse(gates["economic_result"]["checks"]["candidate_bearing_censored_count"])
         self.assertFalse(gates["economic_result"]["passed"])
 
+    def test_non_candidate_censor_is_coverage_evidence_not_a_causal_failure(self) -> None:
+        key = self.position_key()
+        observed, matched = gate.economic_observations(
+            {key: self.opened_position(key)},
+            {key: [self.comparison_row(key=key, timestamp_ms=1_000)]},
+            {},
+            {},
+            {
+                key: {
+                    "candidate_gate": None,
+                    "reason": "controlled_runtime_horizon",
+                }
+            },
+            self.criteria,
+        )
+        self.assertEqual(matched, [])
+        self.assertEqual(observed["censored_position_count"], 1)
+        self.assertEqual(observed["candidate_bearing_censored_count"], 0)
+
     def test_calibration_manifest_is_rejected_by_promotion_evaluate(self) -> None:
         with self.assertRaisesRegex(gate.ContractError, "validation manifests only"):
             gate.evaluate(
@@ -1140,6 +1159,20 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         self.assertEqual(complete["admission_missing_final_count"], 0)
         self.assertEqual(complete["admission_missing_monitoring_registered_count"], 0)
         self.assertEqual(complete["admission_missing_release_count"], 0)
+
+        missing_release_rows = complete_rows[:-1]
+        missing_release = gate.reconcile_admission_with_opened_positions(
+            missing_release_rows,
+            opened,
+            gate.summarize_admission(missing_release_rows),
+            {key: [self.comparison_row(key=key, timestamp_ms=2_000)]},
+            1_000,
+        )
+        self.assertEqual(
+            missing_release["admission_missing_release_count"],
+            1,
+            "one accepted/opened identity without a terminal release is one violation",
+        )
 
     def test_execution_event_position_opened_is_primary_denominator_evidence(self) -> None:
         key = self.position_key()
