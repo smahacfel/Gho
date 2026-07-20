@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import shlex
 import shutil
 import subprocess
@@ -31,6 +32,7 @@ FAIL_EVENT_CANARY = "FAIL_EVENT_CANARY"
 FAIL_LIFECYCLE_PROOF = "FAIL_LIFECYCLE_PROOF"
 FAIL_TMUX = "FAIL_TMUX"
 INCONCLUSIVE_ENV_OR_CONFIG = "INCONCLUSIVE_ENV_OR_CONFIG"
+RUNTIME_STOP_GRACE_SECONDS = 15
 
 RUN_STATE_RUNNING = "RUN_LEFT_RUNNING_AFTER_LIFECYCLE_PROOF"
 RUN_STATE_EVENT_ONLY = "RUN_LEFT_RUNNING_AFTER_EVENT_CANARY_ZERO_BUY_LIFECYCLE_ALLOWED"
@@ -137,7 +139,7 @@ def build_runtime_timeout_prefix(runtime_timeout_seconds: int | None) -> str:
     if runtime_timeout_seconds is None or runtime_timeout_seconds <= 0:
         return ""
     return (
-        "timeout --signal=INT --kill-after=120s "
+        "timeout --foreground --signal=INT --kill-after=120s "
         f"{int(runtime_timeout_seconds)}s "
     )
 
@@ -210,6 +212,79 @@ def kill_tmux_session(session: str) -> None:
     subprocess.run(["tmux", "kill-session", "-t", session], check=False)
 
 
+def read_runtime_pgid(pidfile: Path) -> int | None:
+    try:
+        raw = pidfile.read_text(encoding="utf-8").strip()
+        pgid = int(raw)
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    return pgid if pgid > 1 else None
+
+
+def runtime_process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate_runtime_process(
+    *,
+    session: str,
+    runtime_pidfile: Path,
+    grace_seconds: int = RUNTIME_STOP_GRACE_SECONDS,
+) -> dict[str, Any]:
+    """Stop the runtime process group, then clean up the tmux session.
+
+    `tmux kill-session` alone can leave the launcher orphaned under pid 1 when
+    the pane shell dies before forwarding the signal.  The pidfile points at a
+    separate `setsid` process group owned by the runtime command.
+    """
+
+    result: dict[str, Any] = {
+        "tmux_session": session,
+        "runtime_pidfile": str(runtime_pidfile),
+        "runtime_pgid": None,
+        "signals_sent": [],
+        "pidfile_found": False,
+        "runtime_process_group_alive_after": None,
+        "tmux_session_exists_after": None,
+    }
+    pgid = read_runtime_pgid(runtime_pidfile)
+    result["pidfile_found"] = pgid is not None
+    if pgid is not None:
+        result["runtime_pgid"] = pgid
+        try:
+            os.killpg(pgid, signal.SIGINT)
+            result["signals_sent"].append("SIGINT")
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            result["permission_error"] = str(exc)
+
+        deadline = time.monotonic() + max(0, grace_seconds)
+        while runtime_process_group_exists(pgid) and time.monotonic() < deadline:
+            time.sleep(0.25)
+
+        if runtime_process_group_exists(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+                result["signals_sent"].append("SIGKILL")
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                result["permission_error"] = str(exc)
+
+        result["runtime_process_group_alive_after"] = runtime_process_group_exists(pgid)
+
+    kill_tmux_session(session)
+    result["tmux_session_exists_after"] = tmux_session_exists(session)
+    return result
+
+
 def start_tmux_session(
     *,
     root: Path,
@@ -217,18 +292,24 @@ def start_tmux_session(
     launcher: Path,
     config_path: Path,
     runtime_log: Path,
+    runtime_pidfile: Path,
     runtime_timeout_seconds: int | None,
 ) -> dict[str, Any]:
     runtime_log.parent.mkdir(parents=True, exist_ok=True)
+    runtime_pidfile.parent.mkdir(parents=True, exist_ok=True)
     timeout_prefix = build_runtime_timeout_prefix(runtime_timeout_seconds)
+    runtime_inner_command = (
+        f"printf '%s\\n' \"$$\" > {shlex.quote(str(runtime_pidfile))}; "
+        f"exec {timeout_prefix}{shlex.quote(str(launcher))} "
+        f"--config {shlex.quote(str(config_path))}"
+    )
     command = (
         f"cd {shlex.quote(str(root))} && "
         "set -a; if [ -f ./.env ]; then . ./.env; fi; set +a; "
         'if [ -z "${NLN_API_KEY:-}" ] && [ -n "${GHOST_SEER_GRPC_X_TOKEN:-}" ]; then '
         'export NLN_API_KEY="$GHOST_SEER_GRPC_X_TOKEN"; '
         "fi && "
-        f"RUST_LOG=info RUST_BACKTRACE=1 {timeout_prefix}{shlex.quote(str(launcher))} "
-        f"--config {shlex.quote(str(config_path))} "
+        f"RUST_LOG=info RUST_BACKTRACE=1 setsid sh -c {shlex.quote(runtime_inner_command)} "
         f">> {shlex.quote(str(runtime_log))} 2>&1"
     )
     proc = subprocess.run(
@@ -244,6 +325,7 @@ def start_tmux_session(
         "stdout": proc.stdout,
         "stderr": proc.stderr,
         "runtime_log": str(runtime_log),
+        "runtime_pidfile": str(runtime_pidfile),
     }
 
 
@@ -344,6 +426,18 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
         lines.extend(["", "## Errors", ""])
         for error in errors:
             lines.append(f"- {error}")
+    runtime_termination = payload.get("runtime_termination") or {}
+    if runtime_termination:
+        lines.extend(["", "## Runtime Termination", ""])
+        for reason, termination in sorted(runtime_termination.items()):
+            if not isinstance(termination, dict):
+                continue
+            lines.append(
+                f"- {reason}: pgid=`{termination.get('runtime_pgid')}` "
+                f"signals=`{termination.get('signals_sent')}` "
+                f"alive_after=`{termination.get('runtime_process_group_alive_after')}` "
+                f"tmux_exists_after=`{termination.get('tmux_session_exists_after')}`"
+            )
     lines.extend(
         [
             "",
@@ -442,6 +536,7 @@ def main(argv: list[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     baseline_path = output_dir / "baseline_before_start.json"
     runtime_log = output_dir / "runtime.log"
+    runtime_pidfile = output_dir / "runtime_process_group.pid"
     report: dict[str, Any] = {
         "schema_version": 1,
         "guard": "selector_lifecycle_run_launcher",
@@ -474,8 +569,12 @@ def main(argv: list[str] | None = None) -> int:
         "baseline": str(baseline_path),
         "event_canary": {},
         "lifecycle_canary": {},
+        "runtime_termination": {},
         "errors": [],
-        "artifacts": {"runtime_log": str(runtime_log)},
+        "artifacts": {
+            "runtime_log": str(runtime_log),
+            "runtime_pidfile": str(runtime_pidfile),
+        },
     }
 
     current_free_gb = free_gb(root)
@@ -587,7 +686,10 @@ def main(argv: list[str] | None = None) -> int:
         return finish(report, output_dir, FAIL_TMUX)
 
     if tmux_session_exists(args.tmux_session) and args.allow_existing_session:
-        kill_tmux_session(args.tmux_session)
+        report["runtime_termination"]["existing_session"] = terminate_runtime_process(
+            session=args.tmux_session,
+            runtime_pidfile=runtime_pidfile,
+        )
 
     report["git_head_at_launch"] = git_head(root)
     if args.build_release_before_start and report.get("git_head_at_build") != report.get("git_head_at_launch"):
@@ -600,6 +702,7 @@ def main(argv: list[str] | None = None) -> int:
         launcher=launcher,
         config_path=resolved_config,
         runtime_log=runtime_log,
+        runtime_pidfile=runtime_pidfile,
         runtime_timeout_seconds=args.runtime_timeout_seconds,
     )
     report["tmux_start"] = start
@@ -629,7 +732,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     report["event_canary"] = event_result
     if event_result["exit_code"] != 0:
-        kill_tmux_session(args.tmux_session)
+        report["runtime_termination"]["event_canary_failed"] = terminate_runtime_process(
+            session=args.tmux_session,
+            runtime_pidfile=runtime_pidfile,
+        )
         report["run_state"] = RUN_STATE_KILLED
         report["errors"].append("event canary failed")
         return finish(report, output_dir, FAIL_EVENT_CANARY)
@@ -664,7 +770,10 @@ def main(argv: list[str] | None = None) -> int:
             return finish(report, output_dir, PASS_STATUS)
         time.sleep(max(1, args.lifecycle_poll_seconds))
 
-    kill_tmux_session(args.tmux_session)
+    report["runtime_termination"]["lifecycle_proof_timeout"] = terminate_runtime_process(
+        session=args.tmux_session,
+        runtime_pidfile=runtime_pidfile,
+    )
     report["run_state"] = RUN_STATE_KILLED
     report["errors"].append("lifecycle proof timeout expired")
     return finish(report, output_dir, FAIL_LIFECYCLE_PROOF)

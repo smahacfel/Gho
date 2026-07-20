@@ -19,6 +19,8 @@ The primary goals are:
 
 Use this file as the always-on repository orchestration layer.
 
+> **NADRZĘDNA ZASADA REALIZACJI: NAJPIERW WDROŻ DZIAŁAJĄCE ROZWIĄZANIE RZECZYWISTEGO PROBLEMU, A POTEM SPRAWDŹ JE NA DANYCH; NIGDY NIE ZASTĘPUJ BRAKU TEGO ROZWIĄZANIA DODATKOWĄ OBSERWACJĄ, RAPORTEM, RUNEM, CHECKLISTĄ ANI FORMALNYM ARTEFAKTEM.**
+
 Detailed specialist role definitions live in: docs/agents/
 
 Project skills live in: .codex/skills/
