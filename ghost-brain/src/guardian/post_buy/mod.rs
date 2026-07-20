@@ -40,11 +40,11 @@ mod trajectory_v1;
 pub use crate::events::ShadowUnresolvedReason;
 pub use config::{
     CrashGuardMode, ExitPolicyV1Config, HetPmV2Config, HetPmV2Mode, PostBuyGuardianConfig,
-    ShadowExitReplayConfig, TimeStopV2Config,
+    ShadowExitReplayConfig, ShadowMarketRefreshConfig, TimeStopV2Config,
 };
 pub use engine::{
     MonitoringEngine, MonitoringEngineConfigError, RegisteredShadowPosition,
-    ShadowTerminalDisposition,
+    ShadowMarketRefreshTarget, ShadowTerminalDisposition,
 };
 pub use exit_policy_v1::{
     validate_exit_policy_v1_config, ExitPolicyConfigError, ExitPolicyV1Status,

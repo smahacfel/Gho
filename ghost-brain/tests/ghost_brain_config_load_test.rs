@@ -74,6 +74,20 @@ fn post_buy_guardian_lifecycle_thresholds_load_from_r41_selector_config() {
 }
 
 #[test]
+fn het_pm_v2_rollout_refreshes_before_quote_stale_boundary() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../configs/rollout/ghost_brain_het_pm_v2_promotion_evidence_v1.toml");
+    let config = GhostBrainConfig::from_toml_file(&path).expect("HET PM V2 config should load");
+    let post_buy = &config.post_buy_guardian;
+    let refresh = &post_buy.shadow_market_refresh;
+
+    assert!(refresh.enabled);
+    assert!(refresh.stale_after_ms < post_buy.aem.oracle_stale_hard_ms);
+    assert!(refresh.per_position_cooldown_ms <= post_buy.tick_interval_ms);
+    assert!(refresh.max_requests_per_cycle >= 32);
+}
+
+#[test]
 fn gatekeeper_v3_config_loads_from_production_toml() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ghost_brain_config.toml");
     let config = GhostBrainConfig::from_toml_file(&path).expect("production config should load");

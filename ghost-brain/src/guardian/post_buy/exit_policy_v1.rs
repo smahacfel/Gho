@@ -379,6 +379,8 @@ pub(super) enum ExitCandidateReason {
     Inactivity,
     AbsoluteMaxHold,
     CrashGuard,
+    ExecutableTrailing,
+    VitalityDecay,
 }
 
 impl ExitCandidateReason {
@@ -390,6 +392,8 @@ impl ExitCandidateReason {
             Self::Inactivity => "inactivity",
             Self::AbsoluteMaxHold => "absolute_max_hold",
             Self::CrashGuard => "crash_guard",
+            Self::ExecutableTrailing => "executable_trailing",
+            Self::VitalityDecay => "vitality_decay",
         }
     }
 
@@ -400,6 +404,8 @@ impl ExitCandidateReason {
             Self::Inactivity => "time_stop",
             Self::AbsoluteMaxHold => "absolute_max_hold",
             Self::CrashGuard => "crash_guard",
+            Self::ExecutableTrailing => "executable_trailing",
+            Self::VitalityDecay => "vitality_decay",
         }
     }
 }

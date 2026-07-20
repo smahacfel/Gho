@@ -1253,8 +1253,23 @@ escalation_critical_count = 1
 signal_aggregation_window_ms = 5000
 max_signals_per_position = 200
 
-# Position Manager Lite V1 remains the sole lifecycle authority throughout the
-# promotion-evidence burn-in. These fields match the accepted PR A profile.
+# When a managed shadow position becomes quiet, stream-fed curve state can
+# become stale although the account is still readable. Refresh only that
+# already-managed account through a bounded, processed-RPC point query. This
+# is read-only: it cannot place, submit, or confirm a sell, and it runs outside
+# the monitor tick. This table deliberately follows all direct
+# `post_buy_guardian` fields: TOML would otherwise assign those fields to this
+# nested table.
+[post_buy_guardian.shadow_market_refresh]
+enabled = true
+stale_after_ms = 500
+interval_ms = 250
+per_position_cooldown_ms = 250
+max_requests_per_cycle = 32
+rpc_timeout_ms = 750
+
+# V1 remains the quote/apply/retry safety envelope. It no longer chooses a new
+# shadow exit when the V2 manager below is authoritative.
 [post_buy_guardian.exit_policy_v1]
 quote_recovery_ms = 5000
 absolute_max_hold_enabled = true
@@ -1267,24 +1282,27 @@ crash_min_distinct_slots = 2
 crash_max_sample_age_ms = 1500
 crash_max_executable_return_pct = -20.0
 
-# HET-PM V2 is evidence-only in this profile. Its immutable comparison stream
-# is the input to the deterministic promotion gate; it cannot mutate lifecycle.
+# HET-PM V2 is the sole shadow exit decision owner in this profile. It can only
+# execute through the existing shadow lifecycle; it cannot enable live selling.
 [post_buy_guardian.het_pm_v2]
 enabled = true
-mode = "observe_only"
+mode = "authoritative_shadow"
 trajectory_short_ms = 1500
 trajectory_medium_ms = 5000
 trajectory_long_ms = 15000
 max_newest_sample_age_ms = 1500
-trailing_arm_mark_return_bps = 2500
-trailing_mark_candidate_drawdown_bps = 1500
-trailing_executable_breach_bps = 1800
-peak_anchor_min_step_bps = 500
-peak_anchor_force_refresh_on_new_peak_after_ms = 5000
-vitality_min_age_ms = 11000
-vitality_required_non_alive_windows = 3
-vitality_min_time_since_peak_ms = 5000
-vitality_recovery_return_bps = 300
+# Deliberately permissive shadow-manager settings: 5% arm, 3% mark
+# drawdown and 1% executable drawdown.  Entry minimums remain 5 tx / 3 buys /
+# 3 unique signers in the Gatekeeper section above.
+trailing_arm_mark_return_bps = 500
+trailing_mark_candidate_drawdown_bps = 300
+trailing_executable_breach_bps = 100
+peak_anchor_min_step_bps = 100
+peak_anchor_force_refresh_on_new_peak_after_ms = 2000
+vitality_min_age_ms = 5000
+vitality_required_non_alive_windows = 1
+vitality_min_time_since_peak_ms = 2000
+vitality_recovery_return_bps = 100
 writer_queue_capacity = 256
 terminal_write_budget_ms = 25
 
@@ -1292,15 +1310,15 @@ terminal_write_budget_ms = 25
 [post_buy_guardian.time_stop_v2]
 enabled = true
 mode = "observe_only"
-first_check_ms = 3000
-window_ms = 4000
-failed_windows_to_signal = 3
-min_age_before_signal_ms = 11000
-min_price_delta_pct_alive = 3.0
-min_mcap_delta_pct_alive = 3.0
-min_bonding_delta_pct_alive = 0.75
-min_volume_delta_sol_alive = 1.0
-min_price_delta_pct_for_volume_alive = 1.0
+first_check_ms = 1000
+window_ms = 2000
+failed_windows_to_signal = 1
+min_age_before_signal_ms = 5000
+min_price_delta_pct_alive = 0.5
+min_mcap_delta_pct_alive = 0.5
+min_bonding_delta_pct_alive = 0.25
+min_volume_delta_sol_alive = 0.1
+min_price_delta_pct_for_volume_alive = 0.25
 min_tx_delta_for_heartbeat = 1
 max_avg_volume_per_tx_sol_heartbeat = 0.05
 max_abs_price_delta_pct_heartbeat = 1.0

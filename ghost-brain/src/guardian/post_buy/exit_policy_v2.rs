@@ -1,9 +1,8 @@
-//! Pure HET Position Manager V2 policy and observer contracts (PR A).
+//! Pure HET Position Manager V2 policy and its shadow-manager contracts.
 //!
-//! This module is deliberately incapable of mutating a position. It produces
-//! counterfactual candidates, typed blockers, quote requirements, comparison
-//! evidence, and guarded executable-anchor requests. V1 remains the sole
-//! shadow authority.
+//! Evaluation remains side-effect free.  In `authoritative_shadow` mode the
+//! engine consumes its completed decisions through the existing guarded shadow
+//! sell/apply path; this module never performs mutation itself.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -64,8 +63,6 @@ pub enum HetPmV2ConfigError {
     InvalidWriterQueueCapacity,
     #[error("HET-PM V2 terminal write budget must be within 1..=100 ms")]
     InvalidTerminalWriteBudget,
-    #[error("HET-PM V2 authoritative_shadow is forbidden in PR A")]
-    AuthoritativeModeForbidden,
     #[error("HET-PM V2 vitality requires time_stop_v2.enabled=true")]
     VitalitySourceDisabled,
     #[error("HET-PM V2 config could not be serialized for hashing")]
@@ -156,10 +153,6 @@ impl EffectiveHetPmV2Config {
         {
             return Err(HetPmV2ConfigError::InvalidTerminalWriteBudget);
         }
-        if matches!(config.mode, HetPmV2Mode::AuthoritativeShadow) {
-            return Err(HetPmV2ConfigError::AuthoritativeModeForbidden);
-        }
-
         #[derive(Serialize)]
         struct HashInput {
             enabled: bool,
@@ -231,6 +224,10 @@ impl EffectiveHetPmV2Config {
     pub(super) fn enabled(&self) -> bool {
         self.enabled
     }
+
+    pub(super) const fn authoritative_shadow(&self) -> bool {
+        matches!(self.mode, HetPmV2Mode::AuthoritativeShadow)
+    }
     pub(super) fn trajectory_short_ms(&self) -> u64 {
         self.trajectory_short_ms
     }
@@ -253,6 +250,7 @@ impl EffectiveHetPmV2Config {
         self.terminal_write_budget_ms
     }
     pub(super) fn status(&self, crash_guard_mode: CrashGuardMode) -> HetPmV2Status {
+        let v2_shadow_authority = self.authoritative_shadow();
         HetPmV2Status {
             policy_id: self.policy_id.to_string(),
             policy_version: self.policy_version,
@@ -282,8 +280,8 @@ impl EffectiveHetPmV2Config {
             terminal_write_budget_ms: self.terminal_write_budget_ms,
             crash_guard_mode,
             crash_guard_mode_source: "effective_exit_policy_v1_config".to_string(),
-            v1_shadow_authority: true,
-            v2_shadow_authority: false,
+            v1_shadow_authority: !v2_shadow_authority,
+            v2_shadow_authority,
             live_authority: false,
         }
     }
@@ -528,6 +526,21 @@ pub(super) enum HetPmExitReasonV2 {
     AbsoluteMaxHold,
 }
 
+impl HetPmExitReasonV2 {
+    /// Map the V2 decision to the existing guarded full-position execution
+    /// envelope.  The envelope owns retries, fill application and terminal
+    /// cleanup; it does not choose this reason.
+    pub(super) const fn exit_candidate_reason(self) -> ExitCandidateReason {
+        match self {
+            Self::Crash => ExitCandidateReason::CrashGuard,
+            Self::HardLoss => ExitCandidateReason::StopLoss,
+            Self::ExecutableTrailing => ExitCandidateReason::ExecutableTrailing,
+            Self::VitalityDecay => ExitCandidateReason::VitalityDecay,
+            Self::AbsoluteMaxHold => ExitCandidateReason::AbsoluteMaxHold,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum HetPmUnknownReasonV2 {
@@ -689,17 +702,76 @@ pub(super) struct HetPmQuoteFinalizationInputV2<'a> {
 }
 
 impl ExitPolicyV2 {
+    fn mark_return_bps(entry_price: f64, mark_price: f64) -> i32 {
+        if entry_price > 0.0 && mark_price.is_finite() && mark_price > 0.0 {
+            (10_000.0 * (mark_price / entry_price - 1.0))
+                .round()
+                .clamp(i32::MIN as f64, i32::MAX as f64) as i32
+        } else {
+            i32::MIN
+        }
+    }
+
+    fn trailing_arm_mark_return_bps(view: PostBuyDecisionViewV2<'_>) -> i32 {
+        let entry_price = view.base.entry_price_sol().unwrap_or_default();
+        match view.extras.trajectory.peak_mark_price_sol {
+            Some(peak_mark) => Self::mark_return_bps(entry_price, peak_mark),
+            None => i32::MIN,
+        }
+    }
+
     pub(super) fn evaluate_prequote(
         view: PostBuyDecisionViewV2<'_>,
         v1_prequote: &PreQuoteDecision,
         crash_prequote: &CrashGuardPreQuoteDecision,
         config: &EffectiveHetPmV2Config,
     ) -> HetPmPreQuoteEvaluationV2 {
+        let absolute_max_hold_due = matches!(
+            v1_prequote,
+            PreQuoteDecision::QuoteRequired { candidate }
+                if matches!(candidate.reason(), ExitCandidateReason::AbsoluteMaxHold)
+        );
+        Self::evaluate_prequote_with_absolute_max_hold(
+            view,
+            v1_prequote,
+            crash_prequote,
+            config,
+            absolute_max_hold_due,
+        )
+    }
+
+    /// Evaluate the hierarchy with the hard position-age ceiling supplied by
+    /// the runtime.  The ceiling is deliberately independent of the ordinary
+    /// V1 prequote winner: at its deadline an older V1 take-profit or
+    /// inactivity candidate must not hide it, and a V2 data blocker must not
+    /// leave the position open indefinitely.
+    pub(super) fn evaluate_prequote_with_absolute_max_hold(
+        view: PostBuyDecisionViewV2<'_>,
+        v1_prequote: &PreQuoteDecision,
+        crash_prequote: &CrashGuardPreQuoteDecision,
+        config: &EffectiveHetPmV2Config,
+        absolute_max_hold_due: bool,
+    ) -> HetPmPreQuoteEvaluationV2 {
         let mut suppressed = 0_u16;
         let finish = |candidate, winning_gate, suppressed_gates_mask| HetPmPreQuoteEvaluationV2 {
             candidate,
             winning_gate,
             suppressed_gates_mask,
+        };
+        let max_hold_or_blocked = |reason, suppressed_gates_mask| {
+            if absolute_max_hold_due {
+                finish(
+                    HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::AbsoluteMaxHold),
+                    HetPmGateV2::AbsoluteMaxHold,
+                    suppressed_gates_mask,
+                )
+            } else {
+                finish(
+                    HetPmCandidateV2::Blocked(reason),
+                    HetPmGateV2::Integrity,
+                    suppressed_gates_mask,
+                )
+            }
         };
 
         if !config.enabled() {
@@ -725,26 +797,14 @@ impl ExitPolicyV2 {
             );
         }
         if view.extras.entry_value_quote_raw.is_none() {
-            return finish(
-                HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::EntryCapitalUnavailable),
-                HetPmGateV2::Integrity,
-                suppressed,
-            );
+            return max_hold_or_blocked(HetPmUnknownReasonV2::EntryCapitalUnavailable, suppressed);
         }
         match view.extras.route_status {
             RouteStatusV1::CurveCompletePumpSwapUnsupported => {
-                return finish(
-                    HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::RouteUnsupported),
-                    HetPmGateV2::Integrity,
-                    suppressed,
-                );
+                return max_hold_or_blocked(HetPmUnknownReasonV2::RouteUnsupported, suppressed);
             }
             RouteStatusV1::Unknown => {
-                return finish(
-                    HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::RouteUnknown),
-                    HetPmGateV2::Integrity,
-                    suppressed,
-                );
+                return max_hold_or_blocked(HetPmUnknownReasonV2::RouteUnknown, suppressed);
             }
             RouteStatusV1::PumpCurveSupported => {}
         }
@@ -755,31 +815,18 @@ impl ExitPolicyV2 {
             MarkEvidenceStatus::Invalid => Some(HetPmUnknownReasonV2::MarkInvalid),
         };
         if let Some(reason) = mark_blocker {
-            return finish(
-                HetPmCandidateV2::Blocked(reason),
-                HetPmGateV2::Integrity,
-                suppressed,
-            );
+            return max_hold_or_blocked(reason, suppressed);
         }
         match view.extras.trajectory.quality {
             TrajectoryQualityV1::Invalid => {
-                return finish(
-                    HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::TrajectoryInvalid),
-                    HetPmGateV2::Integrity,
-                    suppressed,
-                );
+                return max_hold_or_blocked(HetPmUnknownReasonV2::TrajectoryInvalid, suppressed);
             }
             TrajectoryQualityV1::Stale => {
-                return finish(
-                    HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::TrajectoryStale),
-                    HetPmGateV2::Integrity,
-                    suppressed,
-                );
+                return max_hold_or_blocked(HetPmUnknownReasonV2::TrajectoryStale, suppressed);
             }
             TrajectoryQualityV1::Unavailable | TrajectoryQualityV1::InsufficientSamples => {
-                return finish(
-                    HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::TrajectoryUnavailable),
-                    HetPmGateV2::Integrity,
+                return max_hold_or_blocked(
+                    HetPmUnknownReasonV2::TrajectoryUnavailable,
                     suppressed,
                 );
             }
@@ -812,14 +859,8 @@ impl ExitPolicyV2 {
         }
         suppressed |= HetPmGateV2::HardLoss.bit();
 
-        let entry_price = view.base.entry_price_sol().unwrap_or_default();
-        let current_mark = view.base.mark_price_sol().unwrap_or_default();
-        let mark_return_bps = if entry_price > 0.0 {
-            (10_000.0 * (current_mark / entry_price - 1.0)).round() as i32
-        } else {
-            i32::MIN
-        };
-        let trailing_mark_candidate = mark_return_bps >= config.trailing_arm_mark_return_bps
+        let trailing_mark_candidate = Self::trailing_arm_mark_return_bps(view)
+            >= config.trailing_arm_mark_return_bps
             && view
                 .extras
                 .trajectory
@@ -888,11 +929,7 @@ impl ExitPolicyV2 {
         }
         suppressed |= HetPmGateV2::VitalityDecay.bit();
 
-        if matches!(
-            v1_prequote,
-            PreQuoteDecision::QuoteRequired { candidate }
-                if matches!(candidate.reason(), ExitCandidateReason::AbsoluteMaxHold)
-        ) {
+        if absolute_max_hold_due {
             return finish(
                 HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::AbsoluteMaxHold),
                 HetPmGateV2::AbsoluteMaxHold,
@@ -915,6 +952,27 @@ impl ExitPolicyV2 {
         v1_prequote: &PreQuoteDecision,
         crash_prequote: &CrashGuardPreQuoteDecision,
         config: &EffectiveHetPmV2Config,
+    ) -> Vec<HetPmGatePreQuoteEvidenceV2> {
+        let absolute_max_hold_due = matches!(
+            v1_prequote,
+            PreQuoteDecision::QuoteRequired { candidate }
+                if matches!(candidate.reason(), ExitCandidateReason::AbsoluteMaxHold)
+        );
+        Self::evaluate_gate_lattice_with_absolute_max_hold(
+            view,
+            v1_prequote,
+            crash_prequote,
+            config,
+            absolute_max_hold_due,
+        )
+    }
+
+    pub(super) fn evaluate_gate_lattice_with_absolute_max_hold(
+        view: PostBuyDecisionViewV2<'_>,
+        v1_prequote: &PreQuoteDecision,
+        crash_prequote: &CrashGuardPreQuoteDecision,
+        config: &EffectiveHetPmV2Config,
+        absolute_max_hold_due: bool,
     ) -> Vec<HetPmGatePreQuoteEvidenceV2> {
         let global = if !config.enabled() {
             Some(HetPmCandidateV2::Blocked(
@@ -983,7 +1041,18 @@ impl ExitPolicyV2 {
                 .into_iter()
                 .map(|reason| HetPmGatePreQuoteEvidenceV2 {
                     reason,
-                    candidate: candidate.clone(),
+                    // Absolute max hold is the last hard occupancy ceiling.
+                    // Missing trajectory, vitality or route evidence cannot
+                    // turn it into an endless Hold.  The normal quote/retry
+                    // path will either resolve a full exit or emit its typed
+                    // unresolved terminal outcome.
+                    candidate: if matches!(reason, HetPmExitReasonV2::AbsoluteMaxHold)
+                        && absolute_max_hold_due
+                    {
+                        HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::AbsoluteMaxHold)
+                    } else {
+                        candidate.clone()
+                    },
                 })
                 .collect();
         }
@@ -1005,14 +1074,8 @@ impl ExitPolicyV2 {
         } else {
             HetPmCandidateV2::Hold
         };
-        let entry_price = view.base.entry_price_sol().unwrap_or_default();
-        let current_mark = view.base.mark_price_sol().unwrap_or_default();
-        let mark_return_bps = if entry_price > 0.0 {
-            (10_000.0 * (current_mark / entry_price - 1.0)).round() as i32
-        } else {
-            i32::MIN
-        };
-        let trailing = if mark_return_bps >= config.trailing_arm_mark_return_bps
+        let trailing = if Self::trailing_arm_mark_return_bps(view)
+            >= config.trailing_arm_mark_return_bps
             && view
                 .extras
                 .trajectory
@@ -1064,11 +1127,7 @@ impl ExitPolicyV2 {
         } else {
             HetPmCandidateV2::Hold
         };
-        let absolute_max_hold = if matches!(
-            v1_prequote,
-            PreQuoteDecision::QuoteRequired { candidate }
-                if matches!(candidate.reason(), ExitCandidateReason::AbsoluteMaxHold)
-        ) {
+        let absolute_max_hold = if absolute_max_hold_due {
             HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::AbsoluteMaxHold)
         } else {
             HetPmCandidateV2::Hold
@@ -1154,6 +1213,28 @@ impl ExitPolicyV2 {
             peak_mark_price_sol: peak_price,
             source_snapshot_id: view.base.snapshot_id().to_string(),
         }
+    }
+
+    /// Select the actual shadow exit from the already finalized lattice.
+    ///
+    /// The vector is in the fixed hierarchy order.  A Crash observation that
+    /// has no authority is skipped, not converted into Hold and not allowed to
+    /// suppress a lower active rule such as executable trailing.
+    pub(super) fn select_authoritative_exit(
+        evaluations: &[HetPmGateEvaluationV2],
+        crash_guard_mode: CrashGuardMode,
+    ) -> Option<HetPmExitReasonV2> {
+        evaluations.iter().find_map(|evaluation| {
+            let HetPmFinalDecisionV2::ExitAll { reason, .. } = evaluation.final_decision else {
+                return None;
+            };
+            if matches!(reason, HetPmExitReasonV2::Crash)
+                && !matches!(crash_guard_mode, CrashGuardMode::AuthoritativeShadow)
+            {
+                return None;
+            }
+            Some(reason)
+        })
     }
 
     pub(super) fn finalize_with_quote(
@@ -1481,6 +1562,15 @@ pub(super) struct V1V2ComparisonRecord {
     pub(super) v1_authority_receipt: Option<V1AuthorityTickReceiptV1>,
     pub(super) v2_prequote: String,
     pub(super) v2_final: Option<String>,
+    /// Exact shared-envelope reason selected by an authoritative V2 tick.
+    ///
+    /// `v2_winning_gate` intentionally remains the pure hierarchy result for
+    /// diagnostics.  It can therefore be a higher typed blocker while a lower
+    /// hard ceiling (for example AbsoluteMaxHold) is the actual V2 action.
+    /// This field records only the candidate that V2 handed to the guarded
+    /// executor on this snapshot, so finalization never has to infer ownership
+    /// from the diagnostic winner or from a shared V1 reason label.
+    pub(super) v2_selected_execution_reason: Option<String>,
     pub(super) v2_crash_quote_decision: Option<CrashGuardQuoteDecision>,
     pub(super) v2_winning_gate: HetPmGateV2,
     pub(super) v2_suppressed_gates_mask: u16,
@@ -1697,7 +1787,21 @@ impl PreparedV1V2ComparisonCoreV1 {
                             V1TerminalCommitStatusV1::NotRequired
                         );
                 record.v1_final = Some(receipt.outcome.as_label().to_string());
+                // An authoritative-V2 tick can still encounter an action that
+                // was already started by V1 before cutover. That action must
+                // finish unchanged, but it must not be attributed to V2. The
+                // engine records the exact V2 candidate it actually passed to
+                // the shared envelope; comparing that value avoids both a
+                // HardLoss/StopLoss label mismatch and the false inference
+                // from a higher diagnostic blocker over AbsoluteMaxHold.
+                let v2_started_this_action = record.v2_shadow_authority
+                    && receipt.reason.as_deref() == record.v2_selected_execution_reason.as_deref();
+                let v2_proposal_created = v2_started_this_action && receipt.action_id.is_some();
+                let v2_economic_mutation = v2_started_this_action
+                    && matches!(receipt.exit_apply_status, V1ExitApplyStatusV1::Applied);
                 record.v1_authority_receipt = Some(receipt);
+                record.v2_proposal_created = v2_proposal_created;
+                record.v2_economic_mutation = v2_economic_mutation;
                 record.anchor_applied = anchor_applied;
                 match record.validate_and_serialize() {
                     Ok(encoded) => PreparedHetComparisonV1::Ready {
@@ -1759,14 +1863,26 @@ impl V1V2ComparisonRecord {
         if !matches!(self.lane, Lane::Shadow) {
             return Err("comparison_lane_is_not_shadow");
         }
-        if self.consumed_by_policy {
-            return Err("observe_only_record_marked_as_policy_consumed");
-        }
-        if !self.v1_shadow_authority || self.v2_shadow_authority || self.live_authority {
+        if self.v1_shadow_authority == self.v2_shadow_authority || self.live_authority {
             return Err("comparison_authority_contract_mismatch");
         }
-        if self.v2_economic_mutation
-            || self.v2_proposal_created
+        if self.consumed_by_policy != self.v2_shadow_authority {
+            return Err("comparison_policy_consumption_mismatch");
+        }
+        if let Some(selected_reason) = self.v2_selected_execution_reason.as_deref() {
+            let selected_reason_is_real_v2_exit =
+                self.v2_gate_evaluations.iter().any(|evaluation| {
+                    matches!(
+                        &evaluation.final_decision,
+                        HetPmFinalDecisionV2::ExitAll { reason, .. }
+                            if reason.exit_candidate_reason().as_label() == selected_reason
+                    )
+                });
+            if !self.v2_shadow_authority || !selected_reason_is_real_v2_exit {
+                return Err("comparison_v2_selected_execution_reason_mismatch");
+            }
+        }
+        if (!self.v2_shadow_authority && (self.v2_economic_mutation || self.v2_proposal_created))
             || self.v2_time_stop_mutation
             || self.duplicate_action_observed
             || self.route_build_authority_changed
@@ -2179,6 +2295,7 @@ mod tests {
             }),
             v2_prequote: "Hold".to_string(),
             v2_final: Some("Hold".to_string()),
+            v2_selected_execution_reason: None,
             v2_crash_quote_decision: None,
             v2_winning_gate: HetPmGateV2::Hold,
             v2_suppressed_gates_mask: 0,
@@ -2227,17 +2344,18 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_disabled_and_authoritative_mode_is_rejected() {
+    fn defaults_are_disabled_and_authoritative_shadow_is_explicitly_enabled() {
         let cfg = PostBuyGuardianConfig::default();
         let effective = EffectiveHetPmV2Config::from_guardian(&cfg).unwrap();
         assert!(!effective.enabled());
 
-        let mut invalid = cfg;
-        invalid.het_pm_v2.mode = HetPmV2Mode::AuthoritativeShadow;
-        assert_eq!(
-            EffectiveHetPmV2Config::from_guardian(&invalid),
-            Err(HetPmV2ConfigError::AuthoritativeModeForbidden)
-        );
+        let mut authoritative = cfg;
+        authoritative.het_pm_v2.enabled = true;
+        authoritative.time_stop_v2.enabled = true;
+        authoritative.het_pm_v2.mode = HetPmV2Mode::AuthoritativeShadow;
+        assert!(EffectiveHetPmV2Config::from_guardian(&authoritative)
+            .unwrap()
+            .authoritative_shadow());
     }
 
     #[test]
@@ -2401,6 +2519,88 @@ mod tests {
             record.validate_and_serialize(),
             Err("v1_receipt_apply_commit_axes_mismatch")
         );
+    }
+
+    #[test]
+    fn authoritative_v2_max_hold_is_attributed_even_when_pure_hierarchy_is_blocked() {
+        let mut record = comparison_record();
+        record.v1_shadow_authority = false;
+        record.v2_shadow_authority = true;
+        record.consumed_by_policy = true;
+        record.v1_final = None;
+        record.v1_authority_receipt = None;
+        // The pure diagnostic hierarchy can be blocked above MaxHold. The
+        // separately stored lattice still proves the hard ceiling was the
+        // precise V2 action passed to the shared executor.
+        record.v2_final = Some("Blocked(VitalityEvidenceStale)".to_string());
+        record.v2_selected_execution_reason = Some("absolute_max_hold".to_string());
+        let max_hold = record
+            .v2_gate_evaluations
+            .iter_mut()
+            .find(|evaluation| evaluation.gate == HetPmExitReasonV2::AbsoluteMaxHold)
+            .expect("absolute-max-hold lattice entry");
+        max_hold.prequote = HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::AbsoluteMaxHold);
+        max_hold.final_decision = HetPmFinalDecisionV2::ExitAll {
+            reason: HetPmExitReasonV2::AbsoluteMaxHold,
+            quantity_raw: 100,
+            executable_gross_return_bps: -95,
+        };
+        max_hold.quote_status = HetPmGateQuoteStatusV2::Resolved;
+        max_hold.executable_gross_return_bps = Some(-95);
+
+        let prepared = PreparedV1V2ComparisonCoreV1::prepare(record);
+        let finalized = prepared.finalize(
+            V1AuthorityTickReceiptV1 {
+                snapshot_id: "snapshot".to_string(),
+                state_revision: 2,
+                remaining_quantity_raw: 100,
+                outcome: V1AuthorityTickOutcomeV1::ExitApplied,
+                exit_apply_status: V1ExitApplyStatusV1::Applied,
+                terminal_commit_status: V1TerminalCommitStatusV1::Pending,
+                action_id: Some("action".to_string()),
+                reason: Some("absolute_max_hold".to_string()),
+                crash_quote_decision: None,
+            },
+            false,
+        );
+
+        let PreparedHetComparisonV1::Ready { encoded, .. } = finalized else {
+            panic!("authoritative V2 MaxHold comparison must serialize");
+        };
+        let row: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("serialized comparison JSON");
+        assert_eq!(row["v2_selected_execution_reason"], "absolute_max_hold");
+        assert_eq!(row["v2_proposal_created"], true);
+        assert_eq!(row["v2_economic_mutation"], true);
+    }
+
+    #[test]
+    fn v1_action_is_not_attributed_when_v2_selected_no_exit() {
+        let mut record = comparison_record();
+        record.v1_final = None;
+        record.v1_authority_receipt = None;
+        let finalized = PreparedV1V2ComparisonCoreV1::prepare(record).finalize(
+            V1AuthorityTickReceiptV1 {
+                snapshot_id: "snapshot".to_string(),
+                state_revision: 2,
+                remaining_quantity_raw: 100,
+                outcome: V1AuthorityTickOutcomeV1::ExitApplied,
+                exit_apply_status: V1ExitApplyStatusV1::Applied,
+                terminal_commit_status: V1TerminalCommitStatusV1::Pending,
+                action_id: Some("action".to_string()),
+                reason: Some("absolute_max_hold".to_string()),
+                crash_quote_decision: None,
+            },
+            false,
+        );
+
+        let PreparedHetComparisonV1::Ready { encoded, .. } = finalized else {
+            panic!("V1 comparison must serialize");
+        };
+        let row: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("serialized comparison JSON");
+        assert_eq!(row["v2_proposal_created"], false);
+        assert_eq!(row["v2_economic_mutation"], false);
     }
 
     #[test]
@@ -2587,6 +2787,22 @@ mod tests {
             HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::RouteUnsupported)
         );
 
+        let max_hold_lattice = ExitPolicyV2::evaluate_gate_lattice(
+            unsupported.view(),
+            &PreQuoteDecision::QuoteRequired {
+                candidate: ExitCandidate::from_reason(ExitCandidateReason::AbsoluteMaxHold),
+            },
+            &CrashGuardPreQuoteDecision::Disabled,
+            &config,
+        );
+        assert!(matches!(
+            max_hold_lattice.last(),
+            Some(HetPmGatePreQuoteEvidenceV2 {
+                reason: HetPmExitReasonV2::AbsoluteMaxHold,
+                candidate: HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::AbsoluteMaxHold),
+            })
+        ));
+
         let normal = bundle(
             false,
             20_000,
@@ -2646,12 +2862,14 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.winning_gate, HetPmGateV2::ExecutableTrailing);
 
+        let mut non_trailing_trajectory = usable_trajectory();
+        non_trailing_trajectory.drawdown_from_peak_bps = Some(0);
         let vitality_candidate = bundle(
             false,
             20_000,
             1.1,
             RouteStatusV1::PumpCurveSupported,
-            usable_trajectory(),
+            non_trailing_trajectory,
             vitality(VitalityStateV1::HeartbeatOnly, 3),
             Some(anchor(&config)),
         );
@@ -2666,6 +2884,7 @@ mod tests {
         assert_eq!(result.winning_gate, HetPmGateV2::VitalityDecay);
 
         let mut recovered_trajectory = usable_trajectory();
+        recovered_trajectory.drawdown_from_peak_bps = Some(0);
         recovered_trajectory.return_5s_bps = Some(300);
         let recovered = bundle(
             false,
@@ -2694,6 +2913,52 @@ mod tests {
         );
         assert_eq!(hold.winning_gate, HetPmGateV2::Hold);
         assert_eq!(hold.candidate, HetPmCandidateV2::Hold);
+    }
+
+    #[test]
+    fn executable_trailing_arms_from_peak_mark_return_not_current_return_after_giveback() {
+        let config = effective();
+        let mut trajectory = usable_trajectory();
+        trajectory.peak_mark_price_sol = Some(1.5);
+        trajectory.drawdown_from_peak_bps = Some(3_000);
+        trajectory.time_since_peak_ms = Some(6_000);
+        let snapshot = bundle(
+            false,
+            20_000,
+            1.05,
+            RouteStatusV1::PumpCurveSupported,
+            trajectory,
+            vitality(VitalityStateV1::Alive, 0),
+            Some(anchor(&config)),
+        );
+
+        let result = ExitPolicyV2::evaluate_prequote(
+            snapshot.view(),
+            &PreQuoteDecision::Hold,
+            &CrashGuardPreQuoteDecision::Disabled,
+            &config,
+        );
+        assert_eq!(result.winning_gate, HetPmGateV2::ExecutableTrailing);
+        assert_eq!(
+            result.candidate,
+            HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::ExecutableTrailing)
+        );
+
+        let lattice = ExitPolicyV2::evaluate_gate_lattice(
+            snapshot.view(),
+            &PreQuoteDecision::Hold,
+            &CrashGuardPreQuoteDecision::Disabled,
+            &config,
+        );
+        assert!(matches!(
+            lattice
+                .iter()
+                .find(|gate| gate.reason == HetPmExitReasonV2::ExecutableTrailing),
+            Some(HetPmGatePreQuoteEvidenceV2 {
+                candidate: HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::ExecutableTrailing),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2814,6 +3079,21 @@ mod tests {
                 }
             })
             .collect();
+        assert_eq!(
+            ExitPolicyV2::select_authoritative_exit(
+                &prepared.v2_gate_evaluations,
+                CrashGuardMode::ObserveOnly,
+            ),
+            Some(HetPmExitReasonV2::ExecutableTrailing),
+            "an observe-only Crash must not suppress the lower active Trailing exit"
+        );
+        assert_eq!(
+            ExitPolicyV2::select_authoritative_exit(
+                &prepared.v2_gate_evaluations,
+                CrashGuardMode::AuthoritativeShadow,
+            ),
+            Some(HetPmExitReasonV2::Crash)
+        );
         assert!(prepared.validate_and_serialize().is_ok());
     }
 

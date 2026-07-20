@@ -89,6 +89,7 @@ async fn test_post_buy_runtime_paper_lifecycle() {
         shadow_lifecycle_log_path: None,
         probe_lifecycle_log_path: None,
         shadow_v2_burnin: None,
+        shadow_market_refresh_rpc_url: None,
         account_state_core: Some(Arc::new(AccountStateReducer::new())),
         shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };
@@ -311,6 +312,7 @@ async fn test_post_buy_runtime_no_event_loss_with_early_subscribe() {
         shadow_lifecycle_log_path: None,
         probe_lifecycle_log_path: None,
         shadow_v2_burnin: None,
+        shadow_market_refresh_rpc_url: None,
         account_state_core: Some(Arc::new(AccountStateReducer::new())),
         shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };
@@ -442,6 +444,7 @@ async fn test_live_lane_routes_to_sender_not_paper_lifecycle() {
         shadow_lifecycle_log_path: None,
         probe_lifecycle_log_path: None,
         shadow_v2_burnin: None,
+        shadow_market_refresh_rpc_url: None,
         account_state_core: Some(Arc::new(AccountStateReducer::new())),
         shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };
@@ -558,6 +561,7 @@ async fn test_live_lane_without_handle_fails_closed_instead_of_paper_fallback() 
         shadow_lifecycle_log_path: None,
         probe_lifecycle_log_path: None,
         shadow_v2_burnin: None,
+        shadow_market_refresh_rpc_url: None,
         account_state_core: Some(Arc::new(AccountStateReducer::new())),
         shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };

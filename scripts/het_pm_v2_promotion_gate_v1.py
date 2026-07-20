@@ -2571,9 +2571,20 @@ def evaluate(
                 hold_quotes += resolution_count
     quote_values = [float(value) for value in quote_counts.values()]
     anchor_values = [float(value) for value in anchor_quote_counts.values()]
+    structural_quote_budget = structural["quote_budget"]
     quote_observed = {
         "quote_count_per_position_p95": quantile(quote_values, 0.95),
         "quote_count_per_position_max": max(quote_values, default=0.0),
+        "all_tick_current_executable_presence_rate": structural_quote_budget[
+            "all_tick_current_executable_presence_rate"
+        ],
+        "quote_planned_record_count": structural_quote_budget["quote_planned_record_count"],
+        "quote_required_current_executable_resolution_rate": structural_quote_budget[
+            "quote_required_current_executable_resolution_rate"
+        ],
+        "quote_required_stale_snapshot_rate": structural_quote_budget[
+            "quote_required_stale_snapshot_rate"
+        ],
         "hold_quote_count": hold_quotes,
         "duplicate_identical_key_resolution_count": duplicate_keys,
         # The runtime has no cross-tick cache object. This is independently

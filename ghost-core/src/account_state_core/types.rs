@@ -48,6 +48,9 @@ impl StatePhase {
 pub enum UpdateSource {
     #[default]
     GeyserAccountUpdate,
+    /// Read-only processed-RPC point query performed only for an already
+    /// managed shadow position after its stream state became stale.
+    RpcRefresh,
     WalReplay,
     TxObservedBootstrap,
 }

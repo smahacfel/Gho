@@ -71,17 +71,20 @@ use super::exit_policy_v1::{
 };
 #[cfg(test)]
 use super::exit_policy_v1::{EXIT_POLICY_V1_ID, EXIT_POLICY_V1_VERSION};
+#[cfg(test)]
+use super::exit_policy_v2::HetPmGateQuoteStatusV2;
 use super::exit_policy_v2::{
     build_entry_value_contract, materialize_anchor, prequote_label, EffectiveHetPmV2Config,
     ExecutablePeakAnchorV1, ExecutableQuoteKeyV2, ExitPolicyV2, HetComparisonCorrelationV1,
-    HetPmCandidateV2, HetPmFinalDecisionV2, HetPmGateEvaluationV2, HetPmGateV2,
-    HetPmPreQuoteEvaluationV2, HetPmQuoteFinalizationInputV2, HetPmV2ConfigError, HetPmV2Status,
-    PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2, PostBuySnapshotBundle,
-    PreparedHetComparisonV1, PreparedV1V2ComparisonCoreV1, RouteStatusV1,
-    TerminalV2ComparisonOutcomeUnknownReasonV1, TerminalV2ComparisonSkipReasonV1,
-    TimeStopV2ProjectionV1, TimeStopV2Subreason, TimeStopV2WindowStatus, V1AuthorityTickOutcomeV1,
-    V1AuthorityTickReceiptV1, V1ExitApplyStatusV1, V1TerminalCommitStatusV1, V1V2ComparisonRecord,
-    VitalityFeaturesV1, HET_PM_V2_MAX_QUOTE_CELLS, HET_PM_V2_POLICY_ID, HET_PM_V2_POLICY_VERSION,
+    HetPmCandidateV2, HetPmExitReasonV2, HetPmFinalDecisionV2, HetPmGateEvaluationV2, HetPmGateV2,
+    HetPmPreQuoteEvaluationV2, HetPmQuoteFinalizationInputV2, HetPmUnknownReasonV2,
+    HetPmV2ConfigError, HetPmV2Status, PeakAnchorPreQuoteDecisionV1, PostBuyDecisionExtrasV2,
+    PostBuyDecisionViewV2, PostBuySnapshotBundle, PreparedHetComparisonV1,
+    PreparedV1V2ComparisonCoreV1, RouteStatusV1, TerminalV2ComparisonOutcomeUnknownReasonV1,
+    TerminalV2ComparisonSkipReasonV1, TimeStopV2ProjectionV1, TimeStopV2Subreason,
+    TimeStopV2WindowStatus, V1AuthorityTickOutcomeV1, V1AuthorityTickReceiptV1,
+    V1ExitApplyStatusV1, V1TerminalCommitStatusV1, V1V2ComparisonRecord, VitalityFeaturesV1,
+    HET_PM_V2_MAX_QUOTE_CELLS, HET_PM_V2_POLICY_ID, HET_PM_V2_POLICY_VERSION,
     HET_PM_V2_SAMPLING_MODE, HET_PM_V2_SCHEMA_VERSION, HET_PM_V2_TRAJECTORY_GRADE,
 };
 use super::exit_replay::{
@@ -112,7 +115,7 @@ const SHADOW_TOKEN_DECIMAL_FACTOR_F64: f64 = 1_000_000.0;
 const SHADOW_V2_EXIT_FEE_BPS_DIAGNOSTIC_MODEL: u16 = 100;
 const SHADOW_V2_EXIT_SLIPPAGE_BPS_DIAGNOSTIC_MODEL: u16 = 150;
 use super::signals::*;
-use super::trajectory_v1::materialize_trajectory_v1;
+use super::trajectory_v1::{materialize_trajectory_v1, TrajectoryFeaturesV1};
 
 const SHADOW_QUOTE_RETRY_INTERVAL_MS: u64 = 500;
 
@@ -649,25 +652,32 @@ impl SnapshotTimeline {
             && (lhs.reserve_quote - rhs.reserve_quote).abs() <= 1e-12
     }
 
-    fn trim(&mut self, max_snapshots: usize, retention_ms: u64) {
-        if max_snapshots > 0 && self.snapshots.len() > max_snapshots {
-            let excess = self.snapshots.len() - max_snapshots;
-            self.snapshots.drain(..excess);
+    fn trim_snapshots(
+        snapshots: &mut Vec<MarketSnapshot>,
+        max_snapshots: usize,
+        retention_ms: u64,
+    ) {
+        if max_snapshots > 0 && snapshots.len() > max_snapshots {
+            let excess = snapshots.len() - max_snapshots;
+            snapshots.drain(..excess);
         }
 
-        if retention_ms > 0 && self.snapshots.len() > 1 {
-            if let Some(latest_ts) = self.snapshots.last().map(|snapshot| snapshot.timestamp_ms) {
+        if retention_ms > 0 && snapshots.len() > 1 {
+            if let Some(latest_ts) = snapshots.last().map(|snapshot| snapshot.timestamp_ms) {
                 let cutoff_ts = latest_ts.saturating_sub(retention_ms);
-                let first_retained = self
-                    .snapshots
+                let first_retained = snapshots
                     .iter()
                     .position(|snapshot| snapshot.timestamp_ms >= cutoff_ts)
-                    .unwrap_or_else(|| self.snapshots.len().saturating_sub(1));
+                    .unwrap_or_else(|| snapshots.len().saturating_sub(1));
                 if first_retained > 0 {
-                    self.snapshots.drain(..first_retained);
+                    snapshots.drain(..first_retained);
                 }
             }
         }
+    }
+
+    fn trim(&mut self, max_snapshots: usize, retention_ms: u64) {
+        Self::trim_snapshots(&mut self.snapshots, max_snapshots, retention_ms);
 
         self.cumulative_volume_sol = self
             .snapshots
@@ -1617,17 +1627,191 @@ impl HetPmV2QuotePlan {
     }
 }
 
+struct HetPmV2ResolvedQuoteForFinalization<'a> {
+    cell: Option<&'a HetPmV2QuoteCell>,
+    quote: Option<ExecutableExitQuote>,
+    evidence: Option<QuoteEvidenceRevisionV1>,
+}
+
+impl<'a> HetPmV2ResolvedQuoteForFinalization<'a> {
+    fn input<'b>(
+        &'b self,
+        crash_requirement: Option<&'b CrashGuardQuoteRequirementV1>,
+    ) -> HetPmQuoteFinalizationInputV2<'b> {
+        HetPmQuoteFinalizationInputV2 {
+            quote: self.quote.as_ref(),
+            quote_key: self.cell.map(|cell| &cell.key),
+            quote_evidence: self.evidence,
+            crash_requirement,
+        }
+    }
+}
+
+fn het_pm_v2_quote_source_for_reason<'a>(
+    reason: HetPmExitReasonV2,
+    latest_snapshot: Option<&'a MarketSnapshot>,
+    raw_canonical_snapshot: Option<&'a MarketSnapshot>,
+) -> Option<&'a MarketSnapshot> {
+    match reason {
+        // CrashGuard must retain raw canonical provenance. Runtime-observed
+        // freshness is intentionally not allowed to make a stale crash path
+        // look executable.
+        HetPmExitReasonV2::Crash => raw_canonical_snapshot.or(latest_snapshot),
+        // The remaining gates decide against the currently executable path.
+        // Using the raw CrashGuard snapshot here would make Trailing/Vitality
+        // inherit stale Crash evidence and suppress valid lower-gate exits.
+        HetPmExitReasonV2::HardLoss
+        | HetPmExitReasonV2::ExecutableTrailing
+        | HetPmExitReasonV2::VitalityDecay
+        | HetPmExitReasonV2::AbsoluteMaxHold => latest_snapshot.or(raw_canonical_snapshot),
+    }
+}
+
+fn het_pm_v2_quote_key_for_source(
+    view: PostBuyDecisionViewV2<'_>,
+    source: &MarketSnapshot,
+) -> ExecutableQuoteKeyV2 {
+    let mut key = ExecutableQuoteKeyV2::from_view(view);
+    key.sample_slot = source.slot;
+    key.sample_timestamp_ms = Some(source.timestamp_ms);
+    key
+}
+
+fn het_pm_v2_snapshot_id_for_quote_key(key: &ExecutableQuoteKeyV2) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        key.position_id,
+        key.position_epoch,
+        key.state_revision,
+        key.remaining_quantity_raw,
+        key.sample_slot
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        key.sample_timestamp_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    )
+}
+
+fn het_pm_v2_quote_key_matches_source(key: &ExecutableQuoteKeyV2, source: &MarketSnapshot) -> bool {
+    key.sample_slot == source.slot && key.sample_timestamp_ms == Some(source.timestamp_ms)
+}
+
+fn het_pm_v2_peak_snapshot_matches_trajectory(
+    source: &MarketSnapshot,
+    trajectory: &TrajectoryFeaturesV1,
+) -> bool {
+    if trajectory.peak_sample_slot != source.slot
+        || trajectory.peak_sample_timestamp_ms != Some(source.timestamp_ms)
+    {
+        return false;
+    }
+    let Some(peak_mark_price_sol) = trajectory.peak_mark_price_sol else {
+        return false;
+    };
+    let Some(source_price_sol) = PriceTruthResolver::normalize_shadow_snapshot_price_sol(source)
+    else {
+        return false;
+    };
+    (source_price_sol - peak_mark_price_sol).abs() <= peak_mark_price_sol.abs().max(1.0) * 1e-9
+}
+
+fn het_pm_v2_historical_peak_anchor_request(
+    view: PostBuyDecisionViewV2<'_>,
+    peak_source: &MarketSnapshot,
+) -> Option<PeakAnchorPreQuoteDecisionV1> {
+    if view.extras.executable_peak_anchor.is_some()
+        || !het_pm_v2_peak_snapshot_matches_trajectory(peak_source, &view.extras.trajectory)
+    {
+        return None;
+    }
+    let peak_mark_price_sol = view.extras.trajectory.peak_mark_price_sol?;
+    let mut key = ExecutableQuoteKeyV2::from_view(view);
+    key.sample_slot = peak_source.slot;
+    key.sample_timestamp_ms = Some(peak_source.timestamp_ms);
+    Some(PeakAnchorPreQuoteDecisionV1::QuoteRequired {
+        source_snapshot_id: het_pm_v2_snapshot_id_for_quote_key(&key),
+        key,
+        peak_mark_price_sol,
+    })
+}
+
+fn het_pm_v2_anchor_source_for_key<'a>(
+    key: &ExecutableQuoteKeyV2,
+    latest_snapshot: Option<&'a MarketSnapshot>,
+    raw_canonical_snapshot: Option<&'a MarketSnapshot>,
+    trajectory_peak_snapshot: Option<&'a MarketSnapshot>,
+) -> Option<&'a MarketSnapshot> {
+    latest_snapshot
+        .filter(|source| het_pm_v2_quote_key_matches_source(key, source))
+        .or_else(|| {
+            raw_canonical_snapshot.filter(|source| het_pm_v2_quote_key_matches_source(key, source))
+        })
+        .or_else(|| {
+            trajectory_peak_snapshot
+                .filter(|source| het_pm_v2_quote_key_matches_source(key, source))
+        })
+}
+
+fn het_pm_v2_resolved_quote_for_candidate<'a>(
+    view: PostBuyDecisionViewV2<'_>,
+    candidate: &HetPmCandidateV2,
+    latest_snapshot: Option<&'a MarketSnapshot>,
+    raw_canonical_snapshot: Option<&'a MarketSnapshot>,
+    quote_cells: &'a [HetPmV2QuoteCell],
+) -> HetPmV2ResolvedQuoteForFinalization<'a> {
+    let Some(source) = (match candidate {
+        HetPmCandidateV2::QuoteRequired(reason) => {
+            het_pm_v2_quote_source_for_reason(*reason, latest_snapshot, raw_canonical_snapshot)
+        }
+        HetPmCandidateV2::Hold | HetPmCandidateV2::Pending | HetPmCandidateV2::Blocked(_) => None,
+    }) else {
+        return HetPmV2ResolvedQuoteForFinalization {
+            cell: None,
+            quote: None,
+            evidence: None,
+        };
+    };
+    let key = het_pm_v2_quote_key_for_source(view, source);
+    let cell = quote_cells.iter().find(|cell| cell.key == key);
+    let truth = cell.and_then(|cell| cell.outcome.as_ref().ok());
+    HetPmV2ResolvedQuoteForFinalization {
+        cell,
+        quote: truth.map(|truth| {
+            ExecutableExitQuote::new(
+                truth.exit_token_amount_raw,
+                truth.exit_price_sol,
+                truth.exit_value_sol,
+                truth.gross_pnl_sol,
+                truth.pnl_pct,
+            )
+        }),
+        evidence: truth.map(|truth| {
+            QuoteEvidenceRevisionV1::new(
+                truth.evidence.slot,
+                truth.evidence.timestamp_ms,
+                truth.evidence.age_ms,
+            )
+        }),
+    }
+}
+
 #[derive(Debug)]
 struct PreparedHetPmV2Tick {
     comparison_core: PreparedV1V2ComparisonCoreV1,
     quote_cells: Vec<HetPmV2QuoteCell>,
+    anchor_quote_cell: Option<HetPmV2QuoteCell>,
     anchor_request: PeakAnchorPreQuoteDecisionV1,
+    /// The only candidate allowed to enter the guarded shadow execution path
+    /// when this profile explicitly enables V2 authority.
+    authority_candidate: Option<ExitCandidate>,
 }
 
 struct HetPmV2TickInput<'a> {
     bundle: &'a PostBuySnapshotBundle,
     latest_snapshot: Option<&'a MarketSnapshot>,
     raw_canonical_snapshot: Option<&'a MarketSnapshot>,
+    trajectory_peak_snapshot: Option<&'a MarketSnapshot>,
     v1_prequote: &'a PreQuoteDecision,
     crash_prequote: &'a CrashGuardPreQuoteDecision,
     v1_policy: &'a EffectiveExitPolicyV1Config,
@@ -2420,6 +2604,16 @@ pub enum MonitoringEngineConfigError {
     TimeStopV2ConfigHashSerialization,
 }
 
+/// Immutable address tuple used by the launcher-owned, read-only stale-market
+/// refresh task.  The monitoring engine only exposes existing shadow position
+/// identity here; it neither performs network I/O nor mutates policy state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShadowMarketRefreshTarget {
+    pub pool_amm_id: Pubkey,
+    pub base_mint: Pubkey,
+    pub bonding_curve: Pubkey,
+}
+
 pub struct MonitoringEngine {
     config: PostBuyGuardianConfig,
     shadow_ledger: Arc<ShadowLedger>,
@@ -2567,6 +2761,39 @@ impl MonitoringEngine {
 
     pub fn set_account_state_core(&mut self, account_state_core: Arc<AccountStateReducer>) {
         self.account_state_core = Some(account_state_core);
+    }
+
+    /// Return active shadow positions whose canonical curve state is absent or
+    /// older than `stale_after_ms`.  A caller may use these identities for a
+    /// bounded, read-only point query; this method deliberately has no I/O and
+    /// never makes a stale sample look current.
+    pub fn stale_shadow_market_refresh_targets(
+        &self,
+        now_ms: u64,
+        stale_after_ms: u64,
+    ) -> Vec<ShadowMarketRefreshTarget> {
+        let Some(account_state_core) = self.account_state_core.as_ref() else {
+            return Vec::new();
+        };
+        let stale_after_ms = stale_after_ms.max(1);
+        let positions = self.positions.read();
+        let mut targets = positions
+            .values()
+            .filter(|position| matches!(position.lane, Lane::Shadow))
+            .filter_map(|position| {
+                let is_stale_or_absent = account_state_core
+                    .get_canonical_state(&position.base_mint)
+                    .map(|state| now_ms.saturating_sub(state.last_update_ts_ms) >= stale_after_ms)
+                    .unwrap_or(true);
+                is_stale_or_absent.then_some(ShadowMarketRefreshTarget {
+                    pool_amm_id: position.pool_amm_id,
+                    base_mint: position.base_mint,
+                    bonding_curve: position.bonding_curve,
+                })
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|target| target.base_mint);
+        targets
     }
 
     #[cfg(test)]
@@ -3086,6 +3313,7 @@ impl MonitoringEngine {
         PostBuySnapshotBundle,
         Option<MarketSnapshot>,
         Option<MarketSnapshot>,
+        Option<MarketSnapshot>,
     )> {
         let policy = self.exit_policy_v1.as_ref()?;
         let het_policy = self.het_pm_v2.as_ref()?;
@@ -3096,8 +3324,9 @@ impl MonitoringEngine {
         }
         let (snapshot, latest_snapshot, crash_evidence_snapshot) =
             self.materialize_post_buy_base_from_position(pos, now_ms, policy);
+        let trajectory_snapshots = self.trajectory_snapshots_for_materialization(pos);
         let trajectory = materialize_trajectory_v1(
-            &pos.snapshot_timeline.snapshots,
+            &trajectory_snapshots,
             now_ms,
             self.config.tick_interval_ms,
             het_policy.trajectory_short_ms(),
@@ -3105,6 +3334,8 @@ impl MonitoringEngine {
             het_policy.trajectory_long_ms(),
             het_policy.max_newest_sample_age_ms(),
         );
+        let trajectory_peak_snapshot =
+            Self::trajectory_peak_snapshot(&trajectory_snapshots, &trajectory);
         let time_stop_projection = pos
             .time_stop_v2
             .project(now_ms, self.config.time_stop_v2.window_ms());
@@ -3136,7 +3367,18 @@ impl MonitoringEngine {
             },
             latest_snapshot,
             crash_evidence_snapshot,
+            trajectory_peak_snapshot,
         ))
+    }
+
+    fn trajectory_peak_snapshot(
+        snapshots: &[MarketSnapshot],
+        trajectory: &TrajectoryFeaturesV1,
+    ) -> Option<MarketSnapshot> {
+        snapshots
+            .iter()
+            .find(|snapshot| het_pm_v2_peak_snapshot_matches_trajectory(snapshot, trajectory))
+            .cloned()
     }
 
     fn materialize_post_buy_base_from_position(
@@ -3746,6 +3988,28 @@ impl MonitoringEngine {
         } else {
             self.refresh_snapshot_timeline_from_legacy(base_mint)
         }
+    }
+
+    fn trajectory_snapshots_for_materialization(
+        &self,
+        pos: &MonitoredPosition,
+    ) -> Vec<MarketSnapshot> {
+        let mut snapshots = pos.snapshot_timeline.clone_snapshots();
+        if let Some(runtime_snapshot) = pos.last_shadow_snapshot.as_ref() {
+            let should_append = snapshots.last().map_or(true, |latest| {
+                runtime_snapshot.timestamp_ms > latest.timestamp_ms
+                    && !SnapshotTimeline::equivalent(latest, runtime_snapshot)
+            });
+            if should_append {
+                snapshots.push(runtime_snapshot.clone());
+                SnapshotTimeline::trim_snapshots(
+                    &mut snapshots,
+                    self.snapshot_history_max_snapshots(),
+                    self.snapshot_history_retention_ms(),
+                );
+            }
+        }
+        snapshots
     }
 
     fn resolve_shadow_exit_sample_for_runtime(
@@ -6151,6 +6415,12 @@ impl MonitoringEngine {
         self.positions.read().len()
     }
 
+    /// Lightweight lifecycle query for launcher-owned background helpers.
+    /// It performs no I/O and does not expose mutable position state.
+    pub fn active_position_contains(&self, base_mint: &Pubkey) -> bool {
+        self.positions.read().contains_key(base_mint)
+    }
+
     /// Returns the list of currently monitored base mints.
     pub fn active_mints(&self) -> Vec<Pubkey> {
         self.positions.read().keys().cloned().collect()
@@ -7549,11 +7819,52 @@ impl MonitoringEngine {
             })
     }
 
+    fn resolve_shadow_exit_truth_for_anchor(
+        &self,
+        snapshot: &PostBuyDecisionSnapshot,
+        anchor_snapshot: &MarketSnapshot,
+        expected_quantity: u64,
+        now_ms: u64,
+        evidence_source: PriceTruthSource,
+    ) -> Result<ShadowExitTruth, ExecutableQuoteFailure> {
+        Self::resolve_shadow_exit_sample_for_runtime(anchor_snapshot, now_ms, 0, evidence_source)
+            .map_err(ExecutableQuoteFailure::from_price_truth_error)
+            .and_then(|sample| {
+                let entry_price =
+                    snapshot
+                        .entry_price_sol()
+                        .ok_or_else(|| ExecutableQuoteFailure {
+                            kind: ExecutableQuoteFailureKind::InternalFailure,
+                            evidence: PriceTruthEvidence {
+                                source: sample.evidence.source,
+                                status: PriceTruthStatus::SemanticViolation,
+                                detail: Some(
+                                    "shadow entry price missing at anchor quote boundary"
+                                        .to_string(),
+                                ),
+                                slot: sample.evidence.slot,
+                                timestamp_ms: sample.evidence.timestamp_ms,
+                                age_ms: sample.evidence.age_ms,
+                                price_state: sample.evidence.price_state,
+                                price_reason: sample.evidence.price_reason,
+                            },
+                        })?;
+                PriceTruthResolver::resolve_shadow_exit(
+                    entry_price,
+                    expected_quantity,
+                    &sample,
+                    0.0,
+                )
+                .map_err(ExecutableQuoteFailure::from_price_truth_error)
+            })
+    }
+
     fn prepare_het_pm_v2_tick(&self, input: HetPmV2TickInput<'_>) -> PreparedHetPmV2Tick {
         let HetPmV2TickInput {
             bundle,
             latest_snapshot,
             raw_canonical_snapshot,
+            trajectory_peak_snapshot,
             v1_prequote,
             crash_prequote,
             v1_policy,
@@ -7561,9 +7872,39 @@ impl MonitoringEngine {
             now_ms,
         } = input;
         let view = bundle.view();
-        let v2_prequote =
-            ExitPolicyV2::evaluate_prequote(view, v1_prequote, crash_prequote, het_policy);
-        let anchor_request = ExitPolicyV2::evaluate_anchor_request(view, now_ms, het_policy);
+        let absolute_max_hold_due = v1_policy.absolute_max_hold_enabled()
+            && bundle.base.absolute_age_ms() >= v1_policy.absolute_max_hold_ms();
+        let v2_prequote = ExitPolicyV2::evaluate_prequote_with_absolute_max_hold(
+            view,
+            v1_prequote,
+            crash_prequote,
+            het_policy,
+            absolute_max_hold_due,
+        );
+        let mut anchor_request = ExitPolicyV2::evaluate_anchor_request(view, now_ms, het_policy);
+        let v2_gate_prequotes = ExitPolicyV2::evaluate_gate_lattice_with_absolute_max_hold(
+            view,
+            v1_prequote,
+            crash_prequote,
+            het_policy,
+            absolute_max_hold_due,
+        );
+        let trailing_blocked_for_missing_anchor = v2_gate_prequotes.iter().any(|gate| {
+            gate.reason == HetPmExitReasonV2::ExecutableTrailing
+                && matches!(
+                    gate.candidate,
+                    HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::AnchorUnavailable)
+                )
+        });
+        if matches!(anchor_request, PeakAnchorPreQuoteDecisionV1::NoChange)
+            && trailing_blocked_for_missing_anchor
+        {
+            if let Some(backfill_request) = trajectory_peak_snapshot
+                .and_then(|source| het_pm_v2_historical_peak_anchor_request(view, source))
+            {
+                anchor_request = backfill_request;
+            }
+        }
 
         let mut quote_plan = HetPmV2QuotePlan::default();
 
@@ -7588,17 +7929,17 @@ impl MonitoringEngine {
             }
         }
 
-        let v2_quote_required = matches!(v2_prequote.candidate, HetPmCandidateV2::QuoteRequired(_));
-        let anchor_quote_required = matches!(
-            anchor_request,
-            PeakAnchorPreQuoteDecisionV1::QuoteRequired { .. }
-        );
-        if v2_quote_required || anchor_quote_required {
-            if let Some(source) = raw_canonical_snapshot.or(latest_snapshot) {
-                let _ = quote_plan.add(ExecutableQuoteKeyV2::from_view(view), source);
+        for gate_prequote in &v2_gate_prequotes {
+            if let HetPmCandidateV2::QuoteRequired(reason) = &gate_prequote.candidate {
+                if let Some(source) = het_pm_v2_quote_source_for_reason(
+                    *reason,
+                    latest_snapshot,
+                    raw_canonical_snapshot,
+                ) {
+                    let _ = quote_plan.add(ExecutableQuoteKeyV2::from_view(view), source);
+                }
             }
         }
-
         let planned_cells = quote_plan.into_cells();
         let mut quote_cells = Vec::with_capacity(planned_cells.len());
         let mut quote_keys = Vec::with_capacity(planned_cells.len());
@@ -7619,54 +7960,66 @@ impl MonitoringEngine {
             }
             quote_cells.push(HetPmV2QuoteCell { key, outcome });
         }
+        let anchor_quote_cell = if let PeakAnchorPreQuoteDecisionV1::QuoteRequired { key, .. } =
+            &anchor_request
+        {
+            if let Some(existing_cell) = quote_cells.iter().find(|cell| &cell.key == key) {
+                Some(existing_cell.clone())
+            } else if quote_cells.len() < HET_PM_V2_MAX_QUOTE_CELLS {
+                het_pm_v2_anchor_source_for_key(
+                    key,
+                    latest_snapshot,
+                    raw_canonical_snapshot,
+                    trajectory_peak_snapshot,
+                )
+                .map(|source| {
+                    let outcome = self.resolve_shadow_exit_truth_for_anchor(
+                        &bundle.base,
+                        source,
+                        key.remaining_quantity_raw,
+                        now_ms,
+                        bundle.base.mark_source(),
+                    );
+                    quote_keys.push(key.stable_label());
+                    match &outcome {
+                        Ok(_) => quote_statuses.push("resolved".to_string()),
+                        Err(failure) => quote_statuses.push(format!("blocked:{:?}", failure.kind)),
+                    }
+                    HetPmV2QuoteCell {
+                        key: key.clone(),
+                        outcome,
+                    }
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-        let raw_key = raw_canonical_snapshot.or(latest_snapshot).map(|source| {
-            let mut key = ExecutableQuoteKeyV2::from_view(view);
-            key.sample_slot = source.slot;
-            key.sample_timestamp_ms = Some(source.timestamp_ms);
-            key
-        });
-        let v2_cell = raw_key
-            .as_ref()
-            .and_then(|key| quote_cells.iter().find(|cell| &cell.key == key));
-        let v2_truth = v2_cell.and_then(|cell| cell.outcome.as_ref().ok());
-        let v2_quote = v2_truth.map(|truth| {
-            ExecutableExitQuote::new(
-                truth.exit_token_amount_raw,
-                truth.exit_price_sol,
-                truth.exit_value_sol,
-                truth.gross_pnl_sol,
-                truth.pnl_pct,
-            )
-        });
-        let v2_quote_evidence = v2_truth.map(|truth| {
-            QuoteEvidenceRevisionV1::new(
-                truth.evidence.slot,
-                truth.evidence.timestamp_ms,
-                truth.evidence.age_ms,
-            )
-        });
         let v2_crash_requirement = matches!(
-            v2_prequote.candidate,
-            HetPmCandidateV2::QuoteRequired(super::exit_policy_v2::HetPmExitReasonV2::Crash)
+            &v2_prequote.candidate,
+            HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::Crash)
         )
         .then(|| ExitPolicyV1::crash_guard_quote_requirement(&bundle.base))
         .flatten();
+        let v2_resolved_quote = het_pm_v2_resolved_quote_for_candidate(
+            view,
+            &v2_prequote.candidate,
+            latest_snapshot,
+            raw_canonical_snapshot,
+            &quote_cells,
+        );
         let v2_final = ExitPolicyV2::finalize_with_quote(
             view,
             &v2_prequote,
-            HetPmQuoteFinalizationInputV2 {
-                quote: v2_quote.as_ref(),
-                quote_key: v2_truth.and(v2_cell).map(|cell| &cell.key),
-                quote_evidence: v2_quote_evidence,
-                crash_requirement: v2_crash_requirement.as_ref(),
-            },
+            v2_resolved_quote.input(v2_crash_requirement.as_ref()),
             v1_policy,
             het_policy,
         );
         let v2_crash_quote_decision = match &v2_final {
             HetPmFinalDecisionV2::ExitAll {
-                reason: super::exit_policy_v2::HetPmExitReasonV2::Crash,
+                reason: HetPmExitReasonV2::Crash,
                 ..
             } => Some(CrashGuardQuoteDecision::Confirmed),
             HetPmFinalDecisionV2::CrashRejectedByQuote { reason } => {
@@ -7677,73 +8030,107 @@ impl MonitoringEngine {
             }
             _ => None,
         };
-        let v2_gate_evaluations =
-            ExitPolicyV2::evaluate_gate_lattice(view, v1_prequote, crash_prequote, het_policy)
-                .into_iter()
-                .map(|gate_prequote| {
-                    let prequote = HetPmPreQuoteEvaluationV2 {
-                        candidate: gate_prequote.candidate.clone(),
-                        winning_gate: match gate_prequote.reason {
-                            super::exit_policy_v2::HetPmExitReasonV2::Crash => HetPmGateV2::Crash,
-                            super::exit_policy_v2::HetPmExitReasonV2::HardLoss => {
-                                HetPmGateV2::HardLoss
-                            }
-                            super::exit_policy_v2::HetPmExitReasonV2::ExecutableTrailing => {
-                                HetPmGateV2::ExecutableTrailing
-                            }
-                            super::exit_policy_v2::HetPmExitReasonV2::VitalityDecay => {
-                                HetPmGateV2::VitalityDecay
-                            }
-                            super::exit_policy_v2::HetPmExitReasonV2::AbsoluteMaxHold => {
-                                HetPmGateV2::AbsoluteMaxHold
-                            }
-                        },
-                        suppressed_gates_mask: 0,
-                    };
-                    let final_decision = ExitPolicyV2::finalize_with_quote(
-                        view,
-                        &prequote,
-                        HetPmQuoteFinalizationInputV2 {
-                            quote: v2_quote.as_ref(),
-                            quote_key: v2_truth.and(v2_cell).map(|cell| &cell.key),
-                            quote_evidence: v2_quote_evidence,
-                            crash_requirement: v2_crash_requirement.as_ref(),
-                        },
-                        v1_policy,
-                        het_policy,
-                    );
-                    let executable_gross_return_bps = match final_decision {
-                        HetPmFinalDecisionV2::ExitAll {
-                            executable_gross_return_bps,
-                            ..
-                        } => Some(executable_gross_return_bps),
-                        _ => None,
-                    };
-                    HetPmGateEvaluationV2 {
-                        gate: gate_prequote.reason,
-                        prequote: gate_prequote.candidate.clone(),
-                        quote_status: ExitPolicyV2::gate_quote_status(
-                            &gate_prequote.candidate,
-                            &final_decision,
-                        ),
-                        final_decision,
+        let v2_gate_evaluations: Vec<HetPmGateEvaluationV2> = v2_gate_prequotes
+            .into_iter()
+            .map(|gate_prequote| {
+                let prequote = HetPmPreQuoteEvaluationV2 {
+                    candidate: gate_prequote.candidate.clone(),
+                    winning_gate: match gate_prequote.reason {
+                        HetPmExitReasonV2::Crash => HetPmGateV2::Crash,
+                        HetPmExitReasonV2::HardLoss => HetPmGateV2::HardLoss,
+                        HetPmExitReasonV2::ExecutableTrailing => HetPmGateV2::ExecutableTrailing,
+                        HetPmExitReasonV2::VitalityDecay => HetPmGateV2::VitalityDecay,
+                        HetPmExitReasonV2::AbsoluteMaxHold => HetPmGateV2::AbsoluteMaxHold,
+                    },
+                    suppressed_gates_mask: 0,
+                };
+                let crash_requirement = matches!(
+                    &gate_prequote.candidate,
+                    HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::Crash)
+                )
+                .then(|| ExitPolicyV1::crash_guard_quote_requirement(&bundle.base))
+                .flatten();
+                let resolved_quote = het_pm_v2_resolved_quote_for_candidate(
+                    view,
+                    &gate_prequote.candidate,
+                    latest_snapshot,
+                    raw_canonical_snapshot,
+                    &quote_cells,
+                );
+                let final_decision = ExitPolicyV2::finalize_with_quote(
+                    view,
+                    &prequote,
+                    resolved_quote.input(crash_requirement.as_ref()),
+                    v1_policy,
+                    het_policy,
+                );
+                let executable_gross_return_bps = match final_decision {
+                    HetPmFinalDecisionV2::ExitAll {
                         executable_gross_return_bps,
-                    }
-                })
-                .collect();
-        let current_executable_value_sol = v2_truth.map(|truth| truth.exit_value_sol);
-        let current_executable_gross_return_bps = v2_truth.map(|truth| {
+                        ..
+                    } => Some(executable_gross_return_bps),
+                    _ => None,
+                };
+                HetPmGateEvaluationV2 {
+                    gate: gate_prequote.reason,
+                    prequote: gate_prequote.candidate.clone(),
+                    quote_status: ExitPolicyV2::gate_quote_status(
+                        &gate_prequote.candidate,
+                        &final_decision,
+                    ),
+                    final_decision,
+                    executable_gross_return_bps,
+                }
+            })
+            .collect();
+        let authority_candidate = het_policy
+            .authoritative_shadow()
+            .then(|| {
+                ExitPolicyV2::select_authoritative_exit(
+                    &v2_gate_evaluations,
+                    v1_policy.crash_guard_mode(),
+                )
+            })
+            .flatten()
+            .map(|reason| ExitCandidate::from_reason(reason.exit_candidate_reason()));
+        // Preserve the precise V2 candidate passed into the shared guarded
+        // executor. The top-level V2 diagnostic winner is intentionally pure
+        // hierarchy and may be a higher typed blocker; it is not sufficient to
+        // attribute a lower hard ceiling such as AbsoluteMaxHold after apply.
+        // A pre-existing V1 proposal remains V1-owned through completion.
+        let v2_selected_execution_reason = (het_policy.authoritative_shadow()
+            && !bundle.base.has_pending_proposal())
+        .then(|| {
+            authority_candidate
+                .as_ref()
+                .map(|candidate| candidate.reason().as_label().to_string())
+        })
+        .flatten();
+        let current_executable_truth = v2_resolved_quote
+            .cell
+            .and_then(|cell| cell.outcome.as_ref().ok());
+        let current_executable_value_sol =
+            current_executable_truth.map(|truth| truth.exit_value_sol);
+        let current_executable_gross_return_bps = current_executable_truth.map(|truth| {
             (truth.pnl_pct * 100.0)
                 .round()
                 .clamp(i32::MIN as f64, i32::MAX as f64) as i32
         });
-        let known_estimated_costs_sol = v2_truth.map(|truth| truth.estimated_costs_sol);
+        let known_estimated_costs_sol =
+            current_executable_truth.map(|truth| truth.estimated_costs_sol);
 
         let anchor_request_label = match &anchor_request {
             PeakAnchorPreQuoteDecisionV1::NoChange => None,
-            PeakAnchorPreQuoteDecisionV1::QuoteRequired { .. } => {
-                Some("quote_required_on_new_canonical_peak".to_string())
-            }
+            PeakAnchorPreQuoteDecisionV1::QuoteRequired { key, .. } => Some(
+                if key.sample_slot == bundle.v2.trajectory.newest_sample_slot
+                    && key.sample_timestamp_ms == bundle.v2.trajectory.newest_sample_timestamp_ms
+                {
+                    "quote_required_on_new_canonical_peak"
+                } else {
+                    "quote_required_on_historical_peak_backfill"
+                }
+                .to_string(),
+            ),
             PeakAnchorPreQuoteDecisionV1::Blocked { reason } => Some(format!("blocked:{reason:?}")),
         };
 
@@ -7789,13 +8176,14 @@ impl MonitoringEngine {
             v1_authority_receipt: None,
             v2_prequote: format!("{:?}", v2_prequote.candidate),
             v2_final: Some(format!("{v2_final:?}")),
+            v2_selected_execution_reason,
             v2_crash_quote_decision,
             v2_winning_gate: v2_prequote.winning_gate,
             v2_suppressed_gates_mask: v2_prequote.suppressed_gates_mask,
             v2_gate_evaluations,
-            consumed_by_policy: false,
-            v1_shadow_authority: true,
-            v2_shadow_authority: false,
+            consumed_by_policy: het_policy.authoritative_shadow(),
+            v1_shadow_authority: !het_policy.authoritative_shadow(),
+            v2_shadow_authority: het_policy.authoritative_shadow(),
             live_authority: false,
             v2_economic_mutation: false,
             v2_proposal_created: false,
@@ -7826,7 +8214,9 @@ impl MonitoringEngine {
         PreparedHetPmV2Tick {
             comparison_core,
             quote_cells,
+            anchor_quote_cell,
             anchor_request,
+            authority_candidate,
         }
     }
 
@@ -7834,7 +8224,7 @@ impl MonitoringEngine {
         &self,
         base_mint: &Pubkey,
         request: &PeakAnchorPreQuoteDecisionV1,
-        quote_cells: &[HetPmV2QuoteCell],
+        anchor_quote_cell: Option<&HetPmV2QuoteCell>,
         entry_value_quote_raw: Option<u64>,
         policy_config_hash: &str,
         now_ms: u64,
@@ -7842,7 +8232,7 @@ impl MonitoringEngine {
         let PeakAnchorPreQuoteDecisionV1::QuoteRequired { key, .. } = request else {
             return false;
         };
-        let Some(cell) = quote_cells.iter().find(|cell| &cell.key == key) else {
+        let Some(cell) = anchor_quote_cell.filter(|cell| &cell.key == key) else {
             return false;
         };
         let Ok(truth) = &cell.outcome else {
@@ -7861,7 +8251,7 @@ impl MonitoringEngine {
         };
         if pos.position_id != key.position_id
             || pos.position_epoch != key.position_epoch
-            || pos.state_revision != key.state_revision
+            || pos.state_revision < key.state_revision
             || pos.remaining_token_amount_raw != key.remaining_quantity_raw
             || pos.last_shadow_outcome.is_some()
             || pos.het_route_status.route_id() != key.route_id
@@ -7911,7 +8301,7 @@ impl MonitoringEngine {
         if let Some(latest) = latest {
             self.remember_shadow_snapshot(base_mint, latest);
         }
-        let Some((bundle, latest_snapshot, raw_canonical_snapshot)) =
+        let Some((bundle, latest_snapshot, raw_canonical_snapshot, trajectory_peak_snapshot)) =
             self.materialize_post_buy_snapshot_bundle(base_mint, now_ms)
         else {
             return;
@@ -7922,6 +8312,7 @@ impl MonitoringEngine {
             bundle: &bundle,
             latest_snapshot: latest_snapshot.as_ref(),
             raw_canonical_snapshot: raw_canonical_snapshot.as_ref(),
+            trajectory_peak_snapshot: trajectory_peak_snapshot.as_ref(),
             v1_prequote: &v1_prequote,
             crash_prequote: &crash_prequote,
             v1_policy,
@@ -7930,6 +8321,28 @@ impl MonitoringEngine {
         });
         self.record_het_pm_v2_censoring_evidence(base_mint, &prepared.comparison_core, now_ms);
 
+        // An already-created V1 proposal belongs to V1 until it has either
+        // filled or reached its existing typed recovery terminal.  We never
+        // convert it in place and never run two sell owners for one position.
+        let (authoritative_prequote, authority_crash_prequote) =
+            if het_policy.authoritative_shadow() && !bundle.base.has_pending_proposal() {
+                match prepared.authority_candidate.as_ref() {
+                    Some(candidate) => (
+                        PreQuoteDecision::QuoteRequired {
+                            candidate: candidate.clone(),
+                        },
+                        if matches!(candidate.reason(), ExitCandidateReason::CrashGuard) {
+                            crash_prequote.clone()
+                        } else {
+                            CrashGuardPreQuoteDecision::Disabled
+                        },
+                    ),
+                    None => (PreQuoteDecision::Hold, CrashGuardPreQuoteDecision::Disabled),
+                }
+            } else {
+                (v1_prequote.clone(), crash_prequote.clone())
+            };
+
         let receipt = self
             .run_shadow_runtime_tick_v1(
                 base_mint,
@@ -7937,8 +8350,8 @@ impl MonitoringEngine {
                     snapshot: &bundle.base,
                     latest_snapshot: latest_snapshot.as_ref(),
                     crash_evidence_snapshot: raw_canonical_snapshot.as_ref(),
-                    authoritative_prequote: &v1_prequote,
-                    crash_prequote: &crash_prequote,
+                    authoritative_prequote: &authoritative_prequote,
+                    crash_prequote: &authority_crash_prequote,
                     pre_resolved_quotes: &prepared.quote_cells,
                     policy: v1_policy,
                     now_ms,
@@ -7948,7 +8361,7 @@ impl MonitoringEngine {
         let anchor_applied = self.apply_het_pm_v2_anchor_after_v1(
             base_mint,
             &prepared.anchor_request,
-            &prepared.quote_cells,
+            prepared.anchor_quote_cell.as_ref(),
             bundle.v2.entry_value_quote_raw,
             het_policy.config_hash(),
             now_ms,
@@ -8167,7 +8580,7 @@ impl MonitoringEngine {
             if let Some(action) = action.as_ref() {
                 receipt_outcome = V1AuthorityTickOutcomeV1::ProposalStarted;
                 receipt_action_id = Some(action.action_id.clone());
-                receipt_reason = Some(format!("{:?}", action.reason));
+                receipt_reason = Some(action.reason.as_label().to_string());
             }
 
             let crash_action_owned = action
@@ -8478,7 +8891,7 @@ impl MonitoringEngine {
                     self.emit_shadow_exit_for_action(&action, &exit, &truth, now_ms);
                     exit_applied = true;
                     receipt_action_id = Some(action.action_id.clone());
-                    receipt_reason = Some(format!("{:?}", action.reason));
+                    receipt_reason = Some(action.reason.as_label().to_string());
                     self.finish_resolved_shadow_position(action, now_ms);
                 }
                 FinalPolicyDecision::UnknownEvidence { reason } => {
@@ -9777,9 +10190,32 @@ mod tests {
         fail_sidecar: bool,
         stalled_writer_capacity: Option<usize>,
     ) -> HetTerminalTestContext {
-        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        setup_het_terminal_exit_with_writer_and_authority(
+            tmp,
+            fail_canonical_terminal,
+            fail_sidecar,
+            stalled_writer_capacity,
+            false,
+        )
+    }
+
+    fn setup_authoritative_het_terminal_exit(tmp: &TempDir) -> HetTerminalTestContext {
+        setup_het_terminal_exit_with_writer_and_authority(tmp, false, false, None, true)
+    }
+
+    fn setup_het_terminal_exit_with_writer_and_authority(
+        tmp: &TempDir,
+        fail_canonical_terminal: bool,
+        fail_sidecar: bool,
+        stalled_writer_capacity: Option<usize>,
+        authoritative_v2: bool,
+    ) -> HetTerminalTestContext {
+        let mut config = pr2_guardian_config(authoritative_v2, CrashGuardMode::Disabled);
         config.het_pm_v2.enabled = true;
         config.time_stop_v2.enabled = true;
+        if authoritative_v2 {
+            config.het_pm_v2.mode = super::super::config::HetPmV2Mode::AuthoritativeShadow;
+        }
         config.het_pm_v2.terminal_write_budget_ms = if stalled_writer_capacity.is_some() {
             10
         } else {
@@ -10235,6 +10671,29 @@ mod tests {
         assert!(registered.is_some());
 
         (engine, account_state_core, mint, bonding_curve)
+    }
+
+    #[test]
+    fn stale_shadow_market_refresh_targets_use_raw_canonical_state_age() {
+        let now_ms = current_time_ms();
+        let (engine, account_state_core, mint, bonding_curve) =
+            make_shadow_v2_exit_test_engine(42, now_ms.saturating_sub(10_000));
+
+        let stale = engine.stale_shadow_market_refresh_targets(now_ms, 1_500);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].base_mint, mint);
+        assert_eq!(stale[0].bonding_curve, bonding_curve);
+
+        apply_test_canonical_update_with_receive_ts(
+            &account_state_core,
+            mint,
+            bonding_curve,
+            43,
+            now_ms,
+        );
+        assert!(engine
+            .stale_shadow_market_refresh_targets(now_ms.saturating_add(1), 1_500)
+            .is_empty());
     }
 
     fn shadow_v2_exit_test_record(
@@ -12578,19 +13037,23 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_shadow_never_degrades_to_disabled() {
+    fn authoritative_shadow_is_an_explicit_valid_runtime_mode() {
         let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
         config.het_pm_v2.enabled = true;
         config.time_stop_v2.enabled = true;
         config.het_pm_v2.mode = super::super::config::HetPmV2Mode::AuthoritativeShadow;
         let (tx, _rx) = mpsc::channel(4);
 
-        assert!(matches!(
-            MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx),
-            Err(MonitoringEngineConfigError::HetPmV2(
-                HetPmV2ConfigError::AuthoritativeModeForbidden
-            ))
-        ));
+        let engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("authoritative shadow configuration is valid");
+        let status = engine
+            .het_pm_v2
+            .as_ref()
+            .expect("authoritative V2 policy is installed")
+            .status(CrashGuardMode::Disabled);
+        assert!(status.v2_shadow_authority);
+        assert!(!status.v1_shadow_authority);
+        assert!(!status.live_authority);
     }
 
     #[test]
@@ -12905,7 +13368,7 @@ mod tests {
             pos.het_route_status = RouteStatusV1::PumpCurveSupported;
         }
 
-        let (bundle, _, _) = engine
+        let (bundle, _, _, _) = engine
             .materialize_post_buy_snapshot_bundle(&mint, 121_001)
             .expect("active HET bundle");
         assert!(bundle.v2.vitality.quality_fresh);
@@ -14107,6 +14570,106 @@ mod tests {
     }
 
     #[test]
+    fn het_trajectory_uses_fresh_runtime_observation_without_refreshing_crash_guard() {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::ObserveOnly);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        let (tx, _rx) = mpsc::channel(16);
+        let engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid HET config");
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000),
+                Some(1_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
+                    candidate_id: "trajectory-runtime-observation".to_string(),
+                    entry_order_id: "trajectory-runtime-observation-entry".to_string(),
+                    quote_id: "trajectory-runtime-observation-quote".to_string(),
+                    slot: Some(1),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:test:trajectory-runtime-observation".to_string()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1),
+                }),
+            )
+            .expect("shadow registration");
+
+        {
+            let mut positions = engine.positions.write();
+            let position = positions.get_mut(&mint).expect("monitored position");
+            position.peak_since_entry = 1.10;
+            position.snapshot_timeline = SnapshotTimeline {
+                cumulative_volume_sol: 0.0,
+                snapshots: vec![
+                    MarketSnapshot {
+                        slot: Some(100),
+                        timestamp_ms: 1_000,
+                        price_sol_per_token: 1.10,
+                        price_state: PriceState::Valid,
+                        ..MarketSnapshot::default()
+                    },
+                    MarketSnapshot {
+                        slot: Some(101),
+                        timestamp_ms: 1_500,
+                        price_sol_per_token: 0.80,
+                        price_state: PriceState::Valid,
+                        ..MarketSnapshot::default()
+                    },
+                    MarketSnapshot {
+                        slot: Some(102),
+                        timestamp_ms: 2_000,
+                        price_sol_per_token: 0.70,
+                        price_state: PriceState::Valid,
+                        ..MarketSnapshot::default()
+                    },
+                ],
+            };
+            position.last_shadow_snapshot = Some(MarketSnapshot {
+                slot: Some(102),
+                timestamp_ms: 10_000,
+                price_sol_per_token: 0.70,
+                price_state: PriceState::Valid,
+                ..MarketSnapshot::default()
+            });
+        }
+
+        let (bundle, runtime_snapshot, crash_snapshot, _) = engine
+            .materialize_post_buy_snapshot_bundle(&mint, 10_000)
+            .expect("HET snapshot bundle");
+
+        assert_eq!(
+            runtime_snapshot.map(|sample| sample.timestamp_ms),
+            Some(10_000)
+        );
+        assert_eq!(
+            crash_snapshot.map(|sample| sample.timestamp_ms),
+            Some(2_000),
+            "CrashGuard must stay on raw canonical samples"
+        );
+        assert_eq!(
+            bundle.v2.trajectory.newest_sample_timestamp_ms,
+            Some(10_000)
+        );
+        assert_eq!(bundle.v2.trajectory.newest_sample_age_ms, Some(0));
+        assert_ne!(
+            bundle.v2.trajectory.quality,
+            super::super::trajectory_v1::TrajectoryQualityV1::Stale,
+            "fresh runtime observation should prevent false TrajectoryStale"
+        );
+        assert_eq!(
+            bundle.base.crash_vector().latest_sample_age_ms(),
+            Some(8_000),
+            "trajectory freshness must not refresh CrashGuard evidence"
+        );
+    }
+
+    #[test]
     fn guardian_outcome_source_reads_position_timeline_without_shadow_ledger_history() {
         let config = PostBuyGuardianConfig::default();
         let shadow_ledger = Arc::new(ShadowLedger::new());
@@ -14413,6 +14976,102 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_het_v2_ignores_v1_take_profit_and_executes_v2_max_hold() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut context = setup_authoritative_het_terminal_exit(&tmp);
+
+        // At 10x the entry price V1's old take-profit would sell immediately.
+        // V2 has no usable trajectory yet, so the authoritative V2 decision is
+        // Hold and the position must remain open.
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+        assert_eq!(context.engine.active_position_count(), 1);
+
+        // The same route/trajectory blocker must not defeat the hard maximum
+        // hold.  V2 chooses AbsoluteMaxHold, then the existing guarded shadow
+        // execution envelope applies the full simulated sell.
+        context.tick_ms = 121_001;
+        context.snapshot.timestamp_ms = context.tick_ms;
+        context.snapshot.slot = Some(12);
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        assert_eq!(context.engine.active_position_count(), 0);
+        let lifecycle = read_jsonl_rows(&context.lifecycle_path);
+        let fill = lifecycle
+            .iter()
+            .find(|row| row["record_type"] == "exit_filled")
+            .expect("V2 max-hold shadow fill");
+        assert_eq!(fill["exit_policy_reason_code"], "absolute_max_hold");
+
+        let comparisons = wait_for_jsonl_rows(&context.sidecar_path, 2).await;
+        assert!(comparisons.iter().any(|row| {
+            row["v2_shadow_authority"] == Value::Bool(true)
+                && row["v1_shadow_authority"] == Value::Bool(false)
+                && row["v2_proposal_created"] == Value::Bool(true)
+                && row["v2_economic_mutation"] == Value::Bool(true)
+        }));
+    }
+
+    #[tokio::test]
+    async fn authoritative_het_v2_finishes_a_preexisting_v1_proposal_without_replacing_it() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut context = setup_authoritative_het_terminal_exit(&tmp);
+
+        // Model the exact deploy boundary: V1 started a sticky take-profit
+        // proposal before V2 authority became active.  V2 must not replace it
+        // with its own later max-hold decision for the same position.
+        context
+            .engine
+            .remember_shadow_snapshot(&context.mint, &context.snapshot);
+        let (decision_snapshot, _, _) = context
+            .engine
+            .materialize_post_buy_decision_snapshot(&context.mint, context.tick_ms)
+            .expect("decision snapshot for existing V1 proposal");
+        let v1_action = context
+            .engine
+            .begin_exit_proposal(
+                &context.mint,
+                decision_snapshot.guard(),
+                &ExitCandidate::from_reason(ExitCandidateReason::TakeProfit),
+                decision_snapshot.snapshot_id(),
+                decision_snapshot.inactivity_age_ms(),
+                None,
+                context.tick_ms,
+            )
+            .expect("preexisting V1 proposal");
+
+        context.tick_ms = 121_001;
+        context.snapshot.timestamp_ms = context.tick_ms;
+        context.snapshot.slot = Some(12);
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        assert_eq!(context.engine.active_position_count(), 0);
+        let lifecycle = read_jsonl_rows(&context.lifecycle_path);
+        let fill = lifecycle
+            .iter()
+            .find(|row| row["record_type"] == "exit_filled")
+            .expect("the existing V1 proposal fills");
+        assert_eq!(fill["action_id"], v1_action.action_id);
+        assert_eq!(fill["exit_policy_reason_code"], "target");
+
+        let comparisons = wait_for_jsonl_rows(&context.sidecar_path, 1).await;
+        assert!(comparisons.iter().any(|row| {
+            row["v2_shadow_authority"] == Value::Bool(true)
+                && row["v1_shadow_authority"] == Value::Bool(false)
+                && row["v2_proposal_created"] == Value::Bool(false)
+                && row["v2_economic_mutation"] == Value::Bool(false)
+        }));
     }
 
     #[tokio::test]
@@ -15283,7 +15942,7 @@ mod tests {
     }
 
     #[test]
-    fn het_anchor_apply_is_observer_only_guarded_and_never_moves_down() {
+    fn het_anchor_apply_allows_forward_revisions_and_never_moves_down() {
         let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
         config.het_pm_v2.enabled = true;
         config.time_stop_v2.enabled = true;
@@ -15364,7 +16023,7 @@ mod tests {
         assert!(engine.apply_het_pm_v2_anchor_after_v1(
             &mint,
             &request,
-            &cells,
+            cells.first(),
             Some(1_000_000_000),
             policy.config_hash(),
             2_000,
@@ -15385,7 +16044,7 @@ mod tests {
             !engine.apply_het_pm_v2_anchor_after_v1(
                 &mint,
                 &request,
-                &cells,
+                cells.first(),
                 Some(1_000_000_000),
                 policy.config_hash(),
                 2_500,
@@ -15393,26 +16052,512 @@ mod tests {
             "the same or lower peak cannot replace the historical anchor"
         );
 
-        {
+        let advanced_revision = {
             let mut positions = engine.positions.write();
-            positions.get_mut(&mint).expect("position").state_revision += 1;
-        }
-        let stale_request = PeakAnchorPreQuoteDecisionV1::QuoteRequired {
-            key,
+            let position = positions.get_mut(&mint).expect("position");
+            position.state_revision += 1;
+            position.state_revision
+        };
+        let advanced_position_request = PeakAnchorPreQuoteDecisionV1::QuoteRequired {
+            key: key.clone(),
             peak_mark_price_sol: 1.3,
-            source_snapshot_id: "snapshot:stale".to_string(),
+            source_snapshot_id: "snapshot:advanced-position".to_string(),
         };
         assert!(
-            !engine.apply_het_pm_v2_anchor_after_v1(
+            engine.apply_het_pm_v2_anchor_after_v1(
                 &mint,
-                &stale_request,
-                &cells,
+                &advanced_position_request,
+                cells.first(),
                 Some(1_000_000_000),
                 policy.config_hash(),
                 3_000,
             ),
-            "stale observer guard must not mutate the anchor"
+            "a newer position revision with the same identity, quantity and route must still accept a historical peak anchor"
         );
+        {
+            let positions = engine.positions.read();
+            let position = positions.get(&mint).expect("position state");
+            let anchor = position
+                .het_executable_peak_anchor
+                .as_ref()
+                .expect("updated anchor");
+            assert_eq!(position.state_revision, advanced_revision);
+            assert_eq!(anchor.peak_mark_price_sol, 1.3);
+            assert_eq!(anchor.quote_state_revision, state_revision);
+        }
+
+        let mut future_key = key;
+        future_key.state_revision = advanced_revision.saturating_add(10);
+        let future_request = PeakAnchorPreQuoteDecisionV1::QuoteRequired {
+            key: future_key.clone(),
+            peak_mark_price_sol: 1.4,
+            source_snapshot_id: "snapshot:future".to_string(),
+        };
+        let future_cells = vec![HetPmV2QuoteCell {
+            key: future_key,
+            outcome: cells[0].outcome.clone(),
+        }];
+        assert!(
+            !engine.apply_het_pm_v2_anchor_after_v1(
+                &mint,
+                &future_request,
+                future_cells.first(),
+                Some(1_000_000_000),
+                policy.config_hash(),
+                3_500,
+            ),
+            "an anchor quote from a future position revision cannot mutate the observer state"
+        );
+    }
+
+    #[test]
+    fn het_anchor_quote_plan_uses_exact_runtime_peak_key_not_stale_crash_source() {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        let (tx, _rx) = mpsc::channel(4);
+        let engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("monitoring engine");
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000_000),
+                Some(1_000_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("het-anchor-exact-key".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "het-anchor-exact-key".to_string(),
+                    entry_order_id: "het-anchor-exact-key-entry".to_string(),
+                    quote_id: "het-anchor-exact-key-quote".to_string(),
+                    slot: Some(10),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:het-anchor-exact-key".to_string()),
+                    position_epoch: Some(5),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("position");
+
+        {
+            let mut positions = engine.positions.write();
+            let position = positions.get_mut(&mint).expect("position state");
+            position.het_route_status = RouteStatusV1::PumpCurveSupported;
+            position.snapshot_timeline = SnapshotTimeline {
+                cumulative_volume_sol: 100.0,
+                snapshots: vec![MarketSnapshot {
+                    slot: Some(100),
+                    timestamp_ms: 2_000,
+                    price_sol_per_token: 1.1,
+                    price_state: PriceState::Valid,
+                    market_cap_sol: 1.1,
+                    reserve_base: 10_000_000.0,
+                    reserve_quote: 11.0,
+                    ..MarketSnapshot::default()
+                }],
+            };
+            position.last_shadow_snapshot = Some(MarketSnapshot {
+                slot: Some(101),
+                timestamp_ms: 10_000,
+                price_sol_per_token: 1.3,
+                price_state: PriceState::Valid,
+                market_cap_sol: 1.3,
+                reserve_base: 10_000_000.0,
+                reserve_quote: 13.0,
+                ..MarketSnapshot::default()
+            });
+        }
+
+        let (bundle, latest_snapshot, raw_canonical_snapshot, trajectory_peak_snapshot) = engine
+            .materialize_post_buy_snapshot_bundle(&mint, 10_000)
+            .expect("HET snapshot bundle");
+        assert_eq!(
+            latest_snapshot.as_ref().map(|sample| sample.timestamp_ms),
+            Some(10_000)
+        );
+        assert_eq!(
+            raw_canonical_snapshot
+                .as_ref()
+                .map(|sample| sample.timestamp_ms),
+            Some(2_000),
+            "the raw CrashGuard source is intentionally stale in this regression"
+        );
+        assert_eq!(
+            bundle.v2.trajectory.newest_sample_timestamp_ms,
+            Some(10_000)
+        );
+        assert_eq!(bundle.v2.trajectory.peak_sample_timestamp_ms, Some(10_000));
+
+        let v1_policy = engine.exit_policy_v1.as_ref().expect("V1 policy");
+        let het_policy = engine.het_pm_v2.as_ref().expect("HET policy");
+        let v1_prequote = ExitPolicyV1::evaluate_prequote(&bundle.base, v1_policy);
+        let crash_prequote = ExitPolicyV1::evaluate_crash_guard_prequote(&bundle.base, v1_policy);
+        let prepared = engine.prepare_het_pm_v2_tick(HetPmV2TickInput {
+            bundle: &bundle,
+            latest_snapshot: latest_snapshot.as_ref(),
+            raw_canonical_snapshot: raw_canonical_snapshot.as_ref(),
+            trajectory_peak_snapshot: trajectory_peak_snapshot.as_ref(),
+            v1_prequote: &v1_prequote,
+            crash_prequote: &crash_prequote,
+            v1_policy,
+            het_policy,
+            now_ms: 10_000,
+        });
+
+        let PeakAnchorPreQuoteDecisionV1::QuoteRequired { key, .. } = &prepared.anchor_request
+        else {
+            panic!("fresh newest peak must request an executable anchor quote");
+        };
+        assert_eq!(key.sample_timestamp_ms, Some(10_000));
+        assert!(
+            prepared
+                .anchor_quote_cell
+                .as_ref()
+                .is_some_and(|cell| &cell.key == key && cell.outcome.is_ok()),
+            "quote plan must resolve the exact anchor key instead of the stale raw CrashGuard key"
+        );
+        assert!(engine.apply_het_pm_v2_anchor_after_v1(
+            &mint,
+            &prepared.anchor_request,
+            prepared.anchor_quote_cell.as_ref(),
+            bundle.v2.entry_value_quote_raw,
+            het_policy.config_hash(),
+            10_000,
+        ));
+    }
+
+    #[test]
+    fn het_trailing_quote_uses_latest_runtime_source_not_stale_crash_source() {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        config.het_pm_v2.trailing_arm_mark_return_bps = 500;
+        config.het_pm_v2.trailing_mark_candidate_drawdown_bps = 500;
+        config.het_pm_v2.trailing_executable_breach_bps = 500;
+        let (tx, _rx) = mpsc::channel(4);
+        let engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("monitoring engine");
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000_000),
+                Some(1_000_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("het-trailing-latest-quote".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "het-trailing-latest-quote".to_string(),
+                    entry_order_id: "het-trailing-latest-quote-entry".to_string(),
+                    quote_id: "het-trailing-latest-quote-quote".to_string(),
+                    slot: Some(20),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:het-trailing-latest-quote".to_string()),
+                    position_epoch: Some(6),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("position");
+
+        let policy_hash = engine
+            .het_pm_v2
+            .as_ref()
+            .expect("HET policy")
+            .config_hash()
+            .to_string();
+        {
+            let mut positions = engine.positions.write();
+            let position = positions.get_mut(&mint).expect("position state");
+            position.het_route_status = RouteStatusV1::PumpCurveSupported;
+            position.snapshot_timeline = SnapshotTimeline {
+                cumulative_volume_sol: 100.0,
+                snapshots: vec![MarketSnapshot {
+                    slot: Some(200),
+                    timestamp_ms: 2_000,
+                    price_sol_per_token: 1.8,
+                    price_state: PriceState::Valid,
+                    market_cap_sol: 1.8,
+                    reserve_base: 10_000_000.0,
+                    reserve_quote: 18.0,
+                    ..MarketSnapshot::default()
+                }],
+            };
+            position.last_shadow_snapshot = Some(MarketSnapshot {
+                slot: Some(201),
+                timestamp_ms: 10_000,
+                price_sol_per_token: 1.3,
+                price_state: PriceState::Valid,
+                market_cap_sol: 1.3,
+                reserve_base: 10_000_000.0,
+                reserve_quote: 13.0,
+                ..MarketSnapshot::default()
+            });
+            position.het_executable_peak_anchor = Some(ExecutablePeakAnchorV1 {
+                position_id: "shadow:het-trailing-latest-quote".to_string(),
+                position_epoch: 6,
+                remaining_quantity_raw: position.remaining_token_amount_raw,
+                route_id: "pump_curve".to_string(),
+                quote_model_id: "price_truth_resolver_shadow_curve_v1".to_string(),
+                policy_config_hash: policy_hash,
+                quote_state_revision: position.state_revision,
+                source_snapshot_id: "snapshot:peak".to_string(),
+                source_sample_slot: Some(200),
+                source_sample_timestamp_ms: Some(2_000),
+                peak_mark_price_sol: 1.8,
+                executable_value_quote_raw: None,
+                executable_value_sol: 2.0,
+                executable_gross_return_bps: Some(10_000),
+                anchor_seq: 1,
+                created_at_ms: 2_000,
+            });
+        }
+
+        let (bundle, latest_snapshot, raw_canonical_snapshot, trajectory_peak_snapshot) = engine
+            .materialize_post_buy_snapshot_bundle(&mint, 10_000)
+            .expect("HET snapshot bundle");
+        assert_eq!(
+            latest_snapshot.as_ref().map(|sample| sample.timestamp_ms),
+            Some(10_000)
+        );
+        assert_eq!(
+            raw_canonical_snapshot
+                .as_ref()
+                .map(|sample| sample.timestamp_ms),
+            Some(2_000)
+        );
+        assert_eq!(
+            bundle.v2.trajectory.newest_sample_timestamp_ms,
+            Some(10_000)
+        );
+        assert_eq!(bundle.v2.trajectory.peak_sample_timestamp_ms, Some(2_000));
+
+        let v1_policy = engine.exit_policy_v1.as_ref().expect("V1 policy");
+        let het_policy = engine.het_pm_v2.as_ref().expect("HET policy");
+        let v1_prequote = ExitPolicyV1::evaluate_prequote(&bundle.base, v1_policy);
+        let crash_prequote = ExitPolicyV1::evaluate_crash_guard_prequote(&bundle.base, v1_policy);
+        let prepared = engine.prepare_het_pm_v2_tick(HetPmV2TickInput {
+            bundle: &bundle,
+            latest_snapshot: latest_snapshot.as_ref(),
+            raw_canonical_snapshot: raw_canonical_snapshot.as_ref(),
+            trajectory_peak_snapshot: trajectory_peak_snapshot.as_ref(),
+            v1_prequote: &v1_prequote,
+            crash_prequote: &crash_prequote,
+            v1_policy,
+            het_policy,
+            now_ms: 10_000,
+        });
+
+        assert!(
+            prepared.quote_cells.iter().any(|cell| {
+                cell.key.sample_timestamp_ms == Some(10_000) && cell.outcome.is_ok()
+            }),
+            "Trailing must resolve against the fresh runtime quote"
+        );
+        assert!(
+            prepared.quote_cells.iter().all(|cell| {
+                cell.key.sample_timestamp_ms != Some(2_000) || cell.outcome.is_err()
+            }),
+            "the stale raw Crash source must not be the resolved Trailing quote"
+        );
+        let trailing = prepared.comparison_core;
+        let PreparedV1V2ComparisonCoreV1::Ready(record) = trailing else {
+            panic!("comparison core must be ready");
+        };
+        let trailing = record
+            .v2_gate_evaluations
+            .iter()
+            .find(|evaluation| evaluation.gate == HetPmExitReasonV2::ExecutableTrailing)
+            .expect("trailing evaluation");
+        assert_eq!(trailing.quote_status, HetPmGateQuoteStatusV2::Resolved);
+        assert!(matches!(
+            trailing.final_decision,
+            HetPmFinalDecisionV2::ExitAll {
+                reason: HetPmExitReasonV2::ExecutableTrailing,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn het_missing_anchor_is_backfilled_from_historical_peak_snapshot_before_next_tick() {
+        let mut config = pr2_guardian_config(false, CrashGuardMode::Disabled);
+        config.het_pm_v2.enabled = true;
+        config.time_stop_v2.enabled = true;
+        config.het_pm_v2.trailing_arm_mark_return_bps = 500;
+        config.het_pm_v2.trailing_mark_candidate_drawdown_bps = 500;
+        config.het_pm_v2.trailing_executable_breach_bps = 500;
+        let (tx, _rx) = mpsc::channel(4);
+        let engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("monitoring engine");
+        let mint = Pubkey::new_unique();
+        engine
+            .register_position_with_context(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(1.0),
+                Some(1_000_000_000),
+                Some(1_000_000),
+                Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        run_id: Some("het-trailing-anchor-backfill".to_string()),
+                        ..PositionJoinMetadata::default()
+                    },
+                    candidate_id: "het-trailing-anchor-backfill".to_string(),
+                    entry_order_id: "het-trailing-anchor-backfill-entry".to_string(),
+                    quote_id: "het-trailing-anchor-backfill-quote".to_string(),
+                    slot: Some(30),
+                    lane: Lane::Shadow,
+                    position_id: Some("shadow:het-trailing-anchor-backfill".to_string()),
+                    position_epoch: Some(7),
+                    opened_at_ms: Some(1_000),
+                }),
+            )
+            .expect("position");
+
+        {
+            let mut positions = engine.positions.write();
+            let position = positions.get_mut(&mint).expect("position state");
+            position.het_route_status = RouteStatusV1::PumpCurveSupported;
+            position.snapshot_timeline = SnapshotTimeline {
+                cumulative_volume_sol: 100.0,
+                snapshots: vec![MarketSnapshot {
+                    slot: Some(300),
+                    timestamp_ms: 2_000,
+                    price_sol_per_token: 1.8,
+                    price_state: PriceState::Valid,
+                    market_cap_sol: 1.8,
+                    reserve_base: 10_000_000.0,
+                    reserve_quote: 18.0,
+                    ..MarketSnapshot::default()
+                }],
+            };
+            position.last_shadow_snapshot = Some(MarketSnapshot {
+                slot: Some(301),
+                timestamp_ms: 10_000,
+                price_sol_per_token: 1.3,
+                price_state: PriceState::Valid,
+                market_cap_sol: 1.3,
+                reserve_base: 10_000_000.0,
+                reserve_quote: 13.0,
+                ..MarketSnapshot::default()
+            });
+        }
+
+        let (bundle, latest_snapshot, raw_canonical_snapshot, trajectory_peak_snapshot) = engine
+            .materialize_post_buy_snapshot_bundle(&mint, 10_000)
+            .expect("HET snapshot bundle");
+        assert_eq!(
+            bundle.v2.trajectory.newest_sample_timestamp_ms,
+            Some(10_000)
+        );
+        assert_eq!(bundle.v2.trajectory.peak_sample_timestamp_ms, Some(2_000));
+        assert_eq!(
+            trajectory_peak_snapshot
+                .as_ref()
+                .map(|sample| sample.timestamp_ms),
+            Some(2_000)
+        );
+        assert!(
+            bundle.v2.executable_peak_anchor.is_none(),
+            "fixture starts with the exact runtime residual: peak exists, executable anchor does not"
+        );
+
+        let v1_policy = engine.exit_policy_v1.as_ref().expect("V1 policy");
+        let het_policy = engine.het_pm_v2.as_ref().expect("HET policy");
+        let v1_prequote = ExitPolicyV1::evaluate_prequote(&bundle.base, v1_policy);
+        let crash_prequote = ExitPolicyV1::evaluate_crash_guard_prequote(&bundle.base, v1_policy);
+        let prepared = engine.prepare_het_pm_v2_tick(HetPmV2TickInput {
+            bundle: &bundle,
+            latest_snapshot: latest_snapshot.as_ref(),
+            raw_canonical_snapshot: raw_canonical_snapshot.as_ref(),
+            trajectory_peak_snapshot: trajectory_peak_snapshot.as_ref(),
+            v1_prequote: &v1_prequote,
+            crash_prequote: &crash_prequote,
+            v1_policy,
+            het_policy,
+            now_ms: 10_000,
+        });
+        let PeakAnchorPreQuoteDecisionV1::QuoteRequired { key, .. } = &prepared.anchor_request
+        else {
+            panic!("historical peak without anchor must request an anchor backfill quote");
+        };
+        assert_eq!(key.sample_timestamp_ms, Some(2_000));
+        assert!(
+            prepared
+                .anchor_quote_cell
+                .as_ref()
+                .is_some_and(|cell| &cell.key == key && cell.outcome.is_ok()),
+            "anchor backfill must resolve from the historical peak sample, independently of current exit quote freshness"
+        );
+        let PreparedV1V2ComparisonCoreV1::Ready(record) = &prepared.comparison_core else {
+            panic!("comparison core must be ready");
+        };
+        let first_trailing = record
+            .v2_gate_evaluations
+            .iter()
+            .find(|evaluation| evaluation.gate == HetPmExitReasonV2::ExecutableTrailing)
+            .expect("trailing evaluation");
+        assert_eq!(
+            first_trailing.quote_status,
+            HetPmGateQuoteStatusV2::BlockedPreQuote,
+            "first tick records the original missing-anchor blocker while preparing the backfill"
+        );
+        assert!(engine.apply_het_pm_v2_anchor_after_v1(
+            &mint,
+            &prepared.anchor_request,
+            prepared.anchor_quote_cell.as_ref(),
+            bundle.v2.entry_value_quote_raw,
+            het_policy.config_hash(),
+            10_000,
+        ));
+
+        let (next_bundle, next_latest, next_raw, next_peak) = engine
+            .materialize_post_buy_snapshot_bundle(&mint, 10_500)
+            .expect("next HET snapshot bundle");
+        assert!(
+            next_bundle.v2.executable_peak_anchor.is_some(),
+            "historical peak anchor must be available to the next policy tick"
+        );
+        let next_v1_prequote = ExitPolicyV1::evaluate_prequote(&next_bundle.base, v1_policy);
+        let next_crash_prequote =
+            ExitPolicyV1::evaluate_crash_guard_prequote(&next_bundle.base, v1_policy);
+        let next_prepared = engine.prepare_het_pm_v2_tick(HetPmV2TickInput {
+            bundle: &next_bundle,
+            latest_snapshot: next_latest.as_ref(),
+            raw_canonical_snapshot: next_raw.as_ref(),
+            trajectory_peak_snapshot: next_peak.as_ref(),
+            v1_prequote: &next_v1_prequote,
+            crash_prequote: &next_crash_prequote,
+            v1_policy,
+            het_policy,
+            now_ms: 10_500,
+        });
+        let PreparedV1V2ComparisonCoreV1::Ready(next_record) = next_prepared.comparison_core else {
+            panic!("next comparison core must be ready");
+        };
+        let next_trailing = next_record
+            .v2_gate_evaluations
+            .iter()
+            .find(|evaluation| evaluation.gate == HetPmExitReasonV2::ExecutableTrailing)
+            .expect("next trailing evaluation");
+        assert_eq!(next_trailing.quote_status, HetPmGateQuoteStatusV2::Resolved);
+        assert!(matches!(
+            next_trailing.final_decision,
+            HetPmFinalDecisionV2::ExitAll {
+                reason: HetPmExitReasonV2::ExecutableTrailing,
+                ..
+            }
+        ));
     }
 
     #[test]

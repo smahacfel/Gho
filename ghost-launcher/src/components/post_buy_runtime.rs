@@ -36,6 +36,7 @@ use crate::components::trigger::safety::{PositionLimitTracker, PositionSlotId, S
 use crate::events::{
     EventBusReceiver, GhostEvent, PostBuySource, RuntimePlane, ShadowV2EntryBoundaryPayload,
 };
+use futures::{stream, StreamExt};
 use ghost_brain::config::ghost_brain_config::ShadowV2BurninConfig;
 use ghost_brain::events::{EventEmitter, EventWriterConfig};
 use ghost_brain::execution::paper_lifecycle::{PaperLifecycleConfig, PaperPositionLifecycle};
@@ -53,15 +54,18 @@ use ghost_brain::guardian::post_buy::shadow_v2::{
 };
 use ghost_brain::guardian::post_buy::{
     validate_exit_policy_v1_config, validate_het_pm_v2_config, CrashGuardMode, ExitPolicyV1Status,
-    MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, ShadowPositionBook,
-    ShadowTerminalDisposition, SignalRouter,
+    MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, ShadowMarketRefreshConfig,
+    ShadowMarketRefreshTarget, ShadowPositionBook, ShadowTerminalDisposition, SignalRouter,
 };
 use ghost_brain::quotes::{ExecutableQuoteProvider, QuoteProviderConfig};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
+use ghost_core::account_state_core::types::{
+    AccountStateUpdate, AccountUpdateResult, UpdateSource,
+};
 use ghost_core::shadow_ledger::ShadowLedger;
-use ghost_core::{ShadowV2PoolPhase, LAMPORTS_PER_SOL};
+use ghost_core::{CurveFinality, ShadowV2PoolPhase, LAMPORTS_PER_SOL};
 use parking_lot::Mutex as ParkingMutex;
-use seer::parse_curve_from_account;
+use seer::{new_async_rpc_client_with_timeout, parse_curve_from_account};
 use serde::Serialize;
 use solana_client::client_error::ClientError;
 use solana_client::nonblocking::rpc_client::RpcClient as AsyncRpcClient;
@@ -304,6 +308,9 @@ pub struct PostBuyRuntimeConfig {
     pub shadow_ledger: Option<Arc<ShadowLedger>>,
     /// Canonical account-state runtime truth shared with shadow guardian.
     pub account_state_core: Option<Arc<AccountStateReducer>>,
+    /// Read-only RPC endpoint used only by the bounded stale-market refresh
+    /// task for active shadow positions.
+    pub shadow_market_refresh_rpc_url: Option<String>,
     /// Canonical shadow lifecycle/PnL proof log path derived from execution.shadow.*.
     pub shadow_lifecycle_log_path: Option<PathBuf>,
     /// Counterfactual probe lifecycle proof log path derived from p37_shadow_probe.*.
@@ -333,6 +340,7 @@ impl Default for PostBuyRuntimeConfig {
             shadow_guardian: None,
             shadow_ledger: None,
             account_state_core: None,
+            shadow_market_refresh_rpc_url: None,
             shadow_lifecycle_log_path: None,
             probe_lifecycle_log_path: None,
             shadow_v2_burnin: None,
@@ -362,45 +370,62 @@ impl PostBuyRuntimeConfig {
                         .to_string(),
                 );
             }
+            if guardian.shadow_market_refresh.enabled
+                && self
+                    .shadow_market_refresh_rpc_url
+                    .as_deref()
+                    .is_none_or(|url| url.trim().is_empty())
+            {
+                return Err(
+                    "shadow_market_refresh.enabled requires a non-empty read-only RPC endpoint"
+                        .to_string(),
+                );
+            }
         }
-        let crash_guard_authoritative = self.shadow_guardian.as_ref().is_some_and(|guardian| {
+        let authoritative_shadow = self.shadow_guardian.as_ref().is_some_and(|guardian| {
             matches!(
                 guardian.exit_policy_v1.crash_guard_mode,
                 CrashGuardMode::AuthoritativeShadow
-            )
+            ) || (guardian.het_pm_v2.enabled
+                && matches!(
+                    guardian.het_pm_v2.mode,
+                    ghost_brain::guardian::post_buy::HetPmV2Mode::AuthoritativeShadow
+                ))
         });
-        if crash_guard_authoritative {
+        if authoritative_shadow {
             if self.execution_mode != "shadow" {
                 return Err(
-                    "CrashGuard authoritative_shadow requires execution_mode=shadow".to_string(),
+                    "authoritative shadow position management requires execution_mode=shadow"
+                        .to_string(),
                 );
             }
             if self.entry_mode != "shadow_only" {
                 return Err(
-                    "CrashGuard authoritative_shadow requires entry_mode=shadow_only".to_string(),
+                    "authoritative shadow position management requires entry_mode=shadow_only"
+                        .to_string(),
                 );
             }
             if self.live_sell.is_some() {
                 return Err(
-                    "CrashGuard authoritative_shadow requires live sell dispatch to be disabled"
+                    "authoritative shadow position management requires live sell dispatch to be disabled"
                         .to_string(),
                 );
             }
             if self.shadow_ledger.is_none() {
                 return Err(
-                    "CrashGuard authoritative_shadow requires the canonical shadow monitor to be wired"
+                    "authoritative shadow position management requires the canonical shadow monitor to be wired"
                         .to_string(),
                 );
             }
             if self.shadow_lifecycle_log_path.is_none() {
                 return Err(
-                    "CrashGuard authoritative_shadow requires shadow lifecycle evidence logging"
+                    "authoritative shadow position management requires shadow lifecycle evidence logging"
                         .to_string(),
                 );
             }
             if self.events_output_path.as_os_str().is_empty() {
                 return Err(
-                    "CrashGuard authoritative_shadow requires canonical terminal evidence output"
+                    "authoritative shadow position management requires canonical terminal evidence output"
                         .to_string(),
                 );
             }
@@ -449,6 +474,170 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Starts the read-only fallback that obtains a new account snapshot only
+/// after stream-backed state for an active shadow position has become stale.
+/// It is intentionally independent from `MonitoringEngine::tick`: a slow RPC
+/// request cannot delay the policy clock, a terminal commit, or capacity
+/// release.
+fn spawn_shadow_market_refresh(
+    monitor: Arc<MonitoringEngine>,
+    account_state_core: Arc<AccountStateReducer>,
+    rpc_url: String,
+    refresh: ShadowMarketRefreshConfig,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let rpc_timeout = Duration::from_millis(refresh.rpc_timeout_ms());
+        let rpc_client = Arc::new(new_async_rpc_client_with_timeout(rpc_url, rpc_timeout));
+        let mut interval = tokio::time::interval(Duration::from_millis(refresh.interval_ms()));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_request_at_ms = HashMap::<Pubkey, u64>::new();
+        // The engine returns a deterministic mint ordering.  Keep an explicit
+        // cursor so the first few stale positions cannot monopolize the RPC
+        // budget when there are more stale positions than one cycle can read.
+        let mut round_robin_cursor = 0_usize;
+
+        info!(
+            runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+            stale_after_ms = refresh.stale_after_ms(),
+            interval_ms = refresh.interval_ms(),
+            per_position_cooldown_ms = refresh.per_position_cooldown_ms(),
+            max_requests_per_cycle = refresh.max_requests_per_cycle(),
+            rpc_timeout_ms = refresh.rpc_timeout_ms(),
+            "PostBuyRuntime: bounded shadow market refresh started"
+        );
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => break,
+                _ = interval.tick() => {
+                    let now = now_ms();
+                    let targets = monitor.stale_shadow_market_refresh_targets(
+                        now,
+                        refresh.stale_after_ms(),
+                    );
+                    let cooldown_ms = refresh.per_position_cooldown_ms();
+                    let eligible = targets
+                        .into_iter()
+                        .filter(|target| {
+                            last_request_at_ms
+                                .get(&target.base_mint)
+                                .is_none_or(|previous| now.saturating_sub(*previous) >= cooldown_ms)
+                        })
+                        .collect::<Vec<_>>();
+                    let selected_count = eligible.len().min(refresh.max_requests_per_cycle());
+                    let selected = if selected_count == 0 {
+                        Vec::new()
+                    } else {
+                        let start = round_robin_cursor % eligible.len();
+                        let selected = (0..selected_count)
+                            .map(|offset| eligible[(start + offset) % eligible.len()])
+                            .collect::<Vec<_>>();
+                        round_robin_cursor = (start + selected_count) % eligible.len();
+                        selected
+                    };
+
+                    for target in &selected {
+                        last_request_at_ms.insert(target.base_mint, now);
+                    }
+                    last_request_at_ms.retain(|mint, _| {
+                        monitor.active_position_contains(mint)
+                    });
+
+                    stream::iter(selected)
+                        .map(|target| {
+                            let rpc_client = Arc::clone(&rpc_client);
+                            let account_state_core = Arc::clone(&account_state_core);
+                            async move {
+                                let result = refresh_shadow_market_target(
+                                    rpc_client,
+                                    account_state_core,
+                                    target,
+                                    rpc_timeout,
+                                )
+                                .await;
+                                if let Err(error) = result {
+                                    debug!(
+                                        base_mint = %target.base_mint,
+                                        bonding_curve = %target.bonding_curve,
+                                        error = %error,
+                                        "PostBuyRuntime: shadow market refresh unavailable"
+                                    );
+                                }
+                            }
+                        })
+                        .buffer_unordered(refresh.max_requests_per_cycle())
+                        .collect::<Vec<_>>()
+                        .await;
+                }
+            }
+        }
+
+        info!(
+            runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+            "PostBuyRuntime: bounded shadow market refresh stopped"
+        );
+    })
+}
+
+async fn refresh_shadow_market_target(
+    rpc_client: Arc<AsyncRpcClient>,
+    account_state_core: Arc<AccountStateReducer>,
+    target: ShadowMarketRefreshTarget,
+    rpc_timeout: Duration,
+) -> Result<(), String> {
+    let response = tokio::time::timeout(
+        rpc_timeout,
+        rpc_client
+            .get_account_with_commitment(&target.bonding_curve, CommitmentConfig::processed()),
+    )
+    .await
+    .map_err(|_| "rpc_timeout".to_string())?
+    .map_err(|error| format!("rpc_error:{error}"))?;
+    let account = response
+        .value
+        .ok_or_else(|| "account_not_found".to_string())?;
+    let curve = parse_curve_from_account(&account.data)
+        .map_err(|error| format!("curve_parse_failed:{error}"))?;
+    if response.context.slot == 0 {
+        return Err("rpc_context_slot_missing".to_string());
+    }
+
+    let apply_result = account_state_core.apply_account_update(AccountStateUpdate {
+        pool_amm_id: target.pool_amm_id,
+        base_mint: target.base_mint,
+        bonding_curve: target.bonding_curve,
+        sol_reserves: curve.virtual_sol_reserves,
+        token_reserves: curve.virtual_token_reserves,
+        is_complete: curve.complete,
+        slot: response.context.slot,
+        // RPC supplies a read-context slot rather than an account write
+        // version. `0` lets an eventual same-slot Geyser write supersede this
+        // fallback under AccountStateCore's monotonic ordering.
+        write_version: Some(0),
+        source_account_pubkey: Some(target.bonding_curve),
+        source_account_owner_or_program: Some(account.owner),
+        account_data_len: Some(account.data.len() as u64),
+        account_data_hash: Some(blake3::hash(&account.data).to_hex().to_string()),
+        receive_ts_ms: now_ms(),
+        receive_seq: account_state_core.next_recv_seq(),
+        curve_finality: CurveFinality::Provisional,
+        source: UpdateSource::RpcRefresh,
+    });
+    match apply_result {
+        AccountUpdateResult::Applied | AccountUpdateResult::PromotedFromBootstrap => Ok(()),
+        AccountUpdateResult::Rejected(reason) => {
+            debug!(
+                base_mint = %target.base_mint,
+                slot = response.context.slot,
+                ?reason,
+                "PostBuyRuntime: RPC refresh superseded by newer canonical state"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn init_shadow_v2_validation_harness(
@@ -779,6 +968,11 @@ async fn run_shadow_v2_post_run_manifest_generation_and_audit_with_timeout(
 /// This closes the race where shutdown starts while a background shadow simulation is still
 /// finalizing and only emits its post-buy handoff a few seconds later.
 const POST_BUY_SHUTDOWN_DRAIN_MS: u64 = 10_000;
+/// Hard cap for shutdown-edge direct handoff draining.  OracleRuntime awaits
+/// in-flight pool tasks for up to 30s during shutdown; closing the direct
+/// receiver before those tasks release their senders creates false queue-closed
+/// handoff noise at the process edge.
+const POST_BUY_SHUTDOWN_DIRECT_DRAIN_HARD_MS: u64 = 35_000;
 const POST_BUY_DEDUP_CACHE_CAPACITY: usize = 16_384;
 
 /// Price poll cadence for the live sell monitoring loop.
@@ -2753,6 +2947,25 @@ pub async fn run(
     } else {
         None
     };
+    let mut shadow_market_refresh_handle = match (
+        shadow_monitor.as_ref(),
+        config.account_state_core.as_ref(),
+        config.shadow_guardian.as_ref(),
+        config.shadow_market_refresh_rpc_url.as_deref(),
+    ) {
+        (Some(monitor), Some(account_state_core), Some(guardian), Some(rpc_url))
+            if guardian.shadow_market_refresh.enabled =>
+        {
+            Some(spawn_shadow_market_refresh(
+                Arc::clone(monitor),
+                Arc::clone(account_state_core),
+                rpc_url.to_string(),
+                guardian.shadow_market_refresh.clone(),
+                shutdown_rx.resubscribe(),
+            ))
+        }
+        _ => None,
+    };
     let mut probe_runtime_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut probe_signal_router_handle: Option<tokio::task::JoinHandle<()>> = None;
     let probe_monitor = if config.execution_mode == "shadow" {
@@ -2879,8 +3092,8 @@ pub async fn run(
                 v1_shadow_authority = status.v1_shadow_authority,
                 v2_shadow_authority = status.v2_shadow_authority,
                 live_authority = status.live_authority,
-                hypotheses_grade = "safe_initial_shadow_hypothesis",
-                "PostBuyRuntime: effective HET-PM V2 PR A configuration"
+                decision_owner = if status.v2_shadow_authority { "v2" } else { "v1" },
+                "PostBuyRuntime: effective HET-PM V2 shadow-manager configuration"
             );
         }
     }
@@ -2920,7 +3133,9 @@ pub async fn run(
     let mut epoch_counter: u64 = 1;
     let mut lifecycle_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut draining_shutdown = false;
-    let mut shutdown_deadline: Option<tokio::time::Instant> = None;
+    let mut shutdown_soft_deadline: Option<tokio::time::Instant> = None;
+    let mut shutdown_hard_deadline: Option<tokio::time::Instant> = None;
+    let mut shutdown_waiting_for_direct_producer_logged = false;
     let mut recent_handoffs = RecentPostBuyCache::default();
     let mut event_bus_closed = false;
 
@@ -2963,10 +3178,16 @@ pub async fn run(
         tokio::select! {
             _ = shutdown_rx.recv(), if !draining_shutdown => {
                 draining_shutdown = true;
-                shutdown_deadline = Some(
-                    tokio::time::Instant::now()
+                let now = tokio::time::Instant::now();
+                shutdown_soft_deadline = Some(
+                    now
                         + tokio::time::Duration::from_millis(POST_BUY_SHUTDOWN_DRAIN_MS),
                 );
+                shutdown_hard_deadline = Some(
+                    now
+                        + tokio::time::Duration::from_millis(POST_BUY_SHUTDOWN_DIRECT_DRAIN_HARD_MS),
+                );
+                shutdown_waiting_for_direct_producer_logged = false;
                 info!(
                     runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                     "PostBuyRuntime received shutdown signal; draining late PostBuySubmitted events for {}ms",
@@ -3046,9 +3267,24 @@ pub async fn run(
             }
             _ = tokio::time::sleep(idle_sleep) => {
                 if draining_shutdown
-                    && shutdown_deadline
+                    && shutdown_soft_deadline
                         .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                 {
+                    let direct_producer_open = direct_handoff_rx.is_some();
+                    let hard_elapsed = shutdown_hard_deadline
+                        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
+                    if direct_producer_open && !hard_elapsed {
+                        if !shutdown_waiting_for_direct_producer_logged {
+                            shutdown_waiting_for_direct_producer_logged = true;
+                            info!(
+                                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                                soft_drain_ms = POST_BUY_SHUTDOWN_DRAIN_MS,
+                                hard_drain_ms = POST_BUY_SHUTDOWN_DIRECT_DRAIN_HARD_MS,
+                                "PostBuyRuntime shutdown soft drain elapsed; keeping direct handoff receiver open until Oracle producers finish"
+                            );
+                        }
+                        continue;
+                    }
                     let active_shadow_positions = shadow_monitor
                         .as_ref()
                         .map(|monitor| monitor.active_position_count())
@@ -3068,6 +3304,11 @@ pub async fn run(
                         } else {
                             "remaining_positions_censored_administratively"
                         },
+                        direct_handoff_receiver_status = if direct_producer_open {
+                            "hard_deadline_elapsed"
+                        } else {
+                            "producer_closed"
+                        },
                         "PostBuyRuntime shutdown drain elapsed; stopping subscriber"
                     );
                     break;
@@ -3080,6 +3321,10 @@ pub async fn run(
     // Remaining positions are censored at the process boundary; they must not
     // keep terminal watchers or capacity alive and must never become fabricated
     // economic terminal records.
+    if let Some(handle) = shadow_market_refresh_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
     if let Some(handle) = shadow_runtime_handle.take() {
         handle.abort();
         let _ = handle.await;
@@ -7726,18 +7971,44 @@ sys.exit(0)
     }
 
     #[test]
-    fn pr_a_rejects_authoritative_het_pm_v2_in_every_execution_mode() {
-        let mut guardian = PostBuyGuardianConfig::default();
-        guardian.het_pm_v2.enabled = true;
-        guardian.het_pm_v2.mode = ghost_brain::guardian::post_buy::HetPmV2Mode::AuthoritativeShadow;
-        let config = PostBuyRuntimeConfig {
-            execution_mode: "paper".to_string(),
+    fn authoritative_het_pm_v2_requires_and_accepts_complete_shadow_runtime() {
+        let guardian = PostBuyGuardianConfig {
+            enabled: true,
+            target_threshold: Some(50.0),
+            stoploss_threshold: Some(50.0),
+            wait_for_timestop: Some(30_000),
+            aem: ghost_brain::aem::config::AemConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            het_pm_v2: ghost_brain::guardian::post_buy::HetPmV2Config {
+                enabled: true,
+                mode: ghost_brain::guardian::post_buy::HetPmV2Mode::AuthoritativeShadow,
+                ..Default::default()
+            },
+            time_stop_v2: ghost_brain::guardian::post_buy::TimeStopV2Config {
+                enabled: true,
+                ..Default::default()
+            },
+            ..PostBuyGuardianConfig::default()
+        };
+        let complete_shadow = PostBuyRuntimeConfig {
+            execution_mode: "shadow".to_string(),
+            entry_mode: "shadow_only".to_string(),
+            shadow_ledger: Some(Arc::new(ShadowLedger::new())),
+            account_state_core: Some(Arc::new(AccountStateReducer::new())),
+            shadow_lifecycle_log_path: Some(PathBuf::from("/tmp/het-pm-v2-lifecycle.jsonl")),
             shadow_guardian: Some(guardian),
             ..PostBuyRuntimeConfig::default()
         };
+        assert!(complete_shadow.validate().is_ok());
 
-        let error = config.validate().expect_err("PR A must reject authority");
-        assert!(error.contains("authoritative_shadow is forbidden in PR A"));
+        let mut paper = complete_shadow;
+        paper.execution_mode = "paper".to_string();
+        let error = paper
+            .validate()
+            .expect_err("V2 authority must not be accepted outside shadow");
+        assert!(error.contains("requires execution_mode=shadow"));
     }
 
     #[test]
@@ -7756,6 +8027,21 @@ sys.exit(0)
             .validate()
             .expect_err("HET route truth must fail closed without AccountStateCore");
         assert!(error.contains("requires AccountStateCore route truth"));
+    }
+
+    #[test]
+    fn shadow_market_refresh_requires_read_only_rpc_endpoint() {
+        let mut guardian = PostBuyGuardianConfig::default();
+        guardian.shadow_market_refresh.enabled = true;
+        let config = PostBuyRuntimeConfig {
+            shadow_guardian: Some(guardian),
+            ..PostBuyRuntimeConfig::default()
+        };
+
+        let error = config
+            .validate()
+            .expect_err("refresh without its RPC endpoint must fail at startup");
+        assert!(error.contains("shadow_market_refresh.enabled requires"));
     }
 
     #[test]
@@ -8734,6 +9020,7 @@ sys.exit(0)
             shadow_lifecycle_log_path: None,
             probe_lifecycle_log_path: None,
             shadow_v2_burnin: None,
+            shadow_market_refresh_rpc_url: None,
         };
 
         let runtime_handle = tokio::spawn(run(event_rx, shutdown_rx, None, config));
@@ -8835,6 +9122,7 @@ sys.exit(0)
             shadow_lifecycle_log_path: None,
             probe_lifecycle_log_path: None,
             shadow_v2_burnin: None,
+            shadow_market_refresh_rpc_url: None,
         };
 
         event_tx
@@ -8947,6 +9235,7 @@ sys.exit(0)
             shadow_lifecycle_log_path: None,
             probe_lifecycle_log_path: None,
             shadow_v2_burnin: None,
+            shadow_market_refresh_rpc_url: None,
         };
 
         drop(event_tx);
@@ -9007,6 +9296,62 @@ sys.exit(0)
             saw_candidate,
             "direct handoff should preserve lifecycle even when broadcast transport is closed"
         );
+    }
+
+    #[tokio::test]
+    async fn post_buy_runtime_shutdown_keeps_direct_receiver_open_until_producer_closes() {
+        let tmp_dir = tempfile::tempdir().expect("temp dir");
+        let events_dir = tmp_dir.path().join("events");
+        std::fs::create_dir_all(&events_dir).expect("create events dir");
+
+        let (event_tx, _event_rx) = create_event_bus();
+        let event_rx = event_tx.subscribe();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let (direct_tx, direct_rx) = create_direct_post_buy_handoff_channel(1);
+
+        let config = PostBuyRuntimeConfig {
+            events_output_path: events_dir,
+            paper_fill_delay_min_ms: 10,
+            paper_fill_delay_max_ms: 20,
+            tick_interval_ms: 10,
+            max_ticks_before_exit: 2,
+            execution_mode: "paper".to_string(),
+            entry_mode: "paper".to_string(),
+            aem_t_s: 1,
+            max_concurrent_positions: 1,
+            position_limit_tracker: None,
+            live_sell: None,
+            live_position_registry: None,
+            slippage_tolerance: 0.20,
+            live_exit_take_profit_pct: 0.02,
+            live_exit_stop_loss_pct: 0.02,
+            shadow_guardian: None,
+            shadow_ledger: None,
+            account_state_core: None,
+            shadow_lifecycle_log_path: None,
+            probe_lifecycle_log_path: None,
+            shadow_v2_burnin: None,
+            shadow_market_refresh_rpc_url: None,
+        };
+
+        let runtime_handle = tokio::spawn(run(event_rx, shutdown_rx, Some(direct_rx), config));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        shutdown_tx.send(()).expect("send shutdown");
+        tokio::time::sleep(Duration::from_millis(POST_BUY_SHUTDOWN_DRAIN_MS + 250)).await;
+
+        assert!(
+            !runtime_handle.is_finished(),
+            "runtime must keep direct handoff receiver alive past soft drain while producer is still open"
+        );
+
+        drop(direct_tx);
+        drop(event_tx);
+
+        tokio::time::timeout(Duration::from_secs(5), runtime_handle)
+            .await
+            .expect("runtime should finish after direct producer closes")
+            .expect("runtime task should join");
     }
 
     #[test]

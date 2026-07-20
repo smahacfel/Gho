@@ -50,6 +50,11 @@ pub const DEFAULT_HET_PM_V2_VITALITY_MIN_TIME_SINCE_PEAK_MS: u64 = 5_000;
 pub const DEFAULT_HET_PM_V2_VITALITY_RECOVERY_RETURN_BPS: i32 = 300;
 pub const DEFAULT_HET_PM_V2_WRITER_QUEUE_CAPACITY: usize = 256;
 pub const DEFAULT_HET_PM_V2_TERMINAL_WRITE_BUDGET_MS: u64 = 25;
+pub const DEFAULT_SHADOW_MARKET_REFRESH_STALE_AFTER_MS: u64 = 1_500;
+pub const DEFAULT_SHADOW_MARKET_REFRESH_INTERVAL_MS: u64 = 250;
+pub const DEFAULT_SHADOW_MARKET_REFRESH_PER_POSITION_COOLDOWN_MS: u64 = 2_000;
+pub const DEFAULT_SHADOW_MARKET_REFRESH_MAX_REQUESTS_PER_CYCLE: usize = 8;
+pub const DEFAULT_SHADOW_MARKET_REFRESH_RPC_TIMEOUT_MS: u64 = 750;
 pub const DEFAULT_EXIT_REPLAY_LEVELS_BPS: [i32; 23] = [
     -5000, -3000, -2000, -1500, -1000, -700, -500, -300, -200, -100, 100, 200, 300, 400, 500, 700,
     1000, 1500, 2000, 3000, 5000, 7500, 10000,
@@ -288,11 +293,72 @@ impl ShadowExitReplayConfig {
     }
 }
 
-/// Authority mode for the Hierarchical Executable Trajectory observer.
+/// Bounded read-only refresh for an active shadow position whose canonical
+/// curve update has become stale.
 ///
-/// PR A accepts only `ObserveOnly`. The second variant is deserializable so a
-/// premature rollout request fails with a typed startup error rather than an
-/// opaque TOML enum error.
+/// Yellowstone/Seer account updates remain the primary source.  This path is
+/// deliberately a fallback: it reads the current bonding-curve account from
+/// RPC and republishes the exact decoded reserves into AccountStateCore.  It
+/// never submits a transaction and is kept outside the monitoring tick so a
+/// slow RPC cannot delay position-policy evaluation or capacity release.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShadowMarketRefreshConfig {
+    pub enabled: bool,
+    /// Canonical state age after which a managed position becomes eligible for
+    /// a point-in-time RPC refresh.
+    pub stale_after_ms: u64,
+    /// Scheduler cadence.  This controls scheduling only, not request
+    /// freshness or policy thresholds.
+    pub interval_ms: u64,
+    /// Minimum interval between point-in-time reads for one position.
+    pub per_position_cooldown_ms: u64,
+    /// Upper bound on reads started by one scheduler cycle.
+    pub max_requests_per_cycle: usize,
+    /// Hard wall-clock budget for one read-only RPC request.
+    pub rpc_timeout_ms: u64,
+}
+
+impl Default for ShadowMarketRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stale_after_ms: DEFAULT_SHADOW_MARKET_REFRESH_STALE_AFTER_MS,
+            interval_ms: DEFAULT_SHADOW_MARKET_REFRESH_INTERVAL_MS,
+            per_position_cooldown_ms: DEFAULT_SHADOW_MARKET_REFRESH_PER_POSITION_COOLDOWN_MS,
+            max_requests_per_cycle: DEFAULT_SHADOW_MARKET_REFRESH_MAX_REQUESTS_PER_CYCLE,
+            rpc_timeout_ms: DEFAULT_SHADOW_MARKET_REFRESH_RPC_TIMEOUT_MS,
+        }
+    }
+}
+
+impl ShadowMarketRefreshConfig {
+    pub fn stale_after_ms(&self) -> u64 {
+        self.stale_after_ms.max(1)
+    }
+
+    pub fn interval_ms(&self) -> u64 {
+        self.interval_ms.max(1)
+    }
+
+    pub fn per_position_cooldown_ms(&self) -> u64 {
+        self.per_position_cooldown_ms.max(self.interval_ms())
+    }
+
+    pub fn max_requests_per_cycle(&self) -> usize {
+        self.max_requests_per_cycle.clamp(1, 128)
+    }
+
+    pub fn rpc_timeout_ms(&self) -> u64 {
+        self.rpc_timeout_ms.clamp(1, 5_000)
+    }
+}
+
+/// Authority mode for the Hierarchical Executable Trajectory position manager.
+///
+/// `ObserveOnly` is the backward-compatible default. `AuthoritativeShadow`
+/// makes V2 the only exit decision owner in the shadow lane; it never enables
+/// live trading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HetPmV2Mode {
@@ -301,10 +367,10 @@ pub enum HetPmV2Mode {
     AuthoritativeShadow,
 }
 
-/// Observe-only hypotheses for HET Position Manager V2 PR A.
+/// Configuration for HET Position Manager V2.
 ///
-/// An absent section remains disabled. These defaults are research starting
-/// points, not production exit authority.
+/// An absent section remains disabled. Defaults preserve the former
+/// observe-only behaviour; authority is an explicit per-profile opt-in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HetPmV2Config {
@@ -415,6 +481,11 @@ pub struct PostBuyGuardianConfig {
     #[serde(default)]
     pub het_pm_v2: HetPmV2Config,
 
+    /// Read-only fallback for refreshing stale canonical curve state of an
+    /// active shadow position. Disabled unless an operator enables it.
+    #[serde(default)]
+    pub shadow_market_refresh: ShadowMarketRefreshConfig,
+
     // ── LIGMA thresholds ────────────────────────────────────────────────
     /// Retail impact (bps) above which we emit Warning.
     pub ligma_warning_impact_bps: f64,
@@ -508,6 +579,7 @@ impl Default for PostBuyGuardianConfig {
             exit_replay_v1: ShadowExitReplayConfig::default(),
             exit_policy_v1: ExitPolicyV1Config::default(),
             het_pm_v2: HetPmV2Config::default(),
+            shadow_market_refresh: ShadowMarketRefreshConfig::default(),
 
             // LIGMA
             ligma_warning_impact_bps: 3500.0,
@@ -590,6 +662,32 @@ mod tests {
         assert_eq!(cfg.tick_interval_ms, 250);
         // Other fields should be default
         assert_eq!(cfg.max_monitored_positions, 10);
+    }
+
+    #[test]
+    fn shadow_market_refresh_config_is_backward_compatible_and_bounded() {
+        let defaults: PostBuyGuardianConfig = toml::from_str("").expect("default TOML");
+        assert!(!defaults.shadow_market_refresh.enabled);
+
+        let cfg: PostBuyGuardianConfig = toml::from_str(
+            r#"
+            [shadow_market_refresh]
+            enabled = true
+            stale_after_ms = 0
+            interval_ms = 0
+            per_position_cooldown_ms = 0
+            max_requests_per_cycle = 999
+            rpc_timeout_ms = 99999
+            "#,
+        )
+        .expect("refresh TOML");
+
+        assert!(cfg.shadow_market_refresh.enabled);
+        assert_eq!(cfg.shadow_market_refresh.stale_after_ms(), 1);
+        assert_eq!(cfg.shadow_market_refresh.interval_ms(), 1);
+        assert_eq!(cfg.shadow_market_refresh.per_position_cooldown_ms(), 1);
+        assert_eq!(cfg.shadow_market_refresh.max_requests_per_cycle(), 128);
+        assert_eq!(cfg.shadow_market_refresh.rpc_timeout_ms(), 5_000);
     }
 
     #[test]
