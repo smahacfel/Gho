@@ -15115,11 +15115,11 @@ mod tests {
             .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
             .await;
 
-        let position_after_tick = context.engine.positions.read().get(&context.mint).cloned();
+        let position_still_open = context.engine.positions.read().contains_key(&context.mint);
         assert_eq!(
             context.engine.active_position_count(),
             0,
-            "V2 MaxHold must pass the guarded executor: position={position_after_tick:?}, lifecycle={:?}",
+            "V2 MaxHold must pass the guarded executor: position_still_open={position_still_open}, lifecycle={:?}",
             read_jsonl_rows(&context.lifecycle_path)
         );
         let lifecycle = read_jsonl_rows(&context.lifecycle_path);
@@ -15220,11 +15220,11 @@ mod tests {
             .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
             .await;
 
-        let position_after_tick = context.engine.positions.read().get(&context.mint).cloned();
+        let position_still_open = context.engine.positions.read().contains_key(&context.mint);
         assert_eq!(
             context.engine.active_position_count(),
             0,
-            "the sticky V1 proposal must complete unchanged: position={position_after_tick:?}, lifecycle={:?}",
+            "the sticky V1 proposal must complete unchanged: position_still_open={position_still_open}, lifecycle={:?}",
             read_jsonl_rows(&context.lifecycle_path)
         );
         let lifecycle = read_jsonl_rows(&context.lifecycle_path);
