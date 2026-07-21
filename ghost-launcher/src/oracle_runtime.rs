@@ -27,6 +27,12 @@ use crate::events::{
     AccountUpdateEvent, DetectedPool, EventBusSender, ExecutionJoinMetadata,
     FundingTransferObserved, GhostEvent, PoolTransaction, PostBuySource,
 };
+use crate::rug_scalp_v2::{
+    append_rug_scalp_jsonl_record, RugScalpCanonicalStateV2, RugScalpEntryAttemptRecordV2,
+    RugScalpEntryIntentV2, RugScalpOutcomeRecordV2, RugScalpRuntimeActionV2,
+    RugScalpRuntimeAdapterV2, RugScalpTerminalOutcomeV2, RugScalpV2Config,
+    RUG_SCALP_EXIT_PROFILE_ID, RUG_SCALP_V2_STRATEGY_ID,
+};
 use crate::session::{
     OpenSessionRequest, PoolObservationSession, SessionConfig, SessionManager, SharedSession,
 };
@@ -34,6 +40,7 @@ use crate::tx_intelligence::{CrossPoolVelocityConfig, FundingSourceConfig};
 use ghost_brain::config::PanicConfig;
 use ghost_brain::execution::backend::Lane;
 use ghost_brain::fast_pipeline::EnhancedCandidate;
+use ghost_brain::guardian::post_buy::RugScalpEntryWatermarkV1;
 use ghost_brain::oracle::hyper_prediction::{HyperPredictionOracle, HyperPredictionResult};
 use ghost_brain::oracle::tx_metrics::IntervalSource;
 use ghost_brain::oracle::ultrafast::PanicTx;
@@ -120,7 +127,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::{broadcast, watch, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
 // =============================================================================
@@ -128,6 +135,7 @@ use tracing::{debug, error, info, trace, warn};
 // =============================================================================
 
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
+const RUG_SCALP_ENTRY_EVIDENCE_CAP: usize = 64;
 const PUMPFUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -1940,6 +1948,9 @@ pub struct OracleRuntimeConfig {
     /// activation is additionally restricted to dedicated shadow mode.
     pub metric_contract_pr2c_enabled: bool,
     pub p37_shadow_probe: P37ShadowProbeConfig,
+    /// Isolated prospective RUG SCALP V2 adapter configuration.  It is read
+    /// once and never derives authority from a Gatekeeper decision.
+    pub rug_scalp_v2: RugScalpV2Config,
     pub selector: SelectorRuntimeConfig,
     pub run_id: Option<String>,
     pub session_id: Option<String>,
@@ -1991,6 +2002,7 @@ impl OracleRuntimeConfig {
             metric_contract_funding_source_producer_config: None,
             metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            rug_scalp_v2: RugScalpV2Config::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -2013,6 +2025,7 @@ impl OracleRuntimeConfig {
             metric_contract_funding_source_producer_config: None,
             metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            rug_scalp_v2: RugScalpV2Config::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -2076,6 +2089,7 @@ impl Default for OracleRuntimeConfig {
             metric_contract_funding_source_producer_config: None,
             metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            rug_scalp_v2: RugScalpV2Config::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -7016,6 +7030,11 @@ fn p37_shadow_probe_join_metadata(
     record: &P37ShadowProbeSelectionRecord,
 ) -> Option<ExecutionJoinMetadata> {
     Some(ExecutionJoinMetadata {
+        strategy_id: None,
+        exit_profile_id: None,
+        rug_scalp_entry_watermark_slot: None,
+        rug_scalp_entry_watermark_tx_index: None,
+        rug_scalp_entry_watermark_event_ordinal: None,
         ab_record_id: record.ab_record_id.clone(),
         source_ab_record_id: record.source_ab_record_id.clone(),
         probe_id: record.probe_id.clone(),
@@ -22514,6 +22533,426 @@ async fn send_probe_post_buy_handoff(
     send_direct_shadow_post_buy_handoff(post_buy_tx, &handoff_event, pool_amm_id, "probe").await
 }
 
+#[derive(Debug)]
+enum RugScalpAdapterCompletionV2 {
+    BindRegisteredPosition {
+        mint: String,
+        candidate_id: String,
+        position_id: String,
+        entry_token_amount_raw: u64,
+        entry_watermark: RugScalpEntryWatermarkV1,
+    },
+}
+
+fn rug_scalp_join_metadata(intent: &RugScalpEntryIntentV2) -> ExecutionJoinMetadata {
+    ExecutionJoinMetadata {
+        strategy_id: Some(RUG_SCALP_V2_STRATEGY_ID.to_string()),
+        exit_profile_id: Some(RUG_SCALP_EXIT_PROFILE_ID.to_string()),
+        probe_id: Some(format!("rug-scalp-probe:{}", intent.candidate_id)),
+        dispatch_source: Some("rug_scalp_v2_isolated_shadow_adapter".to_string()),
+        collection_plane: Some("rug_scalp_v2".to_string()),
+        probe_plane: Some("rug_scalp_v2_primary_010_sol".to_string()),
+        decision_plane: Some("rug_scalp_signal_reducer_v2".to_string()),
+        ..ExecutionJoinMetadata::default()
+    }
+}
+
+fn rug_scalp_join_metadata_with_entry_watermark(
+    intent: &RugScalpEntryIntentV2,
+    entry_watermark: RugScalpEntryWatermarkV1,
+) -> ExecutionJoinMetadata {
+    let mut metadata = rug_scalp_join_metadata(intent);
+    metadata.rug_scalp_entry_watermark_slot = Some(entry_watermark.slot);
+    metadata.rug_scalp_entry_watermark_tx_index = entry_watermark.tx_index;
+    metadata.rug_scalp_entry_watermark_event_ordinal = entry_watermark.event_ordinal;
+    metadata
+}
+
+async fn append_rug_scalp_entry_attempt(
+    path: &std::path::Path,
+    record: &RugScalpEntryAttemptRecordV2,
+) {
+    if let Err(error) = append_rug_scalp_jsonl_record(path, record).await {
+        warn!(
+            candidate_id = %record.candidate_id,
+            error = %error,
+            "RUG_SCALP_ENTRY_ATTEMPT_WRITE_FAILED"
+        );
+    }
+}
+
+async fn append_rug_scalp_entry_terminal(
+    path: &std::path::Path,
+    intent: &RugScalpEntryIntentV2,
+    outcome: RugScalpTerminalOutcomeV2,
+    status: &str,
+    reason: impl Into<String>,
+) {
+    let record =
+        RugScalpOutcomeRecordV2::entry_terminal(intent, outcome, status, Some(reason.into()));
+    if let Err(error) = append_rug_scalp_jsonl_record(path, &record).await {
+        warn!(
+            candidate_id = %record.candidate_id,
+            error = %error,
+            "RUG_SCALP_ENTRY_TERMINAL_WRITE_FAILED"
+        );
+    }
+}
+
+/// Waits only on canonical AccountStateCore updates until the frozen primary
+/// slot latency is covered.  This does not use a Gatekeeper verdict, wall-clock
+/// proxy, or an external synthetic quote.
+async fn wait_for_rug_scalp_entry_latency(
+    oracle_runtime: &OracleRuntime,
+    mint: Pubkey,
+    signal_slot: u64,
+    latency_slots: u64,
+    max_wait_ms: u64,
+) -> Result<(), String> {
+    let target_slot = signal_slot.saturating_add(latency_slots);
+    let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
+    let mut readiness_rx = oracle_runtime.subscribe_canonical_readiness(&mint);
+    loop {
+        if oracle_runtime.account_state_core().is_canonical(&mint)
+            && oracle_runtime
+                .account_state_core()
+                .get_canonical_state(&mint)
+                .is_some_and(|state| state.last_update_slot >= target_slot)
+        {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("entry_latency_slot_timeout_target={target_slot}"));
+        }
+        match tokio::time::timeout(remaining, readiness_rx.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err("canonical_readiness_notifier_closed".to_string()),
+            Err(_) => return Err(format!("entry_latency_slot_timeout_target={target_slot}")),
+        }
+    }
+}
+
+async fn send_rug_scalp_post_buy_handoff(
+    post_buy_tx: Option<&DirectPostBuySender>,
+    pool_amm_id: Pubkey,
+    pool_data: &DetectedPool,
+    shadow_event: &crate::events::ShadowBuySimulationEvent,
+    request: &crate::components::trigger::PreparedBuyRequest,
+    epoch: u64,
+    intent: &RugScalpEntryIntentV2,
+    entry_watermark: RugScalpEntryWatermarkV1,
+) -> Result<DirectPostBuyHandoffAck, String> {
+    let sender = post_buy_tx.ok_or_else(|| "post_buy_direct_lane_unavailable".to_string())?;
+    let event = GhostEvent::PostBuySubmitted {
+        // This identity is allocated by the RUG reducer before the asynchronous
+        // probe begins and is reused by PM for the one position lifecycle.
+        candidate_id: intent.candidate_id.clone(),
+        pool_amm_id: pool_amm_id.to_string(),
+        base_mint: pool_data.base_mint.clone(),
+        signature: shadow_event
+            .live_signature
+            .clone()
+            .unwrap_or_else(|| format!("rug-scalp-modelled:{}", intent.candidate_id)),
+        amount_sol: request.trade_value_sol,
+        tip_lamports: request.tip_lamports,
+        lane: "probe".to_string(),
+        epoch_id: epoch,
+        position_slot_id: None,
+        source: PostBuySource::RugScalpV2Probe,
+        min_tokens_out: Some(request.min_tokens_out),
+        entry_token_amount_raw: shadow_event
+            .entry_token_amount_raw
+            .or(request.entry_token_amount_raw),
+        buy_landed_slot: Some(shadow_event.rpc_slot),
+        entry_simulation_rpc_slot: Some(shadow_event.rpc_slot),
+        entry_opened_at_ms: Some(shadow_event.decision_ts_ms),
+        creator_pubkey: Pubkey::from_str(&pool_data.creator)
+            .ok()
+            .map(|pubkey| pubkey.to_string()),
+        join_metadata: rug_scalp_join_metadata_with_entry_watermark(intent, entry_watermark),
+        shadow_v2_entry_boundary: request.shadow_v2_entry_boundary.clone(),
+    };
+    let (handoff, ack_rx) = DirectPostBuyHandoff::with_ack(event);
+    sender
+        .send(handoff)
+        .await
+        .map_err(|_| "post_buy_direct_lane_closed".to_string())?;
+    // Do not turn a queued-but-slow PM registration into ENTRY_UNKNOWN.  A
+    // timeout here would allow the caller to write an unknown terminal while
+    // the direct lane later registers the same position and emits a second
+    // PM terminal.  The entry semaphore bounds the one in-flight RUG handoff;
+    // after a successful enqueue, only the definitive PM ACK may decide
+    // whether the adapter binds the fact stream.  A closed receiver means no
+    // ACK was delivered and remains fail-closed.
+    ack_rx
+        .await
+        .map_err(|_| "post_buy_handoff_ack_channel_closed".to_string())
+}
+
+/// Executes exactly one isolated, modelled shadow entry for a reducer-owned
+/// intent.  It reuses only the canonical Pump route/builder materialization;
+/// no P37 selection record or Gatekeeper verdict enters this function.
+async fn run_rug_scalp_v2_entry_adapter(
+    ctx: Arc<PoolObservationContext>,
+    intent: RugScalpEntryIntentV2,
+    pool_data: Arc<DetectedPool>,
+    entry_evidence_txs: Vec<Arc<PoolTransaction>>,
+    completion_tx: tokio::sync::mpsc::Sender<RugScalpAdapterCompletionV2>,
+) {
+    let config = &ctx.oracle_runtime.config.rug_scalp_v2;
+    let entry_log_path = std::path::PathBuf::from(&config.entry_log_path);
+    let outcome_log_path = std::path::PathBuf::from(&config.outcome_log_path);
+    let mut entry_record = RugScalpEntryAttemptRecordV2::from_intent(&intent, "accepted_intent");
+    let mint = match Pubkey::from_str(&intent.assessment.mint) {
+        Ok(mint) => mint,
+        Err(_) => {
+            entry_record.dispatch_status = "data_invalidated".to_string();
+            entry_record.failure_reason = Some("invalid_mint_identity".to_string());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_rug_scalp_entry_terminal(
+                &outcome_log_path,
+                &intent,
+                RugScalpTerminalOutcomeV2::DataInvalidated,
+                "not_submitted",
+                "invalid_mint_identity",
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(trigger_component) = ctx.trigger.as_ref().map(Arc::clone) else {
+        entry_record.dispatch_status = "entry_failed".to_string();
+        entry_record.failure_reason = Some("authoritative_pump_builder_unavailable".to_string());
+        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+        append_rug_scalp_entry_terminal(
+            &outcome_log_path,
+            &intent,
+            RugScalpTerminalOutcomeV2::EntryFailed,
+            "not_submitted",
+            "authoritative_pump_builder_unavailable",
+        )
+        .await;
+        return;
+    };
+    let Some(signal_slot) = intent.assessment.signal_slot else {
+        entry_record.dispatch_status = "data_invalidated".to_string();
+        entry_record.failure_reason = Some("signal_slot_missing".to_string());
+        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+        append_rug_scalp_entry_terminal(
+            &outcome_log_path,
+            &intent,
+            RugScalpTerminalOutcomeV2::DataInvalidated,
+            "not_submitted",
+            "signal_slot_missing",
+        )
+        .await;
+        return;
+    };
+    let Some(latency_slots) = config.primary_entry_latency_slots else {
+        entry_record.dispatch_status = "data_invalidated".to_string();
+        entry_record.failure_reason = Some("primary_entry_latency_not_frozen".to_string());
+        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+        append_rug_scalp_entry_terminal(
+            &outcome_log_path,
+            &intent,
+            RugScalpTerminalOutcomeV2::DataInvalidated,
+            "not_submitted",
+            "primary_entry_latency_not_frozen",
+        )
+        .await;
+        return;
+    };
+    if let Err(reason) = wait_for_rug_scalp_entry_latency(
+        ctx.oracle_runtime.as_ref(),
+        mint,
+        signal_slot,
+        latency_slots,
+        config.max_hold_ms,
+    )
+    .await
+    {
+        entry_record.dispatch_status = "entry_unknown".to_string();
+        entry_record.failure_reason = Some(reason.clone());
+        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+        append_rug_scalp_entry_terminal(
+            &outcome_log_path,
+            &intent,
+            RugScalpTerminalOutcomeV2::EntryUnknown,
+            "latency_wait_unresolved",
+            reason,
+        )
+        .await;
+        return;
+    }
+
+    // This is the existing canonical route resolver/Pump builder.  It only
+    // consumes observed account evidence and pool identity, never P37 policy
+    // selection or a Gatekeeper decision.
+    let account_overrides = derive_active_buy_account_overrides_from_evidence(
+        ctx.as_ref(),
+        mint,
+        pool_data.as_ref(),
+        &entry_evidence_txs,
+    );
+    let request = match trigger_component
+        .prepare_buy_request_with_decision_ts_and_amount_lamports(
+            &mint,
+            &account_overrides,
+            0,
+            Some(intent.assessment.signal_ingress_ms),
+            Some(intent.primary_notional_lamports),
+        )
+        .await
+    {
+        Ok(request) => request.with_join_metadata(rug_scalp_join_metadata(&intent)),
+        Err(error) => {
+            let reason = format!("authoritative_pump_prepare_failed:{error}");
+            entry_record.dispatch_status = "entry_failed".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_rug_scalp_entry_terminal(
+                &outcome_log_path,
+                &intent,
+                RugScalpTerminalOutcomeV2::EntryFailed,
+                "prepare_failed",
+                reason,
+            )
+            .await;
+            return;
+        }
+    };
+    let report = match trigger_component
+        .simulate_counterfactual_shadow_probe(&request)
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            let reason = format!("isolated_shadow_submission_failed:{error}");
+            entry_record.dispatch_status = "entry_failed".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_rug_scalp_entry_terminal(
+                &outcome_log_path,
+                &intent,
+                RugScalpTerminalOutcomeV2::EntryFailed,
+                "submission_failed",
+                reason,
+            )
+            .await;
+            return;
+        }
+    };
+    let shadow_event = crate::components::trigger::shadow_run::shadow_buy_event_from_report(
+        &intent.assessment.pool_id,
+        &intent.assessment.mint,
+        report,
+    );
+    entry_record.simulation_rpc_slot = Some(shadow_event.rpc_slot);
+    if let Some(error) = shadow_event.err.as_deref() {
+        let reason = format!("modelled_fill_rejected:{error}");
+        entry_record.dispatch_status = "entry_failed".to_string();
+        entry_record.failure_reason = Some(reason.clone());
+        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+        append_rug_scalp_entry_terminal(
+            &outcome_log_path,
+            &intent,
+            RugScalpTerminalOutcomeV2::EntryFailed,
+            "modelled_fill_rejected",
+            reason,
+        )
+        .await;
+        return;
+    }
+    let entry_token_amount_raw = shadow_event
+        .entry_token_amount_raw
+        .or(request.entry_token_amount_raw)
+        .filter(|amount| *amount > 0);
+    let Some(entry_token_amount_raw) = entry_token_amount_raw else {
+        entry_record.dispatch_status = "entry_unknown".to_string();
+        entry_record.failure_reason = Some("modelled_fill_quantity_missing".to_string());
+        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+        append_rug_scalp_entry_terminal(
+            &outcome_log_path,
+            &intent,
+            RugScalpTerminalOutcomeV2::EntryUnknown,
+            "modelled_fill_unresolved",
+            "modelled_fill_quantity_missing",
+        )
+        .await;
+        return;
+    };
+    // The isolated shadow simulator proves the canonical RPC slot but does
+    // not invent a tx/event ordinal.  Same-slot facts therefore remain a
+    // typed ambiguity until a confirmed fill can supply the full watermark.
+    let entry_watermark = RugScalpEntryWatermarkV1::modelled(shadow_event.rpc_slot);
+    let epoch = ctx.post_buy_epoch.fetch_add(1, Ordering::Relaxed);
+    let handoff = send_rug_scalp_post_buy_handoff(
+        ctx.post_buy_tx.as_ref(),
+        Pubkey::from_str(&intent.assessment.pool_id).unwrap_or(mint),
+        pool_data.as_ref(),
+        &shadow_event,
+        &request,
+        epoch,
+        &intent,
+        entry_watermark,
+    )
+    .await;
+    match handoff {
+        Ok(DirectPostBuyHandoffAck::Accepted) => {
+            let position_id = format!("rug-scalp-position:{}", intent.candidate_id);
+            entry_record.dispatch_status = "modelled_fill_registered".to_string();
+            entry_record.entry_token_amount_raw = Some(entry_token_amount_raw);
+            entry_record.position_id = Some(position_id.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            // This bounded handoff is deliberately awaited after PM has
+            // acknowledged registration.  With the one-entry semaphore its
+            // capacity cannot grow with accepted signals, and a registered
+            // position never has its adapter bind silently discarded.
+            if completion_tx
+                .send(RugScalpAdapterCompletionV2::BindRegisteredPosition {
+                    mint: intent.assessment.mint.clone(),
+                    candidate_id: intent.candidate_id,
+                    position_id,
+                    entry_token_amount_raw,
+                    entry_watermark,
+                })
+                .await
+                .is_err()
+            {
+                warn!("RUG_SCALP_ADAPTER_COMPLETION_CHANNEL_CLOSED");
+            }
+        }
+        Ok(DirectPostBuyHandoffAck::Rejected(reason)) => {
+            let reason = format!("pm_registration_rejected:{reason}");
+            entry_record.dispatch_status = "entry_failed".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_rug_scalp_entry_terminal(
+                &outcome_log_path,
+                &intent,
+                RugScalpTerminalOutcomeV2::EntryFailed,
+                "pm_registration_rejected",
+                reason,
+            )
+            .await;
+        }
+        Err(reason) => {
+            entry_record.dispatch_status = "entry_unknown".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_rug_scalp_entry_terminal(
+                &outcome_log_path,
+                &intent,
+                RugScalpTerminalOutcomeV2::EntryUnknown,
+                "pm_handoff_unresolved",
+                reason,
+            )
+            .await;
+        }
+    }
+}
+
 async fn apply_trigger_buy_outcome(
     event_tx: &crate::events::EventBusSender,
     post_buy_tx: Option<&DirectPostBuySender>,
@@ -25133,6 +25572,44 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         dry_run,
         ab_window_ms: analysis_window_ms,
     });
+    // RUG SCALP has a deliberately separate reducer/adapter state.  It is
+    // neither a Gatekeeper policy input nor a P37 selection state.  The small
+    // bounded outbox protects PM fact order without handing raw trades to PM.
+    let mut rug_scalp_adapter =
+        RugScalpRuntimeAdapterV2::new(oracle_runtime.config.rug_scalp_v2.clone());
+    let mut rug_scalp_entry_evidence: HashMap<String, VecDeque<Arc<PoolTransaction>>> =
+        HashMap::new();
+    let mut rug_scalp_fact_outbox =
+        VecDeque::<ghost_brain::guardian::post_buy::RugScalpMarketFactV1>::new();
+    // There can be at most one active isolated entry task.  Keep completion
+    // transport bounded nevertheless, so a broken main loop cannot turn
+    // accepted assessments into an unbounded in-memory queue.
+    let (rug_scalp_completion_tx, mut rug_scalp_completion_rx) =
+        mpsc::channel::<RugScalpAdapterCompletionV2>(2);
+    let rug_scalp_entry_semaphore = Arc::new(Semaphore::new(1));
+    let (rug_scalp_assessment_tx, mut rug_scalp_assessment_rx) =
+        mpsc::channel::<crate::rug_scalp_v2::RugScalpEntryAssessmentV2>(256);
+    if oracle_runtime.config.rug_scalp_v2.enabled {
+        let assessment_path = std::path::PathBuf::from(
+            &oracle_runtime
+                .config
+                .rug_scalp_v2
+                .signal_assessment_log_path,
+        );
+        tokio::spawn(async move {
+            while let Some(assessment) = rug_scalp_assessment_rx.recv().await {
+                if let Err(error) =
+                    append_rug_scalp_jsonl_record(&assessment_path, &assessment).await
+                {
+                    warn!(
+                        mint = %assessment.mint,
+                        error = %error,
+                        "RUG_SCALP_SIGNAL_ASSESSMENT_WRITE_FAILED"
+                    );
+                }
+            }
+        });
+    }
     let (account_update_work_tx, account_update_work_rx) =
         tokio::sync::mpsc::unbounded_channel::<AccountUpdateEvent>();
     let account_update_queue_depth = Arc::new(AtomicUsize::new(0));
@@ -25156,6 +25633,34 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     );
 
     loop {
+        // Drain in original adapter order.  Facts are small and bounded; on a
+        // full direct lane they remain queued rather than being silently
+        // discarded or converted into synthetic empty slots.
+        while let Some(fact) = rug_scalp_fact_outbox.front().cloned() {
+            let Some(sender) = ctx.post_buy_tx.as_ref() else {
+                warn!(
+                    position_id = %fact.position_id,
+                    "RUG_SCALP_PM_FACT_LANE_UNAVAILABLE; invalidating adapter stream"
+                );
+                rug_scalp_fact_outbox.clear();
+                let _ = rug_scalp_adapter.mark_stream_gap();
+                break;
+            };
+            match sender.try_send(DirectPostBuyHandoff::rug_scalp_market_fact_without_ack(
+                fact,
+            )) {
+                Ok(()) => {
+                    rug_scalp_fact_outbox.pop_front();
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("RUG_SCALP_PM_FACT_LANE_CLOSED; invalidating adapter stream");
+                    rug_scalp_fact_outbox.clear();
+                    let _ = rug_scalp_adapter.mark_stream_gap();
+                    break;
+                }
+            }
+        }
         tokio::select! {
             shutdown = async {
                 match shutdown_rx.as_mut() {
@@ -25227,12 +25732,60 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                 );
             }
 
+            Some(completion) = rug_scalp_completion_rx.recv() => {
+                let actions = match completion {
+                    RugScalpAdapterCompletionV2::BindRegisteredPosition {
+                        mint,
+                        candidate_id,
+                        position_id,
+                        entry_token_amount_raw,
+                        entry_watermark,
+                    } => rug_scalp_adapter.bind_confirmed_or_modelled_fill(
+                        &mint,
+                        &candidate_id,
+                        position_id,
+                        entry_token_amount_raw,
+                        entry_watermark,
+                    ),
+                };
+                match actions {
+                    Ok(actions) => {
+                        for action in actions {
+                            if let RugScalpRuntimeActionV2::MarketFact(fact) = action {
+                                if rug_scalp_fact_outbox.len() >= 256 {
+                                    warn!("RUG_SCALP_PM_FACT_OUTBOX_OVERFLOW; emitting DATA_GAP");
+                                    rug_scalp_fact_outbox.clear();
+                                    rug_scalp_fact_outbox.extend(
+                                        rug_scalp_adapter.mark_stream_gap().into_iter().filter_map(|action| {
+                                            match action {
+                                                RugScalpRuntimeActionV2::MarketFact(fact) => Some(fact),
+                                                _ => None,
+                                            }
+                                        }),
+                                    );
+                                    break;
+                                }
+                                rug_scalp_fact_outbox.push_back(fact);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "RUG_SCALP_PM_BIND_REJECTED_AFTER_ACCEPTED_HANDOFF");
+                    }
+                }
+            }
+
             event_result = event_rx.recv() => {
                 let event = match event_result {
                     Ok(e) => e,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!("LAG ORACLE by {} messages", n);
                         ctx.session_manager.mark_metric_contract_stream_gap();
+                        for action in rug_scalp_adapter.mark_stream_gap() {
+                            if let RugScalpRuntimeActionV2::MarketFact(fact) = action {
+                                rug_scalp_fact_outbox.push_back(fact);
+                            }
+                        }
                         continue;
                     }
                     Err(_) => break,
@@ -25248,6 +25801,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                             emit_new_pool_detected_evidence_event(emitter, &pool_data);
                         }
                         let registered_wall_ts_ms = current_time_ms();
+                        rug_scalp_adapter.on_birth(pool_data.as_ref(), registered_wall_ts_ms);
 
                         if let Ok(candidate) = build_enhanced_candidate_from_pool_data(
                             &pool_data,
@@ -25385,6 +25939,148 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                 base_mint,
                                 tx.as_ref(),
                             );
+
+                            // RUG signal ownership is intentionally parallel to
+                            // Gatekeeper routing.  It sees canonical evidence,
+                            // but its accepted intent does not alter a BUY/REJECT
+                            // verdict, primary capacity, or P37 selection.
+                            if oracle_runtime.config.rug_scalp_v2.enabled {
+                                if let Some(mint_text) = tx.token_mint.as_ref() {
+                                    let evidence = rug_scalp_entry_evidence
+                                        .entry(mint_text.clone())
+                                        .or_default();
+                                    if evidence.len() >= RUG_SCALP_ENTRY_EVIDENCE_CAP {
+                                        evidence.pop_front();
+                                    }
+                                    evidence.push_back(Arc::clone(&tx));
+                                    let canonical = base_mint.map_or_else(
+                                        RugScalpCanonicalStateV2::default,
+                                        |mint| RugScalpCanonicalStateV2 {
+                                            state_clean: oracle_runtime
+                                                .account_state_core()
+                                                .is_canonical(&mint),
+                                            ordering_known: tx.slot.is_some()
+                                                && tx.tx_index.is_some()
+                                                && tx.event_ordinal.is_some(),
+                                            accepted_window_has_gap: false,
+                                        },
+                                    );
+                                    let canonical_curve = base_mint
+                                        .filter(|mint| oracle_runtime.account_state_core().is_canonical(mint))
+                                        .and_then(|mint| oracle_runtime.account_state_core().bonding_curve(&mint));
+                                    let actions = rug_scalp_adapter.on_trade(
+                                        tx.as_ref(),
+                                        current_time_ms(),
+                                        canonical,
+                                        canonical_curve,
+                                    );
+                                    let mut assessment_delivery_failed = false;
+                                    for action in actions {
+                                        match action {
+                                            RugScalpRuntimeActionV2::Assessment(assessment) => {
+                                                if rug_scalp_assessment_tx.try_send(assessment).is_err() {
+                                                    warn!("RUG_SCALP_SIGNAL_ASSESSMENT_QUEUE_GAP");
+                                                    assessment_delivery_failed = true;
+                                                    for gap_action in rug_scalp_adapter.mark_stream_gap() {
+                                                        if let RugScalpRuntimeActionV2::MarketFact(fact) = gap_action {
+                                                            rug_scalp_fact_outbox.push_back(fact);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            RugScalpRuntimeActionV2::MarketFact(fact) => {
+                                                if rug_scalp_fact_outbox.len() >= 256 {
+                                                    warn!("RUG_SCALP_PM_FACT_OUTBOX_OVERFLOW; emitting DATA_GAP");
+                                                    rug_scalp_fact_outbox.clear();
+                                                    rug_scalp_fact_outbox.extend(
+                                                        rug_scalp_adapter.mark_stream_gap().into_iter().filter_map(|gap_action| {
+                                                            match gap_action {
+                                                                RugScalpRuntimeActionV2::MarketFact(fact) => Some(fact),
+                                                                _ => None,
+                                                            }
+                                                        }),
+                                                    );
+                                                } else {
+                                                    rug_scalp_fact_outbox.push_back(fact);
+                                                }
+                                            }
+                                            RugScalpRuntimeActionV2::EntryIntent(intent) => {
+                                                if assessment_delivery_failed {
+                                                    let outcome_path = std::path::PathBuf::from(
+                                                        &oracle_runtime.config.rug_scalp_v2.outcome_log_path,
+                                                    );
+                                                    tokio::spawn(async move {
+                                                        append_rug_scalp_entry_terminal(
+                                                            &outcome_path,
+                                                            &intent,
+                                                            RugScalpTerminalOutcomeV2::DataInvalidated,
+                                                            "adapter_blocked",
+                                                            "signal_assessment_delivery_gap",
+                                                        )
+                                                        .await;
+                                                    });
+                                                    continue;
+                                                }
+                                                let pool_data = oracle_runtime.lookup_detected_pool(&pool_id);
+                                                let entry_evidence_txs = rug_scalp_entry_evidence
+                                                    .get(&intent.assessment.mint)
+                                                    .map(|txs| txs.iter().cloned().collect::<Vec<_>>())
+                                                    .unwrap_or_default();
+                                                match (
+                                                    pool_data,
+                                                    Arc::clone(&rug_scalp_entry_semaphore).try_acquire_owned(),
+                                                ) {
+                                                    (Some(pool_data), Ok(permit)) => {
+                                                        let ctx = Arc::clone(&ctx);
+                                                        let completion_tx = rug_scalp_completion_tx.clone();
+                                                        tokio::spawn(async move {
+                                                            let _permit = permit;
+                                                            run_rug_scalp_v2_entry_adapter(
+                                                                ctx,
+                                                                intent,
+                                                                pool_data,
+                                                                entry_evidence_txs,
+                                                                completion_tx,
+                                                            )
+                                                            .await;
+                                                        });
+                                                    }
+                                                    (None, _) => {
+                                                        let outcome_path = std::path::PathBuf::from(
+                                                            &oracle_runtime.config.rug_scalp_v2.outcome_log_path,
+                                                        );
+                                                        tokio::spawn(async move {
+                                                            append_rug_scalp_entry_terminal(
+                                                                &outcome_path,
+                                                                &intent,
+                                                                RugScalpTerminalOutcomeV2::NoEntry,
+                                                                "adapter_blocked",
+                                                                "pool_metadata_unavailable",
+                                                            )
+                                                            .await;
+                                                        });
+                                                    }
+                                                    (Some(_), Err(_)) => {
+                                                        let outcome_path = std::path::PathBuf::from(
+                                                            &oracle_runtime.config.rug_scalp_v2.outcome_log_path,
+                                                        );
+                                                        tokio::spawn(async move {
+                                                            append_rug_scalp_entry_terminal(
+                                                                &outcome_path,
+                                                                &intent,
+                                                                RugScalpTerminalOutcomeV2::NoEntry,
+                                                                "adapter_blocked",
+                                                                "isolated_entry_capacity_exhausted",
+                                                            )
+                                                            .await;
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
 
                             // Durable selector feature evidence is intentionally
                             // emitted before runtime rejected-pool filtering.  The

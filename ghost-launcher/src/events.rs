@@ -1093,6 +1093,21 @@ pub struct PoolScoredEvent {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionJoinMetadata {
+    /// Immutable strategy authority of the entry handoff.  Optional for
+    /// compatibility with existing Gatekeeper/P37 handoffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_id: Option<String>,
+    /// Immutable Position Manager profile selected by the entry adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_profile_id: Option<String>,
+    /// Canonical order boundary for RUG fact replay.  Modelled fills carry
+    /// only the slot; confirmed fills may carry all three coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_watermark_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_watermark_tx_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_watermark_event_ordinal: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ab_record_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1135,7 +1150,12 @@ pub struct ExecutionJoinMetadata {
 
 impl ExecutionJoinMetadata {
     pub fn is_empty(&self) -> bool {
-        self.ab_record_id.is_none()
+        self.strategy_id.is_none()
+            && self.exit_profile_id.is_none()
+            && self.rug_scalp_entry_watermark_slot.is_none()
+            && self.rug_scalp_entry_watermark_tx_index.is_none()
+            && self.rug_scalp_entry_watermark_event_ordinal.is_none()
+            && self.ab_record_id.is_none()
             && self.source_ab_record_id.is_none()
             && self.probe_id.is_none()
             && self.dispatch_source.is_none()
@@ -1709,6 +1729,11 @@ mod tests {
     #[test]
     fn execution_join_metadata_probe_fields_roundtrip() {
         let metadata = ExecutionJoinMetadata {
+            strategy_id: None,
+            exit_profile_id: None,
+            rug_scalp_entry_watermark_slot: None,
+            rug_scalp_entry_watermark_tx_index: None,
+            rug_scalp_entry_watermark_event_ordinal: None,
             ab_record_id: Some("probe-ab".to_string()),
             source_ab_record_id: Some("source-ab".to_string()),
             probe_id: Some("probe-id".to_string()),
@@ -2329,4 +2354,5 @@ pub enum PostBuySource {
     LiveBuy,
     Recovery,
     CounterfactualShadowProbe,
+    RugScalpV2Probe,
 }

@@ -789,6 +789,28 @@ async fn run_preflight(
         }
     }
 
+    let rug_scalp_result = config
+        .rug_scalp_v2
+        .validate_enabled_contract()
+        .and_then(|()| {
+            if config.rug_scalp_v2.enabled && config.p37_shadow_probe.enabled {
+                Err(ghost_launcher::rug_scalp_v2::RugScalpConfigError::IsolatedProbeLaneRequired)
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(anyhow::Error::msg);
+    match rug_scalp_result {
+        Ok(()) if config.rug_scalp_v2.enabled => {
+            println!("[ok] rug_scalp_v2: observe_only, frozen entry/exit latency slots")
+        }
+        Ok(()) => println!("[ok] rug_scalp_v2: disabled"),
+        Err(err) => {
+            eprintln!("[fail] rug_scalp_v2: {err}");
+            failures.push(format!("rug_scalp_v2: {err}"));
+        }
+    }
+
     let grpc_result = config.validate_grpc_config().map_err(anyhow::Error::msg);
     match grpc_result {
         Ok(()) => println!(
@@ -1116,6 +1138,9 @@ async fn run_preflight(
 /// the manager is active there and no legacy/default fallback is valid.
 fn validate_post_buy_manager_preflight(config: &LauncherConfig) -> Result<()> {
     if config.execution.execution_mode != ExecutionMode::Shadow {
+        if config.rug_scalp_v2.enabled {
+            bail!("rug_scalp_v2.enabled requires execution.execution_mode=shadow");
+        }
         return Ok(());
     }
 
@@ -1126,7 +1151,17 @@ fn validate_post_buy_manager_preflight(config: &LauncherConfig) -> Result<()> {
             brain_path.display()
         )
     })?;
-    let guardian = &brain.post_buy_guardian;
+    // RUG's profile is projected from the experiment config only after its
+    // own fail-closed validation.  Preflight must validate that *effective*
+    // manager config, not the dormant profile stored in the base brain TOML.
+    let mut guardian = brain.post_buy_guardian.clone();
+    if config.rug_scalp_v2.enabled {
+        guardian.rug_scalp_exit_v1 = config
+            .rug_scalp_v2
+            .position_manager_exit_profile()
+            .map_err(anyhow::Error::msg)
+            .context("invalid rug_scalp_exit_v1 Position Manager profile")?;
+    }
 
     if !guardian.enabled {
         bail!("shadow mode requires post_buy_guardian.enabled=true");
@@ -1134,10 +1169,10 @@ fn validate_post_buy_manager_preflight(config: &LauncherConfig) -> Result<()> {
     if guardian.aem.enabled {
         bail!("Position Manager Lite V1 requires post_buy_guardian.aem.enabled=false");
     }
-    validate_exit_policy_v1_config(guardian).map_err(|error| {
+    validate_exit_policy_v1_config(&guardian).map_err(|error| {
         anyhow::anyhow!("invalid Position Manager Lite V1 configuration: {error}")
     })?;
-    validate_het_pm_v2_config(guardian)
+    validate_het_pm_v2_config(&guardian)
         .map_err(|error| anyhow::anyhow!("invalid HET-PM V2 configuration: {error}"))?;
     if guardian.shadow_market_refresh.enabled
         && config.trigger.shadow_run.shadow_rpc_url.trim().is_empty()
@@ -2042,6 +2077,7 @@ async fn run_launcher() -> Result<()> {
         .as_ref()
         .is_some_and(|brain| brain.metric_contract_pr2c_enabled);
     oracle_runtime_config.p37_shadow_probe = config.p37_shadow_probe.clone();
+    oracle_runtime_config.rug_scalp_v2 = config.rug_scalp_v2.clone();
     oracle_runtime_config.selector = config.selector.clone();
     oracle_runtime_config.run_id = (!config.p37_shadow_probe.run_id.trim().is_empty())
         .then(|| config.p37_shadow_probe.run_id.clone());
@@ -2234,11 +2270,21 @@ async fn run_launcher() -> Result<()> {
         PathBuf::from(&config.execution.events.output_dir).join("live_positions.jsonl"),
     );
     let shadow_lifecycle_log_path = effective_shadow_lifecycle_log_path(&config);
-    let probe_lifecycle_log_path = config
-        .p37_shadow_probe
-        .enabled
-        .then(|| PathBuf::from(&config.p37_shadow_probe.lifecycle_log_path));
+    let probe_lifecycle_log_path = if config.rug_scalp_v2.enabled {
+        Some(PathBuf::from(&config.rug_scalp_v2.lifecycle_log_path))
+    } else if config.p37_shadow_probe.enabled {
+        Some(PathBuf::from(&config.p37_shadow_probe.lifecycle_log_path))
+    } else {
+        None
+    };
 
+    let rug_scalp_exit_profile = config
+        .rug_scalp_v2
+        .enabled
+        .then(|| config.rug_scalp_v2.position_manager_exit_profile())
+        .transpose()
+        .map_err(anyhow::Error::msg)
+        .context("invalid rug_scalp_exit_v1 Position Manager profile")?;
     let post_buy_config = ghost_launcher::components::post_buy_runtime::PostBuyRuntimeConfig {
         events_output_path: PathBuf::from(&config.execution.events.output_dir),
         paper_fill_delay_min_ms: config.execution.paper.fill_delay_ms_min,
@@ -2255,14 +2301,29 @@ async fn run_launcher() -> Result<()> {
         slippage_tolerance: config.trigger.slippage_tolerance,
         live_exit_take_profit_pct: config.trigger.live_exit_take_profit_pct,
         live_exit_stop_loss_pct: config.trigger.live_exit_stop_loss_pct,
-        shadow_guardian: ghost_brain_config
-            .as_ref()
-            .map(|brain| brain.post_buy_guardian.clone()),
+        shadow_guardian: {
+            // A RUG primary cannot be registered without its PM-owned profile.
+            // When no explicit brain config is loaded, materialize the same
+            // safe default guardian and project the profile into it; this is
+            // still shadow-only and does not create a second manager.
+            let mut guardian = ghost_brain_config
+                .as_ref()
+                .map(|brain| brain.post_buy_guardian.clone())
+                .unwrap_or_default();
+            if let Some(profile) = rug_scalp_exit_profile.as_ref() {
+                guardian.rug_scalp_exit_v1 = profile.clone();
+            }
+            (ghost_brain_config.is_some() || rug_scalp_exit_profile.is_some()).then_some(guardian)
+        },
         shadow_ledger: Some(Arc::clone(&shadow_ledger)),
         account_state_core: Some(Arc::clone(oracle_runtime.account_state_core())),
         shadow_market_refresh_rpc_url: Some(config.trigger.shadow_run.shadow_rpc_url.clone()),
         shadow_lifecycle_log_path,
         probe_lifecycle_log_path,
+        rug_scalp_outcome_log_path: config
+            .rug_scalp_v2
+            .enabled
+            .then(|| PathBuf::from(&config.rug_scalp_v2.outcome_log_path)),
         shadow_v2_burnin: shadow_v2_burnin_config
             .enabled
             .then(|| shadow_v2_burnin_config.clone()),
