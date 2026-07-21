@@ -481,6 +481,12 @@ pub struct PostBuyGuardianConfig {
     #[serde(default)]
     pub het_pm_v2: HetPmV2Config,
 
+    /// Dedicated, shadow-only profile for prospective RUG SCALP V2 positions.
+    /// It is disabled by default and is selected per position through the
+    /// immutable `exit_profile_id`; it never changes the generic PM policy.
+    #[serde(default)]
+    pub rug_scalp_exit_v1: super::rug_scalp::RugScalpExitProfileConfigV1,
+
     /// Read-only fallback for refreshing stale canonical curve state of an
     /// active shadow position. Disabled unless an operator enables it.
     #[serde(default)]
@@ -579,6 +585,7 @@ impl Default for PostBuyGuardianConfig {
             exit_replay_v1: ShadowExitReplayConfig::default(),
             exit_policy_v1: ExitPolicyV1Config::default(),
             het_pm_v2: HetPmV2Config::default(),
+            rug_scalp_exit_v1: super::rug_scalp::RugScalpExitProfileConfigV1::default(),
             shadow_market_refresh: ShadowMarketRefreshConfig::default(),
 
             // LIGMA

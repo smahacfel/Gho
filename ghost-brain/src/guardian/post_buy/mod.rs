@@ -32,6 +32,7 @@ mod exit_policy_v2;
 pub mod exit_replay;
 pub mod integration;
 pub mod lifecycle_jsonl;
+pub mod rug_scalp;
 pub mod shadow_v2;
 pub mod shadow_v2_execution;
 pub mod signals;
@@ -51,6 +52,13 @@ pub use exit_policy_v1::{
 };
 pub use exit_policy_v2::{validate_het_pm_v2_config, HetPmV2ConfigError, HetPmV2Status};
 pub use integration::{PositionRuntimeRouter, ShadowPositionBook, SignalRouter};
+pub use rug_scalp::{
+    evaluate_rug_scalp_exit_v1, RugScalpDataCompletenessV1, RugScalpEntryWatermarkV1,
+    RugScalpExitProfileConfigErrorV1, RugScalpExitProfileConfigV1, RugScalpExitReasonV1,
+    RugScalpFactIngressResultV1, RugScalpMarketFactKindV1, RugScalpMarketFactStateV1,
+    RugScalpMarketFactV1, RUG_SCALP_EXIT_PROFILE_ID, RUG_SCALP_EXIT_PROFILE_VERSION,
+    RUG_SCALP_V2_STRATEGY_ID,
+};
 pub use signals::{
     GuardianSignal, PositionHealth, RecommendedAction, SignalSeverity, SignalSource,
 };
