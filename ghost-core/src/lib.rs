@@ -32,6 +32,7 @@ pub mod market_state;
 pub mod metric_contracts;
 pub mod pipeline_coverage;
 pub mod pool_identity;
+pub mod pump_quote;
 pub mod session;
 pub mod shadow_ledger;
 pub mod shadow_v2_price;
@@ -102,6 +103,12 @@ pub use pipeline_coverage::{
     pipeline_coverage, PipelineCoverage, PipelineCoverageSnapshot, PipelineCoverageStage,
 };
 pub use pool_identity::{BaseMint, BondingCurveKey, PoolId, PoolIdentity, PoolIdentityRegistry};
+pub use pump_quote::{
+    quote_exact_base_in_sell, quote_exact_base_out, quote_exact_quote_in, FeeRounding,
+    InstructionLimitCheck, ProgramFeeCharge, ProgramFeeRule, ProgramFeeSchedule, ProgramSettlement,
+    ProgramStateTransition, PumpQuoteError, PumpQuoteV1, PumpReserveState, PumpRouteVariant,
+    TransactionCosts,
+};
 pub use shadow_ledger::{
     build_market_snapshots_from_trades,
     calculate_price_impact,
