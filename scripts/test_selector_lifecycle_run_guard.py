@@ -435,13 +435,13 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
                 mock.patch.object(launcher, "tmux_session_exists", return_value=False),
             ):
                 result = launcher.terminate_runtime_process(
-                    session="selector_lifecycle_retry5",
+                    session="het_pm_v2_refresh_retry5",
                     runtime_pidfile=pidfile,
                     grace_seconds=0,
                 )
 
         killpg.assert_called_once_with(12345, signal.SIGINT)
-        kill_tmux.assert_called_once_with("selector_lifecycle_retry5")
+        kill_tmux.assert_called_once_with("het_pm_v2_refresh_retry5")
         self.assertEqual(["SIGINT"], result["signals_sent"])
         self.assertFalse(result["runtime_process_group_alive_after"])
         self.assertFalse(result["tmux_session_exists_after"])
@@ -461,7 +461,7 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
                 mock.patch.object(launcher, "tmux_session_exists", return_value=False),
             ):
                 result = launcher.terminate_runtime_process(
-                    session="selector_lifecycle_retry5",
+                    session="het_pm_v2_refresh_retry5",
                     runtime_pidfile=pidfile,
                     grace_seconds=0,
                 )
