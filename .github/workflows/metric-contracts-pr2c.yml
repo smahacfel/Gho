@@ -106,16 +106,16 @@ jobs:
           cargo test -p ghost-brain --lib guardian::post_buy
           cargo test -p ghost-launcher components::post_buy_runtime --lib
           cargo test -p ghost-core --lib \
-            identical_rpc_refresh_updates_observation_without_activity_or_geyser_ordering \
+            account_state_core::reducer::tests::identical_rpc_refresh_updates_observation_without_activity_or_geyser_ordering \
             -- --exact
           cargo test -p ghost-core --lib \
-            changed_rpc_refresh_updates_data_change_without_advancing_geyser_guard \
+            account_state_core::reducer::tests::changed_rpc_refresh_updates_data_change_without_advancing_geyser_guard \
             -- --exact
           cargo test -p ghost-brain --lib \
-            authoritative_shadow_max_hold_on_unsupported_route_never_simulates_fill \
+            guardian::post_buy::engine::tests::authoritative_shadow_max_hold_on_unsupported_route_never_simulates_fill \
             -- --exact
           cargo test -p ghost-brain --lib \
-            unchanged_rpc_refresh_updates_quote_observation_without_vitality_activity \
+            guardian::post_buy::engine::tests::unchanged_rpc_refresh_updates_quote_observation_without_vitality_activity \
             -- --exact
           # This exact smoke test was run at the PR base and at HEAD. It is
           # intentionally kept explicit alongside the full module run so a

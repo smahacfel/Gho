@@ -55,6 +55,14 @@ Post-buy materializuje observation timestamp dla quote freshness i
 data-change count dla timeline/vitality/activity. Identyczny odczyt RPC może
 więc odświeżyć quote boundary, ale nie może stać się heartbeat rynku.
 
+Ta sama separacja obowiązuje w `MonitoringEngine::remember_shadow_snapshot()`.
+Jeżeli późniejszy snapshot ma identyczne dane ekonomiczne, ale nowszy
+`timestamp_ms`, runtime aktualizuje wyłącznie `last_shadow_snapshot` używany
+przez guarded quote resolution. Nie podbija `state_revision`, nie aktualizuje
+peak i nie dokłada sample'u do trajectory. Dzięki temu MaxHold oraz już
+rozpoczęta proposal V1 dostają świeży quote, bez udawania nowej aktywności
+rynku dla trajectory lub vitality.
+
 ## D4. Regresje i CI
 
 Dodano test end-to-end:
@@ -76,6 +84,18 @@ unchanged_rpc_refresh_updates_quote_observation_without_vitality_activity
 Łączy reducer, snapshot timeline, activity anchor i TimeStop. Potwierdza
 nowy timestamp quote bez wzrostu `tx_count`, trajectory sample, activity
 heartbeat ani vitality checkpoint.
+
+Regresje końca ścieżki quote obejmują również:
+
+```text
+authoritative_het_v2_ignores_v1_take_profit_and_executes_v2_max_hold
+authoritative_het_v2_finishes_a_preexisting_v1_proposal_without_replacing_it
+```
+
+Oba podają późniejszą obserwację z identycznymi danymi konta. Pierwszy wymaga
+wykonania V2 `AbsoluteMaxHold`; drugi wymaga dokończenia istniejącej, sticky
+proposal V1. Zabezpieczają więc odrębnie semantykę świeżego quote i zakaz
+fabrykowania market activity.
 
 Workflow uruchamia teraz Pythonowe testy analyzera/promotion toola, pełny
 moduł `guardian::post_buy`, pełny moduł launchera `post_buy_runtime`, testy

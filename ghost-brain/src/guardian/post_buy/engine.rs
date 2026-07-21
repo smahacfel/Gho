@@ -3094,11 +3094,20 @@ impl MonitoringEngine {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(base_mint) {
             if matches!(pos.lane, Lane::Shadow) {
-                let changed = pos
-                    .last_shadow_snapshot
-                    .as_ref()
+                let previous = pos.last_shadow_snapshot.as_ref();
+                let changed = previous
                     .is_none_or(|previous| !SnapshotTimeline::equivalent(previous, snapshot));
                 if !changed {
+                    // A later observation of identical account data is fresh
+                    // quote evidence, but not a new market write. Keep it at
+                    // the boundary used by guarded quote resolution without
+                    // advancing trajectory/activity, peak, or revision.
+                    if previous
+                        .is_some_and(|previous| snapshot.timestamp_ms > previous.timestamp_ms)
+                    {
+                        pos.last_shadow_snapshot = Some(snapshot.clone());
+                        pos.last_snapshot_source = snapshot_source;
+                    }
                     return;
                 }
                 pos.last_shadow_snapshot = Some(snapshot.clone());
@@ -15115,12 +15124,13 @@ mod tests {
             .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
             .await;
 
+        let comparisons = wait_for_jsonl_rows(&context.sidecar_path, 2).await;
         let position_still_open = context.engine.positions.read().contains_key(&context.mint);
         assert_eq!(
             context.engine.active_position_count(),
             0,
-            "V2 MaxHold must pass the guarded executor: position_still_open={position_still_open}, lifecycle={:?}",
-            read_jsonl_rows(&context.lifecycle_path)
+            "V2 MaxHold must pass the guarded executor: position_still_open={position_still_open}, lifecycle={:?}, comparisons={comparisons:?}",
+            read_jsonl_rows(&context.lifecycle_path),
         );
         let lifecycle = read_jsonl_rows(&context.lifecycle_path);
         let fill = lifecycle
@@ -15129,7 +15139,6 @@ mod tests {
             .expect("V2 max-hold shadow fill");
         assert_eq!(fill["exit_policy_reason_code"], "absolute_max_hold");
 
-        let comparisons = wait_for_jsonl_rows(&context.sidecar_path, 2).await;
         assert!(comparisons.iter().any(|row| {
             row["v2_shadow_authority"] == Value::Bool(true)
                 && row["v1_shadow_authority"] == Value::Bool(false)
@@ -15220,12 +15229,13 @@ mod tests {
             .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
             .await;
 
+        let comparisons = wait_for_jsonl_rows(&context.sidecar_path, 1).await;
         let position_still_open = context.engine.positions.read().contains_key(&context.mint);
         assert_eq!(
             context.engine.active_position_count(),
             0,
-            "the sticky V1 proposal must complete unchanged: position_still_open={position_still_open}, lifecycle={:?}",
-            read_jsonl_rows(&context.lifecycle_path)
+            "the sticky V1 proposal must complete unchanged: position_still_open={position_still_open}, lifecycle={:?}, comparisons={comparisons:?}",
+            read_jsonl_rows(&context.lifecycle_path),
         );
         let lifecycle = read_jsonl_rows(&context.lifecycle_path);
         let fill = lifecycle
@@ -15235,7 +15245,6 @@ mod tests {
         assert_eq!(fill["action_id"], v1_action.action_id);
         assert_eq!(fill["exit_policy_reason_code"], "target");
 
-        let comparisons = wait_for_jsonl_rows(&context.sidecar_path, 1).await;
         assert!(comparisons.iter().any(|row| {
             row["v2_shadow_authority"] == Value::Bool(true)
                 && row["v1_shadow_authority"] == Value::Bool(false)
