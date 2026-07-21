@@ -17341,14 +17341,6 @@ struct PoolObservationContext {
 }
 
 impl PoolObservationContext {
-    fn runtime_lane(&self) -> Lane {
-        match self.execution_mode {
-            ExecutionMode::Live | ExecutionMode::Dual => Lane::Live,
-            ExecutionMode::Paper => Lane::Paper,
-            ExecutionMode::Shadow => Lane::Shadow,
-        }
-    }
-
     fn post_buy_lane(&self) -> &'static str {
         match self.execution_mode {
             ExecutionMode::Live | ExecutionMode::Dual => "live",
@@ -18816,7 +18808,7 @@ async fn execute_gatekeeper_buy_path(
                         let join_metadata = build_buy_execution_join_metadata(
                             pool_amm_id,
                             window_state,
-                            &assessment,
+                            assessment,
                             &ctx.gatekeeper_v3_config,
                             &ctx.gatekeeper_rollout_profile,
                             &ctx.oracle_runtime.config,

@@ -979,8 +979,7 @@ fn synthesize_scores(
     }
 
     // Reduce confidence if signals are conflicting
-    if (organic_score > 0.7 && rug_threat_score > 0.7) || (organic_score > 0.7 && sybil_score > 0.7)
-    {
+    if organic_score > 0.7 && (rug_threat_score > 0.7 || sybil_score > 0.7) {
         confidence *= 0.7; // Conflicting signals reduce confidence
     }
 

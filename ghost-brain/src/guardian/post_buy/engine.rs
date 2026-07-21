@@ -117,6 +117,13 @@ const SHADOW_V2_EXIT_SLIPPAGE_BPS_DIAGNOSTIC_MODEL: u16 = 150;
 use super::signals::*;
 use super::trajectory_v1::{materialize_trajectory_v1, TrajectoryFeaturesV1};
 
+type PostBuySnapshotBundleMaterialization = (
+    PostBuySnapshotBundle,
+    Option<MarketSnapshot>,
+    Option<MarketSnapshot>,
+    Option<MarketSnapshot>,
+);
+
 const SHADOW_QUOTE_RETRY_INTERVAL_MS: u64 = 500;
 
 #[derive(Debug, Default)]
@@ -3330,12 +3337,7 @@ impl MonitoringEngine {
         &self,
         base_mint: &Pubkey,
         now_ms: u64,
-    ) -> Option<(
-        PostBuySnapshotBundle,
-        Option<MarketSnapshot>,
-        Option<MarketSnapshot>,
-        Option<MarketSnapshot>,
-    )> {
+    ) -> Option<PostBuySnapshotBundleMaterialization> {
         let policy = self.exit_policy_v1.as_ref()?;
         let het_policy = self.het_pm_v2.as_ref()?;
         let positions = self.positions.read();
@@ -4007,7 +4009,7 @@ impl MonitoringEngine {
     ) -> Vec<MarketSnapshot> {
         let mut snapshots = pos.snapshot_timeline.clone_snapshots();
         if let Some(runtime_snapshot) = pos.last_shadow_snapshot.as_ref() {
-            let should_append = snapshots.last().map_or(true, |latest| {
+            let should_append = snapshots.last().is_none_or(|latest| {
                 runtime_snapshot.timestamp_ms > latest.timestamp_ms
                     && !SnapshotTimeline::equivalent(latest, runtime_snapshot)
             });
