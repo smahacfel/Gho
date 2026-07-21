@@ -11815,21 +11815,21 @@ mod tests {
             }),
             RugScalpFactIngressResultV1::Applied
         );
-        shadow_ledger.set_snapshots(
-            mint,
-            vec![MarketSnapshot {
-                slot: Some(71),
-                timestamp_ms: now_ms,
-                price_sol_per_token: 0.000_000_1,
-                price_state: PriceState::Valid,
-                market_cap_sol: 1.0,
-                reserve_base: 1_000_000.0,
-                reserve_quote: 0.1,
-                ..MarketSnapshot::default()
-            }],
-        );
+        let canonical_snapshot = MarketSnapshot {
+            slot: Some(71),
+            timestamp_ms: now_ms,
+            price_sol_per_token: 0.000_000_1,
+            price_state: PriceState::Valid,
+            market_cap_sol: 1.0,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 0.1,
+            ..MarketSnapshot::default()
+        };
+        shadow_ledger.set_snapshots(mint, vec![canonical_snapshot.clone()]);
         let engine = Arc::new(engine);
-        engine.run_shadow_runtime_tick(&mint, None, now_ms).await;
+        engine
+            .run_shadow_runtime_tick(&mint, Some(&canonical_snapshot), now_ms)
+            .await;
         assert_eq!(engine.active_position_count(), 0);
         let (_, terminal_rx) = registered.into_parts();
         match terminal_rx.await.expect("one PM terminal disposition") {
@@ -11922,22 +11922,22 @@ mod tests {
             engine.observe_rug_scalp_market_fact(second_empty.clone()),
             RugScalpFactIngressResultV1::Applied
         );
-        shadow_ledger.set_snapshots(
-            mint,
-            vec![MarketSnapshot {
-                slot: Some(72),
-                timestamp_ms: now_ms,
-                price_sol_per_token: 0.000_000_1,
-                price_state: PriceState::Valid,
-                market_cap_sol: 1.0,
-                reserve_base: 1_000_000.0,
-                reserve_quote: 0.1,
-                ..MarketSnapshot::default()
-            }],
-        );
+        let canonical_snapshot = MarketSnapshot {
+            slot: Some(72),
+            timestamp_ms: now_ms,
+            price_sol_per_token: 0.000_000_1,
+            price_state: PriceState::Valid,
+            market_cap_sol: 1.0,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 0.1,
+            ..MarketSnapshot::default()
+        };
+        shadow_ledger.set_snapshots(mint, vec![canonical_snapshot.clone()]);
 
         let engine = Arc::new(engine);
-        engine.run_shadow_runtime_tick(&mint, None, now_ms).await;
+        engine
+            .run_shadow_runtime_tick(&mint, Some(&canonical_snapshot), now_ms)
+            .await;
         assert_eq!(engine.active_position_count(), 0);
         let (_, terminal_rx) = registered.into_parts();
         match terminal_rx.await.expect("one PM terminal disposition") {
