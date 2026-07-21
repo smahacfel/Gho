@@ -331,7 +331,10 @@ def validate_v2_gate_evaluations(value: Any, source: str) -> None:
 
 
 def validate_anchor_request(value: str | None, source: str) -> None:
-    if value is None or value == "quote_required_on_new_canonical_peak":
+    if value is None or value in {
+        "quote_required_on_new_canonical_peak",
+        "quote_required_on_historical_peak_backfill",
+    }:
         return
     blocked = re.fullmatch(r"blocked:([A-Za-z]+)", value)
     if blocked and blocked.group(1) in V2_UNKNOWN_REASONS:
@@ -440,12 +443,16 @@ def validate_record(record: dict[str, Any], source: str) -> None:
         raise ContractError(f"{source}: invalid v2_winning_gate")
     require(record, "v2_suppressed_gates_mask", int)
     validate_v2_gate_evaluations(require(record, "v2_gate_evaluations", list), source)
-    if require(record, "consumed_by_policy", bool):
-        raise ContractError(f"{source}: consumed_by_policy must be false")
-    if not require(record, "v1_shadow_authority", bool):
-        raise ContractError(f"{source}: v1_shadow_authority must be true")
-    if require(record, "v2_shadow_authority", bool) or require(record, "live_authority", bool):
-        raise ContractError(f"{source}: V2/live authority must be false")
+    consumed_by_policy = require(record, "consumed_by_policy", bool)
+    v1_shadow_authority = require(record, "v1_shadow_authority", bool)
+    v2_shadow_authority = require(record, "v2_shadow_authority", bool)
+    if require(record, "live_authority", bool):
+        raise ContractError(f"{source}: live_authority must be false")
+    if consumed_by_policy:
+        if not v2_shadow_authority or v1_shadow_authority:
+            raise ContractError(f"{source}: active shadow policy must be V2-owned only")
+    elif not v1_shadow_authority or v2_shadow_authority:
+        raise ContractError(f"{source}: observe-only shadow policy must be V1-owned only")
     for name in (
         "v2_economic_mutation", "v2_proposal_created", "v2_time_stop_mutation",
         "duplicate_action_observed", "route_build_authority_changed",
@@ -950,6 +957,11 @@ def analyze(
 
     usable = collapsed = same_slot = anchored = route_classified = quote_classified = 0
     missing_to_hold = hold_quotes = duplicate_key_resolutions = micropeak_anchor_requests = 0
+    historical_peak_anchor_requests = 0
+    current_executable_record_count = 0
+    quote_planned_record_count = 0
+    quote_planned_current_executable_record_count = 0
+    quote_planned_stale_snapshot_record_count = 0
     v2_economic_mutations = v2_proposals = v2_time_stop_mutations = 0
 
     for record in records:
@@ -980,14 +992,22 @@ def analyze(
             raise ContractError("quote plan cardinalities disagree")
         if resolution_count > 2:
             raise ContractError("quote plan exceeds PR A bound")
+        quote_planned = resolution_count > 0
+        if quote_planned:
+            quote_planned_record_count += 1
         quote_counts[identity] += resolution_count
         duplicate_key_resolutions += len(quote_keys) - len(set(quote_keys))
+        row_has_stale_snapshot_quote = False
         for status in quote_statuses:
             if not isinstance(status, str):
                 raise ContractError("quote status must be a string")
             quote_classified += 1
             if status != "resolved":
                 quote_blockers[status] += 1
+            if status == "blocked:StaleSnapshot":
+                row_has_stale_snapshot_quote = True
+        if quote_planned and row_has_stale_snapshot_quote:
+            quote_planned_stale_snapshot_record_count += 1
         if (
             record.get("v2_prequote") == "Hold"
             and record.get("v1_prequote") == "hold"
@@ -997,6 +1017,8 @@ def analyze(
             hold_quotes += resolution_count
         if record.get("anchor_request") == "quote_required_on_new_canonical_peak":
             micropeak_anchor_requests += 1
+        if record.get("anchor_request") == "quote_required_on_historical_peak_backfill":
+            historical_peak_anchor_requests += 1
         if record.get("v2_prequote", "").startswith("Blocked") and record.get("v2_final") == "Hold":
             missing_to_hold += 1
 
@@ -1008,6 +1030,9 @@ def analyze(
         value_sol = record.get("current_executable_value_sol")
         entry_raw = record.get("entry_value_quote_raw")
         if gross_bps is not None:
+            current_executable_record_count += 1
+            if quote_planned:
+                quote_planned_current_executable_record_count += 1
             if not isinstance(gross_bps, int):
                 raise ContractError("current_executable_gross_return_bps must be an integer")
             cost_scenarios["gross_bps"].append(float(gross_bps))
@@ -1051,6 +1076,16 @@ def analyze(
             "independent_reconciliation_status": "not_evaluated",
             "duplicate_action_count": duplicate_actions,
             "duplicate_terminal_count": duplicate_terminals,
+            # In authoritative-shadow mode these are expected observations:
+            # V2 selects a shadow proposal and the shared shadow executor
+            # records the simulated fill. They are intentionally distinct
+            # from a live-authority violation, which this schema rejects.
+            "v2_shadow_economic_mutation_count": v2_economic_mutations,
+            "v2_shadow_proposal_creation_count": v2_proposals,
+            "v2_live_economic_mutation_count": 0,
+            "v2_live_proposal_creation_count": 0,
+            "live_authority_violation_count": 0,
+            # Compatibility names retained for existing offline consumers.
             "v2_economic_mutation_count": v2_economic_mutations,
             "v2_proposal_creation_count": v2_proposals,
             "route_build_authority_change_count": sum(
@@ -1063,6 +1098,11 @@ def analyze(
         },
         "producer_asserted_integrity": {
             "evidence_origin": "het_pm_v2_runtime_record_self_report",
+            "v2_shadow_economic_mutation_count": v2_economic_mutations,
+            "v2_shadow_proposal_creation_count": v2_proposals,
+            "v2_live_economic_mutation_count": 0,
+            "v2_live_proposal_creation_count": 0,
+            "live_authority_violation_count": 0,
             "v2_economic_mutation_count": v2_economic_mutations,
             "v2_proposal_creation_count": v2_proposals,
             "route_build_authority_change_count": sum(
@@ -1100,10 +1140,34 @@ def analyze(
             "quote_count_per_position_p50": quantile(quote_values, 0.50),
             "quote_count_per_position_p95": quantile(quote_values, 0.95),
             "quote_count_per_position_max": max(quote_values, default=0),
+            "all_tick_current_executable_record_count": current_executable_record_count,
+            "all_tick_current_executable_presence_rate": ratio(
+                current_executable_record_count, len(records)
+            ),
+            "quote_planned_record_count": quote_planned_record_count,
+            "quote_not_planned_record_count": len(records) - quote_planned_record_count,
+            "quote_required_current_executable_record_count": (
+                quote_planned_current_executable_record_count
+            ),
+            "quote_required_current_executable_resolution_rate": ratio(
+                quote_planned_current_executable_record_count, quote_planned_record_count
+            ),
+            "quote_required_stale_snapshot_record_count": (
+                quote_planned_stale_snapshot_record_count
+            ),
+            "quote_required_stale_snapshot_rate": ratio(
+                quote_planned_stale_snapshot_record_count, quote_planned_record_count
+            ),
             "hold_quote_count": hold_quotes,
             "duplicate_identical_key_resolution_count": duplicate_key_resolutions,
-            "anchor_quote_request_count": micropeak_anchor_requests,
+            "anchor_quote_request_count": micropeak_anchor_requests
+            + historical_peak_anchor_requests,
+            "new_canonical_peak_anchor_request_count": micropeak_anchor_requests,
+            "historical_peak_anchor_request_count": historical_peak_anchor_requests,
             "micropeak_anchor_request_rate": ratio(micropeak_anchor_requests, len(records)),
+            "historical_peak_anchor_request_rate": ratio(
+                historical_peak_anchor_requests, len(records)
+            ),
             "between_tick_cache_reuse_violation_count": None,
             "between_tick_cache_reuse_measurement_status": (
                 "not_observable_from_pr_a_sidecar; enforced_by_runtime_local_quote_plan"

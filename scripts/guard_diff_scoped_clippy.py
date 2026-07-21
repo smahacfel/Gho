@@ -2,10 +2,10 @@
 """Fail a PR when Clippy introduces diagnostics in its Rust diff.
 
 The repository has a documented full-workspace Clippy baseline waiver.  That
-waiver must never hide a warning introduced by a PR, nor a warning in a Rust
-file changed by the PR.  This guard compares machine-readable Clippy output
-from the base revision and the candidate head without passing any global
-`-A` lint suppressions.
+waiver must never hide a warning introduced by a PR, nor a warning whose
+*primary span* intersects a changed Rust line.  This guard compares
+machine-readable Clippy output from the base revision and the candidate head
+without passing any global `-A` lint suppressions.
 """
 
 from __future__ import annotations
@@ -37,11 +37,19 @@ class GateError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class PrimarySpan:
+    path: str
+    line_start: int
+    line_end: int
+
+
+@dataclass(frozen=True)
 class Diagnostic:
     level: str
     code: str | None
     message: str
     paths: tuple[str, ...]
+    primary_spans: tuple[PrimarySpan, ...]
 
     @property
     def identity(self) -> tuple[str, str | None, str, tuple[str, ...]]:
@@ -98,20 +106,32 @@ def parse_diagnostics(output: str, worktree: Path) -> list[Diagnostic]:
         level = message.get("level")
         if level not in {"warning", "error"}:
             continue
-        primary_paths = sorted(
-            {
-                relative_path(worktree, span["file_name"])
-                for span in message.get("spans", [])
-                if span.get("is_primary") and span.get("file_name")
-            }
+        primary_spans = tuple(
+            sorted(
+                {
+                    PrimarySpan(
+                        path=relative_path(worktree, span["file_name"]),
+                        line_start=max(int(span.get("line_start") or 1), 1),
+                        line_end=max(
+                            int(span.get("line_end") or span.get("line_start") or 1),
+                            int(span.get("line_start") or 1),
+                        ),
+                    )
+                    for span in message.get("spans", [])
+                    if span.get("is_primary") and span.get("file_name")
+                },
+                key=lambda span: (span.path, span.line_start, span.line_end),
+            )
         )
+        primary_paths = tuple(sorted({span.path for span in primary_spans}))
         code = message.get("code")
         diagnostics.append(
             Diagnostic(
                 level=level,
                 code=code.get("code") if isinstance(code, dict) else None,
                 message=message.get("message", "<missing diagnostic message>"),
-                paths=tuple(primary_paths),
+                paths=primary_paths,
+                primary_spans=primary_spans,
             )
         )
     return diagnostics
@@ -174,10 +194,58 @@ def changed_rust_paths(repo: Path, base: str, head: str) -> list[str]:
     return sorted(path for path in output.splitlines() if path.endswith(".rs"))
 
 
+def changed_rust_line_ranges(repo: Path, base: str, head: str) -> dict[str, tuple[tuple[int, int], ...]]:
+    """Return added/modified head line ranges for Rust sources only.
+
+    `--unified=0` makes the hunk's `+start,count` portion an exact boundary
+    for the candidate source.  Deleted-only hunks intentionally contribute no
+    range: a diagnostic cannot point to code that is absent from HEAD.
+    """
+    output = checked(
+        ["git", "diff", "--unified=0", "--diff-filter=ACMR", base, head, "--", "*.rs"],
+        cwd=repo,
+    )
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    current_path: str | None = None
+    for line in output.splitlines():
+        if line.startswith("+++ "):
+            raw_path = line.removeprefix("+++ ")
+            current_path = raw_path.removeprefix("b/") if raw_path != "/dev/null" else None
+            continue
+        if not line.startswith("@@ ") or current_path is None:
+            continue
+        # @@ -old[,count] +new[,count] @@
+        try:
+            head_range = line.split("+", 1)[1].split(" ", 1)[0]
+            start_text, separator, count_text = head_range.partition(",")
+            start = int(start_text)
+            count = int(count_text) if separator else 1
+        except (IndexError, ValueError) as error:
+            raise GateError(f"cannot parse unified diff hunk: {line!r}") from error
+        if count > 0:
+            ranges.setdefault(current_path, []).append((start, start + count - 1))
+    return {path: tuple(path_ranges) for path, path_ranges in ranges.items()}
+
+
+def diagnostic_intersects_changed_lines(
+    diagnostic: Diagnostic,
+    changed_ranges: dict[str, tuple[tuple[int, int], ...]],
+) -> bool:
+    for span in diagnostic.primary_spans:
+        for changed_start, changed_end in changed_ranges.get(span.path, ()):
+            if span.line_start <= changed_end and changed_start <= span.line_end:
+                return True
+    return False
+
+
 def render_diagnostic(diagnostic: Diagnostic) -> str:
     code = diagnostic.code or "no-code"
     paths = ", ".join(diagnostic.paths) if diagnostic.paths else "<no-primary-span>"
-    return f"[{diagnostic.level}/{code}] {paths}: {diagnostic.message}"
+    spans = ", ".join(
+        f"{span.path}:{span.line_start}-{span.line_end}" for span in diagnostic.primary_spans
+    )
+    location = spans or paths
+    return f"[{diagnostic.level}/{code}] {location}: {diagnostic.message}"
 
 
 def main() -> int:
@@ -191,6 +259,7 @@ def main() -> int:
         checked(["git", "rev-parse", "--verify", f"{args.base}^{{commit}}"], cwd=repo)
         checked(["git", "rev-parse", "--verify", f"{args.head}^{{commit}}"], cwd=repo)
         changed_paths = changed_rust_paths(repo, args.base, args.head)
+        changed_ranges = changed_rust_line_ranges(repo, args.base, args.head)
         packages = packages_for_paths(changed_paths)
         print(
             "diff-scoped clippy: "
@@ -232,26 +301,25 @@ def main() -> int:
             for diagnostic in head_diagnostics
             if diagnostic.identity not in base_identities
         ]
-        changed_path_set = set(changed_paths)
-        diagnostics_in_changed_files = [
+        diagnostics_in_changed_lines = [
             diagnostic
             for diagnostic in head_diagnostics
-            if changed_path_set.intersection(diagnostic.paths)
+            if diagnostic_intersects_changed_lines(diagnostic, changed_ranges)
         ]
-        if new_head_diagnostics or diagnostics_in_changed_files:
+        if new_head_diagnostics or diagnostics_in_changed_lines:
             print("FAIL: diff-scoped Clippy found disallowed diagnostics.", file=sys.stderr)
             if new_head_diagnostics:
                 print("New diagnostics relative to base:", file=sys.stderr)
                 for diagnostic in new_head_diagnostics:
                     print(f"  {render_diagnostic(diagnostic)}", file=sys.stderr)
-            if diagnostics_in_changed_files:
-                print("Diagnostics with a primary span in a changed Rust file:", file=sys.stderr)
-                for diagnostic in diagnostics_in_changed_files:
+            if diagnostics_in_changed_lines:
+                print("Diagnostics with a primary span on a changed Rust line:", file=sys.stderr)
+                for diagnostic in diagnostics_in_changed_lines:
                     print(f"  {render_diagnostic(diagnostic)}", file=sys.stderr)
             return 1
 
         print(
-            "PASS: no new Clippy diagnostics and no diagnostic with a primary span in changed Rust source."
+            "PASS: no new Clippy diagnostics and no diagnostic with a primary span on changed Rust lines."
         )
         return 0
     except GateError as error:

@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 **/*.rs.bk
 __pycache__/
 .env
@@ -28,3 +27,4 @@ dashboard.py
 *.json
 # Wyjątek dla plików Cargo (jeśli jednak chciałbyś je śledzić - patrz niżej)
 !Cargo.toml
+!Cargo.lock

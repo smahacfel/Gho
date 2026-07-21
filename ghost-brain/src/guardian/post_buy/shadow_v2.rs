@@ -6000,7 +6000,7 @@ fn shadow_v2_record_from_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghost_core::account_state_core::types::StatePhase;
+    use ghost_core::account_state_core::types::{StatePhase, UpdateSource};
     use ghost_core::{
         quote_constant_product, CurveFinality, ShadowV2QuoteSide, SHADOW_V2_PRICE_FORMULA_VERSION,
     };
@@ -6287,6 +6287,13 @@ mod tests {
             is_complete: false,
             last_update_slot: 41,
             last_update_ts_ms: 1_785_000_000_000,
+            last_observed_slot: 41,
+            last_observed_ts_ms: 1_785_000_000_000,
+            last_observation_source: UpdateSource::GeyserAccountUpdate,
+            observation_count: 3,
+            last_data_change_ts_ms: 1_785_000_000_000,
+            last_data_change_source: UpdateSource::GeyserAccountUpdate,
+            data_change_count: 3,
             source_write_version: Some(7),
             source_account_pubkey: Some(Pubkey::new_unique()),
             source_account_owner_or_program: Some(Pubkey::new_unique()),

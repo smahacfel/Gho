@@ -1473,12 +1473,102 @@ Missing lub niespełniony minimalny count oznacza FAIL.
 
 - identyczne input artifacts + criteria + tool version -> bitowo identyczny promotion artifact;
 - każdy input ma content hash;
+- prospective runtime binary jest budowana wyłącznie z clean detached worktree
+  na zamrożonym commicie przez ograniczony package clean
+  `cargo clean --release -p ghost-brain -p ghost-launcher`, a następnie
+  `cargo build --release --locked -p ghost-launcher`;
+- tracked `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`, pełny `rustc`,
+  `cargo` oraz effective native target cfg mają osobne hashe w criteria i launcher proof;
+- canonical release build ustawia `CARGO_ENCODED_RUSTFLAGS` z `target-cpu=native`
+  oraz `--remap-path-prefix=<runtime-source-root>=/workspace/ghost`, aby absolutne
+  checkout/`OUT_DIR` paths nie zmieniały bytes pomiędzy detached worktrees;
+- canonical package clean jest uruchamiany z dokładnie tym samym encoded
+  rustflags env co build i jawnie wybiera profil `--release`; `Removed 0 files`
+  spowodowane innym profilem/fingerprintem nie może udawać fresh provenance
+  rebuilda;
+- launcher i criteria locker wymagają nieobecności release binary bezpośrednio
+  po cleanie i przed buildem;
+- criteria i launcher proof utrwalają stabilny rustflags/remap contract, a nie
+  lokalną ścieżkę checkoutu;
+- produkcyjne komponenty nie osadzają `CARGO_MANIFEST_DIR`; workspace/static
+  paths są rozwiązywane w runtime (`GHOST_WORKSPACE_ROOT` -> położenie binarki
+  -> current directory), ponieważ compile-time env literals nie podlegają
+  rustc path remapping;
+- prospective lifecycle-capable shadow run configs zachowują wymagany przez
+  restore guard `payer_strategy = "configured"`; launcher preflight wymaga
+  poprawnego, finansowanego paper-burnin keypaira przed startem;
+- preflight keypair/balance probe pozostaje wymagany dla live i configured
+  payera, lecz nie może odrzucać dokładnej kombinacji `shadow_only +
+  shadow_run.enabled + ephemeral`;
+- brak zgodności któregokolwiek build identity albo dirty worktree przed/po buildzie -> FAIL;
+- canonical binary SHA musi zostać odtworzone przez dwa niezależne clean buildy
+  przed pierwszym prospective runem;
 - brak inputu lub hash mismatch -> FAIL;
 - unsupported schema -> FAIL;
 - missing gate/column/threshold -> FAIL;
 - non-finite metric -> FAIL;
 - `promotion_gate_passed = true` tylko, gdy wszystkie wymagane gate'y mają `passed = true`;
 - PR B nie może rozpocząć się bez committed artifactu i criteria file.
+
+### 19.9a. Wiążąca decyzja właściciela — horyzont prospective validation
+
+Decyzją właściciela projektu z `2026-07-19`, zastępującą decyzję jednogodzinną
+z `2026-07-18`, oba prospective runy evidence `validation-v1a` i
+`validation-v1b` mają maksymalny horyzont runtime równy `1800` sekund
+(30 minut). Dla każdego nowego uruchomienia launcher musi otrzymać jawne:
+
+```text
+--runtime-timeout-seconds 1800
+```
+
+co skutkuje kontrolowanym `SIGINT` i istniejącym bounded hard backstopem
+launchera. Wartość musi pozostać widoczna w
+`RUN_LIFECYCLE_LAUNCHER_REPORT.json` oraz exact launcher invocation danego
+runu. Zewnętrzny timer/tmux nie jest dopuszczalnym mechanizmem skracania
+prospective runu.
+
+Historyczny `validation-v1a` z limitem `10800` sekund pozostaje **invalid
+promotion evidence**. Ponowiony jednogodzinny `validation-v1a-1h` jest
+wyłącznie artifactem diagnostycznym: nie wolno go relabelować ani łączyć z
+prospective pair, ponieważ przed tą korektą jego manifest wskazywał
+`position_manager_terminal_truth_v2/...` zamiast primary `ExecutionEvent`
+`PositionOpened`, a launcher report znajdował się poza clean runtime root.
+Nie naprawia się tych artefaktów po fakcie.
+
+Po zakończonym diagnostycznym `validation-v1a-30m` z ujawnioną luką
+`terminal_release`, jego replacement pair musi mieć od startu native launcherowy
+`--runtime-timeout-seconds 1800`, nowe `run_id`, `launch_cohort_id`, namespace
+i ścieżki: `validation-v1a-30m-r2` oraz `validation-v1b-30m-r2`. Przed ich
+startem trzeba ponownie zablokować criteria/provenance dla nowego commita,
+binarki i obu exact run-config hashes. Historyczny scope `validation-v1a-30m`
+pozostaje diagnostic-only i nie może zostać podany jako manifest finalnej pary.
+
+Dla validation launcher wymusza, aby `output_dir` (a zatem launcher report,
+runtime log, static guard i canaries) pozostawał pod jednym clean runtime
+rootem. Nie podaje się zewnętrznego absolutnego `--output-dir`; domyślne
+`reports/selector/<scope>/run_lifecycle_guard_<utc>` pod runtime rootem jest
+właściwym wyborem.
+
+`position_events` w run manifeście musi wskazywać primary event stream:
+
+```text
+datasets/events/<validation-scope>/exec_*.jsonl
+```
+
+To ten stream zawiera schema `ExecutionEvent` z
+`kind.type = PositionOpened`, `envelope.lane = shadow`, orderem
+`shadow-entry-*` oraz position identity. Pliki
+`position_manager_terminal_truth_v2/shadow_position_event_v2.jsonl` nie są
+źródłem PositionOpened i nie mogą zostać podane w tej klasie artefaktu.
+
+Skrócenie horyzontu i korekta ścieżek evidence nie zmieniają HET/V1/TimeStop
+policy identity, zamrożonych progów Gate 1--5, minimów candidates/matched
+positions, V1-only lifecycle authority ani shadow/live separation. Run, który
+w 30 minut nie dostarczy wymaganej próby lub kompletności evidence, kończy się
+fail-closed i nie może uzasadniać promotion.
+
+Pełne uzasadnienie, zakres oraz procedura weryfikacji są zapisane w:
+`docs/ADR/ADR_8D_HET_PM_V2_THIRTY_MINUTE_VALIDATION_AND_ROOTED_EVIDENCE_20260719.md`.
 
 ### 19.10. Obowiązkowe acceptance tests promotion artifact
 
@@ -1816,6 +1906,9 @@ Nie wolno utrzymywać V1 i V2 jako równoległych apply owners „na okres migra
 
 - [ ] istnieje committed, validated `het_pm_v2_promotion_gate_v1.json`;
 - [ ] istnieje committed, hashed promotion criteria file;
+- [ ] criteria i oba launcher proofs mają identyczny tracked lockfile/toolchain/build/native-target contract;
+- [ ] criteria i oba launcher proofs mają identyczny canonical source-path-remap contract;
+- [ ] release binary SHA zostało odtworzone przez dwa niezależne clean locked buildy;
 - [ ] `promotion_gate_passed = true` wynika deterministycznie z wszystkich gate'ów;
 - [ ] każdy gate posiada jawne observed values i thresholds;
 - [ ] brak ręcznej interpretacji acceptance;

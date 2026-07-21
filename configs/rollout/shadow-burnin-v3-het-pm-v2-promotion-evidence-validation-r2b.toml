@@ -1,5 +1,5 @@
-# HET_PM_V2_PROMOTION_EVIDENCE_VALIDATION_V1B.
-# Purpose: collect the second independent HET-PM V2 validation cohort with a
+# HET_PM_V2_PROMOTION_EVIDENCE_VALIDATION_V1B_THIRTY_MINUTE_POST_ADMISSION_RECONCILIATION.
+# Purpose: collect the second independent 30-minute HET-PM V2 validation cohort with a
 # 66000ms Gatekeeper observation window, TimeStop V2 observe-only windows,
 # and exit replay.
 #
@@ -113,7 +113,7 @@ replace_recent_blockhash = true
 timeout_ms = 5000
 max_retries = 1
 max_concurrent = 1
-output_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-buys.jsonl"
+output_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2-buys.jsonl"
 emit_event_bus = true
 
 [execution]
@@ -122,13 +122,13 @@ execution_mode = "shadow"
 [execution.shadow]
 tx_build_compensation_ms = 200
 max_quote_age_ms = 1500
-entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/shadow_entries.jsonl"
-lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/shadow_lifecycle.jsonl"
+entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/shadow_lifecycle.jsonl"
 timing_model = "prepared_entry_mirror"
 stale_policy = "emit_warning"
 
 [execution.events]
-output_dir = "../../datasets/events/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b"
+output_dir = "../../datasets/events/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2"
 rotation_interval_ms = 300000
 flush_interval_ms = 1000
 max_file_size_bytes = 50000000
@@ -137,7 +137,7 @@ enable_optional_events = false
 
 [p37_shadow_probe]
 enabled = true
-namespace = "shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b"
+namespace = "shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2"
 dispatch_source = "counterfactual_shadow_probe"
 p37_execution_builder_mode = "route_resolver"
 sample_source = "v3_mfs_decision_rows"
@@ -145,8 +145,8 @@ sample_mode = "deterministic_hash_mod"
 sample_modulus = 1
 sample_threshold = 1
 sampling_version = "het-pm-v2-promotion-evidence-validation-v1"
-run_id = "shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b"
-session_id = "het-pm-v2-promotion-evidence-validation-v1b"
+run_id = "shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2"
+session_id = "het-pm-v2-promotion-evidence-validation-v1b-30m-r2"
 max_probes_per_run = 100000
 max_probes_per_minute = 500
 max_concurrent = 16
@@ -173,19 +173,19 @@ probe_curve_age_max_ms = 1500
 probe_wait_for_execution_accounts_ms = 1500
 append = true
 require_unique_namespace = true
-selection_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/probe_selection.jsonl"
-skip_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/probe_skips.jsonl"
-transport_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/probe_transport.jsonl"
-entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/probe_shadow_entries.jsonl"
-lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/probe_shadow_lifecycle.jsonl"
+selection_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/probe_selection.jsonl"
+skip_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/probe_skips.jsonl"
+transport_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/probe_shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/probe_shadow_lifecycle.jsonl"
 
 [oracle]
-decision_log_path = "../../logs/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/decisions"
+decision_log_path = "../../logs/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/decisions"
 
 [durability]
 wal_enabled = false
-wal_dir = "../../data/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/wal"
-snapshot_dir = "../../data/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/snapshots"
+wal_dir = "../../data/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/wal"
+snapshot_dir = "../../data/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/snapshots"
 
 [metrics]
 enabled = true
@@ -202,7 +202,7 @@ level = "info"
 console_enabled = true
 json_format = false
 file_enabled = true
-file_path = "../../logs/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/system.log"
+file_path = "../../logs/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/system.log"
 oracle_log_enabled = true
-oracle_log_path = "../../logs/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b/oracle.log"
+oracle_log_path = "../../logs/rollout/shadow-burnin-v3-het-pm-v2-promotion-evidence-validation-v1b-30m-r2/oracle.log"
 oracle_json_format = false

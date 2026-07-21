@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,11 +37,48 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         self.criteria = json.loads(CRITERIA_PATH.read_text(encoding="utf-8"))
         self.observed = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
         gate.validate_criteria(self.criteria)
+        self.observed["lifecycle_integrity"].setdefault(
+            "v2_shadow_economic_mutation_count", 0
+        )
+        self.observed["lifecycle_integrity"].setdefault(
+            "v2_shadow_proposal_creation_count", 0
+        )
+        self.observed["lifecycle_integrity"].setdefault(
+            "v2_live_economic_mutation_count", 0
+        )
+        self.observed["lifecycle_integrity"].setdefault(
+            "v2_live_proposal_creation_count", 0
+        )
+        self.observed["lifecycle_integrity"].setdefault(
+            "live_authority_violation_count", 0
+        )
         # Arithmetic fixtures predate the prospective sample-size contract.
         # Keep their narrow assertions independent of the production release
         # thresholds; dedicated tests below assert that the checked-in values
         # are non-vacuous.
         self.criteria["contract_state"] = "locked"
+        self.criteria.update({
+            "expected_runtime_commit_sha": "a" * 40,
+            "expected_release_binary_sha256": "b" * 64,
+            "expected_cargo_lock_sha256": "c" * 64,
+            "expected_rust_toolchain_sha256": "d" * 64,
+            "expected_cargo_config_sha256": "e" * 64,
+            "expected_rustc_verbose_sha256": "f" * 64,
+            "expected_cargo_version_sha256": "1" * 64,
+            "expected_native_target_cfg_sha256": "2" * 64,
+            "expected_brain_config_content_hash": "3" * 64,
+            "expected_normalized_behavioral_config_hash": "4" * 64,
+            "expected_promotion_tool_hash": "5" * 64,
+            "expected_pr_a_analyzer_hash": "6" * 64,
+            "expected_release_build_command": list(gate.RELEASE_BUILD_COMMAND),
+            "expected_release_clean_command": list(gate.RELEASE_CLEAN_COMMAND),
+            "expected_release_rustflags_contract": list(gate.RELEASE_RUSTFLAGS_CONTRACT),
+            "require_clean_runtime_build_worktree": True,
+            "allowed_exact_run_config_hashes": {
+                "validation-a": "7" * 64,
+                "validation-b": "8" * 64,
+            },
+        })
         economic = self.criteria["gates"]["economic_result"]["thresholds"]
         economic.update({
             "min_matched_v2_candidate_positions": 50,
@@ -296,15 +334,38 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         for field in (
             "expected_runtime_commit_sha",
             "expected_release_binary_sha256",
+            "expected_cargo_lock_sha256",
+            "expected_rust_toolchain_sha256",
+            "expected_cargo_config_sha256",
+            "expected_rustc_verbose_sha256",
+            "expected_cargo_version_sha256",
+            "expected_native_target_cfg_sha256",
             "expected_brain_config_content_hash",
             "expected_normalized_behavioral_config_hash",
             "expected_promotion_tool_hash",
             "expected_pr_a_analyzer_hash",
         ):
             template[field] = "unlocked"
+        template["expected_release_build_command"] = ["unlocked"]
+        template["expected_release_clean_command"] = ["unlocked"]
+        template["expected_release_rustflags_contract"] = ["unlocked"]
         template["allowed_exact_run_config_hashes"] = {}
         gate.validate_criteria(template)
         return template
+
+    def runtime_build_contract(self) -> dict:
+        return {
+            "cargo_lock_sha256": "1" * 64,
+            "rust_toolchain_sha256": "2" * 64,
+            "cargo_config_sha256": "3" * 64,
+            "rustc_verbose_sha256": "4" * 64,
+            "cargo_version_sha256": "5" * 64,
+            "native_target_cfg_sha256": "6" * 64,
+            "build_command": list(gate.RELEASE_BUILD_COMMAND),
+            "clean_command": list(gate.RELEASE_CLEAN_COMMAND),
+            "rustflags_contract": list(gate.RELEASE_RUSTFLAGS_CONTRACT),
+            "worktree_clean": True,
+        }
 
     def write_lock_inputs(self, root: Path) -> tuple[Path, Path, Path, Path]:
         brain = root / "brain.toml"
@@ -336,6 +397,87 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         )
         return result.stdout.strip()
 
+    def current_runtime_commit(self) -> str:
+        return self.git(ROOT, "rev-parse", "HEAD")
+
+    def test_materialized_release_clean_and_build_share_canonical_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "target" / "release" / "ghost-launcher"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"release-binary")
+            runtime_commit = "a" * 40
+            canonical_env = {
+                "CARGO_ENCODED_RUSTFLAGS": "-C\x1ftarget-cpu=native"
+            }
+            completed = subprocess.CompletedProcess(args=[], returncode=0)
+
+            def run_command(command: list[str], **_: object) -> subprocess.CompletedProcess:
+                if command == list(gate.RELEASE_CLEAN_COMMAND):
+                    binary.unlink()
+                elif command == list(gate.RELEASE_BUILD_COMMAND):
+                    binary.write_bytes(b"rebuilt-release-binary")
+                return completed
+
+            with (
+                mock.patch.object(
+                    gate, "command_stdout", return_value=runtime_commit
+                ),
+                mock.patch.object(
+                    gate, "inspect_runtime_build_contract", return_value={}
+                ),
+                mock.patch.object(
+                    gate,
+                    "canonical_release_build_env",
+                    return_value=canonical_env,
+                ),
+                mock.patch.object(gate, "git_worktree_is_clean", return_value=True),
+                mock.patch.object(
+                    gate.subprocess,
+                    "run",
+                    side_effect=run_command,
+                ) as run,
+            ):
+                gate.materialize_runtime_release_build(
+                    runtime_source_root=root,
+                    runtime_commit_sha=runtime_commit,
+                    release_binary=binary,
+                )
+
+            self.assertEqual(2, run.call_count)
+            self.assertEqual(canonical_env, run.call_args_list[0].kwargs["env"])
+            self.assertEqual(canonical_env, run.call_args_list[1].kwargs["env"])
+
+    def test_materialized_release_rejects_clean_that_leaves_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "target" / "release" / "ghost-launcher"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"stale-release-binary")
+            runtime_commit = "a" * 40
+            completed = subprocess.CompletedProcess(args=[], returncode=0)
+
+            with (
+                mock.patch.object(
+                    gate, "command_stdout", return_value=runtime_commit
+                ),
+                mock.patch.object(
+                    gate, "inspect_runtime_build_contract", return_value={}
+                ),
+                mock.patch.object(
+                    gate, "canonical_release_build_env", return_value={}
+                ),
+                mock.patch.object(gate.subprocess, "run", return_value=completed),
+            ):
+                with self.assertRaisesRegex(
+                    gate.ContractError, "clean left release binary"
+                ):
+                    gate.materialize_runtime_release_build(
+                        runtime_source_root=root,
+                        runtime_commit_sha=runtime_commit,
+                        release_binary=binary,
+                    )
+
     def test_golden_pass_fixture_sets_root_true(self) -> None:
         gates = self.evaluate()
         self.assertTrue(all(result["passed"] for result in gates.values()))
@@ -344,16 +486,38 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
 
     def test_checked_in_template_keeps_runtime_policy_identity_and_non_vacuous_floors(self) -> None:
         production = json.loads(CRITERIA_PATH.read_text(encoding="utf-8"))
+        self.assertIn("--release", gate.RELEASE_CLEAN_COMMAND)
         self.assertEqual(production["policy_version"], 2)
         self.assertEqual(production["comparison_schema_version"], 3)
-        self.assertEqual(production["contract_state"], "locked")
-        self.assertEqual(
-            gate.canonicalize_runtime_commit_sha(
+        self.assertIn(production["contract_state"], {"calibration_pending", "locked"})
+        if production["contract_state"] == "locked":
+            self.assertEqual(
+                gate.canonicalize_runtime_commit_sha(
+                    production["expected_runtime_commit_sha"],
+                    ROOT,
+                ),
                 production["expected_runtime_commit_sha"],
-                ROOT,
-            ),
-            production["expected_runtime_commit_sha"],
-        )
+            )
+            self.assertEqual(
+                production["expected_release_build_command"],
+                list(gate.RELEASE_BUILD_COMMAND),
+            )
+            self.assertEqual(
+                production["expected_release_clean_command"],
+                list(gate.RELEASE_CLEAN_COMMAND),
+            )
+            self.assertEqual(
+                production["expected_release_rustflags_contract"],
+                list(gate.RELEASE_RUSTFLAGS_CONTRACT),
+            )
+            self.assertTrue(production["require_clean_runtime_build_worktree"])
+        else:
+            self.assertEqual(production["expected_runtime_commit_sha"], "unlocked")
+            self.assertEqual(production["expected_release_build_command"], ["unlocked"])
+            self.assertEqual(production["expected_release_clean_command"], ["unlocked"])
+            self.assertEqual(
+                production["expected_release_rustflags_contract"], ["unlocked"]
+            )
         for gate_key, prefix in (("executable_trailing", "executable_trailing"), ("vitality_decay", "vitality")):
             thresholds = production["gate_specific_thresholds"][gate_key]["thresholds"]
             self.assertGreaterEqual(thresholds[f"{prefix}_candidate_positions_min"], 100)
@@ -366,13 +530,14 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             brain, first, second, binary = self.write_lock_inputs(root)
-            runtime_commit = self.criteria["expected_runtime_commit_sha"]
+            runtime_commit = self.current_runtime_commit()
             locked = gate.lock_criteria_template(
                 criteria_template=self.criteria_template(),
                 runtime_commit_sha=runtime_commit,
                 release_binary=binary,
                 brain_config=brain,
                 run_configs={"validation-v1a": first, "validation-v1b": second},
+                runtime_build_contract=self.runtime_build_contract(),
                 repo_root=ROOT,
             )
             self.assertEqual(locked["contract_state"], "locked")
@@ -386,6 +551,23 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                 locked["allowed_exact_run_config_hashes"]["validation-v1b"],
             )
             self.assertNotEqual(locked["expected_normalized_behavioral_config_hash"], "unlocked")
+            self.assertEqual(
+                locked["expected_cargo_lock_sha256"],
+                self.runtime_build_contract()["cargo_lock_sha256"],
+            )
+            self.assertEqual(
+                locked["expected_release_build_command"],
+                list(gate.RELEASE_BUILD_COMMAND),
+            )
+            self.assertEqual(
+                locked["expected_release_clean_command"],
+                list(gate.RELEASE_CLEAN_COMMAND),
+            )
+            self.assertEqual(
+                locked["expected_release_rustflags_contract"],
+                list(gate.RELEASE_RUSTFLAGS_CONTRACT),
+            )
+            self.assertTrue(locked["require_clean_runtime_build_worktree"])
 
             second.write_text(
                 second.read_text(encoding="utf-8").replace("max_probes_per_run = 100", "max_probes_per_run = 101"),
@@ -398,6 +580,41 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                     release_binary=binary,
                     brain_config=brain,
                     run_configs={"validation-v1a": first, "validation-v1b": second},
+                    runtime_build_contract=self.runtime_build_contract(),
+                    repo_root=ROOT,
+                )
+
+    def test_criteria_lock_rejects_dirty_runtime_build_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain, first, second, binary = self.write_lock_inputs(root)
+            dirty = self.runtime_build_contract()
+            dirty["worktree_clean"] = False
+            with self.assertRaisesRegex(gate.ContractError, "worktree must be clean"):
+                gate.lock_criteria_template(
+                    criteria_template=self.criteria_template(),
+                    runtime_commit_sha=self.current_runtime_commit(),
+                    release_binary=binary,
+                    brain_config=brain,
+                    run_configs={"validation-v1a": first, "validation-v1b": second},
+                    runtime_build_contract=dirty,
+                    repo_root=ROOT,
+                )
+
+    def test_criteria_lock_rejects_unlocked_release_build_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain, first, second, binary = self.write_lock_inputs(root)
+            contract = self.runtime_build_contract()
+            contract["build_command"] = ["cargo", "build", "--release"]
+            with self.assertRaisesRegex(gate.ContractError, "frozen locked release command"):
+                gate.lock_criteria_template(
+                    criteria_template=self.criteria_template(),
+                    runtime_commit_sha=self.current_runtime_commit(),
+                    release_binary=binary,
+                    brain_config=brain,
+                    run_configs={"validation-v1a": first, "validation-v1b": second},
+                    runtime_build_contract=contract,
                     repo_root=ROOT,
                 )
 
@@ -412,6 +629,7 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                     release_binary=binary,
                     brain_config=brain,
                     run_configs={"validation-v1a": first, "validation-v1b": second},
+                    runtime_build_contract=self.runtime_build_contract(),
                     repo_root=ROOT,
                 )
 
@@ -419,13 +637,14 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             brain, first, second, binary = self.write_lock_inputs(root)
-            runtime_commit = self.criteria["expected_runtime_commit_sha"]
+            runtime_commit = self.current_runtime_commit()
             locked = gate.lock_criteria_template(
                 criteria_template=self.criteria_template(),
                 runtime_commit_sha=runtime_commit[:12],
                 release_binary=binary,
                 brain_config=brain,
                 run_configs={"validation-v1a": first, "validation-v1b": second},
+                runtime_build_contract=self.runtime_build_contract(),
                 repo_root=ROOT,
             )
             self.assertEqual(locked["expected_runtime_commit_sha"], runtime_commit)
@@ -449,6 +668,7 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                     release_binary=binary,
                     brain_config=brain,
                     run_configs={"validation-v1a": first, "validation-v1b": second},
+                    runtime_build_contract=self.runtime_build_contract(),
                     repo_root=repo,
                 )
 
@@ -467,6 +687,18 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                 gates = self.evaluate(observed)
                 self.assertFalse(gates[gate_name]["passed"])
                 self.assertFalse(all(result["passed"] for result in gates.values()))
+
+    def test_active_shadow_mutations_are_observed_but_live_mutations_fail_integrity(self) -> None:
+        shadow_activity = copy.deepcopy(self.observed)
+        lifecycle = shadow_activity["lifecycle_integrity"]
+        lifecycle["v2_shadow_economic_mutation_count"] = 17
+        lifecycle["v2_shadow_proposal_creation_count"] = 17
+        gates = self.evaluate(shadow_activity)
+        self.assertTrue(gates["lifecycle_integrity"]["passed"])
+
+        live_activity = copy.deepcopy(shadow_activity)
+        live_activity["lifecycle_integrity"]["v2_live_economic_mutation_count"] = 1
+        self.assertFalse(self.evaluate(live_activity)["lifecycle_integrity"]["passed"])
 
     def test_missing_and_non_finite_metrics_fail_closed(self) -> None:
         missing = copy.deepcopy(self.observed)
@@ -845,6 +1077,25 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         self.assertFalse(gates["economic_result"]["checks"]["candidate_bearing_censored_count"])
         self.assertFalse(gates["economic_result"]["passed"])
 
+    def test_non_candidate_censor_is_coverage_evidence_not_a_causal_failure(self) -> None:
+        key = self.position_key()
+        observed, matched = gate.economic_observations(
+            {key: self.opened_position(key)},
+            {key: [self.comparison_row(key=key, timestamp_ms=1_000)]},
+            {},
+            {},
+            {
+                key: {
+                    "candidate_gate": None,
+                    "reason": "controlled_runtime_horizon",
+                }
+            },
+            self.criteria,
+        )
+        self.assertEqual(matched, [])
+        self.assertEqual(observed["censored_position_count"], 1)
+        self.assertEqual(observed["candidate_bearing_censored_count"], 0)
+
     def test_calibration_manifest_is_rejected_by_promotion_evaluate(self) -> None:
         with self.assertRaisesRegex(gate.ContractError, "validation manifests only"):
             gate.evaluate(
@@ -957,6 +1208,106 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         self.assertEqual(complete["admission_missing_final_count"], 0)
         self.assertEqual(complete["admission_missing_monitoring_registered_count"], 0)
         self.assertEqual(complete["admission_missing_release_count"], 0)
+
+        missing_release_rows = complete_rows[:-1]
+        missing_release = gate.reconcile_admission_with_opened_positions(
+            missing_release_rows,
+            opened,
+            gate.summarize_admission(missing_release_rows),
+            {key: [self.comparison_row(key=key, timestamp_ms=2_000)]},
+            1_000,
+        )
+        self.assertEqual(
+            missing_release["admission_missing_release_count"],
+            1,
+            "one accepted/opened identity without a terminal release is one violation",
+        )
+
+    def test_execution_event_position_opened_is_primary_denominator_evidence(self) -> None:
+        key = self.position_key()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "exec_launcher_test.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "envelope": {
+                            "run_id": "launcher-private-id",
+                            "lane": "shadow",
+                            "candidate_id": self.opened_position(key)["candidate_id"],
+                            "position_id": key[1],
+                            "position_epoch": key[2],
+                            "event_time_ms": 1_000,
+                            "order_id": "shadow-entry-candidate-1",
+                        },
+                        "kind": {"type": "PositionOpened", "payload": {}},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            opened, duplicates = gate.load_position_events(key[0], [path])
+
+        self.assertEqual(duplicates, 0)
+        self.assertEqual(
+            opened,
+            {
+                key: self.opened_position(key)
+                | {"order_id": "shadow-entry-candidate-1"}
+            },
+        )
+
+    def test_launcher_proof_rejects_validation_output_outside_runtime_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runtime"
+            root.mkdir()
+            (root / "run.toml").write_text("[run]\n", encoding="utf-8")
+            (root / "brain.toml").write_text("[brain]\n", encoding="utf-8")
+            build = {
+                "started_at_utc": "2026-07-19T00:00:00+00:00",
+                "cargo_lock_sha256": "1" * 64,
+                "rust_toolchain_sha256": "2" * 64,
+                "cargo_config_sha256": "3" * 64,
+                "rustc_verbose_sha256": "4" * 64,
+                "cargo_version_sha256": "5" * 64,
+                "native_target_cfg_sha256": "6" * 64,
+                "command": list(gate.RELEASE_BUILD_COMMAND),
+                "clean_command": list(gate.RELEASE_CLEAN_COMMAND),
+                "rustflags_contract": list(gate.RELEASE_RUSTFLAGS_CONTRACT),
+                "worktree_clean_before_build": True,
+                "worktree_clean_after_build": True,
+            }
+            report = {
+                "scope": "validation-run",
+                "launch_cohort_id": "cohort",
+                "run_role": "validation",
+                "git_head_at_build": "a" * 40,
+                "git_head_at_launch": "a" * 40,
+                "release_binary_sha256": "b" * 64,
+                "build_freshness": build,
+                "runtime_started_at_utc": "2026-07-19T00:01:00+00:00",
+                "config": str(root / "run.toml"),
+                "output_dir": str(Path(tmp) / "other-root" / "reports"),
+                "output_dir_contract": "inside_runtime_root",
+            }
+            artifacts = {
+                "run_config": [{"path": "run.toml", "sha256": "c" * 64}],
+                "brain_config": [{"path": "brain.toml", "sha256": "d" * 64}],
+            }
+            args = gate.argparse.Namespace(
+                run_id="validation-run",
+                launch_cohort_id="cohort",
+                run_role="validation",
+            )
+            with self.assertRaisesRegex(
+                gate.ContractError, "output directory escapes runtime root"
+            ):
+                gate.build_launcher_proof(
+                    report=report,
+                    args=args,
+                    artifacts=artifacts,
+                    runtime_paths=[],
+                    repo_root=root,
+                )
 
     def test_admission_reconciliation_is_bidirectional_and_has_first_het_sla(self) -> None:
         key = self.position_key()

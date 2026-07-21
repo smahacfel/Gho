@@ -474,6 +474,42 @@ class AnalysisContractTest(unittest.TestCase):
 
         self.assertEqual(report["quote_budget"]["hold_quote_count"], 0)
 
+    def test_quote_budget_separates_all_tick_and_quote_required_denominators(self) -> None:
+        no_quote = fixture_for(1)
+
+        resolved = fixture_for(2)
+        resolved["quote_keys"] = ["current-key"]
+        resolved["quote_statuses"] = ["resolved"]
+        resolved["quote_resolution_count"] = 1
+        resolved["current_executable_value_sol"] = 1.1
+        resolved["current_executable_gross_return_bps"] = 1_000
+
+        stale = fixture_for(3)
+        stale["quote_keys"] = ["current-key"]
+        stale["quote_statuses"] = ["blocked:StaleSnapshot"]
+        stale["quote_resolution_count"] = 1
+
+        report = MODULE.analyze([no_quote, resolved, stale], [], 0.0005)
+        quote_budget = report["quote_budget"]
+
+        self.assertEqual(quote_budget["all_tick_current_executable_record_count"], 1)
+        self.assertAlmostEqual(
+            quote_budget["all_tick_current_executable_presence_rate"],
+            1 / 3,
+        )
+        self.assertEqual(quote_budget["quote_planned_record_count"], 2)
+        self.assertEqual(quote_budget["quote_not_planned_record_count"], 1)
+        self.assertEqual(quote_budget["quote_required_current_executable_record_count"], 1)
+        self.assertAlmostEqual(
+            quote_budget["quote_required_current_executable_resolution_rate"],
+            0.5,
+        )
+        self.assertEqual(quote_budget["quote_required_stale_snapshot_record_count"], 1)
+        self.assertAlmostEqual(
+            quote_budget["quote_required_stale_snapshot_rate"],
+            0.5,
+        )
+
     def test_unsupported_schema_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "input.jsonl"
@@ -531,13 +567,39 @@ class AnalysisContractTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.ContractError, "mixed evidence contracts"):
                 MODULE.load_records([path])
 
+    def test_active_shadow_v2_authority_is_accepted_when_policy_consumes_record(self) -> None:
+        row = fixture()
+        row["consumed_by_policy"] = True
+        row["v1_shadow_authority"] = False
+        row["v2_shadow_authority"] = True
+
+        report = MODULE.analyze([row], [], 0.0005)
+
+        self.assertEqual(report["record_count"], 1)
+
     def test_wrong_lane_or_authority_is_rejected(self) -> None:
-        for field, value in (("lane", "live"), ("v1_shadow_authority", False), ("v2_shadow_authority", True)):
-            with self.subTest(field=field):
+        cases = (
+            {"lane": "live"},
+            {"live_authority": True},
+            {"consumed_by_policy": False, "v1_shadow_authority": False},
+            {"consumed_by_policy": False, "v2_shadow_authority": True},
+            {
+                "consumed_by_policy": True,
+                "v1_shadow_authority": True,
+                "v2_shadow_authority": True,
+            },
+            {
+                "consumed_by_policy": True,
+                "v1_shadow_authority": False,
+                "v2_shadow_authority": False,
+            },
+        )
+        for updates in cases:
+            with self.subTest(updates=updates):
                 with tempfile.TemporaryDirectory() as temp_dir:
                     path = Path(temp_dir) / "input.jsonl"
                     row = fixture()
-                    row[field] = value
+                    row.update(updates)
                     path.write_text(json.dumps(row) + "\n", encoding="utf-8")
                     with self.assertRaises(MODULE.ContractError):
                         MODULE.load_records([path])
@@ -577,6 +639,21 @@ class AnalysisContractTest(unittest.TestCase):
             path.write_text(json.dumps(row) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(MODULE.ContractError, "invalid v2_final enum label"):
                 MODULE.load_records([path])
+
+    def test_historical_peak_anchor_backfill_label_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "input.jsonl"
+            row = fixture()
+            row["anchor_request"] = "quote_required_on_historical_peak_backfill"
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            records, _ = MODULE.load_records([path])
+            report = MODULE.analyze(records, [], 0.0005)
+
+            self.assertEqual(report["quote_budget"]["anchor_quote_request_count"], 1)
+            self.assertEqual(
+                report["quote_budget"]["historical_peak_anchor_request_count"], 1
+            )
 
     def test_v1_final_must_match_actual_authority_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

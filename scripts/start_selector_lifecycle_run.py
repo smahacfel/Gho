@@ -37,6 +37,28 @@ RUNTIME_STOP_GRACE_SECONDS = 15
 RUN_STATE_RUNNING = "RUN_LEFT_RUNNING_AFTER_LIFECYCLE_PROOF"
 RUN_STATE_EVENT_ONLY = "RUN_LEFT_RUNNING_AFTER_EVENT_CANARY_ZERO_BUY_LIFECYCLE_ALLOWED"
 RUN_STATE_KILLED = "RUN_KILLED_AFTER_FAILED_CANARY"
+RELEASE_CLEAN_COMMAND = [
+    "cargo",
+    "clean",
+    "--release",
+    "-p",
+    "ghost-brain",
+    "-p",
+    "ghost-launcher",
+]
+RELEASE_BUILD_COMMAND = [
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "-p",
+    "ghost-launcher",
+]
+RELEASE_RUSTFLAGS_CONTRACT = [
+    "-C",
+    "target-cpu=native",
+    "--remap-path-prefix=<runtime-source-root>=/workspace/ghost",
+]
 
 
 def utc_timestamp() -> str:
@@ -63,6 +85,28 @@ def exit_code_for_status(status: str) -> int:
 
 def output_dir_default(root: Path, scope: str) -> Path:
     return root / "reports" / "selector" / scope / f"run_lifecycle_guard_{utc_timestamp()}"
+
+
+def validate_output_dir_contract(root: Path, output_dir: Path, run_role: str) -> str | None:
+    """Keep prospective-validation evidence under the reviewed runtime root.
+
+    A promotion manifest verifies every input relative to one immutable runtime
+    worktree.  Letting the validation launcher place its report or runtime log
+    in another checkout makes that proof structurally impossible, even if both
+    files happen to exist.  Calibration runs retain the historical flexibility
+    to write elsewhere; prospective validation does not.
+    """
+
+    if run_role != "validation":
+        return None
+    try:
+        output_dir.relative_to(root)
+    except ValueError:
+        return (
+            "validation output directory must reside inside --root "
+            f"(root={root}, output_dir={output_dir})"
+        )
+    return None
 
 
 def free_gb(path: Path) -> float:
@@ -100,21 +144,112 @@ def sha256_file(path: Path) -> str | None:
     return digest.hexdigest()
 
 
+def command_stdout(command: list[str], *, cwd: Path) -> str | None:
+    proc = subprocess.run(
+        command,
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def sha256_command_stdout(command: list[str], *, cwd: Path) -> str | None:
+    value = command_stdout(command, cwd=cwd)
+    if value is None:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def git_worktree_is_clean(root: Path) -> bool:
+    status = command_stdout(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=root,
+    )
+    return status == ""
+
+
+def tracked_file_sha256(root: Path, relative_path: Path) -> str | None:
+    tracked = command_stdout(
+        ["git", "ls-files", "--error-unmatch", str(relative_path)],
+        cwd=root,
+    )
+    if not tracked:
+        return None
+    return sha256_file(root / relative_path)
+
+
+def canonical_release_build_env(root: Path) -> dict[str, str]:
+    """Apply the frozen native-codegen and source-path remap contract."""
+    env = os.environ.copy()
+    rustflags = [
+        "-C",
+        "target-cpu=native",
+        f"--remap-path-prefix={root.resolve()}=/workspace/ghost",
+    ]
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(rustflags)
+    return env
+
+
 def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path) -> dict[str, Any]:
+    worktree_clean_before_build = git_worktree_is_clean(root)
+    cargo_lock_sha256 = tracked_file_sha256(root, Path("Cargo.lock"))
+    rust_toolchain_sha256 = tracked_file_sha256(root, Path("rust-toolchain.toml"))
+    cargo_config_sha256 = tracked_file_sha256(root, Path(".cargo/config.toml"))
+    rustc_verbose_sha256 = sha256_command_stdout(["rustc", "-vV"], cwd=root)
+    cargo_version_sha256 = sha256_command_stdout(["cargo", "-V"], cwd=root)
+    native_target_cfg_sha256 = sha256_command_stdout(
+        ["rustc", "--print", "cfg", "-C", "target-cpu=native"],
+        cwd=root,
+    )
+    build_env = canonical_release_build_env(root)
     started_at = datetime.now(timezone.utc)
+    clean_result = run_command(
+        RELEASE_CLEAN_COMMAND,
+        cwd=root,
+        log_path=output_dir / "commands" / "cargo_clean_release_provenance_packages.log",
+        env=build_env,
+    )
+    binary_absent_after_clean = not launcher.exists()
     result = run_command(
-        ["cargo", "build", "--release", "-p", "ghost-launcher"],
+        RELEASE_BUILD_COMMAND,
         cwd=root,
         log_path=output_dir / "commands" / "cargo_build_release_ghost_launcher.log",
+        env=build_env,
     )
     finished_at = datetime.now(timezone.utc)
-    # Cargo may legitimately no-op when the release binary is already up to date.
-    # The freshness contract is that this launcher ran Cargo successfully before
-    # start and the expected release binary exists; binary_mtime is provenance,
-    # not a rebuild-required gate.
-    build_fresh = result["exit_code"] == 0 and launcher.exists()
+    worktree_clean_after_build = git_worktree_is_clean(root)
+    # Freshness requires the canonical clean to remove any prior launcher before
+    # the canonical build recreates it.  Binary mtime remains provenance rather
+    # than an independent acceptance gate.
+    build_fresh = (
+        clean_result["exit_code"] == 0
+        and binary_absent_after_clean
+        and result["exit_code"] == 0
+        and launcher.exists()
+        and worktree_clean_before_build
+        and worktree_clean_after_build
+        and all(
+            value is not None
+            for value in (
+                cargo_lock_sha256,
+                rust_toolchain_sha256,
+                cargo_config_sha256,
+                rustc_verbose_sha256,
+                cargo_version_sha256,
+                native_target_cfg_sha256,
+            )
+        )
+    )
     return {
         "status": PASS_STATUS if build_fresh else INCONCLUSIVE_ENV_OR_CONFIG,
+        "clean_command": clean_result["command"],
+        "clean_exit_code": clean_result["exit_code"],
+        "clean_log_path": clean_result["log_path"],
+        "binary_absent_after_clean": binary_absent_after_clean,
         "command": result["command"],
         "exit_code": result["exit_code"],
         "log_path": result["log_path"],
@@ -123,6 +258,15 @@ def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path)
         "runtime_binary": str(launcher),
         "binary_exists": launcher.exists(),
         "release_binary_sha256": sha256_file(launcher),
+        "cargo_lock_sha256": cargo_lock_sha256,
+        "rust_toolchain_sha256": rust_toolchain_sha256,
+        "cargo_config_sha256": cargo_config_sha256,
+        "rustc_verbose_sha256": rustc_verbose_sha256,
+        "cargo_version_sha256": cargo_version_sha256,
+        "native_target_cfg_sha256": native_target_cfg_sha256,
+        "rustflags_contract": RELEASE_RUSTFLAGS_CONTRACT,
+        "worktree_clean_before_build": worktree_clean_before_build,
+        "worktree_clean_after_build": worktree_clean_after_build,
         "binary_mtime_utc": mtime_utc(launcher),
         "git_head_at_build": git_head(root),
         "build_freshness_status": PASS_STATUS if build_fresh else "FAIL_STALE_OR_MISSING_BINARY",
@@ -180,12 +324,19 @@ def validate_scope_contract(
     return (PASS_STATUS if not errors else FAIL_CONFIG_CONTRACT), errors
 
 
-def run_command(command: list[str], *, cwd: Path, log_path: Path) -> dict[str, Any]:
+def run_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    log_path: Path,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8", errors="ignore") as log_fh:
         proc = subprocess.run(
             command,
             cwd=cwd,
+            env=env,
             check=False,
             text=True,
             stdout=log_fh,
@@ -533,6 +684,10 @@ def main(argv: list[str] | None = None) -> int:
     config_path = resolve_repo_path(root, args.config)
     launcher = resolve_repo_path(root, args.launcher_binary)
     output_dir = resolve_repo_path(root, args.output_dir) if args.output_dir else output_dir_default(root, args.scope)
+    output_dir_error = validate_output_dir_contract(root, output_dir, args.run_role)
+    if output_dir_error is not None:
+        print(f"selector lifecycle launcher: {output_dir_error}", file=sys.stderr)
+        return 2
     output_dir.mkdir(parents=True, exist_ok=True)
     baseline_path = output_dir / "baseline_before_start.json"
     runtime_log = output_dir / "runtime.log"
@@ -553,6 +708,9 @@ def main(argv: list[str] | None = None) -> int:
         "runtime_timeout_seconds": args.runtime_timeout_seconds,
         "allow_zero_buy_lifecycle_proof": args.allow_zero_buy_lifecycle_proof,
         "output_dir": str(output_dir),
+        "output_dir_contract": (
+            "inside_runtime_root" if args.run_role == "validation" else "not_required"
+        ),
         "runtime_binary": str(launcher),
         "build_release_before_start": args.build_release_before_start,
         "build_freshness_status": "NOT_REQUESTED",

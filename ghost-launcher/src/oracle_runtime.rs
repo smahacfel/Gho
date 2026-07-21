@@ -3371,6 +3371,7 @@ impl OracleRuntime {
             1u64,
             "source" => match source {
                 UpdateSource::GeyserAccountUpdate => "geyser_account_update",
+                UpdateSource::RpcRefresh => "rpc_refresh",
                 UpdateSource::WalReplay => "wal_replay",
                 UpdateSource::TxObservedBootstrap => "tx_observed_bootstrap",
             }
@@ -17314,6 +17315,7 @@ struct PoolObservationContext {
     snapshot_engine: Arc<SnapshotEngine>,
     event_tx: EventBusSender,
     post_buy_tx: Option<DirectPostBuySender>,
+    shutdown_requested: Arc<AtomicBool>,
     decision_logger: Arc<ghost_brain::oracle::DecisionLogger>,
     coverage_audit_log_path: std::path::PathBuf,
     trigger: Option<Arc<crate::components::trigger::TriggerComponent>>,
@@ -17339,14 +17341,6 @@ struct PoolObservationContext {
 }
 
 impl PoolObservationContext {
-    fn runtime_lane(&self) -> Lane {
-        match self.execution_mode {
-            ExecutionMode::Live | ExecutionMode::Dual => Lane::Live,
-            ExecutionMode::Paper => Lane::Paper,
-            ExecutionMode::Shadow => Lane::Shadow,
-        }
-    }
-
     fn post_buy_lane(&self) -> &'static str {
         match self.execution_mode {
             ExecutionMode::Live | ExecutionMode::Dual => "live",
@@ -17357,6 +17351,10 @@ impl PoolObservationContext {
 
     fn canonical_shadow_mode(&self) -> bool {
         self.execution_mode == ExecutionMode::Shadow
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Relaxed)
     }
 }
 
@@ -17382,6 +17380,25 @@ struct BuyPathExecutionOutcome {
     retain_runtime_pool: bool,
     close_reason: WindowCloseReason,
     shadow_execution_outcome: String,
+}
+
+fn record_shadow_post_buy_handoff_skipped_for_shutdown(
+    pool_id: Pubkey,
+    base_mint: Pubkey,
+    phase: &'static str,
+) {
+    increment_counter!(
+        "trigger_post_buy_handoff_skipped_total",
+        "lane" => "shadow",
+        "reason" => "shutdown_requested",
+        "phase" => phase
+    );
+    info!(
+        pool = %pool_id,
+        base_mint = %base_mint,
+        phase,
+        "Shadow BUY post-buy handoff skipped because OracleRuntime shutdown is requested"
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18612,251 +18629,277 @@ async fn execute_gatekeeper_buy_path(
                     };
                 };
 
-                trigger_component
-                    .spawn_prewarm_advisory(
-                        crate::components::trigger::TriggerPrewarmAdvisory::TipFloor,
-                    )
-                    .await;
-                if let Err(err) = wait_for_live_trigger_readiness(
-                    pool_amm_id,
-                    registered_wall_ts_ms,
-                    initial_buy_mint,
-                    trigger_component.entry_mode(),
-                    rx,
-                    ctx,
-                    identity,
-                    base_mint_pubkey,
-                    pool_data,
-                )
-                .await
-                {
-                    error!(
-                        pool = %pool_amm_id,
-                        base_mint = %initial_buy_mint,
-                        outcome = err.outcome_tag(),
-                        error = ?err,
-                        "Gatekeeper BUY readiness gate blocked live trigger dispatch"
+                if ctx.canonical_shadow_mode() && ctx.shutdown_requested() {
+                    record_shadow_post_buy_handoff_skipped_for_shutdown(
+                        pool_amm_id,
+                        initial_buy_mint,
+                        "before_trigger_dispatch",
                     );
-                    shadow_execution_outcome = err.outcome_tag().to_string();
-                } else if let Some(pd) = pool_data.as_deref() {
-                    let pd_snapshot = pd.clone();
-                    let pd = &pd_snapshot;
-                    let buy_mint = base_mint_pubkey.unwrap_or(initial_buy_mint);
-                    let trade_value_sol =
-                        trigger_component.estimate_trade_value_sol(pd.initial_liquidity_sol);
-                    let urgency = (assessment.phases_passed as f64 / 6.0).clamp(0.0, 1.0);
-                    let resolved_tip = trigger_component
-                        .resolve_live_buy_tip(trade_value_sol, urgency)
-                        .await;
-                    let tip_lamports = resolved_tip.tip_lamports;
-                    let mut execution_evidence_txs =
-                        build_active_buy_execution_evidence_txs(buffered_txs);
-                    let mut account_overrides = derive_active_buy_account_overrides_from_evidence(
-                        ctx,
-                        buy_mint,
-                        pd,
-                        &execution_evidence_txs,
-                    );
-                    if active_buy_should_try_route_manifest_cache(&account_overrides) {
-                        let (cached_overrides, _cache_lookup) =
-                            try_reuse_active_buy_route_manifest_cache(
-                                ctx,
-                                pool_amm_id,
-                                buy_mint,
-                                pd,
-                                "before_wait",
-                                &account_overrides,
-                            );
-                        account_overrides = cached_overrides;
-                    }
-                    let route_wait_ms =
-                        active_buy_shadow_route_evidence_wait_ms(ctx, trigger_component.as_ref());
-                    let initial_route_contract_reason = account_overrides
-                        .execution_account_contract_reason
-                        .clone()
-                        .unwrap_or_else(|| "route_account_contract_status_unknown".to_string());
-                    let (waited_overrides, route_wait_elapsed_ms, route_wait_result) =
-                        wait_for_active_buy_route_evidence(
-                            pool_amm_id,
-                            registered_wall_ts_ms,
-                            buy_mint,
-                            pd,
-                            route_wait_ms,
-                            rx,
-                            ctx,
-                            identity,
-                            base_mint_pubkey,
-                            pool_data,
-                            &mut execution_evidence_txs,
-                            account_overrides,
+                    shadow_execution_outcome = "shadow_skipped_shutdown".to_string();
+                } else {
+                    trigger_component
+                        .spawn_prewarm_advisory(
+                            crate::components::trigger::TriggerPrewarmAdvisory::TipFloor,
                         )
                         .await;
-                    account_overrides = waited_overrides;
-                    if active_buy_should_try_route_manifest_cache(&account_overrides) {
-                        let (cached_overrides, _cache_lookup) =
-                            try_reuse_active_buy_route_manifest_cache(
-                                ctx,
-                                pool_amm_id,
-                                buy_mint,
-                                pd,
-                                "after_wait",
-                                &account_overrides,
-                            );
-                        account_overrides = cached_overrides;
-                    }
-                    if let Some(wait_result) = route_wait_result.as_deref() {
-                        info!(
-                            pool = %pool_amm_id,
-                            base_mint = %pd.base_mint,
-                            wait_ms = route_wait_ms,
-                            elapsed_ms = route_wait_elapsed_ms.unwrap_or_default(),
-                            wait_result,
-                            initial_route_contract_reason,
-                            final_route_contract_status = account_overrides
-                                .execution_account_contract_status
-                                .as_deref()
-                                .unwrap_or("unknown"),
-                            final_route_contract_reason = account_overrides
-                                .execution_account_contract_reason
-                                .as_deref()
-                                .unwrap_or("unknown"),
-                            execution_evidence_txs = execution_evidence_txs.len(),
-                            "ACTIVE_BUY_ROUTE_EVIDENCE_WAIT"
-                        );
-                    }
-                    if account_overrides.legacy_buy_curve.is_none() {
-                        warn!(
-                            pool = %pool_amm_id,
-                            base_mint = %pd.base_mint,
-                            "Trigger: buy override is missing ghost-core curve state; live BUY will fail closed"
-                        );
-                    }
-                    info!(
-                        pool = %pool_amm_id,
-                        base_mint = %pd.base_mint,
-                        has_token_program = account_overrides.token_program.is_some(),
-                        has_global_config = account_overrides.global_config.is_some(),
-                        has_fee_recipient = account_overrides.fee_recipient.is_some(),
-                        has_creator_pubkey = account_overrides.creator_pubkey.is_some(),
-                        has_associated_bonding_curve =
-                            account_overrides.associated_bonding_curve.is_some(),
-                        has_legacy_buy_curve = account_overrides.legacy_buy_curve.is_some(),
-                        buy_remaining_account_count = account_overrides.buy_remaining_accounts.len(),
-                        token_program = %account_overrides
-                            .token_program
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "none".to_string()),
-                        global_config = %account_overrides
-                            .global_config
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "none".to_string()),
-                        fee_recipient = %account_overrides
-                            .fee_recipient
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "none".to_string()),
-                        creator_pubkey = %account_overrides
-                            .creator_pubkey
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "none".to_string()),
-                        associated_bonding_curve = %account_overrides
-                            .associated_bonding_curve
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "none".to_string()),
-                        buy_variant = account_overrides
-                            .buy_variant
-                            .map(|variant| variant.as_str())
-                            .unwrap_or("unknown"),
-                        "Shadow buy account overrides prepared"
-                    );
-
-                    let fsc_gate_status =
-                        ctx.authoritative_funding_coverage_gate_enabled.then(|| {
-                            current_fsc_authoritative_buy_gate_status(
-                                ctx.session_manager.as_ref(),
-                                &ctx.funding_source_config,
-                                true,
-                            )
-                        });
-                    let join_metadata = build_buy_execution_join_metadata(
+                    if let Err(err) = wait_for_live_trigger_readiness(
                         pool_amm_id,
-                        window_state,
-                        &assessment,
-                        &ctx.gatekeeper_v3_config,
-                        &ctx.gatekeeper_rollout_profile,
-                        &ctx.oracle_runtime.config,
-                    );
-                    let working_builder_parity_mode = p37_working_builder_parity_enabled(
-                        &ctx.oracle_runtime.config.p37_shadow_probe,
-                    );
-                    let working_builder_execution_evidence_context = working_builder_parity_mode
-                        .then(|| P37WorkingBuilderExecutionEvidenceContext {
-                            store: ctx.oracle_runtime.execution_account_evidence_store(),
-                            freshness_ms: ctx
-                                .oracle_runtime
-                                .config
-                                .p37_shadow_probe
-                                .execution_account_evidence_freshness_ms,
-                            bcv2_terminal_route_closure_enabled:
-                                p37_bcv2_terminal_route_closure_enabled(
-                                    &ctx.oracle_runtime.config.p37_shadow_probe,
-                                ),
-                        });
-                    let receipt = execute_gatekeeper_buy_via_trigger_with_fsc_gate(
-                        trigger_component,
-                        fsc_gate_status,
-                        buy_mint,
-                        &account_overrides,
-                        tip_lamports,
-                        Some(resolved_tip.telemetry.clone()),
-                        Some(join_metadata),
-                        working_builder_parity_mode,
-                        working_builder_execution_evidence_context,
-                        &ctx.oracle_runtime
-                            .config
-                            .selector
-                            .simcov
-                            .state_readiness_latch,
-                    )
-                    .await;
-                    match apply_trigger_dispatch_receipt_with_builder_mode(
-                        &ctx.event_tx,
-                        ctx.post_buy_tx.as_ref(),
-                        trigger_component,
-                        &ctx.post_buy_epoch,
-                        ctx.execution_mode,
-                        &ctx.shadow_entry_log_path,
-                        ctx.shadow_lifecycle_log_path.as_deref(),
-                        &ctx.gatekeeper_rollout_profile,
-                        pool_amm_id,
-                        pd,
-                        trade_value_sol,
-                        tip_lamports,
-                        post_buy_lane,
-                        receipt,
-                        p37_working_builder_parity_enabled(
-                            &ctx.oracle_runtime.config.p37_shadow_probe,
-                        ),
+                        registered_wall_ts_ms,
+                        initial_buy_mint,
+                        trigger_component.entry_mode(),
+                        rx,
+                        ctx,
+                        identity,
+                        base_mint_pubkey,
+                        pool_data,
                     )
                     .await
                     {
-                        Ok(applied) => {
-                            bought = applied.bought;
-                            retain_runtime_pool = applied.retain_runtime_pool;
-                            buy_close_reason = applied.close_reason;
-                            shadow_execution_outcome = applied.shadow_execution_outcome;
-                        }
-                        Err(e) => {
-                            error!(
-                                pool = %pool_amm_id,
-                                "GATEKEEPER BUY PATH FAILED: {}",
-                                e
+                        error!(
+                            pool = %pool_amm_id,
+                            base_mint = %initial_buy_mint,
+                            outcome = err.outcome_tag(),
+                            error = ?err,
+                            "Gatekeeper BUY readiness gate blocked live trigger dispatch"
+                        );
+                        shadow_execution_outcome = err.outcome_tag().to_string();
+                    } else if let Some(pd) = pool_data.as_deref() {
+                        let pd_snapshot = pd.clone();
+                        let pd = &pd_snapshot;
+                        let buy_mint = base_mint_pubkey.unwrap_or(initial_buy_mint);
+                        let trade_value_sol =
+                            trigger_component.estimate_trade_value_sol(pd.initial_liquidity_sol);
+                        let urgency = (assessment.phases_passed as f64 / 6.0).clamp(0.0, 1.0);
+                        let resolved_tip = trigger_component
+                            .resolve_live_buy_tip(trade_value_sol, urgency)
+                            .await;
+                        let tip_lamports = resolved_tip.tip_lamports;
+                        let mut execution_evidence_txs =
+                            build_active_buy_execution_evidence_txs(buffered_txs);
+                        let mut account_overrides =
+                            derive_active_buy_account_overrides_from_evidence(
+                                ctx,
+                                buy_mint,
+                                pd,
+                                &execution_evidence_txs,
                             );
-                            shadow_execution_outcome =
-                                shadow_execution_outcome_from_dispatch_error(trigger_component, &e);
+                        if active_buy_should_try_route_manifest_cache(&account_overrides) {
+                            let (cached_overrides, _cache_lookup) =
+                                try_reuse_active_buy_route_manifest_cache(
+                                    ctx,
+                                    pool_amm_id,
+                                    buy_mint,
+                                    pd,
+                                    "before_wait",
+                                    &account_overrides,
+                                );
+                            account_overrides = cached_overrides;
                         }
+                        let route_wait_ms = active_buy_shadow_route_evidence_wait_ms(
+                            ctx,
+                            trigger_component.as_ref(),
+                        );
+                        let initial_route_contract_reason = account_overrides
+                            .execution_account_contract_reason
+                            .clone()
+                            .unwrap_or_else(|| "route_account_contract_status_unknown".to_string());
+                        let (waited_overrides, route_wait_elapsed_ms, route_wait_result) =
+                            wait_for_active_buy_route_evidence(
+                                pool_amm_id,
+                                registered_wall_ts_ms,
+                                buy_mint,
+                                pd,
+                                route_wait_ms,
+                                rx,
+                                ctx,
+                                identity,
+                                base_mint_pubkey,
+                                pool_data,
+                                &mut execution_evidence_txs,
+                                account_overrides,
+                            )
+                            .await;
+                        account_overrides = waited_overrides;
+                        if active_buy_should_try_route_manifest_cache(&account_overrides) {
+                            let (cached_overrides, _cache_lookup) =
+                                try_reuse_active_buy_route_manifest_cache(
+                                    ctx,
+                                    pool_amm_id,
+                                    buy_mint,
+                                    pd,
+                                    "after_wait",
+                                    &account_overrides,
+                                );
+                            account_overrides = cached_overrides;
+                        }
+                        if let Some(wait_result) = route_wait_result.as_deref() {
+                            info!(
+                                pool = %pool_amm_id,
+                                base_mint = %pd.base_mint,
+                                wait_ms = route_wait_ms,
+                                elapsed_ms = route_wait_elapsed_ms.unwrap_or_default(),
+                                wait_result,
+                                initial_route_contract_reason,
+                                final_route_contract_status = account_overrides
+                                    .execution_account_contract_status
+                                    .as_deref()
+                                    .unwrap_or("unknown"),
+                                final_route_contract_reason = account_overrides
+                                    .execution_account_contract_reason
+                                    .as_deref()
+                                    .unwrap_or("unknown"),
+                                execution_evidence_txs = execution_evidence_txs.len(),
+                                "ACTIVE_BUY_ROUTE_EVIDENCE_WAIT"
+                            );
+                        }
+                        if account_overrides.legacy_buy_curve.is_none() {
+                            warn!(
+                                pool = %pool_amm_id,
+                                base_mint = %pd.base_mint,
+                                "Trigger: buy override is missing ghost-core curve state; live BUY will fail closed"
+                            );
+                        }
+                        info!(
+                            pool = %pool_amm_id,
+                            base_mint = %pd.base_mint,
+                            has_token_program = account_overrides.token_program.is_some(),
+                            has_global_config = account_overrides.global_config.is_some(),
+                            has_fee_recipient = account_overrides.fee_recipient.is_some(),
+                            has_creator_pubkey = account_overrides.creator_pubkey.is_some(),
+                            has_associated_bonding_curve =
+                                account_overrides.associated_bonding_curve.is_some(),
+                            has_legacy_buy_curve = account_overrides.legacy_buy_curve.is_some(),
+                            buy_remaining_account_count = account_overrides.buy_remaining_accounts.len(),
+                            token_program = %account_overrides
+                                .token_program
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                            global_config = %account_overrides
+                                .global_config
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                            fee_recipient = %account_overrides
+                                .fee_recipient
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                            creator_pubkey = %account_overrides
+                                .creator_pubkey
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                            associated_bonding_curve = %account_overrides
+                                .associated_bonding_curve
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                            buy_variant = account_overrides
+                                .buy_variant
+                                .map(|variant| variant.as_str())
+                                .unwrap_or("unknown"),
+                            "Shadow buy account overrides prepared"
+                        );
+
+                        let fsc_gate_status =
+                            ctx.authoritative_funding_coverage_gate_enabled.then(|| {
+                                current_fsc_authoritative_buy_gate_status(
+                                    ctx.session_manager.as_ref(),
+                                    &ctx.funding_source_config,
+                                    true,
+                                )
+                            });
+                        let join_metadata = build_buy_execution_join_metadata(
+                            pool_amm_id,
+                            window_state,
+                            assessment,
+                            &ctx.gatekeeper_v3_config,
+                            &ctx.gatekeeper_rollout_profile,
+                            &ctx.oracle_runtime.config,
+                        );
+                        let working_builder_parity_mode = p37_working_builder_parity_enabled(
+                            &ctx.oracle_runtime.config.p37_shadow_probe,
+                        );
+                        let working_builder_execution_evidence_context =
+                            working_builder_parity_mode.then(|| {
+                                P37WorkingBuilderExecutionEvidenceContext {
+                                    store: ctx.oracle_runtime.execution_account_evidence_store(),
+                                    freshness_ms: ctx
+                                        .oracle_runtime
+                                        .config
+                                        .p37_shadow_probe
+                                        .execution_account_evidence_freshness_ms,
+                                    bcv2_terminal_route_closure_enabled:
+                                        p37_bcv2_terminal_route_closure_enabled(
+                                            &ctx.oracle_runtime.config.p37_shadow_probe,
+                                        ),
+                                }
+                            });
+                        let receipt = execute_gatekeeper_buy_via_trigger_with_fsc_gate(
+                            trigger_component,
+                            fsc_gate_status,
+                            buy_mint,
+                            &account_overrides,
+                            tip_lamports,
+                            Some(resolved_tip.telemetry.clone()),
+                            Some(join_metadata),
+                            working_builder_parity_mode,
+                            working_builder_execution_evidence_context,
+                            &ctx.oracle_runtime
+                                .config
+                                .selector
+                                .simcov
+                                .state_readiness_latch,
+                        )
+                        .await;
+                        if ctx.canonical_shadow_mode() && ctx.shutdown_requested() {
+                            record_shadow_post_buy_handoff_skipped_for_shutdown(
+                                pool_amm_id,
+                                buy_mint,
+                                "after_trigger_dispatch_before_post_buy",
+                            );
+                            shadow_execution_outcome = "shadow_skipped_shutdown".to_string();
+                        } else {
+                            match apply_trigger_dispatch_receipt_with_builder_mode(
+                                &ctx.event_tx,
+                                ctx.post_buy_tx.as_ref(),
+                                trigger_component,
+                                &ctx.post_buy_epoch,
+                                ctx.execution_mode,
+                                &ctx.shadow_entry_log_path,
+                                ctx.shadow_lifecycle_log_path.as_deref(),
+                                &ctx.gatekeeper_rollout_profile,
+                                pool_amm_id,
+                                pd,
+                                trade_value_sol,
+                                tip_lamports,
+                                post_buy_lane,
+                                receipt,
+                                p37_working_builder_parity_enabled(
+                                    &ctx.oracle_runtime.config.p37_shadow_probe,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(applied) => {
+                                    bought = applied.bought;
+                                    retain_runtime_pool = applied.retain_runtime_pool;
+                                    buy_close_reason = applied.close_reason;
+                                    shadow_execution_outcome = applied.shadow_execution_outcome;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        pool = %pool_amm_id,
+                                        "GATEKEEPER BUY PATH FAILED: {}",
+                                        e
+                                    );
+                                    shadow_execution_outcome =
+                                        shadow_execution_outcome_from_dispatch_error(
+                                            trigger_component,
+                                            &e,
+                                        );
+                                }
+                            }
+                        }
+                    } else {
+                        shadow_execution_outcome = "metadata_missing".to_string();
                     }
-                } else {
-                    shadow_execution_outcome = "metadata_missing".to_string();
                 }
             } else {
                 shadow_execution_outcome = "metadata_missing".to_string();
@@ -25050,6 +25093,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         tokio::sync::mpsc::unbounded_channel::<PoolObservationResult>();
     let session_manager = oracle_runtime.session_manager();
     let funding_source_config = oracle_runtime.config.funding_source_config.clone();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
     apply_authoritative_funding_stream_availability(
         session_manager.as_ref(),
         authoritative_funding_stream_available,
@@ -25063,6 +25107,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         snapshot_engine: snapshot_engine.clone(),
         event_tx: event_tx.clone(),
         post_buy_tx,
+        shutdown_requested: Arc::clone(&shutdown_requested),
         decision_logger: decision_logger.clone(),
         coverage_audit_log_path: build_coverage_audit_log_path(&normalized_decision_log_path),
         trigger: trigger.clone(),
@@ -25119,11 +25164,17 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                 }
             }, if shutdown_rx.is_some() => {
                 match shutdown {
-                    Ok(()) => info!("OracleRuntime shutdown signal received; stopping event loop"),
-                    Err(error) => warn!(
-                        error = %error,
-                        "OracleRuntime shutdown receiver closed; stopping event loop"
-                    ),
+                    Ok(()) => {
+                        shutdown_requested.store(true, Ordering::Relaxed);
+                        info!("OracleRuntime shutdown signal received; stopping event loop")
+                    }
+                    Err(error) => {
+                        shutdown_requested.store(true, Ordering::Relaxed);
+                        warn!(
+                            error = %error,
+                            "OracleRuntime shutdown receiver closed; stopping event loop"
+                        )
+                    }
                 }
                 break;
             }
@@ -34477,6 +34528,7 @@ mod tests {
             snapshot_engine,
             event_tx,
             post_buy_tx: None,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             decision_logger: Arc::new(ghost_brain::oracle::DecisionLogger::new(
                 ghost_brain::oracle::DecisionLoggerConfig {
                     enabled: false,
@@ -35826,6 +35878,7 @@ mod tests {
             snapshot_engine,
             event_tx,
             post_buy_tx: None,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             decision_logger: Arc::new(ghost_brain::oracle::DecisionLogger::new(
                 ghost_brain::oracle::DecisionLoggerConfig {
                     enabled: false,
@@ -35941,6 +35994,7 @@ mod tests {
             snapshot_engine,
             event_tx,
             post_buy_tx: None,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             decision_logger: Arc::new(ghost_brain::oracle::DecisionLogger::new(
                 ghost_brain::oracle::DecisionLoggerConfig {
                     enabled: false,

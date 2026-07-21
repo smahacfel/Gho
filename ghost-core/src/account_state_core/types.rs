@@ -48,6 +48,9 @@ impl StatePhase {
 pub enum UpdateSource {
     #[default]
     GeyserAccountUpdate,
+    /// Read-only processed-RPC point query performed only for an already
+    /// managed shadow position after its stream state became stale.
+    RpcRefresh,
     WalReplay,
     TxObservedBootstrap,
 }
@@ -79,6 +82,11 @@ pub struct BootstrapPoolState {
 pub enum AccountUpdateRejectReason {
     OlderSlot,
     OlderOrDuplicateReceiveSeq,
+    RpcRefreshInvalidSource,
+    RpcRefreshMissingAccountDataHash,
+    RpcRefreshWithoutCanonicalState,
+    RpcRefreshIdentityMismatch,
+    RpcRefreshPhaseRegression,
 }
 
 impl AccountUpdateRejectReason {
@@ -87,6 +95,11 @@ impl AccountUpdateRejectReason {
         match self {
             Self::OlderSlot => "older_slot",
             Self::OlderOrDuplicateReceiveSeq => "older_or_duplicate_recv_seq",
+            Self::RpcRefreshInvalidSource => "rpc_refresh_invalid_source",
+            Self::RpcRefreshMissingAccountDataHash => "rpc_refresh_missing_account_data_hash",
+            Self::RpcRefreshWithoutCanonicalState => "rpc_refresh_without_canonical_state",
+            Self::RpcRefreshIdentityMismatch => "rpc_refresh_identity_mismatch",
+            Self::RpcRefreshPhaseRegression => "rpc_refresh_phase_regression",
         }
     }
 }
@@ -96,6 +109,17 @@ impl AccountUpdateRejectReason {
 pub enum AccountUpdateResult {
     Applied,
     PromotedFromBootstrap,
+    Rejected(AccountUpdateRejectReason),
+}
+
+/// Result of the read-only RPC refresh path.  It is deliberately separate
+/// from [`AccountUpdateResult`]: an RPC context slot is an observation
+/// boundary, not a canonical account-write ordering key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcRefreshResult {
+    ObservationRefreshed,
+    DataChanged,
     Rejected(AccountUpdateRejectReason),
 }
 
@@ -124,6 +148,25 @@ pub struct CanonicalPoolState {
     pub is_complete: bool,
     pub last_update_slot: u64,
     pub last_update_ts_ms: u64,
+    /// Latest successful observation boundary.  This is suitable for quote
+    /// freshness, including read-only RPC refreshes; it is not market
+    /// activity or a Geyser write ordering proof.
+    #[serde(default)]
+    pub last_observed_slot: u64,
+    #[serde(default)]
+    pub last_observed_ts_ms: u64,
+    #[serde(default)]
+    pub last_observation_source: UpdateSource,
+    #[serde(default)]
+    pub observation_count: u64,
+    /// Last time the decoded account contents actually changed.  This is the
+    /// only AccountStateCore timestamp/counter used for activity and velocity.
+    #[serde(default)]
+    pub last_data_change_ts_ms: u64,
+    #[serde(default)]
+    pub last_data_change_source: UpdateSource,
+    #[serde(default)]
+    pub data_change_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_write_version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

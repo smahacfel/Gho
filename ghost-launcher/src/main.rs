@@ -31,6 +31,7 @@ use ghost_brain::config::{
     MetricContractRolloutMode,
 };
 use ghost_brain::guardian::post_buy::shadow_v2::shadow_v2_artifact_budget_exceeded;
+use ghost_brain::guardian::post_buy::{validate_exit_policy_v1_config, validate_het_pm_v2_config};
 use ghost_brain::oracle::SnapshotEngine;
 use ghost_brain::tuning::{BanditAlgorithm, TuningMessage, TuningService, TuningServiceConfig};
 use ghost_core::health::RuntimeHealth;
@@ -48,6 +49,7 @@ use ghost_launcher::{
     components::wallet_scanner::scan_wallet_positions,
     config::{
         redact_endpoint_for_logs, AppMode, ExecutionMode, LauncherConfig, ResolvedDurabilityConfig,
+        TriggerEntryMode, TriggerShadowPayerStrategy,
     },
     events::create_event_bus,
     events::{GhostEvent, PostBuySource},
@@ -92,7 +94,12 @@ const EXIT_GRPC_SUBSCRIBE_TIMEOUT: i32 = 5;
 const EXIT_ORACLE_RUNTIME_STOPPED: i32 = 6;
 const STARTUP_HYDRATION_TIMEOUT_SECS: u64 = 15;
 const STARTUP_HYDRATION_IGNORE_MINTS_ENV: &str = "GHOST_STARTUP_HYDRATION_IGNORE_MINTS";
+/// The production event path processes deep protobuf, account-state and session call chains.
+/// Keep worker stacks explicit so one busy session cannot abort the whole launcher at Tokio's
+/// platform-default worker-stack limit.
+const LAUNCHER_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 const COMPONENT_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+const POST_BUY_RUNTIME_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 const SHADOW_V2_POST_BUY_JOIN_MARGIN: Duration = Duration::from_secs(30);
 
 fn load_startup_hydration_ignore_mints(config_path: &Path) -> Result<Vec<Pubkey>> {
@@ -251,12 +258,14 @@ fn component_shutdown_join_timeout(
     component_name: &str,
     shadow_v2_burnin_config: &ShadowV2BurninConfig,
 ) -> Duration {
-    if component_name == "PostBuyRuntime"
-        && shadow_v2_burnin_config.enabled
-        && shadow_v2_burnin_config.logging_only
-    {
-        return Duration::from_millis(shadow_v2_burnin_config.post_run_manifest_drain_timeout_ms)
+    if component_name == "PostBuyRuntime" {
+        if shadow_v2_burnin_config.enabled && shadow_v2_burnin_config.logging_only {
+            return Duration::from_millis(
+                shadow_v2_burnin_config.post_run_manifest_drain_timeout_ms,
+            )
             .saturating_add(SHADOW_V2_POST_BUY_JOIN_MARGIN);
+        }
+        return POST_BUY_RUNTIME_SHUTDOWN_JOIN_TIMEOUT;
     }
     COMPONENT_SHUTDOWN_JOIN_TIMEOUT
 }
@@ -771,6 +780,15 @@ async fn run_preflight(
         }
     }
 
+    let post_buy_manager_result = validate_post_buy_manager_preflight(config);
+    match post_buy_manager_result {
+        Ok(()) => println!("[ok] post_buy.manager: complete shadow manager configuration"),
+        Err(err) => {
+            eprintln!("[fail] post_buy.manager: {err}");
+            failures.push(format!("post_buy.manager: {err}"));
+        }
+    }
+
     let grpc_result = config.validate_grpc_config().map_err(anyhow::Error::msg);
     match grpc_result {
         Ok(()) => println!(
@@ -927,24 +945,33 @@ async fn run_preflight(
         }
     }
 
-    let payer = match config.trigger.keypair_path.as_deref() {
-        Some(path) => match read_keypair_file(path) {
-            Ok(keypair) => {
-                println!("[ok] trigger.keypair: {} ({})", path, keypair.pubkey());
-                Some(keypair.pubkey())
-            }
-            Err(err) => {
-                let message = format!("failed to read keypair at {path}: {err}");
+    let uses_ephemeral_shadow_payer = config.trigger.enabled
+        && config.trigger.entry_mode == TriggerEntryMode::ShadowOnly
+        && config.trigger.shadow_run.enabled
+        && config.trigger.shadow_run.payer_strategy == TriggerShadowPayerStrategy::Ephemeral;
+    let payer = if uses_ephemeral_shadow_payer {
+        println!("[ok] trigger.keypair: not required for shadow_only ephemeral payer");
+        None
+    } else {
+        match config.trigger.keypair_path.as_deref() {
+            Some(path) => match read_keypair_file(path) {
+                Ok(keypair) => {
+                    println!("[ok] trigger.keypair: {} ({})", path, keypair.pubkey());
+                    Some(keypair.pubkey())
+                }
+                Err(err) => {
+                    let message = format!("failed to read keypair at {path}: {err}");
+                    eprintln!("[fail] trigger.keypair: {message}");
+                    failures.push(format!("trigger.keypair: {message}"));
+                    None
+                }
+            },
+            None => {
+                let message = "trigger.keypair_path is not configured".to_string();
                 eprintln!("[fail] trigger.keypair: {message}");
                 failures.push(format!("trigger.keypair: {message}"));
                 None
             }
-        },
-        None => {
-            let message = "trigger.keypair_path is not configured".to_string();
-            eprintln!("[fail] trigger.keypair: {message}");
-            failures.push(format!("trigger.keypair: {message}"));
-            None
         }
     };
 
@@ -1081,6 +1108,44 @@ async fn run_preflight(
             failures.join("\n- ")
         )
     }
+}
+
+/// Validate the complete post-buy manager contract during preflight, rather
+/// than discovering a malformed guardian section only after the launcher has
+/// started its runtime components.  This is deliberately strict for Shadow:
+/// the manager is active there and no legacy/default fallback is valid.
+fn validate_post_buy_manager_preflight(config: &LauncherConfig) -> Result<()> {
+    if config.execution.execution_mode != ExecutionMode::Shadow {
+        return Ok(());
+    }
+
+    let brain_path = Path::new(&config.ghost_brain_config_path);
+    let brain = GhostBrainConfig::from_toml_file(brain_path).with_context(|| {
+        format!(
+            "failed to load complete Ghost Brain configuration for post-buy validation: {}",
+            brain_path.display()
+        )
+    })?;
+    let guardian = &brain.post_buy_guardian;
+
+    if !guardian.enabled {
+        bail!("shadow mode requires post_buy_guardian.enabled=true");
+    }
+    if guardian.aem.enabled {
+        bail!("Position Manager Lite V1 requires post_buy_guardian.aem.enabled=false");
+    }
+    validate_exit_policy_v1_config(guardian).map_err(|error| {
+        anyhow::anyhow!("invalid Position Manager Lite V1 configuration: {error}")
+    })?;
+    validate_het_pm_v2_config(guardian)
+        .map_err(|error| anyhow::anyhow!("invalid HET-PM V2 configuration: {error}"))?;
+    if guardian.shadow_market_refresh.enabled
+        && config.trigger.shadow_run.shadow_rpc_url.trim().is_empty()
+    {
+        bail!("shadow_market_refresh.enabled requires trigger.shadow_run.shadow_rpc_url");
+    }
+
+    Ok(())
 }
 
 fn build_live_sell_handle(
@@ -1233,8 +1298,16 @@ async fn hydrate_startup_live_positions(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(LAUNCHER_TOKIO_WORKER_STACK_SIZE_BYTES)
+        .build()
+        .context("failed to build Ghost launcher Tokio runtime")?
+        .block_on(run_launcher())
+}
+
+async fn run_launcher() -> Result<()> {
     let cli = parse_cli_args()?;
     let config_path = LauncherConfig::resolve_config_path(&cli.requested_config_path)
         .unwrap_or_else(|| cli.requested_config_path.clone());
@@ -2187,6 +2260,7 @@ async fn main() -> Result<()> {
             .map(|brain| brain.post_buy_guardian.clone()),
         shadow_ledger: Some(Arc::clone(&shadow_ledger)),
         account_state_core: Some(Arc::clone(oracle_runtime.account_state_core())),
+        shadow_market_refresh_rpc_url: Some(config.trigger.shadow_run.shadow_rpc_url.clone()),
         shadow_lifecycle_log_path,
         probe_lifecycle_log_path,
         shadow_v2_burnin: shadow_v2_burnin_config
@@ -3393,7 +3467,19 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         shadow_v2.enabled = false;
         assert_eq!(
             component_shutdown_join_timeout("PostBuyRuntime", &shadow_v2),
-            COMPONENT_SHUTDOWN_JOIN_TIMEOUT
+            POST_BUY_RUNTIME_SHUTDOWN_JOIN_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn test_post_buy_runtime_default_join_budget_exceeds_direct_handoff_drain() {
+        assert!(
+            POST_BUY_RUNTIME_SHUTDOWN_JOIN_TIMEOUT > COMPONENT_SHUTDOWN_JOIN_TIMEOUT,
+            "PostBuyRuntime has its own bounded shutdown drain and needs a larger join budget"
+        );
+        assert_eq!(
+            component_shutdown_join_timeout("PostBuyRuntime", &ShadowV2BurninConfig::default()),
+            POST_BUY_RUNTIME_SHUTDOWN_JOIN_TIMEOUT
         );
     }
 
@@ -4085,6 +4171,32 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         config
     }
 
+    #[test]
+    fn post_buy_preflight_rejects_missing_take_profit_threshold() {
+        let base_dir = tempdir().expect("base dir");
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../ghost-brain/ghost_brain_config.toml");
+        let source = std::fs::read_to_string(&source_path).expect("read baseline brain config");
+        let invalid = source.replacen("target_threshold = 50.0\n", "", 1);
+        assert_ne!(source, invalid, "baseline must contain the target field");
+        let brain_path = base_dir.path().join("invalid-post-buy.toml");
+        std::fs::write(&brain_path, invalid).expect("write invalid brain config");
+
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.ghost_brain_config_path = brain_path.to_string_lossy().into_owned();
+
+        let error = validate_post_buy_manager_preflight(&config)
+            .expect_err("missing Position Manager take-profit must fail preflight");
+        assert!(
+            error
+                .to_string()
+                .contains("take-profit threshold is required"),
+            "unexpected error: {error}"
+        );
+    }
+
     async fn configure_live_sender_preflight(config: &mut LauncherConfig) -> EnvVarGuard {
         let grpc_endpoint = spawn_mock_grpc_server("token").await;
         let sender_endpoint = spawn_mock_sender_server().await;
@@ -4119,6 +4231,25 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         .await
         .unwrap_err();
         assert!(err.to_string().contains("trigger.keypair"));
+    }
+
+    #[tokio::test]
+    async fn test_run_preflight_accepts_shadow_only_ephemeral_without_keypair() {
+        let rpc_url = spawn_mock_rpc_server(1_000_000_000).await;
+        let base_dir = tempdir().expect("base dir");
+        let mut config = base_preflight_config(rpc_url, base_dir.path());
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
+        config.trigger.keypair_path = None;
+
+        run_preflight(
+            &config,
+            Path::new("shadow-ephemeral-config.toml"),
+            &pr1_metric_contract_foundation(),
+        )
+        .await
+        .expect("shadow-only ephemeral preflight must not require a configured keypair");
     }
 
     #[tokio::test]

@@ -4,11 +4,15 @@ Data: 2026-07-17
 
 Typ: ADR-8D / PR #73 promotion-evidence prerequisite / observe-only telemetry
 
-Status: Accepted and materialized. Contract został zablokowany po buildzie reviewed
+Status: Superseded in release-provenance scope by
+`ADR_8D_HET_PM_V2_REPRODUCIBLE_RELEASE_PROVENANCE_20260718.md`. Schema-V3 lattice
+i ekonomiczne progi pozostają obowiązujące, lecz poniższy pierwotny binary lock
+nie może autoryzować prospective runu. Historycznie contract został zablokowany po buildzie reviewed
 release binary z `7e162a90846a0425cc3ed01f90bcf2fb52d39c71`; criteria zapisują jej
 SHA-256 `8f38ee7879f4c8ce58b43c3757b4fe1cd09d4b398a07e56d99165c690e6a3804`.
-Pozostaje niepromowalny wyłącznie dlatego, że nie istnieją jeszcze dwa wymagane
-prospective validation runy ani source-recomputed promotion artifact.
+Ten historyczny lock został wycofany przed prospective validation po wykazaniu,
+że brak tracked lockfile/toolchain contractu uniemożliwia jego wiarygodną
+reprodukcję.
 
 ## D1. Problem
 
