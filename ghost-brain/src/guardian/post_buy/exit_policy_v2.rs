@@ -20,9 +20,11 @@ use super::trajectory_v1::{TrajectoryFeaturesV1, TrajectoryQualityV1};
 
 pub(super) const HET_PM_V2_POLICY_ID: &str = "hierarchical_executable_trajectory_pm_v2";
 pub(super) const HET_PM_V2_POLICY_VERSION: u16 = 2;
-/// Schema V3 adds an additive, per-gate candidate lattice.  This changes the
-/// observer payload, not the V2 pure-policy semantics nor its authority (V1
-/// remains the only apply owner).
+/// Schema V3 adds an additive, per-gate candidate lattice.  It does not alter
+/// the V2 pure-policy semantics. In observe-only mode V1 remains the shadow
+/// decision owner; in authoritative-shadow mode V2 selects the shadow action
+/// while the shared shadow executor remains the only apply path. Live
+/// authority is never enabled by this schema.
 pub(super) const HET_PM_V2_SCHEMA_VERSION: u16 = 3;
 pub(super) const HET_PM_V2_SAMPLING_MODE: &str = "latest_canonical_state_per_monitor_tick";
 pub(super) const HET_PM_V2_TRAJECTORY_GRADE: &str = "online_non_lookahead_sampled_trajectory";
@@ -720,6 +722,10 @@ impl ExitPolicyV2 {
         }
     }
 
+    // Production always supplies the explicit absolute-max-hold boundary.
+    // This convenience wrapper exists solely to keep focused policy tests
+    // readable, so do not retain it in the non-test runtime binary.
+    #[cfg(test)]
     pub(super) fn evaluate_prequote(
         view: PostBuyDecisionViewV2<'_>,
         v1_prequote: &PreQuoteDecision,
@@ -799,12 +805,25 @@ impl ExitPolicyV2 {
         if view.extras.entry_value_quote_raw.is_none() {
             return max_hold_or_blocked(HetPmUnknownReasonV2::EntryCapitalUnavailable, suppressed);
         }
+        // AbsoluteMaxHold can bypass missing *decision data* so a position
+        // does not remain open forever merely because trajectory/vitality
+        // evidence degraded.  It must never bypass execution capability:
+        // this runtime has no PumpSwap route, so a migrated or unknown route
+        // cannot be represented as a simulated Pump-curve fill.
         match view.extras.route_status {
             RouteStatusV1::CurveCompletePumpSwapUnsupported => {
-                return max_hold_or_blocked(HetPmUnknownReasonV2::RouteUnsupported, suppressed);
+                return finish(
+                    HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::RouteUnsupported),
+                    HetPmGateV2::Integrity,
+                    suppressed,
+                );
             }
             RouteStatusV1::Unknown => {
-                return max_hold_or_blocked(HetPmUnknownReasonV2::RouteUnknown, suppressed);
+                return finish(
+                    HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::RouteUnknown),
+                    HetPmGateV2::Integrity,
+                    suppressed,
+                );
             }
             RouteStatusV1::PumpCurveSupported => {}
         }
@@ -947,6 +966,9 @@ impl ExitPolicyV2 {
     /// view: when e.g. Crash and ExecutableTrailing are both candidates, the
     /// latter must remain observable even though Crash is the observed winner.
     /// No quote is requested here and this function has no mutation surface.
+    // See `evaluate_prequote`: the runtime uses the explicit ceiling variant
+    // below, while unit tests exercise the default ceiling derivation.
+    #[cfg(test)]
     pub(super) fn evaluate_gate_lattice(
         view: PostBuyDecisionViewV2<'_>,
         v1_prequote: &PreQuoteDecision,
@@ -974,6 +996,15 @@ impl ExitPolicyV2 {
         config: &EffectiveHetPmV2Config,
         absolute_max_hold_due: bool,
     ) -> Vec<HetPmGatePreQuoteEvidenceV2> {
+        let route_blocker = match view.extras.route_status {
+            RouteStatusV1::PumpCurveSupported => None,
+            RouteStatusV1::CurveCompletePumpSwapUnsupported => Some(HetPmCandidateV2::Blocked(
+                HetPmUnknownReasonV2::RouteUnsupported,
+            )),
+            RouteStatusV1::Unknown => Some(HetPmCandidateV2::Blocked(
+                HetPmUnknownReasonV2::RouteUnknown,
+            )),
+        };
         let global = if !config.enabled() {
             Some(HetPmCandidateV2::Blocked(
                 HetPmUnknownReasonV2::PolicyDisabled,
@@ -991,17 +1022,8 @@ impl ExitPolicyV2 {
             Some(HetPmCandidateV2::Blocked(
                 HetPmUnknownReasonV2::EntryCapitalUnavailable,
             ))
-        } else if matches!(
-            view.extras.route_status,
-            RouteStatusV1::CurveCompletePumpSwapUnsupported
-        ) {
-            Some(HetPmCandidateV2::Blocked(
-                HetPmUnknownReasonV2::RouteUnsupported,
-            ))
-        } else if matches!(view.extras.route_status, RouteStatusV1::Unknown) {
-            Some(HetPmCandidateV2::Blocked(
-                HetPmUnknownReasonV2::RouteUnknown,
-            ))
+        } else if let Some(route_blocker) = route_blocker {
+            Some(route_blocker)
         } else {
             match view.base.mark_evidence_status() {
                 MarkEvidenceStatus::Available => match view.extras.trajectory.quality {
@@ -1041,14 +1063,17 @@ impl ExitPolicyV2 {
                 .into_iter()
                 .map(|reason| HetPmGatePreQuoteEvidenceV2 {
                     reason,
-                    // Absolute max hold is the last hard occupancy ceiling.
-                    // Missing trajectory, vitality or route evidence cannot
-                    // turn it into an endless Hold.  The normal quote/retry
-                    // path will either resolve a full exit or emit its typed
-                    // unresolved terminal outcome.
+                    // Absolute max hold is the last hard occupancy ceiling
+                    // for missing decision data.  It is not an executor and
+                    // must not manufacture a Pump-curve exit when the route
+                    // is unsupported or unknown.
                     candidate: if matches!(reason, HetPmExitReasonV2::AbsoluteMaxHold)
                         && absolute_max_hold_due
-                    {
+                        && !matches!(
+                            candidate,
+                            HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::RouteUnsupported)
+                                | HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::RouteUnknown)
+                        ) {
                         HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::AbsoluteMaxHold)
                     } else {
                         candidate.clone()
@@ -1255,6 +1280,16 @@ impl ExitPolicyV2 {
             HetPmCandidateV2::Pending => HetPmFinalDecisionV2::Pending,
             HetPmCandidateV2::Blocked(reason) => HetPmFinalDecisionV2::Blocked(*reason),
             HetPmCandidateV2::QuoteRequired(reason) => {
+                let route_blocker = match view.extras.route_status {
+                    RouteStatusV1::PumpCurveSupported => None,
+                    RouteStatusV1::CurveCompletePumpSwapUnsupported => {
+                        Some(HetPmUnknownReasonV2::RouteUnsupported)
+                    }
+                    RouteStatusV1::Unknown => Some(HetPmUnknownReasonV2::RouteUnknown),
+                };
+                if let Some(reason) = route_blocker {
+                    return HetPmFinalDecisionV2::Blocked(reason);
+                }
                 let Some(quote) = quote else {
                     return if matches!(reason, HetPmExitReasonV2::Crash) {
                         HetPmFinalDecisionV2::CrashBlockedByData
@@ -2799,7 +2834,7 @@ mod tests {
             max_hold_lattice.last(),
             Some(HetPmGatePreQuoteEvidenceV2 {
                 reason: HetPmExitReasonV2::AbsoluteMaxHold,
-                candidate: HetPmCandidateV2::QuoteRequired(HetPmExitReasonV2::AbsoluteMaxHold),
+                candidate: HetPmCandidateV2::Blocked(HetPmUnknownReasonV2::RouteUnsupported),
             })
         ));
 

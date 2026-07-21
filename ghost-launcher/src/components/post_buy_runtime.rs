@@ -59,9 +59,7 @@ use ghost_brain::guardian::post_buy::{
 };
 use ghost_brain::quotes::{ExecutableQuoteProvider, QuoteProviderConfig};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
-use ghost_core::account_state_core::types::{
-    AccountStateUpdate, AccountUpdateResult, UpdateSource,
-};
+use ghost_core::account_state_core::types::{AccountStateUpdate, RpcRefreshResult, UpdateSource};
 use ghost_core::shadow_ledger::ShadowLedger;
 use ghost_core::{CurveFinality, ShadowV2PoolPhase, LAMPORTS_PER_SOL};
 use parking_lot::Mutex as ParkingMutex;
@@ -605,7 +603,7 @@ async fn refresh_shadow_market_target(
         return Err("rpc_context_slot_missing".to_string());
     }
 
-    let apply_result = account_state_core.apply_account_update(AccountStateUpdate {
+    let apply_result = account_state_core.apply_rpc_refresh(AccountStateUpdate {
         pool_amm_id: target.pool_amm_id,
         base_mint: target.base_mint,
         bonding_curve: target.bonding_curve,
@@ -613,9 +611,9 @@ async fn refresh_shadow_market_target(
         token_reserves: curve.virtual_token_reserves,
         is_complete: curve.complete,
         slot: response.context.slot,
-        // RPC supplies a read-context slot rather than an account write
-        // version. `0` lets an eventual same-slot Geyser write supersede this
-        // fallback under AccountStateCore's monotonic ordering.
+        // This is an observation-context slot, never an account-write
+        // ordering proof. `apply_rpc_refresh` deliberately keeps it out of
+        // the canonical Geyser monotonic guard.
         write_version: Some(0),
         source_account_pubkey: Some(target.bonding_curve),
         source_account_owner_or_program: Some(account.owner),
@@ -627,8 +625,8 @@ async fn refresh_shadow_market_target(
         source: UpdateSource::RpcRefresh,
     });
     match apply_result {
-        AccountUpdateResult::Applied | AccountUpdateResult::PromotedFromBootstrap => Ok(()),
-        AccountUpdateResult::Rejected(reason) => {
+        RpcRefreshResult::ObservationRefreshed | RpcRefreshResult::DataChanged => Ok(()),
+        RpcRefreshResult::Rejected(reason) => {
             debug!(
                 base_mint = %target.base_mint,
                 slot = response.context.slot,
@@ -6072,6 +6070,13 @@ mod tests {
             is_complete: false,
             last_update_slot,
             last_update_ts_ms: entry_ts_ms,
+            last_observed_slot: last_update_slot,
+            last_observed_ts_ms: entry_ts_ms,
+            last_observation_source: UpdateSource::GeyserAccountUpdate,
+            observation_count: 3,
+            last_data_change_ts_ms: entry_ts_ms,
+            last_data_change_source: UpdateSource::GeyserAccountUpdate,
+            data_change_count: 3,
             source_write_version: None,
             source_account_pubkey: None,
             source_account_owner_or_program: None,
@@ -6308,7 +6313,12 @@ sys.exit(0)
     #[test]
     fn shadow_v2_validation_smoke_marker_writes_required_artifacts_without_handoff() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let burnin = shadow_v2_burnin_config_for_temp_scope(tmp.path());
+        // Compact density deliberately waits for a terminal truth.  This
+        // startup-only marker has no terminal, so this fixture explicitly
+        // requests the diagnostic full stream before asserting density rows.
+        let mut burnin = shadow_v2_burnin_config_for_temp_scope(tmp.path());
+        burnin.compact_density_enabled = false;
+        burnin.density_full_stream_enabled = true;
         let runtime_config = PostBuyRuntimeConfig {
             shadow_v2_burnin: Some(burnin),
             ..PostBuyRuntimeConfig::default()
@@ -6479,6 +6489,13 @@ sys.exit(0)
             is_complete: false,
             last_update_slot: 430_000_010,
             last_update_ts_ms: entry_ts_ms,
+            last_observed_slot: 430_000_010,
+            last_observed_ts_ms: entry_ts_ms,
+            last_observation_source: UpdateSource::GeyserAccountUpdate,
+            observation_count: 3,
+            last_data_change_ts_ms: entry_ts_ms,
+            last_data_change_source: UpdateSource::GeyserAccountUpdate,
+            data_change_count: 3,
             source_write_version: Some(11),
             source_account_pubkey: Some(Pubkey::new_unique()),
             source_account_owner_or_program: Some(Pubkey::new_unique()),
@@ -6620,6 +6637,13 @@ sys.exit(0)
             is_complete: false,
             last_update_slot: 430_000_010,
             last_update_ts_ms: entry_ts_ms,
+            last_observed_slot: 430_000_010,
+            last_observed_ts_ms: entry_ts_ms,
+            last_observation_source: UpdateSource::GeyserAccountUpdate,
+            observation_count: 3,
+            last_data_change_ts_ms: entry_ts_ms,
+            last_data_change_source: UpdateSource::GeyserAccountUpdate,
+            data_change_count: 3,
             source_write_version: None,
             source_account_pubkey: None,
             source_account_owner_or_program: None,

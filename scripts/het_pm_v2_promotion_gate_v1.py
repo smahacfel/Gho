@@ -2468,8 +2468,15 @@ def evaluate(
     integrity_observed = {
         "duplicate_action_count": duplicate_action_count,
         "duplicate_terminal_count": duplicate_terminal_count,
-        "v2_economic_mutation_count": structural["lifecycle_integrity"]["v2_economic_mutation_count"],
-        "v2_proposal_creation_count": structural["lifecycle_integrity"]["v2_proposal_creation_count"],
+        # Active HET-PM V2 owns shadow decisions, so shadow proposals/fills
+        # are expected evidence, not a lifecycle violation. The producer
+        # schema rejects live authority; keep separate zero-tolerance fields
+        # so a later schema relaxation cannot silently turn that into a pass.
+        "v2_shadow_economic_mutation_count": structural["lifecycle_integrity"]["v2_shadow_economic_mutation_count"],
+        "v2_shadow_proposal_creation_count": structural["lifecycle_integrity"]["v2_shadow_proposal_creation_count"],
+        "v2_live_economic_mutation_count": structural["lifecycle_integrity"]["v2_live_economic_mutation_count"],
+        "v2_live_proposal_creation_count": structural["lifecycle_integrity"]["v2_live_proposal_creation_count"],
+        "live_authority_violation_count": structural["lifecycle_integrity"]["live_authority_violation_count"],
         "route_build_authority_change_count": structural["lifecycle_integrity"]["route_build_authority_change_count"],
         "time_stop_parity_violation_count": structural["lifecycle_integrity"]["time_stop_parity_violation_count"],
         "terminal_isolation_violation_count": structural["lifecycle_integrity"]["terminal_isolation_violation_count"],

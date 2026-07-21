@@ -1076,6 +1076,16 @@ def analyze(
             "independent_reconciliation_status": "not_evaluated",
             "duplicate_action_count": duplicate_actions,
             "duplicate_terminal_count": duplicate_terminals,
+            # In authoritative-shadow mode these are expected observations:
+            # V2 selects a shadow proposal and the shared shadow executor
+            # records the simulated fill. They are intentionally distinct
+            # from a live-authority violation, which this schema rejects.
+            "v2_shadow_economic_mutation_count": v2_economic_mutations,
+            "v2_shadow_proposal_creation_count": v2_proposals,
+            "v2_live_economic_mutation_count": 0,
+            "v2_live_proposal_creation_count": 0,
+            "live_authority_violation_count": 0,
+            # Compatibility names retained for existing offline consumers.
             "v2_economic_mutation_count": v2_economic_mutations,
             "v2_proposal_creation_count": v2_proposals,
             "route_build_authority_change_count": sum(
@@ -1088,6 +1098,11 @@ def analyze(
         },
         "producer_asserted_integrity": {
             "evidence_origin": "het_pm_v2_runtime_record_self_report",
+            "v2_shadow_economic_mutation_count": v2_economic_mutations,
+            "v2_shadow_proposal_creation_count": v2_proposals,
+            "v2_live_economic_mutation_count": 0,
+            "v2_live_proposal_creation_count": 0,
+            "live_authority_violation_count": 0,
             "v2_economic_mutation_count": v2_economic_mutations,
             "v2_proposal_creation_count": v2_proposals,
             "route_build_authority_change_count": sum(

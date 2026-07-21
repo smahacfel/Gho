@@ -37,11 +37,48 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
         self.criteria = json.loads(CRITERIA_PATH.read_text(encoding="utf-8"))
         self.observed = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
         gate.validate_criteria(self.criteria)
+        self.observed["lifecycle_integrity"].setdefault(
+            "v2_shadow_economic_mutation_count", 0
+        )
+        self.observed["lifecycle_integrity"].setdefault(
+            "v2_shadow_proposal_creation_count", 0
+        )
+        self.observed["lifecycle_integrity"].setdefault(
+            "v2_live_economic_mutation_count", 0
+        )
+        self.observed["lifecycle_integrity"].setdefault(
+            "v2_live_proposal_creation_count", 0
+        )
+        self.observed["lifecycle_integrity"].setdefault(
+            "live_authority_violation_count", 0
+        )
         # Arithmetic fixtures predate the prospective sample-size contract.
         # Keep their narrow assertions independent of the production release
         # thresholds; dedicated tests below assert that the checked-in values
         # are non-vacuous.
         self.criteria["contract_state"] = "locked"
+        self.criteria.update({
+            "expected_runtime_commit_sha": "a" * 40,
+            "expected_release_binary_sha256": "b" * 64,
+            "expected_cargo_lock_sha256": "c" * 64,
+            "expected_rust_toolchain_sha256": "d" * 64,
+            "expected_cargo_config_sha256": "e" * 64,
+            "expected_rustc_verbose_sha256": "f" * 64,
+            "expected_cargo_version_sha256": "1" * 64,
+            "expected_native_target_cfg_sha256": "2" * 64,
+            "expected_brain_config_content_hash": "3" * 64,
+            "expected_normalized_behavioral_config_hash": "4" * 64,
+            "expected_promotion_tool_hash": "5" * 64,
+            "expected_pr_a_analyzer_hash": "6" * 64,
+            "expected_release_build_command": list(gate.RELEASE_BUILD_COMMAND),
+            "expected_release_clean_command": list(gate.RELEASE_CLEAN_COMMAND),
+            "expected_release_rustflags_contract": list(gate.RELEASE_RUSTFLAGS_CONTRACT),
+            "require_clean_runtime_build_worktree": True,
+            "allowed_exact_run_config_hashes": {
+                "validation-a": "7" * 64,
+                "validation-b": "8" * 64,
+            },
+        })
         economic = self.criteria["gates"]["economic_result"]["thresholds"]
         economic.update({
             "min_matched_v2_candidate_positions": 50,
@@ -650,6 +687,18 @@ class HetPmV2PromotionGateV1Tests(unittest.TestCase):
                 gates = self.evaluate(observed)
                 self.assertFalse(gates[gate_name]["passed"])
                 self.assertFalse(all(result["passed"] for result in gates.values()))
+
+    def test_active_shadow_mutations_are_observed_but_live_mutations_fail_integrity(self) -> None:
+        shadow_activity = copy.deepcopy(self.observed)
+        lifecycle = shadow_activity["lifecycle_integrity"]
+        lifecycle["v2_shadow_economic_mutation_count"] = 17
+        lifecycle["v2_shadow_proposal_creation_count"] = 17
+        gates = self.evaluate(shadow_activity)
+        self.assertTrue(gates["lifecycle_integrity"]["passed"])
+
+        live_activity = copy.deepcopy(shadow_activity)
+        live_activity["lifecycle_integrity"]["v2_live_economic_mutation_count"] = 1
+        self.assertFalse(self.evaluate(live_activity)["lifecycle_integrity"]["passed"])
 
     def test_missing_and_non_finite_metrics_fail_closed(self) -> None:
         missing = copy.deepcopy(self.observed)

@@ -7,6 +7,11 @@ on:
     paths:
       - ".github/workflows/metric-contracts-pr2c.yml"
       - "scripts/guard_diff_scoped_clippy.py"
+      - "scripts/test_guard_diff_scoped_clippy.py"
+      - "scripts/het_pm_v2_analysis.py"
+      - "scripts/het_pm_v2_promotion_gate_v1.py"
+      - "scripts/test_het_pm_v2_analysis.py"
+      - "scripts/test_het_pm_v2_promotion_gate_v1.py"
       - "ghost-core/**"
       - "ghost-launcher/**"
       - "ghost-brain/**"
@@ -88,6 +93,36 @@ jobs:
           cargo test -p ghost-launcher --test session_lifecycle_tests
           cargo test -p ghost-launcher --test refactor_invariants_tests
           cargo test -p ghost-brain --lib replay_payload
+
+      - name: HET-PM V2 active-shadow regressions
+        run: |
+          python3 -m unittest \
+            scripts/test_het_pm_v2_analysis.py \
+            scripts/test_het_pm_v2_promotion_gate_v1.py \
+            scripts/test_guard_diff_scoped_clippy.py
+          # The active manager lives here; run the whole module, not only
+          # narrow smoke names, because the shared executor and sticky V1
+          # proposal boundary are part of the same contract.
+          cargo test -p ghost-brain --lib guardian::post_buy
+          cargo test -p ghost-launcher components::post_buy_runtime --lib
+          cargo test -p ghost-core --lib \
+            identical_rpc_refresh_updates_observation_without_activity_or_geyser_ordering \
+            -- --exact
+          cargo test -p ghost-core --lib \
+            changed_rpc_refresh_updates_data_change_without_advancing_geyser_guard \
+            -- --exact
+          cargo test -p ghost-brain --lib \
+            authoritative_shadow_max_hold_on_unsupported_route_never_simulates_fill \
+            -- --exact
+          cargo test -p ghost-brain --lib \
+            unchanged_rpc_refresh_updates_quote_observation_without_vitality_activity \
+            -- --exact
+          # This exact smoke test was run at the PR base and at HEAD. It is
+          # intentionally kept explicit alongside the full module run so a
+          # future density regression cannot hide in a broad test report.
+          cargo test -p ghost-launcher \
+            components::post_buy_runtime::tests::shadow_v2_validation_smoke_marker_writes_required_artifacts_without_handoff \
+            --lib -- --exact
 
       - name: Changed-crate checks
         run: |

@@ -178,14 +178,11 @@ impl ShadowMarketActivityAnchor {
     }
 
     fn observe_snapshot(&mut self, snapshot: &MarketSnapshot, now_ms: u64) -> bool {
-        let is_newer_slot = match (self.slot, snapshot.slot) {
-            (Some(previous), Some(current)) => current > previous,
-            (None, Some(_)) => true,
-            _ => false,
-        };
-        let is_newer_snapshot =
-            snapshot.timestamp_ms > self.snapshot_ts_ms || snapshot.tx_count > self.tx_count;
-        if !is_newer_slot && !is_newer_snapshot {
+        // `slot` and `timestamp_ms` may advance after a read-only RPC
+        // observation of identical bytes.  They prove quote freshness, not a
+        // market write.  AccountStateCore materializes `tx_count` from its
+        // data-change counter, so it is the only activity heartbeat here.
+        if snapshot.tx_count <= self.tx_count {
             return false;
         }
         self.last_seen_ms = now_ms;
@@ -223,11 +220,10 @@ impl TimeStopV2Checkpoint {
     }
 
     fn is_newer_than(self, previous: Self) -> bool {
-        match (previous.slot, self.slot) {
-            (Some(previous_slot), Some(current_slot)) if current_slot > previous_slot => true,
-            (None, Some(_)) => true,
-            _ => self.timestamp_ms > previous.timestamp_ms || self.tx_count > previous.tx_count,
-        }
+        // A later observation timestamp is not a later market update.  The
+        // checkpoint is for vitality/activity, therefore only the canonical
+        // AccountStateCore data-change counter can advance it.
+        self.tx_count > previous.tx_count
     }
 }
 
@@ -573,6 +569,12 @@ impl SnapshotTimeline {
             self.cumulative_volume_sol = snapshot.cum_volume_sol;
             self.snapshots.push(snapshot);
             self.trim(max_snapshots, retention_ms);
+        } else if let Some(latest) = self.snapshots.last_mut() {
+            // Preserve the newest observation boundary for quote freshness
+            // without turning an identical read-only refresh into another
+            // trajectory/activity sample.
+            latest.slot = snapshot.slot;
+            latest.timestamp_ms = snapshot.timestamp_ms;
         }
         self.latest()
             .expect("snapshot timeline must contain latest after canonical ingest")
@@ -625,9 +627,9 @@ impl SnapshotTimeline {
         MarketSnapshot {
             slot: (state.last_update_slot > 0).then_some(state.last_update_slot),
             tx_key: None,
-            timestamp_ms: state.last_update_ts_ms,
+            timestamp_ms: state.last_observed_ts_ms.max(state.last_update_ts_ms),
             cum_volume_sol,
-            tx_count: state.update_count,
+            tx_count: state.data_change_count.max(state.update_count),
             unique_addrs: previous.map(|snap| snap.unique_addrs).unwrap_or(1),
             price_sol_per_token,
             price_state,
@@ -643,9 +645,7 @@ impl SnapshotTimeline {
     }
 
     fn equivalent(lhs: &MarketSnapshot, rhs: &MarketSnapshot) -> bool {
-        lhs.slot == rhs.slot
-            && lhs.timestamp_ms == rhs.timestamp_ms
-            && lhs.tx_count == rhs.tx_count
+        lhs.tx_count == rhs.tx_count
             && (lhs.price_sol_per_token - rhs.price_sol_per_token).abs() <= 1e-12
             && (lhs.market_cap_sol - rhs.market_cap_sol).abs() <= 1e-12
             && (lhs.reserve_base - rhs.reserve_base).abs() <= 1e-6
@@ -800,6 +800,9 @@ struct PendingExitProposal {
     source_snapshot_id: String,
     would_hold_under_legacy_inactivity_policy: Option<bool>,
     crash_guard_quote_requirement: Option<CrashGuardQuoteRequirementV1>,
+    /// Route bound only for a V2-authoritative action.  A later route change
+    /// must prevent the stale Pump-curve proposal from becoming a fill.
+    execution_route_id: Option<String>,
     last_quote_attempt_ms: Option<u64>,
 }
 
@@ -1247,7 +1250,7 @@ impl HetPmV2ObservationWriterV1 {
                         source_snapshot_id = %job.correlation.source_snapshot_id,
                         error,
                         reason = TerminalV2ComparisonSkipReasonV1::WriterIoFailed.as_label(),
-                        "PostBuyGuardian: asynchronous HET-PM V2 sidecar write failed; V1 remains unaffected"
+                        "PostBuyGuardian: asynchronous HET-PM V2 sidecar write failed; shadow lifecycle executor remains unaffected"
                     );
                 }
             }
@@ -1826,6 +1829,9 @@ struct V1AuthorityTickInput<'a> {
     authoritative_prequote: &'a PreQuoteDecision,
     crash_prequote: &'a CrashGuardPreQuoteDecision,
     pre_resolved_quotes: &'a [HetPmV2QuoteCell],
+    /// `Some` only when this tick deliberately hands a V2-selected candidate
+    /// to the shared guarded shadow executor.
+    v2_execution_route_id: Option<&'a str>,
     policy: &'a EffectiveExitPolicyV1Config,
     now_ms: u64,
 }
@@ -1965,6 +1971,9 @@ struct ShadowExitActionHandle {
     source_snapshot_id: String,
     would_hold_under_legacy_inactivity_policy: Option<bool>,
     crash_guard_quote_requirement: Option<CrashGuardQuoteRequirementV1>,
+    /// Present only for a V2-authoritative shadow action.  It binds the
+    /// guarded proposal to the route that made its executable decision valid.
+    execution_route_id: Option<String>,
 }
 
 impl ShadowUnresolvedReason {
@@ -2037,6 +2046,8 @@ enum PositionApplyError {
     ConcurrentActionPending,
     #[error("position is already terminal")]
     AlreadyTerminal,
+    #[error("V2 action route is no longer executable")]
+    RouteNotExecutable,
 }
 
 /// Signal with its emission timestamp, for aggregation window management.
@@ -2646,7 +2657,8 @@ pub struct MonitoringEngine {
     /// runs outside the Tokio authority task and never owns terminal truth.
     het_pm_v2_observation_writer: Option<HetPmV2ObservationWriterV1>,
     /// Preserves a typed startup failure when the optional writer thread could
-    /// not be created. V1 remains active and HET rows degrade to `Skipped`.
+    /// not be created. The shadow lifecycle executor remains active and HET
+    /// rows degrade to `Skipped`.
     het_pm_v2_observation_writer_start_error: Option<String>,
     /// Optional Shadow V2 validation harness. Logging-only evidence sink; never consumed by policy.
     shadow_v2_validation_harness: Option<Arc<Mutex<ShadowV2ValidationHarness>>>,
@@ -2907,7 +2919,7 @@ impl MonitoringEngine {
                 warn!(
                     path = %path.display(),
                     error = %error,
-                    "PostBuyGuardian: HET-PM V2 sidecar worker could not start; V1 remains active"
+                    "PostBuyGuardian: HET-PM V2 sidecar worker could not start; shadow lifecycle executor remains active"
                 );
                 self.het_pm_v2_observation_writer_start_error = Some(error.to_string());
             }
@@ -3545,6 +3557,7 @@ impl MonitoringEngine {
         source_snapshot_id: &str,
         inactivity_age_ms: u64,
         crash_guard_quote_requirement: Option<CrashGuardQuoteRequirementV1>,
+        execution_route_id: Option<&str>,
         now_ms: u64,
     ) -> Result<ShadowExitActionHandle, PositionApplyError> {
         let policy = self
@@ -3589,6 +3602,7 @@ impl MonitoringEngine {
             source_snapshot_id: source_snapshot_id.to_string(),
             would_hold_under_legacy_inactivity_policy,
             crash_guard_quote_requirement: crash_guard_quote_requirement.clone(),
+            execution_route_id: execution_route_id.map(ToOwned::to_owned),
             last_quote_attempt_ms: Some(now_ms),
         };
         pos.pending_exit_proposal = Some(proposal.clone());
@@ -3607,6 +3621,7 @@ impl MonitoringEngine {
             source_snapshot_id: source_snapshot_id.to_string(),
             would_hold_under_legacy_inactivity_policy,
             crash_guard_quote_requirement,
+            execution_route_id: proposal.execution_route_id,
         })
     }
 
@@ -3648,6 +3663,7 @@ impl MonitoringEngine {
             would_hold_under_legacy_inactivity_policy: proposal
                 .would_hold_under_legacy_inactivity_policy,
             crash_guard_quote_requirement: proposal.crash_guard_quote_requirement,
+            execution_route_id: proposal.execution_route_id,
         }))
     }
 
@@ -3687,6 +3703,13 @@ impl MonitoringEngine {
             .get_mut(&handle.base_mint)
             .ok_or(PositionApplyError::PositionNotFound)?;
         Self::validate_action_handle(pos, handle)?;
+        if let Some(route_id) = handle.execution_route_id.as_deref() {
+            if route_id != RouteStatusV1::PumpCurveSupported.route_id()
+                || !matches!(pos.het_route_status, RouteStatusV1::PumpCurveSupported)
+            {
+                return Err(PositionApplyError::RouteNotExecutable);
+            }
+        }
         if truth.exit_token_amount_raw != handle.expected_remaining_quantity {
             return Err(PositionApplyError::QuantityMismatch);
         }
@@ -3815,6 +3838,7 @@ impl MonitoringEngine {
             would_hold_under_legacy_inactivity_policy: proposal
                 .would_hold_under_legacy_inactivity_policy,
             crash_guard_quote_requirement: proposal.crash_guard_quote_requirement,
+            execution_route_id: proposal.execution_route_id,
         })
     }
 
@@ -3872,37 +3896,15 @@ impl MonitoringEngine {
     fn current_runtime_shadow_snapshot_with_curve(
         &self,
         base_mint: &Pubkey,
-        observed_at_ms: u64,
+        _observed_at_ms: u64,
         bonding_curve_override: Option<Pubkey>,
     ) -> Option<MarketSnapshot> {
-        let mut snapshot =
-            self.current_shadow_curve_snapshot_with_curve(base_mint, bonding_curve_override)?;
-        let Some(account_state_core) = self.account_state_core.as_ref() else {
-            return Some(snapshot);
-        };
-        let Some(snapshot_slot) = snapshot.slot else {
-            return Some(snapshot);
-        };
-        let Some(latest_observed_slot) = account_state_core.latest_observed_slot() else {
-            return Some(snapshot);
-        };
-
-        // History modules keep the original write timestamp, but runtime exit truth may use the
-        // same canonical state as "current" once AccountStateCore has already advanced beyond the
-        // pool's last write. That proves the stream is still progressing after this state and lets
-        // TimeStop close quiet pools without reviving any cached/avg fallback.
-        if latest_observed_slot > snapshot_slot {
-            debug!(
-                %base_mint,
-                snapshot_slot,
-                latest_observed_slot,
-                state_age_ms = observed_at_ms.saturating_sub(snapshot.timestamp_ms),
-                "PostBuyGuardian: using currently observed canonical state for shadow runtime"
-            );
-            snapshot.timestamp_ms = observed_at_ms;
-        }
-
-        Some(snapshot)
+        // Runtime freshness belongs to this pool's canonical observation
+        // boundary (`last_observed_*`), which is materialized by
+        // `SnapshotTimeline`.  Global Geyser progress can come from an
+        // unrelated pool and therefore must never make this pool's price look
+        // fresh or look like market activity.
+        self.current_shadow_curve_snapshot_with_curve(base_mint, bonding_curve_override)
     }
 
     fn legacy_shadow_curve_snapshot(&self, base_mint: &Pubkey) -> Option<MarketSnapshot> {
@@ -4161,7 +4163,7 @@ impl MonitoringEngine {
                 comparison_id = %correlation.comparison_id,
                 source_snapshot_id = %correlation.source_snapshot_id,
                 reason = reason.as_label(),
-                "PostBuyGuardian: HET-PM V2 sidecar unavailable; V1 remains unaffected"
+                "PostBuyGuardian: HET-PM V2 sidecar unavailable; shadow lifecycle executor remains unaffected"
             );
             return Err(HetComparisonWriteStatusV1::Skipped { reason, detail });
         };
@@ -8342,6 +8344,10 @@ impl MonitoringEngine {
             } else {
                 (v1_prequote.clone(), crash_prequote.clone())
             };
+        let v2_execution_route_id = (het_policy.authoritative_shadow()
+            && !bundle.base.has_pending_proposal()
+            && prepared.authority_candidate.is_some())
+        .then_some(bundle.v2.route_status.route_id());
 
         let receipt = self
             .run_shadow_runtime_tick_v1(
@@ -8353,6 +8359,7 @@ impl MonitoringEngine {
                     authoritative_prequote: &authoritative_prequote,
                     crash_prequote: &authority_crash_prequote,
                     pre_resolved_quotes: &prepared.quote_cells,
+                    v2_execution_route_id,
                     policy: v1_policy,
                     now_ms,
                 },
@@ -8424,6 +8431,7 @@ impl MonitoringEngine {
                     authoritative_prequote: &authoritative_prequote,
                     crash_prequote: &crash_prequote,
                     pre_resolved_quotes: &[],
+                    v2_execution_route_id: None,
                     policy,
                     now_ms,
                 },
@@ -8446,6 +8454,7 @@ impl MonitoringEngine {
             authoritative_prequote,
             crash_prequote,
             pre_resolved_quotes,
+            v2_execution_route_id,
             policy,
             now_ms,
         } = input;
@@ -8555,6 +8564,7 @@ impl MonitoringEngine {
                             snapshot.snapshot_id(),
                             snapshot.inactivity_age_ms(),
                             crash_guard_quote_requirement,
+                            v2_execution_route_id,
                             now_ms,
                         ) {
                         Ok(action) => Some(action),
@@ -9963,7 +9973,9 @@ mod tests {
     };
     use crate::guardian::post_buy::shadow_v2_execution::ShadowV2ExecutionLabelGrade;
     use ghost_core::account_state_core::reducer::AccountStateReducer;
-    use ghost_core::account_state_core::types::{AccountStateUpdate, UpdateSource};
+    use ghost_core::account_state_core::types::{
+        AccountStateUpdate, RpcRefreshResult, UpdateSource,
+    };
     use ghost_core::market_state::BondingCurve;
     use ghost_core::shadow_ledger::types::PriceState;
     use ghost_core::shadow_ledger::ShadowLedger;
@@ -10264,6 +10276,17 @@ mod tests {
                 },
             )
             .expect("valid HET terminal test registration");
+        if authoritative_v2 {
+            // Production promotes this only from AccountStateCore.  The unit
+            // harness has no reducer feed, so provide explicit supported-route
+            // evidence for tests that exercise the V2 execution path.
+            engine
+                .positions
+                .write()
+                .get_mut(&mint)
+                .expect("registered authoritative test position")
+                .het_route_status = RouteStatusV1::PumpCurveSupported;
+        }
         let snapshot = MarketSnapshot {
             slot: Some(11),
             timestamp_ms: 2_000,
@@ -10621,6 +10644,97 @@ mod tests {
             ghost_core::account_state_core::types::AccountUpdateResult::Applied
                 | ghost_core::account_state_core::types::AccountUpdateResult::PromotedFromBootstrap
         ));
+    }
+
+    #[test]
+    fn unchanged_rpc_refresh_updates_quote_observation_without_vitality_activity() {
+        let account_state_core = AccountStateReducer::new();
+        let mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        apply_test_canonical_update_with_account_proof(
+            &account_state_core,
+            mint,
+            bonding_curve,
+            100,
+            1_000,
+        );
+
+        let canonical = account_state_core
+            .get_canonical_state(&mint)
+            .expect("canonical state from Geyser update");
+        let mut timeline = SnapshotTimeline::default();
+        let initial = timeline
+            .ingest_canonical_state(&canonical, 8, 60_000)
+            .clone();
+        let mut activity = ShadowMarketActivityAnchor::from_registration(1_000, Some(&initial));
+        let mut vitality = TimeStopV2State::from_registration(Some(&initial));
+
+        let refresh = AccountStateUpdate {
+            pool_amm_id: canonical.pool_amm_id,
+            base_mint: mint,
+            bonding_curve,
+            sol_reserves: 210_000_000_000,
+            token_reserves: 760_000_000_000_000,
+            is_complete: 0,
+            // A node may be far ahead of the Geyser event that supplied the
+            // canonical state.  This must refresh only the quote boundary.
+            slot: 500,
+            write_version: Some(0),
+            source_account_pubkey: canonical.source_account_pubkey,
+            source_account_owner_or_program: canonical.source_account_owner_or_program,
+            account_data_len: canonical.account_data_len,
+            account_data_hash: canonical.account_data_hash.clone(),
+            receive_ts_ms: 4_000,
+            receive_seq: 2,
+            curve_finality: canonical.curve_finality,
+            source: UpdateSource::RpcRefresh,
+        };
+        assert_eq!(
+            account_state_core.apply_rpc_refresh(refresh),
+            RpcRefreshResult::ObservationRefreshed
+        );
+
+        let refreshed_state = account_state_core
+            .get_canonical_state(&mint)
+            .expect("refreshed canonical state");
+        let refreshed = timeline
+            .ingest_canonical_state(&refreshed_state, 8, 60_000)
+            .clone();
+
+        assert_eq!(refreshed.timestamp_ms, 4_000);
+        assert_eq!(refreshed.tx_count, initial.tx_count);
+        assert_eq!(timeline.clone_snapshots().len(), 1);
+        assert!(
+            !activity.observe_snapshot(&refreshed, 4_000),
+            "identical RPC bytes must not become a market-activity heartbeat"
+        );
+        assert_eq!(activity.last_seen_ms, 1_000);
+
+        let cfg = TimeStopV2Config {
+            enabled: true,
+            first_check_ms: 3_000,
+            window_ms: 3_000,
+            ..TimeStopV2Config::default()
+        };
+        let evaluation = vitality
+            .evaluate(
+                &cfg,
+                1_000,
+                Some(initial.price_sol_per_token),
+                Some(&refreshed),
+                4_000,
+            )
+            .expect("first scheduled vitality window");
+        assert_eq!(evaluation.status, TimeStopV2WindowStatus::Weak);
+        assert_eq!(evaluation.subreason, TimeStopV2Subreason::NoNewMarketSample);
+        assert_eq!(evaluation.tx_delta_window, Some(0));
+        assert_eq!(
+            vitality
+                .last_checkpoint
+                .map(|checkpoint| checkpoint.tx_count),
+            Some(initial.tx_count),
+            "a quote-only refresh must not advance the vitality checkpoint"
+        );
     }
 
     fn make_shadow_v2_exit_test_engine(
@@ -11883,6 +11997,7 @@ mod tests {
                 decision_snapshot.snapshot_id(),
                 decision_snapshot.inactivity_age_ms(),
                 None,
+                None,
                 200,
             )
             .expect("pending proposal");
@@ -12037,6 +12152,7 @@ mod tests {
                 snapshot.snapshot_id(),
                 snapshot.inactivity_age_ms(),
                 Some(crash_requirement),
+                None,
                 200,
             )
             .expect("CrashGuard proposal");
@@ -13882,6 +13998,7 @@ mod tests {
         let snapshot = MarketSnapshot {
             slot: Some(69),
             timestamp_ms: now_ms,
+            tx_count: 1,
             price_sol_per_token: 1.0,
             price_state: PriceState::Valid,
             market_cap_sol: 1.0,
@@ -14281,7 +14398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_runtime_time_stop_uses_currently_observed_canonical_state_for_quiet_pool() {
+    async fn shadow_runtime_time_stop_does_not_treat_other_pool_progress_as_freshness() {
         let tmp = TempDir::new().expect("tempdir");
         let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
 
@@ -14386,29 +14503,27 @@ mod tests {
             .current_runtime_shadow_snapshot(&mint, observed_at_ms)
             .expect("runtime canonical snapshot");
         assert_eq!(runtime_snapshot.slot, historical_latest.slot);
-        assert_eq!(runtime_snapshot.timestamp_ms, observed_at_ms);
+        assert_eq!(
+            runtime_snapshot.timestamp_ms,
+            historical_latest.timestamp_ms
+        );
 
         engine.tick().await;
 
-        assert_eq!(engine.active_position_count(), 0);
+        assert_eq!(engine.active_position_count(), 1);
 
         let lifecycle_rows = read_jsonl_rows(&lifecycle_log);
         assert!(
-            lifecycle_rows.iter().any(|row| {
-                row.get("record_type") == Some(&Value::String("exit_filled".to_string()))
-                    && row.get("truth_status") == Some(&Value::String("resolved".to_string()))
-                    && row.get("truth_source")
-                        == Some(&Value::String(
-                            "canonical_account_state_snapshot".to_string(),
-                        ))
+            lifecycle_rows.iter().all(|row| {
+                row.get("record_type") != Some(&Value::String("exit_filled".to_string()))
             }),
-            "currently observed canonical state must emit exit_filled proof: {lifecycle_rows:?}"
+            "an unrelated pool update must not manufacture a fresh executable exit: {lifecycle_rows:?}"
         );
         assert!(
-            lifecycle_rows.iter().all(|row| {
-                row.get("truth_status") != Some(&Value::String("stale".to_string()))
+            lifecycle_rows.iter().any(|row| {
+                row.get("truth_status") == Some(&Value::String("stale".to_string()))
             }),
-            "currently observed canonical state must avoid stale close proof: {lifecycle_rows:?}"
+            "the stale pool snapshot must remain stale until this pool is observed again: {lifecycle_rows:?}"
         );
     }
 
@@ -14570,7 +14685,7 @@ mod tests {
     }
 
     #[test]
-    fn het_trajectory_uses_fresh_runtime_observation_without_refreshing_crash_guard() {
+    fn het_trajectory_does_not_treat_timestamp_only_observation_as_market_activity() {
         let mut config = pr2_guardian_config(false, CrashGuardMode::ObserveOnly);
         config.het_pm_v2.enabled = true;
         config.time_stop_v2.enabled = true;
@@ -14652,15 +14767,12 @@ mod tests {
             Some(2_000),
             "CrashGuard must stay on raw canonical samples"
         );
+        assert_eq!(bundle.v2.trajectory.newest_sample_timestamp_ms, Some(2_000));
+        assert_eq!(bundle.v2.trajectory.newest_sample_age_ms, Some(8_000));
         assert_eq!(
-            bundle.v2.trajectory.newest_sample_timestamp_ms,
-            Some(10_000)
-        );
-        assert_eq!(bundle.v2.trajectory.newest_sample_age_ms, Some(0));
-        assert_ne!(
             bundle.v2.trajectory.quality,
             super::super::trajectory_v1::TrajectoryQualityV1::Stale,
-            "fresh runtime observation should prevent false TrajectoryStale"
+            "timestamp-only observation must not create a trajectory sample"
         );
         assert_eq!(
             bundle.base.crash_vector().latest_sample_age_ms(),
@@ -15003,7 +15115,13 @@ mod tests {
             .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
             .await;
 
-        assert_eq!(context.engine.active_position_count(), 0);
+        let position_after_tick = context.engine.positions.read().get(&context.mint).cloned();
+        assert_eq!(
+            context.engine.active_position_count(),
+            0,
+            "V2 MaxHold must pass the guarded executor: position={position_after_tick:?}, lifecycle={:?}",
+            read_jsonl_rows(&context.lifecycle_path)
+        );
         let lifecycle = read_jsonl_rows(&context.lifecycle_path);
         let fill = lifecycle
             .iter()
@@ -15017,6 +15135,51 @@ mod tests {
                 && row["v1_shadow_authority"] == Value::Bool(false)
                 && row["v2_proposal_created"] == Value::Bool(true)
                 && row["v2_economic_mutation"] == Value::Bool(true)
+        }));
+    }
+
+    #[tokio::test]
+    async fn authoritative_shadow_max_hold_on_unsupported_route_never_simulates_fill() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut context = setup_authoritative_het_terminal_exit(&tmp);
+        {
+            let mut positions = context.engine.positions.write();
+            let position = positions
+                .get_mut(&context.mint)
+                .expect("registered position");
+            position.het_route_status = RouteStatusV1::CurveCompletePumpSwapUnsupported;
+        }
+        context.tick_ms = 121_001;
+        context.snapshot.timestamp_ms = context.tick_ms;
+        context.snapshot.slot = Some(12);
+
+        // Exercise the real active-shadow chain: one bundle, HET lattice,
+        // quote planning, authoritative selection and the shared executor.
+        // A fresh synthetic Pump quote is deliberately available; route truth
+        // must still make a fill impossible.
+        context
+            .engine
+            .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
+            .await;
+
+        assert_eq!(context.engine.active_position_count(), 1);
+        assert!(!context.engine.has_pending_terminal_commit(&context.mint));
+        let positions = context.engine.positions.read();
+        let position = positions.get(&context.mint).expect("position remains open");
+        assert!(position.pending_exit_proposal.is_none());
+        assert!(!matches!(
+            position.last_shadow_outcome,
+            Some(ShadowOutcomeKind::SimulatedFilled)
+        ));
+        drop(positions);
+        assert!(read_jsonl_rows(&context.lifecycle_path)
+            .iter()
+            .all(|row| row["record_type"] != "exit_filled"));
+
+        let comparisons = wait_for_jsonl_rows(&context.sidecar_path, 1).await;
+        assert!(comparisons.iter().any(|row| {
+            row["v2_final"] == "Blocked(RouteUnsupported)"
+                && row["v2_selected_execution_reason"].is_null()
         }));
     }
 
@@ -15044,6 +15207,7 @@ mod tests {
                 decision_snapshot.snapshot_id(),
                 decision_snapshot.inactivity_age_ms(),
                 None,
+                None,
                 context.tick_ms,
             )
             .expect("preexisting V1 proposal");
@@ -15056,7 +15220,13 @@ mod tests {
             .run_shadow_runtime_tick(&context.mint, Some(&context.snapshot), context.tick_ms)
             .await;
 
-        assert_eq!(context.engine.active_position_count(), 0);
+        let position_after_tick = context.engine.positions.read().get(&context.mint).cloned();
+        assert_eq!(
+            context.engine.active_position_count(),
+            0,
+            "the sticky V1 proposal must complete unchanged: position={position_after_tick:?}, lifecycle={:?}",
+            read_jsonl_rows(&context.lifecycle_path)
+        );
         let lifecycle = read_jsonl_rows(&context.lifecycle_path);
         let fill = lifecycle
             .iter()

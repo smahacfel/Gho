@@ -2,7 +2,7 @@ use super::monotonic_guard::MonotonicUpdateGuard;
 use super::types::{
     AccountStateFeatures, AccountStateReserveVelocitySnapshotV1, AccountStateUpdate,
     AccountUpdateRejectReason, AccountUpdateResult, BootstrapHints, BootstrapPoolState,
-    CanonicalPoolState, StatePhase,
+    CanonicalPoolState, RpcRefreshResult, StatePhase, UpdateSource,
 };
 use crate::market_state::BondingCurve;
 use crate::PROTOCOL_GENESIS_TOKEN_TOTAL_SUPPLY;
@@ -108,19 +108,23 @@ impl AccountStateReducer {
         ) = if let Some(previous) = previous_state.as_ref() {
             let initial_price_sol =
                 normalize_initial_price(previous.initial_price_sol, previous.price_sol);
+            let previous_data_change_ts_ms = previous
+                .last_data_change_ts_ms
+                .max(previous.last_update_ts_ms);
             let reserve_velocity_sol_per_sec = compute_reserve_velocity_sol_per_sec(
                 previous.real_sol_reserves,
                 curve.real_sol_reserves,
-                previous.last_update_ts_ms,
+                previous_data_change_ts_ms,
                 update.receive_ts_ms,
             );
-            let interval_ms = update.receive_ts_ms.checked_sub(previous.last_update_ts_ms);
+            let interval_ms = update.receive_ts_ms.checked_sub(previous_data_change_ts_ms);
             let status = match interval_ms {
                 Some(0) => crate::metric_contracts::ReserveVelocityStatusV1::ZeroDeltaTime,
                 Some(_) => crate::metric_contracts::ReserveVelocityStatusV1::Measured,
                 None => crate::metric_contracts::ReserveVelocityStatusV1::Unavailable,
             };
-            let (update_count, status) = match previous.update_count.checked_add(1) {
+            let previous_data_change_count = previous.data_change_count.max(previous.update_count);
+            let (update_count, status) = match previous_data_change_count.checked_add(1) {
                 Some(update_count) => (update_count, status),
                 None => (
                     previous.update_count,
@@ -174,6 +178,21 @@ impl AccountStateReducer {
                 is_complete,
                 last_update_slot: update.slot,
                 last_update_ts_ms: update.receive_ts_ms,
+                last_observed_slot: update.slot,
+                last_observed_ts_ms: update.receive_ts_ms,
+                last_observation_source: update.source,
+                observation_count: previous_state
+                    .as_ref()
+                    .map(|state| {
+                        state
+                            .observation_count
+                            .max(state.update_count)
+                            .saturating_add(1)
+                    })
+                    .unwrap_or(1),
+                last_data_change_ts_ms: update.receive_ts_ms,
+                last_data_change_source: update.source,
+                data_change_count: update_count,
                 source_write_version: update.write_version,
                 source_account_pubkey: update.source_account_pubkey,
                 source_account_owner_or_program: update.source_account_owner_or_program,
@@ -208,6 +227,127 @@ impl AccountStateReducer {
         } else {
             AccountUpdateResult::Applied
         }
+    }
+
+    /// Apply a processed-RPC point observation for an already canonical pool.
+    ///
+    /// The RPC context slot says only that a node observed the account at that
+    /// slot.  It is intentionally excluded from `update_guards` and from the
+    /// reducer-wide Geyser ordering watermark: allowing it to advance either
+    /// would let polling reject a later-delivered real account write.
+    #[must_use]
+    pub fn apply_rpc_refresh(&self, update: AccountStateUpdate) -> RpcRefreshResult {
+        if !matches!(update.source, UpdateSource::RpcRefresh) {
+            return RpcRefreshResult::Rejected(AccountUpdateRejectReason::RpcRefreshInvalidSource);
+        }
+        let Some(account_data_hash) = update.account_data_hash.as_deref() else {
+            return RpcRefreshResult::Rejected(
+                AccountUpdateRejectReason::RpcRefreshMissingAccountDataHash,
+            );
+        };
+
+        let mut state = match self.states.get_mut(&update.base_mint) {
+            Some(state) => state,
+            None => {
+                return RpcRefreshResult::Rejected(
+                    AccountUpdateRejectReason::RpcRefreshWithoutCanonicalState,
+                );
+            }
+        };
+        if state.pool_amm_id != update.pool_amm_id || state.bonding_curve != update.bonding_curve {
+            return RpcRefreshResult::Rejected(
+                AccountUpdateRejectReason::RpcRefreshIdentityMismatch,
+            );
+        }
+
+        let next_observation_ts_ms = state.last_observed_ts_ms.max(update.receive_ts_ms);
+        let next_observation_slot = state.last_observed_slot.max(update.slot);
+        let next_observation_count = state
+            .observation_count
+            .max(state.update_count)
+            .saturating_add(1);
+        let same_account_data = state.account_data_hash.as_deref() == Some(account_data_hash);
+        if same_account_data {
+            state.last_observed_slot = next_observation_slot;
+            state.last_observed_ts_ms = next_observation_ts_ms;
+            state.last_observation_source = UpdateSource::RpcRefresh;
+            state.observation_count = next_observation_count;
+            return RpcRefreshResult::ObservationRefreshed;
+        }
+
+        let token_total_supply = state.token_total_supply;
+        let curve = bonding_curve_from_update(&update, token_total_supply);
+        let price_sol = normalized_price_sol(&curve);
+        let market_cap_sol = normalized_market_cap_sol(&curve);
+        let bonding_curve_progress = curve.get_bonding_progress() as f64 / 100.0;
+        let is_complete = update.is_complete != 0;
+        let next_phase = if is_complete {
+            StatePhase::Migrated
+        } else {
+            StatePhase::Canonical
+        };
+        if !state.state_phase.can_transition_to(next_phase) {
+            return RpcRefreshResult::Rejected(
+                AccountUpdateRejectReason::RpcRefreshPhaseRegression,
+            );
+        }
+
+        let previous_real_sol_reserves = state.real_sol_reserves;
+        let previous_data_change_ts_ms = state.last_data_change_ts_ms.max(state.last_update_ts_ms);
+        let reserve_velocity_sol_per_sec = compute_reserve_velocity_sol_per_sec(
+            previous_real_sol_reserves,
+            curve.real_sol_reserves,
+            previous_data_change_ts_ms,
+            update.receive_ts_ms,
+        );
+        let interval_ms = update.receive_ts_ms.checked_sub(previous_data_change_ts_ms);
+        let reserve_velocity_status = match interval_ms {
+            Some(0) => crate::metric_contracts::ReserveVelocityStatusV1::ZeroDeltaTime,
+            Some(_) => crate::metric_contracts::ReserveVelocityStatusV1::Measured,
+            None => crate::metric_contracts::ReserveVelocityStatusV1::Unavailable,
+        };
+        let previous_data_change_count = state.data_change_count.max(state.update_count);
+        let data_change_count = previous_data_change_count.saturating_add(1);
+        let initial_price_sol = normalize_initial_price(state.initial_price_sol, state.price_sol);
+
+        state.virtual_sol_reserves = curve.virtual_sol_reserves;
+        state.virtual_token_reserves = curve.virtual_token_reserves;
+        state.real_sol_reserves = curve.real_sol_reserves;
+        state.real_token_reserves = curve.real_token_reserves;
+        state.bonding_curve_progress = bonding_curve_progress;
+        state.price_sol = price_sol;
+        state.market_cap_sol = market_cap_sol;
+        state.is_complete = is_complete;
+        state.source_account_pubkey = update.source_account_pubkey;
+        state.source_account_owner_or_program = update.source_account_owner_or_program;
+        state.account_data_len = update.account_data_len;
+        state.account_data_hash = update.account_data_hash;
+        state.curve_finality = update.curve_finality;
+        state.state_phase = next_phase;
+        state.update_count = data_change_count;
+        state.initial_price_sol = initial_price_sol;
+        state.price_change_since_t0_pct = compute_price_change_pct(initial_price_sol, price_sol);
+        state.reserve_velocity_sol_per_sec = reserve_velocity_sol_per_sec;
+        state.last_observed_slot = next_observation_slot;
+        state.last_observed_ts_ms = next_observation_ts_ms;
+        state.last_observation_source = UpdateSource::RpcRefresh;
+        state.observation_count = next_observation_count;
+        state.last_data_change_ts_ms = update.receive_ts_ms;
+        state.last_data_change_source = UpdateSource::RpcRefresh;
+        state.data_change_count = data_change_count;
+
+        self.reserve_velocity_evidence.insert(
+            update.base_mint,
+            AccountStateReserveVelocitySnapshotV1 {
+                legacy_velocity_sol_per_sec: reserve_velocity_sol_per_sec,
+                previous_real_sol_reserves_lamports: Some(previous_real_sol_reserves),
+                current_real_sol_reserves_lamports: Some(curve.real_sol_reserves),
+                interval_ms,
+                accepted_update_count: data_change_count,
+                status: reserve_velocity_status,
+            },
+        );
+        RpcRefreshResult::DataChanged
     }
 
     #[must_use]
@@ -369,6 +509,107 @@ mod tests {
             curve_finality: CurveFinality::Provisional,
             source: UpdateSource::GeyserAccountUpdate,
         }
+    }
+
+    fn rpc_refresh_from(
+        canonical: &AccountStateUpdate,
+        slot: u64,
+        ts_ms: u64,
+    ) -> AccountStateUpdate {
+        AccountStateUpdate {
+            slot,
+            write_version: Some(0),
+            receive_ts_ms: ts_ms,
+            receive_seq: 999,
+            source: UpdateSource::RpcRefresh,
+            account_data_hash: Some("rpc-account-data".to_string()),
+            account_data_len: Some(16),
+            source_account_pubkey: Some(canonical.bonding_curve),
+            ..canonical.clone()
+        }
+    }
+
+    #[test]
+    fn identical_rpc_refresh_updates_observation_without_activity_or_geyser_ordering() {
+        let reducer = AccountStateReducer::new();
+        let mut canonical = sample_update(100, 1);
+        canonical.account_data_hash = Some("rpc-account-data".to_string());
+        canonical.account_data_len = Some(16);
+        canonical.source_account_pubkey = Some(canonical.bonding_curve);
+        assert_eq!(
+            reducer.apply_account_update(canonical.clone()),
+            AccountUpdateResult::Applied
+        );
+        let before = reducer
+            .get_canonical_state(&canonical.base_mint)
+            .expect("canonical state");
+        let velocity_before = reducer
+            .get_reserve_velocity_snapshot(&canonical.base_mint)
+            .expect("velocity evidence");
+
+        let refresh = rpc_refresh_from(&canonical, 500, 500_000);
+        assert_eq!(
+            reducer.apply_rpc_refresh(refresh),
+            RpcRefreshResult::ObservationRefreshed
+        );
+        let after = reducer
+            .get_canonical_state(&canonical.base_mint)
+            .expect("canonical state after refresh");
+        assert_eq!(after.last_observed_slot, 500);
+        assert_eq!(after.last_observed_ts_ms, 500_000);
+        assert_eq!(after.last_observation_source, UpdateSource::RpcRefresh);
+        assert_eq!(after.last_data_change_ts_ms, before.last_data_change_ts_ms);
+        assert_eq!(after.data_change_count, before.data_change_count);
+        assert_eq!(after.update_count, before.update_count);
+        assert_eq!(
+            after.reserve_velocity_sol_per_sec,
+            before.reserve_velocity_sol_per_sec
+        );
+        assert_eq!(
+            reducer.get_reserve_velocity_snapshot(&canonical.base_mint),
+            Some(velocity_before)
+        );
+        assert_eq!(reducer.latest_observed_slot(), Some(100));
+
+        let mut delayed_geyser = canonical;
+        delayed_geyser.slot = 101;
+        delayed_geyser.write_version = Some(101);
+        delayed_geyser.receive_seq = 2;
+        delayed_geyser.receive_ts_ms = 101_000;
+        assert_eq!(
+            reducer.apply_account_update(delayed_geyser),
+            AccountUpdateResult::Applied,
+            "a high RPC context slot must not reject a later-delivered Geyser write"
+        );
+    }
+
+    #[test]
+    fn changed_rpc_refresh_updates_data_change_without_advancing_geyser_guard() {
+        let reducer = AccountStateReducer::new();
+        let mut canonical = sample_update(100, 1);
+        canonical.account_data_hash = Some("canonical-account-data".to_string());
+        canonical.account_data_len = Some(16);
+        canonical.source_account_pubkey = Some(canonical.bonding_curve);
+        assert_eq!(
+            reducer.apply_account_update(canonical.clone()),
+            AccountUpdateResult::Applied
+        );
+
+        let mut refresh = rpc_refresh_from(&canonical, 500, 500_000);
+        refresh.account_data_hash = Some("changed-rpc-account-data".to_string());
+        refresh.sol_reserves = refresh.sol_reserves.saturating_add(1_000);
+        assert_eq!(
+            reducer.apply_rpc_refresh(refresh),
+            RpcRefreshResult::DataChanged
+        );
+        let state = reducer
+            .get_canonical_state(&canonical.base_mint)
+            .expect("canonical state after changed refresh");
+        assert_eq!(state.last_update_slot, 100);
+        assert_eq!(state.last_observed_slot, 500);
+        assert_eq!(state.last_data_change_source, UpdateSource::RpcRefresh);
+        assert_eq!(state.data_change_count, 2);
+        assert_eq!(reducer.latest_observed_slot(), Some(100));
     }
 
     #[test]
