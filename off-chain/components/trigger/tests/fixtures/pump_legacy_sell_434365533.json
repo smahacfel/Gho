@@ -1,0 +1,63 @@
+{
+  "schema_version": "pump_route_quote_fixture_v1",
+  "source": {
+    "signature": "2Y68uh5FrbALZFBetEdDkwrPYVfrC2BPuu1sHutGLoMSXrVx2vvfphskstv5t1JziHagqdGDLs1Eb4as54nEQUXk",
+    "slot": 434365533,
+    "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "idl_repository": "https://github.com/pump-fun/pump-public-docs",
+    "idl_commit": "9c82f61cb711b044a17f770ab8ce9f9bdf78f333",
+    "idl_path": "idl/pump.json",
+    "idl_sha256": "b90bc471327f671449271d5d1d42354d1fae6f5a06502f5834459a3108138e49"
+  },
+  "route_variant": "legacy_sell",
+  "instruction_data_hex": "33e685a4017f83ad8bb5d60d6b0d0000c95aa85800000000",
+  "instruction_args": {
+    "base_amount_in": 14753444836747,
+    "min_sol_output": 1487428297
+  },
+  "accounts": [
+    "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",
+    "7VtfL8fvgNfhz17qKRMjzQEXgbdpnHHHQRh54R9jP2RJ",
+    "6P1EKxhPB1ZBMmduhuHZ9DcMVcgHqzj7frPNSduZpump",
+    "9tjWWjthfFY5vJW5XHp1ckmXji8F28pXWwLQtqkBVYDP",
+    "HKmHWXZ6mRxVZQe7qCDacyjTtpSCZzhFvYnGGsL7DTSK",
+    "D2rnwKJaSCpbViF2fUJJc6GxELyCSHpjr8HjYyfg1ruW",
+    "6VCqJ1Jcoy2i2jcfZt15PFQfb6jBb8LQsSExv3kiuEUA",
+    "11111111111111111111111111111111",
+    "3Bhktw9vSBLMLZZh1QiBfgoH4ibtakfHRpCiH7pM5afT",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt",
+    "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+    "2fQ35ig934RRSK25GxoiC3TSdfT3tw2U9UqonFM2hw56",
+    "ETy1VXz4kR6mfqgWSWZTkAWnA3A3qGWNmyuvrUy798J9",
+    "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"
+  ],
+  "reserve_before": {
+    "virtual_base": 462474426627677,
+    "virtual_quote": 69603849321
+  },
+  "reserve_after": {
+    "virtual_base": 477227871464424,
+    "virtual_quote": 67452054314
+  },
+  "program_settlement": {
+    "curve_quote_output": 2151795007,
+    "fees": {
+      "lp_fee": 6455386,
+      "fee_recipient": 10221027,
+      "buyback_fee_recipient": 10221026,
+      "creator_fee": 21248975
+    },
+    "wallet_credit_before_transaction_costs": 2103648593
+  },
+  "transaction_costs": {
+    "base_fee": 5000,
+    "priority_fee": 3000000,
+    "jito_tip": 1185624,
+    "ata_rent": 0
+  },
+  "wallet_credit_after_transaction_costs": 2099457969,
+  "chain_execution_status": "success"
+}
