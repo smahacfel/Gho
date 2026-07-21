@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import signal
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -172,7 +173,7 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
 
     def test_runtime_timeout_requests_controlled_launcher_shutdown(self) -> None:
         self.assertEqual(
-            "timeout --signal=INT --kill-after=120s 5400s ",
+            "timeout --foreground --signal=INT --kill-after=120s 5400s ",
             launcher.build_runtime_timeout_prefix(5400),
         )
         self.assertEqual("", launcher.build_runtime_timeout_prefix(None))
@@ -405,6 +406,7 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
                 launcher=root / "target/release/ghost-launcher",
                 config_path=root / "configs/rollout/r12.toml",
                 runtime_log=root / "reports/runtime.log",
+                runtime_pidfile=root / "reports/runtime.pid",
                 runtime_timeout_seconds=5400,
             )
 
@@ -414,11 +416,62 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
         self.assertNotIn("[ -f ./.env ] && . ./.env", tmux_payload)
         self.assertIn('export NLN_API_KEY="$GHOST_SEER_GRPC_X_TOKEN"', tmux_payload)
         self.assertIn(
-            "timeout --signal=INT --kill-after=120s 5400s",
+            "timeout --foreground --signal=INT --kill-after=120s 5400s",
             tmux_payload,
         )
+        self.assertIn("setsid sh -c", tmux_payload)
+        self.assertIn("runtime.pid", tmux_payload)
         self.assertIn("RUST_BACKTRACE=1", tmux_payload)
         self.assertNotIn("sk_live_", tmux_payload)
+
+    def test_runtime_termination_sends_signal_to_runtime_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "runtime.pid"
+            with (
+                mock.patch.object(launcher, "read_runtime_pgid", return_value=12345),
+                mock.patch.object(launcher.os, "killpg") as killpg,
+                mock.patch.object(launcher, "runtime_process_group_exists", return_value=False),
+                mock.patch.object(launcher, "kill_tmux_session") as kill_tmux,
+                mock.patch.object(launcher, "tmux_session_exists", return_value=False),
+            ):
+                result = launcher.terminate_runtime_process(
+                    session="het_pm_v2_refresh_retry5",
+                    runtime_pidfile=pidfile,
+                    grace_seconds=0,
+                )
+
+        killpg.assert_called_once_with(12345, signal.SIGINT)
+        kill_tmux.assert_called_once_with("het_pm_v2_refresh_retry5")
+        self.assertEqual(["SIGINT"], result["signals_sent"])
+        self.assertFalse(result["runtime_process_group_alive_after"])
+        self.assertFalse(result["tmux_session_exists_after"])
+
+    def test_runtime_termination_escalates_when_group_survives_sigint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "runtime.pid"
+            with (
+                mock.patch.object(launcher, "read_runtime_pgid", return_value=12345),
+                mock.patch.object(launcher.os, "killpg") as killpg,
+                mock.patch.object(
+                    launcher,
+                    "runtime_process_group_exists",
+                    side_effect=[True, True, False],
+                ),
+                mock.patch.object(launcher, "kill_tmux_session"),
+                mock.patch.object(launcher, "tmux_session_exists", return_value=False),
+            ):
+                result = launcher.terminate_runtime_process(
+                    session="het_pm_v2_refresh_retry5",
+                    runtime_pidfile=pidfile,
+                    grace_seconds=0,
+                )
+
+        self.assertEqual(
+            [mock.call(12345, signal.SIGINT), mock.call(12345, signal.SIGKILL)],
+            killpg.call_args_list,
+        )
+        self.assertEqual(["SIGINT", "SIGKILL"], result["signals_sent"])
+        self.assertFalse(result["runtime_process_group_alive_after"])
 
     def test_launcher_zero_buy_lifecycle_allowance_has_distinct_pass_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
