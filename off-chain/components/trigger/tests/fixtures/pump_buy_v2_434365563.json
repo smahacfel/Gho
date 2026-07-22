@@ -1,0 +1,80 @@
+{
+  "schema_version": "pump_route_quote_fixture_v1",
+  "source": {
+    "signature": "2cwZGUYroPdkAsfdN1jsPB6sbdqUhgzrzgUAoTohKnTzvYzMr5YEjJCVDwxLZJ9ugTuGdg4YHYmTLQoZNDQKykrh",
+    "slot": 434365563,
+    "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "idl_repository": "https://github.com/pump-fun/pump-public-docs",
+    "idl_commit": "9c82f61cb711b044a17f770ab8ce9f9bdf78f333",
+    "idl_path": "idl/pump.json",
+    "idl_sha256": "b90bc471327f671449271d5d1d42354d1fae6f5a06502f5834459a3108138e49"
+  },
+  "route_variant": "buy_v2",
+  "instruction_data_hex": "b817ee6167c5d33da7998e392c030000064be11b00000000",
+  "instruction_args": {
+    "requested_base_out": 3488479091111,
+    "max_sol_cost": 467749638
+  },
+  "accounts": [
+    "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",
+    "6P1EKxhPB1ZBMmduhuHZ9DcMVcgHqzj7frPNSduZpump",
+    "So11111111111111111111111111111111111111112",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+    "FWsW1xNtWscwNmKv6wVsU1iTzRN6wmmk3MjxRP5tT7hz",
+    "7xQYoUjUJF1Kg6WVczoTAkaNhn5syQYcbvjmFrhjWpx",
+    "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
+    "GAFuhgcd328SkkBYHpfadzmef9hTGAFRCi9QoCnsZQug",
+    "9tjWWjthfFY5vJW5XHp1ckmXji8F28pXWwLQtqkBVYDP",
+    "HKmHWXZ6mRxVZQe7qCDacyjTtpSCZzhFvYnGGsL7DTSK",
+    "9FZq8CagKxN23rjmMXTAbPWozDjkTGPuMYp93pnzs3wk",
+    "56S29mZ3wqvw8hATuUUFqKhGcSGYFASRRFNT38W8q7G3",
+    "DFpjqhS7KjjbfJ3Z1iT88zDzYNZprotME6V4QTVhGPq1",
+    "GVYgQ23wsZrK8Qe6Hv1KGoBXA2gQqQbbXNT31yFbNbk5",
+    "3Bhktw9vSBLMLZZh1QiBfgoH4ibtakfHRpCiH7pM5afT",
+    "5y5PDbL9Saviioi8oZQUGmftZgfCnZi3L2YrwANbn7zE",
+    "41HfcPtkmGqP8CHrNDtP4xdQqeUHH8nLVfD9RpxoqsRQ",
+    "Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y",
+    "3keQZW9jqiwCRREZ9vXX7Ngek9myaiSzfdeYQtcwnkZX",
+    "GR4WnrUNhcnbiioANtgSj4od7PUTnN26aRi7ET8su9es",
+    "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt",
+    "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+    "11111111111111111111111111111111",
+    "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+  ],
+  "reserve_before": {
+    "virtual_base": 494936173200993,
+    "virtual_quote": 65038689937
+  },
+  "reserve_after": {
+    "virtual_base": 491447694109882,
+    "virtual_quote": 65500358825
+  },
+  "program_settlement": {
+    "curve_quote_input": 461668888,
+    "fees": {
+      "fee_recipient": 2192928,
+      "buyback_fee_recipient": 2192927
+    },
+    "wallet_debit": 466054743
+  },
+  "transaction_costs": {
+    "base_fee": 5000,
+    "priority_fee": 123539,
+    "jito_tip": 0,
+    "ata_rent": 2074080,
+    "user_volume_accumulator_rent": 1385007
+  },
+  "wallet_debit_including_transaction_costs": 469642369,
+  "builder_simulation": {
+    "captured_slot": 434374399,
+    "status": "success",
+    "units_consumed": 101029,
+    "sig_verify": false,
+    "replace_recent_blockhash": true,
+    "prepended_idempotent_base_ata_create": true
+  },
+  "chain_execution_status": "success"
+}

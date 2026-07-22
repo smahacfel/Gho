@@ -53,6 +53,7 @@ pub mod leader_resolver;
 pub mod leader_tracker;
 pub mod metrics;
 pub mod panic_executor;
+pub mod pump_route_v2;
 pub mod revolver;
 pub mod revolver_integration;
 pub mod revolver_price_feed;
@@ -106,6 +107,20 @@ pub use leader_tracker::{
 };
 pub use metrics::TriggerMetrics;
 pub use panic_executor::{KillReason, PanicExecutor};
+pub use pump_route_v2::{
+    decode_pump_route_instruction, pump_route_execution_authorization,
+    require_pump_route_execution_authorization, validate_legacy_buy_account_owners,
+    validate_legacy_buy_instruction, validate_legacy_sell_account_owners,
+    validate_legacy_sell_instruction, validate_route_account_count, validate_v2_account_owners,
+    validate_v2_instruction, DecodedPumpRouteInstruction, PumpLegacyBuyRouteAccounts,
+    PumpLegacyBuyRouteBuilder, PumpLegacySellRouteAccounts, PumpLegacySellRouteBuilder,
+    PumpRouteAccountOwnerEvidence, PumpRouteError, PumpRouteExecutionAuthorizationV1,
+    PumpV2RouteAccounts, PumpV2RouteBuilder, ASSOCIATED_TOKEN_PROGRAM_ID,
+    BUY_EXACT_QUOTE_IN_V2_ACCOUNT_COUNT, BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR, BUY_V2_ACCOUNT_COUNT,
+    BUY_V2_DISCRIMINATOR, LEGACY_BUY_ACCOUNT_COUNT, LEGACY_SELL_ACCOUNT_COUNT, PUMP_FEE_CONFIG_PDA,
+    PUMP_FEE_PROGRAM_ID, SELL_V2_ACCOUNT_COUNT, SELL_V2_DISCRIMINATOR, SPL_TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID, WRAPPED_SOL_MINT,
+};
 pub use revolver::{Bullet, Revolver, StrategyMode, TokenRevolver};
 pub use revolver_integration::{
     create_magazine_after_buy, create_standard_magazine, create_virtual_magazine, MagazineConfig,
