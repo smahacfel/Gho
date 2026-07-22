@@ -7054,6 +7054,7 @@ fn p37_shadow_probe_join_metadata(
         source_decision_row_sha256: record.source_decision_row_sha256.clone(),
         source_v3_feature_snapshot_hash: record.source_v3_feature_snapshot_hash.clone(),
         source_v3_policy_config_hash: record.source_v3_policy_config_hash.clone(),
+        ..ExecutionJoinMetadata::default()
     })
 }
 
@@ -22548,6 +22549,11 @@ fn rug_scalp_join_metadata(intent: &RugScalpEntryIntentV2) -> ExecutionJoinMetad
     ExecutionJoinMetadata {
         strategy_id: Some(RUG_SCALP_V2_STRATEGY_ID.to_string()),
         exit_profile_id: Some(RUG_SCALP_EXIT_PROFILE_ID.to_string()),
+        rug_scalp_entry_total_debit_lamports: Some(intent.entry_total_debit_lamports),
+        rug_scalp_entry_route_id: Some(intent.entry_route_id.clone()),
+        rug_scalp_exit_route_id: Some(intent.exit_route_id.clone()),
+        rug_scalp_entry_fee_schedule_id: Some(intent.entry_fee_schedule_id.clone()),
+        rug_scalp_exit_fee_schedule_id: Some(intent.exit_fee_schedule_id.clone()),
         probe_id: Some(format!("rug-scalp-probe:{}", intent.candidate_id)),
         dispatch_source: Some("rug_scalp_v2_isolated_shadow_adapter".to_string()),
         collection_plane: Some("rug_scalp_v2".to_string()),
@@ -22654,7 +22660,9 @@ async fn send_rug_scalp_post_buy_handoff(
             .live_signature
             .clone()
             .unwrap_or_else(|| format!("rug-scalp-modelled:{}", intent.candidate_id)),
-        amount_sol: request.trade_value_sol,
+        // PM owns PnL against the exact typed `BuyV2` debit plus entry
+        // envelope cost, not against the historical request cap.
+        amount_sol: intent.entry_total_debit_lamports as f64 / 1_000_000_000.0,
         tip_lamports: request.tip_lamports,
         lane: "probe".to_string(),
         epoch_id: epoch,
@@ -22688,6 +22696,55 @@ async fn send_rug_scalp_post_buy_handoff(
     ack_rx
         .await
         .map_err(|_| "post_buy_handoff_ack_channel_closed".to_string())
+}
+
+/// Materializes the exact, independently-authorized `buy_v2` account surface
+/// for the RUG entry adapter.  This is intentionally not the historical
+/// `BuyAccountOverrides` execution path: the latter can describe a routed
+/// exact-SOL-in instruction and is only used here as retained canonical
+/// account evidence.  Missing or ambiguous evidence has no legacy fallback.
+fn rug_scalp_buy_v2_route_evidence_from_canonical(
+    ctx: &PoolObservationContext,
+    mint: Pubkey,
+    pool_data: &DetectedPool,
+    entry_evidence_txs: &[Arc<PoolTransaction>],
+) -> Result<crate::components::trigger::RugScalpBuyV2RouteEvidence, String> {
+    let overrides =
+        derive_active_buy_account_overrides_from_evidence(ctx, mint, pool_data, entry_evidence_txs);
+    let quote_mint = match pool_data.quote_mint.as_str() {
+        "SOL" | "sol" | "WSOL" | "wsol" => trigger::WRAPPED_SOL_MINT,
+        encoded => Pubkey::from_str(encoded)
+            .map_err(|_| format!("unsupported_or_invalid_quote_mint:{encoded}"))?,
+    };
+    if quote_mint != trigger::WRAPPED_SOL_MINT {
+        return Err(format!("unsupported_quote_mint:{quote_mint}"));
+    }
+    let base_token_program = overrides
+        .token_program
+        .ok_or_else(|| "missing_canonical_base_token_program".to_string())?;
+    let creator = overrides
+        .creator_pubkey
+        .filter(|_| overrides.creator_pubkey_authoritative == Some(true))
+        .ok_or_else(|| "missing_authoritative_creator".to_string())?;
+    let fee_recipient = overrides
+        .fee_recipient
+        .ok_or_else(|| "missing_canonical_fee_recipient".to_string())?;
+    // The current observed Pump manifest places the BCV2 account first and
+    // the buyback fee recipient second.  We never derive a replacement from
+    // payer/mint: absent retained route evidence blocks the isolated entry.
+    let buyback_fee_recipient = overrides
+        .buy_remaining_accounts
+        .get(1)
+        .copied()
+        .ok_or_else(|| "missing_observed_buyback_fee_recipient".to_string())?;
+    Ok(crate::components::trigger::RugScalpBuyV2RouteEvidence {
+        quote_mint,
+        base_token_program,
+        quote_token_program: trigger::SPL_TOKEN_PROGRAM_ID,
+        creator,
+        fee_recipient,
+        buyback_fee_recipient,
+    })
 }
 
 /// Executes exactly one isolated, modelled shadow entry for a reducer-owned
@@ -22786,22 +22843,37 @@ async fn run_rug_scalp_v2_entry_adapter(
         return;
     }
 
-    // This is the existing canonical route resolver/Pump builder.  It only
-    // consumes observed account evidence and pool identity, never P37 policy
-    // selection or a Gatekeeper decision.
-    let account_overrides = derive_active_buy_account_overrides_from_evidence(
+    let route_evidence = match rug_scalp_buy_v2_route_evidence_from_canonical(
         ctx.as_ref(),
         mint,
         pool_data.as_ref(),
         &entry_evidence_txs,
-    );
+    ) {
+        Ok(evidence) => evidence,
+        Err(reason) => {
+            let reason = format!("route_not_execution_authorized:{reason}");
+            entry_record.dispatch_status = "entry_failed".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_rug_scalp_entry_terminal(
+                &outcome_log_path,
+                &intent,
+                RugScalpTerminalOutcomeV2::EntryFailed,
+                "route_evidence_incomplete",
+                reason,
+            )
+            .await;
+            return;
+        }
+    };
     let request = match trigger_component
-        .prepare_buy_request_with_decision_ts_and_amount_lamports(
+        .prepare_rug_scalp_buy_v2_request(
             &mint,
-            &account_overrides,
-            0,
-            Some(intent.assessment.signal_ingress_ms),
-            Some(intent.primary_notional_lamports),
+            route_evidence,
+            intent.expected_entry_token_amount_raw,
+            intent.entry_wallet_debit_lamports,
+            intent.entry_total_debit_lamports,
+            intent.assessment.signal_ingress_ms,
         )
         .await
     {
@@ -33148,6 +33220,7 @@ mod tests {
             trade_value_sol: amount_lamports as f64 / LAMPORTS_PER_SOL,
             pre_submit_token_balance: Some(0),
             buy_variant: trigger::PumpfunBuyVariant::RoutedExactSolIn,
+            typed_route_variant: None,
             entry_token_amount_raw: Some(min_tokens_out),
             min_tokens_out,
             token_param_role: "min_tokens_out",
@@ -33286,6 +33359,7 @@ mod tests {
             trade_value_sol: amount_lamports as f64 / LAMPORTS_PER_SOL,
             pre_submit_token_balance: Some(0),
             buy_variant: trigger::PumpfunBuyVariant::LegacyBuy,
+            typed_route_variant: None,
             entry_token_amount_raw: Some(min_tokens_out),
             min_tokens_out,
             token_param_role: "token_amount",

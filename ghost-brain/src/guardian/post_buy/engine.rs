@@ -95,11 +95,12 @@ use super::exit_replay::{
 use super::integration::SHADOW_VIRTUAL_MAGAZINE_TIME_STOP_SECS;
 use super::integration::{PositionRuntimeRouter, ShadowPositionBookAemAdapter};
 use super::rug_scalp::{
-    evaluate_rug_scalp_exit_v1, RugScalpDataCompletenessV1, RugScalpEntryWatermarkV1,
-    RugScalpExitProfileConfigErrorV1, RugScalpExitReasonV1, RugScalpFactIngressResultV1,
-    RugScalpMarketFactKindV1, RugScalpMarketFactStateV1, RugScalpMarketFactV1,
-    RUG_SCALP_EXIT_PROFILE_ID, RUG_SCALP_V2_STRATEGY_ID,
+    evaluate_rug_scalp_exit_v1, RugScalpEntryWatermarkV1, RugScalpExitProfileConfigErrorV1,
+    RugScalpExitReasonV1, RugScalpFactIngressResultV1, RugScalpMarketFactStateV1,
+    RugScalpMarketFactV1, RUG_SCALP_EXIT_PROFILE_ID, RUG_SCALP_V2_STRATEGY_ID,
 };
+#[cfg(test)]
+use super::rug_scalp::{RugScalpDataCompletenessV1, RugScalpMarketFactKindV1};
 #[cfg(test)]
 use super::shadow_v2::ShadowV2ValidationHarnessConfig;
 use super::shadow_v2::{
@@ -2112,6 +2113,13 @@ pub struct PositionJoinMetadata {
     pub rug_scalp_entry_watermark_slot: Option<u64>,
     pub rug_scalp_entry_watermark_tx_index: Option<u32>,
     pub rug_scalp_entry_watermark_event_ordinal: Option<u32>,
+    /// Exact full entry debit (Pump settlement plus transaction envelope) for
+    /// the typed RUG route.  It is the denominator for PM-owned net PnL.
+    pub rug_scalp_entry_total_debit_lamports: Option<u64>,
+    pub rug_scalp_entry_route_id: Option<String>,
+    pub rug_scalp_exit_route_id: Option<String>,
+    pub rug_scalp_entry_fee_schedule_id: Option<String>,
+    pub rug_scalp_exit_fee_schedule_id: Option<String>,
     pub ab_record_id: Option<String>,
     pub source_ab_record_id: Option<String>,
     pub probe_id: Option<String>,
@@ -6288,6 +6296,40 @@ impl MonitoringEngine {
             );
             return None;
         }
+        if is_rug_scalp_position
+            && (event_context
+                .join_metadata
+                .rug_scalp_entry_total_debit_lamports
+                .filter(|value| *value > 0)
+                .is_none()
+                || event_context
+                    .join_metadata
+                    .rug_scalp_entry_route_id
+                    .as_deref()
+                    != Some("buy_v2")
+                || event_context
+                    .join_metadata
+                    .rug_scalp_exit_route_id
+                    .as_deref()
+                    != Some("legacy_sell")
+                || event_context
+                    .join_metadata
+                    .rug_scalp_entry_fee_schedule_id
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || event_context
+                    .join_metadata
+                    .rug_scalp_exit_fee_schedule_id
+                    .as_deref()
+                    .is_none_or(str::is_empty))
+        {
+            warn!(
+                position_id = %position_id,
+                base_mint = %base_mint,
+                "PostBuyGuardian: refused RUG position without typed Pump route/economics evidence"
+            );
+            return None;
+        }
         if matches!(event_context.lane, Lane::Shadow) {
             let valid_entry_price =
                 entry_price_sol.is_some_and(|price| price.is_finite() && price > 0.0);
@@ -6327,7 +6369,14 @@ impl MonitoringEngine {
             entry_time: Instant::now(),
             entry_unix_ms: opened_at_ms,
             entry_price_sol,
-            entry_size_lamports: entry_amount_lamports.unwrap_or(0),
+            entry_size_lamports: if is_rug_scalp_position {
+                event_context
+                    .join_metadata
+                    .rug_scalp_entry_total_debit_lamports
+                    .unwrap_or_default()
+            } else {
+                entry_amount_lamports.unwrap_or(0)
+            },
             entry_token_amount_raw: entry_token_amount_raw.unwrap_or(0),
             remaining_token_amount_raw: entry_token_amount_raw.unwrap_or(0),
             position_id: position_id.clone(),
@@ -6355,15 +6404,20 @@ impl MonitoringEngine {
             last_tcf_score: 1.0,
             last_tradability: 1.0,
             recent_signals: Vec::with_capacity(64),
-            entry_value_sol: entry_amount_lamports.unwrap_or(0) as f64 / 1_000_000_000.0,
-            realized_exit_value_sol: 0.0,
-            estimated_costs_sol: if is_rug_scalp_position {
-                (self.config.rug_scalp_exit_v1.entry_fixed_cost_lamports
-                    + self.config.rug_scalp_exit_v1.exit_fixed_cost_lamports) as f64
-                    / SHADOW_LAMPORTS_PER_SOL_F64
+            entry_value_sol: if is_rug_scalp_position {
+                event_context
+                    .join_metadata
+                    .rug_scalp_entry_total_debit_lamports
+                    .unwrap_or_default() as f64
+                    / 1_000_000_000.0
             } else {
-                0.0
+                entry_amount_lamports.unwrap_or(0) as f64 / 1_000_000_000.0
             },
+            realized_exit_value_sol: 0.0,
+            // RUG's entry total and fact values already include their
+            // non-program transaction ledgers.  Keeping this zero prevents a
+            // second deduction at terminal PnL materialisation.
+            estimated_costs_sol: 0.0,
             realized_pnl_sol: 0.0,
             realized_pnl_pct: 0.0,
             total_exits: 0,
@@ -8555,7 +8609,7 @@ impl MonitoringEngine {
             self.retry_pending_terminal_commit(base_mint, now_ms).await;
             return;
         }
-        let Some(policy) = self.exit_policy_v1.as_ref() else {
+        let Some(_policy) = self.exit_policy_v1.as_ref() else {
             return;
         };
         let Some((facts, entry_slot, entry_size_lamports)) =
@@ -8588,34 +8642,36 @@ impl MonitoringEngine {
             return;
         };
         let profile = &self.config.rug_scalp_exit_v1;
-        let net_return_bps = if facts.blocker_active() {
-            None
-        } else {
-            self.resolve_shadow_exit_truth_for_policy(
-                &snapshot,
-                latest_snapshot.as_ref(),
-                snapshot.remaining_token_amount_raw(),
-                now_ms,
-                self.snapshot_source_for_position(base_mint),
-            )
-            .ok()
-            .and_then(|truth| {
-                let exit_value_lamports =
-                    (truth.exit_value_sol * SHADOW_LAMPORTS_PER_SOL_F64).round() as i128;
-                let intended_lamports = entry_size_lamports as i128;
-                (intended_lamports > 0).then(|| {
-                    let numerator = exit_value_lamports
-                        - intended_lamports
-                        - profile.entry_fixed_cost_lamports as i128
-                        - profile.exit_fixed_cost_lamports as i128;
-                    numerator
-                        .saturating_mul(10_000)
-                        .saturating_div(intended_lamports)
-                        .clamp(i32::MIN as i128, i32::MAX as i128) as i32
-                })
-            })
+        // RUG must not fall back to PriceTruthResolver / BondingCurve's
+        // historical 1% model.  The adapter supplies the full-position value
+        // quoted through `LegacySell`, after current program settlement and
+        // the explicit exit transaction-cost ledger.  The entry amount is the
+        // corresponding `BuyV2` wallet debit plus its envelope cost.
+        let net_return_bps =
+            facts
+                .latest_executable_position_value_lamports()
+                .and_then(|exit_value_lamports| {
+                    let intended_lamports = entry_size_lamports as i128;
+                    (intended_lamports > 0).then(|| {
+                        (exit_value_lamports as i128)
+                            .saturating_sub(intended_lamports)
+                            .saturating_mul(10_000)
+                            .saturating_div(intended_lamports)
+                            .clamp(i32::MIN as i128, i32::MAX as i128)
+                            as i32
+                    })
+                });
+        // A typed RUG fact, not a generic mark, is the primary lifecycle
+        // clock.  A later canonical snapshot may advance the frozen latency
+        // boundary, but an older snapshot can never move the fact backwards.
+        let observed_slot = match (
+            facts.latest_observed_slot(),
+            latest_snapshot.as_ref().and_then(|sample| sample.slot),
+        ) {
+            (Some(fact_slot), Some(snapshot_slot)) => Some(fact_slot.max(snapshot_slot)),
+            (Some(fact_slot), None) => Some(fact_slot),
+            (None, snapshot_slot) => snapshot_slot,
         };
-        let observed_slot = latest_snapshot.as_ref().and_then(|sample| sample.slot);
         let reason = evaluate_rug_scalp_exit_v1(
             &facts,
             profile,
@@ -8696,29 +8752,104 @@ impl MonitoringEngine {
             | Some(RugScalpExitReasonV1::Hold)
             | None => None,
         };
-        let authoritative_prequote = candidate.map_or(PreQuoteDecision::Hold, |candidate| {
-            PreQuoteDecision::QuoteRequired { candidate }
-        });
-        let crash_prequote = CrashGuardPreQuoteDecision::Disabled;
-        let _ = self
-            .run_shadow_runtime_tick_v1(
-                base_mint,
-                V1AuthorityTickInput {
-                    snapshot: &snapshot,
-                    latest_snapshot: latest_snapshot.as_ref(),
-                    crash_evidence_snapshot: None,
-                    authoritative_prequote: &authoritative_prequote,
-                    crash_prequote: &crash_prequote,
-                    pre_resolved_quotes: &[],
-                    v2_execution_route_id: None,
-                    policy,
-                    now_ms,
-                },
-            )
-            .await;
+        if let Some(candidate) = candidate {
+            self.run_rug_scalp_typed_exit(base_mint, &snapshot, candidate, now_ms);
+        }
         if self.has_pending_terminal_commit(base_mint) {
             self.retry_pending_terminal_commit(base_mint, now_ms).await;
         }
+    }
+
+    /// Commit one RUG terminal through the existing Position Manager guarded
+    /// proposal/apply/terminal pipeline.  Unlike generic V1 exits, this path
+    /// accepts only the adapter's typed `LegacySell` value; it never asks the
+    /// old generic quote resolver to re-price the position.
+    fn run_rug_scalp_typed_exit(
+        &self,
+        base_mint: &Pubkey,
+        snapshot: &PostBuyDecisionSnapshot,
+        candidate: ExitCandidate,
+        now_ms: u64,
+    ) {
+        let Some((exit_value_lamports, exit_value_slot, entry_value_lamports)) =
+            self.positions.read().get(base_mint).and_then(|position| {
+                position.rug_scalp_facts.as_ref().and_then(|facts| {
+                    facts
+                        .latest_executable_position_value_lamports()
+                        .zip(facts.latest_executable_position_value_slot())
+                        .map(|(value, slot)| (value, slot, position.entry_size_lamports))
+                })
+            })
+        else {
+            return;
+        };
+        if entry_value_lamports == 0 || snapshot.remaining_token_amount_raw() == 0 {
+            return;
+        }
+        let action = match self.begin_exit_proposal(
+            base_mint,
+            snapshot.guard(),
+            &candidate,
+            snapshot.snapshot_id(),
+            snapshot.inactivity_age_ms(),
+            None,
+            None,
+            now_ms,
+        ) {
+            Ok(action) => action,
+            Err(
+                PositionApplyError::ConcurrentActionPending | PositionApplyError::StaleRevision,
+            ) => {
+                return;
+            }
+            Err(error) => {
+                debug!(base_mint = %base_mint, error = %error, "PostBuyGuardian: typed RUG exit proposal rejected");
+                return;
+            }
+        };
+        let entry_value_sol = entry_value_lamports as f64 / SHADOW_LAMPORTS_PER_SOL_F64;
+        let exit_value_sol = exit_value_lamports as f64 / SHADOW_LAMPORTS_PER_SOL_F64;
+        let gross_pnl_sol = exit_value_sol - entry_value_sol;
+        let pnl_pct = (gross_pnl_sol / entry_value_sol) * 100.0;
+        let quantity = snapshot.remaining_token_amount_raw();
+        // The valuation itself is the adapter's canonical `LegacySell`
+        // settlement.  Do not mislabel a missing generic MarketSnapshot as a
+        // semantic violation, and do not claim a mark price supplied the
+        // exit economics.
+        let evidence = PriceTruthEvidence {
+            source: self.snapshot_source_for_position(base_mint),
+            status: PriceTruthStatus::Resolved,
+            detail: Some("rug_scalp_pump_quote_v1_legacy_sell".to_string()),
+            slot: Some(exit_value_slot),
+            timestamp_ms: None,
+            age_ms: None,
+            price_state: None,
+            price_reason: None,
+        };
+        let truth = ShadowExitTruth {
+            exit_price_sol: exit_value_sol / quantity as f64,
+            exit_token_amount_raw: quantity,
+            entry_value_sol,
+            exit_value_sol,
+            gross_pnl_sol,
+            net_pnl_sol: gross_pnl_sol,
+            estimated_costs_sol: 0.0,
+            pnl_pct,
+            evidence,
+        };
+        if let Err(error) = self.apply_shadow_quote_outcome(&action, snapshot, &truth) {
+            debug!(action_id = %action.action_id, error = %error, "PostBuyGuardian: typed RUG quote apply rejected");
+            return;
+        }
+        let exit = super::integration::ShadowExitExecution {
+            position_id: action.position_id.clone(),
+            position_epoch: action.position_epoch,
+            fraction_bps: 10_000,
+            remaining_fraction_bps: 0,
+            fill_price: truth.exit_price_sol,
+        };
+        self.emit_shadow_exit_for_action(&action, &exit, &truth, now_ms);
+        self.finish_resolved_shadow_position(action, now_ms);
     }
 
     /// A typed RUG data/identity/route blocker has no executable sell fact.
@@ -10405,6 +10536,19 @@ mod tests {
             .collect()
     }
 
+    fn typed_rug_scalp_join_metadata(total_entry_debit_lamports: u64) -> PositionJoinMetadata {
+        PositionJoinMetadata {
+            strategy_id: Some(RUG_SCALP_V2_STRATEGY_ID.to_string()),
+            exit_profile_id: Some(RUG_SCALP_EXIT_PROFILE_ID.to_string()),
+            rug_scalp_entry_total_debit_lamports: Some(total_entry_debit_lamports),
+            rug_scalp_entry_route_id: Some("buy_v2".to_string()),
+            rug_scalp_exit_route_id: Some("legacy_sell".to_string()),
+            rug_scalp_entry_fee_schedule_id: Some("test-buy-v2@0".to_string()),
+            rug_scalp_exit_fee_schedule_id: Some("test-legacy-sell@0".to_string()),
+            ..PositionJoinMetadata::default()
+        }
+    }
+
     #[test]
     fn concurrent_lifecycle_jsonl_appends_preserve_record_boundaries() {
         let tmp = TempDir::new().expect("tempdir");
@@ -11663,11 +11807,7 @@ mod tests {
                 Some(100_000_000),
                 Some(1_000_000),
                 PositionEventContext {
-                    join_metadata: PositionJoinMetadata {
-                        strategy_id: Some(RUG_SCALP_V2_STRATEGY_ID.to_string()),
-                        exit_profile_id: Some(RUG_SCALP_EXIT_PROFILE_ID.to_string()),
-                        ..PositionJoinMetadata::default()
-                    },
+                    join_metadata: typed_rug_scalp_join_metadata(1_000_000),
                     candidate_id: "rug-scalp-data-gap".to_string(),
                     entry_order_id: "rug-scalp-entry-data-gap".to_string(),
                     quote_id: "rug-scalp-quote-data-gap".to_string(),
@@ -11755,12 +11895,10 @@ mod tests {
                 Some(1_000_000),
                 PositionEventContext {
                     join_metadata: PositionJoinMetadata {
-                        strategy_id: Some(RUG_SCALP_V2_STRATEGY_ID.to_string()),
-                        exit_profile_id: Some(RUG_SCALP_EXIT_PROFILE_ID.to_string()),
                         rug_scalp_entry_watermark_slot: Some(71),
                         rug_scalp_entry_watermark_tx_index: Some(1),
                         rug_scalp_entry_watermark_event_ordinal: Some(0),
-                        ..PositionJoinMetadata::default()
+                        ..typed_rug_scalp_join_metadata(1_000)
                     },
                     candidate_id: "rug-scalp-replayed-material-sell".to_string(),
                     entry_order_id: "rug-scalp-entry-replayed-material-sell".to_string(),
@@ -11863,8 +12001,6 @@ mod tests {
         config.target_threshold = Some(50.0);
         config.stoploss_threshold = Some(50.0);
         config.rug_scalp_exit_v1.enabled = true;
-        config.rug_scalp_exit_v1.entry_fixed_cost_lamports = 100;
-        config.rug_scalp_exit_v1.exit_fixed_cost_lamports = 200;
         let (tx, _rx) = mpsc::channel(4);
         let mut engine = MonitoringEngine::try_new(config, Arc::clone(&shadow_ledger), tx)
             .expect("valid RUG PM profile");
@@ -11882,11 +12018,7 @@ mod tests {
                 Some(100_000_000),
                 Some(1_000_000),
                 PositionEventContext {
-                    join_metadata: PositionJoinMetadata {
-                        strategy_id: Some(RUG_SCALP_V2_STRATEGY_ID.to_string()),
-                        exit_profile_id: Some(RUG_SCALP_EXIT_PROFILE_ID.to_string()),
-                        ..PositionJoinMetadata::default()
-                    },
+                    join_metadata: typed_rug_scalp_join_metadata(1_000_300),
                     candidate_id: "rug-scalp-flow-exit".to_string(),
                     entry_order_id: "rug-scalp-entry-flow-exit".to_string(),
                     quote_id: "rug-scalp-quote-flow-exit".to_string(),
@@ -11910,7 +12042,7 @@ mod tests {
             reserve_before: None,
             reserve_after: None,
             executable_position_value_before: None,
-            executable_position_value_after: None,
+            executable_position_value_after: Some(1_000_000),
             data_completeness: RugScalpDataCompletenessV1::Complete,
         };
         assert_eq!(
@@ -11971,7 +12103,11 @@ mod tests {
             .find(|row| row["record_type"] == "position_closed")
             .expect("flow close lifecycle");
         assert_eq!(closed["exit_policy_reason_code"], "flow_exhausted");
-        assert_eq!(closed["net_pnl_sol"], -0.000_000_3);
+        assert!(
+            (closed["net_pnl_sol"].as_f64().expect("net PnL SOL") + 0.000_000_3).abs()
+                < f64::EPSILON,
+            "the authoritative assertion is the exact -300 lamport result above; JSON SOL is a display projection"
+        );
     }
 
     #[test]

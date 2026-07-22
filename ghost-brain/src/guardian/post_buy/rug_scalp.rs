@@ -331,10 +331,26 @@ pub struct RugScalpMarketFactStateV1 {
     recent_fact_ids: VecDeque<String>,
     slots: BTreeMap<u64, RugScalpSlotAccumulatorV1>,
     last_completed_slot: Option<u64>,
+    /// Last canonical trade order consumed by this position.  Facts are a
+    /// lifecycle evidence stream, so a late lower-order trade is a data
+    /// integrity failure rather than an opportunity to rewrite valuation.
+    last_accepted_trade_order: Option<(u64, u32, u32)>,
     material_sell_due: bool,
     consecutive_empty_complete_slots: u8,
     data_or_route_blocked: bool,
     entry_watermark: Option<RugScalpEntryWatermarkV1>,
+    /// Latest adapter-materialised *net executable* full-position value.
+    /// It is produced by the typed Pump route contract, not reconstructed by
+    /// Position Manager from a mark or the historical one-percent simulator.
+    latest_executable_position_value_lamports: Option<u64>,
+    /// Canonical slot of the fact that produced the current executable value.
+    /// It lets the PM audit the typed `LegacySell` quote without claiming that
+    /// a generic `MarketSnapshot` was the pricing authority.
+    latest_executable_position_value_slot: Option<u64>,
+    /// Highest accepted canonical fact slot.  This is separate from the
+    /// executable-value slot: a later `SLOT_COMPLETE` can advance lifecycle
+    /// latency without fabricating a fresh executable quote.
+    latest_observed_slot: Option<u64>,
 }
 
 impl RugScalpMarketFactStateV1 {
@@ -345,10 +361,14 @@ impl RugScalpMarketFactStateV1 {
             recent_fact_ids: VecDeque::with_capacity(MAX_RECENT_FACT_IDS),
             slots: BTreeMap::new(),
             last_completed_slot: None,
+            last_accepted_trade_order: None,
             material_sell_due: false,
             consecutive_empty_complete_slots: 0,
             data_or_route_blocked: false,
             entry_watermark: None,
+            latest_executable_position_value_lamports: None,
+            latest_executable_position_value_slot: None,
+            latest_observed_slot: None,
         }
     }
 
@@ -399,11 +419,35 @@ impl RugScalpMarketFactStateV1 {
         if self.recent_fact_ids.iter().any(|seen| seen == &fact_id) {
             return RugScalpFactIngressResultV1::Duplicate;
         }
+        if matches!(
+            fact.fact_kind,
+            RugScalpMarketFactKindV1::SuccessfulBuy | RugScalpMarketFactKindV1::SuccessfulSell
+        ) {
+            let order = (
+                fact.slot,
+                fact.tx_index.unwrap_or_default(),
+                fact.event_ordinal.unwrap_or_default(),
+            );
+            let behind_completed_slot = self
+                .last_completed_slot
+                .is_some_and(|slot| fact.slot <= slot);
+            let non_monotonic_trade = self
+                .last_accepted_trade_order
+                .is_some_and(|last| order <= last);
+            if behind_completed_slot || non_monotonic_trade {
+                // There is no safe replay buffer inside PM for a fact whose
+                // canonical order has already been passed.  Preserve a typed
+                // evidence failure instead of letting a late fact overwrite
+                // the latest executable value.
+                self.data_or_route_blocked = true;
+                self.consecutive_empty_complete_slots = 0;
+                return RugScalpFactIngressResultV1::RejectedInvalidFact;
+            }
+        }
         self.recent_fact_ids.push_back(fact_id);
         if self.recent_fact_ids.len() > MAX_RECENT_FACT_IDS {
             self.recent_fact_ids.pop_front();
         }
-
         match fact.fact_kind {
             RugScalpMarketFactKindV1::DataGap => {
                 // A data gap never creates a synthetic empty slot.  The
@@ -418,6 +462,15 @@ impl RugScalpMarketFactStateV1 {
                 }
             }
             RugScalpMarketFactKindV1::SuccessfulBuy | RugScalpMarketFactKindV1::SuccessfulSell => {
+                if let Some(value) = fact.executable_position_value_after {
+                    self.latest_executable_position_value_lamports = Some(value);
+                    self.latest_executable_position_value_slot = Some(fact.slot);
+                }
+                self.last_accepted_trade_order = Some((
+                    fact.slot,
+                    fact.tx_index.unwrap_or_default(),
+                    fact.event_ordinal.unwrap_or_default(),
+                ));
                 self.slots.entry(fact.slot).or_default().observe(&fact);
             }
             RugScalpMarketFactKindV1::SlotComplete => {
@@ -429,6 +482,14 @@ impl RugScalpMarketFactStateV1 {
                     self.data_or_route_blocked = true;
                     self.consecutive_empty_complete_slots = 0;
                 }
+                if self
+                    .last_accepted_trade_order
+                    .is_some_and(|(slot, _, _)| slot > fact.slot)
+                {
+                    self.data_or_route_blocked = true;
+                    self.consecutive_empty_complete_slots = 0;
+                    return RugScalpFactIngressResultV1::RejectedInvalidFact;
+                }
                 let mut slot = self.slots.remove(&fact.slot).unwrap_or_default();
                 // `SLOT_COMPLETE` carries the adapter's canonical aggregate as
                 // well.  This keeps the PM robust if individual buy facts were
@@ -436,6 +497,14 @@ impl RugScalpMarketFactStateV1 {
                 slot.successful_buy_count = slot
                     .successful_buy_count
                     .max(fact.successful_buy_count_in_slot);
+                // Empty completed slots may still carry a canonical
+                // full-position `LegacySell` valuation.  This is essential
+                // for a FLOW_EXHAUSTED close: no buy occurred in either slot,
+                // but PM must not fall back to a mark-price estimate.
+                if let Some(value) = fact.executable_position_value_after {
+                    self.latest_executable_position_value_lamports = Some(value);
+                    self.latest_executable_position_value_slot = Some(fact.slot);
+                }
                 self.last_completed_slot = Some(fact.slot);
                 if slot.material_sell(profile) {
                     self.material_sell_due = true;
@@ -451,6 +520,13 @@ impl RugScalpMarketFactStateV1 {
                 self.slots.retain(|slot_id, _| *slot_id > fact.slot);
             }
         }
+        // Only a fact that fully passed its variant-specific ordering checks
+        // is allowed to advance the lifecycle clock.  In particular, a
+        // rejected stale `SLOT_COMPLETE` must not shorten the frozen latency.
+        self.latest_observed_slot = Some(
+            self.latest_observed_slot
+                .map_or(fact.slot, |slot| slot.max(fact.slot)),
+        );
         RugScalpFactIngressResultV1::Applied
     }
 
@@ -464,6 +540,24 @@ impl RugScalpMarketFactStateV1 {
 
     pub fn flow_exhausted(&self, profile: &RugScalpExitProfileConfigV1) -> bool {
         self.consecutive_empty_complete_slots >= profile.flow_stop_empty_slots
+    }
+
+    /// The value includes the typed route's program settlement and explicit
+    /// transaction-envelope debit exactly once.  `None` is an evidence gap,
+    /// never a zero-valued executable position.
+    pub fn latest_executable_position_value_lamports(&self) -> Option<u64> {
+        self.latest_executable_position_value_lamports
+    }
+
+    /// Slot in which the current exact executable value was materialised.
+    pub fn latest_executable_position_value_slot(&self) -> Option<u64> {
+        self.latest_executable_position_value_slot
+    }
+
+    /// Last accepted fact slot, used solely to advance the RUG lifecycle's
+    /// frozen slot-latency boundary.
+    pub fn latest_observed_slot(&self) -> Option<u64> {
+        self.latest_observed_slot
     }
 }
 
@@ -734,6 +828,67 @@ mod tests {
                 100,
             ),
             RugScalpExitReasonV1::Hold
+        );
+    }
+
+    #[test]
+    fn slot_complete_carries_the_only_valid_empty_slot_exit_valuation() {
+        let (position_id, mint) = position();
+        let profile = RugScalpExitProfileConfigV1::default();
+        let mut state = RugScalpMarketFactStateV1::new(position_id.clone(), mint);
+        let mut empty_complete = complete(&position_id, mint, 41, 0);
+        empty_complete.executable_position_value_after = Some(987_654);
+
+        assert_eq!(
+            state.apply_fact(empty_complete, &profile),
+            RugScalpFactIngressResultV1::Applied
+        );
+        assert_eq!(
+            state.latest_executable_position_value_lamports(),
+            Some(987_654)
+        );
+        assert_eq!(state.latest_executable_position_value_slot(), Some(41));
+        assert_eq!(state.latest_observed_slot(), Some(41));
+    }
+
+    #[test]
+    fn late_trade_after_slot_complete_invalidates_instead_of_repricing_position() {
+        let (position_id, mint) = position();
+        let profile = RugScalpExitProfileConfigV1::default();
+        let mut state = RugScalpMarketFactStateV1::new(position_id.clone(), mint);
+        let mut accepted = fact(
+            &position_id,
+            mint,
+            51,
+            RugScalpMarketFactKindV1::SuccessfulSell,
+        );
+        accepted.executable_position_value_after = Some(900);
+        assert_eq!(
+            state.apply_fact(accepted, &profile),
+            RugScalpFactIngressResultV1::Applied
+        );
+        assert_eq!(
+            state.apply_fact(complete(&position_id, mint, 51, 0), &profile),
+            RugScalpFactIngressResultV1::Applied
+        );
+
+        let mut late = fact(
+            &position_id,
+            mint,
+            51,
+            RugScalpMarketFactKindV1::SuccessfulSell,
+        );
+        late.tx_index = Some(2);
+        late.executable_position_value_after = Some(1_500);
+        assert_eq!(
+            state.apply_fact(late, &profile),
+            RugScalpFactIngressResultV1::RejectedInvalidFact
+        );
+        assert!(state.blocker_active());
+        assert_eq!(
+            state.latest_executable_position_value_lamports(),
+            Some(900),
+            "a late higher valuation must not rewrite the completed canonical slot"
         );
     }
 

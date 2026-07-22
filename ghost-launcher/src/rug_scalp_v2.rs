@@ -13,6 +13,10 @@ use ghost_brain::guardian::post_buy::{
     RugScalpMarketFactKindV1, RugScalpMarketFactV1,
 };
 use ghost_core::market_state::BondingCurve;
+use ghost_core::{
+    ProgramFeeSchedule, PumpQuoteError, PumpQuoteV1, PumpReserveState, PumpRouteVariant,
+    RuntimeProgramFeeScheduleRegistryV1, TransactionCosts,
+};
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
@@ -22,6 +26,144 @@ pub const RUG_SCALP_EXIT_PROFILE_ID: &str = "rug_scalp_exit_v1";
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 const MAX_TRACKED_TRADES_PER_MINT: usize = 64;
 const MAX_QTP_SEARCH_LAMPORTS: u64 = 1_000 * LAMPORTS_PER_SOL;
+pub const RUG_SCALP_ENTRY_ROUTE: PumpRouteVariant = PumpRouteVariant::BuyV2;
+pub const RUG_SCALP_EXIT_ROUTE: PumpRouteVariant = PumpRouteVariant::LegacySell;
+
+/// Frozen runtime authority for the two and only two Pump routes used by the
+/// prospective RUG experiment.  The serialized form is deliberately only an
+/// input to [`RuntimeProgramFeeScheduleRegistryV1`]: fixture evidence is
+/// rejected by that registry before a RUG quote can be materialised.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RugScalpPumpQuoteAuthorityV1 {
+    pub schedules: Vec<RugScalpPumpFeeScheduleV1>,
+    pub entry_transaction_costs: TransactionCosts,
+    pub exit_transaction_costs: TransactionCosts,
+}
+
+impl Default for RugScalpPumpQuoteAuthorityV1 {
+    fn default() -> Self {
+        Self {
+            schedules: Vec::new(),
+            entry_transaction_costs: TransactionCosts::default(),
+            exit_transaction_costs: TransactionCosts::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RugScalpPumpFeeScheduleV1 {
+    pub route_variant: PumpRouteVariant,
+    pub schedule: ProgramFeeSchedule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RugScalpPumpQuoteContractV1 {
+    registry: RuntimeProgramFeeScheduleRegistryV1,
+    entry_transaction_costs: TransactionCosts,
+    exit_transaction_costs: TransactionCosts,
+}
+
+impl RugScalpPumpQuoteAuthorityV1 {
+    fn materialize(&self) -> Result<RugScalpPumpQuoteContractV1, PumpQuoteError> {
+        let mut registry = RuntimeProgramFeeScheduleRegistryV1::default();
+        for entry in &self.schedules {
+            if !matches!(
+                entry.route_variant,
+                RUG_SCALP_ENTRY_ROUTE | RUG_SCALP_EXIT_ROUTE
+            ) {
+                return Err(PumpQuoteError::InvalidFeeEvidence {
+                    detail: format!(
+                        "rug_scalp_v2 route {} is typed but not execution-authorized",
+                        entry.route_variant.as_str()
+                    ),
+                });
+            }
+            registry.register(entry.route_variant, entry.schedule.clone())?;
+        }
+        // Resolve neither schedule here: resolution is deliberately bound to
+        // every canonical quote slot below.  This only rejects malformed
+        // transaction-cost evidence before a runtime adapter is created.
+        self.entry_transaction_costs.net_wallet_debit()?;
+        self.exit_transaction_costs.net_wallet_debit()?;
+        Ok(RugScalpPumpQuoteContractV1 {
+            registry,
+            entry_transaction_costs: self.entry_transaction_costs,
+            exit_transaction_costs: self.exit_transaction_costs,
+        })
+    }
+}
+
+impl RugScalpPumpQuoteContractV1 {
+    fn entry_transaction_cost_lamports(&self) -> Result<u64, PumpQuoteError> {
+        self.entry_transaction_costs.net_wallet_debit()
+    }
+
+    fn exit_transaction_cost_lamports(&self) -> Result<u64, PumpQuoteError> {
+        self.exit_transaction_costs.net_wallet_debit()
+    }
+
+    fn quote_buy_v2_under_wallet_cap(
+        &self,
+        slot: u64,
+        reserves: PumpReserveState,
+        max_wallet_debit: u64,
+    ) -> Result<PumpQuoteV1, PumpQuoteError> {
+        if max_wallet_debit == 0 || reserves.real_base_reserves == 0 {
+            return Err(PumpQuoteError::ZeroAmount);
+        }
+        let mut lower = 1_u64;
+        let mut upper = reserves.real_base_reserves;
+        let mut best = None;
+        while lower <= upper {
+            let middle = lower.saturating_add(upper.saturating_sub(lower) / 2);
+            let quote = self.registry.quote_exact_base_out(
+                RUG_SCALP_ENTRY_ROUTE,
+                slot,
+                reserves,
+                middle,
+                max_wallet_debit,
+            )?;
+            if quote.instruction_limit_check.passed {
+                best = Some(quote);
+                lower = middle.saturating_add(1);
+            } else {
+                upper = middle.saturating_sub(1);
+            }
+        }
+        best.ok_or(PumpQuoteError::ZeroAmount)
+    }
+
+    fn quote_exit_value(
+        &self,
+        slot: u64,
+        reserves: PumpReserveState,
+        token_amount: u64,
+    ) -> Result<PumpQuoteV1, PumpQuoteError> {
+        self.registry.quote_exact_base_in_sell(
+            RUG_SCALP_EXIT_ROUTE,
+            slot,
+            reserves,
+            token_amount,
+            0,
+        )
+    }
+
+    fn executable_exit_value_lamports(
+        &self,
+        slot: u64,
+        reserves: PumpReserveState,
+        token_amount: u64,
+    ) -> Result<(PumpQuoteV1, u64), PumpQuoteError> {
+        let quote = self.quote_exit_value(slot, reserves, token_amount)?;
+        let net = quote
+            .program_settlement
+            .wallet_debit_or_credit
+            .checked_sub(self.exit_transaction_cost_lamports()?)
+            .ok_or(PumpQuoteError::TransactionRefundExceedsDebit)?;
+        Ok((quote, net))
+    }
+}
 
 /// Frozen prospective settings for the RUG SCALP V2 experiment.
 ///
@@ -72,12 +214,16 @@ pub struct RugScalpV2Config {
     /// Exactly one terminal outcome row per entry attempt or registered
     /// position.  The PM lifecycle file remains the detailed close authority.
     pub outcome_log_path: String,
-    /// Fixed non-program costs applied once per entry attempt.  Program fees
-    /// are already embedded in [`BondingCurve::simulate_buy`] and must not be
-    /// duplicated here.
+    /// Backwards-compatible mirror of the typed entry transaction envelope.
+    /// Program fees come only from `PumpQuoteV1` and must never be added here.
     pub entry_fixed_cost_lamports: Option<u64>,
     /// Fixed non-program costs applied once per full-position exit attempt.
     pub exit_fixed_cost_lamports: Option<u64>,
+    /// Slot-resolved Pump V2 fee authority and the separately accounted
+    /// transaction envelope.  This must be materialised from current
+    /// on-chain/effective-slot evidence; a canonical fixture is rejected by
+    /// the runtime registry and can only exercise offline quote tests.
+    pub pump_quote_authority: Option<RugScalpPumpQuoteAuthorityV1>,
 }
 
 impl Default for RugScalpV2Config {
@@ -120,6 +266,7 @@ impl Default for RugScalpV2Config {
             outcome_log_path: "logs/rug_scalp_v2/rug_scalp_outcomes_v2.jsonl".to_string(),
             entry_fixed_cost_lamports: None,
             exit_fixed_cost_lamports: None,
+            pump_quote_authority: None,
         }
     }
 }
@@ -147,6 +294,31 @@ impl RugScalpV2Config {
         }
         if self.entry_fixed_cost_lamports.is_none() || self.exit_fixed_cost_lamports.is_none() {
             return Err(RugScalpConfigError::CostModelNotFrozen);
+        }
+        let quote_authority = self
+            .pump_quote_authority
+            .as_ref()
+            .ok_or(RugScalpConfigError::PumpQuoteAuthorityNotFrozen)?;
+        let quote_contract = quote_authority
+            .materialize()
+            .map_err(|_| RugScalpConfigError::InvalidPumpQuoteAuthority)?;
+        // The historical scalar values remain only as a backwards-compatible
+        // config surface.  They must exactly mirror the typed envelope costs,
+        // never replace the typed Pump settlement contract.
+        if self.entry_fixed_cost_lamports
+            != Some(
+                quote_contract
+                    .entry_transaction_cost_lamports()
+                    .map_err(|_| RugScalpConfigError::InvalidPumpQuoteAuthority)?,
+            )
+            || self.exit_fixed_cost_lamports
+                != Some(
+                    quote_contract
+                        .exit_transaction_cost_lamports()
+                        .map_err(|_| RugScalpConfigError::InvalidPumpQuoteAuthority)?,
+                )
+        {
+            return Err(RugScalpConfigError::CostModelMismatch);
         }
         if self.primary_notional_lamports().is_none()
             || self.sensitivity_notional_lamports().is_none()
@@ -215,6 +387,9 @@ pub enum RugScalpConfigError {
     ModeMustBeObserveOnly,
     LatencyNotFrozen,
     CostModelNotFrozen,
+    PumpQuoteAuthorityNotFrozen,
+    InvalidPumpQuoteAuthority,
+    CostModelMismatch,
     InvalidNotional,
     InvalidPositionManagerProfile,
     MissingArtifactPath,
@@ -230,6 +405,15 @@ impl std::fmt::Display for RugScalpConfigError {
             Self::LatencyNotFrozen => "rug_scalp_v2 latency slots must be frozen before enable",
             Self::CostModelNotFrozen => {
                 "rug_scalp_v2 fixed cost model must be frozen before enable"
+            }
+            Self::PumpQuoteAuthorityNotFrozen => {
+                "rug_scalp_v2 requires slot-resolved Pump fee authority before enable"
+            }
+            Self::InvalidPumpQuoteAuthority => {
+                "rug_scalp_v2 Pump fee authority is invalid or cannot authorize runtime quotes"
+            }
+            Self::CostModelMismatch => {
+                "rug_scalp_v2 legacy cost totals must equal the typed transaction-cost ledger"
             }
             Self::InvalidNotional => {
                 "rug_scalp_v2 requires finite 0.10 SOL primary and larger sensitivity"
@@ -314,6 +498,16 @@ pub enum RugScalpReasonCodeV2 {
 pub struct RugScalpNotionalQuoteV2 {
     pub notional_lamports: u64,
     pub entry_token_amount_raw: u64,
+    /// Program settlement debit for the exact `buy_v2` instruction.  The
+    /// primary notional is a ceiling, never an ambiguous curve input.
+    pub entry_wallet_debit_lamports: u64,
+    /// Transaction-envelope debit kept outside Pump settlement.
+    pub entry_transaction_cost_lamports: u64,
+    pub exit_transaction_cost_lamports: u64,
+    pub entry_route_id: String,
+    pub exit_route_id: String,
+    pub entry_fee_schedule_id: String,
+    pub exit_fee_schedule_id: String,
     pub self_impact_bps: u32,
     pub q_tp_lamports: Option<u64>,
     pub q_tp_status: RugScalpQuoteStatusV2,
@@ -325,6 +519,7 @@ pub enum RugScalpQuoteStatusV2 {
     Resolved,
     Unreachable,
     InvalidCurve,
+    RuntimeFeeAuthorityUnavailable,
 }
 
 /// Typed assessment written before any execution adapter consumes a signal.
@@ -365,13 +560,15 @@ impl RugScalpEntryAssessmentV2 {
 #[derive(Debug)]
 pub struct RugScalpSignalReducerV2 {
     config: RugScalpV2Config,
+    quote_contract: Option<RugScalpPumpQuoteContractV1>,
     mints: HashMap<String, MintSignalState>,
 }
 
 impl RugScalpSignalReducerV2 {
-    pub fn new(config: RugScalpV2Config) -> Self {
+    fn new(config: RugScalpV2Config, quote_contract: Option<RugScalpPumpQuoteContractV1>) -> Self {
         Self {
             config,
+            quote_contract,
             mints: HashMap::new(),
         }
     }
@@ -498,8 +695,15 @@ impl RugScalpSignalReducerV2 {
         if age_ms > self.config.max_birth_age_ms {
             signal_state.terminal_reason = Some(RugScalpReasonCodeV2::AgeExceeded);
         }
-        let (assessment, reason, primary_quote, sensitivity_quote) =
-            signal_state.evaluate(&self.config, mint, slot, ingress_ms, state, curve);
+        let (assessment, reason, primary_quote, sensitivity_quote) = signal_state.evaluate(
+            &self.config,
+            self.quote_contract.as_ref(),
+            mint,
+            slot,
+            ingress_ms,
+            state,
+            curve,
+        );
         if matches!(assessment, RugScalpAssessment::ShadowEdgeCandidate) {
             signal_state.signal_emitted = true;
         }
@@ -531,6 +735,14 @@ pub struct RugScalpEntryIntentV2 {
     pub assessment: RugScalpEntryAssessmentV2,
     pub primary_notional_lamports: u64,
     pub expected_entry_token_amount_raw: u64,
+    /// Exact typed `BuyV2` economics carried into the one PM lifecycle.  The
+    /// sensitivity notional has no corresponding field and no lifecycle.
+    pub entry_wallet_debit_lamports: u64,
+    pub entry_total_debit_lamports: u64,
+    pub entry_route_id: String,
+    pub exit_route_id: String,
+    pub entry_fee_schedule_id: String,
+    pub exit_fee_schedule_id: String,
 }
 
 /// Bounded, typed hand-off produced by the launcher-side RUG adapter.  The
@@ -582,6 +794,10 @@ pub struct RugScalpOutcomeRecordV2 {
     pub pool_id: String,
     pub primary_notional_lamports: u64,
     pub sensitivity_notional_lamports: u64,
+    pub entry_route_id: String,
+    pub exit_route_id: String,
+    pub entry_fee_schedule_id: String,
+    pub exit_fee_schedule_id: String,
     pub entry_status: String,
     pub exit_reason: Option<String>,
     pub failure_reason: Option<String>,
@@ -601,6 +817,10 @@ pub struct RugScalpEntryAttemptRecordV2 {
     pub pool_id: String,
     pub primary_notional_lamports: u64,
     pub sensitivity_notional_lamports: u64,
+    pub entry_route_id: String,
+    pub exit_route_id: String,
+    pub entry_fee_schedule_id: String,
+    pub exit_fee_schedule_id: String,
     pub signal_slot: Option<u64>,
     pub dispatch_status: String,
     pub simulation_rpc_slot: Option<u64>,
@@ -625,6 +845,10 @@ impl RugScalpEntryAttemptRecordV2 {
                 .as_ref()
                 .map(|quote| quote.notional_lamports)
                 .unwrap_or_default(),
+            entry_route_id: intent.entry_route_id.clone(),
+            exit_route_id: intent.exit_route_id.clone(),
+            entry_fee_schedule_id: intent.entry_fee_schedule_id.clone(),
+            exit_fee_schedule_id: intent.exit_fee_schedule_id.clone(),
             signal_slot: intent.assessment.signal_slot,
             dispatch_status: dispatch_status.into(),
             simulation_rpc_slot: None,
@@ -671,6 +895,10 @@ impl RugScalpOutcomeRecordV2 {
                 .as_ref()
                 .map(|quote| quote.notional_lamports)
                 .unwrap_or_default(),
+            entry_route_id: intent.entry_route_id.clone(),
+            exit_route_id: intent.exit_route_id.clone(),
+            entry_fee_schedule_id: intent.entry_fee_schedule_id.clone(),
+            exit_fee_schedule_id: intent.exit_fee_schedule_id.clone(),
             entry_status: entry_status.into(),
             exit_reason: None,
             failure_reason,
@@ -692,6 +920,10 @@ impl RugScalpOutcomeRecordV2 {
         exit_reason: String,
         exit_landed_slot: Option<u64>,
         net_pnl_lamports: Option<i64>,
+        entry_route_id: String,
+        exit_route_id: String,
+        entry_fee_schedule_id: String,
+        exit_fee_schedule_id: String,
     ) -> Self {
         let (ev_disposition, invalidates_smoke_or_run) = Self::accounting_disposition(&outcome);
         Self {
@@ -707,6 +939,10 @@ impl RugScalpOutcomeRecordV2 {
             pool_id,
             primary_notional_lamports,
             sensitivity_notional_lamports,
+            entry_route_id,
+            exit_route_id,
+            entry_fee_schedule_id,
+            exit_fee_schedule_id,
             entry_status: "modelled_fill_registered".to_string(),
             exit_reason: Some(exit_reason),
             failure_reason: None,
@@ -778,6 +1014,7 @@ impl std::error::Error for RugScalpAdapterBindErrorV2 {}
 #[derive(Debug)]
 pub struct RugScalpRuntimeAdapterV2 {
     config: RugScalpV2Config,
+    quote_contract: Option<RugScalpPumpQuoteContractV1>,
     signal: RugScalpSignalReducerV2,
     pending_entries: HashMap<String, PendingRugScalpEntryV2>,
     active_positions: HashMap<String, ActiveRugScalpFactStreamV2>,
@@ -808,6 +1045,7 @@ struct ActiveRugScalpFactStreamV2 {
     last_order: Option<TradeOrder>,
     seen_signatures: HashSet<String>,
     gap_reported: bool,
+    quote_contract: Option<RugScalpPumpQuoteContractV1>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -818,9 +1056,14 @@ struct RugScalpOpenSlotV2 {
 
 impl RugScalpRuntimeAdapterV2 {
     pub fn new(config: RugScalpV2Config) -> Self {
+        let quote_contract = config
+            .pump_quote_authority
+            .as_ref()
+            .and_then(|authority| authority.materialize().ok());
         Self {
-            signal: RugScalpSignalReducerV2::new(config.clone()),
+            signal: RugScalpSignalReducerV2::new(config.clone(), quote_contract.clone()),
             config,
+            quote_contract,
             pending_entries: HashMap::new(),
             active_positions: HashMap::new(),
         }
@@ -873,6 +1116,14 @@ impl RugScalpRuntimeAdapterV2 {
         };
         let primary_notional_lamports = primary.notional_lamports;
         let expected_entry_token_amount_raw = primary.entry_token_amount_raw;
+        let entry_wallet_debit_lamports = primary.entry_wallet_debit_lamports;
+        let entry_total_debit_lamports = primary
+            .entry_wallet_debit_lamports
+            .saturating_add(primary.entry_transaction_cost_lamports);
+        let entry_route_id = primary.entry_route_id.clone();
+        let exit_route_id = primary.exit_route_id.clone();
+        let entry_fee_schedule_id = primary.entry_fee_schedule_id.clone();
+        let exit_fee_schedule_id = primary.exit_fee_schedule_id.clone();
         let candidate_id =
             crate::events::build_execution_candidate_id(mint, &assessment.pool_id, &tx.signature);
         let intent = RugScalpEntryIntentV2 {
@@ -880,6 +1131,12 @@ impl RugScalpRuntimeAdapterV2 {
             assessment,
             primary_notional_lamports,
             expected_entry_token_amount_raw,
+            entry_wallet_debit_lamports,
+            entry_total_debit_lamports,
+            entry_route_id,
+            exit_route_id,
+            entry_fee_schedule_id,
+            exit_fee_schedule_id,
         };
         self.pending_entries.insert(
             mint.clone(),
@@ -929,6 +1186,7 @@ impl RugScalpRuntimeAdapterV2 {
             last_order: None,
             seen_signatures: HashSet::new(),
             gap_reported: false,
+            quote_contract: self.quote_contract.clone(),
         };
         let mut actions = Vec::new();
         for deferred in pending.deferred_trades {
@@ -1054,6 +1312,20 @@ impl ActiveRugScalpFactStreamV2 {
                     open_slot.successful_buy_count
                 })
                 .unwrap_or_default();
+            let Some((_exit_quote, executable_after)) =
+                curve.and_then(pump_reserves).and_then(|reserves| {
+                    self.quote_contract
+                        .as_ref()?
+                        .executable_exit_value_lamports(slot, reserves, self.entry_token_amount_raw)
+                        .ok()
+                })
+            else {
+                return self
+                    .data_gap()
+                    .into_iter()
+                    .map(RugScalpRuntimeActionV2::MarketFact)
+                    .collect();
+            };
             facts.push(RugScalpRuntimeActionV2::MarketFact(RugScalpMarketFactV1 {
                 position_id: self.position_id.clone(),
                 mint: self.mint,
@@ -1066,18 +1338,34 @@ impl ActiveRugScalpFactStreamV2 {
                 reserve_before: None,
                 reserve_after: None,
                 executable_position_value_before: None,
-                executable_position_value_after: None,
+                executable_position_value_after: Some(executable_after),
                 data_completeness: RugScalpDataCompletenessV1::Complete,
             }));
         } else if tx.success && !tx.is_buy {
-            let before = self.last_curve;
-            let values = before.zip(curve).map(|(before, after)| {
-                (
-                    before.virtual_sol_reserves,
-                    after.virtual_sol_reserves,
-                    before.simulate_sell(self.entry_token_amount_raw),
-                    after.simulate_sell(self.entry_token_amount_raw),
-                )
+            let values = self.last_curve.zip(curve).and_then(|(before, after)| {
+                let contract = self.quote_contract.as_ref()?;
+                let before_reserves = pump_reserves(before)?;
+                let after_reserves = pump_reserves(after)?;
+                let (before_quote, executable_before) = contract
+                    .executable_exit_value_lamports(
+                        slot,
+                        before_reserves,
+                        self.entry_token_amount_raw,
+                    )
+                    .ok()?;
+                let (after_quote, executable_after) = contract
+                    .executable_exit_value_lamports(
+                        slot,
+                        after_reserves,
+                        self.entry_token_amount_raw,
+                    )
+                    .ok()?;
+                Some((
+                    before_quote.reserve_transition.quote_before,
+                    after_quote.reserve_transition.quote_before,
+                    executable_before,
+                    executable_after,
+                ))
             });
             let Some((reserve_before, reserve_after, executable_before, executable_after)) = values
             else {
@@ -1206,6 +1494,7 @@ impl MintSignalState {
     fn evaluate(
         &self,
         config: &RugScalpV2Config,
+        quote_contract: Option<&RugScalpPumpQuoteContractV1>,
         _mint: &str,
         current_slot: u64,
         ingress_ms: u64,
@@ -1320,24 +1609,21 @@ impl MintSignalState {
         let Some(sensitivity_notional) = config.sensitivity_notional_lamports() else {
             return non_evaluable(RugScalpReasonCodeV2::QuoteMathUnavailable);
         };
-        let Some(entry_cost) = config.entry_fixed_cost_lamports else {
-            return non_evaluable(RugScalpReasonCodeV2::QuoteMathUnavailable);
-        };
-        let Some(exit_cost) = config.exit_fixed_cost_lamports else {
+        let Some(quote_contract) = quote_contract else {
             return non_evaluable(RugScalpReasonCodeV2::QuoteMathUnavailable);
         };
         let primary = quote_notional(
+            quote_contract,
             curve,
+            current_slot,
             primary_notional,
-            entry_cost,
-            exit_cost,
             config.profit_min_net_bps,
         );
         let sensitivity = quote_notional(
+            quote_contract,
             curve,
+            current_slot,
             sensitivity_notional,
-            entry_cost,
-            exit_cost,
             config.profit_min_net_bps,
         );
         if primary.notional_lamports as f64
@@ -1507,38 +1793,76 @@ fn is_sol_pair(value: &str) -> bool {
 }
 
 fn quote_notional(
+    quote_contract: &RugScalpPumpQuoteContractV1,
     curve: BondingCurve,
+    canonical_slot: u64,
     notional_lamports: u64,
-    entry_fixed_cost_lamports: u64,
-    exit_fixed_cost_lamports: u64,
     profit_min_net_bps: i32,
 ) -> RugScalpNotionalQuoteV2 {
     let invalid = || RugScalpNotionalQuoteV2 {
         notional_lamports,
         entry_token_amount_raw: 0,
+        entry_wallet_debit_lamports: 0,
+        entry_transaction_cost_lamports: 0,
+        exit_transaction_cost_lamports: 0,
+        entry_route_id: RUG_SCALP_ENTRY_ROUTE.as_str().to_string(),
+        exit_route_id: RUG_SCALP_EXIT_ROUTE.as_str().to_string(),
+        entry_fee_schedule_id: String::new(),
+        exit_fee_schedule_id: String::new(),
         self_impact_bps: u32::MAX,
         q_tp_lamports: None,
         q_tp_status: RugScalpQuoteStatusV2::InvalidCurve,
     };
-    let Some((post_entry_curve, entry_tokens)) = apply_program_buy(curve, notional_lamports) else {
+    let Some(reserves) = pump_reserves(curve) else {
         return invalid();
     };
-    if entry_tokens == 0 {
+    let Ok(entry_quote) =
+        quote_contract.quote_buy_v2_under_wallet_cap(canonical_slot, reserves, notional_lamports)
+    else {
         return invalid();
-    }
-    let self_impact_bps = price_impact_bps(curve, post_entry_curve).unwrap_or(u32::MAX);
-    let target_net_lamports = (notional_lamports as u128)
+    };
+    let entry_tokens = entry_quote.token_amount;
+    let post_entry_reserves = reserves_after_buy(reserves, &entry_quote);
+    let self_impact_bps = price_impact_bps(reserves, post_entry_reserves).unwrap_or(u32::MAX);
+    let entry_transaction_cost_lamports = match quote_contract.entry_transaction_cost_lamports() {
+        Ok(cost) => cost,
+        Err(_) => return invalid(),
+    };
+    let exit_transaction_cost_lamports = match quote_contract.exit_transaction_cost_lamports() {
+        Ok(cost) => cost,
+        Err(_) => return invalid(),
+    };
+    let entry_total_debit = entry_quote
+        .program_settlement
+        .wallet_debit_or_credit
+        .saturating_add(entry_transaction_cost_lamports);
+    let target_net_lamports = (entry_total_debit as u128)
         .saturating_mul((10_000_i32.saturating_add(profit_min_net_bps)) as u128)
         / 10_000_u128;
     let required_exit_lamports = target_net_lamports
-        .saturating_add(entry_fixed_cost_lamports as u128)
-        .saturating_add(exit_fixed_cost_lamports as u128)
+        .saturating_add(exit_transaction_cost_lamports as u128)
         .min(u64::MAX as u128) as u64;
-    let q_tp_lamports =
-        minimum_additional_buy_flow(post_entry_curve, entry_tokens, required_exit_lamports);
+    let q_tp_lamports = minimum_additional_buy_flow(
+        quote_contract,
+        canonical_slot,
+        post_entry_reserves,
+        entry_tokens,
+        required_exit_lamports,
+    );
     RugScalpNotionalQuoteV2 {
         notional_lamports,
         entry_token_amount_raw: entry_tokens,
+        entry_wallet_debit_lamports: entry_quote.program_settlement.wallet_debit_or_credit,
+        entry_transaction_cost_lamports,
+        exit_transaction_cost_lamports,
+        entry_route_id: entry_quote.route_variant.as_str().to_string(),
+        exit_route_id: RUG_SCALP_EXIT_ROUTE.as_str().to_string(),
+        entry_fee_schedule_id: entry_quote.fee_schedule_id,
+        exit_fee_schedule_id: quote_contract
+            .registry
+            .resolve(RUG_SCALP_EXIT_ROUTE, canonical_slot)
+            .map(|schedule| schedule.fee_schedule_id.clone())
+            .unwrap_or_default(),
         self_impact_bps,
         q_tp_status: if q_tp_lamports.is_some() {
             RugScalpQuoteStatusV2::Resolved
@@ -1550,29 +1874,43 @@ fn quote_notional(
 }
 
 fn minimum_additional_buy_flow(
-    curve_after_entry: BondingCurve,
+    quote_contract: &RugScalpPumpQuoteContractV1,
+    canonical_slot: u64,
+    reserves_after_entry: PumpReserveState,
     entry_tokens: u64,
     required_exit_lamports: u64,
 ) -> Option<u64> {
     let can_exit = |additional_flow| {
-        apply_program_buy(curve_after_entry, additional_flow)
-            .map(|(curve, _)| curve.simulate_sell(entry_tokens) >= required_exit_lamports)
-            .unwrap_or(false)
+        let quote = quote_contract
+            .quote_buy_v2_under_wallet_cap(canonical_slot, reserves_after_entry, additional_flow)
+            .ok()?;
+        let (_, exit_value) = quote_contract
+            .executable_exit_value_lamports(
+                canonical_slot,
+                reserves_after_buy(reserves_after_entry, &quote),
+                entry_tokens,
+            )
+            .ok()?;
+        Some(exit_value >= required_exit_lamports)
     };
-    if can_exit(0) {
+    if quote_contract
+        .executable_exit_value_lamports(canonical_slot, reserves_after_entry, entry_tokens)
+        .map(|(_, value)| value >= required_exit_lamports)
+        .unwrap_or(false)
+    {
         return Some(0);
     }
     let mut upper = LAMPORTS_PER_SOL / 1_000;
-    while upper < MAX_QTP_SEARCH_LAMPORTS && !can_exit(upper) {
+    while upper < MAX_QTP_SEARCH_LAMPORTS && !can_exit(upper).unwrap_or(false) {
         upper = upper.saturating_mul(2).min(MAX_QTP_SEARCH_LAMPORTS);
     }
-    if !can_exit(upper) {
+    if !can_exit(upper).unwrap_or(false) {
         return None;
     }
     let mut lower = 0_u64;
     while lower < upper {
         let midpoint = lower.saturating_add(upper.saturating_sub(lower) / 2);
-        if can_exit(midpoint) {
+        if can_exit(midpoint).unwrap_or(false) {
             upper = midpoint;
         } else {
             lower = midpoint.saturating_add(1);
@@ -1581,36 +1919,36 @@ fn minimum_additional_buy_flow(
     Some(lower)
 }
 
-/// Applies the exact invariant transition used by the canonical
-/// [`BondingCurve::simulate_buy`] quote.  It intentionally models only the
-/// program curve state; node/priority/Jito/ATA costs remain explicit inputs.
-fn apply_program_buy(curve: BondingCurve, amount_lamports: u64) -> Option<(BondingCurve, u64)> {
-    if !curve.is_active() || amount_lamports == 0 {
-        return None;
-    }
-    let tokens_out = curve.simulate_buy(amount_lamports);
-    let effective_sol_in = amount_lamports.saturating_sub(amount_lamports / 100);
-    if tokens_out == 0 || tokens_out > curve.virtual_token_reserves {
-        return None;
-    }
-    let mut next = curve;
-    next.virtual_sol_reserves = next.virtual_sol_reserves.checked_add(effective_sol_in)?;
-    next.virtual_token_reserves = next.virtual_token_reserves.checked_sub(tokens_out)?;
-    next.real_token_reserves = next.real_token_reserves.saturating_sub(tokens_out);
-    next.real_sol_reserves = next.real_sol_reserves.checked_add(effective_sol_in)?;
-    Some((next, tokens_out))
+fn pump_reserves(curve: BondingCurve) -> Option<PumpReserveState> {
+    curve.is_active().then_some(PumpReserveState {
+        virtual_base_reserves: curve.virtual_token_reserves,
+        virtual_quote_reserves: curve.virtual_sol_reserves,
+        real_base_reserves: curve.real_token_reserves,
+        real_quote_reserves: curve.real_sol_reserves,
+    })
 }
 
-fn price_impact_bps(before: BondingCurve, after: BondingCurve) -> Option<u32> {
-    if before.virtual_sol_reserves == 0
-        || before.virtual_token_reserves == 0
-        || after.virtual_sol_reserves == 0
-        || after.virtual_token_reserves == 0
+fn reserves_after_buy(before: PumpReserveState, quote: &PumpQuoteV1) -> PumpReserveState {
+    PumpReserveState {
+        virtual_base_reserves: quote.reserve_transition.base_after,
+        virtual_quote_reserves: quote.reserve_transition.quote_after,
+        real_base_reserves: before.real_base_reserves.saturating_sub(quote.token_amount),
+        real_quote_reserves: before
+            .real_quote_reserves
+            .saturating_add(quote.curve_quote_amount),
+    }
+}
+
+fn price_impact_bps(before: PumpReserveState, after: PumpReserveState) -> Option<u32> {
+    if before.virtual_quote_reserves == 0
+        || before.virtual_base_reserves == 0
+        || after.virtual_quote_reserves == 0
+        || after.virtual_base_reserves == 0
     {
         return None;
     }
-    let before_price = before.virtual_sol_reserves as f64 / before.virtual_token_reserves as f64;
-    let after_price = after.virtual_sol_reserves as f64 / after.virtual_token_reserves as f64;
+    let before_price = before.virtual_quote_reserves as f64 / before.virtual_base_reserves as f64;
+    let after_price = after.virtual_quote_reserves as f64 / after.virtual_base_reserves as f64;
     let impact = ((after_price / before_price) - 1.0) * 10_000.0;
     (impact.is_finite() && impact >= 0.0).then_some(impact.ceil() as u32)
 }
@@ -1618,8 +1956,84 @@ fn price_impact_bps(before: BondingCurve, after: BondingCurve) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghost_core::shadow_ledger::simulation::{simulate_buy_pure, simulate_sell_pure, FEE_BPS};
     use ghost_core::EventSemanticEnvelope;
+    use ghost_core::{FeeRounding, ProgramFeeRule, ProgramFeeScheduleEvidenceV1, PumpQuoteError};
+
+    fn runtime_schedule(
+        route_variant: PumpRouteVariant,
+        fee_schedule_id: &str,
+        rules: Vec<ProgramFeeRule>,
+    ) -> RugScalpPumpFeeScheduleV1 {
+        RugScalpPumpFeeScheduleV1 {
+            route_variant,
+            schedule: ProgramFeeSchedule {
+                fee_schedule_id: fee_schedule_id.to_string(),
+                effective_slot: 0,
+                evidence: ProgramFeeScheduleEvidenceV1::OnChainConfig {
+                    config_pubkey: format!("pump-fee-config-{fee_schedule_id}"),
+                    owner_program: "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ".to_string(),
+                    account_data_hash: format!("onchain-hash-{fee_schedule_id}"),
+                    observed_slot: 0,
+                },
+                rules,
+            },
+        }
+    }
+
+    fn runtime_quote_authority() -> RugScalpPumpQuoteAuthorityV1 {
+        RugScalpPumpQuoteAuthorityV1 {
+            schedules: vec![
+                runtime_schedule(
+                    RUG_SCALP_ENTRY_ROUTE,
+                    "onchain-buy-v2-test-schedule",
+                    vec![ProgramFeeRule {
+                        component_id: "protocol_and_buyback".to_string(),
+                        numerator: 95,
+                        denominator: 10_000,
+                        rounding: FeeRounding::Ceil,
+                    }],
+                ),
+                runtime_schedule(
+                    RUG_SCALP_EXIT_ROUTE,
+                    "onchain-legacy-sell-test-schedule",
+                    vec![
+                        ProgramFeeRule {
+                            component_id: "lp_fee".to_string(),
+                            numerator: 3,
+                            denominator: 1_000,
+                            rounding: FeeRounding::Ceil,
+                        },
+                        ProgramFeeRule {
+                            component_id: "protocol_fee_recipient".to_string(),
+                            numerator: 95,
+                            denominator: 20_000,
+                            rounding: FeeRounding::Ceil,
+                        },
+                        ProgramFeeRule {
+                            component_id: "buyback_fee_recipient".to_string(),
+                            numerator: 95,
+                            denominator: 20_000,
+                            rounding: FeeRounding::Floor,
+                        },
+                        ProgramFeeRule {
+                            component_id: "creator_fee".to_string(),
+                            numerator: 395,
+                            denominator: 40_000,
+                            rounding: FeeRounding::Floor,
+                        },
+                    ],
+                ),
+            ],
+            entry_transaction_costs: TransactionCosts::default(),
+            exit_transaction_costs: TransactionCosts::default(),
+        }
+    }
+
+    fn runtime_quote_contract() -> RugScalpPumpQuoteContractV1 {
+        runtime_quote_authority()
+            .materialize()
+            .expect("on-chain evidence must authorise the test quote contract")
+    }
 
     fn enabled_config() -> RugScalpV2Config {
         RugScalpV2Config {
@@ -1628,8 +2042,19 @@ mod tests {
             primary_exit_latency_slots: Some(1),
             entry_fixed_cost_lamports: Some(0),
             exit_fixed_cost_lamports: Some(0),
+            pump_quote_authority: Some(runtime_quote_authority()),
             ..RugScalpV2Config::default()
         }
+    }
+
+    fn reducer(config: RugScalpV2Config) -> RugScalpSignalReducerV2 {
+        let quote_contract = config
+            .pump_quote_authority
+            .as_ref()
+            .expect("enabled test config has typed fee authority")
+            .materialize()
+            .expect("test authority materializes");
+        RugScalpSignalReducerV2::new(config, Some(quote_contract))
     }
 
     fn curve() -> BondingCurve {
@@ -1750,9 +2175,12 @@ mod tests {
             ordering_known: true,
             accepted_window_has_gap: false,
         };
-        let mut first = buy(2, 1, "buyer-a", 1.00);
+        // The typed BuyV2/LegacySell settlement includes the current program
+        // fees, so the fixture supplies enough observed two-slot flow to
+        // satisfy the unchanged `Q_TP / V_2 <= 1.0` admission contract.
+        let mut first = buy(2, 1, "buyer-a", 10.00);
         first.token_mint = Some(mint.clone());
-        let mut second = buy(3, 1, "buyer-a", 1.00);
+        let mut second = buy(3, 1, "buyer-a", 10.00);
         second.token_mint = Some(mint.clone());
         adapter.on_trade(&first, 1_100, canonical, Some(curve()));
         let actions = adapter.on_trade(&second, 1_200, canonical, Some(curve()));
@@ -1896,9 +2324,9 @@ mod tests {
             ordering_known: true,
             accepted_window_has_gap: false,
         };
-        let mut first = buy(2, 1, "buyer-a", 1.00);
+        let mut first = buy(2, 1, "buyer-a", 10.00);
         first.token_mint = Some(mint.clone());
-        let mut entry_signal = buy(3, 5, "buyer-b", 1.00);
+        let mut entry_signal = buy(3, 5, "buyer-b", 10.00);
         entry_signal.token_mint = Some(mint.clone());
         adapter.on_trade(&first, 1_100, canonical, Some(curve()));
         let intent = adapter
@@ -2010,37 +2438,36 @@ mod tests {
     }
 
     #[test]
-    fn qtp_quote_matches_builder_quote_and_canonical_reserve_transition_fixture() {
-        let before = curve();
-        let primary_lamports = 100_000_000;
-        let builder_tokens = before.simulate_buy(primary_lamports);
-        let canonical_buy = simulate_buy_pure(&before, primary_lamports);
-        let (after, quote_tokens) =
-            apply_program_buy(before, primary_lamports).expect("active canonical curve");
+    fn typed_quote_keeps_buy_v2_cap_settlement_and_legacy_sell_separate() {
+        let quote_contract = runtime_quote_contract();
+        let reserves = pump_reserves(curve()).expect("active canonical reserves");
+        let max_sol_cost = 100_000_000;
+        let buy = quote_contract
+            .quote_buy_v2_under_wallet_cap(3, reserves, max_sol_cost)
+            .expect("typed buy_v2 quote under cap");
+        let after_buy = reserves_after_buy(reserves, &buy);
+        let (sell, executable_value) = quote_contract
+            .executable_exit_value_lamports(3, after_buy, buy.token_amount)
+            .expect("typed legacy_sell quote");
 
+        assert_eq!(buy.route_variant, RUG_SCALP_ENTRY_ROUTE);
+        assert_eq!(sell.route_variant, RUG_SCALP_EXIT_ROUTE);
+        assert_eq!(buy.fee_schedule_id, "onchain-buy-v2-test-schedule");
+        assert_eq!(sell.fee_schedule_id, "onchain-legacy-sell-test-schedule");
+        assert!(buy.instruction_limit_check.passed);
+        assert!(buy.program_settlement.wallet_debit_or_credit <= max_sol_cost);
         assert_eq!(
-            BondingCurve::FEE_BPS,
-            FEE_BPS,
-            "RUG quote refuses a divergent in-repo Pump fee schedule"
-        );
-        assert_eq!(quote_tokens, builder_tokens);
-        assert_eq!(quote_tokens, canonical_buy.tokens_out);
-        assert_eq!(
-            after.virtual_sol_reserves,
-            before
-                .virtual_sol_reserves
-                .saturating_add(canonical_buy.effective_sol_in)
+            buy.reserve_transition.quote_after,
+            reserves.virtual_quote_reserves + buy.curve_quote_amount,
+            "curve transition never includes program or transaction fees"
         );
         assert_eq!(
-            after.virtual_token_reserves,
-            before
-                .virtual_token_reserves
-                .saturating_sub(canonical_buy.tokens_out)
+            executable_value, sell.program_settlement.wallet_debit_or_credit,
+            "zero envelope costs leave net exit equal to program settlement only"
         );
-        assert_eq!(
-            after.simulate_sell(quote_tokens),
-            simulate_sell_pure(&after, quote_tokens).sol_out,
-            "Q_TP sell leg must match the canonical pure sell simulation"
+        assert_ne!(
+            buy.curve_quote_amount, max_sol_cost,
+            "buy_v2 max_sol_cost is an instruction cap, not a curve input"
         );
     }
 
@@ -2081,29 +2508,60 @@ mod tests {
     #[test]
     fn exact_quotes_keep_primary_and_sensitivity_separate() {
         let config = enabled_config();
+        let quote_contract = runtime_quote_contract();
         let primary = quote_notional(
+            &quote_contract,
             curve(),
+            12,
             config.primary_notional_lamports().unwrap(),
-            0,
-            0,
             config.profit_min_net_bps,
         );
         let sensitivity = quote_notional(
+            &quote_contract,
             curve(),
+            12,
             config.sensitivity_notional_lamports().unwrap(),
-            0,
-            0,
             config.profit_min_net_bps,
         );
         assert_eq!(primary.notional_lamports, 100_000_000);
         assert_eq!(sensitivity.notional_lamports, 200_000_000);
         assert!(sensitivity.self_impact_bps >= primary.self_impact_bps);
         assert!(primary.q_tp_lamports.is_some());
+        assert_eq!(primary.entry_route_id, "buy_v2");
+        assert_eq!(primary.exit_route_id, "legacy_sell");
+        assert_eq!(
+            primary.entry_fee_schedule_id,
+            "onchain-buy-v2-test-schedule"
+        );
+        assert_eq!(
+            primary.exit_fee_schedule_id,
+            "onchain-legacy-sell-test-schedule"
+        );
+    }
+
+    #[test]
+    fn canonical_fixture_never_authorizes_runtime_rug_quote() {
+        let mut authority = runtime_quote_authority();
+        authority.schedules[0].schedule.evidence = ProgramFeeScheduleEvidenceV1::CanonicalFixture {
+            fixture_id: "offline-buy-v2-fixture".to_string(),
+            transaction_signature: "fixture-signature".to_string(),
+            observed_slot: 0,
+        };
+        assert_eq!(
+            authority.materialize(),
+            Err(PumpQuoteError::FixtureEvidenceCannotAuthorizeRuntime)
+        );
+        let mut config = enabled_config();
+        config.pump_quote_authority = Some(authority);
+        assert_eq!(
+            config.validate_enabled_contract(),
+            Err(RugScalpConfigError::InvalidPumpQuoteAuthority)
+        );
     }
 
     #[test]
     fn reducer_accepts_only_the_first_complete_two_slot_burst() {
-        let mut reducer = RugScalpSignalReducerV2::new(enabled_config());
+        let mut reducer = reducer(enabled_config());
         reducer.on_birth(&birth(10), 1_000);
         let mut outcome = None;
         for (slot, index, signer) in [
@@ -2131,7 +2589,7 @@ mod tests {
 
     #[test]
     fn successful_sell_terminally_invalidates_before_entry() {
-        let mut reducer = RugScalpSignalReducerV2::new(enabled_config());
+        let mut reducer = reducer(enabled_config());
         reducer.on_birth(&birth(10), 1_000);
         let mut sell = buy(11, 1, "seller", 0.1);
         sell.is_buy = false;
@@ -2145,7 +2603,7 @@ mod tests {
 
     #[test]
     fn missing_canonical_curve_is_non_evaluable_not_an_optimistic_signal() {
-        let mut reducer = RugScalpSignalReducerV2::new(enabled_config());
+        let mut reducer = reducer(enabled_config());
         reducer.on_birth(&birth(10), 1_000);
         let mut outcome = None;
         for (slot, index, signer) in [

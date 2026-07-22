@@ -1108,6 +1108,18 @@ pub struct ExecutionJoinMetadata {
     pub rug_scalp_entry_watermark_tx_index: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rug_scalp_entry_watermark_event_ordinal: Option<u32>,
+    /// Immutable typed Pump economics selected by the RUG reducer.  They are
+    /// evidence fields only; Position Manager remains the terminal owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_total_debit_lamports: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_route_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_exit_route_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_fee_schedule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_exit_fee_schedule_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ab_record_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1155,6 +1167,11 @@ impl ExecutionJoinMetadata {
             && self.rug_scalp_entry_watermark_slot.is_none()
             && self.rug_scalp_entry_watermark_tx_index.is_none()
             && self.rug_scalp_entry_watermark_event_ordinal.is_none()
+            && self.rug_scalp_entry_total_debit_lamports.is_none()
+            && self.rug_scalp_entry_route_id.is_none()
+            && self.rug_scalp_exit_route_id.is_none()
+            && self.rug_scalp_entry_fee_schedule_id.is_none()
+            && self.rug_scalp_exit_fee_schedule_id.is_none()
             && self.ab_record_id.is_none()
             && self.source_ab_record_id.is_none()
             && self.probe_id.is_none()
@@ -1755,6 +1772,7 @@ mod tests {
             source_decision_row_sha256: Some("row-sha".to_string()),
             source_v3_feature_snapshot_hash: Some("feature-hash".to_string()),
             source_v3_policy_config_hash: Some("policy-hash".to_string()),
+            ..ExecutionJoinMetadata::default()
         };
 
         let json = serde_json::to_string(&metadata).unwrap();
