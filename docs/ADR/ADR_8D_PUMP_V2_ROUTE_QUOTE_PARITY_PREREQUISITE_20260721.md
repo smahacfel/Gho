@@ -122,10 +122,37 @@ LP/protocol/buyback/creator fees, net program credit oraz odrębne base,
 priority i Jito costs. Test wykonuje pełne zachowanie lamport conservation,
 bez porównywania jednej liczby równocześnie do gross i net.
 
+`SellV2` ma poprawny typed decoder oraz IDL-pinned layout, ale **nie ma**
+udanej, aktualnej on-chain fixture settlement parity. Dlatego jego status to
+wyłącznie:
+
+```text
+typed_supported_but_not_execution_authorized
+```
+
+Publiczny `build_sell_v2` kończy się typed `RouteNotExecutionAuthorized`.
+Nie jest to wariant parity-validated i nie może zostać użyty przez przyszłą
+integrację #78. Dopiero osobny fixture `sell_v2` (arguments, gross reserve
+decrement, komplet fee, net credit, exact metas i builder simulation success)
+może zdjąć tę blokadę.
+
+Na obecnym evidence tylko `BuyV2` oraz `LegacySell` są
+`ParityValidated`. `LegacyBuy` i `BuyExactQuoteInV2` zachowują typed
+decode/layout, ale ich publiczne execution-capable builders są równie
+fail-closed do czasu route-specific fixture. Historyczne
+`DirectBuyBuilder`/`DirectSellBuilder` nie zostały w tej zmianie przepięte ani
+milcząco przereklasyfikowane.
+
 ## D4. Zachowane inwarianty
 
 - Nie ma fallbacku z nieznanego route'u do `is_buy`/`is_sell`.
 - Nie ma domyślnego schedule opłat ani ukrytego `1%`.
+- Runtime może cytować fee tylko przez
+  `RuntimeProgramFeeScheduleRegistryV1`, materializowany z `OnChainConfig`
+  albo `EffectiveSlotRegistry`. Każdy schedule ma `effective_slot`,
+  `observed_slot` i hash/identity evidence; resolver wybiera tylko schedule
+  znany już w canonical decision slot. `CanonicalFixture` służy wyłącznie do
+  offline replay i jest odrzucany przy rejestracji runtime.
 - Program fees nie są dublowane w transaction cost ledger.
 - `max_sol_cost` nie jest traktowany jak curve input.
 - Fee/config/owner evidence nie są pobierane z publicznego RPC w teście CI.
@@ -161,6 +188,25 @@ git diff --check
 
 Testy przechodzą. Workspace emituje istniejące, niepowiązane warnings w
 `shadow_ledger` i `trigger`; żaden nie pochodzi z nowych module/fixture tests.
+
+### D6.1 Reproducible baseline receipt: pełny suite `trigger`
+
+Pełny `cargo test -q -p trigger` nie jest obecnie zielony, ale trzy porażki
+nie pochodzą z tego PR-a. Zostały odtworzone na czystym `origin/main`:
+
+```text
+baseline commit: 3e2f0bd5d52d665343945830baef5201e701b0cd
+command: cargo test -q -p trigger
+```
+
+| Test | Identyczny failure signature na `origin/main` |
+|---|---|
+| `jito_client::tests::test_get_bundle_status_by_uuid_uses_submit_endpoint_host_for_polling` | `ConfigError("Jito status polling requires status_uuid but none is configured")` |
+| `jito_client::tests::test_confirm_bundle_submission_rejected_bundle_keeps_tip_signature_offchain` | `ConfigError("Jito status polling requires status_uuid but none is configured")` |
+| `transaction_builder::tests::test_presigned_transaction_size_validation` | `assertion failed: presigned.size_bytes < 700` |
+
+To jest receipt baseline, nie waiver: remote CI i review nadal są wymagane
+przed merge #79.
 
 ## D7. Następne bramki
 

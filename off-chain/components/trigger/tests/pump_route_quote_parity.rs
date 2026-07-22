@@ -6,7 +6,8 @@
 
 use ghost_core::{
     quote_exact_base_in_sell, quote_exact_base_out, FeeRounding, ProgramFeeRule,
-    ProgramFeeSchedule, PumpReserveState, PumpRouteVariant, TransactionCosts,
+    ProgramFeeSchedule, ProgramFeeScheduleEvidenceV1, PumpReserveState, PumpRouteVariant,
+    TransactionCosts,
 };
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
@@ -145,6 +146,14 @@ fn fixture_legacy_sell_accounts() -> PumpLegacySellRouteAccounts {
     }
 }
 
+fn fixture_fee_evidence(fixture: &Fixture, fixture_id: &str) -> ProgramFeeScheduleEvidenceV1 {
+    ProgramFeeScheduleEvidenceV1::CanonicalFixture {
+        fixture_id: fixture_id.into(),
+        transaction_signature: fixture.source.signature.clone(),
+        observed_slot: fixture.source.slot,
+    }
+}
+
 #[test]
 fn buy_v2_fixture_has_exact_builder_reserves_settlement_and_cost_conservation() {
     let fixture = read_fixture(include_str!("fixtures/pump_buy_v2_434365563.json"));
@@ -195,6 +204,7 @@ fn buy_v2_fixture_has_exact_builder_reserves_settlement_and_cost_conservation() 
     let schedule = ProgramFeeSchedule {
         fee_schedule_id: format!("fixture-buy-v2-{}", fixture.source.slot),
         effective_slot: fixture.source.slot,
+        evidence: fixture_fee_evidence(&fixture, "pump_buy_v2_434365563"),
         rules: vec![
             ProgramFeeRule {
                 component_id: "fee_recipient".into(),
@@ -257,9 +267,19 @@ fn buy_v2_fixture_has_exact_builder_reserves_settlement_and_cost_conservation() 
             + fixture.transaction_costs.user_volume_accumulator_rent,
         ..TransactionCosts::default()
     };
+    let fee_total = fixture.program_settlement.fees.fee_recipient
+        + fixture.program_settlement.fees.buyback_fee_recipient;
     assert_eq!(
-        quote.program_settlement.wallet_debit_or_credit + costs.net_wallet_debit().unwrap(),
+        fixture.program_settlement.wallet_debit.unwrap(),
+        fixture.program_settlement.curve_quote_input.unwrap() + fee_total,
+        "program debit must be curve input plus every program fee",
+    );
+    assert_eq!(
         fixture.wallet_debit_including_transaction_costs.unwrap(),
+        fixture.program_settlement.curve_quote_input.unwrap()
+            + fee_total
+            + costs.net_wallet_debit().unwrap(),
+        "all-in wallet debit must conserve curve, program fees and envelope costs",
     );
 }
 
@@ -304,6 +324,7 @@ fn legacy_sell_fixture_has_exact_gross_net_and_transaction_cost_conservation() {
     let schedule = ProgramFeeSchedule {
         fee_schedule_id: format!("fixture-legacy-sell-{}", fixture.source.slot),
         effective_slot: fixture.source.slot,
+        evidence: fixture_fee_evidence(&fixture, "pump_legacy_sell_434365533"),
         rules: vec![
             ProgramFeeRule {
                 component_id: "lp_fee".into(),
@@ -387,8 +408,24 @@ fn legacy_sell_fixture_has_exact_gross_net_and_transaction_cost_conservation() {
         ata_rent_lamports: fixture.transaction_costs.ata_rent,
         ..TransactionCosts::default()
     };
+    let fee_total = fixture.program_settlement.fees.lp_fee
+        + fixture.program_settlement.fees.fee_recipient
+        + fixture.program_settlement.fees.buyback_fee_recipient
+        + fixture.program_settlement.fees.creator_fee;
     assert_eq!(
-        quote.program_settlement.wallet_debit_or_credit - costs.net_wallet_debit().unwrap(),
+        fixture.program_settlement.curve_quote_output.unwrap(),
+        fee_total
+            + fixture
+                .program_settlement
+                .wallet_credit_before_transaction_costs
+                .unwrap(),
+        "gross reserve decrement must be program fees plus net program credit",
+    );
+    assert_eq!(
         fixture.wallet_credit_after_transaction_costs.unwrap(),
+        fixture.program_settlement.curve_quote_output.unwrap()
+            - fee_total
+            - costs.net_wallet_debit().unwrap(),
+        "final wallet credit must conserve gross output, fees and envelope costs",
     );
 }

@@ -102,6 +102,63 @@ impl DecodedPumpRouteInstruction {
     }
 }
 
+/// Execution status is intentionally separate from typed decoding/layout
+/// support.  A route can be understood well enough to reject bad chain
+/// evidence without being authorised to construct an executable intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpRouteExecutionAuthorizationV1 {
+    /// A successful current-route golden fixture covers the settlement and the
+    /// builder surface used by this route.
+    ParityValidated,
+    /// The discriminator and account contract are typed, but execution stays
+    /// fail-closed until a route-specific settlement-parity fixture exists.
+    TypedSupportedNotExecutionAuthorized { reason: &'static str },
+}
+
+/// The authorization map is deliberately narrow.  It is not an inference
+/// from `is_buy`/`is_sell`, nor a promise that all typed routes may execute.
+pub const fn pump_route_execution_authorization(
+    route: PumpRouteVariant,
+) -> PumpRouteExecutionAuthorizationV1 {
+    match route {
+        PumpRouteVariant::BuyV2 | PumpRouteVariant::LegacySell => {
+            PumpRouteExecutionAuthorizationV1::ParityValidated
+        }
+        PumpRouteVariant::SellV2 => {
+            PumpRouteExecutionAuthorizationV1::TypedSupportedNotExecutionAuthorized {
+                reason: "sell_v2 has no successful on-chain settlement-parity fixture",
+            }
+        }
+        PumpRouteVariant::LegacyBuy => {
+            PumpRouteExecutionAuthorizationV1::TypedSupportedNotExecutionAuthorized {
+                reason: "legacy_buy has no current-route settlement-parity fixture",
+            }
+        }
+        PumpRouteVariant::BuyExactQuoteInV2 => {
+            PumpRouteExecutionAuthorizationV1::TypedSupportedNotExecutionAuthorized {
+                reason: "buy_exact_quote_in_v2 has no current-route settlement-parity fixture",
+            }
+        }
+    }
+}
+
+/// Requires a route-specific parity authorization immediately before an
+/// execution-capable builder is used.  In particular, `SellV2` cannot be
+/// submitted merely because its discriminator and account layout decode.
+pub fn require_pump_route_execution_authorization(
+    route: PumpRouteVariant,
+) -> Result<(), PumpRouteError> {
+    match pump_route_execution_authorization(route) {
+        PumpRouteExecutionAuthorizationV1::ParityValidated => Ok(()),
+        PumpRouteExecutionAuthorizationV1::TypedSupportedNotExecutionAuthorized { reason } => {
+            Err(PumpRouteError::RouteNotExecutionAuthorized {
+                route: route.as_str(),
+                reason,
+            })
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PumpRouteError {
     #[error("Pump instruction payload is shorter than the eight-byte discriminator")]
@@ -136,6 +193,11 @@ pub enum PumpRouteError {
     RouteVariantMismatch {
         expected: &'static str,
         actual: &'static str,
+    },
+    #[error("Pump route {route} is typed-supported but not execution-authorized: {reason}")]
+    RouteNotExecutionAuthorized {
+        route: &'static str,
+        reason: &'static str,
     },
     #[error("owner evidence count for {route} must be {expected}, got {actual}")]
     InvalidOwnerEvidenceCount {
@@ -448,6 +510,7 @@ impl PumpV2RouteBuilder {
         spendable_quote_in: u64,
         min_tokens_out: u64,
     ) -> Result<Instruction, PumpRouteError> {
+        require_pump_route_execution_authorization(PumpRouteVariant::BuyExactQuoteInV2)?;
         accounts.validate()?;
         Ok(Self::build(
             PumpRouteVariant::BuyExactQuoteInV2,
@@ -462,6 +525,7 @@ impl PumpV2RouteBuilder {
         amount: u64,
         min_sol_output: u64,
     ) -> Result<Instruction, PumpRouteError> {
+        require_pump_route_execution_authorization(PumpRouteVariant::SellV2)?;
         accounts.validate()?;
         Ok(Self::build(
             PumpRouteVariant::SellV2,
@@ -637,17 +701,26 @@ impl PumpLegacyBuyRouteBuilder {
         amount: u64,
         max_sol_cost: u64,
     ) -> Result<Instruction, PumpRouteError> {
+        require_pump_route_execution_authorization(PumpRouteVariant::LegacyBuy)?;
         accounts.validate()?;
+        Ok(Self::build_unchecked(accounts, amount, max_sol_cost))
+    }
+
+    fn build_unchecked(
+        accounts: &PumpLegacyBuyRouteAccounts,
+        amount: u64,
+        max_sol_cost: u64,
+    ) -> Instruction {
         let mut data = Vec::with_capacity(25);
         data.extend_from_slice(&LEGACY_BUY_DISCRIMINATOR);
         data.extend_from_slice(&amount.to_le_bytes());
         data.extend_from_slice(&max_sol_cost.to_le_bytes());
         data.push(1); // `track_volume`; fixed by the current pinned route.
-        Ok(Instruction {
+        Instruction {
             program_id: PUMP_PROGRAM_ID,
             accounts: Self::expected_accounts(accounts),
             data,
-        })
+        }
     }
 
     pub fn expected_accounts(accounts: &PumpLegacyBuyRouteAccounts) -> Vec<AccountMeta> {
@@ -1118,8 +1191,15 @@ mod tests {
     #[test]
     fn all_v2_variants_are_independently_encoded_and_checked() {
         let accounts = fixture_accounts();
+        assert!(matches!(
+            PumpV2RouteBuilder::build_buy_exact_quote_in_v2(&accounts, 22, 11),
+            Err(PumpRouteError::RouteNotExecutionAuthorized {
+                route: "buy_exact_quote_in_v2",
+                ..
+            })
+        ));
         let exact_quote =
-            PumpV2RouteBuilder::build_buy_exact_quote_in_v2(&accounts, 22, 11).unwrap();
+            PumpV2RouteBuilder::build(PumpRouteVariant::BuyExactQuoteInV2, &accounts, 22, 11);
         assert_eq!(
             exact_quote.accounts.len(),
             BUY_EXACT_QUOTE_IN_V2_ACCOUNT_COUNT
@@ -1145,7 +1225,23 @@ mod tests {
             &exact_quote_owner_evidence,
         )
         .unwrap();
-        let sell = PumpV2RouteBuilder::build_sell_v2(&accounts, 22, 11).unwrap();
+        assert_eq!(
+            pump_route_execution_authorization(PumpRouteVariant::SellV2),
+            PumpRouteExecutionAuthorizationV1::TypedSupportedNotExecutionAuthorized {
+                reason: "sell_v2 has no successful on-chain settlement-parity fixture",
+            }
+        );
+        assert!(matches!(
+            PumpV2RouteBuilder::build_sell_v2(&accounts, 22, 11),
+            Err(PumpRouteError::RouteNotExecutionAuthorized {
+                route: "sell_v2",
+                ..
+            })
+        ));
+        // The private raw constructor is reachable only inside this module's
+        // tests.  It proves the typed decoder/layout contract without making
+        // the public execution-capable builder available for SellV2.
+        let sell = PumpV2RouteBuilder::build(PumpRouteVariant::SellV2, &accounts, 22, 11);
         assert_eq!(sell.accounts.len(), SELL_V2_ACCOUNT_COUNT);
         assert!(matches!(
             validate_v2_instruction(&sell, &accounts),
@@ -1194,7 +1290,14 @@ mod tests {
             buyback_fee_recipient: Pubkey::from_str("9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7")
                 .unwrap(),
         };
-        let instruction = PumpLegacyBuyRouteBuilder::build_buy(&accounts, 100, 1_000).unwrap();
+        assert!(matches!(
+            PumpLegacyBuyRouteBuilder::build_buy(&accounts, 100, 1_000),
+            Err(PumpRouteError::RouteNotExecutionAuthorized {
+                route: "legacy_buy",
+                ..
+            })
+        ));
+        let instruction = PumpLegacyBuyRouteBuilder::build_unchecked(&accounts, 100, 1_000);
         assert_eq!(instruction.accounts.len(), LEGACY_BUY_ACCOUNT_COUNT);
         assert_eq!(
             validate_legacy_buy_instruction(&instruction, &accounts).unwrap(),

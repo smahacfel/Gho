@@ -105,8 +105,9 @@ pub use pipeline_coverage::{
 pub use pool_identity::{BaseMint, BondingCurveKey, PoolId, PoolIdentity, PoolIdentityRegistry};
 pub use pump_quote::{
     quote_exact_base_in_sell, quote_exact_base_out, quote_exact_quote_in, FeeRounding,
-    InstructionLimitCheck, ProgramFeeCharge, ProgramFeeRule, ProgramFeeSchedule, ProgramSettlement,
-    ProgramStateTransition, PumpQuoteError, PumpQuoteV1, PumpReserveState, PumpRouteVariant,
+    InstructionLimitCheck, ProgramFeeCharge, ProgramFeeRule, ProgramFeeSchedule,
+    ProgramFeeScheduleEvidenceV1, ProgramSettlement, ProgramStateTransition, PumpQuoteError,
+    PumpQuoteV1, PumpReserveState, PumpRouteVariant, RuntimeProgramFeeScheduleRegistryV1,
     TransactionCosts,
 };
 pub use shadow_ledger::{

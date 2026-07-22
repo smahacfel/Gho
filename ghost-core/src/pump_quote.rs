@@ -82,6 +82,55 @@ pub struct ProgramFeeRule {
     pub rounding: FeeRounding,
 }
 
+/// Provenance of a fee schedule.  A canonical fixture is permitted for
+/// deterministic replay, but it is deliberately rejected by
+/// [`RuntimeProgramFeeScheduleRegistryV1`]: static fixture values must never
+/// become a hidden runtime fee constant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProgramFeeScheduleEvidenceV1 {
+    /// A canonical account snapshot decoded by the caller from the current
+    /// route's on-chain fee/config authority.
+    OnChainConfig {
+        config_pubkey: String,
+        owner_program: String,
+        account_data_hash: String,
+        observed_slot: u64,
+    },
+    /// A versioned registry whose records are effective from an explicit slot.
+    /// The registry itself must be materialised from canonical evidence by the
+    /// caller; its identity and content hash are retained for audit/replay.
+    EffectiveSlotRegistry {
+        registry_id: String,
+        registry_hash: String,
+        observed_slot: u64,
+    },
+    /// Offline/replay-only source.  It can exercise the pure quote model but
+    /// cannot authorise a runtime execution quote.
+    CanonicalFixture {
+        fixture_id: String,
+        transaction_signature: String,
+        observed_slot: u64,
+    },
+}
+
+impl ProgramFeeScheduleEvidenceV1 {
+    pub const fn observed_slot(&self) -> u64 {
+        match self {
+            Self::OnChainConfig { observed_slot, .. }
+            | Self::EffectiveSlotRegistry { observed_slot, .. }
+            | Self::CanonicalFixture { observed_slot, .. } => *observed_slot,
+        }
+    }
+
+    const fn is_runtime_authority(&self) -> bool {
+        matches!(
+            self,
+            Self::OnChainConfig { .. } | Self::EffectiveSlotRegistry { .. }
+        )
+    }
+}
+
 /// Fee authority supplied from an on-chain config snapshot, an effective-slot
 /// registry, or a complete canonical fixture.  The caller owns acquisition of
 /// that evidence; the quote engine never assumes a default schedule.
@@ -89,7 +138,164 @@ pub struct ProgramFeeRule {
 pub struct ProgramFeeSchedule {
     pub fee_schedule_id: String,
     pub effective_slot: u64,
+    pub evidence: ProgramFeeScheduleEvidenceV1,
     pub rules: Vec<ProgramFeeRule>,
+}
+
+impl ProgramFeeSchedule {
+    fn validate(&self) -> Result<(), PumpQuoteError> {
+        if self.fee_schedule_id.is_empty() {
+            return Err(PumpQuoteError::InvalidFeeEvidence {
+                detail: "fee_schedule_id is empty".into(),
+            });
+        }
+        if self.rules.is_empty() {
+            return Err(PumpQuoteError::MissingFeeSchedule);
+        }
+        if self.evidence.observed_slot() < self.effective_slot {
+            return Err(PumpQuoteError::InvalidFeeEvidence {
+                detail: "fee evidence predates its effective slot".into(),
+            });
+        }
+        let non_empty = |value: &str| !value.trim().is_empty();
+        let valid = match &self.evidence {
+            ProgramFeeScheduleEvidenceV1::OnChainConfig {
+                config_pubkey,
+                owner_program,
+                account_data_hash,
+                ..
+            } => {
+                non_empty(config_pubkey) && non_empty(owner_program) && non_empty(account_data_hash)
+            }
+            ProgramFeeScheduleEvidenceV1::EffectiveSlotRegistry {
+                registry_id,
+                registry_hash,
+                ..
+            } => non_empty(registry_id) && non_empty(registry_hash),
+            ProgramFeeScheduleEvidenceV1::CanonicalFixture {
+                fixture_id,
+                transaction_signature,
+                ..
+            } => non_empty(fixture_id) && non_empty(transaction_signature),
+        };
+        if !valid {
+            return Err(PumpQuoteError::InvalidFeeEvidence {
+                detail: "fee evidence contains an empty authority field".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Slot-resolved runtime authority for program fees.  It intentionally owns a
+/// small immutable-after-materialisation list rather than reading RPC or a
+/// mutable global during quote calculation.  A caller must populate it from a
+/// canonical on-chain config snapshot or a versioned effective-slot registry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeProgramFeeScheduleRegistryV1 {
+    schedules: Vec<(PumpRouteVariant, ProgramFeeSchedule)>,
+}
+
+impl RuntimeProgramFeeScheduleRegistryV1 {
+    /// Adds one route-specific schedule.  Fixture-only evidence is rejected
+    /// here even though the pure quote functions support replay fixtures.
+    pub fn register(
+        &mut self,
+        route_variant: PumpRouteVariant,
+        schedule: ProgramFeeSchedule,
+    ) -> Result<(), PumpQuoteError> {
+        schedule.validate()?;
+        if !schedule.evidence.is_runtime_authority() {
+            return Err(PumpQuoteError::FixtureEvidenceCannotAuthorizeRuntime);
+        }
+        if self.schedules.iter().any(|(registered_route, registered)| {
+            *registered_route == route_variant
+                && registered.effective_slot == schedule.effective_slot
+        }) {
+            return Err(PumpQuoteError::DuplicateRuntimeFeeSchedule {
+                route_variant,
+                effective_slot: schedule.effective_slot,
+            });
+        }
+        self.schedules.push((route_variant, schedule));
+        Ok(())
+    }
+
+    /// Resolves the latest fee schedule whose effectivity and evidence were
+    /// both already known at `canonical_slot`.  Future fee/config evidence is
+    /// never allowed to quote a historical decision.
+    pub fn resolve(
+        &self,
+        route_variant: PumpRouteVariant,
+        canonical_slot: u64,
+    ) -> Result<&ProgramFeeSchedule, PumpQuoteError> {
+        self.schedules
+            .iter()
+            .filter(|(registered_route, schedule)| {
+                *registered_route == route_variant
+                    && schedule.effective_slot <= canonical_slot
+                    && schedule.evidence.observed_slot() <= canonical_slot
+            })
+            .max_by_key(|(_, schedule)| schedule.effective_slot)
+            .map(|(_, schedule)| schedule)
+            .ok_or(PumpQuoteError::MissingRuntimeFeeSchedule {
+                route_variant,
+                canonical_slot,
+            })
+    }
+
+    /// Runtime-only convenience surface for exact-base-out buys.  It resolves
+    /// fee authority at the canonical decision slot before invoking the pure
+    /// math function, so an execution caller need not (and must not) inject a
+    /// fixture schedule by hand.
+    pub fn quote_exact_base_out(
+        &self,
+        route_variant: PumpRouteVariant,
+        canonical_slot: u64,
+        reserves: PumpReserveState,
+        requested_base_out: u64,
+        max_quote_cost: u64,
+    ) -> Result<PumpQuoteV1, PumpQuoteError> {
+        let schedule = self.resolve(route_variant, canonical_slot)?;
+        quote_exact_base_out(
+            route_variant,
+            reserves,
+            requested_base_out,
+            max_quote_cost,
+            schedule,
+        )
+    }
+
+    /// Runtime-only convenience surface for exact-quote-in buys.
+    pub fn quote_exact_quote_in(
+        &self,
+        canonical_slot: u64,
+        reserves: PumpReserveState,
+        spendable_quote_in: u64,
+        min_base_out: u64,
+    ) -> Result<PumpQuoteV1, PumpQuoteError> {
+        let schedule = self.resolve(PumpRouteVariant::BuyExactQuoteInV2, canonical_slot)?;
+        quote_exact_quote_in(reserves, spendable_quote_in, min_base_out, schedule)
+    }
+
+    /// Runtime-only convenience surface for exact-base-in sells.
+    pub fn quote_exact_base_in_sell(
+        &self,
+        route_variant: PumpRouteVariant,
+        canonical_slot: u64,
+        reserves: PumpReserveState,
+        base_amount_in: u64,
+        min_quote_output: u64,
+    ) -> Result<PumpQuoteV1, PumpQuoteError> {
+        let schedule = self.resolve(route_variant, canonical_slot)?;
+        quote_exact_base_in_sell(
+            route_variant,
+            reserves,
+            base_amount_in,
+            min_quote_output,
+            schedule,
+        )
+    }
 }
 
 /// One materialised program fee.  Its amount is always based on the curve
@@ -155,6 +361,8 @@ impl TransactionCosts {
 pub struct PumpQuoteV1 {
     pub route_variant: PumpRouteVariant,
     pub fee_schedule_id: String,
+    pub fee_schedule_effective_slot: u64,
+    pub fee_evidence: ProgramFeeScheduleEvidenceV1,
     pub reserve_transition: ProgramStateTransition,
     pub token_amount: u64,
     pub curve_quote_amount: u64,
@@ -175,8 +383,28 @@ pub enum PumpQuoteError {
     InsufficientRealBaseReserves,
     #[error("requested base amount exhausts virtual base reserves")]
     ExhaustedVirtualBaseReserves,
+    #[error("route {route_variant:?} does not use exact-base-out buy semantics")]
+    RouteDoesNotUseExactBaseOut { route_variant: PumpRouteVariant },
+    #[error("route {route_variant:?} does not use exact-base-in sell semantics")]
+    RouteDoesNotUseExactBaseInSell { route_variant: PumpRouteVariant },
     #[error("fee schedule contains no rules")]
     MissingFeeSchedule,
+    #[error("invalid fee evidence: {detail}")]
+    InvalidFeeEvidence { detail: String },
+    #[error("canonical fixture evidence cannot authorise a runtime fee schedule")]
+    FixtureEvidenceCannotAuthorizeRuntime,
+    #[error("duplicate runtime fee schedule for {route_variant:?} at slot {effective_slot}")]
+    DuplicateRuntimeFeeSchedule {
+        route_variant: PumpRouteVariant,
+        effective_slot: u64,
+    },
+    #[error(
+        "no runtime fee schedule for {route_variant:?} known at canonical slot {canonical_slot}"
+    )]
+    MissingRuntimeFeeSchedule {
+        route_variant: PumpRouteVariant,
+        canonical_slot: u64,
+    },
     #[error("fee rule {component_id} has denominator zero")]
     InvalidFeeRule { component_id: String },
     #[error("fee total exceeds the gross curve quote output")]
@@ -206,9 +434,7 @@ fn fee_charges(
     curve_quote_amount: u64,
     schedule: &ProgramFeeSchedule,
 ) -> Result<(Vec<ProgramFeeCharge>, u64), PumpQuoteError> {
-    if schedule.rules.is_empty() {
-        return Err(PumpQuoteError::MissingFeeSchedule);
-    }
+    schedule.validate()?;
 
     let mut charges = Vec::with_capacity(schedule.rules.len());
     let mut total = 0u64;
@@ -250,6 +476,12 @@ pub fn quote_exact_base_out(
     max_quote_cost: u64,
     schedule: &ProgramFeeSchedule,
 ) -> Result<PumpQuoteV1, PumpQuoteError> {
+    if !matches!(
+        route_variant,
+        PumpRouteVariant::LegacyBuy | PumpRouteVariant::BuyV2
+    ) {
+        return Err(PumpQuoteError::RouteDoesNotUseExactBaseOut { route_variant });
+    }
     if requested_base_out == 0 {
         return Err(PumpQuoteError::ZeroAmount);
     }
@@ -279,6 +511,8 @@ pub fn quote_exact_base_out(
     Ok(PumpQuoteV1 {
         route_variant,
         fee_schedule_id: schedule.fee_schedule_id.clone(),
+        fee_schedule_effective_slot: schedule.effective_slot,
+        fee_evidence: schedule.evidence.clone(),
         reserve_transition: ProgramStateTransition {
             base_before: reserves.virtual_base_reserves,
             base_after,
@@ -344,6 +578,8 @@ pub fn quote_exact_quote_in(
     Ok(PumpQuoteV1 {
         route_variant: PumpRouteVariant::BuyExactQuoteInV2,
         fee_schedule_id: schedule.fee_schedule_id.clone(),
+        fee_schedule_effective_slot: schedule.effective_slot,
+        fee_evidence: schedule.evidence.clone(),
         reserve_transition: ProgramStateTransition {
             base_before: reserves.virtual_base_reserves,
             base_after,
@@ -383,6 +619,12 @@ pub fn quote_exact_base_in_sell(
     min_quote_output: u64,
     schedule: &ProgramFeeSchedule,
 ) -> Result<PumpQuoteV1, PumpQuoteError> {
+    if !matches!(
+        route_variant,
+        PumpRouteVariant::LegacySell | PumpRouteVariant::SellV2
+    ) {
+        return Err(PumpQuoteError::RouteDoesNotUseExactBaseInSell { route_variant });
+    }
     if base_amount_in == 0 {
         return Err(PumpQuoteError::ZeroAmount);
     }
@@ -410,6 +652,8 @@ pub fn quote_exact_base_in_sell(
     Ok(PumpQuoteV1 {
         route_variant,
         fee_schedule_id: schedule.fee_schedule_id.clone(),
+        fee_schedule_effective_slot: schedule.effective_slot,
+        fee_evidence: schedule.evidence.clone(),
         reserve_transition: ProgramStateTransition {
             base_before: reserves.virtual_base_reserves,
             base_after,
@@ -439,6 +683,14 @@ pub fn quote_exact_base_in_sell(
 mod tests {
     use super::*;
 
+    fn fixture_evidence(slot: u64) -> ProgramFeeScheduleEvidenceV1 {
+        ProgramFeeScheduleEvidenceV1::CanonicalFixture {
+            fixture_id: format!("unit-fixture-{slot}"),
+            transaction_signature: format!("unit-signature-{slot}"),
+            observed_slot: slot,
+        }
+    }
+
     #[test]
     fn buy_v2_exact_base_out_uses_cap_only_as_limit() {
         let reserves = PumpReserveState {
@@ -450,6 +702,7 @@ mod tests {
         let schedule = ProgramFeeSchedule {
             fee_schedule_id: "fixture-buy-v2-434365563".into(),
             effective_slot: 434_365_563,
+            evidence: fixture_evidence(434_365_563),
             rules: vec![ProgramFeeRule {
                 component_id: "protocol_and_buyback".into(),
                 numerator: 95,
@@ -486,6 +739,7 @@ mod tests {
         let schedule = ProgramFeeSchedule {
             fee_schedule_id: "fixture-legacy-sell-434365533".into(),
             effective_slot: 434_365_533,
+            evidence: fixture_evidence(434_365_533),
             rules: vec![
                 ProgramFeeRule {
                     component_id: "lp_fee".into(),
@@ -556,6 +810,7 @@ mod tests {
             &ProgramFeeSchedule {
                 fee_schedule_id: "missing".into(),
                 effective_slot: 0,
+                evidence: fixture_evidence(0),
                 rules: vec![],
             },
         );
@@ -576,6 +831,7 @@ mod tests {
             &ProgramFeeSchedule {
                 fee_schedule_id: "unit".into(),
                 effective_slot: 1,
+                evidence: fixture_evidence(1),
                 rules: vec![ProgramFeeRule {
                     component_id: "protocol".into(),
                     numerator: 1,
@@ -593,5 +849,108 @@ mod tests {
         assert_eq!(output.limit, 9_000);
         assert_eq!(output.required_or_produced, quote.token_amount);
         assert!(output.passed);
+    }
+
+    #[test]
+    fn runtime_fee_registry_is_slot_resolved_and_rejects_fixture_authority() {
+        let rule = ProgramFeeRule {
+            component_id: "protocol".into(),
+            numerator: 1,
+            denominator: 100,
+            rounding: FeeRounding::Ceil,
+        };
+        let mut registry = RuntimeProgramFeeScheduleRegistryV1::default();
+        let fixture_schedule = ProgramFeeSchedule {
+            fee_schedule_id: "fixture-only".into(),
+            effective_slot: 100,
+            evidence: fixture_evidence(100),
+            rules: vec![rule.clone()],
+        };
+        assert_eq!(
+            registry.register(PumpRouteVariant::BuyV2, fixture_schedule),
+            Err(PumpQuoteError::FixtureEvidenceCannotAuthorizeRuntime)
+        );
+
+        registry
+            .register(
+                PumpRouteVariant::BuyV2,
+                ProgramFeeSchedule {
+                    fee_schedule_id: "onchain-config-at-100".into(),
+                    effective_slot: 100,
+                    evidence: ProgramFeeScheduleEvidenceV1::OnChainConfig {
+                        config_pubkey: "config-pubkey".into(),
+                        owner_program: "pump-fee-program".into(),
+                        account_data_hash: "account-hash-at-100".into(),
+                        observed_slot: 100,
+                    },
+                    rules: vec![rule.clone()],
+                },
+            )
+            .unwrap();
+        registry
+            .register(
+                PumpRouteVariant::BuyV2,
+                ProgramFeeSchedule {
+                    fee_schedule_id: "registry-at-200".into(),
+                    effective_slot: 200,
+                    evidence: ProgramFeeScheduleEvidenceV1::EffectiveSlotRegistry {
+                        registry_id: "pump-fee-registry-v2".into(),
+                        registry_hash: "registry-hash-at-200".into(),
+                        observed_slot: 220,
+                    },
+                    rules: vec![rule],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.resolve(PumpRouteVariant::BuyV2, 99),
+            Err(PumpQuoteError::MissingRuntimeFeeSchedule {
+                route_variant: PumpRouteVariant::BuyV2,
+                canonical_slot: 99,
+            })
+        );
+        assert_eq!(
+            registry
+                .resolve(PumpRouteVariant::BuyV2, 150)
+                .unwrap()
+                .fee_schedule_id,
+            "onchain-config-at-100"
+        );
+        // The registry change is effective at 200 but was not observable until
+        // 220; historical quotes between those slots keep the older evidence.
+        assert_eq!(
+            registry
+                .resolve(PumpRouteVariant::BuyV2, 219)
+                .unwrap()
+                .fee_schedule_id,
+            "onchain-config-at-100"
+        );
+        assert_eq!(
+            registry
+                .resolve(PumpRouteVariant::BuyV2, 220)
+                .unwrap()
+                .fee_schedule_id,
+            "registry-at-200"
+        );
+        let runtime_quote = registry
+            .quote_exact_base_out(
+                PumpRouteVariant::BuyV2,
+                220,
+                PumpReserveState {
+                    virtual_base_reserves: 1_000,
+                    virtual_quote_reserves: 1_000,
+                    real_base_reserves: 1_000,
+                    real_quote_reserves: 0,
+                },
+                1,
+                100,
+            )
+            .unwrap();
+        assert_eq!(runtime_quote.fee_schedule_id, "registry-at-200");
+        assert!(matches!(
+            runtime_quote.fee_evidence,
+            ProgramFeeScheduleEvidenceV1::EffectiveSlotRegistry { .. }
+        ));
     }
 }
