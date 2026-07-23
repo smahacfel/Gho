@@ -33,6 +33,10 @@ use crate::rug_scalp_v2::{
     RugScalpRuntimeAdapterV2, RugScalpTerminalOutcomeV2, RugScalpV2Config,
     RUG_SCALP_EXIT_PROFILE_ID, RUG_SCALP_V2_STRATEGY_ID,
 };
+use crate::rug_scalp_validation_tape::{
+    RugScalpCanonicalOrderKeyV1, RugScalpValidationRunContextV1, RugScalpValidationTapeBusV1,
+    RugScalpValidationTapeRecordV1, RugScalpValidationTapeV1,
+};
 use crate::session::{
     OpenSessionRequest, PoolObservationSession, SessionConfig, SessionManager, SharedSession,
 };
@@ -1951,6 +1955,10 @@ pub struct OracleRuntimeConfig {
     /// Isolated prospective RUG SCALP V2 adapter configuration.  It is read
     /// once and never derives authority from a Gatekeeper decision.
     pub rug_scalp_v2: RugScalpV2Config,
+    /// Additive observe-only tape context. It carries frozen identity hashes
+    /// but cannot change reducer, PM, or execution behaviour.
+    pub rug_scalp_validation_run_context: Option<RugScalpValidationRunContextV1>,
+    pub rug_scalp_validation_tape_bus: Option<RugScalpValidationTapeBusV1>,
     pub selector: SelectorRuntimeConfig,
     pub run_id: Option<String>,
     pub session_id: Option<String>,
@@ -2003,6 +2011,8 @@ impl OracleRuntimeConfig {
             metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             rug_scalp_v2: RugScalpV2Config::default(),
+            rug_scalp_validation_run_context: None,
+            rug_scalp_validation_tape_bus: None,
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -2026,6 +2036,8 @@ impl OracleRuntimeConfig {
             metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             rug_scalp_v2: RugScalpV2Config::default(),
+            rug_scalp_validation_run_context: None,
+            rug_scalp_validation_tape_bus: None,
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -2090,6 +2102,8 @@ impl Default for OracleRuntimeConfig {
             metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             rug_scalp_v2: RugScalpV2Config::default(),
+            rug_scalp_validation_run_context: None,
+            rug_scalp_validation_tape_bus: None,
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -22541,6 +22555,7 @@ enum RugScalpAdapterCompletionV2 {
         candidate_id: String,
         position_id: String,
         entry_token_amount_raw: u64,
+        entry_total_debit_lamports: u64,
         entry_watermark: RugScalpEntryWatermarkV1,
     },
 }
@@ -22585,6 +22600,22 @@ async fn append_rug_scalp_entry_attempt(
             "RUG_SCALP_ENTRY_ATTEMPT_WRITE_FAILED"
         );
     }
+}
+
+/// A bounded sidecar writer for validation evidence. A full queue is never
+/// treated as a successful observation: callers must invalidate active tape
+/// attempts through `mark_stream_gap` before continuing.
+fn enqueue_rug_scalp_validation_records(
+    sender: &mpsc::Sender<RugScalpValidationTapeRecordV1>,
+    records: Vec<RugScalpValidationTapeRecordV1>,
+) -> bool {
+    for record in records {
+        if sender.try_send(record).is_err() {
+            warn!("RUG_SCALP_VALIDATION_TAPE_WRITER_QUEUE_GAP");
+            return false;
+        }
+    }
+    true
 }
 
 async fn append_rug_scalp_entry_terminal(
@@ -22756,25 +22787,62 @@ async fn run_rug_scalp_v2_entry_adapter(
     pool_data: Arc<DetectedPool>,
     entry_evidence_txs: Vec<Arc<PoolTransaction>>,
     completion_tx: tokio::sync::mpsc::Sender<RugScalpAdapterCompletionV2>,
+    validation_tape_bus: Option<RugScalpValidationTapeBusV1>,
 ) {
     let config = &ctx.oracle_runtime.config.rug_scalp_v2;
     let entry_log_path = std::path::PathBuf::from(&config.entry_log_path);
     let outcome_log_path = std::path::PathBuf::from(&config.outcome_log_path);
     let mut entry_record = RugScalpEntryAttemptRecordV2::from_intent(&intent, "accepted_intent");
+    macro_rules! append_terminal {
+        ($outcome:expr, $status:expr, $reason:expr) => {{
+            let terminal_outcome = $outcome;
+            let terminal_reason = ($reason).to_string();
+            append_rug_scalp_entry_terminal(
+                &outcome_log_path,
+                &intent,
+                terminal_outcome.clone(),
+                $status,
+                terminal_reason.clone(),
+            )
+            .await;
+            if let Some(bus) = validation_tape_bus.as_ref() {
+                let status = match terminal_outcome {
+                    RugScalpTerminalOutcomeV2::NoEntry | RugScalpTerminalOutcomeV2::EntryFailed => {
+                        crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::EntryFailed
+                    }
+                    RugScalpTerminalOutcomeV2::EntryUnknown => {
+                        crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::EntryUnknown
+                    }
+                    RugScalpTerminalOutcomeV2::DataInvalidated => {
+                        crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::DataInvalidated
+                    }
+                    RugScalpTerminalOutcomeV2::PositionClosed => {
+                        crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::PositionClosed
+                    }
+                    RugScalpTerminalOutcomeV2::ExitUnavailable => {
+                        crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::ExitUnavailable
+                    }
+                };
+                bus.emit(crate::rug_scalp_validation_tape::RugScalpValidationTapeEventV1::EntryTerminal {
+                    candidate_id: intent.candidate_id.clone(),
+                    status,
+                    reason: terminal_reason,
+                    observed_ingress_ms: current_time_ms(),
+                });
+            }
+        }};
+    }
     let mint = match Pubkey::from_str(&intent.assessment.mint) {
         Ok(mint) => mint,
         Err(_) => {
             entry_record.dispatch_status = "data_invalidated".to_string();
             entry_record.failure_reason = Some("invalid_mint_identity".to_string());
             append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-            append_rug_scalp_entry_terminal(
-                &outcome_log_path,
-                &intent,
+            append_terminal!(
                 RugScalpTerminalOutcomeV2::DataInvalidated,
                 "not_submitted",
-                "invalid_mint_identity",
-            )
-            .await;
+                "invalid_mint_identity"
+            );
             return;
         }
     };
@@ -22782,64 +22850,53 @@ async fn run_rug_scalp_v2_entry_adapter(
         entry_record.dispatch_status = "entry_failed".to_string();
         entry_record.failure_reason = Some("authoritative_pump_builder_unavailable".to_string());
         append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-        append_rug_scalp_entry_terminal(
-            &outcome_log_path,
-            &intent,
+        append_terminal!(
             RugScalpTerminalOutcomeV2::EntryFailed,
             "not_submitted",
-            "authoritative_pump_builder_unavailable",
-        )
-        .await;
+            "authoritative_pump_builder_unavailable"
+        );
         return;
     };
     let Some(signal_slot) = intent.assessment.signal_slot else {
         entry_record.dispatch_status = "data_invalidated".to_string();
         entry_record.failure_reason = Some("signal_slot_missing".to_string());
         append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-        append_rug_scalp_entry_terminal(
-            &outcome_log_path,
-            &intent,
+        append_terminal!(
             RugScalpTerminalOutcomeV2::DataInvalidated,
             "not_submitted",
-            "signal_slot_missing",
-        )
-        .await;
+            "signal_slot_missing"
+        );
         return;
     };
-    let Some(latency_slots) = config.primary_entry_latency_slots else {
+    if let Some(latency_slots) = config.primary_entry_latency_slots {
+        if let Err(reason) = wait_for_rug_scalp_entry_latency(
+            ctx.oracle_runtime.as_ref(),
+            mint,
+            signal_slot,
+            latency_slots,
+            config.max_hold_ms,
+        )
+        .await
+        {
+            entry_record.dispatch_status = "entry_unknown".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_terminal!(
+                RugScalpTerminalOutcomeV2::EntryUnknown,
+                "latency_wait_unresolved",
+                reason
+            );
+            return;
+        }
+    } else if !config.technical_validation_capture_enabled() {
         entry_record.dispatch_status = "data_invalidated".to_string();
         entry_record.failure_reason = Some("primary_entry_latency_not_frozen".to_string());
         append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-        append_rug_scalp_entry_terminal(
-            &outcome_log_path,
-            &intent,
+        append_terminal!(
             RugScalpTerminalOutcomeV2::DataInvalidated,
             "not_submitted",
-            "primary_entry_latency_not_frozen",
-        )
-        .await;
-        return;
-    };
-    if let Err(reason) = wait_for_rug_scalp_entry_latency(
-        ctx.oracle_runtime.as_ref(),
-        mint,
-        signal_slot,
-        latency_slots,
-        config.max_hold_ms,
-    )
-    .await
-    {
-        entry_record.dispatch_status = "entry_unknown".to_string();
-        entry_record.failure_reason = Some(reason.clone());
-        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-        append_rug_scalp_entry_terminal(
-            &outcome_log_path,
-            &intent,
-            RugScalpTerminalOutcomeV2::EntryUnknown,
-            "latency_wait_unresolved",
-            reason,
-        )
-        .await;
+            "primary_entry_latency_not_frozen"
+        );
         return;
     }
 
@@ -22855,14 +22912,11 @@ async fn run_rug_scalp_v2_entry_adapter(
             entry_record.dispatch_status = "entry_failed".to_string();
             entry_record.failure_reason = Some(reason.clone());
             append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-            append_rug_scalp_entry_terminal(
-                &outcome_log_path,
-                &intent,
+            append_terminal!(
                 RugScalpTerminalOutcomeV2::EntryFailed,
                 "route_evidence_incomplete",
-                reason,
-            )
-            .await;
+                reason
+            );
             return;
         }
     };
@@ -22883,17 +22937,28 @@ async fn run_rug_scalp_v2_entry_adapter(
             entry_record.dispatch_status = "entry_failed".to_string();
             entry_record.failure_reason = Some(reason.clone());
             append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-            append_rug_scalp_entry_terminal(
-                &outcome_log_path,
-                &intent,
+            append_terminal!(
                 RugScalpTerminalOutcomeV2::EntryFailed,
                 "prepare_failed",
-                reason,
-            )
-            .await;
+                reason
+            );
             return;
         }
     };
+    if let Some(bus) = validation_tape_bus.as_ref() {
+        bus.emit(crate::rug_scalp_validation_tape::RugScalpValidationTapeEventV1::EntryStage {
+            candidate_id: intent.candidate_id.clone(),
+            stage: crate::rug_scalp_validation_tape::RugScalpValidationLatencyStageV1::EntryBuildCompleted,
+            observed_ingress_ms: current_time_ms(),
+            observed_slot: Some(signal_slot),
+        });
+        bus.emit(crate::rug_scalp_validation_tape::RugScalpValidationTapeEventV1::EntryStage {
+            candidate_id: intent.candidate_id.clone(),
+            stage: crate::rug_scalp_validation_tape::RugScalpValidationLatencyStageV1::EntrySubmitReady,
+            observed_ingress_ms: current_time_ms(),
+            observed_slot: Some(signal_slot),
+        });
+    }
     let report = match trigger_component
         .simulate_counterfactual_shadow_probe(&request)
         .await
@@ -22904,14 +22969,11 @@ async fn run_rug_scalp_v2_entry_adapter(
             entry_record.dispatch_status = "entry_failed".to_string();
             entry_record.failure_reason = Some(reason.clone());
             append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-            append_rug_scalp_entry_terminal(
-                &outcome_log_path,
-                &intent,
+            append_terminal!(
                 RugScalpTerminalOutcomeV2::EntryFailed,
                 "submission_failed",
-                reason,
-            )
-            .await;
+                reason
+            );
             return;
         }
     };
@@ -22926,14 +22988,11 @@ async fn run_rug_scalp_v2_entry_adapter(
         entry_record.dispatch_status = "entry_failed".to_string();
         entry_record.failure_reason = Some(reason.clone());
         append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-        append_rug_scalp_entry_terminal(
-            &outcome_log_path,
-            &intent,
+        append_terminal!(
             RugScalpTerminalOutcomeV2::EntryFailed,
             "modelled_fill_rejected",
-            reason,
-        )
-        .await;
+            reason
+        );
         return;
     }
     let entry_token_amount_raw = shadow_event
@@ -22944,14 +23003,11 @@ async fn run_rug_scalp_v2_entry_adapter(
         entry_record.dispatch_status = "entry_unknown".to_string();
         entry_record.failure_reason = Some("modelled_fill_quantity_missing".to_string());
         append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-        append_rug_scalp_entry_terminal(
-            &outcome_log_path,
-            &intent,
+        append_terminal!(
             RugScalpTerminalOutcomeV2::EntryUnknown,
             "modelled_fill_unresolved",
-            "modelled_fill_quantity_missing",
-        )
-        .await;
+            "modelled_fill_quantity_missing"
+        );
         return;
     };
     // The isolated shadow simulator proves the canonical RPC slot but does
@@ -22987,6 +23043,7 @@ async fn run_rug_scalp_v2_entry_adapter(
                     candidate_id: intent.candidate_id,
                     position_id,
                     entry_token_amount_raw,
+                    entry_total_debit_lamports: intent.entry_total_debit_lamports,
                     entry_watermark,
                 })
                 .await
@@ -23000,27 +23057,21 @@ async fn run_rug_scalp_v2_entry_adapter(
             entry_record.dispatch_status = "entry_failed".to_string();
             entry_record.failure_reason = Some(reason.clone());
             append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-            append_rug_scalp_entry_terminal(
-                &outcome_log_path,
-                &intent,
+            append_terminal!(
                 RugScalpTerminalOutcomeV2::EntryFailed,
                 "pm_registration_rejected",
-                reason,
-            )
-            .await;
+                reason
+            );
         }
         Err(reason) => {
             entry_record.dispatch_status = "entry_unknown".to_string();
             entry_record.failure_reason = Some(reason.clone());
             append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
-            append_rug_scalp_entry_terminal(
-                &outcome_log_path,
-                &intent,
+            append_terminal!(
                 RugScalpTerminalOutcomeV2::EntryUnknown,
                 "pm_handoff_unresolved",
-                reason,
-            )
-            .await;
+                reason
+            );
         }
     }
 }
@@ -23681,6 +23732,7 @@ fn build_seer_geyser_event_from_confirmed_tx(
 
     Some(SeerGeyserEvent::Transaction {
         slot: seer::types::normalize_slot(Some(tx.slot)),
+        tx_index: None,
         event_ts_ms: seer::types::event_ts_from_block_time(tx.block_time),
         arrival_ts_ms: None,
         event_time: ghost_core::EventTimeMetadata::new(
@@ -25682,6 +25734,34 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
             }
         });
     }
+    let mut rug_scalp_validation_tape = oracle_runtime
+        .config
+        .rug_scalp_validation_run_context
+        .clone()
+        .filter(|_| oracle_runtime.config.rug_scalp_v2.validation_tape.enabled)
+        .map(|context| RugScalpValidationTapeV1::new(&oracle_runtime.config.rug_scalp_v2, context));
+    let rug_scalp_validation_tape_bus = oracle_runtime.config.rug_scalp_validation_tape_bus.clone();
+    let (rug_scalp_validation_tx, mut rug_scalp_validation_rx) =
+        mpsc::channel::<RugScalpValidationTapeRecordV1>(2_048);
+    if rug_scalp_validation_tape.is_some() {
+        let validation_path =
+            std::path::PathBuf::from(&oracle_runtime.config.rug_scalp_v2.validation_tape.log_path);
+        tokio::spawn(async move {
+            while let Some(record) = rug_scalp_validation_rx.recv().await {
+                if let Err(error) = append_rug_scalp_jsonl_record(&validation_path, &record).await {
+                    warn!(error = %error, "RUG_SCALP_VALIDATION_TAPE_WRITE_FAILED");
+                }
+            }
+        });
+    }
+    if let Some(tape) = rug_scalp_validation_tape.as_ref() {
+        if !enqueue_rug_scalp_validation_records(
+            &rug_scalp_validation_tx,
+            vec![tape.run_manifest_record()],
+        ) {
+            warn!("RUG_SCALP_VALIDATION_MANIFEST_QUEUE_UNAVAILABLE");
+        }
+    }
     let (account_update_work_tx, account_update_work_rx) =
         tokio::sync::mpsc::unbounded_channel::<AccountUpdateEvent>();
     let account_update_queue_depth = Arc::new(AtomicUsize::new(0));
@@ -25694,6 +25774,8 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     let mut fsc_coverage_window_tick =
         tokio::time::interval(Duration::from_millis(FSC_COVERAGE_WINDOW_POLL_INTERVAL_MS));
     fsc_coverage_window_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut rug_scalp_validation_tape_tick = tokio::time::interval(Duration::from_millis(100));
+    rug_scalp_validation_tape_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_fsc_gate_status = None;
     refresh_fsc_authoritative_buy_gate_status(
         ctx.session_manager.as_ref(),
@@ -25731,6 +25813,16 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                     let _ = rug_scalp_adapter.mark_stream_gap();
                     break;
                 }
+            }
+        }
+        if let (Some(tape), Some(bus)) = (
+            rug_scalp_validation_tape.as_mut(),
+            rug_scalp_validation_tape_bus.as_ref(),
+        ) {
+            let records = tape.drain_external_events(bus);
+            if !enqueue_rug_scalp_validation_records(&rug_scalp_validation_tx, records) {
+                let terminals = tape.mark_stream_gap("validation_writer_queue_gap");
+                let _ = enqueue_rug_scalp_validation_records(&rug_scalp_validation_tx, terminals);
             }
         }
         tokio::select! {
@@ -25804,6 +25896,19 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                 );
             }
 
+            _ = rug_scalp_validation_tape_tick.tick(), if rug_scalp_validation_tape.is_some() => {
+                if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                    let records = tape.on_clock(current_time_ms());
+                    if !enqueue_rug_scalp_validation_records(&rug_scalp_validation_tx, records) {
+                        let terminals = tape.mark_stream_gap("validation_writer_queue_gap");
+                        let _ = enqueue_rug_scalp_validation_records(
+                            &rug_scalp_validation_tx,
+                            terminals,
+                        );
+                    }
+                }
+            }
+
             Some(completion) = rug_scalp_completion_rx.recv() => {
                 let actions = match completion {
                     RugScalpAdapterCompletionV2::BindRegisteredPosition {
@@ -25811,14 +25916,39 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         candidate_id,
                         position_id,
                         entry_token_amount_raw,
+                        entry_total_debit_lamports,
                         entry_watermark,
-                    } => rug_scalp_adapter.bind_confirmed_or_modelled_fill(
-                        &mint,
-                        &candidate_id,
-                        position_id,
-                        entry_token_amount_raw,
-                        entry_watermark,
-                    ),
+                    } => {
+                        if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                            let records = tape.bind_modelled_entry(
+                                &candidate_id,
+                                position_id.clone(),
+                                entry_token_amount_raw,
+                                entry_total_debit_lamports,
+                                entry_watermark.slot,
+                                current_time_ms(),
+                            );
+                            if !enqueue_rug_scalp_validation_records(
+                                &rug_scalp_validation_tx,
+                                records,
+                            ) {
+                                let terminals = tape.mark_stream_gap(
+                                    "validation_writer_queue_gap",
+                                );
+                                let _ = enqueue_rug_scalp_validation_records(
+                                    &rug_scalp_validation_tx,
+                                    terminals,
+                                );
+                            }
+                        }
+                        rug_scalp_adapter.bind_confirmed_or_modelled_fill(
+                            &mint,
+                            &candidate_id,
+                            position_id,
+                            entry_token_amount_raw,
+                            entry_watermark,
+                        )
+                    }
                 };
                 match actions {
                     Ok(actions) => {
@@ -25853,6 +25983,13 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!("LAG ORACLE by {} messages", n);
                         ctx.session_manager.mark_metric_contract_stream_gap();
+                        if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                            let records = tape.mark_stream_gap("oracle_broadcast_lag");
+                            let _ = enqueue_rug_scalp_validation_records(
+                                &rug_scalp_validation_tx,
+                                records,
+                            );
+                        }
                         for action in rug_scalp_adapter.mark_stream_gap() {
                             if let RugScalpRuntimeActionV2::MarketFact(fact) = action {
                                 rug_scalp_fact_outbox.push_back(fact);
@@ -25874,6 +26011,12 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         }
                         let registered_wall_ts_ms = current_time_ms();
                         rug_scalp_adapter.on_birth(pool_data.as_ref(), registered_wall_ts_ms);
+                        if let Some(tape) = rug_scalp_validation_tape.as_ref() {
+                            let _ = enqueue_rug_scalp_validation_records(
+                                &rug_scalp_validation_tx,
+                                tape.on_birth(pool_data.as_ref(), registered_wall_ts_ms),
+                            );
+                        }
 
                         if let Ok(candidate) = build_enhanced_candidate_from_pool_data(
                             &pool_data,
@@ -26040,9 +26183,40 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                     let canonical_curve = base_mint
                                         .filter(|mint| oracle_runtime.account_state_core().is_canonical(mint))
                                         .and_then(|mint| oracle_runtime.account_state_core().bonding_curve(&mint));
+                                    let observed_ingress_ms = current_time_ms();
+                                    if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                                        let records = tape.observe_trade(
+                                            tx.as_ref(),
+                                            observed_ingress_ms,
+                                            canonical,
+                                            canonical_curve,
+                                        );
+                                        if !enqueue_rug_scalp_validation_records(
+                                            &rug_scalp_validation_tx,
+                                            records,
+                                        ) {
+                                            let terminals = tape.mark_stream_gap(
+                                                "validation_writer_queue_gap",
+                                            );
+                                            let _ = enqueue_rug_scalp_validation_records(
+                                                &rug_scalp_validation_tx,
+                                                terminals,
+                                            );
+                                        }
+                                    }
+                                    let signal_order = match (tx.slot, tx.tx_index, tx.event_ordinal) {
+                                        (Some(slot), Some(tx_index), Some(event_ordinal)) => Some(
+                                            RugScalpCanonicalOrderKeyV1 {
+                                                slot,
+                                                tx_index,
+                                                event_ordinal,
+                                            },
+                                        ),
+                                        _ => None,
+                                    };
                                     let actions = rug_scalp_adapter.on_trade(
                                         tx.as_ref(),
-                                        current_time_ms(),
+                                        observed_ingress_ms,
                                         canonical,
                                         canonical_curve,
                                     );
@@ -26050,9 +26224,36 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                     for action in actions {
                                         match action {
                                             RugScalpRuntimeActionV2::Assessment(assessment) => {
+                                                if let (Some(tape), Some(signal_order)) = (
+                                                    rug_scalp_validation_tape.as_mut(),
+                                                    signal_order,
+                                                ) {
+                                                    let records = tape.on_assessment(&assessment, signal_order);
+                                                    if !enqueue_rug_scalp_validation_records(
+                                                        &rug_scalp_validation_tx,
+                                                        records,
+                                                    ) {
+                                                        let terminals = tape.mark_stream_gap(
+                                                            "validation_writer_queue_gap",
+                                                        );
+                                                        let _ = enqueue_rug_scalp_validation_records(
+                                                            &rug_scalp_validation_tx,
+                                                            terminals,
+                                                        );
+                                                    }
+                                                }
                                                 if rug_scalp_assessment_tx.try_send(assessment).is_err() {
                                                     warn!("RUG_SCALP_SIGNAL_ASSESSMENT_QUEUE_GAP");
                                                     assessment_delivery_failed = true;
+                                                    if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                                                        let records = tape.mark_stream_gap(
+                                                            "signal_assessment_delivery_gap",
+                                                        );
+                                                        let _ = enqueue_rug_scalp_validation_records(
+                                                            &rug_scalp_validation_tx,
+                                                            records,
+                                                        );
+                                                    }
                                                     for gap_action in rug_scalp_adapter.mark_stream_gap() {
                                                         if let RugScalpRuntimeActionV2::MarketFact(fact) = gap_action {
                                                             rug_scalp_fact_outbox.push_back(fact);
@@ -26077,7 +26278,42 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                                 }
                                             }
                                             RugScalpRuntimeActionV2::EntryIntent(intent) => {
+                                                if let (Some(tape), Some(signal_order)) = (
+                                                    rug_scalp_validation_tape.as_mut(),
+                                                    signal_order,
+                                                ) {
+                                                    let records = tape.on_accepted_intent(
+                                                        &intent,
+                                                        signal_order,
+                                                    );
+                                                    if !enqueue_rug_scalp_validation_records(
+                                                        &rug_scalp_validation_tx,
+                                                        records,
+                                                    ) {
+                                                        let terminals = tape.mark_stream_gap(
+                                                            "validation_writer_queue_gap",
+                                                        );
+                                                        let _ = enqueue_rug_scalp_validation_records(
+                                                            &rug_scalp_validation_tx,
+                                                            terminals,
+                                                        );
+                                                    }
+                                                }
                                                 if assessment_delivery_failed {
+                                                    if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                                                        let records = tape.finish_candidate(
+                                                            intent.candidate_id.clone(),
+                                                            crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::DataInvalidated,
+                                                            "signal_assessment_delivery_gap".to_string(),
+                                                            None,
+                                                            None,
+                                                            current_time_ms(),
+                                                        );
+                                                        let _ = enqueue_rug_scalp_validation_records(
+                                                            &rug_scalp_validation_tx,
+                                                            records,
+                                                        );
+                                                    }
                                                     let outcome_path = std::path::PathBuf::from(
                                                         &oracle_runtime.config.rug_scalp_v2.outcome_log_path,
                                                     );
@@ -26105,6 +26341,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                                     (Some(pool_data), Ok(permit)) => {
                                                         let ctx = Arc::clone(&ctx);
                                                         let completion_tx = rug_scalp_completion_tx.clone();
+                                                        let validation_tape_bus = rug_scalp_validation_tape_bus.clone();
                                                         tokio::spawn(async move {
                                                             let _permit = permit;
                                                             run_rug_scalp_v2_entry_adapter(
@@ -26113,11 +26350,26 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                                                 pool_data,
                                                                 entry_evidence_txs,
                                                                 completion_tx,
+                                                                validation_tape_bus,
                                                             )
                                                             .await;
                                                         });
                                                     }
                                                     (None, _) => {
+                                                        if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                                                            let records = tape.finish_candidate(
+                                                                intent.candidate_id.clone(),
+                                                                crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::EntryFailed,
+                                                                "pool_metadata_unavailable".to_string(),
+                                                                None,
+                                                                None,
+                                                                current_time_ms(),
+                                                            );
+                                                            let _ = enqueue_rug_scalp_validation_records(
+                                                                &rug_scalp_validation_tx,
+                                                                records,
+                                                            );
+                                                        }
                                                         let outcome_path = std::path::PathBuf::from(
                                                             &oracle_runtime.config.rug_scalp_v2.outcome_log_path,
                                                         );
@@ -26133,6 +26385,20 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                                         });
                                                     }
                                                     (Some(_), Err(_)) => {
+                                                        if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                                                            let records = tape.finish_candidate(
+                                                                intent.candidate_id.clone(),
+                                                                crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::EntryFailed,
+                                                                "isolated_entry_capacity_exhausted".to_string(),
+                                                                None,
+                                                                None,
+                                                                current_time_ms(),
+                                                            );
+                                                            let _ = enqueue_rug_scalp_validation_records(
+                                                                &rug_scalp_validation_tx,
+                                                                records,
+                                                            );
+                                                        }
                                                         let outcome_path = std::path::PathBuf::from(
                                                             &oracle_runtime.config.rug_scalp_v2.outcome_log_path,
                                                         );

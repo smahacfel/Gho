@@ -40,6 +40,9 @@ use crate::rug_scalp_v2::{
     append_rug_scalp_jsonl_record, RugScalpOutcomeRecordV2, RugScalpTerminalOutcomeV2,
     RUG_SCALP_EXIT_PROFILE_ID, RUG_SCALP_V2_STRATEGY_ID,
 };
+use crate::rug_scalp_validation_tape::{
+    RugScalpValidationTapeBusV1, RugScalpValidationTapeEventV1, RugScalpValidationTerminalStatusV1,
+};
 use futures::{stream, StreamExt};
 use ghost_brain::config::ghost_brain_config::ShadowV2BurninConfig;
 use ghost_brain::events::{EventEmitter, EventWriterConfig};
@@ -340,6 +343,9 @@ pub struct PostBuyRuntimeConfig {
     /// Isolated RUG terminal-outcome stream.  It is written only by the RUG
     /// adapter/PM terminal bridge, never by the generic post-buy lifecycle.
     pub rug_scalp_outcome_log_path: Option<PathBuf>,
+    /// Bounded observer-only terminal telemetry for the RUG validation tape.
+    /// It carries PM evidence back to the tape but cannot influence PM.
+    pub rug_scalp_validation_tape_bus: Option<RugScalpValidationTapeBusV1>,
     /// Optional Shadow V2 logging-only validation config. This must never feed decisions.
     pub shadow_v2_burnin: Option<ShadowV2BurninConfig>,
 }
@@ -369,6 +375,7 @@ impl Default for PostBuyRuntimeConfig {
             shadow_lifecycle_log_path: None,
             probe_lifecycle_log_path: None,
             rug_scalp_outcome_log_path: None,
+            rug_scalp_validation_tape_bus: None,
             shadow_v2_burnin: None,
         }
     }
@@ -4000,6 +4007,9 @@ async fn handle_post_buy_event(
                                         .rug_scalp_exit_fee_schedule_id
                                         .clone()
                                         .unwrap_or_default(),
+                                    validation_tape_bus: config
+                                        .rug_scalp_validation_tape_bus
+                                        .clone(),
                                 },
                             ));
                         }
@@ -5099,6 +5109,7 @@ struct RugScalpTerminalOutcomeContext {
     exit_route_id: String,
     entry_fee_schedule_id: String,
     exit_fee_schedule_id: String,
+    validation_tape_bus: Option<RugScalpValidationTapeBusV1>,
 }
 
 /// The one-shot PM terminal receiver is the only close authority observed by
@@ -5164,6 +5175,38 @@ fn spawn_rug_scalp_terminal_outcome_watcher(
                 error = %error,
                 "RUG_SCALP_TERMINAL_OUTCOME_WRITE_FAILED"
             );
+        }
+        if let Some(bus) = context.validation_tape_bus.as_ref() {
+            let status = match &record.terminal_outcome {
+                RugScalpTerminalOutcomeV2::PositionClosed => {
+                    RugScalpValidationTerminalStatusV1::PositionClosed
+                }
+                RugScalpTerminalOutcomeV2::DataInvalidated => {
+                    RugScalpValidationTerminalStatusV1::DataInvalidated
+                }
+                RugScalpTerminalOutcomeV2::ExitUnavailable => {
+                    RugScalpValidationTerminalStatusV1::ExitUnavailable
+                }
+                RugScalpTerminalOutcomeV2::EntryUnknown => {
+                    RugScalpValidationTerminalStatusV1::EntryUnknown
+                }
+                RugScalpTerminalOutcomeV2::NoEntry | RugScalpTerminalOutcomeV2::EntryFailed => {
+                    RugScalpValidationTerminalStatusV1::EntryFailed
+                }
+            };
+            bus.emit(RugScalpValidationTapeEventV1::PmTerminal {
+                candidate_id: record.candidate_id.clone(),
+                position_id: record.position_id.clone().unwrap_or_default(),
+                status,
+                reason: record
+                    .exit_reason
+                    .clone()
+                    .or(record.failure_reason.clone())
+                    .unwrap_or_else(|| "pm_terminal_unclassified".to_string()),
+                exit_landed_slot: record.exit_landed_slot,
+                pm_owned_net_pnl_lamports: record.net_pnl_lamports,
+                observed_ingress_ms: now_ms(),
+            });
         }
     })
 }
@@ -9270,6 +9313,7 @@ sys.exit(0)
             rug_scalp_outcome_log_path: None,
             shadow_v2_burnin: None,
             shadow_market_refresh_rpc_url: None,
+            rug_scalp_validation_tape_bus: None,
         };
 
         let runtime_handle = tokio::spawn(run(event_rx, shutdown_rx, None, config));
@@ -9373,6 +9417,7 @@ sys.exit(0)
             rug_scalp_outcome_log_path: None,
             shadow_v2_burnin: None,
             shadow_market_refresh_rpc_url: None,
+            rug_scalp_validation_tape_bus: None,
         };
 
         event_tx
@@ -9487,6 +9532,7 @@ sys.exit(0)
             rug_scalp_outcome_log_path: None,
             shadow_v2_burnin: None,
             shadow_market_refresh_rpc_url: None,
+            rug_scalp_validation_tape_bus: None,
         };
 
         drop(event_tx);
@@ -9584,6 +9630,7 @@ sys.exit(0)
             rug_scalp_outcome_log_path: None,
             shadow_v2_burnin: None,
             shadow_market_refresh_rpc_url: None,
+            rug_scalp_validation_tape_bus: None,
         };
 
         let runtime_handle = tokio::spawn(run(event_rx, shutdown_rx, Some(direct_rx), config));
@@ -10610,6 +10657,7 @@ sys.exit(0)
                 exit_route_id: intent.exit_route_id.clone(),
                 entry_fee_schedule_id: intent.entry_fee_schedule_id.clone(),
                 exit_fee_schedule_id: intent.exit_fee_schedule_id.clone(),
+                validation_tape_bus: None,
             },
         );
         assert!(adapter
@@ -10763,6 +10811,7 @@ sys.exit(0)
                 exit_route_id: "legacy_sell".to_string(),
                 entry_fee_schedule_id: "test-entry-schedule".to_string(),
                 exit_fee_schedule_id: "test-exit-schedule".to_string(),
+                validation_tape_bus: None,
             },
         );
         terminal_tx
@@ -10812,6 +10861,7 @@ sys.exit(0)
                 exit_route_id: "legacy_sell".to_string(),
                 entry_fee_schedule_id: "test-entry-schedule".to_string(),
                 exit_fee_schedule_id: "test-exit-schedule".to_string(),
+                validation_tape_bus: None,
             },
         );
         terminal_tx

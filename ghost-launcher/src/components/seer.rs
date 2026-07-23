@@ -6020,11 +6020,11 @@ mod tests {
     #[test]
     fn bridge_preserves_tx_index() {
         let mut trade = make_trade(Pubkey::new_unique(), Pubkey::new_unique());
-        trade.tx_index = Some(123);
+        trade.tx_index = Some(37);
 
         let tx = trade_event_to_pool_transaction(&trade);
 
-        assert_eq!(tx.tx_index, Some(123));
+        assert_eq!(tx.tx_index, Some(37));
     }
 
     #[test]

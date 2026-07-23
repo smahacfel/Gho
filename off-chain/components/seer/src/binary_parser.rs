@@ -4117,9 +4117,10 @@ impl BinaryParser {
             )
         });
 
-        let (sig, slot_val, arrival_ts) = if let GeyserEvent::Transaction {
+        let (sig, slot_val, tx_index, arrival_ts) = if let GeyserEvent::Transaction {
             ref signature,
             slot,
+            tx_index,
             arrival_ts_ms,
             ..
         } = event
@@ -4127,10 +4128,16 @@ impl BinaryParser {
             (
                 *signature,
                 *slot,
+                *tx_index,
                 arrival_ts_ms.unwrap_or_else(crate::types::arrival_time_ms),
             )
         } else {
-            (solana_sdk::signature::Signature::default(), Some(0), 0)
+            (
+                solana_sdk::signature::Signature::default(),
+                Some(0),
+                None,
+                0,
+            )
         };
 
         for p in parsed {
@@ -4162,7 +4169,7 @@ impl BinaryParser {
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4251,7 +4258,7 @@ impl BinaryParser {
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4340,7 +4347,7 @@ impl BinaryParser {
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4420,7 +4427,7 @@ impl BinaryParser {
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4533,7 +4540,7 @@ impl BinaryParser {
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4646,7 +4653,7 @@ impl BinaryParser {
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4709,6 +4716,7 @@ impl BinaryParser {
                 &runtime_ctx,
                 sig,
                 slot_val,
+                tx_index,
                 arrival_ts,
             ));
         }
@@ -4732,6 +4740,7 @@ impl BinaryParser {
         runtime_ctx: &RuntimeTradeContext,
         signature: solana_sdk::signature::Signature,
         slot_val: Option<u64>,
+        tx_index: Option<u32>,
         arrival_ts: u64,
     ) -> Vec<TradeEvent> {
         let GeyserEvent::Transaction {
@@ -4780,7 +4789,7 @@ impl BinaryParser {
                 slot: slot_val,
                 signature,
                 event_ordinal: Some(hint.outer_instruction_index),
-                tx_index: None,
+                tx_index,
                 provenance: Some(InstructionProvenance {
                     outer_instruction_index: Some(hint.outer_instruction_index),
                     inner_group_index: None,
@@ -6957,6 +6966,7 @@ mod tests {
     ) -> GeyserEvent {
         GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -7110,6 +7120,7 @@ mod tests {
 
         GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -7914,8 +7925,14 @@ mod tests {
             }],
         );
 
-        if let GeyserEvent::Transaction { event_ts_ms, .. } = &mut event {
+        if let GeyserEvent::Transaction {
+            event_ts_ms,
+            tx_index,
+            ..
+        } = &mut event
+        {
             *event_ts_ms = Some(1_777_777_777_000);
+            *tx_index = Some(0);
         }
 
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -7923,6 +7940,7 @@ mod tests {
         let trades = parser.parse_trades(&event).expect("trade should parse");
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].timestamp_ms, 1_777_777_777_000);
+        assert_eq!(trades[0].tx_index, Some(0));
     }
 
     #[test]
@@ -7991,6 +8009,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
             arrival_ts_ms: Some(9_999),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8039,6 +8058,7 @@ mod tests {
         accounts[PUMP_IDX_USER] = user;
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8089,6 +8109,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_100),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8190,6 +8211,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_200),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8284,6 +8306,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_300),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8386,6 +8409,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_400),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8454,6 +8478,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_500),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8597,6 +8622,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8740,6 +8766,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8903,6 +8930,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9044,6 +9072,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9859,6 +9888,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -12022,6 +12052,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: None,
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -12116,6 +12147,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: None,
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -12210,6 +12242,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(2),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: None,
             event_time: ghost_core::EventTimeMetadata::default(),

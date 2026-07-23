@@ -172,6 +172,12 @@ pub enum GeyserEvent {
     Transaction {
         /// Slot number when transaction was processed (if known)
         slot: Option<u64>,
+        /// Authoritative transaction index within the slot from the source stream.
+        ///
+        /// `Some(0)` is the first transaction in a slot and is valid. `None`
+        /// means the source did not provide a canonical transaction index.
+        #[serde(default)]
+        tx_index: Option<u32>,
         /// Compatibility event timestamp in milliseconds (if known).
         #[serde(default)]
         event_ts_ms: Option<u64>,
@@ -970,6 +976,7 @@ mod tests {
     fn grpc_transaction_event(event_ts_ms: Option<u64>, block_time: Option<i64>) -> GeyserEvent {
         GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms,
             arrival_ts_ms: Some(77),
             event_time: EventTimeMetadata::default(),

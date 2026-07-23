@@ -5208,6 +5208,7 @@ mod tests {
         }
         types::GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(1_005),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -5371,6 +5372,7 @@ mod tests {
             .expect("serialize synthetic pool");
         types::GeyserEvent::Transaction {
             slot: pool.slot,
+            tx_index: None,
             event_ts_ms: pool.event_ts_ms,
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: pool.event_time,
@@ -5445,6 +5447,7 @@ mod tests {
 
         types::GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
             arrival_ts_ms: Some(1_777_777_777_123),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -5504,6 +5507,7 @@ mod tests {
         (
             types::GeyserEvent::Transaction {
                 slot: Some(77),
+                tx_index: None,
                 event_ts_ms: Some(1_666_666_666_000),
                 arrival_ts_ms: Some(1_666_666_666_123),
                 event_time: ghost_core::EventTimeMetadata::default(),
@@ -6115,6 +6119,7 @@ mod tests {
         let recipient = Pubkey::new_unique();
         let event = types::GeyserEvent::Transaction {
             slot: Some(88),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
             arrival_ts_ms: Some(1_777_777_777_123),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -6166,6 +6171,7 @@ mod tests {
         let mint = Pubkey::new_unique();
         let event = types::GeyserEvent::Transaction {
             slot: Some(89),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_778_000),
             arrival_ts_ms: Some(1_777_777_778_123),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -6805,6 +6811,7 @@ mod tests {
             .expect("serialize synthetic pool");
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -6860,6 +6867,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::Transaction {
             slot: Some(7),
+            tx_index: None,
             event_ts_ms: Some(11_111),
             arrival_ts_ms: Some(11_222),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8015,6 +8023,7 @@ mod tests {
             Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8053,6 +8062,7 @@ mod tests {
             Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8097,6 +8107,7 @@ mod tests {
             Pubkey::from_str("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8133,6 +8144,7 @@ mod tests {
             Pubkey::from_str("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8169,6 +8181,7 @@ mod tests {
             Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8208,6 +8221,7 @@ mod tests {
             Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9057,6 +9071,7 @@ mod tests {
         let payload = bincode::serialize(&types::SyntheticPayload::Trade(trade.clone())).unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9134,6 +9149,7 @@ mod tests {
         let payload = bincode::serialize(&types::SyntheticPayload::InitializePool(pool)).unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(99),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9193,6 +9209,7 @@ mod tests {
             bincode::serialize(&types::SyntheticPayload::InitializePool(pool_new)).unwrap();
         let event_new = types::GeyserEvent::Transaction {
             slot: Some(101),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),

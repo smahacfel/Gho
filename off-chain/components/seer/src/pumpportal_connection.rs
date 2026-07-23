@@ -1169,6 +1169,7 @@ impl PumpPortalConnection {
         let ingress_wall_ts_ms = crate::types::ingress_epoch_ms();
         GeyserEvent::Transaction {
             slot: event.slot,
+            tx_index: None,
             event_ts_ms: crate::types::event_ts_from_block_time(event.block_time),
             arrival_ts_ms: Some(arrival_ts_ms),
             event_time: ghost_core::EventTimeMetadata::new(
@@ -1232,6 +1233,7 @@ impl PumpPortalConnection {
         let ingress_wall_ts_ms = crate::types::ingress_epoch_ms();
         GeyserEvent::Transaction {
             slot: event.slot,
+            tx_index: None,
             event_ts_ms: Some(event.timestamp_ms),
             arrival_ts_ms: Some(arrival_ts_ms),
             event_time: ghost_core::EventTimeMetadata::new(

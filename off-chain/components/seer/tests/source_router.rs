@@ -70,6 +70,7 @@ fn default_test_config() -> SeerConfig {
 fn create_synthetic_event() -> GeyserEvent {
     GeyserEvent::Transaction {
         slot: None,
+        tx_index: None,
         event_ts_ms: None,
         arrival_ts_ms: Some(seer::types::arrival_time_ms()),
         event_time: ghost_core::EventTimeMetadata::default(),
@@ -111,6 +112,7 @@ fn create_synthetic_event() -> GeyserEvent {
 fn create_raw_event() -> GeyserEvent {
     GeyserEvent::Transaction {
         slot: Some(12345),
+        tx_index: None,
         event_ts_ms: None,
         arrival_ts_ms: Some(seer::types::arrival_time_ms()),
         event_time: ghost_core::EventTimeMetadata::default(),

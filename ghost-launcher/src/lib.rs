@@ -43,6 +43,7 @@ pub mod metric_contracts;
 pub mod oracle_metrics;
 pub mod oracle_runtime;
 pub mod rug_scalp_v2;
+pub mod rug_scalp_validation_tape;
 pub mod session;
 pub mod tx_intelligence;
 pub mod wal_recovery;

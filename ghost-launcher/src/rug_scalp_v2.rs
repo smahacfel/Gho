@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use anyhow::{anyhow, bail, Context, Result};
 pub use ghost_brain::guardian::post_buy::RUG_SCALP_V2_STRATEGY_ID;
 use ghost_brain::guardian::post_buy::{
     RugScalpDataCompletenessV1, RugScalpEntryWatermarkV1, RugScalpExitProfileConfigV1,
@@ -14,13 +15,17 @@ use ghost_brain::guardian::post_buy::{
 };
 use ghost_core::market_state::BondingCurve;
 use ghost_core::{
-    ProgramFeeSchedule, PumpQuoteError, PumpQuoteV1, PumpReserveState, PumpRouteVariant,
-    RuntimeProgramFeeScheduleRegistryV1, TransactionCosts,
+    FeeRounding, ProgramFeeRule, ProgramFeeSchedule, ProgramFeeScheduleEvidenceV1, PumpQuoteError,
+    PumpQuoteV1, PumpReserveState, PumpRouteVariant, RuntimeProgramFeeScheduleRegistryV1,
+    TransactionCosts,
 };
 use serde::{Deserialize, Serialize};
-use solana_sdk::pubkey::Pubkey;
+use sha2::{Digest, Sha256};
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::{account::Account, commitment_config::CommitmentConfig, pubkey::Pubkey};
 
 use crate::events::{DetectedPool, PoolTransaction};
+use crate::rug_scalp_validation_tape::RugScalpValidationTapeConfigV1;
 
 pub const RUG_SCALP_EXIT_PROFILE_ID: &str = "rug_scalp_exit_v1";
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
@@ -28,6 +33,25 @@ const MAX_TRACKED_TRADES_PER_MINT: usize = 64;
 const MAX_QTP_SEARCH_LAMPORTS: u64 = 1_000 * LAMPORTS_PER_SOL;
 pub const RUG_SCALP_ENTRY_ROUTE: PumpRouteVariant = PumpRouteVariant::BuyV2;
 pub const RUG_SCALP_EXIT_ROUTE: PumpRouteVariant = PumpRouteVariant::LegacySell;
+
+/// Pinned by the same Pump IDL commit used by the typed BuyV2 builder. These
+/// are the only two config accounts from which the RUG runtime materialises
+/// fee authority; a serialized schedule is never its source of truth.
+pub const RUG_SCALP_PUMP_GLOBAL_CONFIG: Pubkey =
+    solana_sdk::pubkey!("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+pub const RUG_SCALP_PUMP_FEE_CONFIG: Pubkey =
+    solana_sdk::pubkey!("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt");
+pub const RUG_SCALP_PUMP_PROGRAM: Pubkey =
+    solana_sdk::pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+pub const RUG_SCALP_PUMP_FEE_PROGRAM: Pubkey =
+    solana_sdk::pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
+
+const PUMP_GLOBAL_DISCRIMINATOR: [u8; 8] = [167, 232, 232, 177, 200, 108, 114, 127];
+const PUMP_FEE_CONFIG_DISCRIMINATOR: [u8; 8] = [143, 52, 146, 187, 219, 123, 76, 155];
+const PUMP_GLOBAL_ACCOUNT_LEN: usize = 1_045;
+const PUMP_FEE_CONFIG_ACCOUNT_LEN: usize = 4_073;
+const PUMP_FEE_CONFIG_KNOWN_PREFIX_LEN: usize = 153;
+const BPS_DENOMINATOR: u64 = 10_000;
 
 /// Frozen runtime authority for the two and only two Pump routes used by the
 /// prospective RUG experiment.  The serialized form is deliberately only an
@@ -57,15 +81,507 @@ pub struct RugScalpPumpFeeScheduleV1 {
     pub schedule: ProgramFeeSchedule,
 }
 
+/// Immutable receipt of the exact two-account authority snapshot used to
+/// build the runtime registry. It is persisted into the validation run
+/// manifest so schedule identifiers cannot be separated from their concrete
+/// owner/address/data evidence later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RugScalpRuntimeFeeAuthorityManifestV1 {
+    pub schema_version: u16,
+    pub observed_slot: u64,
+    pub effective_slot: u64,
+    pub global_config_pubkey: String,
+    pub global_owner_program: String,
+    pub global_account_data_hash: String,
+    pub fee_config_pubkey: String,
+    pub fee_config_owner_program: String,
+    pub fee_config_account_data_hash: String,
+    /// SHA-256 over the two fixed pubkeys, their owners, and their complete
+    /// data. The common observed slot is stored separately; excluding it here
+    /// lets the runtime watch detect an actual account update rather than
+    /// treating a newer unchanged RPC context as a fee-config mutation.
+    pub evidence_hash: String,
+    pub buy_v2_fee_schedule_id: String,
+    pub legacy_sell_fee_schedule_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RugScalpPumpFeesV1 {
+    lp_fee_bps: u64,
+    protocol_fee_bps: u64,
+    creator_fee_bps: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RugScalpGlobalFeeConfigV1 {
+    initialized: bool,
+    create_v2_enabled: bool,
+    fee_basis_points: u64,
+    buyback_basis_points: u64,
+}
+
+/// Fetches the canonical Pump `global` and `fee_config` accounts in one RPC
+/// context, validates their owner/address/discriminator/layout, then derives
+/// the two route-specific typed fee schedules. Any evolved, partial, future,
+/// or conflicting account surface is an error; callers must keep the RUG path
+/// fail-closed rather than retain stale economics.
+pub async fn materialize_rug_scalp_runtime_fee_authority_v1(
+    rpc: &RpcClient,
+    entry_transaction_costs: TransactionCosts,
+    exit_transaction_costs: TransactionCosts,
+) -> Result<(
+    RugScalpPumpQuoteAuthorityV1,
+    RugScalpRuntimeFeeAuthorityManifestV1,
+)> {
+    let response = rpc
+        .get_multiple_accounts_with_commitment(
+            &[RUG_SCALP_PUMP_GLOBAL_CONFIG, RUG_SCALP_PUMP_FEE_CONFIG],
+            CommitmentConfig::processed(),
+        )
+        .await
+        .context("fetch canonical Pump global and fee_config accounts")?;
+    let observed_slot = response.context.slot;
+    let mut accounts = response.value.into_iter();
+    let global = accounts
+        .next()
+        .flatten()
+        .ok_or_else(|| anyhow!("canonical Pump global account is missing"))?;
+    let fee_config = accounts
+        .next()
+        .flatten()
+        .ok_or_else(|| anyhow!("canonical Pump fee_config account is missing"))?;
+    if accounts.next().is_some() {
+        bail!("unexpected additional account in Pump fee authority response");
+    }
+
+    let global_state = decode_rug_scalp_global_config(&global)?;
+    if !global_state.initialized || !global_state.create_v2_enabled {
+        bail!(
+            "Pump global does not authorize BuyV2: initialized={} create_v2_enabled={}",
+            global_state.initialized,
+            global_state.create_v2_enabled,
+        );
+    }
+    if global_state.buyback_basis_points > BPS_DENOMINATOR {
+        bail!(
+            "Pump global buyback_basis_points {} exceeds {}",
+            global_state.buyback_basis_points,
+            BPS_DENOMINATOR,
+        );
+    }
+
+    let fee_schedule = decode_rug_scalp_fee_config(&fee_config)?;
+    if fee_schedule.protocol_fee_bps != global_state.fee_basis_points {
+        bail!(
+            "Pump global/fee_config protocol fee conflict: global={} fee_config={}",
+            global_state.fee_basis_points,
+            fee_schedule.protocol_fee_bps,
+        );
+    }
+
+    // The account data hash preserves both config accounts because either can
+    // change the route's settlement. The Evidence enum has one config pubkey,
+    // therefore the fee-config PDA is the primary address and this aggregate
+    // content hash binds the validated global alongside it.
+    let global_data_hash = sha256_label(&global.data);
+    let fee_config_data_hash = sha256_label(&fee_config.data);
+    let evidence_hash = rug_scalp_fee_authority_evidence_hash(&global, &fee_config);
+    let evidence = ProgramFeeScheduleEvidenceV1::OnChainConfig {
+        config_pubkey: RUG_SCALP_PUMP_FEE_CONFIG.to_string(),
+        owner_program: RUG_SCALP_PUMP_FEE_PROGRAM.to_string(),
+        account_data_hash: evidence_hash.clone(),
+        observed_slot,
+    };
+    let hash_suffix = evidence_hash.trim_start_matches("sha256:");
+    let hash_suffix = &hash_suffix[..16.min(hash_suffix.len())];
+    let buy_v2_fee_schedule_id = format!("pump-buy-v2@{observed_slot}:{hash_suffix}");
+    let legacy_sell_fee_schedule_id = format!("pump-legacy-sell@{observed_slot}:{hash_suffix}");
+    let effective_slot = observed_slot;
+
+    let authority = RugScalpPumpQuoteAuthorityV1 {
+        schedules: vec![
+            RugScalpPumpFeeScheduleV1 {
+                route_variant: RUG_SCALP_ENTRY_ROUTE,
+                schedule: ProgramFeeSchedule {
+                    fee_schedule_id: buy_v2_fee_schedule_id.clone(),
+                    effective_slot,
+                    evidence: evidence.clone(),
+                    rules: runtime_buy_v2_fee_rules(fee_schedule, global_state)?,
+                },
+            },
+            RugScalpPumpFeeScheduleV1 {
+                route_variant: RUG_SCALP_EXIT_ROUTE,
+                schedule: ProgramFeeSchedule {
+                    fee_schedule_id: legacy_sell_fee_schedule_id.clone(),
+                    effective_slot,
+                    evidence,
+                    rules: runtime_legacy_sell_fee_rules(fee_schedule, global_state)?,
+                },
+            },
+        ],
+        entry_transaction_costs,
+        exit_transaction_costs,
+    };
+    authority
+        .materialize()
+        .map_err(|error| anyhow!("materialize runtime Pump fee authority: {error}"))?;
+
+    Ok((
+        authority,
+        RugScalpRuntimeFeeAuthorityManifestV1 {
+            schema_version: 1,
+            observed_slot,
+            effective_slot,
+            global_config_pubkey: RUG_SCALP_PUMP_GLOBAL_CONFIG.to_string(),
+            global_owner_program: global.owner.to_string(),
+            global_account_data_hash: global_data_hash,
+            fee_config_pubkey: RUG_SCALP_PUMP_FEE_CONFIG.to_string(),
+            fee_config_owner_program: fee_config.owner.to_string(),
+            fee_config_account_data_hash: fee_config_data_hash,
+            evidence_hash,
+            buy_v2_fee_schedule_id,
+            legacy_sell_fee_schedule_id,
+        },
+    ))
+}
+
+fn decode_rug_scalp_global_config(account: &Account) -> Result<RugScalpGlobalFeeConfigV1> {
+    validate_rug_scalp_config_account(
+        account,
+        RUG_SCALP_PUMP_PROGRAM,
+        PUMP_GLOBAL_DISCRIMINATOR,
+        PUMP_GLOBAL_ACCOUNT_LEN,
+        "global",
+    )?;
+    let mut cursor = RugScalpAccountCursorV1::new(&account.data);
+    cursor.take_discriminator(PUMP_GLOBAL_DISCRIMINATOR, "global")?;
+    let initialized = cursor.take_bool("global.initialized")?;
+    cursor.skip(32, "global.authority")?;
+    cursor.skip(32, "global.fee_recipient")?;
+    cursor.skip(8 * 4, "global.initial_curve_reserves_and_supply")?;
+    let fee_basis_points = cursor.take_u64("global.fee_basis_points")?;
+    cursor.skip(32, "global.withdraw_authority")?;
+    cursor.take_bool("global.enable_migrate")?;
+    cursor.skip(8 * 2, "global.pool_migration_and_creator_fee")?;
+    cursor.skip(32 * 7, "global.fee_recipients")?;
+    cursor.skip(32 * 2, "global.creator_authorities")?;
+    let create_v2_enabled = cursor.take_bool("global.create_v2_enabled")?;
+    cursor.skip(32 * 2, "global.whitelist_and_reserved_recipient")?;
+    cursor.take_bool("global.mayhem_mode_enabled")?;
+    cursor.skip(32 * 7, "global.reserved_fee_recipients")?;
+    cursor.take_bool("global.is_cashback_enabled")?;
+    cursor.skip(32 * 8, "global.buyback_fee_recipients")?;
+    let buyback_basis_points = cursor.take_u64("global.buyback_basis_points")?;
+    cursor.skip(8, "global.initial_virtual_quote_reserves")?;
+    cursor.skip(32, "global.whitelisted_quote_mints")?;
+    cursor.finish("global")?;
+    Ok(RugScalpGlobalFeeConfigV1 {
+        initialized,
+        create_v2_enabled,
+        fee_basis_points,
+        buyback_basis_points,
+    })
+}
+
+fn decode_rug_scalp_fee_config(account: &Account) -> Result<RugScalpPumpFeesV1> {
+    validate_rug_scalp_config_account(
+        account,
+        RUG_SCALP_PUMP_FEE_PROGRAM,
+        PUMP_FEE_CONFIG_DISCRIMINATOR,
+        PUMP_FEE_CONFIG_ACCOUNT_LEN,
+        "fee_config",
+    )?;
+    let mut cursor = RugScalpAccountCursorV1::new(&account.data);
+    cursor.take_discriminator(PUMP_FEE_CONFIG_DISCRIMINATOR, "fee_config")?;
+    cursor.skip(1 + 32, "fee_config.bump_and_admin")?;
+    let flat_fees = cursor.take_fees("fee_config.flat_fees")?;
+    let fee_tiers = cursor.take_fee_tiers("fee_config.fee_tiers")?;
+    let stable_fee_tiers = cursor.take_fee_tiers("fee_config.stable_fee_tiers")?;
+    if cursor.position() != PUMP_FEE_CONFIG_KNOWN_PREFIX_LEN {
+        bail!(
+            "fee_config parser consumed {} bytes, expected known prefix {}",
+            cursor.position(),
+            PUMP_FEE_CONFIG_KNOWN_PREFIX_LEN,
+        );
+    }
+    let trailing = cursor.remaining();
+    if trailing.iter().any(|byte| *byte != 0) {
+        bail!("fee_config has a nonzero unknown trailing surface");
+    }
+    cursor.skip(trailing.len(), "fee_config.zero_reserved_tail")?;
+    cursor.finish("fee_config")?;
+
+    // The RUG quote contract is intentionally not a dynamic market-cap tier
+    // selector. Current account evidence has one zero-threshold tier and an
+    // identical stable tier; any other shape must be implemented and parity
+    // proven separately, so it fails closed here.
+    let resolve_uniform =
+        |label: &str, tiers: &[(u128, RugScalpPumpFeesV1)]| -> Result<RugScalpPumpFeesV1> {
+            let Some((threshold, fees)) = tiers.first().copied() else {
+                bail!("fee_config.{label} is empty");
+            };
+            if tiers.len() != 1 || threshold != 0 {
+                bail!("fee_config.{label} is not a single zero-threshold schedule");
+            }
+            Ok(fees)
+        };
+    let fee_tier_fees = resolve_uniform("fee_tiers", &fee_tiers)?;
+    let stable_tier_fees = resolve_uniform("stable_fee_tiers", &stable_fee_tiers)?;
+    if flat_fees != fee_tier_fees || fee_tier_fees != stable_tier_fees {
+        bail!("fee_config flat, regular, and stable fees are not identical");
+    }
+    Ok(fee_tier_fees)
+}
+
+fn validate_rug_scalp_config_account(
+    account: &Account,
+    expected_owner: Pubkey,
+    expected_discriminator: [u8; 8],
+    expected_len: usize,
+    label: &str,
+) -> Result<()> {
+    if account.executable {
+        bail!("Pump {label} account is unexpectedly executable");
+    }
+    if account.owner != expected_owner {
+        bail!(
+            "Pump {label} owner mismatch: expected {}, got {}",
+            expected_owner,
+            account.owner,
+        );
+    }
+    if account.data.len() != expected_len {
+        bail!(
+            "Pump {label} layout length mismatch: expected {expected_len}, got {}",
+            account.data.len(),
+        );
+    }
+    if account.data.get(..8) != Some(expected_discriminator.as_slice()) {
+        bail!("Pump {label} discriminator mismatch");
+    }
+    Ok(())
+}
+
+fn runtime_buy_v2_fee_rules(
+    fees: RugScalpPumpFeesV1,
+    global: RugScalpGlobalFeeConfigV1,
+) -> Result<Vec<ProgramFeeRule>> {
+    let mut rules = protocol_fee_split_rules(fees.protocol_fee_bps, global.buyback_basis_points)?;
+    if fees.creator_fee_bps > 0 {
+        rules.push(ProgramFeeRule {
+            component_id: "creator_fee".to_string(),
+            numerator: fees.creator_fee_bps,
+            denominator: BPS_DENOMINATOR,
+            rounding: FeeRounding::Ceil,
+        });
+    }
+    if rules.is_empty() {
+        bail!("BuyV2 runtime fee schedule has no fee rules");
+    }
+    Ok(rules)
+}
+
+fn runtime_legacy_sell_fee_rules(
+    fees: RugScalpPumpFeesV1,
+    global: RugScalpGlobalFeeConfigV1,
+) -> Result<Vec<ProgramFeeRule>> {
+    let mut rules = Vec::new();
+    if fees.lp_fee_bps > 0 {
+        rules.push(ProgramFeeRule {
+            component_id: "lp_fee".to_string(),
+            numerator: fees.lp_fee_bps,
+            denominator: BPS_DENOMINATOR,
+            rounding: FeeRounding::Ceil,
+        });
+    }
+    rules.extend(protocol_fee_split_rules(
+        fees.protocol_fee_bps,
+        global.buyback_basis_points,
+    )?);
+    if fees.creator_fee_bps > 0 {
+        rules.push(ProgramFeeRule {
+            component_id: "creator_fee".to_string(),
+            numerator: fees.creator_fee_bps,
+            denominator: BPS_DENOMINATOR,
+            rounding: FeeRounding::Floor,
+        });
+    }
+    if rules.is_empty() {
+        bail!("LegacySell runtime fee schedule has no fee rules");
+    }
+    Ok(rules)
+}
+
+fn protocol_fee_split_rules(
+    protocol_fee_bps: u64,
+    buyback_basis_points: u64,
+) -> Result<Vec<ProgramFeeRule>> {
+    if protocol_fee_bps == 0 {
+        return Ok(Vec::new());
+    }
+    if buyback_basis_points > BPS_DENOMINATOR {
+        bail!("buyback basis points exceeds denominator");
+    }
+    let denominator = BPS_DENOMINATOR
+        .checked_mul(BPS_DENOMINATOR)
+        .ok_or_else(|| anyhow!("basis point denominator overflow"))?;
+    let fee_recipient_numerator = protocol_fee_bps
+        .checked_mul(BPS_DENOMINATOR.saturating_sub(buyback_basis_points))
+        .ok_or_else(|| anyhow!("fee-recipient numerator overflow"))?;
+    let buyback_numerator = protocol_fee_bps
+        .checked_mul(buyback_basis_points)
+        .ok_or_else(|| anyhow!("buyback numerator overflow"))?;
+    let mut rules = Vec::with_capacity(2);
+    if fee_recipient_numerator > 0 {
+        rules.push(ProgramFeeRule {
+            component_id: "fee_recipient".to_string(),
+            numerator: fee_recipient_numerator,
+            denominator,
+            rounding: FeeRounding::Ceil,
+        });
+    }
+    if buyback_numerator > 0 {
+        rules.push(ProgramFeeRule {
+            component_id: "buyback_fee_recipient".to_string(),
+            numerator: buyback_numerator,
+            denominator,
+            rounding: FeeRounding::Floor,
+        });
+    }
+    Ok(rules)
+}
+
+fn rug_scalp_fee_authority_evidence_hash(global: &Account, fee_config: &Account) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rug_scalp_runtime_fee_authority_v1");
+    for (pubkey, account) in [
+        (RUG_SCALP_PUMP_GLOBAL_CONFIG, global),
+        (RUG_SCALP_PUMP_FEE_CONFIG, fee_config),
+    ] {
+        hasher.update(pubkey.as_ref());
+        hasher.update(account.owner.as_ref());
+        hasher.update((account.data.len() as u64).to_le_bytes());
+        hasher.update(&account.data);
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn sha256_label(data: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(data))
+}
+
+struct RugScalpAccountCursorV1<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> RugScalpAccountCursorV1<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn position(&self) -> usize {
+        self.offset
+    }
+
+    fn remaining(&self) -> &'a [u8] {
+        &self.data[self.offset..]
+    }
+
+    fn take(&mut self, len: usize, label: &str) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("{label}: cursor overflow"))?;
+        let value = self
+            .data
+            .get(self.offset..end)
+            .ok_or_else(|| anyhow!("{label}: truncated account layout"))?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn skip(&mut self, len: usize, label: &str) -> Result<()> {
+        self.take(len, label).map(|_| ())
+    }
+
+    fn take_discriminator(&mut self, expected: [u8; 8], label: &str) -> Result<()> {
+        if self.take(8, label)? != expected.as_slice() {
+            bail!("{label}: discriminator changed while decoding");
+        }
+        Ok(())
+    }
+
+    fn take_bool(&mut self, label: &str) -> Result<bool> {
+        match self.take(1, label)?[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            value => bail!("{label}: invalid bool discriminant {value}"),
+        }
+    }
+
+    fn take_u64(&mut self, label: &str) -> Result<u64> {
+        let raw: [u8; 8] = self
+            .take(8, label)?
+            .try_into()
+            .map_err(|_| anyhow!("{label}: invalid u64 layout"))?;
+        Ok(u64::from_le_bytes(raw))
+    }
+
+    fn take_u128(&mut self, label: &str) -> Result<u128> {
+        let raw: [u8; 16] = self
+            .take(16, label)?
+            .try_into()
+            .map_err(|_| anyhow!("{label}: invalid u128 layout"))?;
+        Ok(u128::from_le_bytes(raw))
+    }
+
+    fn take_fees(&mut self, label: &str) -> Result<RugScalpPumpFeesV1> {
+        Ok(RugScalpPumpFeesV1 {
+            lp_fee_bps: self.take_u64(&format!("{label}.lp_fee_bps"))?,
+            protocol_fee_bps: self.take_u64(&format!("{label}.protocol_fee_bps"))?,
+            creator_fee_bps: self.take_u64(&format!("{label}.creator_fee_bps"))?,
+        })
+    }
+
+    fn take_fee_tiers(&mut self, label: &str) -> Result<Vec<(u128, RugScalpPumpFeesV1)>> {
+        let count_raw: [u8; 4] = self
+            .take(4, label)?
+            .try_into()
+            .map_err(|_| anyhow!("{label}: invalid vector length"))?;
+        let count = u32::from_le_bytes(count_raw) as usize;
+        if count > 32 {
+            bail!("{label}: fee tier count {count} exceeds bounded layout");
+        }
+        let mut tiers = Vec::with_capacity(count);
+        for index in 0..count {
+            let threshold = self.take_u128(&format!("{label}[{index}].threshold"))?;
+            let fees = self.take_fees(&format!("{label}[{index}].fees"))?;
+            tiers.push((threshold, fees));
+        }
+        Ok(tiers)
+    }
+
+    fn finish(&self, label: &str) -> Result<()> {
+        if self.offset != self.data.len() {
+            bail!(
+                "{label}: {} unconsumed layout bytes remain",
+                self.data.len().saturating_sub(self.offset)
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RugScalpPumpQuoteContractV1 {
+pub(crate) struct RugScalpPumpQuoteContractV1 {
     registry: RuntimeProgramFeeScheduleRegistryV1,
     entry_transaction_costs: TransactionCosts,
     exit_transaction_costs: TransactionCosts,
 }
 
 impl RugScalpPumpQuoteAuthorityV1 {
-    fn materialize(&self) -> Result<RugScalpPumpQuoteContractV1, PumpQuoteError> {
+    pub(crate) fn materialize(&self) -> Result<RugScalpPumpQuoteContractV1, PumpQuoteError> {
         let mut registry = RuntimeProgramFeeScheduleRegistryV1::default();
         for entry in &self.schedules {
             if !matches!(
@@ -95,7 +611,7 @@ impl RugScalpPumpQuoteAuthorityV1 {
 }
 
 impl RugScalpPumpQuoteContractV1 {
-    fn entry_transaction_cost_lamports(&self) -> Result<u64, PumpQuoteError> {
+    pub(crate) fn entry_transaction_cost_lamports(&self) -> Result<u64, PumpQuoteError> {
         self.entry_transaction_costs.net_wallet_debit()
     }
 
@@ -103,7 +619,7 @@ impl RugScalpPumpQuoteContractV1 {
         self.exit_transaction_costs.net_wallet_debit()
     }
 
-    fn quote_buy_v2_under_wallet_cap(
+    pub(crate) fn quote_buy_v2_under_wallet_cap(
         &self,
         slot: u64,
         reserves: PumpReserveState,
@@ -149,7 +665,7 @@ impl RugScalpPumpQuoteContractV1 {
         )
     }
 
-    fn executable_exit_value_lamports(
+    pub(crate) fn executable_exit_value_lamports(
         &self,
         slot: u64,
         reserves: PumpReserveState,
@@ -224,6 +740,9 @@ pub struct RugScalpV2Config {
     /// on-chain/effective-slot evidence; a canonical fixture is rejected by
     /// the runtime registry and can only exercise offline quote tests.
     pub pump_quote_authority: Option<RugScalpPumpQuoteAuthorityV1>,
+    /// Append-only, observe-only trajectory evidence. This is intentionally
+    /// separate from the reducer, execution adapter, and Position Manager.
+    pub validation_tape: RugScalpValidationTapeConfigV1,
 }
 
 impl Default for RugScalpV2Config {
@@ -267,6 +786,7 @@ impl Default for RugScalpV2Config {
             entry_fixed_cost_lamports: None,
             exit_fixed_cost_lamports: None,
             pump_quote_authority: None,
+            validation_tape: RugScalpValidationTapeConfigV1::default(),
         }
     }
 }
@@ -280,45 +800,62 @@ impl RugScalpV2Config {
         sol_to_lamports(self.sensitivity_position_size_sol)
     }
 
+    pub fn technical_validation_capture_enabled(&self) -> bool {
+        self.validation_tape.enabled && self.validation_tape.technical_capture
+    }
+
     /// Strict execution readiness.  This deliberately does not auto-fill a
     /// latency or cost value: smoke must freeze both before a capture run.
     pub fn validate_enabled_contract(&self) -> Result<(), RugScalpConfigError> {
         if !self.enabled {
+            if self.validation_tape.enabled {
+                return Err(RugScalpConfigError::ValidationTapeRequiresEnabledExperiment);
+            }
             return Ok(());
         }
         if !matches!(self.mode, RugScalpV2Mode::ObserveOnly) {
             return Err(RugScalpConfigError::ModeMustBeObserveOnly);
         }
-        if self.primary_entry_latency_slots.is_none() || self.primary_exit_latency_slots.is_none() {
+        let technical_capture = self.technical_validation_capture_enabled();
+        if self.validation_tape.enabled && self.validation_tape.log_path.trim().is_empty() {
+            return Err(RugScalpConfigError::MissingValidationTapePath);
+        }
+        if !technical_capture
+            && (self.primary_entry_latency_slots.is_none()
+                || self.primary_exit_latency_slots.is_none())
+        {
             return Err(RugScalpConfigError::LatencyNotFrozen);
         }
-        if self.entry_fixed_cost_lamports.is_none() || self.exit_fixed_cost_lamports.is_none() {
+        if !technical_capture
+            && (self.entry_fixed_cost_lamports.is_none() || self.exit_fixed_cost_lamports.is_none())
+        {
             return Err(RugScalpConfigError::CostModelNotFrozen);
         }
-        let quote_authority = self
-            .pump_quote_authority
-            .as_ref()
-            .ok_or(RugScalpConfigError::PumpQuoteAuthorityNotFrozen)?;
-        let quote_contract = quote_authority
-            .materialize()
-            .map_err(|_| RugScalpConfigError::InvalidPumpQuoteAuthority)?;
-        // The historical scalar values remain only as a backwards-compatible
-        // config surface.  They must exactly mirror the typed envelope costs,
-        // never replace the typed Pump settlement contract.
-        if self.entry_fixed_cost_lamports
-            != Some(
-                quote_contract
-                    .entry_transaction_cost_lamports()
-                    .map_err(|_| RugScalpConfigError::InvalidPumpQuoteAuthority)?,
-            )
-            || self.exit_fixed_cost_lamports
-                != Some(
-                    quote_contract
-                        .exit_transaction_cost_lamports()
-                        .map_err(|_| RugScalpConfigError::InvalidPumpQuoteAuthority)?,
-                )
-        {
-            return Err(RugScalpConfigError::CostModelMismatch);
+        if let Some(quote_authority) = self.pump_quote_authority.as_ref() {
+            let quote_contract = quote_authority
+                .materialize()
+                .map_err(|_| RugScalpConfigError::InvalidPumpQuoteAuthority)?;
+            // The historical scalar values remain only as a backwards-compatible
+            // config surface.  They must exactly mirror the typed envelope costs,
+            // never replace the typed Pump settlement contract.
+            if self.entry_fixed_cost_lamports.is_some()
+                && (self.entry_fixed_cost_lamports
+                    != Some(
+                        quote_contract
+                            .entry_transaction_cost_lamports()
+                            .map_err(|_| RugScalpConfigError::InvalidPumpQuoteAuthority)?,
+                    )
+                    || self.exit_fixed_cost_lamports
+                        != Some(
+                            quote_contract
+                                .exit_transaction_cost_lamports()
+                                .map_err(|_| RugScalpConfigError::InvalidPumpQuoteAuthority)?,
+                        ))
+            {
+                return Err(RugScalpConfigError::CostModelMismatch);
+            }
+        } else if !technical_capture {
+            return Err(RugScalpConfigError::PumpQuoteAuthorityNotFrozen);
         }
         if self.primary_notional_lamports().is_none()
             || self.sensitivity_notional_lamports().is_none()
@@ -393,6 +930,8 @@ pub enum RugScalpConfigError {
     InvalidNotional,
     InvalidPositionManagerProfile,
     MissingArtifactPath,
+    MissingValidationTapePath,
+    ValidationTapeRequiresEnabledExperiment,
     IsolatedProbeLaneRequired,
     SignalIdempotencyRequired,
     InvalidThreshold,
@@ -420,6 +959,10 @@ impl std::fmt::Display for RugScalpConfigError {
             }
             Self::InvalidPositionManagerProfile => "rug_scalp_v2 must use rug_scalp_exit_v1",
             Self::MissingArtifactPath => "rug_scalp_v2 requires dedicated lifecycle and signal artifact paths",
+            Self::MissingValidationTapePath => "rug_scalp_v2.validation_tape requires a log_path",
+            Self::ValidationTapeRequiresEnabledExperiment => {
+                "rug_scalp_v2.validation_tape requires rug_scalp_v2.enabled=true"
+            }
             Self::IsolatedProbeLaneRequired => {
                 "rug_scalp_v2 cannot share the isolated probe Position Manager with p37_shadow_probe"
             }
@@ -577,7 +1120,7 @@ impl RugScalpSignalReducerV2 {
         if !self.config.enabled {
             return;
         }
-        let universe_eligible = pool.amm_program.eq_ignore_ascii_case("pumpfun")
+        let universe_eligible = is_canonical_rug_scalp_pump_program(&pool.amm_program)
             && is_sol_pair(&pool.quote_mint)
             && !pool.bonding_curve.trim().is_empty()
             && pool.slot.is_some();
@@ -1792,6 +2335,17 @@ fn is_sol_pair(value: &str) -> bool {
     )
 }
 
+/// `DetectedPool::amm_program` is canonical program identity materialized by
+/// Seer, never a display label.  Parse and compare the Pubkey so malformed or
+/// legacy labels cannot expand the RUG universe.
+fn is_canonical_rug_scalp_pump_program(value: &str) -> bool {
+    value
+        .trim()
+        .parse::<Pubkey>()
+        .map(|program_id| program_id == RUG_SCALP_PUMP_PROGRAM)
+        .unwrap_or(false)
+}
+
 fn quote_notional(
     quote_contract: &RugScalpPumpQuoteContractV1,
     curve: BondingCurve,
@@ -1919,7 +2473,7 @@ fn minimum_additional_buy_flow(
     Some(lower)
 }
 
-fn pump_reserves(curve: BondingCurve) -> Option<PumpReserveState> {
+pub(crate) fn pump_reserves(curve: BondingCurve) -> Option<PumpReserveState> {
     curve.is_active().then_some(PumpReserveState {
         virtual_base_reserves: curve.virtual_token_reserves,
         virtual_quote_reserves: curve.virtual_sol_reserves,
@@ -1928,7 +2482,10 @@ fn pump_reserves(curve: BondingCurve) -> Option<PumpReserveState> {
     })
 }
 
-fn reserves_after_buy(before: PumpReserveState, quote: &PumpQuoteV1) -> PumpReserveState {
+pub(crate) fn reserves_after_buy(
+    before: PumpReserveState,
+    quote: &PumpQuoteV1,
+) -> PumpReserveState {
     PumpReserveState {
         virtual_base_reserves: quote.reserve_transition.base_after,
         virtual_quote_reserves: quote.reserve_transition.quote_after,
@@ -2035,6 +2592,78 @@ mod tests {
             .expect("on-chain evidence must authorise the test quote contract")
     }
 
+    fn runtime_global_account() -> Account {
+        let mut data = vec![0u8; PUMP_GLOBAL_ACCOUNT_LEN];
+        data[..8].copy_from_slice(&PUMP_GLOBAL_DISCRIMINATOR);
+        data[8] = 1; // initialized
+        data[105..113].copy_from_slice(&95u64.to_le_bytes());
+        data[450] = 1; // create_v2_enabled
+        data[997..1005].copy_from_slice(&5_000u64.to_le_bytes());
+        Account {
+            owner: RUG_SCALP_PUMP_PROGRAM,
+            data,
+            ..Account::default()
+        }
+    }
+
+    fn runtime_fee_config_account() -> Account {
+        let mut data = Vec::with_capacity(PUMP_FEE_CONFIG_ACCOUNT_LEN);
+        data.extend_from_slice(&PUMP_FEE_CONFIG_DISCRIMINATOR);
+        data.push(253); // current PDA bump shape is an opaque layout field.
+        data.extend_from_slice(&[0; 32]);
+        let fees = |data: &mut Vec<u8>| {
+            data.extend_from_slice(&0u64.to_le_bytes());
+            data.extend_from_slice(&95u64.to_le_bytes());
+            data.extend_from_slice(&30u64.to_le_bytes());
+        };
+        fees(&mut data); // flat fees
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u128.to_le_bytes());
+        fees(&mut data); // SOL fee tier
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u128.to_le_bytes());
+        fees(&mut data); // stable tier, required equal for this fixed route
+        assert_eq!(data.len(), PUMP_FEE_CONFIG_KNOWN_PREFIX_LEN);
+        data.resize(PUMP_FEE_CONFIG_ACCOUNT_LEN, 0);
+        Account {
+            owner: RUG_SCALP_PUMP_FEE_PROGRAM,
+            data,
+            ..Account::default()
+        }
+    }
+
+    #[test]
+    fn runtime_fee_authority_decodes_current_uniform_pump_layout() {
+        let global = decode_rug_scalp_global_config(&runtime_global_account()).unwrap();
+        let fees = decode_rug_scalp_fee_config(&runtime_fee_config_account()).unwrap();
+        assert!(global.initialized);
+        assert!(global.create_v2_enabled);
+        assert_eq!(global.fee_basis_points, 95);
+        assert_eq!(global.buyback_basis_points, 5_000);
+        assert_eq!(fees.protocol_fee_bps, 95);
+        assert_eq!(fees.creator_fee_bps, 30);
+
+        let buy = runtime_buy_v2_fee_rules(fees, global).unwrap();
+        let sell = runtime_legacy_sell_fee_rules(fees, global).unwrap();
+        assert_eq!(buy[0].component_id, "fee_recipient");
+        assert_eq!(buy[0].numerator, 95 * 5_000);
+        assert_eq!(buy[0].denominator, 100_000_000);
+        assert_eq!(buy[0].rounding, FeeRounding::Ceil);
+        assert_eq!(buy[1].component_id, "buyback_fee_recipient");
+        assert_eq!(buy[1].rounding, FeeRounding::Floor);
+        assert_eq!(buy[2].component_id, "creator_fee");
+        assert_eq!(buy[2].rounding, FeeRounding::Ceil);
+        assert_eq!(sell.last().unwrap().component_id, "creator_fee");
+        assert_eq!(sell.last().unwrap().rounding, FeeRounding::Floor);
+    }
+
+    #[test]
+    fn runtime_fee_authority_rejects_evolved_fee_config_surface() {
+        let mut account = runtime_fee_config_account();
+        account.data[PUMP_FEE_CONFIG_KNOWN_PREFIX_LEN] = 1;
+        assert!(decode_rug_scalp_fee_config(&account).is_err());
+    }
+
     fn enabled_config() -> RugScalpV2Config {
         RugScalpV2Config {
             enabled: true,
@@ -2076,7 +2705,7 @@ mod tests {
             pool_amm_id: "pool".to_string(),
             base_mint: "mint".to_string(),
             quote_mint: "SOL".to_string(),
-            amm_program: "pumpfun".to_string(),
+            amm_program: RUG_SCALP_PUMP_PROGRAM.to_string(),
             bonding_curve: "curve".to_string(),
             creator: "creator".to_string(),
             slot: Some(slot),
@@ -2086,6 +2715,52 @@ mod tests {
             detected_wall_ts_ms: Some(1_000),
             initial_liquidity_sol: None,
             signature: "birth".to_string(),
+        }
+    }
+
+    #[test]
+    fn universe_eligibility_accepts_only_canonical_pump_program_id() {
+        let pool = birth(10);
+        assert!(is_canonical_rug_scalp_pump_program(&pool.amm_program));
+
+        let mut reducer = reducer(enabled_config());
+        reducer.on_birth(&pool, 1_000);
+        assert!(reducer.mints["mint"].universe_eligible);
+    }
+
+    #[test]
+    fn universe_eligibility_rejects_legacy_pumpfun_label() {
+        let mut pool = birth(10);
+        pool.amm_program = "pumpfun".to_string();
+
+        let mut reducer = reducer(enabled_config());
+        reducer.on_birth(&pool, 1_000);
+        assert!(!reducer.mints["mint"].universe_eligible);
+    }
+
+    #[test]
+    fn universe_eligibility_rejects_other_program_id() {
+        let mut pool = birth(10);
+        pool.amm_program = Pubkey::new_unique().to_string();
+
+        let mut reducer = reducer(enabled_config());
+        reducer.on_birth(&pool, 1_000);
+        assert!(!reducer.mints["mint"].universe_eligible);
+    }
+
+    #[test]
+    fn universe_eligibility_keeps_non_program_requirements_fail_closed() {
+        let mut invalid_quote = birth(10);
+        invalid_quote.quote_mint = Pubkey::new_unique().to_string();
+        let mut missing_curve = birth(10);
+        missing_curve.bonding_curve.clear();
+        let mut missing_slot = birth(10);
+        missing_slot.slot = None;
+
+        for pool in [invalid_quote, missing_curve, missing_slot] {
+            let mut reducer = reducer(enabled_config());
+            reducer.on_birth(&pool, 1_000);
+            assert!(!reducer.mints["mint"].universe_eligible);
         }
     }
 
@@ -2565,7 +3240,7 @@ mod tests {
         reducer.on_birth(&birth(10), 1_000);
         let mut outcome = None;
         for (slot, index, signer) in [
-            (11, 1, "a"),
+            (11, 0, "a"),
             (11, 2, "b"),
             (11, 3, "c"),
             (12, 1, "a"),
@@ -2585,6 +3260,7 @@ mod tests {
         assert_eq!(outcome.n_curr, 3);
         assert_eq!(outcome.u_2, 4);
         assert_eq!(outcome.assessment, RugScalpAssessment::ShadowEdgeCandidate);
+        assert_ne!(outcome.reason, RugScalpReasonCodeV2::MissingTradeOrder);
     }
 
     #[test]
