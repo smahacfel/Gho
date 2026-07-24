@@ -42,7 +42,7 @@ Techniczna dokumentacja aktualnego pipeline runtime systemu Ghost. Opisuje wył�
 
 ## Cel systemu
 
-Ghost to selektywny, zautomatyzowany system tradingowy dla tokenów Pump.fun na Solanie. Wykrywa nowo utworzone poole w czasie rzeczywistym, ocenia ich potencjał wzrostu w oknie obserwacyjnym ~10s, i podejmuje decyzję o wejściu w pozycję — obecnie w trybie **shadow-only** (symulacja bez realnych transakcji). System jest zaprojektowany do pracy w trybie produkcyjnym z maksymalnie jedną pozycją na raz i kapitałem rzędu 0.004 SOL na pozycję.
+Ghost to selektywny, zautomatyzowany system tradingowy dla tokenów Pump.fun na Solanie. Wykrywa nowo utworzone poole w czasie rzeczywistym, ocenia ich potencjał wzrostu w oknie obserwacyjnym, by ostatecznie podejąć decyzję o wejściu w pozycję — obecnie w trybie **shadow-only** (symulacja bez realnych transakcji). System nie posiada obecnie strategii, która osiągnęłaby dodatni EV. Docelowe notional na start powinno mieścić się w przedziale 0.1 - 0.2 SOL.
 
 **Aktywny tryb:** `production` + `execution_mode = "shadow"` (shadow burn-in Gatekeeper V2.5).
 
