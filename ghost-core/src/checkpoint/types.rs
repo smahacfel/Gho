@@ -296,6 +296,18 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+fn true_bool() -> bool {
+    true
+}
+
+fn finite_f64_option(value: f64) -> Option<f64> {
+    if value.is_finite() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionTimeSeriesSourceCounts {
     #[serde(default)]
@@ -750,6 +762,288 @@ pub struct OrganicBroadeningFeatures {
     pub degraded_reasons: Vec<EvidenceDegradedReason>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganicContinuityExperimentalScoreStatusV1 {
+    NotImplemented,
+    Disabled,
+    DiagnosticOnlyComputed,
+}
+
+impl Default for OrganicContinuityExperimentalScoreStatusV1 {
+    fn default() -> Self {
+        Self::NotImplemented
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganicContinuityMissingReasonV1 {
+    OrganicSequenceUnavailable,
+    OrganicStatusUnavailableOrUnusable,
+    BuyRatioMinNonFinite,
+    BuyRatioMeanNonFinite,
+    BuyRatioMaxNonFinite,
+    TxCountGrowthRatioNonFinite,
+    UniqueSignerGrowthRatioNonFinite,
+    MaxSegmentHhiNonFinite,
+    MinSegmentHhiNonFinite,
+    HhiDeltaT2T0NonFinite,
+    TxCountGrowthVsSignerGrowthNonFinite,
+    NewSignerRatioT2NonFinite,
+    BroadeningScoreNonFinite,
+    SolBuyRatioNonFinite,
+    TxBuyRatioNonFinite,
+    BurstRatioNonFinite,
+    SameMsTxRatioNonFinite,
+    FlipperPresenceRatioMissing,
+    FixedSizeBuyRatioMissing,
+    ContradictionScoreNonFinite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganicContinuityBucketReasonV1 {
+    DiagnosticOnly,
+    CoreThreeFinite,
+    CoreThreeUnavailable,
+    SequenceAvailable,
+    SequenceUnavailable,
+    R4R5SolBuyRatioLe05099,
+    R4R5SolBuyRatioLe05173,
+    R4R5SolBuyRatioLe05326,
+    R4R5SolBuyRatioGt05326,
+    R4R5OrganicBuyRatioMeanLe025,
+    R4R5OrganicBuyRatioMeanGt025,
+    R4R5OrganicBuyRatioMaxLe06,
+    R4R5OrganicBuyRatioMaxGt06,
+    R4R5BuyCountLe4,
+    R4R5BuyCountGt4,
+    FullContextAvailable,
+    FullContextUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganicContinuityClaimBoundariesV1 {
+    #[serde(default = "true_bool")]
+    pub diagnostic_only: bool,
+    #[serde(default = "true_bool")]
+    pub shadow_only: bool,
+    #[serde(default)]
+    pub changes_gatekeeper_decision: bool,
+    #[serde(default)]
+    pub changes_execution: bool,
+    #[serde(default)]
+    pub production_promotion_allowed: bool,
+    #[serde(default)]
+    pub policy_score: bool,
+    #[serde(default)]
+    pub runtime_filter: bool,
+}
+
+impl Default for OrganicContinuityClaimBoundariesV1 {
+    fn default() -> Self {
+        Self {
+            diagnostic_only: true,
+            shadow_only: true,
+            changes_gatekeeper_decision: false,
+            changes_execution: false,
+            production_promotion_allowed: false,
+            policy_score: false,
+            runtime_filter: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganicContinuitySourceV1 {
+    #[serde(default)]
+    pub source_snapshot: String,
+    #[serde(default)]
+    pub canonical_feature_source: String,
+    #[serde(default)]
+    pub decision_time_inputs_only: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OrganicContinuityRawOrganicFieldsV1 {
+    #[serde(default)]
+    pub sequence_available: bool,
+    #[serde(default)]
+    pub total_tx_count: u64,
+    #[serde(default)]
+    pub total_unique_signers: u64,
+    #[serde(default)]
+    pub t0_tx_count: u64,
+    #[serde(default)]
+    pub t1_tx_count: u64,
+    #[serde(default)]
+    pub t2_tx_count: u64,
+    #[serde(default)]
+    pub t0_unique_signers: u64,
+    #[serde(default)]
+    pub t1_unique_signers: u64,
+    #[serde(default)]
+    pub t2_unique_signers: u64,
+    #[serde(default)]
+    pub t1_vs_t0_unique_signer_delta: i64,
+    #[serde(default)]
+    pub t2_vs_t1_unique_signer_delta: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_count_growth_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique_signer_growth_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_ratio_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_ratio_min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_ratio_max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_segment_hhi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_segment_hhi: Option<f64>,
+    #[serde(default)]
+    pub signer_growth_t2_t0: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hhi_delta_t2_t0: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_count_growth_vs_signer_growth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_signer_ratio_t2: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broadening_score: Option<f64>,
+    #[serde(default)]
+    pub status: EvidenceStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_reasons: Vec<EvidenceDegradedReason>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OrganicContinuityContextFieldsV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sol_buy_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_buy_ratio: Option<f64>,
+    #[serde(default)]
+    pub buy_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_ms_tx_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flipper_presence_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_size_buy_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contradiction_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganicContinuityAvailabilityV1 {
+    #[serde(default)]
+    pub core_three_finite: bool,
+    #[serde(default)]
+    pub raw_organic_vector_finite: bool,
+    #[serde(default)]
+    pub sequence_available: bool,
+    #[serde(default)]
+    pub status_usable: bool,
+    #[serde(default)]
+    pub full_context_available: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_reasons: Vec<OrganicContinuityMissingReasonV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrganicContinuityExperimentalScoreV1 {
+    #[serde(default)]
+    pub status: OrganicContinuityExperimentalScoreStatusV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    #[serde(default = "true_bool")]
+    pub experimental_diagnostic_score: bool,
+    #[serde(default = "true_bool")]
+    pub not_policy_score: bool,
+    #[serde(default = "true_bool")]
+    pub not_promotion_candidate: bool,
+    #[serde(default = "true_bool")]
+    pub direction_unvalidated: bool,
+    #[serde(default)]
+    pub schema_version: String,
+    #[serde(default)]
+    pub weight_version: String,
+    #[serde(default)]
+    pub contract_hash: u64,
+}
+
+impl Default for OrganicContinuityExperimentalScoreV1 {
+    fn default() -> Self {
+        let schema_version = ORGANIC_CONTINUITY_EXPERIMENTAL_SCORE_SCHEMA_V1.to_string();
+        let weight_version =
+            ORGANIC_CONTINUITY_EXPERIMENTAL_SCORE_NO_WEIGHTS_VERSION_V1.to_string();
+        let contract_hash =
+            organic_continuity_experimental_score_contract_hash(&schema_version, &weight_version);
+        Self {
+            status: OrganicContinuityExperimentalScoreStatusV1::NotImplemented,
+            value: None,
+            experimental_diagnostic_score: true,
+            not_policy_score: true,
+            not_promotion_candidate: true,
+            direction_unvalidated: true,
+            schema_version,
+            weight_version,
+            contract_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OrganicContinuityEvidenceV1 {
+    #[serde(default)]
+    pub claim_boundaries: OrganicContinuityClaimBoundariesV1,
+    #[serde(default)]
+    pub source: OrganicContinuitySourceV1,
+    #[serde(default)]
+    pub raw_organic_fields: OrganicContinuityRawOrganicFieldsV1,
+    #[serde(default)]
+    pub context_fields: OrganicContinuityContextFieldsV1,
+    #[serde(default)]
+    pub availability: OrganicContinuityAvailabilityV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bucket_reasons: Vec<OrganicContinuityBucketReasonV1>,
+    #[serde(default)]
+    pub organic_continuity_experimental_score_v1: OrganicContinuityExperimentalScoreV1,
+}
+
+const ORGANIC_CONTINUITY_R4_R5_SOL_BUY_RATIO_S02_MAX: f64 = 0.5099;
+const ORGANIC_CONTINUITY_R4_R5_SOL_BUY_RATIO_S03_MAX: f64 = 0.5173;
+const ORGANIC_CONTINUITY_R4_R5_SOL_BUY_RATIO_S04_MAX: f64 = 0.5326;
+const ORGANIC_CONTINUITY_R4_R5_BUY_RATIO_MEAN_MAX: f64 = 0.25;
+const ORGANIC_CONTINUITY_R4_R5_BUY_RATIO_MAX_MAX: f64 = 0.6;
+const ORGANIC_CONTINUITY_R4_R5_BUY_COUNT_MAX: u64 = 4;
+const ORGANIC_CONTINUITY_EXPERIMENTAL_SCORE_SCHEMA_V1: &str =
+    "organic_continuity_experimental_score_v1";
+const ORGANIC_CONTINUITY_EXPERIMENTAL_SCORE_NO_WEIGHTS_VERSION_V1: &str = "no_weights_v1";
+
+#[must_use]
+pub fn organic_continuity_experimental_score_contract_hash(
+    schema_version: &str,
+    weight_version: &str,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in schema_version
+        .as_bytes()
+        .iter()
+        .chain(b"|".iter())
+        .chain(weight_version.as_bytes().iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3_u64);
+    }
+    hash
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ManipulationContradictionFeatures {
     #[serde(default)]
@@ -929,6 +1223,244 @@ pub struct MaterializedFeatureSet {
     /// global/session context remains nullable rather than imputed.
     #[serde(default)]
     pub session_regime_snapshot_v1: SessionRegimeSnapshotV1,
+}
+
+impl MaterializedFeatureSet {
+    #[must_use]
+    pub fn organic_continuity_evidence_v1(&self) -> OrganicContinuityEvidenceV1 {
+        OrganicContinuityEvidenceV1::from_materialized_features(self)
+    }
+}
+
+impl OrganicContinuityEvidenceV1 {
+    #[must_use]
+    pub fn from_materialized_features(features: &MaterializedFeatureSet) -> Self {
+        let organic = &features.organic_broadening;
+        let raw_organic_fields = OrganicContinuityRawOrganicFieldsV1 {
+            sequence_available: organic.sequence_available,
+            total_tx_count: organic.total_tx_count,
+            total_unique_signers: organic.total_unique_signers,
+            t0_tx_count: organic.t0_tx_count,
+            t1_tx_count: organic.t1_tx_count,
+            t2_tx_count: organic.t2_tx_count,
+            t0_unique_signers: organic.t0_unique_signers,
+            t1_unique_signers: organic.t1_unique_signers,
+            t2_unique_signers: organic.t2_unique_signers,
+            t1_vs_t0_unique_signer_delta: organic.t1_vs_t0_unique_signer_delta,
+            t2_vs_t1_unique_signer_delta: organic.t2_vs_t1_unique_signer_delta,
+            tx_count_growth_ratio: finite_f64_option(organic.tx_count_growth_ratio),
+            unique_signer_growth_ratio: finite_f64_option(organic.unique_signer_growth_ratio),
+            buy_ratio_mean: finite_f64_option(organic.buy_ratio_mean),
+            buy_ratio_min: finite_f64_option(organic.buy_ratio_min),
+            buy_ratio_max: finite_f64_option(organic.buy_ratio_max),
+            max_segment_hhi: finite_f64_option(organic.max_segment_hhi),
+            min_segment_hhi: finite_f64_option(organic.min_segment_hhi),
+            signer_growth_t2_t0: organic.signer_growth_t2_t0,
+            hhi_delta_t2_t0: finite_f64_option(organic.hhi_delta_t2_t0),
+            tx_count_growth_vs_signer_growth: finite_f64_option(
+                organic.tx_count_growth_vs_signer_growth,
+            ),
+            new_signer_ratio_t2: finite_f64_option(organic.new_signer_ratio_t2),
+            broadening_score: finite_f64_option(organic.broadening_score),
+            status: organic.status,
+            degraded_reasons: organic.degraded_reasons.clone(),
+        };
+
+        let context_fields = OrganicContinuityContextFieldsV1 {
+            sol_buy_ratio: finite_f64_option(features.tx_intel_features.sol_buy_ratio),
+            tx_buy_ratio: finite_f64_option(features.tx_intel_features.buy_ratio),
+            buy_count: features.tx_intel_features.buy_count,
+            burst_ratio: finite_f64_option(features.tx_intel_features.burst_ratio),
+            same_ms_tx_ratio: finite_f64_option(features.tx_intel_features.same_ms_tx_ratio),
+            flipper_presence_ratio: features
+                .alpha_fingerprint
+                .flipper_presence_ratio
+                .and_then(finite_f64_option),
+            fixed_size_buy_ratio: features
+                .alpha_fingerprint
+                .fixed_size_buy_ratio
+                .and_then(finite_f64_option),
+            contradiction_score: finite_f64_option(
+                features.manipulation_contradictions.contradiction_score,
+            ),
+        };
+
+        let mut missing_reasons = Vec::new();
+        let core_three_finite = raw_organic_fields.buy_ratio_min.is_some()
+            && raw_organic_fields.buy_ratio_mean.is_some()
+            && raw_organic_fields.tx_count_growth_ratio.is_some();
+        let raw_organic_vector_finite = raw_organic_fields.tx_count_growth_ratio.is_some()
+            && raw_organic_fields.unique_signer_growth_ratio.is_some()
+            && raw_organic_fields.buy_ratio_mean.is_some()
+            && raw_organic_fields.buy_ratio_min.is_some()
+            && raw_organic_fields.buy_ratio_max.is_some()
+            && raw_organic_fields.max_segment_hhi.is_some()
+            && raw_organic_fields.min_segment_hhi.is_some()
+            && raw_organic_fields.hhi_delta_t2_t0.is_some()
+            && raw_organic_fields
+                .tx_count_growth_vs_signer_growth
+                .is_some()
+            && raw_organic_fields.new_signer_ratio_t2.is_some()
+            && raw_organic_fields.broadening_score.is_some();
+        let status_usable = matches!(
+            raw_organic_fields.status,
+            EvidenceStatus::Clean | EvidenceStatus::Degraded | EvidenceStatus::InsufficientSample
+        );
+
+        if !raw_organic_fields.sequence_available {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::OrganicSequenceUnavailable);
+        }
+        if !status_usable {
+            missing_reasons
+                .push(OrganicContinuityMissingReasonV1::OrganicStatusUnavailableOrUnusable);
+        }
+        if raw_organic_fields.buy_ratio_min.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::BuyRatioMinNonFinite);
+        }
+        if raw_organic_fields.buy_ratio_mean.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::BuyRatioMeanNonFinite);
+        }
+        if raw_organic_fields.buy_ratio_max.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::BuyRatioMaxNonFinite);
+        }
+        if raw_organic_fields.tx_count_growth_ratio.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::TxCountGrowthRatioNonFinite);
+        }
+        if raw_organic_fields.unique_signer_growth_ratio.is_none() {
+            missing_reasons
+                .push(OrganicContinuityMissingReasonV1::UniqueSignerGrowthRatioNonFinite);
+        }
+        if raw_organic_fields.max_segment_hhi.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::MaxSegmentHhiNonFinite);
+        }
+        if raw_organic_fields.min_segment_hhi.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::MinSegmentHhiNonFinite);
+        }
+        if raw_organic_fields.hhi_delta_t2_t0.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::HhiDeltaT2T0NonFinite);
+        }
+        if raw_organic_fields
+            .tx_count_growth_vs_signer_growth
+            .is_none()
+        {
+            missing_reasons
+                .push(OrganicContinuityMissingReasonV1::TxCountGrowthVsSignerGrowthNonFinite);
+        }
+        if raw_organic_fields.new_signer_ratio_t2.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::NewSignerRatioT2NonFinite);
+        }
+        if raw_organic_fields.broadening_score.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::BroadeningScoreNonFinite);
+        }
+        if context_fields.sol_buy_ratio.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::SolBuyRatioNonFinite);
+        }
+        if context_fields.tx_buy_ratio.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::TxBuyRatioNonFinite);
+        }
+        if context_fields.burst_ratio.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::BurstRatioNonFinite);
+        }
+        if context_fields.same_ms_tx_ratio.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::SameMsTxRatioNonFinite);
+        }
+        if context_fields.flipper_presence_ratio.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::FlipperPresenceRatioMissing);
+        }
+        if context_fields.fixed_size_buy_ratio.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::FixedSizeBuyRatioMissing);
+        }
+        if context_fields.contradiction_score.is_none() {
+            missing_reasons.push(OrganicContinuityMissingReasonV1::ContradictionScoreNonFinite);
+        }
+
+        let full_context_available = raw_organic_fields.sequence_available
+            && status_usable
+            && raw_organic_vector_finite
+            && context_fields.sol_buy_ratio.is_some()
+            && context_fields.tx_buy_ratio.is_some()
+            && context_fields.burst_ratio.is_some()
+            && context_fields.same_ms_tx_ratio.is_some()
+            && context_fields.flipper_presence_ratio.is_some()
+            && context_fields.fixed_size_buy_ratio.is_some()
+            && context_fields.contradiction_score.is_some();
+
+        let availability = OrganicContinuityAvailabilityV1 {
+            core_three_finite,
+            raw_organic_vector_finite,
+            sequence_available: raw_organic_fields.sequence_available,
+            status_usable,
+            full_context_available,
+            missing_reasons,
+        };
+
+        let mut bucket_reasons = vec![OrganicContinuityBucketReasonV1::DiagnosticOnly];
+        if core_three_finite {
+            bucket_reasons.push(OrganicContinuityBucketReasonV1::CoreThreeFinite);
+        } else {
+            bucket_reasons.push(OrganicContinuityBucketReasonV1::CoreThreeUnavailable);
+        }
+        if raw_organic_fields.sequence_available {
+            bucket_reasons.push(OrganicContinuityBucketReasonV1::SequenceAvailable);
+        } else {
+            bucket_reasons.push(OrganicContinuityBucketReasonV1::SequenceUnavailable);
+        }
+        if full_context_available {
+            bucket_reasons.push(OrganicContinuityBucketReasonV1::FullContextAvailable);
+        } else {
+            bucket_reasons.push(OrganicContinuityBucketReasonV1::FullContextUnavailable);
+        }
+
+        if let Some(sol_buy_ratio) = context_fields.sol_buy_ratio {
+            if sol_buy_ratio <= ORGANIC_CONTINUITY_R4_R5_SOL_BUY_RATIO_S02_MAX {
+                bucket_reasons.push(OrganicContinuityBucketReasonV1::R4R5SolBuyRatioLe05099);
+            }
+            if sol_buy_ratio <= ORGANIC_CONTINUITY_R4_R5_SOL_BUY_RATIO_S03_MAX {
+                bucket_reasons.push(OrganicContinuityBucketReasonV1::R4R5SolBuyRatioLe05173);
+            }
+            if sol_buy_ratio <= ORGANIC_CONTINUITY_R4_R5_SOL_BUY_RATIO_S04_MAX {
+                bucket_reasons.push(OrganicContinuityBucketReasonV1::R4R5SolBuyRatioLe05326);
+            } else {
+                bucket_reasons.push(OrganicContinuityBucketReasonV1::R4R5SolBuyRatioGt05326);
+            }
+        }
+
+        if let Some(buy_ratio_mean) = raw_organic_fields.buy_ratio_mean {
+            if buy_ratio_mean <= ORGANIC_CONTINUITY_R4_R5_BUY_RATIO_MEAN_MAX {
+                bucket_reasons.push(OrganicContinuityBucketReasonV1::R4R5OrganicBuyRatioMeanLe025);
+            } else {
+                bucket_reasons.push(OrganicContinuityBucketReasonV1::R4R5OrganicBuyRatioMeanGt025);
+            }
+        }
+
+        if let Some(buy_ratio_max) = raw_organic_fields.buy_ratio_max {
+            if buy_ratio_max <= ORGANIC_CONTINUITY_R4_R5_BUY_RATIO_MAX_MAX {
+                bucket_reasons.push(OrganicContinuityBucketReasonV1::R4R5OrganicBuyRatioMaxLe06);
+            } else {
+                bucket_reasons.push(OrganicContinuityBucketReasonV1::R4R5OrganicBuyRatioMaxGt06);
+            }
+        }
+
+        if context_fields.buy_count <= ORGANIC_CONTINUITY_R4_R5_BUY_COUNT_MAX {
+            bucket_reasons.push(OrganicContinuityBucketReasonV1::R4R5BuyCountLe4);
+        } else {
+            bucket_reasons.push(OrganicContinuityBucketReasonV1::R4R5BuyCountGt4);
+        }
+
+        Self {
+            claim_boundaries: OrganicContinuityClaimBoundariesV1::default(),
+            source: OrganicContinuitySourceV1 {
+                source_snapshot: "v3_materialized_feature_snapshot".to_string(),
+                canonical_feature_source: "MaterializedFeatureSet".to_string(),
+                decision_time_inputs_only: true,
+            },
+            raw_organic_fields,
+            context_fields,
+            availability,
+            bucket_reasons,
+            organic_continuity_experimental_score_v1: Default::default(),
+        }
+    }
 }
 
 /// Per-segment trajectory snapshot used by Path B to compute TAS and PDD

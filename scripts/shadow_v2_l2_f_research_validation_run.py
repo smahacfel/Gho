@@ -26,9 +26,11 @@ import build_selector_candidate_universe as candidate_builder
 import shadow_v2_gatekeeper_coverage_denominator_audit as gatekeeper_audit
 import shadow_v2_path_density_horizon_audit as density_horizon_audit
 from shadow_v2_offline_audit_common import (
+    artifact_rotation_report,
     canonical_payload_schema,
     envelope,
     iter_canonical_rows,
+    iter_density_rows,
     iter_lifecycle_rows,
     iter_replay_rows,
     nested_record,
@@ -932,9 +934,7 @@ def position_level_density_retention_gate(
     latest: dict[tuple[str, int], tuple[int, dict[str, Any]]] = {}
     counters = Counter()
 
-    for idx, row, malformed in density_horizon_audit.iter_density_jsonl(
-        scope_root / "shadow_path_density_v2.jsonl"
-    ) or ():
+    for idx, (row, malformed) in enumerate(iter_density_rows(scope_root) or ()):
         if malformed or row is None:
             counters["malformed_density_rows"] += 1
             continue
@@ -1176,6 +1176,17 @@ def malformed_row_count(scope_root: Path | None) -> int:
     return malformed
 
 
+def rotated_artifact_reports(scope_root: Path | None) -> list[dict[str, Any]]:
+    if scope_root is None or not scope_root.exists():
+        return []
+    return [
+        artifact_rotation_report(scope_root, "shadow_position_event_v2.jsonl"),
+        artifact_rotation_report(scope_root, "shadow_replay_v2.jsonl"),
+        artifact_rotation_report(scope_root, "shadow_lifecycle_v2.jsonl"),
+        artifact_rotation_report(scope_root, "shadow_path_density_v2.jsonl"),
+    ]
+
+
 def build_manifest(
     *,
     args: argparse.Namespace,
@@ -1204,6 +1215,7 @@ def build_manifest(
         "unsupported_horizons_ms": UNDECLARED_HORIZONS_MS,
         "positive_claims_from_undeclared_horizons_allowed": False,
         "raw_artifact_audit_consumption": raw_artifact_audit_consumption(args.scope_root),
+        "rotated_artifacts": rotated_artifact_reports(args.scope_root),
         "approval_flags": APPROVAL_FLAGS_FALSE,
         "runtime_decision_behavior_changes": False,
         "gatekeeper_policy_changes": False,
@@ -1546,6 +1558,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "unsupported_horizons_ms": UNDECLARED_HORIZONS_MS,
         "positive_claims_from_undeclared_horizons_allowed": False,
         "raw_artifact_audit_consumption": raw_artifact_audit_consumption(args.scope_root),
+        "rotated_artifacts": rotated_artifact_reports(args.scope_root),
         "approval_flags": APPROVAL_FLAGS_FALSE,
         "runtime_decision_behavior_changes": False,
         "gatekeeper_policy_changes": False,

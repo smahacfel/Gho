@@ -1,2 +1,0 @@
-verdict,blocking_reason,runtime_approval,shadow_close_only_approval
-RCE_BLOCKED_BY_DATA,missing_pre_entry_path_summary_v1_or_session_regime_snapshot_v1,False,False

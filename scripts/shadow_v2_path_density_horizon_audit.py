@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-from shadow_v2_offline_audit_common import emit, parser, position_id
+from shadow_v2_offline_audit_common import emit, iter_density_rows, parser, position_id
 
 
 DECLARED_L2_BASELINE_HORIZONS_MS = [2_000, 3_000, 10_000, 30_000, 120_000]
@@ -456,7 +456,6 @@ def density_snapshot_scan(
     required_replay_horizon_ms: int,
     position_scope: set[str] | None = None,
 ) -> tuple[dict[int, HorizonAccumulator], dict[str, int]]:
-    path = Path(scope_root) / "shadow_path_density_v2.jsonl"
     counters = {
         "density_rows_input": 0,
         "malformed_density_rows": 0,
@@ -469,7 +468,7 @@ def density_snapshot_scan(
     latest: dict[tuple[str, int], tuple[int, dict[str, Any]]] = {}
     accumulators: dict[int, HorizonAccumulator] = {}
 
-    for idx, row, malformed in iter_density_jsonl(path) or ():
+    for idx, (row, malformed) in enumerate(iter_density_rows(scope_root) or ()):
         if malformed or row is None:
             counters["malformed_density_rows"] += 1
             continue

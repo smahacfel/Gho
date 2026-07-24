@@ -17,6 +17,7 @@ from typing import Any, Iterable
 
 
 DEFAULT_SCOPE_ROOT = "reports/selector/shadow-v2-fidelity-validation-pr18c-45m-r1"
+ARTIFACT_ROTATION_MANIFEST = "shadow_artifact_rotation_manifest_v2.jsonl"
 
 
 def parser(description: str) -> argparse.ArgumentParser:
@@ -67,6 +68,85 @@ def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
 
 def scope_path(scope_root: str | Path, artifact_name: str) -> Path:
     return Path(scope_root) / artifact_name
+
+
+def artifact_jsonl_paths(scope_root: str | Path, artifact_name: str) -> list[Path]:
+    """Return rotated JSONL parts followed by the active base artifact."""
+    root = Path(scope_root)
+    base = root / artifact_name
+    if not artifact_name.endswith(".jsonl"):
+        raise ValueError(f"artifact_name must end with .jsonl: {artifact_name}")
+
+    stem = artifact_name[: -len(".jsonl")]
+    parts = sorted(root.glob(f"{stem}.part-*.jsonl"))
+    return [*parts, base]
+
+
+def rotation_manifest_rows(
+    scope_root: str | Path,
+    artifact_name: str,
+) -> tuple[list[dict[str, Any]], int]:
+    artifact = artifact_name[: -len(".jsonl")] if artifact_name.endswith(".jsonl") else artifact_name
+    rows, malformed = read_jsonl(scope_path(scope_root, ARTIFACT_ROTATION_MANIFEST))
+    matched: list[dict[str, Any]] = []
+    for row in rows:
+        row_artifact = row.get("artifact")
+        logical_path = row.get("logical_path")
+        if row_artifact == artifact or (
+            isinstance(logical_path, str) and Path(logical_path).name == artifact_name
+        ):
+            matched.append(row)
+    return matched, malformed
+
+
+def artifact_rotation_report(scope_root: str | Path, artifact_name: str) -> dict[str, Any]:
+    paths = artifact_jsonl_paths(scope_root, artifact_name)
+    manifest_rows, manifest_malformed = rotation_manifest_rows(scope_root, artifact_name)
+    manifest_paths = []
+    for row in manifest_rows:
+        rotated_path = row.get("rotated_path")
+        if isinstance(rotated_path, str):
+            manifest_paths.append(str(Path(rotated_path)))
+    discovered_parts = [str(path) for path in paths[:-1]]
+    manifest_part_names = {Path(path).name for path in manifest_paths}
+    discovered_part_names = {Path(path).name for path in discovered_parts}
+    return {
+        "artifact_name": artifact_name,
+        "logical_stream_paths": [str(path) for path in paths],
+        "rotated_part_count": len(paths) - 1,
+        "base_path": str(paths[-1]),
+        "manifest_path": str(scope_path(scope_root, ARTIFACT_ROTATION_MANIFEST)),
+        "manifest_present": scope_path(scope_root, ARTIFACT_ROTATION_MANIFEST).exists(),
+        "manifest_rows_for_artifact": len(manifest_rows),
+        "manifest_malformed_rows": manifest_malformed,
+        "manifest_missing_discovered_parts": sorted(
+            discovered_part_names.difference(manifest_part_names)
+        ),
+        "manifest_extra_parts": sorted(
+            manifest_part_names.difference(discovered_part_names)
+        ),
+        "read_depends_on_manifest": False,
+    }
+
+
+def iter_artifact_jsonl(
+    scope_root: str | Path,
+    artifact_name: str,
+) -> Iterable[tuple[dict[str, Any] | None, bool]]:
+    for path in artifact_jsonl_paths(scope_root, artifact_name):
+        for row, row_malformed in iter_jsonl(path) or ():
+            yield row, row_malformed
+
+
+def read_artifact_jsonl(scope_root: str | Path, artifact_name: str) -> tuple[list[dict[str, Any]], int]:
+    rows: list[dict[str, Any]] = []
+    malformed = 0
+    for row, row_malformed in iter_artifact_jsonl(scope_root, artifact_name):
+        if row_malformed or row is None:
+            malformed += 1
+            continue
+        rows.append(row)
+    return rows, malformed
 
 
 def nested_record(row: dict[str, Any]) -> dict[str, Any]:
@@ -141,35 +221,35 @@ def limitations(row: dict[str, Any]) -> list[str]:
 
 
 def canonical_rows(scope_root: str | Path) -> tuple[list[dict[str, Any]], int]:
-    return read_jsonl(scope_path(scope_root, "shadow_position_event_v2.jsonl"))
+    return read_artifact_jsonl(scope_root, "shadow_position_event_v2.jsonl")
 
 
 def replay_rows(scope_root: str | Path) -> tuple[list[dict[str, Any]], int]:
-    return read_jsonl(scope_path(scope_root, "shadow_replay_v2.jsonl"))
+    return read_artifact_jsonl(scope_root, "shadow_replay_v2.jsonl")
 
 
 def lifecycle_rows(scope_root: str | Path) -> tuple[list[dict[str, Any]], int]:
-    return read_jsonl(scope_path(scope_root, "shadow_lifecycle_v2.jsonl"))
+    return read_artifact_jsonl(scope_root, "shadow_lifecycle_v2.jsonl")
 
 
 def density_rows(scope_root: str | Path) -> tuple[list[dict[str, Any]], int]:
-    return read_jsonl(scope_path(scope_root, "shadow_path_density_v2.jsonl"))
+    return read_artifact_jsonl(scope_root, "shadow_path_density_v2.jsonl")
 
 
 def iter_canonical_rows(scope_root: str | Path) -> Iterable[tuple[dict[str, Any] | None, bool]]:
-    return iter_jsonl(scope_path(scope_root, "shadow_position_event_v2.jsonl"))
+    return iter_artifact_jsonl(scope_root, "shadow_position_event_v2.jsonl")
 
 
 def iter_replay_rows(scope_root: str | Path) -> Iterable[tuple[dict[str, Any] | None, bool]]:
-    return iter_jsonl(scope_path(scope_root, "shadow_replay_v2.jsonl"))
+    return iter_artifact_jsonl(scope_root, "shadow_replay_v2.jsonl")
 
 
 def iter_lifecycle_rows(scope_root: str | Path) -> Iterable[tuple[dict[str, Any] | None, bool]]:
-    return iter_jsonl(scope_path(scope_root, "shadow_lifecycle_v2.jsonl"))
+    return iter_artifact_jsonl(scope_root, "shadow_lifecycle_v2.jsonl")
 
 
 def iter_density_rows(scope_root: str | Path) -> Iterable[tuple[dict[str, Any] | None, bool]]:
-    return iter_jsonl(scope_path(scope_root, "shadow_path_density_v2.jsonl"))
+    return iter_artifact_jsonl(scope_root, "shadow_path_density_v2.jsonl")
 
 
 def filter_schema(rows: Iterable[dict[str, Any]], schema: str) -> list[dict[str, Any]]:
