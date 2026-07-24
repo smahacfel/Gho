@@ -33,6 +33,8 @@ fn create_test_config(
         grpc_auth_token: None,
         grpc_x_token: None,
         grpc_auth_header: "x-token".to_string(),
+        primary_raw_provider_id: "primary".to_string(),
+        secondary_raw_provider_ids: Vec::new(),
         enable_pumpfun: true,
         enable_bonkfun: true,
         pump_program_id: TEST_PUMP_PROGRAM_ID.to_string(),

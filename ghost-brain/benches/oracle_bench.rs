@@ -8,6 +8,8 @@ use std::sync::Arc;
 fn create_bench_candidate() -> CandidatePool {
     CandidatePool {
         semantic: ghost_core::EventSemanticEnvelope::default(),
+        provider_id: None,
+        provider_role: None,
         slot: Some(12345),
         tx_index: None,
         event_ts_ms: Some(1_234_567_890_000),

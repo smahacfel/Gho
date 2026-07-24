@@ -432,6 +432,8 @@ impl BinaryParser {
                                     .unwrap_or_default();
 
                                 let pool_event = InitializePoolEvent {
+                                    provider_id: None,
+                                    provider_role: None,
                                     slot: crate::types::normalize_slot(*slot),
                                     signature: *signature,
                                     amm_program_id: amm_program.program_id(),
@@ -532,6 +534,8 @@ impl BinaryParser {
 
                                     // Build InitializePoolEvent with reserves from bonding curve account
                                     let pool_event = InitializePoolEvent {
+                                        provider_id: None,
+                                        provider_role: None,
                                         slot: crate::types::normalize_slot(*slot),
                                         signature: *signature,
                                         amm_program_id: amm_program.program_id(),
@@ -620,6 +624,8 @@ impl BinaryParser {
                                             .unwrap_or_default();
 
                                         let pool_event = InitializePoolEvent {
+                                            provider_id: None,
+                                            provider_role: None,
                                             slot: crate::types::normalize_slot(*slot),
                                             signature: *signature,
                                             amm_program_id: amm_program.program_id(),
@@ -801,6 +807,8 @@ impl BinaryParser {
                     }
 
                     let pool_event = InitializePoolEvent {
+                        provider_id: None,
+                        provider_role: None,
                         slot: crate::types::normalize_slot(*slot),
                         signature: *signature,
                         amm_program_id: AmmProgram::PumpFun.program_id(),
@@ -1049,6 +1057,8 @@ impl BinaryParser {
                                             // Create TradeEvent
                                             // Use mpcf_payload_bytes from GeyserEvent if available
                                             let trade_event = crate::types::TradeEvent {
+                                                provider_id: None,
+                                                provider_role: None,
                                                 slot: crate::types::normalize_slot(*slot),
                                                 signature: *signature,
                                                 provenance: None,
@@ -1249,6 +1259,8 @@ impl BinaryParser {
             let quote_mint = get_sol_mint();
 
             let pool_event = InitializePoolEvent {
+                provider_id: None,
+                provider_role: None,
                 slot,
                 signature,
                 amm_program_id: detection.amm_program.program_id(),

@@ -3,11 +3,19 @@ PLAN WYKONAWCZY NAPRAWY GRANICY INGEST–STATE–QUOTE
 Status: "READY FOR IMPLEMENTATION / SHADOW-FIRST / NO LIVE PROMOTION"
 Data: "2026-07-24"
 Repozytorium: "smahacfel/Gho"
-Baseline: "a12ef9cfb7199d44841cde27be2ecd8af13e2f3f"
+Baseline: "88aa1b775d51f4a1b3e512b1aaf05663e7af6db1"
 Zakres: siedem błędów integralności ingestu, stanu i ekonomiki
 Struktura realizacji: baseline receipt + maksymalnie dwa średnie PR-y
 
-Aktualny "main" kończy się na commicie wprowadzającym typowany kontrakt Pump V2 i quote parity prerequisite. Ten commit stanowi bazę planowanej realizacji.
+Aktualny baseline planu został formalnie przesunięty z
+`a12ef9cfb7199d44841cde27be2ecd8af13e2f3f` na
+`88aa1b775d51f4a1b3e512b1aaf05663e7af6db1`, ponieważ implementacja PR1A
+powstała na tym późniejszym commicie i review wymagało jednoznacznej decyzji
+baseline przed zatwierdzeniem bramek. Ten commit stanowi bazę planowanej
+realizacji PR1A od tej aktualizacji.
+
+Receipt dla tej podstawy:
+`PLANS/DO_REALIZACJI/BASELINE_RECEIPT_INGEST_STATE_QUOTE_88AA1B7_20260724.md`.
 
 ---
 
@@ -252,7 +260,7 @@ struct RawPumpMutationLocatorV1 {
     signature: Signature,
     outer_instruction_index: u16,
     inner_instruction_path: Vec<u16>,
-    semantic_event_ordinal: u16,
+    semantic_event_ordinal: u32,
 }
 
 Locator nie zawiera:
@@ -278,7 +286,7 @@ struct CanonicalPumpOrderKeyV1 {
     tx_index: u32,
     outer_instruction_index: u16,
     inner_instruction_path: Vec<u16>,
-    semantic_event_ordinal: u16,
+    semantic_event_ordinal: u32,
 }
 
 Zasady:
@@ -290,33 +298,52 @@ Zasady:
 - rozbieżny slot albo "tx_index" dla tego samego locatora daje typed provider conflict;
 - event bez pełnego raw order może pozostać obserwacją, ale nie uzyskuje statusu exact ordered mutation.
 
-6.3. Semantic payload
+6.3. Semantic claims
 
-struct PumpMutationSemanticPayloadV1 {
-    curve: Pubkey,
-    mint: Pubkey,
-    route_variant: PumpRouteVariant,
-    side: PumpTradeSideV1,
-    success: bool,
-    token_amount_units: u64,
+struct PumpMutationClaimsV1 {
+    curve: Option<Pubkey>,
+    mint: Option<Pubkey>,
+    route_variant: Option<PumpRouteVariant>,
+    side: Option<PumpTradeSideV1>,
+    success: Option<bool>,
+    token_amount_units: Option<u64>,
     instruction_limit: Option<PumpInstructionLimitV1>,
     reported_curve_quote_lamports: Option<u64>,
     reported_wallet_delta_lamports: Option<u64>,
     reported_fee_breakdown: Option<Vec<ProgramFeeCharge>>,
 }
 
-Pola "reported_*" są obserwacją providera. Nie stają się authority bez transaction-local certification.
+Każde `None` znaczy wyłącznie `Unknown`: provider nie znał pola albo go nie
+raportował. Nie znaczy wartości domyślnej i nie jest samodzielnym konfliktem.
+Konflikt powstaje dopiero, gdy dwa źródła zgłoszą konkretne, różne wartości.
+
+Pola `reported_*` są obserwacją providera. Nie stają się authority bez
+transaction-local certification. Rygorystyczny
+`ValidatedPumpMutationFactV1`, którego pola będą bezwarunkowe po walidacji
+primary raw, jest świadomie odroczony poza PR1A (najwcześniej 1D/2A).
 
 6.4. Provenance
 
 struct ObservationProvenanceV1 {
-    source_kind: SourceKindV1,
+    source_family: ObservationSourceFamilyV1,
     source_id: String,
     provider_id: String,
     schema_id: String,
-    payload_hash: [u8; 32],
+    payload_hash_blake3: [u8; 32],
     received_at_monotonic_ns: u64,
 }
+
+`ObservationSourceFamilyV1` opisuje rodzinę dowodu (`RawYellowstone` albo
+`ParsedNln`) i celowo nie używa nazwy istniejącego transportowego
+`SourceKind`. Nie opisuje socketu, adaptera ani endpointu providera.
+
+`payload_hash_blake3` to BLAKE3 captured provider payload bytes przekazanych
+przez adapter do normalizacji. `source_family` i `schema_id` określają ich
+reprezentację. Dla Yellowstone są to bajty prost-encoded zdekodowanego
+`SubscribeUpdateTransaction`, nie oryginalna ramka gRPC: envelope ani
+nieznane pola wire nie muszą zostać zachowane. Hash służy do identyfikacji
+jednej obserwacji i audytu; nie jest hashem zgodności semantycznej między raw
+protobuf i parsed JSON.
 
 "received_at_monotonic_ns":
 
@@ -378,7 +405,7 @@ Powstaje bounded ledger obserwacji.
 
 struct ObservedPumpMutationV1 {
     locator_hint: Option<RawPumpMutationLocatorV1>,
-    semantic_payload: PumpMutationSemanticPayloadV1,
+    claims: PumpMutationClaimsV1,
     provenance: ObservationProvenanceV1,
 }
 
@@ -389,7 +416,7 @@ Primary raw po pełnej walidacji tworzy:
 struct StructuralCanonicalPumpMutationV1 {
     locator: RawPumpMutationLocatorV1,
     order: CanonicalPumpOrderKeyV1,
-    semantic_payload: PumpMutationSemanticPayloadV1,
+    claims: PumpMutationClaimsV1,
     primary_raw_provenance: ObservationProvenanceV1,
     economics_status: PumpEconomicCertificationStatusV1,
 }
@@ -1127,7 +1154,7 @@ Bez zmiany runtime.
 1. Nie resetować istniejącego brudnego worktree.
 2. Utworzyć clean worktree z:
 
-a12ef9cfb7199d44841cde27be2ecd8af13e2f3f
+88aa1b775d51f4a1b3e512b1aaf05663e7af6db1
 
 3. Zapisać:
    
@@ -1159,6 +1186,26 @@ a12ef9cfb7199d44841cde27be2ecd8af13e2f3f
    - LegacySell golden fixture;
    - missing anchor;
    - multiple same-slot transactions.
+
+### 16.0a. Review decision: deferred hard gates for non-CI Change Set 0 work
+
+Dla addytywnego PR1A receipt CI względem wybranego baseline jest wystarczający
+do domknięcia formalnej bramki baseline. Brak istniejącego harnessu i corpus
+ingest/state/quote nie jest waiverem ani deklaracją parity — jest oznaczony w
+receipt jako `DEFERRED HARD GATE`.
+
+Przed pierwszą zmianą zachowania transportu w 1B trzeba:
+
+1. przygotować jeden identyczny harness i workload;
+2. uruchomić go w clean worktree rodzica PR1A oraz na diffie 1B;
+3. zapisać baseline throughput, p99 receive-to-normalize, RSS i queue
+   behavior;
+4. porównać wyniki przed commitem 1B.
+
+Przed 1C/1D trzeba zamrozić odpowiedni differential corpus dla account
+duplicates, provider conflicts i raw/NLN reconciliation. Te warunki nie mogą
+być pominięte przez fakt, że PR1A jest addytywny; nie wymagają jednak osobnego
+piątego PR-a przed 1A.
 
 ---
 

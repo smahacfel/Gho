@@ -62,6 +62,8 @@ impl ScenarioB {
 
                 CandidatePool {
                     semantic: ghost_core::EventSemanticEnvelope::default(),
+                    provider_id: None,
+                    provider_role: None,
                     slot: Some(123456789 + i as u64),
                     tx_index: None,
                     event_ts_ms: Some((1234567890 + i as u64).saturating_mul(1000)),

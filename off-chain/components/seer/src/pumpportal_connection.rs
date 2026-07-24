@@ -890,6 +890,8 @@ impl PumpPortalConnection {
             .or(new_token.virtual_token_reserves);
 
         let pool_event = InitializePoolEvent {
+            provider_id: None,
+            provider_role: None,
             slot: None,
             event_ts_ms: Some(timestamp_ms as u64),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -927,6 +929,8 @@ impl PumpPortalConnection {
 
         let trade_event = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: None,
             signature,
             event_ordinal: Some(0),
@@ -1097,6 +1101,8 @@ impl PumpPortalConnection {
 
         let trade_event = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: None,
             signature,
             event_ordinal: Some(0),
@@ -1178,6 +1184,8 @@ impl PumpPortalConnection {
         let arrival_ts_ms = crate::types::arrival_time_ms();
         let ingress_wall_ts_ms = crate::types::ingress_epoch_ms();
         GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: event.slot,
             tx_index: None,
             event_ts_ms: crate::types::event_ts_from_block_time(event.block_time),
@@ -1242,6 +1250,8 @@ impl PumpPortalConnection {
         let arrival_ts_ms = crate::types::arrival_time_ms();
         let ingress_wall_ts_ms = crate::types::ingress_epoch_ms();
         GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: event.slot,
             tx_index: None,
             event_ts_ms: Some(event.timestamp_ms),

@@ -41,6 +41,8 @@ grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
 # API key dla gRPC.
 grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
 grpc_auth_header = "x-api-key"
+primary_raw_provider_id = "primary"
+secondary_raw_provider_ids = []
 
 # Szybki RPC (HTTPS) do zapytań Seera / backfill.
 rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"

@@ -52,6 +52,14 @@ pub struct SeerConfig {
     #[serde(default = "SeerConfig::default_grpc_auth_header")]
     pub grpc_auth_header: String,
 
+    /// Stable ID of the single primary raw Yellowstone provider.
+    #[serde(default = "SeerConfig::default_primary_raw_provider_id")]
+    pub primary_raw_provider_id: String,
+
+    /// Stable IDs reserved for secondary raw Yellowstone witnesses.
+    #[serde(default)]
+    pub secondary_raw_provider_ids: Vec<String>,
+
     /// Maximum reconnection attempts
     pub max_reconnect_attempts: u32,
 
@@ -571,6 +579,8 @@ impl Default for SeerConfig {
             grpc_client_id: None,
             grpc_auth_token: None,
             grpc_auth_header: Self::default_grpc_auth_header(),
+            primary_raw_provider_id: Self::default_primary_raw_provider_id(),
+            secondary_raw_provider_ids: Vec::new(),
             max_reconnect_attempts: 10,
             reconnect_delay_secs: 5,
             max_reconnect_delay_secs: 300, // 5 minutes max backoff
@@ -624,6 +634,10 @@ impl SeerConfig {
 
     pub fn default_grpc_auth_header() -> String {
         "x-token".to_string()
+    }
+
+    fn default_primary_raw_provider_id() -> String {
+        "primary".to_string()
     }
 
     pub fn default_grpc_max_stalls_before_open() -> u32 {
@@ -807,6 +821,24 @@ mod tests {
         assert!(config.program_streams.disabled_optional_topics.is_empty());
         assert_eq!(config.watched_pools_ttl_ms, 120_000);
         assert_eq!(config.watched_pools_cap, 32_768);
+        assert_eq!(config.primary_raw_provider_id, "primary");
+        assert!(config.secondary_raw_provider_ids.is_empty());
+    }
+
+    #[test]
+    fn old_seer_config_json_defaults_raw_provider_role_contract() {
+        let mut value = serde_json::to_value(SeerConfig::default())
+            .expect("serialize current config as compatibility fixture");
+        let object = value
+            .as_object_mut()
+            .expect("config must serialize as an object");
+        object.remove("primary_raw_provider_id");
+        object.remove("secondary_raw_provider_ids");
+
+        let decoded: SeerConfig =
+            serde_json::from_value(value).expect("old config must remain readable");
+        assert_eq!(decoded.primary_raw_provider_id, "primary");
+        assert!(decoded.secondary_raw_provider_ids.is_empty());
     }
 
     #[test]

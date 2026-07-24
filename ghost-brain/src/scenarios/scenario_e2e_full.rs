@@ -122,6 +122,8 @@ impl TestScenario for ScenarioE2EFull {
                     grpc_client_id: None,
                     grpc_auth_token: None,
                     grpc_auth_header: seer::config::SeerConfig::default_grpc_auth_header(),
+                    primary_raw_provider_id: "primary".to_string(),
+                    secondary_raw_provider_ids: Vec::new(),
                     max_reconnect_attempts: config.seer.max_reconnect_attempts,
                     reconnect_delay_secs: config.seer.reconnect_delay_secs,
                     max_reconnect_delay_secs: 300,

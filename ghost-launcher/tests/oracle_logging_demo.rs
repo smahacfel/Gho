@@ -79,6 +79,8 @@ fn generate_synthetic_history(
 
         history.push(TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(10_000 + i as u64),
             signature: Signature::new_unique(),
             event_ordinal: Some(i as u32),
@@ -420,6 +422,8 @@ async fn test_synthetic_history_prevents_data_starvation() {
 
     let candidate_pool = CandidatePool {
         semantic: ghost_core::EventSemanticEnvelope::default(),
+        provider_id: None,
+        provider_role: None,
         slot: Some(123_456),
         tx_index: None,
         event_ts_ms: Some(1_700_000_100_000),

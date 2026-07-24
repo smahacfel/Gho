@@ -6,6 +6,7 @@
 use crate::types::{CandidatePool, TradeEvent};
 use ghost_core::{
     CurveFinality, EventSemanticEnvelope, EventTimeMetadata, ExecutionAccountEvidence,
+    RawProviderRoleV1,
 };
 use prometheus::{
     register_histogram, register_int_counter, register_int_gauge, Histogram, IntCounter, IntGauge,
@@ -329,6 +330,14 @@ pub struct DetectedFundingTransferEvent {
 /// `OracleRuntime` to drive the corrective reconciliation loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedAccountUpdateEvent {
+    /// Stable raw-provider identifier when supplied by Yellowstone ingest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+
+    /// Configured provider role. Metadata-only until the account arbiter lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_role: Option<RawProviderRoleV1>,
+
     /// Cross-source semantic envelope carried through canonical ingest.
     #[serde(default)]
     pub semantic: EventSemanticEnvelope,
@@ -372,6 +381,11 @@ pub struct DetectedAccountUpdateEvent {
     /// Optional Solana account write-version from Yellowstone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_version: Option<u64>,
+
+    /// Signature of the transaction that produced this account write, when
+    /// present in Yellowstone. Missing signatures remain `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txn_signature: Option<solana_sdk::signature::Signature>,
 
     /// BLAKE3 hash of the original raw account update bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -827,6 +841,8 @@ impl IpcSender {
     /// from the bonding-curve account, not the real balance subset.
     pub async fn send_account_update(
         &self,
+        provider_id: Option<String>,
+        provider_role: Option<RawProviderRoleV1>,
         semantic: EventSemanticEnvelope,
         event_time: EventTimeMetadata,
         base_mint: Pubkey,
@@ -839,6 +855,7 @@ impl IpcSender {
         complete: u8,
         slot: u64,
         write_version: Option<u64>,
+        txn_signature: Option<solana_sdk::signature::Signature>,
         account_data_hash: Option<String>,
         account_data_len: Option<u64>,
         source_account_pubkey: Option<Pubkey>,
@@ -851,6 +868,8 @@ impl IpcSender {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let event = SeerEvent::AccountUpdate(DetectedAccountUpdateEvent {
+            provider_id,
+            provider_role,
             semantic,
             event_time,
             base_mint,
@@ -863,6 +882,7 @@ impl IpcSender {
             complete,
             slot,
             write_version,
+            txn_signature,
             account_data_hash,
             account_data_len,
             source_account_pubkey,
@@ -1108,6 +1128,8 @@ mod tests {
     fn create_test_candidate() -> CandidatePool {
         CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(100),
             tx_index: None,
             event_ts_ms: Some(1_234_567_890_000),
@@ -1158,9 +1180,12 @@ mod tests {
         let base_mint = Pubkey::new_unique();
         let bonding_curve = Pubkey::new_unique();
         let owner = Pubkey::new_unique();
+        let txn_signature = solana_sdk::signature::Signature::new_unique();
 
         sender
             .send_account_update(
+                Some("raw-primary".to_string()),
+                Some(RawProviderRoleV1::PrimaryAuthority),
                 ghost_core::EventSemanticEnvelope::default(),
                 ghost_core::EventTimeMetadata::default(),
                 base_mint,
@@ -1173,6 +1198,7 @@ mod tests {
                 0,
                 123,
                 Some(7),
+                Some(txn_signature),
                 Some("raw-blake3".to_string()),
                 Some(56),
                 Some(bonding_curve),
@@ -1191,6 +1217,12 @@ mod tests {
         assert_eq!(event.source_account_pubkey, Some(bonding_curve));
         assert_eq!(event.source_account_owner_or_program, Some(owner));
         assert_eq!(event.write_version, Some(7));
+        assert_eq!(event.provider_id.as_deref(), Some("raw-primary"));
+        assert_eq!(
+            event.provider_role,
+            Some(RawProviderRoleV1::PrimaryAuthority)
+        );
+        assert_eq!(event.txn_signature, Some(txn_signature));
         assert_eq!(event.real_sol_reserves, Some(300));
         assert_eq!(event.real_token_reserves, Some(400));
     }
@@ -1198,6 +1230,8 @@ mod tests {
     #[test]
     fn detected_account_update_event_old_json_defaults_hash_metadata_to_none() {
         let event = DetectedAccountUpdateEvent {
+            provider_id: Some("raw-primary".to_string()),
+            provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
             semantic: ghost_core::EventSemanticEnvelope::default(),
             event_time: ghost_core::EventTimeMetadata::default(),
             base_mint: Pubkey::new_unique(),
@@ -1210,6 +1244,7 @@ mod tests {
             complete: 0,
             slot: 123,
             write_version: Some(7),
+            txn_signature: Some(solana_sdk::signature::Signature::new_unique()),
             account_data_hash: Some("raw-blake3".to_string()),
             account_data_len: Some(56),
             source_account_pubkey: Some(Pubkey::new_unique()),
@@ -1223,6 +1258,9 @@ mod tests {
         let object = value
             .as_object_mut()
             .expect("account update should serialize as object");
+        object.remove("provider_id");
+        object.remove("provider_role");
+        object.remove("txn_signature");
         object.remove("account_data_hash");
         object.remove("account_data_len");
         object.remove("source_account_pubkey");
@@ -1230,6 +1268,9 @@ mod tests {
 
         let decoded: DetectedAccountUpdateEvent =
             serde_json::from_value(value).expect("deserialize old account update shape");
+        assert_eq!(decoded.provider_id, None);
+        assert_eq!(decoded.provider_role, None);
+        assert_eq!(decoded.txn_signature, None);
         assert_eq!(decoded.account_data_hash, None);
         assert_eq!(decoded.account_data_len, None);
         assert_eq!(decoded.source_account_pubkey, None);
@@ -1324,6 +1365,8 @@ mod tests {
 
         crate::types::TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(12345),
             signature: Signature::new_unique(),
             event_ordinal: Some(0),

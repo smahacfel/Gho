@@ -8,6 +8,8 @@ mod stress_tests {
     fn make_heavy_candidate(pool: Pubkey, mint: Pubkey) -> CandidatePool {
         CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(999),
             tx_index: None,
             event_ts_ms: Some(1700000000000),
@@ -34,6 +36,8 @@ mod stress_tests {
     fn make_atomic_dev_buy(pool: Pubkey, mint: Pubkey) -> TradeEvent {
         TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(999),
             signature: Signature::new_unique(),
             event_ordinal: Some(1),

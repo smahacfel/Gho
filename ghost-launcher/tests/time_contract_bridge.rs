@@ -7,6 +7,8 @@ use solana_sdk::{pubkey::Pubkey, signature::Signature};
 fn make_trade(event_time: EventTimeMetadata, legacy_timestamp_ms: u64) -> TradeEvent {
     TradeEvent {
         semantic: EventSemanticEnvelope::default(),
+        provider_id: None,
+        provider_role: None,
         slot: Some(7),
         signature: Signature::new_unique(),
         event_ordinal: Some(0),

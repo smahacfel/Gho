@@ -25,6 +25,8 @@ use solana_sdk::signature::Signature;
 fn make_buy_trade(pool: Pubkey, mint: Pubkey) -> TradeEvent {
     TradeEvent {
         semantic: ghost_core::EventSemanticEnvelope::default(),
+        provider_id: None,
+        provider_role: None,
         slot: Some(42),
         signature: Signature::new_unique(),
         event_ordinal: Some(0),

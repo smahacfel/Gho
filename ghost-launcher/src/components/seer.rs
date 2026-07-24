@@ -3749,6 +3749,8 @@ fn emit_account_update_to_event_bus(
         "DIAG_ACCOUNT_UPDATE_RELAY"
     );
     let ghost_event = GhostEvent::AccountUpdate(AccountUpdateEvent {
+        provider_id: update.provider_id.clone(),
+        provider_role: update.provider_role,
         semantic: update.semantic,
         event_time: update.event_time,
         base_mint: update.base_mint,
@@ -3761,6 +3763,7 @@ fn emit_account_update_to_event_bus(
         complete: update.complete,
         slot: update.slot,
         write_version: update.write_version,
+        txn_signature: update.txn_signature,
         account_data_hash: update.account_data_hash.clone(),
         account_data_len: update.account_data_len,
         source_account_pubkey: update.source_account_pubkey,
@@ -4104,6 +4107,8 @@ pub async fn run(
         // grpc_x_token is the preferred way to authenticate with Yellowstone
         grpc_auth_token: config.grpc_x_token.or(config.grpc_auth_token),
         grpc_auth_header: config.grpc_auth_header,
+        primary_raw_provider_id: config.primary_raw_provider_id,
+        secondary_raw_provider_ids: config.secondary_raw_provider_ids,
         max_reconnect_attempts: 10,
         reconnect_delay_secs: 5,
         max_reconnect_delay_secs: 300,
@@ -5078,6 +5083,8 @@ mod tests {
     fn make_candidate(pool: Pubkey, mint: Pubkey) -> CandidatePool {
         CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(11),
             tx_index: None,
             event_ts_ms: Some(11_000),
@@ -5733,6 +5740,8 @@ mod tests {
     fn make_trade(pool: Pubkey, mint: Pubkey) -> TradeEvent {
         TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature: Signature::new_unique(),
             event_ordinal: Some(7),
@@ -5899,6 +5908,8 @@ mod tests {
 
     fn make_account_update(base_mint: Pubkey, bonding_curve: Pubkey) -> DetectedAccountUpdateEvent {
         DetectedAccountUpdateEvent {
+            provider_id: None,
+            provider_role: None,
             semantic: ghost_core::EventSemanticEnvelope::default(),
             event_time: ghost_core::EventTimeMetadata::default(),
             base_mint,
@@ -5911,6 +5922,7 @@ mod tests {
             complete: 0,
             slot: 42,
             write_version: Some(7),
+            txn_signature: None,
             account_data_hash: None,
             account_data_len: None,
             source_account_pubkey: None,
@@ -6392,7 +6404,11 @@ mod tests {
         let mint = Pubkey::new_unique();
         let curve = Pubkey::new_unique();
         let owner = Pubkey::new_unique();
+        let txn_signature = Signature::new_unique();
         let mut update = make_account_update(mint, curve);
+        update.provider_id = Some("raw-primary".to_string());
+        update.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
+        update.txn_signature = Some(txn_signature);
         update.account_data_hash = Some("raw-blake3".to_string());
         update.account_data_len = Some(56);
         update.source_account_pubkey = Some(curve);
@@ -6403,6 +6419,12 @@ mod tests {
         let Ok(GhostEvent::AccountUpdate(event)) = rx.recv().await else {
             panic!("expected account update event");
         };
+        assert_eq!(event.provider_id.as_deref(), Some("raw-primary"));
+        assert_eq!(
+            event.provider_role,
+            Some(ghost_core::RawProviderRoleV1::PrimaryAuthority)
+        );
+        assert_eq!(event.txn_signature, Some(txn_signature));
         assert_eq!(event.account_data_hash.as_deref(), Some("raw-blake3"));
         assert_eq!(event.account_data_len, Some(56));
         assert_eq!(event.source_account_pubkey, Some(curve));

@@ -27,6 +27,7 @@ pub mod event_time;
 pub mod execution_account_evidence;
 pub mod features;
 pub mod health;
+pub mod ingest_integrity;
 pub mod init_pool_parser;
 pub mod market_state;
 pub mod metric_contracts;
@@ -71,6 +72,11 @@ pub use execution_account_evidence::{
     ExecutionAccountEvidenceSnapshotCounts, ExecutionAccountEvidenceSource,
     ExecutionAccountEvidenceStatus, ExecutionAccountEvidenceStore, ExecutionAccountRole,
     UpsertExecutionAccountEvidenceOutcome, UpsertExecutionAccountEvidenceResult,
+};
+pub use ingest_integrity::{
+    CanonicalPumpOrderKeyV1, ObservationProvenanceV1, ObservationSourceFamilyV1,
+    PumpInstructionLimitV1, PumpMutationClaimsV1, PumpTradeSideV1, RawProviderRoleV1,
+    RawPumpMutationLocatorV1,
 };
 pub use init_pool_parser::{
     compute_initialize_pool_discriminator,

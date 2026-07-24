@@ -801,6 +801,8 @@ impl HeliusWebSocketAdapter {
                         let arrival_ts_ms = crate::types::arrival_time_ms();
                         let ingress_wall_ts_ms = crate::types::ingress_epoch_ms();
                         let event = GeyserEvent::Transaction {
+                            provider_id: None,
+                            provider_role: None,
                             slot: crate::types::normalize_slot(Some(tx.slot)),
                             tx_index: None,
                             event_ts_ms: crate::types::event_ts_from_block_time(tx.block_time),

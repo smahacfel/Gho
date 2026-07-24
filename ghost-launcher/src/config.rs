@@ -1702,6 +1702,14 @@ pub struct SeerComponentConfig {
     #[serde(default = "default_grpc_auth_header")]
     pub grpc_auth_header: String,
 
+    /// Stable ID of the single primary raw Yellowstone provider.
+    #[serde(default = "default_primary_raw_provider_id")]
+    pub primary_raw_provider_id: String,
+
+    /// Stable IDs reserved for secondary raw Yellowstone witnesses.
+    #[serde(default)]
+    pub secondary_raw_provider_ids: Vec<String>,
+
     /// Enable Pump.fun detection
     #[serde(default = "default_true")]
     pub enable_pumpfun: bool,
@@ -3016,6 +3024,10 @@ fn default_grpc_auth_header() -> String {
     "x-token".to_string()
 }
 
+fn default_primary_raw_provider_id() -> String {
+    "primary".to_string()
+}
+
 fn default_rpc_endpoint() -> String {
     "https://api.devnet.solana.com".to_string()
 }
@@ -3854,6 +3866,8 @@ impl LauncherConfig {
                 grpc_auth_token: None,
                 grpc_x_token: None,
                 grpc_auth_header: default_grpc_auth_header(),
+                primary_raw_provider_id: default_primary_raw_provider_id(),
+                secondary_raw_provider_ids: Vec::new(),
                 enable_pumpfun: true,
                 enable_bonkfun: true,
                 pump_program_id: default_pump_program_id(),
@@ -4737,6 +4751,24 @@ enabled = true
             .program_streams
             .disabled_optional_topics
             .is_empty());
+        assert_eq!(config.seer.primary_raw_provider_id, "primary");
+        assert!(config.seer.secondary_raw_provider_ids.is_empty());
+    }
+
+    #[test]
+    fn old_launcher_seer_config_json_defaults_raw_provider_role_contract() {
+        let mut value = serde_json::to_value(LauncherConfig::default().seer)
+            .expect("serialize current seer config as compatibility fixture");
+        let object = value
+            .as_object_mut()
+            .expect("seer config must serialize as an object");
+        object.remove("primary_raw_provider_id");
+        object.remove("secondary_raw_provider_ids");
+
+        let decoded: SeerComponentConfig =
+            serde_json::from_value(value).expect("old launcher config must remain readable");
+        assert_eq!(decoded.primary_raw_provider_id, "primary");
+        assert!(decoded.secondary_raw_provider_ids.is_empty());
     }
 
     #[test]

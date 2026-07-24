@@ -1061,9 +1061,12 @@ fn summarize_coverage(
 
 #[derive(Clone)]
 struct PendingCurveUpdateSnapshot {
+    provider_id: Option<String>,
+    provider_role: Option<ghost_core::RawProviderRoleV1>,
     slot: u64,
     event_time: ghost_core::EventTimeMetadata,
     write_version: Option<u64>,
+    txn_signature: Option<Signature>,
     owner: Pubkey,
     data: Vec<u8>,
     queued_at: Instant,
@@ -1071,17 +1074,23 @@ struct PendingCurveUpdateSnapshot {
 
 impl PendingCurveUpdateSnapshot {
     fn new(
+        provider_id: Option<String>,
+        provider_role: Option<ghost_core::RawProviderRoleV1>,
         slot: u64,
         event_time: ghost_core::EventTimeMetadata,
         write_version: Option<u64>,
+        txn_signature: Option<Signature>,
         owner: Pubkey,
         data: &[u8],
         queued_at: Instant,
     ) -> Self {
         Self {
+            provider_id,
+            provider_role,
             slot,
             event_time,
             write_version,
+            txn_signature,
             owner,
             data: data.to_vec(),
             queued_at,
@@ -1809,11 +1818,13 @@ impl Seer {
             SeerSourceMode::GeyserGrpc => {
                 let build_grpc_connection =
                     |subscription_profile: GrpcSubscriptionProfile, manual_backfill_enabled| {
-                        GrpcConnection::new_with_auth_header(
+                        GrpcConnection::new_with_auth_header_and_provider_roles(
                             config.grpc_endpoint.clone(),
                             config.grpc_client_id.clone(),
                             config.grpc_auth_token.clone(),
                             config.grpc_auth_header.clone(),
+                            config.primary_raw_provider_id.clone(),
+                            config.secondary_raw_provider_ids.clone(),
                             Arc::clone(&metrics),
                             config.max_reconnect_attempts,
                             config.reconnect_delay_secs,
@@ -3065,6 +3076,8 @@ impl Seer {
                 );
                 if ipc
                     .send_account_update(
+                        replay.provider_id,
+                        replay.provider_role,
                         semantic,
                         replay.event_time,
                         mint,
@@ -3077,6 +3090,7 @@ impl Seer {
                         update_payload.complete,
                         replay.slot,
                         replay.write_version,
+                        replay.txn_signature,
                         Some(account_data_hash),
                         Some(account_data_len),
                         Some(curve),
@@ -3146,9 +3160,12 @@ impl Seer {
     fn queue_pending_curve_update(
         &self,
         curve: Pubkey,
+        provider_id: Option<String>,
+        provider_role: Option<ghost_core::RawProviderRoleV1>,
         slot: u64,
         event_time: ghost_core::EventTimeMetadata,
         write_version: Option<u64>,
+        txn_signature: Option<Signature>,
         owner: Pubkey,
         data: &[u8],
     ) -> PendingCurveUpdateStoreOutcome {
@@ -3156,9 +3173,12 @@ impl Seer {
         let mut pending = self.pending_curve_updates.write();
         let queued_at = Instant::now();
         let snapshot = PendingCurveUpdateSnapshot::new(
+            provider_id,
+            provider_role,
             slot,
             event_time,
             write_version,
+            txn_signature,
             owner,
             data,
             queued_at,
@@ -3269,15 +3289,38 @@ impl Seer {
         }
 
         let recv_started_at = Instant::now();
-        let (slot, event_time, write_version, pubkey, data, owner) = match event {
+        let (
+            provider_id,
+            provider_role,
+            slot,
+            event_time,
+            write_version,
+            txn_signature,
+            pubkey,
+            data,
+            owner,
+        ) = match event {
             types::GeyserEvent::AccountUpdate {
+                provider_id,
+                provider_role,
                 slot,
                 event_time,
                 write_version,
+                txn_signature,
                 pubkey,
                 data,
                 owner,
-            } => (*slot, *event_time, *write_version, *pubkey, data, *owner),
+            } => (
+                provider_id.clone(),
+                *provider_role,
+                *slot,
+                *event_time,
+                *write_version,
+                *txn_signature,
+                *pubkey,
+                data,
+                *owner,
+            ),
             _ => return Ok(false),
         };
         ::metrics::increment_counter!("seer.account_updates.received_total");
@@ -3343,9 +3386,12 @@ impl Seer {
                     // `register_curve_mapping` → `replay_pending_curve_update`.
                     let store_outcome = self.queue_pending_curve_update(
                         pubkey,
+                        provider_id.clone(),
+                        provider_role,
                         slot,
                         event_time,
                         write_version,
+                        txn_signature,
                         owner,
                         data,
                     );
@@ -3387,6 +3433,8 @@ impl Seer {
                 normalize_account_update_semantics("grpc_global_stream", event_time, true);
             match ipc
                 .send_account_update(
+                    provider_id,
+                    provider_role,
                     semantic,
                     event_time,
                     base_mint,
@@ -3399,6 +3447,7 @@ impl Seer {
                     update_payload.complete,
                     slot,
                     write_version,
+                    txn_signature,
                     Some(account_data_hash),
                     Some(account_data_len),
                     Some(pubkey),
@@ -4367,6 +4416,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             executed_transaction_count,
             raw,
             slot,
+            ..
         } = event
         {
             self.coverage
@@ -5231,6 +5281,8 @@ mod tests {
             accounts.push(Pubkey::new_unique());
         }
         types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -5341,6 +5393,8 @@ mod tests {
     fn test_trade(pool_amm_id: Pubkey, mint: Pubkey) -> types::TradeEvent {
         types::TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature: Signature::new_unique(),
             event_ordinal: Some(0),
@@ -5400,6 +5454,8 @@ mod tests {
         let payload = bincode::serialize(&types::SyntheticPayload::InitializePool(pool.clone()))
             .expect("serialize synthetic pool");
         types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: pool.slot,
             tx_index: None,
             event_ts_ms: pool.event_ts_ms,
@@ -5475,6 +5531,8 @@ mod tests {
             .expect("valid pumpfun id");
 
         types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
@@ -5535,6 +5593,8 @@ mod tests {
 
         (
             types::GeyserEvent::Transaction {
+                provider_id: None,
+                provider_role: None,
                 slot: Some(77),
                 tx_index: None,
                 event_ts_ms: Some(1_666_666_666_000),
@@ -5855,6 +5915,8 @@ mod tests {
 
         let candidate = CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -5995,6 +6057,8 @@ mod tests {
 
         seer.process_event(synthetic_initialize_pool_event(
             types::InitializePoolEvent {
+                provider_id: None,
+                provider_role: None,
                 slot: Some(11),
                 event_ts_ms: Some(11_000),
                 event_time: ghost_core::EventTimeMetadata::default(),
@@ -6048,6 +6112,8 @@ mod tests {
 
         seer.process_event(synthetic_initialize_pool_event(
             types::InitializePoolEvent {
+                provider_id: None,
+                provider_role: None,
                 slot: Some(22),
                 event_ts_ms: Some(22_000),
                 event_time: ghost_core::EventTimeMetadata::default(),
@@ -6147,6 +6213,8 @@ mod tests {
         let source = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
         let event = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(88),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
@@ -6199,6 +6267,8 @@ mod tests {
         let recipient_owner = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let event = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(89),
             tx_index: None,
             event_ts_ms: Some(1_777_777_778_000),
@@ -6748,6 +6818,8 @@ mod tests {
         tokio::time::timeout(
             Duration::from_millis(50),
             seer.process_event(types::GeyserEvent::EntryAnchor {
+                provider_id: None,
+                provider_role: None,
                 slot: 77,
                 executed_transaction_count: 17,
                 raw: vec![1u8; 4_096],
@@ -6774,6 +6846,8 @@ mod tests {
 
         let candidate = CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: None,
@@ -6817,6 +6891,8 @@ mod tests {
             .expect("valid sol mint");
 
         let pool = types::InitializePoolEvent {
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             event_ts_ms: Some(1_000),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -6839,6 +6915,8 @@ mod tests {
         let payload = bincode::serialize(&types::SyntheticPayload::InitializePool(pool))
             .expect("serialize synthetic pool");
         let event = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -6895,6 +6973,8 @@ mod tests {
             .expect("serialize synthetic trade");
 
         seer.process_event(types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(7),
             tx_index: None,
             event_ts_ms: Some(11_111),
@@ -6979,8 +7059,12 @@ mod tests {
             .expect("valid pumpfun id");
         let expected_hash = account_data_hash_blake3(&data);
         let expected_len = data.len() as u64;
+        let txn_signature = Signature::new_unique();
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: Some("raw-primary".to_string()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             slot: 42,
+            txn_signature: Some(txn_signature),
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
@@ -7001,6 +7085,12 @@ mod tests {
         assert_eq!(event.base_mint, base_mint);
         assert_eq!(event.bonding_curve, bonding_curve);
         assert_eq!(event.slot, 42);
+        assert_eq!(event.provider_id.as_deref(), Some("raw-primary"));
+        assert_eq!(
+            event.provider_role,
+            Some(ghost_core::RawProviderRoleV1::PrimaryAuthority)
+        );
+        assert_eq!(event.txn_signature, Some(txn_signature));
         assert_eq!(event.token_reserves, 500);
         assert_eq!(event.sol_reserves, 1_000);
         assert_eq!(
@@ -7051,7 +7141,10 @@ mod tests {
         data[8..16].copy_from_slice(&900u64.to_le_bytes());
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 55,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::new(None, Some(1_055), Some(55)),
             write_version: None,
             pubkey: curve,
@@ -7065,7 +7158,10 @@ mod tests {
         newer[0..8].copy_from_slice(&701u64.to_le_bytes());
         newer[8..16].copy_from_slice(&901u64.to_le_bytes());
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 56,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::new(None, Some(1_056), Some(56)),
             write_version: None,
             pubkey: curve,
@@ -7106,7 +7202,10 @@ mod tests {
         first[0..8].copy_from_slice(&700u64.to_le_bytes());
         first[8..16].copy_from_slice(&900u64.to_le_bytes());
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 55,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::new(None, Some(2_055), Some(55)),
             write_version: Some(1),
             pubkey: curve,
@@ -7120,7 +7219,10 @@ mod tests {
         second[0..8].copy_from_slice(&701u64.to_le_bytes());
         second[8..16].copy_from_slice(&901u64.to_le_bytes());
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 56,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::new(None, Some(2_056), Some(56)),
             write_version: Some(2),
             pubkey: curve,
@@ -7217,7 +7319,10 @@ mod tests {
             .expect("valid pumpswap program");
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 55,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: Some(2),
             pubkey: pool,
@@ -7287,7 +7392,10 @@ mod tests {
             .expect("valid pumpswap program");
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 55,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: Some(2),
             pubkey: pool,
@@ -7345,7 +7453,10 @@ mod tests {
         data[40] = curve.complete;
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 42,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
@@ -7414,7 +7525,10 @@ mod tests {
         let owner = Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA")
             .expect("valid pumpswap program");
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 43,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: Some(1),
             pubkey: pool,
@@ -7486,7 +7600,10 @@ mod tests {
         let expected_hash = account_data_hash_blake3(&data);
         let expected_len = data.len() as u64;
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 55,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: Some(2),
             pubkey: curve_pubkey,
@@ -7566,7 +7683,10 @@ mod tests {
         data[40] = 1; // complete
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 99,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
@@ -7610,7 +7730,10 @@ mod tests {
             });
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 99,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: Some(7),
             pubkey: account_pubkey,
@@ -7731,7 +7854,10 @@ mod tests {
         // Send data that is too short (20 bytes instead of 56)
         let short_data = vec![0u8; 20];
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 42,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
@@ -7767,7 +7893,10 @@ mod tests {
         data[40..48].copy_from_slice(&1_500u64.to_le_bytes());
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 42,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
@@ -7815,7 +7944,10 @@ mod tests {
         data[48] = 0;
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 42,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
@@ -7860,7 +7992,10 @@ mod tests {
         data[40] = 0;
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 42,
+            txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: unknown_pubkey,
@@ -8053,6 +8188,8 @@ mod tests {
         let pumpswap_program =
             Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
         let event = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -8092,6 +8229,8 @@ mod tests {
         let pumpfun_program =
             Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
         let event = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -8137,6 +8276,8 @@ mod tests {
         let jupiter_program =
             Pubkey::from_str("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4").unwrap();
         let event = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -8174,6 +8315,8 @@ mod tests {
         let dflow_program =
             Pubkey::from_str("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH").unwrap();
         let event = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -8211,6 +8354,8 @@ mod tests {
         let pumpfun_program =
             Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
         let event = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -8251,6 +8396,8 @@ mod tests {
         let pumpswap_program =
             Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
         let event = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -9101,6 +9248,8 @@ mod tests {
         let trade = test_trade(Pubkey::new_unique(), Pubkey::new_unique());
         let payload = bincode::serialize(&types::SyntheticPayload::Trade(trade.clone())).unwrap();
         let event = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -9158,6 +9307,8 @@ mod tests {
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
 
         let pool = types::InitializePoolEvent {
+            provider_id: None,
+            provider_role: None,
             slot: Some(99), // Old slot
             event_ts_ms: Some(1_000),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9179,6 +9330,8 @@ mod tests {
 
         let payload = bincode::serialize(&types::SyntheticPayload::InitializePool(pool)).unwrap();
         let event = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(99),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -9217,6 +9370,8 @@ mod tests {
         );
 
         let pool_new = types::InitializePoolEvent {
+            provider_id: None,
+            provider_role: None,
             slot: Some(101), // New slot
             event_ts_ms: Some(1_000),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9239,6 +9394,8 @@ mod tests {
         let payload_new =
             bincode::serialize(&types::SyntheticPayload::InitializePool(pool_new)).unwrap();
         let event_new = types::GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(101),
             tx_index: None,
             event_ts_ms: Some(1_000),
@@ -9503,7 +9660,7 @@ mod tests {
     ///      already empty, so ShadowLedger does not receive a second write and
     ///      `last_updated_slot` remains unchanged.
     #[tokio::test]
-    async fn account_update_before_mapping_replays() {
+    async fn account_update_before_mapping_replays_provider_provenance_and_transaction_signature() {
         let config = SeerConfig::default();
         let ipc_config = IpcChannelConfig::default();
         let (ipc_sender, mut rx, _metrics) = create_ipc_channel(ipc_config);
@@ -9512,6 +9669,9 @@ mod tests {
 
         let curve = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
+        let provider_id = "raw-primary".to_owned();
+        let provider_role = ghost_core::RawProviderRoleV1::PrimaryAuthority;
+        let txn_signature = Signature::new_unique();
         const UPDATE_SLOT: u64 = 42;
 
         // Build a valid 56-byte bonding-curve account payload.
@@ -9523,7 +9683,10 @@ mod tests {
 
         // AccountUpdate arrives before mapping is known — must buffer, not apply.
         seer.process_event(types::GeyserEvent::AccountUpdate {
+            provider_id: Some(provider_id.clone()),
+            provider_role: Some(provider_role),
             slot: UPDATE_SLOT,
+            txn_signature: Some(txn_signature),
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: curve,
@@ -9540,6 +9703,18 @@ mod tests {
                 .contains_key(&curve.to_bytes()),
             "AccountUpdate must be buffered in pending_curve_updates when mapping unknown"
         );
+        {
+            let pending_updates = seer.pending_curve_updates.read();
+            let buffered = pending_updates
+                .get(&curve.to_bytes())
+                .expect("pending update must retain the snapshot");
+            assert_eq!(
+                buffered.latest.provider_id.as_deref(),
+                Some(provider_id.as_str())
+            );
+            assert_eq!(buffered.latest.provider_role, Some(provider_role));
+            assert_eq!(buffered.latest.txn_signature, Some(txn_signature));
+        }
         assert!(
             ledger.get_curve_info(&curve).is_none(),
             "ShadowLedger must NOT be updated before mapping is known"
@@ -9568,6 +9743,12 @@ mod tests {
         assert_eq!(event_after_first.base_mint, mint);
         assert_eq!(event_after_first.bonding_curve, curve);
         assert_eq!(event_after_first.slot, UPDATE_SLOT);
+        assert_eq!(
+            event_after_first.provider_id.as_deref(),
+            Some(provider_id.as_str())
+        );
+        assert_eq!(event_after_first.provider_role, Some(provider_role));
+        assert_eq!(event_after_first.txn_signature, Some(txn_signature));
         assert_eq!(
             event_after_first.replay_origin,
             AccountUpdateReplayOrigin::PendingReplay
@@ -9616,25 +9797,34 @@ mod tests {
 
         let first = seer.queue_pending_curve_update(
             curve,
+            None,
+            None,
             10,
             ghost_core::EventTimeMetadata::default(),
             Some(1),
+            None,
             owner,
             &older,
         );
         let second = seer.queue_pending_curve_update(
             curve,
+            None,
+            None,
             11,
             ghost_core::EventTimeMetadata::default(),
             Some(2),
+            None,
             owner,
             &newer,
         );
         let third = seer.queue_pending_curve_update(
             curve,
+            None,
+            None,
             9,
             ghost_core::EventTimeMetadata::default(),
             Some(0),
+            None,
             owner,
             &older,
         );
@@ -9893,6 +10083,8 @@ mod tests {
         //   Step 1 — send PoolDetected on IPC FIRST.
         let candidate = types::CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: Some(1_000_000),

@@ -2,7 +2,9 @@
 //!
 //! This module defines the data structures used for event processing and candidate creation.
 
-use ghost_core::{CurveFinality, EventSemanticEnvelope, EventTimeMetadata, SourceKind};
+use ghost_core::{
+    CurveFinality, EventSemanticEnvelope, EventTimeMetadata, RawProviderRoleV1, SourceKind,
+};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
@@ -170,6 +172,12 @@ pub fn record_trade_outcome_metric(outcome: TradeOutcome) {
 pub enum GeyserEvent {
     /// Transaction event with slot, signature, and transaction data
     Transaction {
+        /// Stable identifier of the raw provider that supplied this observation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        /// Configured role of the raw provider. This is metadata-only in PR 1A.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_role: Option<RawProviderRoleV1>,
         /// Slot number when transaction was processed (if known)
         slot: Option<u64>,
         /// Authoritative transaction index within the slot from the source stream.
@@ -248,6 +256,12 @@ pub enum GeyserEvent {
 
     /// Account update event
     AccountUpdate {
+        /// Stable identifier of the raw provider that supplied this observation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        /// Configured role of the raw provider. This is metadata-only in PR 1A.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_role: Option<RawProviderRoleV1>,
         /// Slot number
         slot: u64,
         /// Explicit provenance for event/ingest time axes.
@@ -256,6 +270,10 @@ pub enum GeyserEvent {
         /// Optional Solana account write-version used for same-slot ordering.
         #[serde(default)]
         write_version: Option<u64>,
+        /// Transaction whose write produced this account update, when supplied
+        /// by Yellowstone. Absence remains explicit and is never inferred.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        txn_signature: Option<Signature>,
         /// Updated account pubkey
         pubkey: Pubkey,
         /// Account data
@@ -281,6 +299,12 @@ pub enum GeyserEvent {
     /// `raw` carries the original SubscribeUpdateEntry proto bytes so that
     /// lib.rs can scan inner CPI data embedded in Entry events (RC-1.2 fix).
     EntryAnchor {
+        /// Stable identifier of the raw provider that supplied this observation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        /// Configured role of the raw provider. This is metadata-only in PR 1A.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_role: Option<RawProviderRoleV1>,
         /// Slot number
         slot: u64,
         /// Number of executed transactions in this slot (coverage denominator).
@@ -447,6 +471,19 @@ impl ToolchainFingerprintInput {
 /// Parsed InitializePool event from Pump.fun or Bonk.fun
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializePoolEvent {
+    /// Stable raw-provider identifier that delivered the source transaction.
+    ///
+    /// This is additive observation provenance. It does not select canonical
+    /// state authority or alter pool-detection behavior in PR 1A.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+
+    /// Configured role of the raw provider that delivered the source transaction.
+    ///
+    /// This remains metadata-only until a later explicit arbitration phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_role: Option<RawProviderRoleV1>,
+
     /// Slot when the pool was initialized (if known)
     pub slot: Option<u64>,
 
@@ -506,6 +543,17 @@ pub struct TradeEvent {
     /// Cross-source semantic envelope carried through canonical ingest.
     #[serde(default)]
     pub semantic: EventSemanticEnvelope,
+
+    /// Stable raw-provider identifier that delivered the source transaction.
+    ///
+    /// This is observation provenance only; no policy, state authority, or
+    /// canonical-emission branch may derive behavior from it in PR 1A.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+
+    /// Configured role of the raw provider that delivered the source transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_role: Option<RawProviderRoleV1>,
 
     /// Slot when the trade occurred (if known)
     pub slot: Option<u64>,
@@ -802,6 +850,17 @@ pub struct CandidatePool {
     #[serde(default)]
     pub semantic: EventSemanticEnvelope,
 
+    /// Stable raw-provider identifier that delivered the pool-init observation.
+    ///
+    /// The field keeps `InitializePoolEvent` provenance intact at the Seer IPC
+    /// boundary. It is metadata-only and not an authority selector in PR 1A.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+
+    /// Configured role of the raw provider that delivered the pool-init observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_role: Option<RawProviderRoleV1>,
+
     /// Slot when detected
     pub slot: Option<u64>,
 
@@ -890,6 +949,8 @@ impl From<InitializePoolEvent> for CandidatePool {
 
         Self {
             semantic: EventSemanticEnvelope::default(),
+            provider_id: event.provider_id,
+            provider_role: event.provider_role,
             slot: event.slot,
             tx_index: None,
             event_ts_ms: event
@@ -991,6 +1052,8 @@ mod tests {
 
     fn grpc_transaction_event(event_ts_ms: Option<u64>, block_time: Option<i64>) -> GeyserEvent {
         GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms,
@@ -1015,6 +1078,80 @@ mod tests {
             pre_token_balances: vec![],
             post_token_balances: vec![],
         }
+    }
+
+    #[test]
+    fn old_geyser_transaction_json_remains_readable_and_baseline_shape_is_unchanged() {
+        let event = grpc_transaction_event(Some(1_000), Some(1));
+        let value = serde_json::to_value(&event).expect("serialize transaction");
+        let payload = value
+            .get("Transaction")
+            .and_then(serde_json::Value::as_object)
+            .expect("externally tagged transaction payload");
+
+        assert!(!payload.contains_key("provider_id"));
+        assert!(!payload.contains_key("provider_role"));
+
+        let decoded: GeyserEvent =
+            serde_json::from_value(value).expect("deserialize old transaction shape");
+        match decoded {
+            GeyserEvent::Transaction {
+                provider_id,
+                provider_role,
+                tx_index,
+                ..
+            } => {
+                assert_eq!(provider_id, None);
+                assert_eq!(provider_role, None);
+                assert_eq!(tx_index, None);
+            }
+            other => panic!("expected transaction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_geyser_entry_anchor_json_defaults_provider_metadata() {
+        let value = serde_json::json!({
+            "EntryAnchor": {
+                "slot": 7,
+                "executed_transaction_count": 3,
+                "raw": []
+            }
+        });
+
+        let decoded: GeyserEvent =
+            serde_json::from_value(value).expect("deserialize old entry anchor shape");
+        match decoded {
+            GeyserEvent::EntryAnchor {
+                provider_id,
+                provider_role,
+                slot,
+                executed_transaction_count,
+                raw,
+            } => {
+                assert_eq!(provider_id, None);
+                assert_eq!(provider_role, None);
+                assert_eq!(slot, 7);
+                assert_eq!(executed_transaction_count, 3);
+                assert!(raw.is_empty());
+            }
+            other => panic!("expected entry anchor, got {other:?}"),
+        }
+
+        let event = GeyserEvent::EntryAnchor {
+            provider_id: None,
+            provider_role: None,
+            slot: 7,
+            executed_transaction_count: 3,
+            raw: vec![],
+        };
+        let value = serde_json::to_value(&event).expect("serialize entry anchor");
+        let payload = value
+            .get("EntryAnchor")
+            .and_then(serde_json::Value::as_object)
+            .expect("externally tagged entry anchor payload");
+        assert!(!payload.contains_key("provider_id"));
+        assert!(!payload.contains_key("provider_role"));
     }
 
     #[test]

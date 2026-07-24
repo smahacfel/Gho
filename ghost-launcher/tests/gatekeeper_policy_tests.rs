@@ -909,6 +909,8 @@ fn account_update(
     token_reserves: u64,
 ) -> AccountStateUpdate {
     AccountStateUpdate {
+        provider_id: None,
+        provider_role: None,
         pool_amm_id: pool_id,
         base_mint,
         bonding_curve,
@@ -917,6 +919,7 @@ fn account_update(
         is_complete: 0,
         slot: 1,
         write_version: Some(receive_ts_ms),
+        txn_signature: None,
         source_account_pubkey: None,
         source_account_owner_or_program: None,
         account_data_len: None,
