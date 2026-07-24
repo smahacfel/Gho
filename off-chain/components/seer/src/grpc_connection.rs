@@ -162,16 +162,14 @@ pub enum PumpEvent {
         signature: String,
         slot: u64,
         received_at: Instant,
-        /// Captured payload bytes handed by the Yellowstone adapter to
-        /// normalization.
-        ///
-        /// Yellowstone gRPC yields a decoded `SubscribeUpdate`; the adapter
-        /// captures its `SubscribeUpdateTransaction` child by prost-encoding
-        /// the in-memory message. These bytes are deterministic for this
-        /// adapter representation, not the original gRPC wire frame.
-        /// Decoded off the I/O thread by parser workers.
-        /// Never decoded inside route_update or the gRPC receive loop.
-        raw: Vec<u8>,
+        /// Yellowstone already decoded this child before handing it to the
+        /// adapter. Ownership crosses the receive boundary without a
+        /// prost encode/decode round trip.
+        decoded: Box<yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction>,
+        /// Capture is an opt-in WAL/audit concern. The encoded representation
+        /// is produced once by the consumer-side normalizer, never by the
+        /// socket receive loop and never used as parser transport.
+        capture_payload: bool,
     },
     AccountUpdate {
         provider_id: Option<String>,
@@ -256,6 +254,7 @@ impl PumpEvent {
 pub struct DualLaneChannel {
     fast: Sender<PumpEvent>,
     overflow: Sender<PumpEvent>,
+    capture_live_payload: Arc<AtomicBool>,
 }
 
 pub struct DualLaneReceiver {
@@ -271,6 +270,7 @@ impl DualLaneChannel {
             Self {
                 fast: fs,
                 overflow: os,
+                capture_live_payload: Arc::new(AtomicBool::new(false)),
             },
             DualLaneReceiver {
                 fast: fr,
@@ -287,7 +287,11 @@ impl DualLaneChannel {
         let (fast, fast_rx) = bounded(fast_capacity);
         let (overflow, overflow_rx) = bounded(overflow_capacity);
         (
-            Self { fast, overflow },
+            Self {
+                fast,
+                overflow,
+                capture_live_payload: Arc::new(AtomicBool::new(false)),
+            },
             DualLaneReceiver {
                 fast: fast_rx,
                 overflow: overflow_rx,
@@ -341,6 +345,15 @@ impl DualLaneChannel {
     #[inline(always)]
     pub fn overflow_len(&self) -> usize {
         self.overflow.len()
+    }
+
+    pub fn set_live_transaction_capture_enabled(&self, enabled: bool) {
+        self.capture_live_payload.store(enabled, Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn live_transaction_capture_enabled(&self) -> bool {
+        self.capture_live_payload.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -3124,12 +3137,11 @@ fn route_update(
             }
 
             let sig = extract_sig(&t);
-            #[cfg(test)]
-            crate::hot_path_metrics::record_live_transaction_prost_encode();
-            let raw = encode_proto(&t);
             stats.bump_tx();
 
-            // I/O thread stays lean: pass raw proto bytes, never decode here.
+            // The I/O thread transfers the already-decoded Yellowstone child.
+            // Optional capture encoding is deferred to the consumer-side
+            // normalizer and never becomes parser transport.
             emit(
                 channel,
                 stats,
@@ -3139,7 +3151,8 @@ fn route_update(
                     signature: sig,
                     slot,
                     received_at,
-                    raw,
+                    decoded: Box::new(t),
+                    capture_payload: channel.live_transaction_capture_enabled(),
                 },
             );
         }
@@ -3263,7 +3276,16 @@ fn route_update(
 pub(crate) fn route_update_for_hot_path_harness(
     msg: yellowstone_grpc_proto::prelude::SubscribeUpdate,
 ) -> SeerResult<GeyserEvent> {
+    route_update_for_hot_path_harness_with_capture(msg, true)
+}
+
+#[cfg(test)]
+pub(crate) fn route_update_for_hot_path_harness_with_capture(
+    msg: yellowstone_grpc_proto::prelude::SubscribeUpdate,
+    capture_payload: bool,
+) -> SeerResult<GeyserEvent> {
     let (channel, receiver) = DualLaneChannel::with_capacities(64, 64);
+    channel.set_live_transaction_capture_enabled(capture_payload);
     let stats = Arc::new(TransportStats::default());
     let slots = Arc::new(SlotTracker::default());
     let (gap_tx, _gap_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3806,6 +3828,13 @@ impl GrpcConnection {
 
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Enable the optional PR1A-compatible prost capture for live
+    /// transactions. Capture is encoded once after the receive queue and is
+    /// shared by WAL/audit consumers; the parser always uses normalized fields.
+    pub fn set_live_transaction_capture_enabled(&self, enabled: bool) {
+        self.injector.set_live_transaction_capture_enabled(enabled);
     }
 
     /// Connect and return an async event stream yielding `GeyserEvent` items.
@@ -4433,14 +4462,22 @@ pub(crate) fn pump_event_to_geyser_event(
             signature,
             slot,
             received_at: _,
-            raw,
+            decoded,
+            capture_payload,
         } => {
-            // Decode on the consumer thread, not on the I/O thread.
-            Some(decode_tx_to_geyser_event(
-                raw,
+            let captured_payload = if capture_payload {
+                #[cfg(test)]
+                crate::hot_path_metrics::record_live_transaction_prost_encode();
+                encode_proto(decoded.as_ref())
+            } else {
+                Vec::new()
+            };
+            Some(tx_update_to_geyser_event(
+                *decoded,
                 &signature,
                 slot,
                 live_source_label,
+                captured_payload,
                 block_time,
                 provider_id,
                 provider_role,
@@ -5163,6 +5200,7 @@ mod tests {
         let ch = DualLaneChannel {
             fast: fs,
             overflow: os,
+            capture_live_payload: Arc::new(AtomicBool::new(false)),
         };
         let stats = Arc::new(TransportStats::default());
 
@@ -5204,6 +5242,7 @@ mod tests {
         let ch = DualLaneChannel {
             fast: fs,
             overflow: os,
+            capture_live_payload: Arc::new(AtomicBool::new(false)),
         };
         let stats = Arc::new(TransportStats::default());
 
@@ -6656,6 +6695,17 @@ mod tests {
         raw
     }
 
+    fn decoded_live_tx(
+        raw: &[u8],
+    ) -> Box<yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction> {
+        Box::new(
+            <yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction as prost::Message>::decode(
+                raw,
+            )
+            .expect("decode live transaction fixture"),
+        )
+    }
+
     #[tokio::test]
     async fn connect_geyser_live_transaction_retains_raw_payload_bytes() {
         let conn = GrpcConnection::new(
@@ -6673,6 +6723,7 @@ mod tests {
         let signature = Signature::new_unique();
         let raw = make_raw_tx(signature, 321);
         let expected_raw = raw.clone();
+        conn.set_live_transaction_capture_enabled(true);
         let stats = conn.transport_stats();
         conn.injector.send(
             PumpEvent::Transaction {
@@ -6681,7 +6732,8 @@ mod tests {
                 signature: signature.to_string(),
                 slot: 321,
                 received_at: Instant::now(),
-                raw,
+                decoded: decoded_live_tx(&raw),
+                capture_payload: true,
             },
             &stats,
         );
@@ -6732,7 +6784,8 @@ mod tests {
                 signature: signature.to_string(),
                 slot: 321,
                 received_at: Instant::now(),
-                raw,
+                decoded: decoded_live_tx(&raw),
+                capture_payload: true,
             },
             GRPC_GLOBAL_STREAM_SOURCE_LABEL,
             None,
@@ -6839,7 +6892,8 @@ mod tests {
                 signature: signature.to_string(),
                 slot: 654,
                 received_at: Instant::now(),
-                raw,
+                decoded: decoded_live_tx(&raw),
+                capture_payload: false,
             },
             &stats,
         );
@@ -6900,7 +6954,8 @@ mod tests {
                 signature: signature_str.clone(),
                 slot: 321,
                 received_at: Instant::now(),
-                raw: make_raw_tx(signature, 321),
+                decoded: decoded_live_tx(&make_raw_tx(signature, 321)),
+                capture_payload: false,
             },
             &stats,
         );
@@ -6967,7 +7022,8 @@ mod tests {
                 signature: signature_str.clone(),
                 slot: 500,
                 received_at: Instant::now(),
-                raw: make_raw_tx(signature, 500),
+                decoded: decoded_live_tx(&make_raw_tx(signature, 500)),
+                capture_payload: false,
             },
             &stats,
         );

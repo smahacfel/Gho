@@ -22,8 +22,9 @@ use crate::{
     },
     config::SeerConfig,
     grpc_connection::{
-        route_update_for_hot_path_harness, DualLaneChannel, PumpEvent, TransportStats,
-        GRPC_GLOBAL_STREAM_SOURCE_LABEL, PUMP_FUN_PROGRAM_ID, PUMP_SWAP_PROGRAM_ID,
+        route_update_for_hot_path_harness, route_update_for_hot_path_harness_with_capture,
+        DualLaneChannel, PumpEvent, TransportStats, GRPC_GLOBAL_STREAM_SOURCE_LABEL,
+        PUMP_FUN_PROGRAM_ID, PUMP_SWAP_PROGRAM_ID,
     },
     hot_path_metrics,
     ipc::{create_ipc_channel, BackpressurePolicy, EventPriority, IpcChannelConfig},
@@ -33,6 +34,8 @@ use crate::{
 
 const HARNESS_ITERATIONS: usize = 200;
 const BURST_EVENTS: usize = 2_048;
+const BASELINE_BUSINESS_DIGEST: &str =
+    "062d36ab094fb470909fd9836318fee85d89dbed8f1a9a86080041f20a399ee2";
 
 #[derive(Clone, Copy, Debug)]
 enum FixtureKind {
@@ -355,6 +358,44 @@ fn saturation_measurement(account_event: GeyserEvent) -> Value {
     })
 }
 
+#[test]
+fn pr1b_single_pass_live_transaction_contract() {
+    hot_path_metrics::reset();
+    let parser = BinaryParser::new(false);
+    let event = route_update_for_hot_path_harness_with_capture(
+        transaction_update(1, FixtureKind::PumpBuy),
+        false,
+    )
+    .expect("normalize live fixture without capture");
+    let bundle = parser
+        .parse_transaction_bundle(&event)
+        .expect("single-pass bundle");
+    assert_eq!(bundle.trades.len(), 1);
+
+    let counts = hot_path_metrics::snapshot();
+    assert_eq!(counts.live_transaction_prost_encodes, 0);
+    assert_eq!(counts.live_transaction_normalizer_decodes, 0);
+    assert_eq!(counts.live_transaction_parser_decodes, 0);
+    assert_eq!(counts.full_instruction_tree_scans, 1);
+
+    hot_path_metrics::reset();
+    let captured = route_update_for_hot_path_harness_with_capture(
+        transaction_update(2, FixtureKind::PumpSell),
+        true,
+    )
+    .expect("normalize live fixture with capture");
+    assert!(matches!(
+        captured,
+        GeyserEvent::Transaction {
+            mpcf_payload_bytes: Some(_),
+            ..
+        }
+    ));
+    let counts = hot_path_metrics::snapshot();
+    assert_eq!(counts.live_transaction_prost_encodes, 1);
+    assert_eq!(counts.live_transaction_normalizer_decodes, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "run explicitly for the PR1B before/after performance receipt"]
 async fn pr1b_hot_path_harness() {
@@ -523,6 +564,10 @@ async fn pr1b_hot_path_harness() {
     )
     .to_hex()
     .to_string();
+    assert_eq!(
+        business_digest, BASELINE_BUSINESS_DIGEST,
+        "PR1B must preserve frozen-corpus business semantics"
+    );
 
     let report = json!({
         "schema": "ghost_pr1b_ingest_hot_path_harness_v1",

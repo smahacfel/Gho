@@ -1953,6 +1953,14 @@ impl Seer {
         };
         let raw_pumpfun_instruction_evidence_tx =
             spawn_raw_pumpfun_instruction_evidence_writer(&config);
+        if raw_pumpfun_instruction_evidence_tx.is_some() {
+            if let Some(connection) = grpc_connection.as_ref() {
+                connection.set_live_transaction_capture_enabled(true);
+            }
+            if let Some(connection) = funding_grpc_connection.as_ref() {
+                connection.set_live_transaction_capture_enabled(true);
+            }
+        }
 
         Self {
             config,
@@ -2005,6 +2013,12 @@ impl Seer {
 
     /// Attach a shared WAL handle for raw/parsed ingest durability.
     pub fn with_wal(mut self, wal: Arc<Wal>) -> Self {
+        if let Some(connection) = self.grpc_connection.as_ref() {
+            connection.set_live_transaction_capture_enabled(true);
+        }
+        if let Some(connection) = self.funding_grpc_connection.as_ref() {
+            connection.set_live_transaction_capture_enabled(true);
+        }
         self.wal = Some(wal);
         self
     }
@@ -4341,11 +4355,14 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         event: &types::GeyserEvent,
         source_label: &str,
         is_coverage_source: bool,
+        parsed_trades: Option<Vec<types::TradeEvent>>,
     ) -> (usize, bool) {
-        self.metrics
-            .binary_parser_invocations
-            .with_label_values(&["trade"])
-            .inc();
+        if parsed_trades.is_none() {
+            self.metrics
+                .binary_parser_invocations
+                .with_label_values(&["trade"])
+                .inc();
+        }
 
         let has_trade_candidate = Self::tx_contains_supported_trade_instruction(event);
         if is_coverage_source && has_trade_candidate {
@@ -4355,7 +4372,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             }
         }
 
-        match parser.parse_trades(event) {
+        match parsed_trades.map_or_else(|| parser.parse_trades(event), Ok) {
             Ok(trades) => {
                 let parsed_trade_count = trades.len();
                 if is_coverage_source && (has_trade_candidate || parsed_trade_count > 0) {
@@ -4547,15 +4564,19 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         self.maybe_emit_funding_transfer_observations(&event, source_label, is_synthetic)
             .await?;
 
-        // Parse event for InitializePool instruction (only if parser is available and should be used)
+        // Parse the normalized transaction once. Pool initialization and every
+        // trade are derived from the same immutable parsed bundle so active
+        // runtime never performs sequential CREATE and TRADE tree scans.
+        let mut binary_trades: Option<Vec<types::TradeEvent>> = None;
         let mut parse_result = if should_use_binary_parser {
             if let Some(ref parser) = self.parser {
-                // Track binary parser invocation
                 self.metrics
                     .binary_parser_invocations
-                    .with_label_values(&["initialize_pool"])
+                    .with_label_values(&["transaction_bundle"])
                     .inc();
-                parser.parse_initialize_pool(&event)?
+                let bundle = parser.parse_transaction_bundle(&event)?;
+                binary_trades = Some(bundle.trades);
+                bundle.initialize_pool
             } else {
                 // This represents an invariant violation: we should never need parsing when parser is None
                 error!("❌ Binary parser not available but was requested - this is a logic bug in source routing");
@@ -4901,6 +4922,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                                 &event,
                                 source_label,
                                 is_coverage_source,
+                                binary_trades.take(),
                             )
                             .await;
                         if parsed_trade_count > 0 {
@@ -4945,6 +4967,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                                 &event,
                                 source_label,
                                 is_coverage_source,
+                                binary_trades.take(),
                             )
                             .await;
                     } else {
