@@ -1238,24 +1238,72 @@ txn_signature Some preserved
 txn_signature None preserved
 baseline authority output unchanged
 
-Commit 1B — nieblokujący transport i gap ledger
+Commit 1B — single-pass ingest, nieblokujące granice i local gap
 
-Zmiany:
+Kolejność realizacji jest normatywna:
 
-- usunąć blokujące "overflow.send";
-- usunąć writer ".send().await" z receive/normalize path;
-- dodać typed saturation outcome;
-- dodać deterministyczny CoverageGap;
-- dodać reconnect/backfill state machine;
-- przenieść JSONL za ledger.
+1. Najpierw usunąć self-generated backlog:
+
+   - nie używać ponownie zakodowanego protobufu jako transportu live;
+   - przenieść zdekodowaną transakcję Yellowstone do normalizacji;
+   - capture tworzyć opcjonalnie, najwyżej raz i dopiero po kolejce ingress;
+   - wykonać jedno przejście outer + inner instructions;
+   - wyprowadzić CREATE i wszystkie TRADE z jednego parsed bundle.
+
+2. Następnie odizolować niezależne wolne sinki:
+
+   - fizyczny WAL append przenieść do jednego bounded writera;
+   - JSON, Base58 i evidence hash przenieść do bounded evidence writera;
+   - oczekiwanie na downstream IPC przenieść do jednego bounded egress
+     dispatchera;
+   - event worker używa wyłącznie nieblokujących enqueue;
+   - wszystkie dispatchery mają stałą liczbę workerów i bounded capacity.
+
+3. Dopiero po usunięciu powielonej pracy i blokujących sinków obsłużyć
+   rzeczywiste przeciążenie:
+
+   - zastąpić układ "fast + overflow + blocking overflow.send" jedną bounded
+     FIFO ingress;
+   - dodać typed local saturation outcome;
+   - jeden ciągły epizod tworzy jeden deterministyczny LocalCoverageGap;
+   - segment z nieodzyskaną luką jest fail-closed i NonEvaluable;
+   - local processing gap nie jest provider slot gap i sam nie uruchamia
+     reconnectu ani backfillu.
+
+Pojemność ingress w PR1B wynosi 1 024 eventy. Wynika z baseline release
+2 117,317 eventów/s × 250 ms = około 530 eventów, zaokrąglonych w górę do
+najbliższej potęgi dwóch. WAL, evidence i IPC mają po jednej jawnej bounded
+kolejce; nie ma kaskadowych overflow queues ani per-event task spawning.
+
+Status PR1B (2026-07-24):
+
+- live Yellowstone: 0 application-level prost decode;
+- capture off: 0 prost encode; capture wymagany: najwyżej 1 prost encode;
+- 1 pełny scan outer + inner na transakcję;
+- business differential digest zachowany:
+  `062d36ab094fb470909fd9836318fee85d89dbed8f1a9a86080041f20a399ee2`;
+- receiver i parser worker nie blokują na ingress, WAL, evidence ani IPC;
+- saturacja ma jawny missing count i deterministyczny local gap;
+- brak dowodu lokalnego recovery pozostawia segment niewiarygodny;
+- authority, strategia, MFS, Gatekeeper i quote math pozostają bez zmian.
 
 PASS:
 
+```text
 receiver_blocked_on_writer = 0
 receiver_blocked_on_overflow = 0
-silent_drop = 0
-one saturation episode = one deterministic gap
-recovered event applied exactly once
+parser_worker_blocked_on_ipc = 0
+live_transaction_prost_decode = 0
+full_instruction_scans_per_transaction = 1
+silent_drop_reported_as_success = 0
+one saturation episode = one deterministic local gap
+unrecovered local gap = non-evaluable
+```
+
+Reconnect/backfill state machine dla dowodliwego provider gap oraz odzyskiwanie
+lokalnej luki nie są implementowane w PR1B. Nie wolno ich zastępować reconnectem
+spowodowanym lokalnym writer stall. Zakres 1C (AccountObservationArbiter) i 1D
+(Observation Ledger oraz raw/NLN reconciliation) pozostaje świadomie odłożony.
 
 Commit 1C — AccountObservationArbiter
 

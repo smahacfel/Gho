@@ -13,7 +13,7 @@ use prometheus::{
 };
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{error, warn};
@@ -729,13 +729,16 @@ pub enum IpcError {
         policy: BackpressurePolicy,
         priority: EventPriority,
     },
+
+    #[error("Local IPC egress coverage gap: bounded dispatcher is saturated")]
+    LocalProcessingGap,
 }
 
 /// Sender wrapper with backpressure handling and metrics
 #[derive(Clone)]
 pub struct IpcSender {
-    /// Underlying channel sender
-    sender: mpsc::Sender<SeerEvent>,
+    /// One bounded nonblocking egress queue drained by a fixed dispatcher.
+    sender: crossbeam_channel::Sender<SeerEvent>,
 
     /// Configuration
     config: IpcChannelConfig,
@@ -745,12 +748,14 @@ pub struct IpcSender {
 
     /// Sequence counter for events
     sequence_counter: Arc<std::sync::atomic::AtomicU64>,
+
+    local_gap: Arc<crate::local_gap::LocalGapTracker>,
 }
 
 impl IpcSender {
     /// Create a new IPC sender
     pub fn new(
-        sender: mpsc::Sender<SeerEvent>,
+        sender: crossbeam_channel::Sender<SeerEvent>,
         config: IpcChannelConfig,
         metrics: Arc<IpcMetrics>,
     ) -> Self {
@@ -759,7 +764,19 @@ impl IpcSender {
             config,
             metrics,
             sequence_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_gap: Arc::new(crate::local_gap::LocalGapTracker::new(
+                ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
+            )),
         }
+    }
+
+    pub fn has_unrecovered_local_gap(&self) -> bool {
+        self.local_gap.is_unreliable()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatcher_queue_len(&self) -> usize {
+        self.sender.len()
     }
 
     /// Send a pool detection event through the channel with backpressure handling
@@ -938,20 +955,8 @@ impl IpcSender {
         priority: EventPriority,
         policy: BackpressurePolicy,
     ) -> Result<(), IpcError> {
-        // Extract sequence number for logging
-        let sequence = match &event {
-            SeerEvent::PoolDetected(e) => e.sequence_number,
-            SeerEvent::Trade(e) => e.sequence_number,
-            SeerEvent::FundingTransfer(e) => e.sequence_number,
-            SeerEvent::AccountUpdate(e) => e.sequence_number,
-            SeerEvent::ExecutionAccountEvidence(e) => e.sequence_number,
-        };
-
-        // Calculate actual queue length from remaining capacity
-        // Note: sender.capacity() returns REMAINING permits, not current queue length
-        // So: queue_length = buffer_size - remaining_capacity
-        let remaining_capacity = self.sender.capacity();
-        let current_queue_length = self.config.buffer_size.saturating_sub(remaining_capacity);
+        // Measure the single bounded egress-dispatch queue.
+        let current_queue_length = self.sender.len();
         self.metrics.update_queue_length(current_queue_length);
 
         // Check if we're approaching capacity
@@ -965,78 +970,46 @@ impl IpcSender {
             );
         }
 
-        // Apply backpressure policy
-        let send_result = match policy {
-            BackpressurePolicy::Block => {
-                // Block until space is available
-                #[cfg(test)]
-                if self.sender.capacity() == 0 {
-                    crate::hot_path_metrics::record_ipc_blocking_wait();
+        let boundary = ipc_event_boundary(&event);
+        let provider_id = ipc_event_provider_id(&event);
+        let send_result = match self.sender.try_send(event) {
+            Ok(()) => {
+                self.local_gap.observe_admitted(boundary);
+                if let Some(gap) = self.local_gap.take_completed() {
+                    error!(
+                        gap_id = %bs58::encode(gap.gap_id_blake3).into_string(),
+                        provider_id = %gap.provider_id,
+                        reason = gap.reason.as_str(),
+                        queue_high_water = gap.queue_high_water,
+                        "IPC dispatcher closed a deterministic local gap; segment remains non-evaluable"
+                    );
                 }
-                self.sender
-                    .send(event)
-                    .await
-                    .map_err(|e| IpcError::SendError(e.to_string()))
+                Ok(())
             }
-            BackpressurePolicy::DropNew => {
-                // Try to send, drop if full
-                match self.sender.try_send(event.clone()) {
-                    Ok(_) => Ok(()),
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        self.metrics.record_drop(priority);
-                        if self.config.log_drops {
-                            error!(
-                                "Dropped event (seq={}, priority={:?}): queue full (DropNew policy)",
-                                sequence, priority
-                            );
-                        }
-                        Err(IpcError::EventDropped {
-                            policy: BackpressurePolicy::DropNew,
-                            priority,
-                        })
-                    }
-                    Err(e) => Err(IpcError::SendError(e.to_string())),
-                }
-            }
-            BackpressurePolicy::DropOldest => {
-                // Try to send, if full, this would require custom implementation
-                // For simplicity, we'll treat this as Block for now since tokio mpsc doesn't support dropping oldest
-                warn!("DropOldest policy not fully implemented, using Block instead");
-                self.sender
-                    .send(event)
-                    .await
-                    .map_err(|e| IpcError::SendError(e.to_string()))
-            }
-            BackpressurePolicy::DropByPriority => {
-                // Try to send, drop low priority first
-                match self.sender.try_send(event.clone()) {
-                    Ok(_) => Ok(()),
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        // Only drop if priority is Low, otherwise block
-                        if priority == EventPriority::Low {
-                            self.metrics.record_drop(priority);
-                            if self.config.log_drops {
-                                error!("Dropped Low priority event (seq={}): queue full", sequence);
-                            }
-                            Err(IpcError::EventDropped {
-                                policy: BackpressurePolicy::DropByPriority,
-                                priority,
-                            })
-                        } else {
-                            // Block for Normal/High priority
-                            #[cfg(test)]
-                            if self.sender.capacity() == 0 {
-                                crate::hot_path_metrics::record_ipc_blocking_wait();
-                            }
-                            self.sender
-                                .send(event)
-                                .await
-                                .map_err(|e| IpcError::SendError(e.to_string()))
-                        }
-                    }
-                    Err(e) => Err(IpcError::SendError(e.to_string())),
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                if matches!(policy, BackpressurePolicy::DropNew)
+                    || matches!(policy, BackpressurePolicy::DropByPriority)
+                        && priority == EventPriority::Low
+                {
+                    self.metrics.record_drop(priority);
+                    Err(IpcError::EventDropped { policy, priority })
+                } else {
+                    self.local_gap.observe_saturation(
+                        provider_id,
+                        0,
+                        boundary,
+                        self.config.buffer_size,
+                    );
+                    ::metrics::increment_counter!(
+                        "seer_local_coverage_gap_opened_total",
+                        "reason" => "ipc_egress_queue_saturated"
+                    );
+                    Err(IpcError::LocalProcessingGap)
                 }
             }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => Err(IpcError::SendError(
+                "IPC egress dispatcher disconnected".to_string(),
+            )),
         };
 
         match send_result {
@@ -1050,6 +1023,7 @@ impl IpcSender {
 
     /// Get current queue utilization
     pub fn queue_utilization(&self) -> f64 {
+        self.metrics.update_queue_length(self.sender.len());
         self.metrics
             .calculate_queue_utilization(self.config.buffer_size)
     }
@@ -1077,6 +1051,44 @@ fn event_detected_at(event: &SeerEvent) -> &std::time::SystemTime {
         SeerEvent::FundingTransfer(e) => &e.detected_at,
         SeerEvent::AccountUpdate(e) => &e.detected_at,
         SeerEvent::ExecutionAccountEvidence(e) => &e.detected_at,
+    }
+}
+
+fn ipc_event_provider_id(event: &SeerEvent) -> String {
+    match event {
+        SeerEvent::PoolDetected(event) => event
+            .candidate
+            .provider_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        SeerEvent::Trade(event) => event
+            .trade
+            .provider_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        SeerEvent::AccountUpdate(event) => event
+            .provider_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        _ => "seer".to_string(),
+    }
+}
+
+fn ipc_event_boundary(event: &SeerEvent) -> ghost_core::LocalCoverageBoundaryV1 {
+    match event {
+        SeerEvent::PoolDetected(event) => ghost_core::LocalCoverageBoundaryV1 {
+            slot: event.candidate.slot,
+            signature: solana_sdk::signature::Signature::from_str(&event.candidate.signature).ok(),
+        },
+        SeerEvent::Trade(event) => ghost_core::LocalCoverageBoundaryV1 {
+            slot: event.trade.slot,
+            signature: Some(event.trade.signature),
+        },
+        SeerEvent::AccountUpdate(event) => ghost_core::LocalCoverageBoundaryV1 {
+            slot: Some(event.slot),
+            signature: event.txn_signature,
+        },
+        _ => ghost_core::LocalCoverageBoundaryV1::default(),
     }
 }
 
@@ -1118,10 +1130,22 @@ impl IpcReceiver {
 
 /// Create a new IPC channel with the given configuration
 pub fn create_ipc_channel(config: IpcChannelConfig) -> (IpcSender, IpcReceiver, Arc<IpcMetrics>) {
-    let (tx, rx) = mpsc::channel(config.buffer_size);
+    let (downstream_tx, rx) = mpsc::channel(config.buffer_size);
+    let (egress_tx, egress_rx) = crossbeam_channel::bounded(config.buffer_size);
     let metrics = IpcMetrics::new();
 
-    let sender = IpcSender::new(tx, config.clone(), Arc::clone(&metrics));
+    std::thread::Builder::new()
+        .name("seer-ipc-egress".to_string())
+        .spawn(move || {
+            while let Ok(event) = egress_rx.recv() {
+                if downstream_tx.blocking_send(event).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn fixed Seer IPC egress dispatcher");
+
+    let sender = IpcSender::new(egress_tx, config.clone(), Arc::clone(&metrics));
     let receiver = IpcReceiver::new(rx, Arc::clone(&metrics));
 
     (sender, receiver, metrics)
@@ -1132,6 +1156,32 @@ mod tests {
     use super::*;
     use crate::types::CandidatePool;
     use solana_sdk::pubkey::Pubkey;
+
+    async fn wait_for_downstream_len(receiver: &IpcReceiver, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if receiver.receiver.len() == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixed IPC dispatcher should reach expected downstream occupancy");
+    }
+
+    async fn wait_for_dispatcher_len(sender: &IpcSender, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if sender.dispatcher_queue_len() == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixed IPC dispatcher queue should reach expected occupancy");
+    }
 
     fn create_test_candidate() -> CandidatePool {
         CandidatePool {
@@ -1293,18 +1343,30 @@ mod tests {
             log_drops: false,
             ..Default::default()
         };
-        let (sender, _receiver, metrics) = create_ipc_channel(config);
+        let (sender, receiver, metrics) = create_ipc_channel(config);
 
-        // Fill the buffer
+        // Fill the existing downstream IPC channel, let the fixed dispatcher
+        // hold one event, then fill the bounded egress queue deterministically.
         let candidate = create_test_candidate();
+        for expected in 1..=2 {
+            sender
+                .send(candidate.clone(), EventPriority::Normal)
+                .await
+                .unwrap();
+            wait_for_downstream_len(&receiver, expected).await;
+        }
         sender
             .send(candidate.clone(), EventPriority::Normal)
             .await
             .unwrap();
-        sender
-            .send(candidate.clone(), EventPriority::Normal)
-            .await
-            .unwrap();
+        wait_for_dispatcher_len(&sender, 0).await;
+        for expected in 1..=2 {
+            sender
+                .send(candidate.clone(), EventPriority::Normal)
+                .await
+                .unwrap();
+            wait_for_dispatcher_len(&sender, expected).await;
+        }
 
         // This should be dropped
         let result = sender.send(candidate, EventPriority::Normal).await;
@@ -1320,18 +1382,30 @@ mod tests {
             log_drops: false,
             ..Default::default()
         };
-        let (sender, _receiver, metrics) = create_ipc_channel(config);
+        let (sender, receiver, metrics) = create_ipc_channel(config);
 
-        // Fill the buffer
+        // Fill the existing downstream IPC channel, let the fixed dispatcher
+        // hold one event, then fill the bounded egress queue deterministically.
         let candidate = create_test_candidate();
+        for expected in 1..=2 {
+            sender
+                .send(candidate.clone(), EventPriority::Normal)
+                .await
+                .unwrap();
+            wait_for_downstream_len(&receiver, expected).await;
+        }
         sender
             .send(candidate.clone(), EventPriority::Normal)
             .await
             .unwrap();
-        sender
-            .send(candidate.clone(), EventPriority::Normal)
-            .await
-            .unwrap();
+        wait_for_dispatcher_len(&sender, 0).await;
+        for expected in 1..=2 {
+            sender
+                .send(candidate.clone(), EventPriority::Normal)
+                .await
+                .unwrap();
+            wait_for_dispatcher_len(&sender, expected).await;
+        }
 
         // Low priority should be dropped
         let result = sender.send(candidate.clone(), EventPriority::Low).await;
@@ -1990,29 +2064,36 @@ mod tests {
             log_drops: false,
             ..Default::default()
         };
-        let (sender, mut receiver, metrics) = create_ipc_channel(config);
+        let (sender, receiver, metrics) = create_ipc_channel(config);
 
-        // Fill the buffer with trades
-        let trade1 = create_test_trade_event(true);
+        // Critical trades override DropNew. They never wait for downstream
+        // capacity: saturation opens a typed local-processing gap and fails
+        // closed instead of reporting delivery.
+        for expected in 1..=2 {
+            sender
+                .send_trade(create_test_trade_event(true), EventPriority::Normal)
+                .await
+                .unwrap();
+            wait_for_downstream_len(&receiver, expected).await;
+        }
         sender
-            .send_trade(trade1, EventPriority::Normal)
+            .send_trade(create_test_trade_event(true), EventPriority::Normal)
             .await
             .unwrap();
+        wait_for_dispatcher_len(&sender, 0).await;
+        for expected in 1..=2 {
+            sender
+                .send_trade(create_test_trade_event(true), EventPriority::Normal)
+                .await
+                .unwrap();
+            wait_for_dispatcher_len(&sender, expected).await;
+        }
 
-        let trade2 = create_test_trade_event(false);
-        sender
-            .send_trade(trade2, EventPriority::Normal)
-            .await
-            .unwrap();
-
-        // Trade events are lossless even under DropNew policy.
-        let trade3 = create_test_trade_event(true);
-        let (send_res, _ev) =
-            tokio::join!(sender.send_trade(trade3, EventPriority::Normal), async {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                receiver.recv().await.expect("receiver should make room")
-            });
-        send_res.unwrap();
+        let send_res = sender
+            .send_trade(create_test_trade_event(true), EventPriority::Normal)
+            .await;
+        assert!(matches!(send_res, Err(IpcError::LocalProcessingGap)));
         assert_eq!(metrics.events_dropped.get(), 0);
+        assert!(sender.has_unrecovered_local_gap());
     }
 }

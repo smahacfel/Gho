@@ -1,8 +1,8 @@
 # PR1B baseline receipt — ingest hot path
 
-Date: 2026-07-24  
-Repository: `/root/Gho_ingest` (`smahacfel/Gho`)  
-Clean parent: `ea7d31a228f8db0b7ed0779dea70b696895e66c2`  
+Date: 2026-07-24
+Repository: `/root/Gho_ingest` (`smahacfel/Gho`)
+Clean parent: `ea7d31a228f8db0b7ed0779dea70b696895e66c2`
 Branch used for the harness commit: `agent/ingest-single-pass-pr1b-20260724`
 
 ## Repository provenance
@@ -173,3 +173,182 @@ Those failures are not masked and are outside the PR1B ingest-boundary scope. Th
 ## B0 scope statement
 
 The B0 changes add only `cfg(test)` counters, deterministic fixtures, the ignored harness, and this receipt. `ParsedTransactionBundle` is introduced only as a compatibility wrapper around both legacy parser calls so the baseline can count existing work; no active runtime call site is changed in B0.
+
+---
+
+## Final PR1B receipt
+
+Final branch: `agent/ingest-single-pass-pr1b-20260724`
+Final parent: `ea7d31a228f8db0b7ed0779dea70b696895e66c2`
+Harness profile: release, identical deterministic workload and command as B0.
+
+### Root cause confirmed in code and measurement
+
+The baseline backlog was self-generated before true overload handling became
+relevant:
+
+1. the already-decoded Yellowstone transaction was prost-encoded for internal
+   transport and then decoded once by normalization and twice by the two parser
+   entry points;
+2. CREATE and TRADE parsing independently scanned the same outer and inner
+   instruction tree;
+3. the event worker performed physical WAL append and raw-buffer cloning;
+4. raw evidence JSON/Base58/hash preparation happened before writer handoff;
+5. critical IPC could await downstream capacity inside every event worker;
+6. the two-lane ingress ended in a blocking `overflow.send`.
+
+The final implementation removes that repeated work before defining overload
+semantics. The unchanged business digest proves that the deterministic corpus
+still emits the same canonical business result:
+
+```text
+062d36ab094fb470909fd9836318fee85d89dbed8f1a9a86080041f20a399ee2
+```
+
+### Before/after live call graph
+
+```text
+BEFORE
+decoded SubscribeUpdateTransaction
+  -> prost encode
+  -> fast queue -> overflow queue -> blocking overflow.send
+  -> prost decode in normalizer
+  -> synchronous raw WAL clone + append
+  -> evidence Base58/String/JSON/hash on event worker
+  -> parse CREATE: prost decode + full outer/inner scan
+  -> parse TRADE:  prost decode + full outer/inner scan
+  -> IPC send().await with Block policy
+
+AFTER
+decoded SubscribeUpdateTransaction
+  -> one bounded ingress FIFO / nonblocking try_send
+  -> direct normalization from decoded fields
+  -> optional shared capture after ingress
+       capture disabled: no prost encode
+       capture required: one prost encode, never decoded by live parser
+  -> parse_transaction_bundle
+       one outer/inner scan
+       one dedupe/provenance/ordinal pass
+       PoolDetected before all Trade events
+  -> nonblocking bounded handoff
+       WAL job -> one fixed writer -> physical append
+       evidence Arc -> one fixed writer -> Base58/JSON/hash/file
+       typed event -> one fixed IPC dispatcher -> downstream capacity wait
+```
+
+### Release-profile comparison
+
+| Metric | Clean parent B0 | Final PR1B | Change |
+|---|---:|---:|---:|
+| Throughput | 2,117.317 events/s | 2,529.194 events/s | +19.453% |
+| receive-to-normalize p50 | 22,976 ns | 20,662 ns | |
+| receive-to-normalize p95 | 38,558 ns | 35,562 ns | |
+| receive-to-normalize p99 | 53,377 ns | 44,751 ns | -16.161% |
+| normalize-to-bundle p50 | 448,334 ns | 390,216 ns | |
+| normalize-to-bundle p95 | 577,705 ns | 468,555 ns | |
+| normalize-to-bundle p99 | 610,701 ns | 513,846 ns | -15.860% |
+| Queue high-water | 2,048 | 1,024 | -50.000% |
+| Oldest queued event age | 4,104,891 ns | 3,999,365 ns | |
+| Steady-state RSS | 71,764 KiB | 24,140 KiB | -66.362% |
+| CPU time | unavailable | unavailable | not claimed |
+| Prost encode / 5 live tx | 5 | 0 with capture off; 5 with required capture | at most 1/tx |
+| Normalizer prost decode / 5 live tx | 5 | 0 | -5 |
+| Parser prost decode / 5 live tx | 10 | 0 | -10 |
+| Full instruction scans / 5 live tx | 10 | 5 | -5 |
+| Event-worker WAL blocking waits | 2 | 0 | removed |
+| Parser-worker IPC blocking waits | 1 | 0 | removed |
+
+These are comparative harness measurements on this host, not a production
+capacity or losslessness claim.
+
+### Queue model and bounded overload result
+
+- Main ingress: one crossbeam bounded FIFO, capacity 1,024.
+- Capacity derivation: 2,117.317 measured events/s × 250 ms = 529.329,
+  rounded up to the next power of two.
+- WAL: one bounded queue, capacity 1,024, one fixed OS writer thread.
+- Raw evidence: one bounded queue, capacity 1,024, one fixed writer task.
+- IPC egress: one bounded queue, configured from the existing IPC buffer size,
+  one fixed dispatcher thread.
+- No general overflow/spill queue and no per-event task spawning.
+
+In the final capacity-two saturation case:
+
+```text
+receiver blocked: false
+blocking wait: 0 ns
+explicit missing events: 2
+local gaps emitted: 1
+silent drops reported as success: 0
+gap id: HRXk4UWUX3dQpf6RwftCizfPHPuxSwEPNuPrUYHKdxhC
+reason: ingress_queue_saturated
+recovered: false
+```
+
+The 2,048-event burst filled the 1,024-event bound and accounted explicitly for
+the remaining 1,024 events in the harness overload model. The segment becomes
+sticky non-evaluable after any unrecovered local ingress, WAL, evidence or IPC
+gap. Canonical account updates continue to be forwarded so PR1B does not change
+AccountStateCore authority; incomplete transaction candidates are suppressed.
+A local stall never triggers a Yellowstone reconnect or claims provider
+backfill.
+
+The slow-sink measurements were:
+
+```text
+slow WAL enqueue: 611,032 ns
+physical writer elapsed: 8,166,808 ns
+physical writer calls/waits: 2/2, isolated from event worker
+slow IPC enqueue: 8,016 ns
+IPC worker waits: 0
+```
+
+### Verification on the final diff
+
+Passed:
+
+```text
+cargo fmt --all --check
+git diff --check
+cargo test -p ghost-core ingest_integrity -- --nocapture
+cargo test -p seer --lib pr1b_ -- --nocapture
+cargo test -p seer --lib one_continuous_saturation_episode_produces_one_deterministic_gap -- --nocapture
+cargo test -p seer --lib bounded_ingress_saturation_is_nonblocking_and_emits_one_gap -- --nocapture
+cargo test -p seer --lib ipc::tests -- --nocapture
+cargo test -p seer --lib provider_metadata -- --nocapture
+cargo test -p seer --lib account_update_preserves_provider_and_optional_transaction_signature -- --nocapture
+cargo test -p ghost-launcher --lib local_coverage_gap_replays_as_audit_only_record -- --nocapture
+cargo check -p ghost-brain --tests
+cargo test --release -p seer --lib pr1b_hot_path_harness -- --ignored --nocapture --test-threads=1
+timeout 900s cargo build --release --workspace
+```
+
+The additive `LocalCoverageGap` WAL replay test counts it as audit evidence and
+performs no state mutation.
+
+Known baseline failures remain visible:
+
+- `timeout 300s cargo test -p seer --lib -- --test-threads=1` timed out after
+  reporting the same 14 PumpPortal/Seer failures listed in the B0 receipt;
+- `cargo check -p ghost-launcher --tests` fails on existing `E0063` fixtures
+  that construct `PoolTransaction` without five fields added before PR1B;
+- `timeout 600s cargo test --workspace -- --test-threads=1` fails with the same
+  `E0063` fixture class.
+
+No unrelated fixture repair is included in PR1B.
+
+### Scope boundary
+
+PR1B changes transport, parsing work ownership, sink scheduling and typed local
+coverage evidence only. It does not change strategy, scores, MFS, Gatekeeper,
+entry/exit thresholds, quote math, execution, NLN role, runtime authority or
+AccountStateCore arbitration.
+
+Intentionally deferred:
+
+- PR1C: typed AccountObservationArbiter and provider/account mutation
+  arbitration;
+- PR1D: Observation Ledger and raw/NLN reconciliation;
+- proof-based recovery of a local processing gap;
+- provider reconnect/backfill state machine for semantically provable provider
+  gaps.

@@ -74,9 +74,9 @@ pub use execution_account_evidence::{
     UpsertExecutionAccountEvidenceOutcome, UpsertExecutionAccountEvidenceResult,
 };
 pub use ingest_integrity::{
-    CanonicalPumpOrderKeyV1, ObservationProvenanceV1, ObservationSourceFamilyV1,
-    PumpInstructionLimitV1, PumpMutationClaimsV1, PumpTradeSideV1, RawProviderRoleV1,
-    RawPumpMutationLocatorV1,
+    CanonicalPumpOrderKeyV1, LocalCoverageBoundaryV1, LocalCoverageGapReasonV1, LocalCoverageGapV1,
+    ObservationProvenanceV1, ObservationSourceFamilyV1, PumpInstructionLimitV1,
+    PumpMutationClaimsV1, PumpTradeSideV1, RawProviderRoleV1, RawPumpMutationLocatorV1,
 };
 pub use init_pool_parser::{
     compute_initialize_pool_discriminator,

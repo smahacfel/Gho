@@ -68,6 +68,7 @@ mod hot_path_harness;
 #[cfg(test)]
 pub(crate) mod hot_path_metrics;
 pub mod ipc;
+mod local_gap;
 pub mod metrics;
 pub mod nln_program_streams;
 pub mod paradox_sensor;
@@ -107,7 +108,10 @@ use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -415,15 +419,63 @@ fn raw_pumpfun_instruction_evidence_rows(event: &types::GeyserEvent) -> Vec<Valu
     rows
 }
 
+struct RawEvidenceDispatcher {
+    sender: mpsc::Sender<Arc<types::GeyserEvent>>,
+    local_gap: Arc<local_gap::LocalGapTracker>,
+    local_segment_unreliable: Arc<AtomicBool>,
+}
+
+impl RawEvidenceDispatcher {
+    fn try_enqueue(&self, event: Arc<types::GeyserEvent>) {
+        let (provider_id, boundary) = geyser_provider_and_boundary(&event);
+        match self.sender.try_send(event) {
+            Ok(()) => {
+                self.local_gap.observe_admitted(boundary);
+                if let Some(gap) = self.local_gap.take_completed() {
+                    log_completed_local_gap(&gap);
+                }
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.local_segment_unreliable.store(true, Release);
+                self.local_gap.observe_saturation(
+                    provider_id.clone(),
+                    0,
+                    boundary.clone(),
+                    RAW_PUMPFUN_INSTRUCTION_EVIDENCE_QUEUE_CAP,
+                );
+                ::metrics::increment_counter!(
+                    "seer_local_coverage_gap_opened_total",
+                    "reason" => "evidence_queue_saturated"
+                );
+                error!(
+                    provider_id,
+                    reason = ghost_core::LocalCoverageGapReasonV1::EvidenceQueueSaturated.as_str(),
+                    queue_high_water = RAW_PUMPFUN_INSTRUCTION_EVIDENCE_QUEUE_CAP,
+                    slot = ?boundary.slot,
+                    "Seer: raw-evidence queue opened a typed local coverage gap"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.local_segment_unreliable.store(true, Release);
+            }
+        }
+    }
+}
+
 fn spawn_raw_pumpfun_instruction_evidence_writer(
     config: &SeerConfig,
-) -> Option<mpsc::Sender<Value>> {
+    local_segment_unreliable: Arc<AtomicBool>,
+) -> Option<RawEvidenceDispatcher> {
     if !config.program_streams.enabled {
         return None;
     }
     let capture_dir = config.program_streams.artifact_capture_dir.as_ref()?;
     let path = PathBuf::from(capture_dir).join("raw_pumpfun_instruction_evidence_v1.jsonl");
-    let (tx, mut rx) = mpsc::channel(RAW_PUMPFUN_INSTRUCTION_EVIDENCE_QUEUE_CAP);
+    let (tx, mut rx) =
+        mpsc::channel::<Arc<types::GeyserEvent>>(RAW_PUMPFUN_INSTRUCTION_EVIDENCE_QUEUE_CAP);
+    let local_gap = Arc::new(local_gap::LocalGapTracker::new(
+        ghost_core::LocalCoverageGapReasonV1::EvidenceQueueSaturated,
+    ));
     tokio::spawn(async move {
         if let Some(parent) = path.parent() {
             if let Err(err) = tokio::fs::create_dir_all(parent).await {
@@ -457,32 +509,34 @@ fn spawn_raw_pumpfun_instruction_evidence_writer(
         ));
         loop {
             tokio::select! {
-                maybe_row = rx.recv() => {
-                    let Some(row) = maybe_row else {
+                maybe_event = rx.recv() => {
+                    let Some(event) = maybe_event else {
                         break;
                     };
-                    match serde_json::to_vec(&row) {
-                        Ok(mut bytes) => {
-                            bytes.push(b'\n');
-                            if let Err(err) = writer.write_all(&bytes).await {
-                                warn!(
-                                    path = %path.display(),
-                                    error = %err,
-                                    "Seer: raw Pump.fun instruction evidence write failed"
-                                );
-                                break;
+                    for row in raw_pumpfun_instruction_evidence_rows(&event) {
+                        match serde_json::to_vec(&row) {
+                            Ok(mut bytes) => {
+                                bytes.push(b'\n');
+                                if let Err(err) = writer.write_all(&bytes).await {
+                                    warn!(
+                                        path = %path.display(),
+                                        error = %err,
+                                        "Seer: raw Pump.fun instruction evidence write failed"
+                                    );
+                                    return;
+                                }
+                                ::metrics::counter!("seer_raw_pumpfun_instruction_evidence_rows_written_total", 1);
                             }
-                            ::metrics::counter!("seer_raw_pumpfun_instruction_evidence_rows_written_total", 1);
-                        }
-                        Err(err) => {
-                            warn!(
-                                error = %err,
-                                "Seer: raw Pump.fun instruction evidence serialization failed"
-                            );
-                            ::metrics::counter!(
-                                "seer_raw_pumpfun_instruction_evidence_serialize_errors_total",
-                                1
-                            );
+                            Err(err) => {
+                                warn!(
+                                    error = %err,
+                                    "Seer: raw Pump.fun instruction evidence serialization failed"
+                                );
+                                ::metrics::counter!(
+                                    "seer_raw_pumpfun_instruction_evidence_serialize_errors_total",
+                                    1
+                                );
+                            }
                         }
                     }
                 }
@@ -506,7 +560,11 @@ fn spawn_raw_pumpfun_instruction_evidence_writer(
             );
         }
     });
-    Some(tx)
+    Some(RawEvidenceDispatcher {
+        sender: tx,
+        local_gap,
+        local_segment_unreliable,
+    })
 }
 
 use ghost_core::coverage_audit;
@@ -535,7 +593,7 @@ const COVERAGE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const PARSE_MISS_LOG_EVERY: u64 = 200;
 const PENDING_TRADE_TTL: Duration = Duration::from_millis(30);
 const PENDING_TRADES_PER_CURVE_MAX: usize = 1_024;
-const RAW_PUMPFUN_INSTRUCTION_EVIDENCE_QUEUE_CAP: usize = 16_384;
+const RAW_PUMPFUN_INSTRUCTION_EVIDENCE_QUEUE_CAP: usize = 1_024;
 const RAW_PUMPFUN_INSTRUCTION_EVIDENCE_FLUSH_MS: u64 = 1_000;
 const RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT: usize = 16;
 const RAW_PUMPFUN_LEGACY_TAIL_COUNT: usize = 2;
@@ -1494,6 +1552,245 @@ pub fn store_repair_curve(
     );
 }
 
+const WAL_JOB_QUEUE_CAP: usize = 1_024;
+
+enum WalJob {
+    RawTransaction(Arc<types::GeyserEvent>),
+    Record {
+        record: WalRecord,
+        record_kind: &'static str,
+        clock: WalRecordClock,
+        provider_id: String,
+        boundary: ghost_core::LocalCoverageBoundaryV1,
+    },
+}
+
+impl WalJob {
+    fn provider_and_boundary(&self) -> (String, ghost_core::LocalCoverageBoundaryV1) {
+        match self {
+            Self::RawTransaction(event) => geyser_provider_and_boundary(event),
+            Self::Record {
+                provider_id,
+                boundary,
+                ..
+            } => (provider_id.clone(), boundary.clone()),
+        }
+    }
+}
+
+struct WalDispatcher {
+    sender: crossbeam_channel::Sender<WalJob>,
+    local_gap: Arc<local_gap::LocalGapTracker>,
+    local_segment_unreliable: Arc<AtomicBool>,
+    high_water: Arc<AtomicU64>,
+    pending: Arc<AtomicU64>,
+}
+
+impl WalDispatcher {
+    fn new(
+        wal: Arc<Wal>,
+        wal_disabled_due_to_enospc: Arc<AtomicBool>,
+        local_segment_unreliable: Arc<AtomicBool>,
+    ) -> Self {
+        let (sender, receiver) = crossbeam_channel::bounded(WAL_JOB_QUEUE_CAP);
+        let local_gap = Arc::new(local_gap::LocalGapTracker::new(
+            ghost_core::LocalCoverageGapReasonV1::WalQueueSaturated,
+        ));
+        let high_water = Arc::new(AtomicU64::new(0));
+        let worker_high_water = Arc::clone(&high_water);
+        let pending = Arc::new(AtomicU64::new(0));
+        let worker_pending = Arc::clone(&pending);
+        let worker_local_segment_unreliable = Arc::clone(&local_segment_unreliable);
+        std::thread::Builder::new()
+            .name("seer-wal-writer".to_string())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    worker_high_water.fetch_max(receiver.len() as u64, Relaxed);
+                    let Some((record, record_kind, clock)) = wal_job_to_record(job) else {
+                        worker_pending.fetch_sub(1, Release);
+                        continue;
+                    };
+                    if wal_disabled_due_to_enospc.load(Relaxed) {
+                        worker_pending.fetch_sub(1, Release);
+                        continue;
+                    }
+                    #[cfg(test)]
+                    {
+                        crate::hot_path_metrics::record_wal_append();
+                        crate::hot_path_metrics::apply_synthetic_wal_delay();
+                    }
+                    if let Err(err) = wal.append_with_clock(&record, clock) {
+                        worker_local_segment_unreliable.store(true, Release);
+                        if is_no_space_error(&err) {
+                            if !wal_disabled_due_to_enospc.swap(true, Relaxed) {
+                                error!(
+                                    record_kind,
+                                    error = %err,
+                                    "Seer: disabling dedicated WAL writer after ENOSPC"
+                                );
+                            }
+                        } else {
+                            warn!(
+                                record_kind,
+                                error = %err,
+                                "Seer: dedicated WAL writer failed to append record"
+                            );
+                        }
+                    }
+                    worker_pending.fetch_sub(1, Release);
+                }
+            })
+            .expect("spawn dedicated bounded Seer WAL writer");
+        Self {
+            sender,
+            local_gap,
+            local_segment_unreliable,
+            high_water,
+            pending,
+        }
+    }
+
+    fn try_enqueue(&self, job: WalJob) -> bool {
+        let (provider_id, boundary) = job.provider_and_boundary();
+        self.pending.fetch_add(1, Release);
+        match self.sender.try_send(job) {
+            Ok(()) => {
+                self.high_water.fetch_max(self.sender.len() as u64, Relaxed);
+                self.local_gap.observe_admitted(boundary);
+                if let Some(gap) = self.local_gap.take_completed() {
+                    log_completed_local_gap(&gap);
+                }
+                true
+            }
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                self.pending.fetch_sub(1, Release);
+                self.local_segment_unreliable.store(true, Release);
+                self.local_gap.observe_saturation(
+                    provider_id.clone(),
+                    0,
+                    boundary.clone(),
+                    self.sender.len().max(WAL_JOB_QUEUE_CAP),
+                );
+                ::metrics::increment_counter!(
+                    "seer_local_coverage_gap_opened_total",
+                    "reason" => "wal_queue_saturated"
+                );
+                error!(
+                    provider_id,
+                    reason = ghost_core::LocalCoverageGapReasonV1::WalQueueSaturated.as_str(),
+                    queue_high_water = self.sender.len().max(WAL_JOB_QUEUE_CAP),
+                    slot = ?boundary.slot,
+                    "Seer: WAL queue opened a typed local coverage gap"
+                );
+                false
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                self.pending.fetch_sub(1, Release);
+                self.local_segment_unreliable.store(true, Release);
+                false
+            }
+        }
+    }
+}
+
+fn wal_job_to_record(job: WalJob) -> Option<(WalRecord, &'static str, WalRecordClock)> {
+    match job {
+        WalJob::Record {
+            record,
+            record_kind,
+            clock,
+            ..
+        } => Some((record, record_kind, clock)),
+        WalJob::RawTransaction(event) => {
+            let event_time = types::transaction_event_time(&event);
+            let compat_event_ts_ms = event.compat_event_ts_ms();
+            let types::GeyserEvent::Transaction {
+                slot,
+                signature,
+                mpcf_payload_bytes,
+                ..
+            } = event.as_ref()
+            else {
+                return None;
+            };
+            let raw_tx = mpcf_payload_bytes
+                .as_ref()
+                .filter(|bytes| !bytes.is_empty())?
+                .clone();
+            Some((
+                WalRecord::RawTx {
+                    ts_ms: compat_event_ts_ms.unwrap_or_else(types::ingress_epoch_ms),
+                    slot: slot.unwrap_or_default(),
+                    signature: Some(signature.as_ref().to_vec()),
+                    raw_tx,
+                },
+                "raw_tx",
+                WalRecordClock::new(event_time, compat_event_ts_ms),
+            ))
+        }
+    }
+}
+
+fn wal_record_slot(record: &WalRecord) -> u64 {
+    match record {
+        WalRecord::RawTx { slot, .. }
+        | WalRecord::ParsedEvent { slot, .. }
+        | WalRecord::Decision { slot, .. }
+        | WalRecord::TradeForwarded { slot, .. }
+        | WalRecord::CommitStaged { slot, .. }
+        | WalRecord::CommitPersisted { slot, .. }
+        | WalRecord::ShadowLedgerCurveUpdate { slot, .. }
+        | WalRecord::RollbackReevalSeed { slot, .. }
+        | WalRecord::LocalCoverageGap { slot, .. } => *slot,
+    }
+}
+
+fn geyser_provider_and_boundary(
+    event: &types::GeyserEvent,
+) -> (String, ghost_core::LocalCoverageBoundaryV1) {
+    match event {
+        types::GeyserEvent::Transaction {
+            provider_id,
+            slot,
+            signature,
+            ..
+        } => (
+            provider_id.clone().unwrap_or_else(|| "unknown".to_string()),
+            ghost_core::LocalCoverageBoundaryV1 {
+                slot: *slot,
+                signature: Some(*signature),
+            },
+        ),
+        types::GeyserEvent::AccountUpdate {
+            provider_id, slot, ..
+        } => (
+            provider_id.clone().unwrap_or_else(|| "unknown".to_string()),
+            ghost_core::LocalCoverageBoundaryV1 {
+                slot: Some(*slot),
+                signature: None,
+            },
+        ),
+        _ => (
+            "seer".to_string(),
+            ghost_core::LocalCoverageBoundaryV1::default(),
+        ),
+    }
+}
+
+fn log_completed_local_gap(gap: &ghost_core::LocalCoverageGapV1) {
+    error!(
+        gap_id = %bs58::encode(gap.gap_id_blake3).into_string(),
+        provider_id = %gap.provider_id,
+        stream_epoch = gap.stream_epoch,
+        reason = gap.reason.as_str(),
+        queue_high_water = gap.queue_high_water,
+        before_slot = ?gap.before.slot,
+        after_slot = ?gap.after.slot,
+        recovered = gap.recovered,
+        "Seer: completed deterministic local coverage gap; segment remains non-evaluable"
+    );
+}
+
 /// Main Seer component for real-time pool detection
 pub struct Seer {
     /// Configuration
@@ -1577,8 +1874,12 @@ pub struct Seer {
     health: Option<Arc<RuntimeHealth>>,
 
     /// Optional write-ahead log for ingest durability and replay diagnostics.
-    wal: Option<Arc<Wal>>,
-    wal_disabled_due_to_enospc: AtomicBool,
+    wal_dispatcher: Option<WalDispatcher>,
+    wal_disabled_due_to_enospc: Arc<AtomicBool>,
+
+    /// Sticky fail-closed marker for the current process segment. PR1B does not
+    /// claim proof-based recovery from local ingress/WAL/IPC loss.
+    local_segment_unreliable: Arc<AtomicBool>,
 
     /// [FIX-3] Slot when the session started to prevent backfilled pools from being forwarded
     session_start_slot: AtomicU64,
@@ -1595,7 +1896,7 @@ pub struct Seer {
     /// This lane is diagnostic evidence only. It is deliberately separate from
     /// `TradeEvent`, Gatekeeper, and execution routing so raw account manifests
     /// cannot unlock active execution by accident.
-    raw_pumpfun_instruction_evidence_tx: Option<mpsc::Sender<Value>>,
+    raw_pumpfun_instruction_evidence_tx: Option<RawEvidenceDispatcher>,
 }
 
 impl Seer {
@@ -1951,8 +2252,11 @@ impl Seer {
         } else {
             (None, None)
         };
-        let raw_pumpfun_instruction_evidence_tx =
-            spawn_raw_pumpfun_instruction_evidence_writer(&config);
+        let local_segment_unreliable = Arc::new(AtomicBool::new(false));
+        let raw_pumpfun_instruction_evidence_tx = spawn_raw_pumpfun_instruction_evidence_writer(
+            &config,
+            Arc::clone(&local_segment_unreliable),
+        );
         if raw_pumpfun_instruction_evidence_tx.is_some() {
             if let Some(connection) = grpc_connection.as_ref() {
                 connection.set_live_transaction_capture_enabled(true);
@@ -1989,8 +2293,9 @@ impl Seer {
             coverage: Arc::new(CoverageCounters::default()),
             coverage_last_log: Arc::new(Mutex::new(Instant::now())),
             health: None,
-            wal: None,
-            wal_disabled_due_to_enospc: AtomicBool::new(false),
+            wal_dispatcher: None,
+            wal_disabled_due_to_enospc: Arc::new(AtomicBool::new(false)),
+            local_segment_unreliable,
             session_start_slot: AtomicU64::new(0),
             canonical_account_update_relay_enabled,
             raw_pumpfun_instruction_evidence_tx,
@@ -2019,7 +2324,11 @@ impl Seer {
         if let Some(connection) = self.funding_grpc_connection.as_ref() {
             connection.set_live_transaction_capture_enabled(true);
         }
-        self.wal = Some(wal);
+        self.wal_dispatcher = Some(WalDispatcher::new(
+            wal,
+            Arc::clone(&self.wal_disabled_due_to_enospc),
+            Arc::clone(&self.local_segment_unreliable),
+        ));
         self
     }
 
@@ -2075,8 +2384,8 @@ impl Seer {
         primary_shutdown && funding_shutdown
     }
 
-    fn append_wal_record(&self, record: WalRecord, record_kind: &'static str) {
-        self.append_wal_record_with_clock(record, record_kind, WalRecordClock::default());
+    fn append_wal_record(&self, record: WalRecord, record_kind: &'static str) -> bool {
+        self.append_wal_record_with_clock(record, record_kind, WalRecordClock::default())
     }
 
     fn append_wal_record_with_clock(
@@ -2084,103 +2393,44 @@ impl Seer {
         record: WalRecord,
         record_kind: &'static str,
         clock: WalRecordClock,
-    ) {
-        let Some(wal) = self.wal.as_ref() else {
-            return;
+    ) -> bool {
+        let Some(dispatcher) = self.wal_dispatcher.as_ref() else {
+            return true;
         };
         if self.wal_disabled_due_to_enospc.load(Relaxed) {
-            return;
+            self.local_segment_unreliable.store(true, Release);
+            return false;
         }
-
-        #[cfg(test)]
-        {
-            crate::hot_path_metrics::record_wal_append();
-            crate::hot_path_metrics::apply_synthetic_wal_delay();
-        }
-        if let Err(err) = wal.append_with_clock(&record, clock) {
-            if is_no_space_error(&err) {
-                if !self.wal_disabled_due_to_enospc.swap(true, Relaxed) {
-                    error!(
-                        record_kind,
-                        error = %err,
-                        "Seer: disabling WAL after ENOSPC; runtime will continue without further WAL appends"
-                    );
-                }
-                return;
-            }
-            warn!(
-                record_kind,
-                error = %err,
-                "Seer: failed to append WAL record"
-            );
-        }
+        let boundary = ghost_core::LocalCoverageBoundaryV1 {
+            slot: Some(wal_record_slot(&record)),
+            signature: None,
+        };
+        dispatcher.try_enqueue(WalJob::Record {
+            record,
+            record_kind,
+            clock,
+            provider_id: "seer".to_string(),
+            boundary,
+        })
     }
 
-    fn append_raw_tx_to_wal(&self, event: &types::GeyserEvent) {
-        let event_time = types::transaction_event_time(event);
-        let compat_event_ts_ms = event.compat_event_ts_ms();
-        let types::GeyserEvent::Transaction {
-            slot,
-            signature,
-            mpcf_payload_bytes,
-            ..
-        } = event
-        else {
-            return;
+    fn append_raw_tx_to_wal(&self, event: Arc<types::GeyserEvent>) -> bool {
+        let Some(dispatcher) = self.wal_dispatcher.as_ref() else {
+            return true;
         };
-
-        let Some(raw_tx) = mpcf_payload_bytes
-            .as_ref()
-            .filter(|bytes| !bytes.is_empty())
-        else {
-            return;
-        };
-
-        self.append_wal_record_with_clock(
-            WalRecord::RawTx {
-                ts_ms: compat_event_ts_ms.unwrap_or_else(types::ingress_epoch_ms),
-                slot: slot.unwrap_or_default(),
-                signature: Some(signature.as_ref().to_vec()),
-                raw_tx: raw_tx.clone(),
-            },
-            "raw_tx",
-            WalRecordClock::new(event_time, compat_event_ts_ms),
-        );
+        if self.wal_disabled_due_to_enospc.load(Relaxed) {
+            self.local_segment_unreliable.store(true, Release);
+            return false;
+        }
+        dispatcher.try_enqueue(WalJob::RawTransaction(event))
     }
 
-    fn enqueue_raw_pumpfun_instruction_evidence(&self, event: &types::GeyserEvent) {
-        let Some(tx) = self.raw_pumpfun_instruction_evidence_tx.as_ref() else {
-            return;
+    fn enqueue_raw_pumpfun_instruction_evidence(&self, event: Arc<types::GeyserEvent>) -> bool {
+        let Some(dispatcher) = self.raw_pumpfun_instruction_evidence_tx.as_ref() else {
+            return true;
         };
-        for row in raw_pumpfun_instruction_evidence_rows(event) {
-            match tx.try_send(row) {
-                Ok(()) => {
-                    ::metrics::counter!(
-                        "seer_raw_pumpfun_instruction_evidence_rows_enqueued_total",
-                        1
-                    );
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    ::metrics::counter!(
-                        "seer_raw_pumpfun_instruction_evidence_dropped_total",
-                        1,
-                        "reason" => "queue_full"
-                    );
-                    warn!(
-                        "Seer: raw Pump.fun instruction evidence queue full; dropping evidence row"
-                    );
-                    break;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    ::metrics::counter!(
-                        "seer_raw_pumpfun_instruction_evidence_dropped_total",
-                        1,
-                        "reason" => "writer_closed"
-                    );
-                    break;
-                }
-            }
-        }
+        dispatcher.try_enqueue(event);
+        !self.local_segment_unreliable.load(Acquire)
     }
 
     fn append_parsed_event_to_wal(
@@ -2190,7 +2440,7 @@ impl Seer {
         slot: Option<u64>,
         pool_id: Option<Pubkey>,
         kind: WalParsedEventKind,
-    ) {
+    ) -> bool {
         self.append_wal_record_with_clock(
             WalRecord::ParsedEvent {
                 ts_ms,
@@ -2200,7 +2450,7 @@ impl Seer {
             },
             "parsed_event",
             WalRecordClock::new(event_time, Some(ts_ms)),
-        );
+        )
     }
 
     /// Run the Seer main loop
@@ -3365,7 +3615,7 @@ impl Seer {
         };
 
         let wal_ingress_wall_ts_ms = types::ingress_epoch_ms();
-        self.append_parsed_event_to_wal(
+        let _ = self.append_parsed_event_to_wal(
             wal_ingress_wall_ts_ms,
             event_time.with_missing_from(ghost_core::EventTimeMetadata::new(
                 None,
@@ -4219,13 +4469,15 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 token_amount: trade.amount as u128,
             }
         };
-        self.append_parsed_event_to_wal(
+        if !self.append_parsed_event_to_wal(
             trade_ts_ms,
             trade.event_time,
             trade.slot,
             Some(trade.pool_amm_id).filter(|pool_id| *pool_id != Pubkey::default()),
             parsed_kind,
-        );
+        ) {
+            return false;
+        }
         if is_coverage_source {
             let pool_id = trade.pool_amm_id.to_string();
             let signature = trade.signature.to_string();
@@ -4437,6 +4689,35 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
 
     #[cfg_attr(test, allow(dead_code))]
     pub async fn process_event(&self, event: types::GeyserEvent) -> SeerResult<()> {
+        if let types::GeyserEvent::LocalCoverageGap { gap } = &event {
+            self.local_segment_unreliable.store(true, Release);
+            let _ = self.append_wal_record_with_clock(
+                WalRecord::LocalCoverageGap {
+                    ts_ms: gap.ended_at_ms,
+                    slot: gap.after.slot.or(gap.before.slot).unwrap_or_default(),
+                    gap: gap.clone(),
+                },
+                "local_coverage_gap",
+                WalRecordClock::default(),
+            );
+            ::metrics::increment_counter!(
+                "seer_local_coverage_gap_total",
+                "reason" => gap.reason.as_str()
+            );
+            error!(
+                gap_id = %bs58::encode(gap.gap_id_blake3).into_string(),
+                provider_id = %gap.provider_id,
+                stream_epoch = gap.stream_epoch,
+                reason = gap.reason.as_str(),
+                queue_high_water = gap.queue_high_water,
+                before_slot = ?gap.before.slot,
+                after_slot = ?gap.after.slot,
+                recovered = gap.recovered,
+                "Seer: local coverage gap makes the current evaluation segment non-evaluable"
+            );
+            return Ok(());
+        }
+
         // [EntryAnchor] — keep raw slot throughput stats and scan for embedded CPI.
         if let types::GeyserEvent::EntryAnchor {
             executed_transaction_count,
@@ -4463,27 +4744,47 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             return Ok(());
         }
 
-        let source_label = match &event {
-            types::GeyserEvent::Transaction { source, .. } => source.as_str(),
-            _ => "unknown",
+        if self
+            .ipc_sender
+            .as_ref()
+            .is_some_and(IpcSender::has_unrecovered_local_gap)
+        {
+            self.local_segment_unreliable.store(true, Release);
+        }
+        if self.local_segment_unreliable.load(Acquire) {
+            ::metrics::increment_counter!(
+                "seer_local_non_evaluable_event_total",
+                "reason" => "unrecovered_local_gap"
+            );
+            return Ok(());
+        }
+
+        let event = Arc::new(event);
+        let source_label = match event.as_ref() {
+            types::GeyserEvent::Transaction { source, .. } => source.clone(),
+            _ => "unknown".to_string(),
         };
 
         // SOURCE ROUTING: Check if this is a synthetic event (e.g., from PumpPortal)
         // Synthetic events are pre-parsed and should NEVER go through binary parsing
-        let is_synthetic = match &event {
+        let is_synthetic = match event.as_ref() {
             types::GeyserEvent::Transaction { synthetic, .. } => *synthetic,
             _ => false,
         };
-        let is_dedicated_funding_lane_source = Self::is_dedicated_funding_lane_source(source_label);
+        let is_dedicated_funding_lane_source =
+            Self::is_dedicated_funding_lane_source(&source_label);
 
         // Track event source in metrics
         self.metrics
             .events_received
-            .with_label_values(&[source_label, if is_synthetic { "synthetic" } else { "raw" }])
+            .with_label_values(&[
+                source_label.as_str(),
+                if is_synthetic { "synthetic" } else { "raw" },
+            ])
             .inc();
 
         if is_dedicated_funding_lane_source {
-            self.maybe_emit_funding_transfer_observations(&event, source_label, is_synthetic)
+            self.maybe_emit_funding_transfer_observations(&event, &source_label, is_synthetic)
                 .await?;
             return Ok(());
         }
@@ -4492,28 +4793,35 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         let detection_received_at = std::time::SystemTime::now();
         let ultrafast_mode = self.update_ultrafast_mode();
         let is_coverage_source = matches!(
-            source_label,
+            source_label.as_str(),
             "grpc_pool_stream" | GRPC_GLOBAL_STREAM_SOURCE_LABEL
         );
         if is_coverage_source {
-            if let types::GeyserEvent::Transaction { signature, .. } = &event {
+            if let types::GeyserEvent::Transaction { signature, .. } = event.as_ref() {
                 let signature = signature.to_string();
-                coverage_audit().record_raw_received(&signature, source_label);
+                coverage_audit().record_raw_received(&signature, &source_label);
             }
         }
         if is_coverage_source {
-            self.track_tx_stream_coverage(source_label);
+            self.track_tx_stream_coverage(&source_label);
             self.maybe_log_coverage();
         }
 
-        self.append_raw_tx_to_wal(&event);
-        self.enqueue_raw_pumpfun_instruction_evidence(&event);
+        let wal_accepted = self.append_raw_tx_to_wal(Arc::clone(&event));
+        let evidence_accepted = self.enqueue_raw_pumpfun_instruction_evidence(Arc::clone(&event));
+        if !wal_accepted || !evidence_accepted || self.local_segment_unreliable.load(Acquire) {
+            ::metrics::increment_counter!(
+                "seer_local_non_evaluable_event_total",
+                "reason" => "required_sink_rejected"
+            );
+            return Ok(());
+        }
 
         // Extract synthetic payload for PumpPortal events (pre-parsed data)
         let mut synthetic_pool: Option<types::InitializePoolEvent> = None;
         let mut synthetic_trade: Option<types::TradeEvent> = None;
         if is_synthetic && source_label == "pumpportal" {
-            if let types::GeyserEvent::Transaction { instructions, .. } = &event {
+            if let types::GeyserEvent::Transaction { instructions, .. } = event.as_ref() {
                 for ix in instructions {
                     if ix.data.is_empty() {
                         continue;
@@ -4561,7 +4869,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             }
         };
 
-        self.maybe_emit_funding_transfer_observations(&event, source_label, is_synthetic)
+        self.maybe_emit_funding_transfer_observations(&event, &source_label, is_synthetic)
             .await?;
 
         // Parse the normalized transaction once. Pool initialization and every
@@ -4641,11 +4949,12 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 }
 
                 // [FIX-3] Reject BackfillTransaction for InitializePool
-                let is_backfill = if let types::GeyserEvent::Transaction { source, .. } = &event {
-                    source == "grpc_backfill"
-                } else {
-                    false
-                };
+                let is_backfill =
+                    if let types::GeyserEvent::Transaction { source, .. } = event.as_ref() {
+                        source == "grpc_backfill"
+                    } else {
+                        false
+                    };
                 if is_backfill {
                     warn!(
                         "Rejecting CandidatePool from backfill queue (slot {:?})",
@@ -4666,7 +4975,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 // Convert to CandidatePool
                 let mut candidate: CandidatePool = pool_event.into();
                 candidate.semantic =
-                    transaction_semantic_from_event(&event, source_label, is_synthetic);
+                    transaction_semantic_from_event(&event, &source_label, is_synthetic);
                 let candidate_mode = self.pool_init_candidate_mode(amm_program, &candidate);
                 let observe_candidate = matches!(candidate_mode, PoolInitCandidateMode::Observe);
 
@@ -4686,7 +4995,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     );
                     return Ok(());
                 }
-                self.append_parsed_event_to_wal(
+                if !self.append_parsed_event_to_wal(
                     candidate
                         .compat_event_ts_ms()
                         .unwrap_or_else(types::ingress_epoch_ms),
@@ -4694,7 +5003,9 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     candidate.slot,
                     Some(candidate.pool_amm_id),
                     WalParsedEventKind::Create,
-                );
+                ) {
+                    return Ok(());
+                }
 
                 // Send PoolDetected via IPC *before* register_curve_mapping.
                 //
@@ -4834,13 +5145,13 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                             let delta_ms = delta.as_millis() as f64;
                             self.metrics
                                 .mint_to_detection_latency
-                                .with_label_values(&[amm_program.name(), source_label])
+                                .with_label_values(&[amm_program.name(), &source_label])
                                 .observe(delta_ms);
 
                             if delta_ms > LATE_DETECTION_THRESHOLD_MS {
                                 self.metrics
                                     .late_detection_total
-                                    .with_label_values(&[amm_program.name(), source_label])
+                                    .with_label_values(&[amm_program.name(), &source_label])
                                     .inc();
                                 warn!(
                                     "⚠️ Late pool detection: {:.2}ms after mint (slot={:?}, source={})",
@@ -4920,7 +5231,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                             .parse_and_forward_binary_trades(
                                 parser,
                                 &event,
-                                source_label,
+                                &source_label,
                                 is_coverage_source,
                                 binary_trades.take(),
                             )
@@ -4938,7 +5249,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 // PumpPortal synthetic trade path (pre-parsed)
                 if let Some(trade) = synthetic_trade.take() {
                     let emitted = self
-                        .handle_trade_event(trade, source_label, is_coverage_source)
+                        .handle_trade_event(trade, &source_label, is_coverage_source)
                         .await;
                     if emitted && is_coverage_source {
                         // Signature-level: one live-forwarded signature for the entire tx.
@@ -4965,7 +5276,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                             .parse_and_forward_binary_trades(
                                 parser,
                                 &event,
-                                source_label,
+                                &source_label,
                                 is_coverage_source,
                                 binary_trades.take(),
                             )
@@ -4989,7 +5300,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                         instructions,
                         logs,
                         ..
-                    } = &event
+                    } = event.as_ref()
                     {
                         if Self::tx_should_log_initialize_pool_miss(&event) {
                             let empty_data_count = instructions
@@ -6828,6 +7139,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pr1b_local_gap_marks_segment_non_evaluable_fail_closed() {
+        let (tx, _rx) = mpsc::channel(8);
+        let seer = Seer::new(SeerConfig::default(), tx);
+        let gap = ghost_core::LocalCoverageGapV1 {
+            gap_id_blake3: [7; 32],
+            provider_id: "pr1b-primary".to_string(),
+            stream_epoch: 3,
+            episode_sequence: 0,
+            reason: ghost_core::LocalCoverageGapReasonV1::IngressQueueSaturated,
+            before: ghost_core::LocalCoverageBoundaryV1 {
+                slot: Some(41),
+                signature: Some(Signature::new_unique()),
+            },
+            after: ghost_core::LocalCoverageBoundaryV1 {
+                slot: Some(42),
+                signature: Some(Signature::new_unique()),
+            },
+            queue_high_water: 1_024,
+            started_at_ms: 1_000,
+            ended_at_ms: 1_001,
+            recovered: false,
+        };
+
+        seer.process_event(types::GeyserEvent::LocalCoverageGap { gap })
+            .await
+            .expect("typed local gap must be accepted as audit evidence");
+
+        assert!(
+            seer.local_segment_unreliable.load(Acquire),
+            "an unrecovered local gap must fail closed for the current evaluation segment"
+        );
+    }
+
+    #[tokio::test]
     async fn entry_anchor_processing_returns_when_scan_queue_is_full() {
         let config = SeerConfig::default();
         let (tx, _rx) = mpsc::channel(8);
@@ -7038,6 +7383,18 @@ mod tests {
         .await
         .expect("synthetic trade should process");
 
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while seer
+            .wal_dispatcher
+            .as_ref()
+            .expect("WAL dispatcher")
+            .pending
+            .load(Acquire)
+            > 0
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         wal.flush().expect("wal flush");
         let mut records = Vec::new();
         wal.replay_all(|record| records.push(record))

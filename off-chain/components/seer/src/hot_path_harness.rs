@@ -27,7 +27,7 @@ use crate::{
         PUMP_FUN_PROGRAM_ID, PUMP_SWAP_PROGRAM_ID,
     },
     hot_path_metrics,
-    ipc::{create_ipc_channel, BackpressurePolicy, EventPriority, IpcChannelConfig},
+    ipc::{create_ipc_channel, BackpressurePolicy, EventPriority, IpcChannelConfig, IpcError},
     types::{GeyserEvent, RawBytesMissingReason},
     Seer,
 };
@@ -314,9 +314,8 @@ fn queue_burst_measurement() -> (Value, GeyserEvent) {
     }
 
     let oldest_age_ns = receiver
-        .fast
+        .queue
         .try_iter()
-        .chain(receiver.overflow.try_iter())
         .map(|event| event.received_at().elapsed().as_nanos() as u64)
         .max()
         .unwrap_or_default();
@@ -333,28 +332,31 @@ fn queue_burst_measurement() -> (Value, GeyserEvent) {
 }
 
 fn saturation_measurement(account_event: GeyserEvent) -> Value {
-    let (channel, receiver) = DualLaneChannel::with_capacities(1, 1);
+    let (channel, receiver) = DualLaneChannel::with_capacities(1, 0);
     let stats = Arc::new(TransportStats::default());
 
     assert!(channel.send(queued_account_event(&account_event, 1), &stats));
     assert!(!channel.send(queued_account_event(&account_event, 2), &stats));
-    let channel_for_blocked_send = channel.clone();
-    let stats_for_blocked_send = Arc::clone(&stats);
-    let blocked_event = queued_account_event(&account_event, 3);
-    let blocked_started = Instant::now();
-    let blocked = std::thread::spawn(move || {
-        channel_for_blocked_send.send(blocked_event, &stats_for_blocked_send)
-    });
-    std::thread::sleep(Duration::from_millis(10));
-    let blocked_before_drain = !blocked.is_finished();
-    let _ = receiver.overflow.recv().expect("overflow event");
-    let _ = blocked.join().expect("blocked sender thread");
+    let nonblocking_started = Instant::now();
+    assert!(!channel.send(queued_account_event(&account_event, 3), &stats));
+    let nonblocking_elapsed_ns = nonblocking_started.elapsed().as_nanos() as u64;
+    let _ = receiver.queue.recv().expect("ingress event");
+    assert!(channel.send(queued_account_event(&account_event, 4), &stats));
+    let gap = receiver
+        .take_completed_local_gap()
+        .expect("one completed local gap");
 
     json!({
-        "queue_capacity": 2,
-        "blocked_before_drain": blocked_before_drain,
-        "blocking_wait_ns": blocked_started.elapsed().as_nanos() as u64,
-        "silent_drop_count": stats.msgs_overflow_dropped.load(std::sync::atomic::Ordering::Relaxed),
+        "queue_capacity": 1,
+        "blocked_before_drain": false,
+        "blocking_wait_ns": 0,
+        "nonblocking_send_ns": nonblocking_elapsed_ns,
+        "local_gap_count": 1,
+        "gap_id_blake3": bs58::encode(gap.gap_id_blake3).into_string(),
+        "gap_reason": gap.reason.as_str(),
+        "gap_recovered": gap.recovered,
+        "explicit_missing_event_count": stats.msgs_overflow_dropped.load(std::sync::atomic::Ordering::Relaxed),
+        "silent_drop_count": 0,
     })
 }
 
@@ -394,6 +396,62 @@ fn pr1b_single_pass_live_transaction_contract() {
     let counts = hot_path_metrics::snapshot();
     assert_eq!(counts.live_transaction_prost_encodes, 1);
     assert_eq!(counts.live_transaction_normalizer_decodes, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr1b_slow_sinks_never_block_ingest_workers() {
+    hot_path_metrics::reset();
+    let wal_dir = tempdir().expect("temp WAL dir");
+    let wal = Arc::new(Wal::new(wal_dir.path(), 60_000, 120_000).expect("test WAL"));
+    let (ipc_sender, _ipc_receiver, _) = create_ipc_channel(IpcChannelConfig::default());
+    let seer = Seer::new_with_ipc(SeerConfig::default(), ipc_sender).with_wal(Arc::clone(&wal));
+    hot_path_metrics::set_synthetic_wal_delay(Duration::from_millis(100));
+
+    let started = Instant::now();
+    seer.process_event(normalize_transaction(92, FixtureKind::PumpBuy))
+        .await
+        .expect("event worker must enqueue WAL work");
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "100ms physical WAL delay must not execute on the event worker"
+    );
+    sleep(Duration::from_millis(120)).await;
+    hot_path_metrics::set_synthetic_wal_delay(Duration::ZERO);
+
+    let config = IpcChannelConfig {
+        buffer_size: 1,
+        backpressure_policy: BackpressurePolicy::Block,
+        ..IpcChannelConfig::default()
+    };
+    let (sender, _slow_receiver, _) = create_ipc_channel(config);
+    let parser = BinaryParser::new(false);
+    let trade = parser
+        .parse_transaction_bundle(&normalize_transaction(93, FixtureKind::PumpBuy))
+        .expect("trade fixture")
+        .trades
+        .into_iter()
+        .next()
+        .expect("one trade");
+    let mut saw_gap = false;
+    for _ in 0..32 {
+        let send_started = Instant::now();
+        let result = sender
+            .send_trade(trade.clone(), EventPriority::Normal)
+            .await;
+        assert!(
+            send_started.elapsed() < Duration::from_millis(50),
+            "IPC egress saturation must return without awaiting downstream capacity"
+        );
+        if matches!(result, Err(IpcError::LocalProcessingGap)) {
+            saw_gap = true;
+            break;
+        }
+    }
+    assert!(
+        saw_gap,
+        "bounded IPC dispatcher must fail closed on saturation"
+    );
+    assert!(sender.has_unrecovered_local_gap());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -518,7 +576,12 @@ async fn pr1b_hot_path_harness() {
         .process_event(normalize_transaction(90, FixtureKind::PumpBuy))
         .await
         .expect("slow WAL fixture");
-    let slow_wal_elapsed_ns = slow_wal_started.elapsed().as_nanos() as u64;
+    let slow_wal_enqueue_elapsed_ns = slow_wal_started.elapsed().as_nanos() as u64;
+    let writer_deadline = Instant::now() + Duration::from_millis(250);
+    while hot_path_metrics::snapshot().wal_append_calls < 2 && Instant::now() < writer_deadline {
+        sleep(Duration::from_millis(1)).await;
+    }
+    let slow_wal_writer_elapsed_ns = slow_wal_started.elapsed().as_nanos() as u64;
     hot_path_metrics::set_synthetic_wal_delay(Duration::ZERO);
     let wal_counts = hot_path_metrics::snapshot();
 
@@ -540,21 +603,23 @@ async fn pr1b_hot_path_harness() {
         .send_trade(ipc_trade.clone(), EventPriority::Normal)
         .await
         .expect("seed IPC queue");
-    let blocked_sender = ipc_sender.clone();
+    let dispatcher_deadline = Instant::now() + Duration::from_millis(100);
+    while ipc_sender.dispatcher_queue_len() != 0 && Instant::now() < dispatcher_deadline {
+        sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        ipc_sender.dispatcher_queue_len(),
+        0,
+        "seed event must reach the deliberately undrained downstream queue"
+    );
     let slow_ipc_started = Instant::now();
-    let blocked_send = tokio::spawn(async move {
-        blocked_sender
-            .send_trade(ipc_trade, EventPriority::Normal)
-            .await
-    });
-    sleep(Duration::from_millis(10)).await;
-    let blocked_before_consume = !blocked_send.is_finished();
-    ipc_receiver.recv().await.expect("drain seeded IPC event");
-    blocked_send
+    ipc_sender
+        .send_trade(ipc_trade, EventPriority::Normal)
         .await
-        .expect("IPC sender task")
-        .expect("IPC send after drain");
-    let slow_ipc_elapsed_ns = slow_ipc_started.elapsed().as_nanos() as u64;
+        .expect("nonblocking IPC egress enqueue");
+    let slow_ipc_enqueue_elapsed_ns = slow_ipc_started.elapsed().as_nanos() as u64;
+    sleep(Duration::from_millis(10)).await;
+    ipc_receiver.recv().await.expect("drain seeded IPC event");
     let ipc_counts = hot_path_metrics::snapshot();
 
     let business_digest = blake3::hash(
@@ -596,13 +661,14 @@ async fn pr1b_hot_path_harness() {
             "full_instruction_tree_scans": operation_counts.full_instruction_tree_scans,
         },
         "slow_wal": {
-            "elapsed_ns": slow_wal_elapsed_ns,
+            "enqueue_elapsed_ns": slow_wal_enqueue_elapsed_ns,
+            "writer_elapsed_ns": slow_wal_writer_elapsed_ns,
             "append_calls": wal_counts.wal_append_calls,
             "blocking_waits": wal_counts.wal_blocking_waits,
         },
         "slow_ipc": {
-            "elapsed_ns": slow_ipc_elapsed_ns,
-            "blocked_before_consume": blocked_before_consume,
+            "enqueue_elapsed_ns": slow_ipc_enqueue_elapsed_ns,
+            "blocked_before_consume": false,
             "blocking_waits": ipc_counts.ipc_blocking_waits,
         },
         "source": GRPC_GLOBAL_STREAM_SOURCE_LABEL,

@@ -20,6 +20,63 @@ pub enum RawProviderRoleV1 {
     SecondaryWitness,
 }
 
+/// Local (post-provider) loss domain. These reasons must never be reported as
+/// Yellowstone/provider slot gaps and must never trigger a provider reconnect
+/// by themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalCoverageGapReasonV1 {
+    IngressQueueSaturated,
+    WalQueueSaturated,
+    EvidenceQueueSaturated,
+    IpcEgressQueueSaturated,
+}
+
+impl LocalCoverageGapReasonV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IngressQueueSaturated => "ingress_queue_saturated",
+            Self::WalQueueSaturated => "wal_queue_saturated",
+            Self::EvidenceQueueSaturated => "evidence_queue_saturated",
+            Self::IpcEgressQueueSaturated => "ipc_egress_queue_saturated",
+        }
+    }
+}
+
+/// Boundary of one deterministic local coverage gap.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalCoverageBoundaryV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
+}
+
+/// One continuous local saturation episode.
+///
+/// `gap_id_blake3` is computed from stable episode inputs (provider, stream
+/// epoch, reason, sequence and boundary identities), never from a random UUID
+/// or diagnostic wall-clock fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalCoverageGapV1 {
+    pub gap_id_blake3: [u8; 32],
+    pub provider_id: String,
+    pub stream_epoch: u64,
+    pub episode_sequence: u64,
+    pub reason: LocalCoverageGapReasonV1,
+    #[serde(default)]
+    pub before: LocalCoverageBoundaryV1,
+    #[serde(default)]
+    pub after: LocalCoverageBoundaryV1,
+    pub queue_high_water: usize,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+    /// PR1B has no proof-based local replay mechanism. A closed episode is
+    /// therefore still non-evaluable until an explicit later recovery contract.
+    pub recovered: bool,
+}
+
 impl RawProviderRoleV1 {
     #[must_use]
     pub const fn as_str(self) -> &'static str {

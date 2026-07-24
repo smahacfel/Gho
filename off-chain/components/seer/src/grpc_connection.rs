@@ -94,17 +94,12 @@ pub const AMM_POOL_DISC: [u8; 8] = [0xf1, 0x9a, 0x6d, 0x28, 0x1c, 0x37, 0xe4, 0x
 
 // ─── Tuning constants ─────────────────────────────────────────────────────────
 
-/// Primary (bounded) channel capacity.
-/// At 10k TPS × 200ms = 2k in-flight events. 32k = 16× headroom.
-const PRIMARY_CHANNEL_CAP: usize = 32_768;
-
-/// Secondary overflow queue capacity.
-/// This must stay bounded; an unbounded spill queue turns consumer lag into
-/// linear RSS growth and eventual OOM.
-const OVERFLOW_CHANNEL_CAP: usize = 65_536;
-
-/// Warn when overflow depth exceeds this.
-const OVERFLOW_WARN_DEPTH: usize = 10_000;
+/// One bounded ingress/work queue.
+///
+/// The B0 release harness measured 2,117 events/s. A 250 ms burst is 530
+/// events; the next power of two is 1,024, providing a measured ~483 ms bound
+/// without turning the queue into a long-lived backlog.
+const PRIMARY_CHANNEL_CAP: usize = 1_024;
 
 const BACKOFF_INIT_MS: u64 = 50;
 const BACKOFF_MAX_MS: u64 = 5_000;
@@ -134,11 +129,7 @@ const PROVIDER_CIRCUIT_BREAKER_WAIT_POLL_MS: u64 = 250;
 const DEFAULT_PROVIDER_MAX_STALLS_BEFORE_OPEN: u32 = 3;
 const DEFAULT_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS: u64 = 15_000;
 
-/// Event-drain fairness: after this many consecutive fast-lane events,
-/// force one overflow-lane check first to avoid starvation under sustained load.
-const FAST_BURST_BEFORE_OVERFLOW_DRAIN: usize = 64;
-
-/// Sleep when both lanes are empty (prevents hot-spin while keeping low latency).
+/// Sleep when the queue is empty (prevents hot-spin while keeping low latency).
 const DRAIN_IDLE_SLEEP_US: u64 = 50;
 
 /// Yellowstone exact-account filters accept at most 200 pubkeys per branch.
@@ -237,44 +228,76 @@ impl PumpEvent {
     pub fn is_backfill(&self) -> bool {
         matches!(self, Self::BackfillTransaction { .. })
     }
+
+    fn local_gap_boundary(&self) -> ghost_core::LocalCoverageBoundaryV1 {
+        let signature = match self {
+            Self::Transaction { signature, .. } | Self::BackfillTransaction { signature, .. } => {
+                Signature::from_str(signature).ok()
+            }
+            _ => None,
+        };
+        ghost_core::LocalCoverageBoundaryV1 {
+            slot: Some(self.slot()),
+            signature,
+        }
+    }
+
+    fn provider_id(&self) -> &str {
+        match self {
+            Self::Transaction { provider_id, .. }
+            | Self::AccountUpdate { provider_id, .. }
+            | Self::EntryUpdate { provider_id, .. }
+            | Self::BackfillTransaction { provider_id, .. } => {
+                provider_id.as_deref().unwrap_or("unknown")
+            }
+        }
+    }
 }
 
-// ─── [FIX-2] Dual-lane channel ────────────────────────────────────────────────
+// ─── PR1B single bounded ingress queue ───────────────────────────────────────
 
-/// Two-lane event channel:
-///   - `fast`:     bounded crossbeam channel (PRIMARY_CHANNEL_CAP).  Consumer
-///                 drains this first; it has the lowest latency.
-///   - `overflow`: bounded crossbeam channel. Spill target when `fast` is full.
-///                 Parser drains this after `fast`.
-///
-/// Combined: absorb short bursts without unbounded RAM growth.
-/// Under sustained overload the overflow lane can fill up; newest events are
-/// then dropped explicitly and counted in telemetry instead of OOMing the node.
+/// Compatibility name retained for callers; PR1B deliberately collapses the
+/// former fast+overflow cascade into exactly one bounded FIFO.
 #[derive(Clone)]
 pub struct DualLaneChannel {
-    fast: Sender<PumpEvent>,
-    overflow: Sender<PumpEvent>,
+    queue: Sender<PumpEvent>,
     capture_live_payload: Arc<AtomicBool>,
+    local_gap: Arc<crate::local_gap::LocalGapTracker>,
+    stream_epoch: Arc<AtomicU64>,
 }
 
 pub struct DualLaneReceiver {
-    pub fast: Receiver<PumpEvent>,
-    pub overflow: Receiver<PumpEvent>,
+    pub queue: Receiver<PumpEvent>,
+    local_gap: Arc<crate::local_gap::LocalGapTracker>,
+}
+
+#[cfg(test)]
+impl DualLaneReceiver {
+    pub(crate) fn take_completed_local_gap(&self) -> Option<ghost_core::LocalCoverageGapV1> {
+        self.local_gap.take_completed()
+    }
 }
 
 impl DualLaneChannel {
     pub fn new() -> (Self, DualLaneReceiver) {
-        let (fs, fr) = bounded(PRIMARY_CHANNEL_CAP);
-        let (os, or) = bounded(OVERFLOW_CHANNEL_CAP);
+        Self::with_capacity(PRIMARY_CHANNEL_CAP)
+    }
+
+    fn with_capacity(capacity: usize) -> (Self, DualLaneReceiver) {
+        let (queue, receiver) = bounded(capacity);
+        let local_gap = Arc::new(crate::local_gap::LocalGapTracker::new(
+            ghost_core::LocalCoverageGapReasonV1::IngressQueueSaturated,
+        ));
         (
             Self {
-                fast: fs,
-                overflow: os,
+                queue,
                 capture_live_payload: Arc::new(AtomicBool::new(false)),
+                local_gap: Arc::clone(&local_gap),
+                stream_epoch: Arc::new(AtomicU64::new(0)),
             },
             DualLaneReceiver {
-                fast: fr,
-                overflow: or,
+                queue: receiver,
+                local_gap,
             },
         )
     }
@@ -284,59 +307,39 @@ impl DualLaneChannel {
         fast_capacity: usize,
         overflow_capacity: usize,
     ) -> (Self, DualLaneReceiver) {
-        let (fast, fast_rx) = bounded(fast_capacity);
-        let (overflow, overflow_rx) = bounded(overflow_capacity);
-        (
-            Self {
-                fast,
-                overflow,
-                capture_live_payload: Arc::new(AtomicBool::new(false)),
-            },
-            DualLaneReceiver {
-                fast: fast_rx,
-                overflow: overflow_rx,
-            },
-        )
+        Self::with_capacity(fast_capacity.saturating_add(overflow_capacity).max(1))
     }
 
-    /// Send to fast lane; if full, spill to overflow.
-    /// Returns `true` if sent to fast, `false` if spilled.
+    /// Nonblocking enqueue into the only ingress FIFO.
     ///
-    /// If both lanes are saturated, apply backpressure by blocking on the
-    /// overflow lane instead of dropping the newest event.
+    /// Saturation never blocks the Yellowstone receive loop. The missing local
+    /// coverage is represented by one deterministic typed gap for the
+    /// continuous full episode and remains fail-closed until a future explicit
+    /// recovery contract proves completeness.
     #[inline(always)]
     pub fn send(&self, ev: PumpEvent, stats: &Arc<TransportStats>) -> bool {
-        match self.fast.try_send(ev) {
-            Ok(()) => true,
+        let boundary = ev.local_gap_boundary();
+        match self.queue.try_send(ev) {
+            Ok(()) => {
+                self.local_gap.observe_admitted(boundary);
+                true
+            }
             Err(TrySendError::Full(ev)) => {
-                // Spill into bounded overflow. If that also fills up, block here
-                // and let the upstream stream naturally backpressure instead of
-                // silently losing events.
                 stats.bump_spill();
-                let depth = self.overflow.len();
-                if depth % OVERFLOW_WARN_DEPTH == 0 && depth > 0 {
-                    warn!("Overflow queue depth={depth} — consumer lagging");
-                }
-                match self.overflow.try_send(ev) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(ev)) => {
-                        warn!(
-                            "Overflow queue FULL depth={} cap={} — applying backpressure instead of dropping",
-                            self.overflow.len(),
-                            OVERFLOW_CHANNEL_CAP,
-                        );
-                        if self.overflow.send(ev).is_err() {
-                            warn!("Transport overflow channel disconnected");
-                        }
-                    }
-                    Err(TrySendError::Disconnected(_)) => {
-                        warn!("Transport overflow channel disconnected");
-                    }
-                }
+                stats.bump_overflow_drop();
+                self.local_gap.observe_saturation(
+                    ev.provider_id(),
+                    self.stream_epoch.load(Ordering::Acquire),
+                    boundary,
+                    self.queue
+                        .capacity()
+                        .unwrap_or_else(|| self.queue.len())
+                        .max(self.queue.len()),
+                );
                 false
             }
             Err(TrySendError::Disconnected(_)) => {
-                warn!("Transport channel disconnected");
+                warn!("Bounded ingress channel disconnected");
                 false
             }
         }
@@ -344,7 +347,7 @@ impl DualLaneChannel {
 
     #[inline(always)]
     pub fn overflow_len(&self) -> usize {
-        self.overflow.len()
+        self.queue.len()
     }
 
     pub fn set_live_transaction_capture_enabled(&self, enabled: bool) {
@@ -358,7 +361,7 @@ impl DualLaneChannel {
 
     #[cfg(test)]
     pub(crate) fn depth(&self) -> usize {
-        self.fast.len().saturating_add(self.overflow.len())
+        self.queue.len()
     }
 }
 
@@ -2128,6 +2131,7 @@ async fn connection_loop(
         first_attempt = false;
 
         stats.bump_recon_with_source(cfg.subscription_profile.source_label());
+        channel.stream_epoch.fetch_add(1, Ordering::AcqRel);
         // `from_slot` is tracked for diagnostics. Current proto 1.14 request
         // shape does not encode replay from this value.
         let from_slot = slots.last_slot();
@@ -3305,13 +3309,9 @@ pub(crate) fn route_update_for_hot_path_harness_with_capture(
         &registry,
     );
 
-    let event = receiver
-        .fast
-        .try_recv()
-        .or_else(|_| receiver.overflow.try_recv())
-        .map_err(|_| {
-            SeerError::ParseError("PR1B harness route_update emitted no event".to_string())
-        })?;
+    let event = receiver.queue.try_recv().map_err(|_| {
+        SeerError::ParseError("PR1B harness route_update emitted no event".to_string())
+    })?;
     pump_event_to_geyser_event(event, GRPC_GLOBAL_STREAM_SOURCE_LABEL, None).ok_or_else(|| {
         SeerError::ParseError("PR1B harness event has no normalized mapping".to_string())
     })?
@@ -3454,42 +3454,18 @@ pub struct GrpcConnection {
 }
 
 enum DrainPick {
-    Event { ev: PumpEvent, from_fast: bool },
+    Event { ev: PumpEvent },
     Empty,
     Disconnected,
 }
 
 #[inline(always)]
-fn try_drain_dual_lane(rx: &DualLaneReceiver, prefer_overflow: bool) -> DrainPick {
-    let (first, first_fast, second, second_fast) = if prefer_overflow {
-        (&rx.overflow, false, &rx.fast, true)
-    } else {
-        (&rx.fast, true, &rx.overflow, false)
-    };
-
-    let first_try = first.try_recv();
-    if let Ok(ev) = first_try {
-        return DrainPick::Event {
-            ev,
-            from_fast: first_fast,
-        };
+fn try_drain_dual_lane(rx: &DualLaneReceiver, _legacy_preference: bool) -> DrainPick {
+    match rx.queue.try_recv() {
+        Ok(ev) => DrainPick::Event { ev },
+        Err(TryRecvError::Empty) => DrainPick::Empty,
+        Err(TryRecvError::Disconnected) => DrainPick::Disconnected,
     }
-
-    let second_try = second.try_recv();
-    if let Ok(ev) = second_try {
-        return DrainPick::Event {
-            ev,
-            from_fast: second_fast,
-        };
-    }
-
-    if matches!(first_try, Err(TryRecvError::Disconnected))
-        && matches!(second_try, Err(TryRecvError::Disconnected))
-    {
-        return DrainPick::Disconnected;
-    }
-
-    DrainPick::Empty
 }
 
 #[inline(always)]
@@ -3955,7 +3931,6 @@ impl GrpcConnection {
         // PumpEvent → GeyserEvent.  Priority: fast lane first, then overflow.
         let stream = async_stream::stream! {
             const SIG_DEDUP_CAP: usize = 100_000;
-            let mut fast_streak: usize = 0;
             let mut seen_sigs: HashSet<String> = HashSet::with_capacity(2048);
             let mut sig_order: VecDeque<String> = VecDeque::with_capacity(2048);
             loop {
@@ -3963,20 +3938,15 @@ impl GrpcConnection {
                     break;
                 }
 
-                // Fair drain policy:
-                //   - prioritize fast lane for low latency
-                //   - force periodic overflow checks so spilled events never starve
-                let prefer_overflow = fast_streak >= FAST_BURST_BEFORE_OVERFLOW_DRAIN;
-                let ev = match try_drain_dual_lane(&rx, prefer_overflow) {
-                    DrainPick::Event { ev, from_fast } => {
-                        if from_fast {
-                            fast_streak = fast_streak.saturating_add(1);
-                        } else {
-                            fast_streak = 0;
-                        }
-                        ev
-                    }
+                if let Some(gap) = rx.local_gap.take_completed() {
+                    yield Ok(GeyserEvent::LocalCoverageGap { gap });
+                    continue;
+                }
+
+                let ev = match try_drain_dual_lane(&rx, false) {
+                    DrainPick::Event { ev } => ev,
                     DrainPick::Empty => {
+                        rx.local_gap.close_open_without_after();
                         tokio::select! {
                             biased;
                             _ = shutdown_token.cancelled() => break,
@@ -5171,7 +5141,7 @@ mod tests {
         assert_eq!(conn.config.circuit_breaker_cooldown_ms, 42_000);
     }
 
-    // ── DualLaneChannel ───────────────────────────────────────────────────────
+    // ── PR1B single bounded ingress queue ────────────────────────────────────
 
     #[test]
     fn dual_lane_fast_path() {
@@ -5185,69 +5155,19 @@ mod tests {
             executed_transaction_count: 5,
             raw: vec![],
         };
-        assert!(ch.send(ev, &stats)); // goes to fast lane
+        assert!(ch.send(ev, &stats));
         assert_eq!(stats.msgs_spilled.load(Ordering::Relaxed), 0);
-        rx.fast
+        rx.queue
             .recv_timeout(Duration::from_millis(10))
-            .expect("should be in fast lane");
+            .expect("should be in ingress queue");
     }
 
     #[test]
-    fn dual_lane_spills_to_overflow_when_fast_full() {
-        // Build channel with capacity 1
-        let (fs, fr) = bounded::<PumpEvent>(1);
-        let (os, or) = bounded::<PumpEvent>(2);
-        let ch = DualLaneChannel {
-            fast: fs,
-            overflow: os,
-            capture_live_payload: Arc::new(AtomicBool::new(false)),
-        };
+    fn bounded_ingress_saturation_is_nonblocking_and_emits_one_gap() {
+        let (ch, rx) = DualLaneChannel::with_capacity(1);
         let stats = Arc::new(TransportStats::default());
-
-        // Fill fast lane
-        let ev1 = PumpEvent::EntryUpdate {
-            provider_id: None,
-            provider_role: None,
-            slot: 1,
-            received_at: Instant::now(),
-            executed_transaction_count: 0,
-            raw: vec![],
-        };
-        let ev2 = PumpEvent::EntryUpdate {
-            provider_id: None,
-            provider_role: None,
-            slot: 2,
-            received_at: Instant::now(),
-            executed_transaction_count: 0,
-            raw: vec![],
-        };
-        ch.send(ev1, &stats);
-        // Second should spill
-        let spilled = !ch.send(ev2, &stats);
-        assert!(
-            spilled || stats.msgs_spilled.load(Ordering::Relaxed) > 0,
-            "second send should spill when fast lane is full"
-        );
-        // Event must be reachable via overflow
-        assert!(
-            or.try_recv().is_ok() || fr.try_recv().is_ok(),
-            "event must be recoverable from one of the two lanes"
-        );
-    }
-
-    #[test]
-    fn dual_lane_blocks_until_overflow_has_room() {
-        let (fs, _fr) = bounded::<PumpEvent>(1);
-        let (os, or) = bounded::<PumpEvent>(1);
-        let ch = DualLaneChannel {
-            fast: fs,
-            overflow: os,
-            capture_live_payload: Arc::new(AtomicBool::new(false)),
-        };
-        let stats = Arc::new(TransportStats::default());
-
         let mk = |slot| PumpEvent::EntryUpdate {
-            provider_id: None,
+            provider_id: Some("primary-a".to_string()),
             provider_role: None,
             slot,
             received_at: Instant::now(),
@@ -5256,76 +5176,27 @@ mod tests {
         };
 
         assert!(ch.send(mk(1), &stats));
+        let started = Instant::now();
         assert!(!ch.send(mk(2), &stats));
-
-        let drain_thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(25));
-            or.recv_timeout(Duration::from_millis(100))
-                .expect("overflow lane should contain one event");
-        });
         assert!(!ch.send(mk(3), &stats));
-        drain_thread.join().expect("drain thread should finish");
+        assert!(
+            started.elapsed() < Duration::from_millis(5),
+            "saturation must not block the receive thread"
+        );
+        rx.queue.try_recv().expect("drain pre-gap event");
+        assert!(ch.send(mk(4), &stats), "first post-gap event is admitted");
 
         assert_eq!(stats.msgs_spilled.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.msgs_overflow_dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(rx.local_gap.completed_len(), 1);
+        let gap = rx.local_gap.take_completed().expect("typed local gap");
         assert_eq!(
-            stats.msgs_overflow_dropped.load(Ordering::Relaxed),
-            0,
-            "blocking overflow path must not drop events"
+            gap.reason,
+            ghost_core::LocalCoverageGapReasonV1::IngressQueueSaturated
         );
-    }
-
-    #[test]
-    fn dual_lane_fair_drain_pulls_overflow_during_fast_burst() {
-        let (fs, fr) = bounded::<PumpEvent>(128);
-        let (os, or) = bounded::<PumpEvent>(1);
-        for i in 0..80u64 {
-            fs.send(PumpEvent::EntryUpdate {
-                provider_id: None,
-                provider_role: None,
-                slot: i,
-                received_at: Instant::now(),
-                executed_transaction_count: 0,
-                raw: vec![],
-            })
-            .expect("seed fast lane");
-        }
-        os.send(PumpEvent::EntryUpdate {
-            provider_id: None,
-            provider_role: None,
-            slot: 999,
-            received_at: Instant::now(),
-            executed_transaction_count: 0,
-            raw: vec![],
-        })
-        .expect("seed overflow lane");
-
-        let rx = DualLaneReceiver {
-            fast: fr,
-            overflow: or,
-        };
-
-        let mut fast_streak = 0usize;
-        let mut saw_overflow = false;
-        for _ in 0..100 {
-            let prefer_overflow = fast_streak >= FAST_BURST_BEFORE_OVERFLOW_DRAIN;
-            match try_drain_dual_lane(&rx, prefer_overflow) {
-                DrainPick::Event { from_fast, .. } => {
-                    if from_fast {
-                        fast_streak += 1;
-                    } else {
-                        saw_overflow = true;
-                        break;
-                    }
-                }
-                DrainPick::Empty => {}
-                DrainPick::Disconnected => break,
-            }
-        }
-
-        assert!(
-            saw_overflow,
-            "overflow lane must be serviced even when fast lane is continuously non-empty"
-        );
+        assert_eq!(gap.before.slot, Some(1));
+        assert_eq!(gap.after.slot, Some(4));
+        assert!(!gap.recovered);
     }
 
     // ── [FIX-1] Entry event forwarded ────────────────────────────────────────
@@ -6307,12 +6178,12 @@ mod tests {
     // ── inject_backfill ───────────────────────────────────────────────────────
 
     #[test]
-    fn inject_backfill_reachable_via_fast_lane() {
+    fn inject_backfill_reachable_via_ingress_queue() {
         let cfg = GrpcConfig::default();
         let (conn, rx, _gap_rx) = YellowstoneConnector::new(cfg);
         conn.inject_backfill("SIG1".into(), 42, vec![1, 2, 3]);
         let ev = rx
-            .fast
+            .queue
             .recv_timeout(Duration::from_millis(50))
             .expect("event not received");
         assert!(ev.is_backfill());

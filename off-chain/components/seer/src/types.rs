@@ -170,6 +170,10 @@ pub fn record_trade_outcome_metric(outcome: TradeOutcome) {
 /// Represents a raw event from the Geyser/WebSocket stream
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GeyserEvent {
+    /// Typed loss of local post-provider coverage. This is not a Yellowstone
+    /// slot gap and does not authorize reconnect/backfill.
+    LocalCoverageGap { gap: ghost_core::LocalCoverageGapV1 },
+
     /// Transaction event with slot, signature, and transaction data
     Transaction {
         /// Stable identifier of the raw provider that supplied this observation.
