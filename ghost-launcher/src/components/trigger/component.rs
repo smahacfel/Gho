@@ -6041,6 +6041,8 @@ mod tests {
 
     fn seed_canonical_buy_state(account_state_core: &Arc<AccountStateReducer>, mint: Pubkey) {
         let update = ghost_core::account_state_core::types::AccountStateUpdate {
+            provider_id: None,
+            provider_role: None,
             pool_amm_id: Pubkey::new_unique(),
             base_mint: mint,
             bonding_curve: Pubkey::new_unique(),
@@ -6049,6 +6051,7 @@ mod tests {
             is_complete: 0,
             slot: 100,
             write_version: Some(1),
+            txn_signature: None,
             source_account_pubkey: None,
             source_account_owner_or_program: None,
             account_data_len: None,
@@ -7599,6 +7602,8 @@ mod tests {
         let source_account_pubkey = Pubkey::new_unique();
         let source_owner = Pubkey::new_unique();
         let update = ghost_core::account_state_core::types::AccountStateUpdate {
+            provider_id: None,
+            provider_role: None,
             pool_amm_id: Pubkey::new_unique(),
             base_mint: mint,
             bonding_curve: source_account_pubkey,
@@ -7607,6 +7612,7 @@ mod tests {
             is_complete: 0,
             slot: 100,
             write_version: Some(9),
+            txn_signature: None,
             source_account_pubkey: Some(source_account_pubkey),
             source_account_owner_or_program: Some(source_owner),
             account_data_len: Some(56),

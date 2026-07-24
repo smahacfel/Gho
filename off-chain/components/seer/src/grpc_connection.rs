@@ -17,7 +17,7 @@
 ///   • Backfill inject with parser-first tag
 ///
 /// [dependencies]
-/// yellowstone-grpc-client  = "1.14"  (proto 1.14 — no nonempty_txn_signature, no post_accounts)
+/// yellowstone-grpc-client  = "1.14"
 /// yellowstone-grpc-proto   = "1.14"
 /// tokio                    = { version = "1", features = ["full"] }
 /// tonic                    = { version = "0.10", features = ["tls", "tls-roots"] }
@@ -157,15 +157,25 @@ static PARSER_TX_DECODE_MALFORMED: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 pub enum PumpEvent {
     Transaction {
+        provider_id: Option<String>,
+        provider_role: Option<ghost_core::RawProviderRoleV1>,
         signature: String,
         slot: u64,
         received_at: Instant,
-        /// Raw SubscribeUpdateTransaction proto bytes.
+        /// Captured payload bytes handed by the Yellowstone adapter to
+        /// normalization.
+        ///
+        /// Yellowstone gRPC yields a decoded `SubscribeUpdate`; the adapter
+        /// captures its `SubscribeUpdateTransaction` child by prost-encoding
+        /// the in-memory message. These bytes are deterministic for this
+        /// adapter representation, not the original gRPC wire frame.
         /// Decoded off the I/O thread by parser workers.
         /// Never decoded inside route_update or the gRPC receive loop.
         raw: Vec<u8>,
     },
     AccountUpdate {
+        provider_id: Option<String>,
+        provider_role: Option<ghost_core::RawProviderRoleV1>,
         pubkey: String,
         slot: u64,
         received_at: Instant,
@@ -181,6 +191,8 @@ pub enum PumpEvent {
     /// Ghost parser walks inner_ixs here to catch the ~20-30% of migrate events
     /// that appear only as CPI inside block entries.
     EntryUpdate {
+        provider_id: Option<String>,
+        provider_role: Option<ghost_core::RawProviderRoleV1>,
         slot: u64,
         received_at: Instant,
         executed_transaction_count: u64,
@@ -190,6 +202,8 @@ pub enum PumpEvent {
     /// Backfill replay — identical wire format as Transaction.
     /// Tagged so parser enforces "backfill → parse → classify" policy.
     BackfillTransaction {
+        provider_id: Option<String>,
+        provider_role: Option<ghost_core::RawProviderRoleV1>,
         signature: String,
         slot: u64,
         received_at: Instant,
@@ -1456,8 +1470,10 @@ pub struct Provider {
     pub x_token: Option<String>,
     /// Metadata header used for authentication.
     pub auth_header: String,
-    /// Human-readable label for logs / metrics.
+    /// Stable provider identifier used for logs, metrics and provenance.
     pub label: String,
+    /// Explicit raw-provider role. It is metadata-only in PR 1A.
+    pub role: ghost_core::RawProviderRoleV1,
 }
 
 impl Provider {
@@ -1480,7 +1496,34 @@ impl Provider {
             x_token,
             auth_header: auth_header.into(),
             label: label.into(),
+            role: ghost_core::RawProviderRoleV1::PrimaryAuthority,
         }
+    }
+
+    /// Construct a provider with an explicit authority/witness role.
+    pub fn new_with_role(
+        endpoint: impl Into<String>,
+        x_token: Option<String>,
+        label: impl Into<String>,
+        role: ghost_core::RawProviderRoleV1,
+    ) -> Self {
+        let mut provider = Self::new(endpoint, x_token, label);
+        provider.role = role;
+        provider
+    }
+
+    /// Convenience constructor for a secondary raw witness.
+    pub fn secondary(
+        endpoint: impl Into<String>,
+        x_token: Option<String>,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::new_with_role(
+            endpoint,
+            x_token,
+            label,
+            ghost_core::RawProviderRoleV1::SecondaryWitness,
+        )
     }
 
     /// Convenience: single anonymous provider.
@@ -1493,17 +1536,79 @@ impl Provider {
         x_token: Option<String>,
         auth_header: impl Into<String>,
     ) -> Self {
-        Self::new_with_auth_header(endpoint, x_token, "primary", auth_header)
+        Self::primary_with_auth_header(endpoint, x_token, "primary", auth_header)
+    }
+
+    /// Construct the primary provider with a stable, config-supplied ID.
+    pub fn primary_with_auth_header(
+        endpoint: impl Into<String>,
+        x_token: Option<String>,
+        provider_id: impl Into<String>,
+        auth_header: impl Into<String>,
+    ) -> Self {
+        Self::new_with_auth_header(endpoint, x_token, provider_id, auth_header)
     }
 }
 
 // ─── Configuration ────────────────────────────────────────────────────────────
+
+/// Declarative primary/secondary assignment expected from production config.
+///
+/// The transport validates this against concrete `Provider`s before starting
+/// workers. This is intentionally a configuration/transport contract only;
+/// PR 1A does not use it to change account-state or canonical-event authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawProviderRoleConfigV1 {
+    pub primary_raw_provider_id: String,
+    pub secondary_raw_provider_ids: Vec<String>,
+}
+
+impl RawProviderRoleConfigV1 {
+    pub fn new(
+        primary_raw_provider_id: impl Into<String>,
+        secondary_raw_provider_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            primary_raw_provider_id: primary_raw_provider_id.into(),
+            secondary_raw_provider_ids,
+        }
+    }
+
+    fn validate_declared_ids(&self) -> Result<()> {
+        if self.primary_raw_provider_id.trim().is_empty()
+            || self.primary_raw_provider_id != self.primary_raw_provider_id.trim()
+        {
+            anyhow::bail!("primary_raw_provider_id must be non-empty and trimmed");
+        }
+
+        let mut secondary_ids = HashSet::new();
+        for secondary_id in &self.secondary_raw_provider_ids {
+            if secondary_id.trim().is_empty() || secondary_id != secondary_id.trim() {
+                anyhow::bail!("secondary_raw_provider_ids must contain only non-empty trimmed IDs");
+            }
+            if secondary_id == &self.primary_raw_provider_id {
+                anyhow::bail!(
+                    "secondary_raw_provider_ids must not contain primary_raw_provider_id '{}'",
+                    self.primary_raw_provider_id
+                );
+            }
+            if !secondary_ids.insert(secondary_id.as_str()) {
+                anyhow::bail!("secondary_raw_provider_ids contains duplicate ID '{secondary_id}'");
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct GrpcConfig {
     /// [FIX-3] Multiple providers — all run in parallel, events merged on one channel.
     /// Provides N-way redundancy: one provider outage ≠ 0% coverage.
     pub providers: Vec<Provider>,
+    /// Production configuration expected for primary/secondary provider IDs.
+    /// `None` preserves programmatic API compatibility while still enforcing
+    /// one primary and unique, non-empty provider IDs at runtime.
+    pub provider_role_config: Option<RawProviderRoleConfigV1>,
     /// Independent streams per provider (increase for very high TPS endpoints).
     pub streams_per_provider: usize,
     pub commitment: CommitmentLevel,
@@ -1519,6 +1624,7 @@ impl Default for GrpcConfig {
     fn default() -> Self {
         Self {
             providers: vec![],
+            provider_role_config: None,
             streams_per_provider: 1,
             commitment: CommitmentLevel::Processed,
             stall_timeout_secs: DEFAULT_SILENT_STALL_SECS,
@@ -1535,6 +1641,83 @@ impl GrpcConfig {
     pub fn with_provider(mut self, p: Provider) -> Self {
         self.providers.push(p);
         self
+    }
+
+    pub fn with_provider_role_config(mut self, config: RawProviderRoleConfigV1) -> Self {
+        self.provider_role_config = Some(config);
+        self
+    }
+
+    fn validate_provider_roles(&self) -> Result<()> {
+        if self.providers.is_empty() {
+            anyhow::bail!("GrpcConfig has no providers — add at least one Provider");
+        }
+
+        let mut provider_ids = HashSet::new();
+        let mut primary_count = 0usize;
+        for provider in &self.providers {
+            if provider.label.trim().is_empty() || provider.label != provider.label.trim() {
+                anyhow::bail!("raw provider ID must be non-empty and trimmed");
+            }
+            if !provider_ids.insert(provider.label.as_str()) {
+                anyhow::bail!("duplicate raw provider ID '{}'", provider.label);
+            }
+            if provider.role == ghost_core::RawProviderRoleV1::PrimaryAuthority {
+                primary_count += 1;
+            }
+        }
+
+        if primary_count != 1 {
+            anyhow::bail!(
+                "GrpcConfig requires exactly one PrimaryAuthority provider, found {primary_count}"
+            );
+        }
+
+        if let Some(contract) = &self.provider_role_config {
+            contract.validate_declared_ids()?;
+            for provider in &self.providers {
+                let expected_role = if provider.label == contract.primary_raw_provider_id {
+                    ghost_core::RawProviderRoleV1::PrimaryAuthority
+                } else if contract
+                    .secondary_raw_provider_ids
+                    .iter()
+                    .any(|id| id == &provider.label)
+                {
+                    ghost_core::RawProviderRoleV1::SecondaryWitness
+                } else {
+                    anyhow::bail!(
+                        "raw provider '{}' is not declared by primary_raw_provider_id or secondary_raw_provider_ids",
+                        provider.label
+                    );
+                };
+
+                if provider.role != expected_role {
+                    anyhow::bail!(
+                        "raw provider '{}' has role '{}' but configured role is '{}'",
+                        provider.label,
+                        provider.role.as_str(),
+                        expected_role.as_str()
+                    );
+                }
+            }
+
+            if !provider_ids.contains(contract.primary_raw_provider_id.as_str()) {
+                anyhow::bail!(
+                    "primary_raw_provider_id '{}' has no configured provider endpoint",
+                    contract.primary_raw_provider_id
+                );
+            }
+            for secondary_id in &contract.secondary_raw_provider_ids {
+                if !provider_ids.contains(secondary_id.as_str()) {
+                    anyhow::bail!(
+                        "secondary_raw_provider_id '{}' has no configured provider endpoint",
+                        secondary_id
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1750,8 +1933,11 @@ impl YellowstoneConnector {
     /// Policy: backfill → parser → classify.  Never short-circuit in transport.
     #[cfg(test)]
     fn inject_backfill(&self, sig: String, slot: u64, raw: Vec<u8>) -> bool {
-        let decoded = decode_tx_to_geyser_event(raw, &sig, slot, "grpc_backfill", None).ok();
+        let decoded =
+            decode_tx_to_geyser_event(raw, &sig, slot, "grpc_backfill", None, None, None).ok();
         let ev = PumpEvent::BackfillTransaction {
+            provider_id: None,
+            provider_role: None,
             signature: sig,
             slot,
             received_at: Instant::now(),
@@ -1762,9 +1948,7 @@ impl YellowstoneConnector {
 
     /// Run all provider workers.  Returns when shutdown is signalled.
     async fn run(self) -> Result<()> {
-        if self.config.providers.is_empty() {
-            anyhow::bail!("GrpcConfig has no providers — add at least one Provider");
-        }
+        self.config.validate_provider_roles()?;
 
         let n_providers = self.config.providers.len();
         let n_streams = self.config.streams_per_provider.max(1);
@@ -1950,6 +2134,8 @@ async fn connection_loop(
             &id,
             client,
             &cfg,
+            &prov.label,
+            prov.role,
             from_slot,
             &channel,
             &stats,
@@ -2560,6 +2746,8 @@ async fn stream_loop(
     id: &str,
     mut client: GeyserGrpcClient<impl tonic::service::Interceptor>,
     cfg: &GrpcConfig,
+    provider_id: &str,
+    provider_role: ghost_core::RawProviderRoleV1,
     from_slot: u64,
     channel: &DualLaneChannel,
     stats: &Arc<TransportStats>,
@@ -2670,7 +2858,18 @@ async fn stream_loop(
                             debug!("[{id}] ← pong {}", p.id);
                         } else {
                             breaker.record_message_progress();
-                            route_update(id, msg, channel, stats, slots, gap_tx, latest_block_time_secs, registry);
+                            route_update(
+                                id,
+                                msg,
+                                provider_id,
+                                provider_role,
+                                channel,
+                                stats,
+                                slots,
+                                gap_tx,
+                                latest_block_time_secs,
+                                registry,
+                            );
                         }
 
                         // [RC-2 fix] Removed immediate resub on every incoming event.
@@ -2872,6 +3071,8 @@ async fn stream_loop(
 fn route_update(
     _id: &str,
     msg: yellowstone_grpc_proto::prelude::SubscribeUpdate,
+    provider_id: &str,
+    provider_role: ghost_core::RawProviderRoleV1,
     channel: &DualLaneChannel,
     stats: &Arc<TransportStats>,
     slots: &Arc<SlotTracker>,
@@ -2910,6 +3111,8 @@ fn route_update(
                 channel,
                 stats,
                 PumpEvent::Transaction {
+                    provider_id: Some(provider_id.to_string()),
+                    provider_role: Some(provider_role),
                     signature: sig,
                     slot,
                     received_at,
@@ -2951,12 +3154,15 @@ fn route_update(
             stats.bump_account();
 
             // Account updates do not need raw bytes downstream, so avoid encode+decode churn.
-            let decoded = account_update_to_geyser_event(a, &pubkey, slot).ok();
+            let decoded =
+                account_update_to_geyser_event(a, &pubkey, slot, provider_id, provider_role).ok();
 
             emit(
                 channel,
                 stats,
                 PumpEvent::AccountUpdate {
+                    provider_id: Some(provider_id.to_string()),
+                    provider_role: Some(provider_role),
                     pubkey,
                     slot,
                     received_at,
@@ -2990,6 +3196,8 @@ fn route_update(
                 channel,
                 stats,
                 PumpEvent::EntryUpdate {
+                    provider_id: Some(provider_id.to_string()),
+                    provider_role: Some(provider_role),
                     slot,
                     received_at,
                     executed_transaction_count,
@@ -3325,6 +3533,43 @@ impl GrpcConnection {
         commitment: SeerCommitmentLevel,
         rpc_endpoint: Option<String>,
     ) -> Self {
+        Self::new_with_auth_header_and_provider_roles(
+            endpoint,
+            _client_id,
+            auth_token,
+            auth_header,
+            "primary".to_string(),
+            Vec::new(),
+            _metrics,
+            _max_reconnect,
+            _reconnect_delay,
+            _max_reconnect_delay,
+            _verbose,
+            commitment,
+            rpc_endpoint,
+        )
+    }
+
+    /// Builds the active gRPC transport with a declared provider-role contract.
+    ///
+    /// The contract is validated by `connect_geyser` before any connection
+    /// worker starts. A non-empty secondary list without matching provider
+    /// endpoints therefore fails closed instead of being ignored.
+    pub fn new_with_auth_header_and_provider_roles(
+        endpoint: String,
+        _client_id: Option<String>,
+        auth_token: Option<String>,
+        auth_header: String,
+        primary_raw_provider_id: String,
+        secondary_raw_provider_ids: Vec<String>,
+        _metrics: Arc<SeerMetrics>,
+        _max_reconnect: u32,
+        _reconnect_delay: u64,
+        _max_reconnect_delay: u64,
+        _verbose: bool,
+        commitment: SeerCommitmentLevel,
+        rpc_endpoint: Option<String>,
+    ) -> Self {
         let proto_commitment = match commitment {
             SeerCommitmentLevel::Mempool => {
                 yellowstone_grpc_proto::prelude::CommitmentLevel::Processed
@@ -3338,11 +3583,16 @@ impl GrpcConnection {
         };
 
         let cfg = GrpcConfig {
-            providers: vec![Provider::single_with_auth_header(
+            providers: vec![Provider::primary_with_auth_header(
                 endpoint,
                 auth_token,
+                primary_raw_provider_id.clone(),
                 auth_header,
             )],
+            provider_role_config: Some(RawProviderRoleConfigV1::new(
+                primary_raw_provider_id,
+                secondary_raw_provider_ids,
+            )),
             streams_per_provider: 1,
             commitment: proto_commitment,
             stall_timeout_secs: DEFAULT_SILENT_STALL_SECS,
@@ -3504,6 +3754,10 @@ impl GrpcConnection {
     /// Internally spawns the YellowstoneConnector as a background task and
     /// drains the DualLaneReceiver, converting PumpEvent → GeyserEvent.
     pub async fn connect_geyser(&self) -> SeerResult<EventStream> {
+        self.config.validate_provider_roles().map_err(|e| {
+            SeerError::ConfigError(format!("invalid raw provider role contract: {e}"))
+        })?;
+
         let connector = self
             .connector
             .lock()
@@ -3686,7 +3940,7 @@ impl GrpcConnection {
                         metrics::histogram!("ingestion_latency_ms", ingestion_latency_ms);
                         yield Err(e)
                     }
-                    None                => {} // filtered out (EntryUpdate etc.)
+                    None                => {}
                 }
             }
         };
@@ -3805,7 +4059,17 @@ impl GrpcConnection {
         slot: u64,
         decoded: crate::types::GeyserEvent,
     ) {
+        let (provider_id, provider_role) = match &decoded {
+            crate::types::GeyserEvent::AccountUpdate {
+                provider_id,
+                provider_role,
+                ..
+            } => (provider_id.clone(), *provider_role),
+            _ => (None, None),
+        };
         let ev = PumpEvent::AccountUpdate {
+            provider_id,
+            provider_role,
             pubkey: curve_pubkey.clone(),
             slot,
             received_at: Instant::now(),
@@ -3915,12 +4179,18 @@ async fn run_manual_backfill_worker_with_fetcher<F, Fut>(
                 let mut recovered = 0u64;
                 for event in events {
                     if let GeyserEvent::Transaction {
-                        signature, slot, ..
+                        provider_id,
+                        provider_role,
+                        signature,
+                        slot,
+                        ..
                     } = &event
                     {
                         let signature_str = signature.to_string();
                         let sent_fast = injector.send(
                             PumpEvent::BackfillTransaction {
+                                provider_id: provider_id.clone(),
+                                provider_role: *provider_role,
                                 signature: signature_str,
                                 slot: slot.unwrap_or_default(),
                                 received_at: Instant::now(),
@@ -4052,6 +4322,8 @@ async fn fetch_gap_backfill_events(
         let arrival_ts_ms = crate::types::arrival_time_ms();
         let ingress_wall_ts_ms = crate::types::ingress_epoch_ms();
         out.push(GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: crate::types::normalize_slot(Some(slot)),
             tx_index: None,
             event_ts_ms: crate::types::event_ts_from_block_time(tx.block_time),
@@ -4087,8 +4359,9 @@ async fn fetch_gap_backfill_events(
 
 /// Convert a PumpEvent (raw proto bytes) into a GeyserEvent (parsed fields).
 ///
-/// Returns None for event types that don't map to GeyserEvent (e.g., EntryUpdate),
-/// which lib.rs doesn't consume directly — the BinaryParser adapter handles those.
+/// Returns None only for future transport-only events that do not map to the
+/// public `GeyserEvent` stream. `EntryUpdate` maps to `EntryAnchor` because it
+/// is part of Yellowstone coverage/gap provenance.
 fn pump_event_to_geyser_event(
     ev: PumpEvent,
     live_source_label: &'static str,
@@ -4096,6 +4369,8 @@ fn pump_event_to_geyser_event(
 ) -> Option<SeerResult<GeyserEvent>> {
     match ev {
         PumpEvent::Transaction {
+            provider_id,
+            provider_role,
             signature,
             slot,
             received_at: _,
@@ -4108,17 +4383,44 @@ fn pump_event_to_geyser_event(
                 slot,
                 live_source_label,
                 block_time,
+                provider_id,
+                provider_role,
             ))
         }
         PumpEvent::BackfillTransaction {
+            provider_id,
+            provider_role,
             signature: _,
             slot: _,
             received_at: _,
             decoded,
         } => Some(
-            decoded.ok_or_else(|| SeerError::ParseError("failed inline decode of backfill".into())),
+            decoded
+                .ok_or_else(|| SeerError::ParseError("failed inline decode of backfill".into()))
+                .map(|mut decoded| {
+                    // The manual backfill producer may have decoded the transaction
+                    // before it attached its outer raw-provider metadata. Preserve
+                    // explicit decoder provenance, and fill only absent values from
+                    // the enclosing PumpEvent.
+                    if let GeyserEvent::Transaction {
+                        provider_id: decoded_provider_id,
+                        provider_role: decoded_provider_role,
+                        ..
+                    } = &mut decoded
+                    {
+                        if decoded_provider_id.is_none() {
+                            *decoded_provider_id = provider_id;
+                        }
+                        if decoded_provider_role.is_none() {
+                            *decoded_provider_role = provider_role;
+                        }
+                    }
+                    decoded
+                }),
         ),
         PumpEvent::AccountUpdate {
+            provider_id: _,
+            provider_role: _,
             pubkey: _,
             slot: _,
             received_at: _,
@@ -4129,11 +4431,15 @@ fn pump_event_to_geyser_event(
             }))
         }
         PumpEvent::EntryUpdate {
+            provider_id,
+            provider_role,
             slot,
             executed_transaction_count,
             raw,
             ..
         } => Some(Ok(GeyserEvent::EntryAnchor {
+            provider_id,
+            provider_role,
             slot,
             executed_transaction_count,
             raw,
@@ -4147,13 +4453,24 @@ fn decode_tx_to_geyser_event(
     slot: u64,
     source: &str,
     block_time: Option<i64>,
+    provider_id: Option<String>,
+    provider_role: Option<ghost_core::RawProviderRoleV1>,
 ) -> SeerResult<GeyserEvent> {
     use yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction;
 
     let result = (|| {
         let update = <SubscribeUpdateTransaction as prost::Message>::decode(raw.as_slice())
             .map_err(|e| SeerError::ParseError(format!("proto decode Tx: {e}")))?;
-        tx_update_to_geyser_event(update, sig_str, slot, source, raw, block_time)
+        tx_update_to_geyser_event(
+            update,
+            sig_str,
+            slot,
+            source,
+            raw,
+            block_time,
+            provider_id,
+            provider_role,
+        )
     })();
     record_parser_malformed_tx_sample(result.is_err());
     result
@@ -4166,6 +4483,8 @@ fn tx_update_to_geyser_event(
     source: &str,
     raw: Vec<u8>,
     block_time: Option<i64>,
+    provider_id: Option<String>,
+    provider_role: Option<ghost_core::RawProviderRoleV1>,
 ) -> SeerResult<GeyserEvent> {
     let arrival_ts_ms = crate::types::arrival_time_ms();
     let ingress_ts_ms = crate::types::ingress_epoch_ms();
@@ -4314,6 +4633,8 @@ fn tx_update_to_geyser_event(
     };
 
     Ok(GeyserEvent::Transaction {
+        provider_id,
+        provider_role,
         slot: Some(slot),
         tx_index: Some(tx_index),
         event_ts_ms: Some(compat_tx_event_ts_ms(block_time, ingress_ts_ms)),
@@ -4352,6 +4673,8 @@ fn account_update_to_geyser_event(
     update: yellowstone_grpc_proto::prelude::SubscribeUpdateAccount,
     pubkey_str: &str,
     slot: u64,
+    provider_id: &str,
+    provider_role: ghost_core::RawProviderRoleV1,
 ) -> SeerResult<GeyserEvent> {
     let acc = update
         .account
@@ -4360,8 +4683,20 @@ fn account_update_to_geyser_event(
 
     let pubkey = Pubkey::from_str(pubkey_str).unwrap_or_default();
     let owner = Pubkey::try_from(acc.owner.as_slice()).unwrap_or_default();
+    let txn_signature = acc
+        .txn_signature
+        .as_deref()
+        .map(Signature::try_from)
+        .transpose()
+        .map_err(|err| {
+            SeerError::ParseError(format!(
+                "invalid account txn_signature for {pubkey_str}: {err}"
+            ))
+        })?;
 
     Ok(GeyserEvent::AccountUpdate {
+        provider_id: Some(provider_id.to_string()),
+        provider_role: Some(provider_role),
         slot,
         event_time: ghost_core::EventTimeMetadata::new(
             None,
@@ -4369,6 +4704,7 @@ fn account_update_to_geyser_event(
             Some(crate::types::arrival_time_ms()),
         ),
         write_version: Some(acc.write_version),
+        txn_signature,
         pubkey,
         data: acc.data.clone(),
         owner,
@@ -4380,9 +4716,91 @@ fn account_update_to_geyser_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binary_parser::BinaryParser;
+    use crate::ipc::{create_ipc_channel, EventPriority, IpcChannelConfig, SeerEvent};
     use futures::StreamExt;
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::Signature;
+    use yellowstone_grpc_proto::prelude::{SubscribeUpdateAccount, SubscribeUpdateAccountInfo};
+
+    fn raw_account_update(
+        account_pubkey: Pubkey,
+        owner: Pubkey,
+        write_version: u64,
+        txn_signature: Option<Signature>,
+    ) -> SubscribeUpdateAccount {
+        SubscribeUpdateAccount {
+            account: Some(SubscribeUpdateAccountInfo {
+                pubkey: account_pubkey.to_bytes().to_vec(),
+                lamports: 1,
+                owner: owner.to_bytes().to_vec(),
+                executable: false,
+                rent_epoch: 0,
+                data: vec![1, 2, 3],
+                write_version,
+                txn_signature: txn_signature.map(|signature| signature.as_ref().to_vec()),
+            }),
+            slot: 42,
+            is_startup: false,
+        }
+    }
+
+    #[test]
+    fn account_update_preserves_provider_and_optional_transaction_signature() {
+        let account_pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let signature = Signature::new_unique();
+
+        let with_signature = account_update_to_geyser_event(
+            raw_account_update(account_pubkey, owner, 7, Some(signature)),
+            &account_pubkey.to_string(),
+            42,
+            "raw-primary",
+            ghost_core::RawProviderRoleV1::PrimaryAuthority,
+        )
+        .expect("valid account update");
+        let without_signature = account_update_to_geyser_event(
+            raw_account_update(account_pubkey, owner, 8, None),
+            &account_pubkey.to_string(),
+            43,
+            "raw-secondary",
+            ghost_core::RawProviderRoleV1::SecondaryWitness,
+        )
+        .expect("valid account update without transaction signature");
+
+        match with_signature {
+            GeyserEvent::AccountUpdate {
+                provider_id,
+                provider_role,
+                txn_signature,
+                ..
+            } => {
+                assert_eq!(provider_id.as_deref(), Some("raw-primary"));
+                assert_eq!(
+                    provider_role,
+                    Some(ghost_core::RawProviderRoleV1::PrimaryAuthority)
+                );
+                assert_eq!(txn_signature, Some(signature));
+            }
+            other => panic!("expected account update, got {other:?}"),
+        }
+        match without_signature {
+            GeyserEvent::AccountUpdate {
+                provider_id,
+                provider_role,
+                txn_signature,
+                ..
+            } => {
+                assert_eq!(provider_id.as_deref(), Some("raw-secondary"));
+                assert_eq!(
+                    provider_role,
+                    Some(ghost_core::RawProviderRoleV1::SecondaryWitness)
+                );
+                assert_eq!(txn_signature, None);
+            }
+            other => panic!("expected account update, got {other:?}"),
+        }
+    }
 
     // ── SlotTracker ───────────────────────────────────────────────────────────
 
@@ -4662,6 +5080,8 @@ mod tests {
         let (ch, rx) = DualLaneChannel::new();
         let stats = Arc::new(TransportStats::default());
         let ev = PumpEvent::EntryUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 1,
             received_at: Instant::now(),
             executed_transaction_count: 5,
@@ -4687,12 +5107,16 @@ mod tests {
 
         // Fill fast lane
         let ev1 = PumpEvent::EntryUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 1,
             received_at: Instant::now(),
             executed_transaction_count: 0,
             raw: vec![],
         };
         let ev2 = PumpEvent::EntryUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 2,
             received_at: Instant::now(),
             executed_transaction_count: 0,
@@ -4723,6 +5147,8 @@ mod tests {
         let stats = Arc::new(TransportStats::default());
 
         let mk = |slot| PumpEvent::EntryUpdate {
+            provider_id: None,
+            provider_role: None,
             slot,
             received_at: Instant::now(),
             executed_transaction_count: 0,
@@ -4754,6 +5180,8 @@ mod tests {
         let (os, or) = bounded::<PumpEvent>(1);
         for i in 0..80u64 {
             fs.send(PumpEvent::EntryUpdate {
+                provider_id: None,
+                provider_role: None,
                 slot: i,
                 received_at: Instant::now(),
                 executed_transaction_count: 0,
@@ -4762,6 +5190,8 @@ mod tests {
             .expect("seed fast lane");
         }
         os.send(PumpEvent::EntryUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 999,
             received_at: Instant::now(),
             executed_transaction_count: 0,
@@ -4804,6 +5234,8 @@ mod tests {
     fn entry_event_is_emitted_not_dropped() {
         // Verify that EntryUpdate variant exists and carries executed_tx_count
         let ev = PumpEvent::EntryUpdate {
+            provider_id: None,
+            provider_role: None,
             slot: 100,
             received_at: Instant::now(),
             executed_transaction_count: 42,
@@ -4826,6 +5258,8 @@ mod tests {
     #[test]
     fn backfill_tagged_correctly() {
         let ev = PumpEvent::BackfillTransaction {
+            provider_id: None,
+            provider_role: None,
             signature: "SIG".into(),
             slot: 99,
             received_at: Instant::now(),
@@ -4841,14 +5275,180 @@ mod tests {
     fn config_multi_provider() {
         let cfg = GrpcConfig::default()
             .with_provider(Provider::new("https://p1.com:443", None, "p1"))
-            .with_provider(Provider::new(
+            .with_provider(Provider::secondary(
                 "https://p2.com:443",
                 Some("tok".into()),
                 "p2",
             ));
         assert_eq!(cfg.providers.len(), 2);
         assert_eq!(cfg.providers[0].label, "p1");
+        assert_eq!(
+            cfg.providers[0].role,
+            ghost_core::RawProviderRoleV1::PrimaryAuthority
+        );
         assert_eq!(cfg.providers[1].x_token, Some("tok".into()));
+        assert_eq!(
+            cfg.providers[1].role,
+            ghost_core::RawProviderRoleV1::SecondaryWitness
+        );
+    }
+
+    #[test]
+    fn provider_role_contract_accepts_exactly_one_declared_primary() {
+        let cfg = GrpcConfig::default()
+            .with_provider(Provider::new("https://p1.com:443", None, "raw-primary"))
+            .with_provider(Provider::secondary(
+                "https://p2.com:443",
+                None,
+                "raw-secondary",
+            ))
+            .with_provider_role_config(RawProviderRoleConfigV1::new(
+                "raw-primary",
+                vec!["raw-secondary".to_string()],
+            ));
+
+        cfg.validate_provider_roles()
+            .expect("declared primary and secondary providers must validate");
+    }
+
+    #[test]
+    fn provider_role_contract_rejects_multiple_implicit_primaries() {
+        let cfg = GrpcConfig::default()
+            .with_provider(Provider::new("https://p1.com:443", None, "raw-primary-a"))
+            .with_provider(Provider::new("https://p2.com:443", None, "raw-primary-b"));
+
+        let error = cfg
+            .validate_provider_roles()
+            .expect_err("multiple primary providers must fail closed");
+        assert!(error.to_string().contains("exactly one PrimaryAuthority"));
+    }
+
+    #[test]
+    fn provider_role_contract_rejects_duplicate_or_missing_provider_ids() {
+        let duplicate = GrpcConfig::default()
+            .with_provider(Provider::new("https://p1.com:443", None, "same-id"))
+            .with_provider(Provider::secondary("https://p2.com:443", None, "same-id"));
+        assert!(duplicate
+            .validate_provider_roles()
+            .expect_err("duplicate provider IDs must fail closed")
+            .to_string()
+            .contains("duplicate raw provider ID"));
+
+        let missing_secondary = GrpcConfig::default()
+            .with_provider(Provider::new("https://p1.com:443", None, "raw-primary"))
+            .with_provider_role_config(RawProviderRoleConfigV1::new(
+                "raw-primary",
+                vec!["raw-secondary".to_string()],
+            ));
+        assert!(missing_secondary
+            .validate_provider_roles()
+            .expect_err("declared secondary without endpoint must fail closed")
+            .to_string()
+            .contains("has no configured provider endpoint"));
+    }
+
+    #[test]
+    fn configured_primary_id_replaces_legacy_hardcoded_provider_label() {
+        let connection = GrpcConnection::new_with_auth_header_and_provider_roles(
+            "https://p1.com:443".to_string(),
+            None,
+            None,
+            DEFAULT_GRPC_AUTH_HEADER.to_string(),
+            "configured-primary".to_string(),
+            Vec::new(),
+            Arc::new(crate::metrics::SeerMetrics::new()),
+            1,
+            1,
+            1,
+            false,
+            crate::config::CommitmentLevel::Confirmed,
+            None,
+        );
+
+        assert_eq!(connection.config.providers.len(), 1);
+        assert_eq!(connection.config.providers[0].label, "configured-primary");
+        assert_eq!(
+            connection
+                .config
+                .provider_role_config
+                .as_ref()
+                .expect("active connection must carry a role contract")
+                .primary_raw_provider_id,
+            "configured-primary"
+        );
+        connection
+            .config
+            .validate_provider_roles()
+            .expect("configured single primary must validate");
+    }
+
+    #[tokio::test]
+    async fn connect_geyser_fails_closed_on_invalid_provider_role_contract() {
+        let connection = GrpcConnection::new_with_auth_header_and_provider_roles(
+            "https://p1.com:443".to_string(),
+            None,
+            None,
+            DEFAULT_GRPC_AUTH_HEADER.to_string(),
+            "raw-primary".to_string(),
+            vec!["missing-secondary".to_string()],
+            Arc::new(crate::metrics::SeerMetrics::new()),
+            1,
+            1,
+            1,
+            false,
+            crate::config::CommitmentLevel::Confirmed,
+            None,
+        )
+        .with_manual_backfill_enabled(false);
+
+        let err = match connection.connect_geyser().await {
+            Ok(_) => panic!("invalid provider contract must not return an active stream"),
+            Err(err) => err,
+        };
+
+        match err {
+            SeerError::ConfigError(message) => {
+                assert!(message.contains("missing-secondary"));
+                assert!(message.contains("has no configured provider endpoint"));
+            }
+            other => panic!("expected ConfigError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entry_anchor_preserves_provider_metadata() {
+        let event = PumpEvent::EntryUpdate {
+            provider_id: Some("raw-secondary".to_string()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::SecondaryWitness),
+            slot: 123,
+            received_at: Instant::now(),
+            executed_transaction_count: 9,
+            raw: vec![1, 2, 3],
+        };
+
+        let converted = pump_event_to_geyser_event(event, GRPC_GLOBAL_STREAM_SOURCE_LABEL, None)
+            .expect("entry update must map to entry anchor")
+            .expect("entry update conversion must succeed");
+
+        match converted {
+            GeyserEvent::EntryAnchor {
+                provider_id,
+                provider_role,
+                slot,
+                executed_transaction_count,
+                raw,
+            } => {
+                assert_eq!(provider_id.as_deref(), Some("raw-secondary"));
+                assert_eq!(
+                    provider_role,
+                    Some(ghost_core::RawProviderRoleV1::SecondaryWitness)
+                );
+                assert_eq!(slot, 123);
+                assert_eq!(executed_transaction_count, 9);
+                assert_eq!(raw, vec![1, 2, 3]);
+            }
+            other => panic!("expected entry anchor, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5873,6 +6473,8 @@ mod tests {
 
     fn make_decoded_tx(signature: Signature, slot: u64, source: &str) -> GeyserEvent {
         GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(slot),
             tx_index: None,
             event_ts_ms: Some(slot * 1000),
@@ -5937,6 +6539,62 @@ mod tests {
         buf
     }
 
+    /// Build one raw Yellowstone transaction whose direct Pump.fun buy can be
+    /// decoded by `BinaryParser`. The fixture intentionally starts at the raw
+    /// transport boundary so the provenance assertion cannot bypass
+    /// `PumpEvent -> GeyserEvent` normalization.
+    fn make_raw_pump_buy_tx(signature: Signature, slot: u64) -> Vec<u8> {
+        use prost::Message as _;
+        use yellowstone_grpc_proto::prelude::{
+            CompiledInstruction, Message as GrpcMessage, SubscribeUpdateTransaction,
+            SubscribeUpdateTransactionInfo, Transaction as GrpcTransaction,
+        };
+
+        let mut accounts = vec![Pubkey::new_unique(); 13];
+        accounts[2] = Pubkey::new_unique(); // Pump mint
+        accounts[3] = Pubkey::new_unique(); // Pump bonding curve
+        accounts[6] = Pubkey::new_unique(); // Transaction signer
+        accounts[8] = Pubkey::from_str(ghost_core::transaction_parser::ProgramIds::TOKEN_PROGRAM)
+            .expect("token program id");
+        accounts[12] = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("pump.fun program id");
+
+        let mut data = crate::binary_parser::DISC_BUY.to_vec();
+        data.extend_from_slice(&1_000_000_u64.to_le_bytes());
+        data.extend_from_slice(&50_000_000_u64.to_le_bytes());
+        let signature_bytes = signature.as_ref().to_vec();
+        let update = SubscribeUpdateTransaction {
+            transaction: Some(SubscribeUpdateTransactionInfo {
+                signature: signature_bytes.clone(),
+                is_vote: false,
+                transaction: Some(GrpcTransaction {
+                    signatures: vec![signature_bytes],
+                    message: Some(GrpcMessage {
+                        header: None,
+                        account_keys: accounts
+                            .iter()
+                            .map(|account| account.to_bytes().to_vec())
+                            .collect(),
+                        recent_blockhash: vec![],
+                        instructions: vec![CompiledInstruction {
+                            program_id_index: 12,
+                            accounts: (0_u8..12_u8).collect(),
+                            data,
+                        }],
+                        versioned: false,
+                        address_table_lookups: vec![],
+                    }),
+                }),
+                meta: None,
+                index: 0,
+            }),
+            slot,
+        };
+
+        let mut raw = Vec::new();
+        update.encode(&mut raw).expect("encode raw Pump buy proto");
+        raw
+    }
+
     #[tokio::test]
     async fn connect_geyser_live_transaction_retains_raw_payload_bytes() {
         let conn = GrpcConnection::new(
@@ -5951,14 +6609,14 @@ mod tests {
             crate::config::CommitmentLevel::Confirmed,
             None,
         );
-        conn.shutdown.store(true, Ordering::Relaxed);
-
         let signature = Signature::new_unique();
         let raw = make_raw_tx(signature, 321);
         let expected_raw = raw.clone();
         let stats = conn.transport_stats();
         conn.injector.send(
             PumpEvent::Transaction {
+                provider_id: None,
+                provider_role: None,
                 signature: signature.to_string(),
                 slot: 321,
                 received_at: Instant::now(),
@@ -5973,6 +6631,7 @@ mod tests {
             .expect("event timeout")
             .expect("stream ended")
             .expect("stream error");
+        conn.request_shutdown();
 
         match event {
             GeyserEvent::Transaction {
@@ -5998,6 +6657,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn raw_transaction_provider_metadata_reaches_parsed_trade_and_ipc() {
+        let signature = Signature::new_unique();
+        let provider_id = "raw-primary".to_string();
+        let provider_role = ghost_core::RawProviderRoleV1::PrimaryAuthority;
+        let raw = make_raw_pump_buy_tx(signature, 321);
+
+        let geyser_event = pump_event_to_geyser_event(
+            PumpEvent::Transaction {
+                provider_id: Some(provider_id.clone()),
+                provider_role: Some(provider_role),
+                signature: signature.to_string(),
+                slot: 321,
+                received_at: Instant::now(),
+                raw,
+            },
+            GRPC_GLOBAL_STREAM_SOURCE_LABEL,
+            None,
+        )
+        .expect("raw transaction maps to public Geyser event")
+        .expect("raw transaction decodes");
+
+        match &geyser_event {
+            GeyserEvent::Transaction {
+                provider_id: observed_provider_id,
+                provider_role: observed_provider_role,
+                tx_index,
+                ..
+            } => {
+                assert_eq!(observed_provider_id.as_deref(), Some(provider_id.as_str()));
+                assert_eq!(*observed_provider_role, Some(provider_role));
+                assert_eq!(*tx_index, Some(0), "first transaction index is valid");
+            }
+            other => panic!("expected normalized transaction, got {other:?}"),
+        }
+
+        let parser = BinaryParser::new(false);
+        let mut trades = parser
+            .parse_trades(&geyser_event)
+            .expect("raw Pump buy must parse as a trade");
+        assert_eq!(trades.len(), 1, "fixture contains exactly one Pump buy");
+        let trade = trades.remove(0);
+        assert_eq!(trade.provider_id.as_deref(), Some(provider_id.as_str()));
+        assert_eq!(trade.provider_role, Some(provider_role));
+
+        let (sender, mut receiver, _) = create_ipc_channel(IpcChannelConfig::default());
+        sender
+            .send_trade(trade, EventPriority::Normal)
+            .await
+            .expect("trade provenance must cross the Seer IPC boundary");
+        match receiver.recv().await.expect("IPC trade event") {
+            SeerEvent::Trade(observed) => {
+                assert_eq!(
+                    observed.trade.provider_id.as_deref(),
+                    Some(provider_id.as_str())
+                );
+                assert_eq!(observed.trade.provider_role, Some(provider_role));
+            }
+            other => panic!("expected IPC trade, got {other:?}"),
+        }
+    }
+
     #[test]
     fn raw_yellowstone_transaction_index_is_preserved_for_zero_and_nonzero_values() {
         for (index, expected) in [(0_u64, 0_u32), (37_u64, 37_u32)] {
@@ -6008,11 +6729,23 @@ mod tests {
                 777,
                 GRPC_GLOBAL_STREAM_SOURCE_LABEL,
                 None,
+                Some("provider-a".to_string()),
+                Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             )
             .expect("raw Yellowstone transaction must decode");
             match event {
-                GeyserEvent::Transaction { tx_index, .. } => {
+                GeyserEvent::Transaction {
+                    provider_id,
+                    provider_role,
+                    tx_index,
+                    ..
+                } => {
                     assert_eq!(tx_index, Some(expected));
+                    assert_eq!(provider_id.as_deref(), Some("provider-a"));
+                    assert_eq!(
+                        provider_role,
+                        Some(ghost_core::RawProviderRoleV1::PrimaryAuthority)
+                    );
                 }
                 other => panic!("expected transaction, got {other:?}"),
             }
@@ -6035,13 +6768,13 @@ mod tests {
         )
         .with_subscription_profile(GrpcSubscriptionProfile::FundingLaneFullChain)
         .with_manual_backfill_enabled(false);
-        conn.shutdown.store(true, Ordering::Relaxed);
-
         let signature = Signature::new_unique();
         let raw = make_raw_tx(signature, 654);
         let stats = conn.transport_stats();
         conn.injector.send(
             PumpEvent::Transaction {
+                provider_id: None,
+                provider_role: None,
                 signature: signature.to_string(),
                 slot: 654,
                 received_at: Instant::now(),
@@ -6056,6 +6789,7 @@ mod tests {
             .expect("event timeout")
             .expect("stream ended")
             .expect("stream error");
+        conn.request_shutdown();
 
         match event {
             GeyserEvent::Transaction { source, slot, .. } => {
@@ -6095,13 +6829,13 @@ mod tests {
             crate::config::CommitmentLevel::Confirmed,
             None,
         );
-        conn.shutdown.store(true, Ordering::Relaxed);
-
         let signature = Signature::new_unique();
         let signature_str = signature.to_string();
         let stats = conn.transport_stats();
         conn.injector.send(
             PumpEvent::Transaction {
+                provider_id: None,
+                provider_role: None,
                 signature: signature_str.clone(),
                 slot: 321,
                 received_at: Instant::now(),
@@ -6111,6 +6845,8 @@ mod tests {
         );
         conn.injector.send(
             PumpEvent::BackfillTransaction {
+                provider_id: None,
+                provider_role: None,
                 signature: signature_str.clone(),
                 slot: 321,
                 received_at: Instant::now(),
@@ -6139,6 +6875,7 @@ mod tests {
             "duplicate live/backfill tx with same signature should be suppressed"
         );
         assert_eq!(conn.dedup_dropped_total(), 1);
+        conn.request_shutdown();
     }
 
     #[tokio::test]
@@ -6164,6 +6901,8 @@ mod tests {
         let stats = conn.transport_stats();
         conn.injector.send(
             PumpEvent::Transaction {
+                provider_id: None,
+                provider_role: None,
                 signature: signature_str.clone(),
                 slot: 500,
                 received_at: Instant::now(),
@@ -6241,6 +6980,8 @@ mod tests {
 
     fn make_acct_ev(slot: u64, pubkey: &str) -> PumpEvent {
         PumpEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             pubkey: pubkey.into(),
             slot,
             received_at: Instant::now(),
@@ -6337,6 +7078,8 @@ mod tests {
         slot: u64,
     ) -> crate::types::GeyserEvent {
         crate::types::GeyserEvent::AccountUpdate {
+            provider_id: None,
+            provider_role: None,
             slot,
             event_time: ghost_core::EventTimeMetadata::new(
                 None,
@@ -6344,6 +7087,7 @@ mod tests {
                 Some(crate::types::arrival_time_ms()),
             ),
             write_version: None,
+            txn_signature: None,
             pubkey,
             data: vec![0u8; 56],
             owner: solana_sdk::pubkey::Pubkey::default(),

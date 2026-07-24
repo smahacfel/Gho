@@ -1039,6 +1039,12 @@ pub struct ExecutionAccountEvidenceEvent {
 /// On-chain AccountUpdate payload on the launcher event bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountUpdateEvent {
+    /// Stable raw-provider identifier when supplied by Yellowstone ingest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Configured provider role. Metadata-only in ingest integrity Observe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_role: Option<ghost_core::RawProviderRoleV1>,
     /// Cross-source semantic envelope carried through canonical ingest.
     #[serde(default)]
     pub semantic: EventSemanticEnvelope,
@@ -1068,6 +1074,10 @@ pub struct AccountUpdateEvent {
     /// Optional Solana account write-version from Yellowstone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_version: Option<u64>,
+    /// Signature of the transaction that produced this account write, when
+    /// provided by Yellowstone. Absence is never inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txn_signature: Option<solana_sdk::signature::Signature>,
     /// BLAKE3 hash of the original raw account update bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_data_hash: Option<String>,
@@ -1970,6 +1980,8 @@ mod tests {
     #[test]
     fn account_update_event_schema_remains_canonical_reserve_update() {
         let update = AccountUpdateEvent {
+            provider_id: None,
+            provider_role: None,
             semantic: ghost_core::EventSemanticEnvelope::default(),
             event_time: ghost_core::EventTimeMetadata::default(),
             base_mint: solana_sdk::pubkey::Pubkey::new_unique(),
@@ -1982,6 +1994,7 @@ mod tests {
             complete: 0,
             slot: 42,
             write_version: Some(7),
+            txn_signature: None,
             account_data_hash: None,
             account_data_len: None,
             source_account_pubkey: None,
@@ -1999,6 +2012,9 @@ mod tests {
 
         assert!(object.contains_key("base_mint"));
         assert!(object.contains_key("bonding_curve"));
+        assert!(!object.contains_key("provider_id"));
+        assert!(!object.contains_key("provider_role"));
+        assert!(!object.contains_key("txn_signature"));
         assert!(!object.contains_key("evidence"));
         assert!(!object.contains_key("account_pubkey"));
         assert!(!object.contains_key("role"));
@@ -2006,6 +2022,9 @@ mod tests {
 
         let decoded: AccountUpdateEvent =
             serde_json::from_value(serialized).expect("deserialize old-compatible account update");
+        assert_eq!(decoded.provider_id, None);
+        assert_eq!(decoded.provider_role, None);
+        assert_eq!(decoded.txn_signature, None);
         assert_eq!(decoded.account_data_hash, None);
         assert_eq!(decoded.account_data_len, None);
         assert_eq!(decoded.source_account_pubkey, None);

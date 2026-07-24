@@ -1775,6 +1775,7 @@ impl PumpParser {
                 slot,
                 received_at,
                 raw,
+                ..
             } => Self::parse_transaction_raw(
                 raw,
                 Some(signature),
@@ -1793,6 +1794,7 @@ impl PumpParser {
                 slot,
                 received_at,
                 decoded,
+                ..
             } => match decoded {
                 Some(GeyserEvent::Transaction {
                     accounts,
@@ -1834,6 +1836,7 @@ impl PumpParser {
                 slot: _,
                 received_at,
                 decoded,
+                ..
             } => match decoded {
                 Some(GeyserEvent::AccountUpdate {
                     slot, pubkey, data, ..
@@ -1854,6 +1857,7 @@ impl PumpParser {
                 received_at,
                 executed_transaction_count,
                 raw,
+                ..
             } => Self::parse_entry_raw(raw, *slot, *received_at, *executed_transaction_count),
         }
     }
@@ -3420,9 +3424,14 @@ fn make_ev(
 //
 // Internally:
 //   1. Extracts raw proto bytes from GeyserEvent::Transaction.mpcf_payload_bytes
-//   2. Wraps them in PumpEvent::Transaction
-//   3. Calls PumpParser::parse()
-//   4. Maps ParsedEventKind → InitializePoolEvent / TradeEvent
+//   2. Calls the raw/decode parser path
+//   3. Maps ParsedEventKind plus the original normalized transaction provenance
+//      → InitializePoolEvent / TradeEvent
+//
+// The parser's intermediate `ParsedPumpEvent` intentionally stays semantic.
+// Raw provider provenance remains attached to the immutable normalized input
+// and is copied at this public-output boundary, so it cannot affect parser
+// classification, canonical state, or policy authority.
 
 use crate::errors::SeerResult;
 use crate::types::{
@@ -3437,7 +3446,7 @@ use std::str::FromStr;
 
 use ghost_core::{
     ExecutionAccountEvidence, ExecutionAccountEvidenceSource, ExecutionAccountEvidenceStatus,
-    ExecutionAccountRole,
+    ExecutionAccountRole, RawProviderRoleV1,
 };
 
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
@@ -3469,6 +3478,24 @@ struct RuntimeTradeContext {
     jito_tip_detected: Option<bool>,
     signer_pre_balance_lamports: HashMap<String, u64>,
     signer_post_balance_lamports: HashMap<String, u64>,
+}
+
+/// Extract raw-provider provenance from a normalized transaction exactly once
+/// at the parser boundary.  Parsed semantic events may fan out from one raw
+/// transaction, so every resulting `TradeEvent` and `InitializePoolEvent`
+/// receives the same observation metadata without making it an identity or
+/// authority input.
+fn transaction_provider_metadata(
+    event: &GeyserEvent,
+) -> (Option<String>, Option<RawProviderRoleV1>) {
+    match event {
+        GeyserEvent::Transaction {
+            provider_id,
+            provider_role,
+            ..
+        } => (provider_id.clone(), *provider_role),
+        _ => (None, None),
+    }
 }
 
 const BCV2_RPC_HYDRATION_QUEUE_CAP: usize = 1024;
@@ -4060,6 +4087,7 @@ impl BinaryParser {
     ) -> SeerResult<Option<InitializePoolEvent>> {
         let event_time = crate::types::transaction_event_time(event);
         let event_ts_ms = event.compat_event_ts_ms();
+        let (provider_id, provider_role) = transaction_provider_metadata(event);
         let parsed = self.parse_pump_events(event);
         // Priority: CpiCreate (Borsh event log, ec.user is always correct) >
         //           Create (direct instruction, account index may shift across Pump.fun versions) >
@@ -4102,6 +4130,8 @@ impl BinaryParser {
                     };
 
                     return Ok(Some(InitializePoolEvent {
+                        provider_id: provider_id.clone(),
+                        provider_role,
                         slot: Some(p.slot),
                         event_ts_ms,
                         event_time,
@@ -4133,6 +4163,8 @@ impl BinaryParser {
                     };
 
                     return Ok(Some(InitializePoolEvent {
+                        provider_id: provider_id.clone(),
+                        provider_role,
                         slot: Some(p.slot),
                         event_ts_ms,
                         event_time,
@@ -4180,6 +4212,8 @@ impl BinaryParser {
                     // pool→mint correctly for PumpSwap.
                     let pool_pk = Pubkey::from_str(pool).unwrap_or_default();
                     return Ok(Some(InitializePoolEvent {
+                        provider_id: provider_id.clone(),
+                        provider_role,
                         slot: Some(p.slot),
                         event_ts_ms,
                         event_time,
@@ -4214,6 +4248,7 @@ impl BinaryParser {
         let parsed = self.parse_pump_events(event);
         let mut trades = Vec::new();
         let runtime_ctx = extract_runtime_trade_context(event);
+        let (provider_id, provider_role) = transaction_provider_metadata(event);
         let has_explicit_trade = parsed.iter().any(|p| {
             matches!(
                 p.kind,
@@ -4281,6 +4316,8 @@ impl BinaryParser {
                         virtual_token_reserves > 0 && virtual_sol_reserves > 0;
                     trades.push(TradeEvent {
                         semantic: ghost_core::EventSemanticEnvelope::default(),
+                        provider_id: provider_id.clone(),
+                        provider_role,
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
@@ -4382,6 +4419,8 @@ impl BinaryParser {
                         .unwrap_or_default();
                     trades.push(TradeEvent {
                         semantic: ghost_core::EventSemanticEnvelope::default(),
+                        provider_id: provider_id.clone(),
+                        provider_role,
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
@@ -4481,6 +4520,8 @@ impl BinaryParser {
                     );
                     trades.push(TradeEvent {
                         semantic: ghost_core::EventSemanticEnvelope::default(),
+                        provider_id: provider_id.clone(),
+                        provider_role,
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
@@ -4566,6 +4607,8 @@ impl BinaryParser {
 
                     trades.push(TradeEvent {
                         semantic: ghost_core::EventSemanticEnvelope::default(),
+                        provider_id: provider_id.clone(),
+                        provider_role,
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
@@ -4684,6 +4727,8 @@ impl BinaryParser {
                     }
                     trades.push(TradeEvent {
                         semantic: ghost_core::EventSemanticEnvelope::default(),
+                        provider_id: provider_id.clone(),
+                        provider_role,
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
@@ -4802,6 +4847,8 @@ impl BinaryParser {
                     }
                     trades.push(TradeEvent {
                         semantic: ghost_core::EventSemanticEnvelope::default(),
+                        provider_id: provider_id.clone(),
+                        provider_role,
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
@@ -4911,6 +4958,7 @@ impl BinaryParser {
 
         let effective_runtime_ts_ms = runtime_ctx.timestamp_ms.unwrap_or(arrival_ts);
         let account_lanes = self.account_reg.snapshot_by_lane();
+        let (provider_id, provider_role) = transaction_provider_metadata(event);
         let mut trades = Vec::new();
 
         for (outer_instruction_index, ix) in instructions.iter().enumerate() {
@@ -4943,6 +4991,8 @@ impl BinaryParser {
 
             trades.push(TradeEvent {
                 semantic: ghost_core::EventSemanticEnvelope::default(),
+                provider_id: provider_id.clone(),
+                provider_role,
                 slot: slot_val,
                 signature,
                 event_ordinal: Some(hint.outer_instruction_index),
@@ -6869,7 +6919,7 @@ pub fn peek_trade_pool_id(event: &crate::types::GeyserEvent) -> Option<solana_sd
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{create_ipc_channel, IpcChannelConfig, SeerEvent};
+    use crate::ipc::{create_ipc_channel, EventPriority, IpcChannelConfig, SeerEvent};
     use metrics::{
         Counter, CounterFn, Gauge, Histogram, Key, KeyName, Recorder, SharedString, Unit,
     };
@@ -7127,6 +7177,8 @@ mod tests {
         inner_instructions: Vec<crate::types::InnerInstructionGroup>,
     ) -> GeyserEvent {
         GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -7162,6 +7214,8 @@ mod tests {
     ) -> TradeEvent {
         TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature,
             event_ordinal,
@@ -7215,6 +7269,28 @@ mod tests {
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
         }
+    }
+
+    #[test]
+    fn old_trade_json_defaults_provider_metadata_to_none() {
+        let trade = sample_trade_event(
+            solana_sdk::signature::Signature::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Some(0),
+        );
+        let mut json = serde_json::to_value(trade).expect("serialize current trade");
+        let object = json
+            .as_object_mut()
+            .expect("serialized trade must be an object");
+        object.remove("provider_id");
+        object.remove("provider_role");
+
+        let decoded: TradeEvent =
+            serde_json::from_value(json).expect("old trade JSON must remain readable");
+        assert_eq!(decoded.provider_id, None);
+        assert_eq!(decoded.provider_role, None);
     }
 
     fn system_transfer_data(lamports: u64) -> Vec<u8> {
@@ -7286,6 +7362,8 @@ mod tests {
         post_balances[PUMP_IDX_USER] = 1_450_000_000;
 
         GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -7803,6 +7881,8 @@ mod tests {
     #[test]
     fn backfill_events_tagged_is_backfill() {
         let ev = PumpEvent::BackfillTransaction {
+            provider_id: None,
+            provider_role: None,
             signature: "SIG".into(),
             slot: 42,
             received_at: Instant::now(),
@@ -7938,6 +8018,66 @@ mod tests {
         assert_eq!(pool.base_mint, mint);
         assert_eq!(pool.pool_amm_id, curve);
         assert_eq!(pool.creator, Pubkey::default());
+    }
+
+    #[tokio::test]
+    async fn initialize_pool_provider_metadata_reaches_candidate_pool_ipc() {
+        let parser = BinaryParser::new(false);
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let provider_id = "raw-primary".to_string();
+        let provider_role = RawProviderRoleV1::PrimaryAuthority;
+        let mut accounts = vec![Pubkey::new_unique(); 12];
+        accounts[CREATE_IDX_MINT] = mint;
+        accounts[CREATE_IDX_BONDING_CURVE] = curve;
+        accounts[CREATE_IDX_USER] = creator;
+        let mut event = make_decoded_tx_event(
+            accounts,
+            vec![crate::types::RawInstruction {
+                program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("pump.fun program id"),
+                account_indices: (0_u8..12_u8).collect(),
+                data: create_data("Metadata", "META", "https://example.invalid"),
+            }],
+        );
+        if let GeyserEvent::Transaction {
+            provider_id: event_provider_id,
+            provider_role: event_provider_role,
+            ..
+        } = &mut event
+        {
+            *event_provider_id = Some(provider_id.clone());
+            *event_provider_role = Some(provider_role);
+        } else {
+            panic!("fixture must be a normalized transaction");
+        }
+
+        let pool = parser
+            .parse_initialize_pool(&event)
+            .expect("decoded create should parse")
+            .expect("decoded create should emit pool");
+        assert_eq!(pool.provider_id.as_deref(), Some(provider_id.as_str()));
+        assert_eq!(pool.provider_role, Some(provider_role));
+
+        let candidate: crate::types::CandidatePool = pool.into();
+        assert_eq!(candidate.provider_id.as_deref(), Some(provider_id.as_str()));
+        assert_eq!(candidate.provider_role, Some(provider_role));
+
+        let (sender, mut receiver, _) = create_ipc_channel(IpcChannelConfig::default());
+        sender
+            .send(candidate, EventPriority::Normal)
+            .await
+            .expect("pool provenance must cross the Seer IPC boundary");
+        match receiver.recv().await.expect("IPC pool event") {
+            SeerEvent::PoolDetected(observed) => {
+                assert_eq!(
+                    observed.candidate.provider_id.as_deref(),
+                    Some(provider_id.as_str())
+                );
+                assert_eq!(observed.candidate.provider_role, Some(provider_role));
+            }
+            other => panic!("expected IPC pool candidate, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8175,6 +8315,8 @@ mod tests {
         data.extend_from_slice(&123_000_000u64.to_le_bytes());
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
@@ -8224,6 +8366,8 @@ mod tests {
         accounts[PUMP_IDX_BONDING_CURVE] = curve;
         accounts[PUMP_IDX_USER] = user;
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
@@ -8275,6 +8419,8 @@ mod tests {
         parser.account_reg.insert_curve(curve.to_string());
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_100),
@@ -8377,6 +8523,8 @@ mod tests {
         parser.account_reg.insert_curve(curve.to_string());
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_200),
@@ -8472,6 +8620,8 @@ mod tests {
         parser.account_reg.insert_curve(curve.to_string());
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_300),
@@ -8575,6 +8725,8 @@ mod tests {
         post_balances[3] = 1_350_000_000;
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_400),
@@ -8644,6 +8796,8 @@ mod tests {
         let wsol_mint = Pubkey::from_str(WSOL_MINT).unwrap();
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_500),
@@ -8788,6 +8942,8 @@ mod tests {
         data.extend_from_slice(&encode_swap_sell_event(&sell_event));
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -8932,6 +9088,8 @@ mod tests {
         data.extend_from_slice(&encode_swap_sell_event(&sell_event));
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -9096,6 +9254,8 @@ mod tests {
         data.extend_from_slice(&encode_swap_sell_event(&sell_event));
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -9238,6 +9398,8 @@ mod tests {
         data.extend_from_slice(&encode_swap_sell_event(&sell_event));
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -10150,6 +10312,8 @@ mod tests {
         }));
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -10282,6 +10446,8 @@ mod tests {
 
         let resolved = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature: signature.clone(),
             event_ordinal: Some(0),
@@ -10342,6 +10508,8 @@ mod tests {
 
         let unresolved = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature,
             event_ordinal: Some(0),
@@ -10415,6 +10583,8 @@ mod tests {
 
         let trade_a = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature,
             event_ordinal: Some(0),
@@ -10572,6 +10742,8 @@ mod tests {
 
         let weak = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature,
             event_ordinal: Some(0),
@@ -10753,6 +10925,8 @@ mod tests {
 
         let mut trade = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature: solana_sdk::signature::Signature::new_unique(),
             event_ordinal: Some(0),
@@ -11334,6 +11508,8 @@ mod tests {
 
         let mut trade = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature: solana_sdk::signature::Signature::new_unique(),
             event_ordinal: Some(0),
@@ -11442,6 +11618,8 @@ mod tests {
 
         let mut trade = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature: solana_sdk::signature::Signature::new_unique(),
             event_ordinal: Some(0),
@@ -11560,6 +11738,8 @@ mod tests {
 
         let mut trade = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature: solana_sdk::signature::Signature::new_unique(),
             event_ordinal: Some(0),
@@ -11661,6 +11841,8 @@ mod tests {
 
         let mut trade = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature: solana_sdk::signature::Signature::new_unique(),
             event_ordinal: Some(0),
@@ -11776,6 +11958,8 @@ mod tests {
 
         let mut trade = TradeEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature: solana_sdk::signature::Signature::new_unique(),
             event_ordinal: Some(0),
@@ -12367,6 +12551,8 @@ mod tests {
         }));
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: None,
@@ -12462,6 +12648,8 @@ mod tests {
         }));
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: None,
@@ -12557,6 +12745,8 @@ mod tests {
         let pump_idx = accounts.iter().position(|p| *p == pumpswap).unwrap() as u8;
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(2),
             tx_index: None,
             event_ts_ms: None,

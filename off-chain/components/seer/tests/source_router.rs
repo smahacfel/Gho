@@ -28,6 +28,8 @@ fn default_test_config() -> SeerConfig {
         grpc_client_id: None,
         grpc_auth_token: None,
         grpc_auth_header: SeerConfig::default_grpc_auth_header(),
+        primary_raw_provider_id: "primary".to_string(),
+        secondary_raw_provider_ids: Vec::new(),
         max_reconnect_attempts: 5,
         reconnect_delay_secs: 1,
         max_reconnect_delay_secs: 60,
@@ -69,6 +71,8 @@ fn default_test_config() -> SeerConfig {
 /// Create a synthetic transaction event (like PumpPortal produces)
 fn create_synthetic_event() -> GeyserEvent {
     GeyserEvent::Transaction {
+        provider_id: None,
+        provider_role: None,
         slot: None,
         tx_index: None,
         event_ts_ms: None,
@@ -111,6 +115,8 @@ fn create_synthetic_event() -> GeyserEvent {
 /// Create a raw (non-synthetic) transaction event (like Geyser produces)
 fn create_raw_event() -> GeyserEvent {
     GeyserEvent::Transaction {
+        provider_id: None,
+        provider_role: None,
         slot: Some(12345),
         tx_index: None,
         event_ts_ms: None,

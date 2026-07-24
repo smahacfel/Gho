@@ -3040,14 +3040,17 @@ impl OracleRuntime {
 
     // ── ReconciliationRuntime integration ────────────────────────────────────
 
-    fn build_account_state_update(
+    fn build_account_state_update_with_provenance(
         &self,
+        provider_id: Option<String>,
+        provider_role: Option<ghost_core::RawProviderRoleV1>,
         base_mint: &Pubkey,
         on_chain_sol: u64,
         on_chain_tok: u64,
         on_chain_complete: u8,
         slot: u64,
         write_version: Option<u64>,
+        txn_signature: Option<Signature>,
         account_data_hash: Option<String>,
         account_data_len: Option<u64>,
         source_account_pubkey: Option<Pubkey>,
@@ -3081,6 +3084,8 @@ impl OracleRuntime {
             }
         };
         Some(AccountStateUpdate {
+            provider_id,
+            provider_role,
             pool_amm_id: identity.pool_id.into(),
             base_mint: *base_mint,
             bonding_curve: identity.bonding_curve.into(),
@@ -3089,6 +3094,7 @@ impl OracleRuntime {
             is_complete: on_chain_complete,
             slot,
             write_version,
+            txn_signature,
             source_account_pubkey,
             source_account_owner_or_program,
             account_data_len,
@@ -3098,6 +3104,44 @@ impl OracleRuntime {
             curve_finality,
             source,
         })
+    }
+
+    /// Backward-compatible builder for sources which do not expose raw-provider
+    /// provenance or an account-update transaction signature.
+    fn build_account_state_update(
+        &self,
+        base_mint: &Pubkey,
+        on_chain_sol: u64,
+        on_chain_tok: u64,
+        on_chain_complete: u8,
+        slot: u64,
+        write_version: Option<u64>,
+        account_data_hash: Option<String>,
+        account_data_len: Option<u64>,
+        source_account_pubkey: Option<Pubkey>,
+        source_account_owner_or_program: Option<Pubkey>,
+        curve_finality: CurveFinality,
+        source: UpdateSource,
+        bonding_curve_hint: Option<&Pubkey>,
+    ) -> Option<AccountStateUpdate> {
+        self.build_account_state_update_with_provenance(
+            None,
+            None,
+            base_mint,
+            on_chain_sol,
+            on_chain_tok,
+            on_chain_complete,
+            slot,
+            write_version,
+            None,
+            account_data_hash,
+            account_data_len,
+            source_account_pubkey,
+            source_account_owner_or_program,
+            curve_finality,
+            source,
+            bonding_curve_hint,
+        )
     }
 
     fn apply_account_state_update(
@@ -3420,13 +3464,16 @@ impl OracleRuntime {
             curve_finality = %curve_finality.as_str(),
             "DIAG_ACCOUNT_UPDATE_RUNTIME_INGRESS"
         );
-        let update = match self.build_account_state_update(
+        let update = match self.build_account_state_update_with_provenance(
+            event.and_then(|event| event.provider_id.clone()),
+            event.and_then(|event| event.provider_role),
             base_mint,
             on_chain_sol,
             on_chain_tok,
             on_chain_complete,
             slot,
             event.and_then(|event| event.write_version),
+            event.and_then(|event| event.txn_signature),
             event.and_then(|event| event.account_data_hash.clone()),
             event.and_then(|event| event.account_data_len),
             event.and_then(|event| event.source_account_pubkey),
@@ -24063,6 +24110,8 @@ fn build_seer_geyser_event_from_confirmed_tx(
     let (pre_token_balances, post_token_balances) = extract_token_balances_from_meta(meta);
 
     Some(SeerGeyserEvent::Transaction {
+        provider_id: None,
+        provider_role: None,
         slot: seer::types::normalize_slot(Some(tx.slot)),
         tx_index: None,
         event_ts_ms: seer::types::event_ts_from_block_time(tx.block_time),
@@ -32491,6 +32540,8 @@ mod tests {
         bonding_curve: Pubkey,
     ) {
         let update = ghost_core::account_state_core::types::AccountStateUpdate {
+            provider_id: None,
+            provider_role: None,
             pool_amm_id: bonding_curve,
             base_mint: mint,
             bonding_curve,
@@ -32499,6 +32550,7 @@ mod tests {
             is_complete: 0,
             slot: 100,
             write_version: Some(1),
+            txn_signature: None,
             source_account_pubkey: None,
             source_account_owner_or_program: None,
             account_data_len: None,
@@ -34175,6 +34227,8 @@ mod tests {
         real_token_reserves: u64,
     ) -> AccountUpdateEvent {
         AccountUpdateEvent {
+            provider_id: None,
+            provider_role: None,
             semantic: Default::default(),
             event_time: ghost_core::EventTimeMetadata::default(),
             base_mint: Pubkey::new_unique(),
@@ -34187,6 +34241,7 @@ mod tests {
             complete: 0,
             slot,
             write_version: Some(1),
+            txn_signature: None,
             account_data_hash: Some("raw-account-state".to_string()),
             account_data_len: Some(64),
             source_account_pubkey: Some(bonding_curve),
@@ -40793,6 +40848,8 @@ mod tests {
         let mut truth = HashMap::new();
         let success_trade = TradeEvent {
             semantic: Default::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(1),
             signature: Signature::new_unique(),
             event_ordinal: None,
@@ -43694,6 +43751,8 @@ mod tests {
             BootstrapHints::default(),
         );
         let result = account_state_core.apply_account_update(AccountStateUpdate {
+            provider_id: None,
+            provider_role: None,
             pool_amm_id: pool_id,
             base_mint,
             bonding_curve,
@@ -43702,6 +43761,7 @@ mod tests {
             is_complete: 0,
             slot: 7,
             write_version: None,
+            txn_signature: None,
             source_account_pubkey: None,
             source_account_owner_or_program: None,
             account_data_len: None,
@@ -44158,15 +44218,19 @@ mod tests {
             ..Default::default()
         };
         assert!(runtime.register_new_pool(pool_id, base_mint, candidate, None));
+        let txn_signature = Signature::new_unique();
 
         let update = runtime
-            .build_account_state_update(
+            .build_account_state_update_with_provenance(
+                Some("raw-primary".to_string()),
+                Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
                 &base_mint,
                 9_000_000_000,
                 888_000_000_000_000,
                 0,
                 2,
                 Some(17),
+                Some(txn_signature),
                 Some("raw-blake3".to_string()),
                 Some(56),
                 Some(source_account_pubkey),
@@ -44178,10 +44242,37 @@ mod tests {
             .expect("tracked mint should build canonical account-state update");
 
         assert_eq!(update.write_version, Some(17));
+        assert_eq!(update.provider_id.as_deref(), Some("raw-primary"));
+        assert_eq!(
+            update.provider_role,
+            Some(ghost_core::RawProviderRoleV1::PrimaryAuthority)
+        );
+        assert_eq!(update.txn_signature, Some(txn_signature));
         assert_eq!(update.account_data_hash.as_deref(), Some("raw-blake3"));
         assert_eq!(update.account_data_len, Some(56));
         assert_eq!(update.source_account_pubkey, Some(source_account_pubkey));
         assert_eq!(update.source_account_owner_or_program, Some(source_owner));
+
+        let update_without_provenance = runtime
+            .build_account_state_update(
+                &base_mint,
+                9_000_000_000,
+                888_000_000_000_000,
+                0,
+                3,
+                Some(18),
+                None,
+                None,
+                None,
+                None,
+                CurveFinality::Speculative,
+                UpdateSource::GeyserAccountUpdate,
+                Some(&bonding_curve),
+            )
+            .expect("legacy builder should remain available");
+        assert_eq!(update_without_provenance.provider_id, None);
+        assert_eq!(update_without_provenance.provider_role, None);
+        assert_eq!(update_without_provenance.txn_signature, None);
     }
 
     #[test]
@@ -45116,6 +45207,8 @@ mod tests {
             CurveFinality::Speculative,
             UpdateSource::GeyserAccountUpdate,
             Some(&AccountUpdateEvent {
+                provider_id: None,
+                provider_role: None,
                 semantic: Default::default(),
                 event_time: ghost_core::EventTimeMetadata::default(),
                 base_mint,
@@ -45128,6 +45221,7 @@ mod tests {
                 complete: 0,
                 slot: 2,
                 write_version: Some(1),
+                txn_signature: None,
                 account_data_hash: None,
                 account_data_len: None,
                 source_account_pubkey: None,
@@ -45200,6 +45294,8 @@ mod tests {
         let bonding_curve = Pubkey::new_unique();
 
         runtime.enqueue_pre_identity_account_update(&AccountUpdateEvent {
+            provider_id: None,
+            provider_role: None,
             semantic: Default::default(),
             event_time: ghost_core::EventTimeMetadata::default(),
             base_mint,
@@ -45212,6 +45308,7 @@ mod tests {
             complete: 0,
             slot: 2,
             write_version: Some(7),
+            txn_signature: None,
             account_data_hash: None,
             account_data_len: None,
             source_account_pubkey: None,
@@ -46666,6 +46763,8 @@ mod tests {
     #[test]
     fn test_runtime_account_update_time_source_info_prefers_event_time_axes() {
         let mut event = AccountUpdateEvent {
+            provider_id: None,
+            provider_role: None,
             semantic: Default::default(),
             event_time: ghost_core::EventTimeMetadata::default(),
             base_mint: Pubkey::new_unique(),
@@ -46678,6 +46777,7 @@ mod tests {
             complete: 0,
             slot: 42,
             write_version: Some(7),
+            txn_signature: None,
             account_data_hash: None,
             account_data_len: None,
             source_account_pubkey: None,
@@ -48399,6 +48499,8 @@ mod tests {
         // Simulate what start_oracle_runtime_task does when it receives
         // GhostEvent::AccountUpdate from the event bus.
         let event = GhostEvent::AccountUpdate(crate::events::AccountUpdateEvent {
+            provider_id: None,
+            provider_role: None,
             semantic: Default::default(),
             event_time: ghost_core::EventTimeMetadata::default(),
             base_mint,
@@ -48411,6 +48513,7 @@ mod tests {
             complete: 0,
             slot: 51,
             write_version: None,
+            txn_signature: None,
             account_data_hash: None,
             account_data_len: None,
             source_account_pubkey: None,
@@ -49346,6 +49449,8 @@ mod tests {
         sequence_number: u64,
     ) -> AccountUpdateEvent {
         AccountUpdateEvent {
+            provider_id: None,
+            provider_role: None,
             semantic: Default::default(),
             event_time: ghost_core::EventTimeMetadata::default(),
             base_mint,
@@ -49358,6 +49463,7 @@ mod tests {
             complete: 0,
             slot,
             write_version,
+            txn_signature: None,
             account_data_hash: None,
             account_data_len: None,
             source_account_pubkey: None,
@@ -49589,6 +49695,8 @@ mod tests {
         event_tx
             .send(GhostEvent::AccountUpdate(
                 crate::events::AccountUpdateEvent {
+                    provider_id: None,
+                    provider_role: None,
                     semantic: Default::default(),
                     event_time: ghost_core::EventTimeMetadata::default(),
                     base_mint,
@@ -49601,6 +49709,7 @@ mod tests {
                     complete: 0,
                     slot: 101,
                     write_version: None,
+                    txn_signature: None,
                     account_data_hash: None,
                     account_data_len: None,
                     source_account_pubkey: None,

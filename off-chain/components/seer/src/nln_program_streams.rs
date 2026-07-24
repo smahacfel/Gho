@@ -260,6 +260,8 @@ impl NlnPumpFunCreateEvent {
 
         Ok(CandidatePool {
             semantic: nln_semantic(self.meta.slot, event_time),
+            provider_id: None,
+            provider_role: None,
             slot: Some(self.slot),
             tx_index: self.tx_index,
             event_ts_ms,
@@ -316,6 +318,8 @@ impl NlnPumpFunTradeEvent {
 
         TradeEvent {
             semantic: nln_semantic(Some(self.slot), event_time),
+            provider_id: None,
+            provider_role: None,
             slot: Some(self.slot),
             signature: self.signature,
             event_ordinal: None,

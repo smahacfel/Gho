@@ -49,6 +49,8 @@ fn state_phase_transitions_preserve_bootstrap_vs_canonical_separation() {
 #[test]
 fn foundational_types_serialize_and_deserialize_roundtrip() {
     let account_update = AccountStateUpdate {
+        provider_id: None,
+        provider_role: None,
         pool_amm_id: pk(1),
         base_mint: pk(2),
         bonding_curve: pk(3),
@@ -57,6 +59,7 @@ fn foundational_types_serialize_and_deserialize_roundtrip() {
         is_complete: 0,
         slot: 77,
         write_version: Some(3),
+        txn_signature: None,
         source_account_pubkey: None,
         source_account_owner_or_program: None,
         account_data_len: None,

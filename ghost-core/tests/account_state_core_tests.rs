@@ -21,6 +21,8 @@ fn account_update(
     receive_seq: u64,
 ) -> AccountStateUpdate {
     AccountStateUpdate {
+        provider_id: None,
+        provider_role: None,
         pool_amm_id,
         base_mint,
         bonding_curve,
@@ -29,6 +31,7 @@ fn account_update(
         is_complete: 0,
         slot,
         write_version: None,
+        txn_signature: None,
         source_account_pubkey: None,
         source_account_owner_or_program: None,
         account_data_len: None,
@@ -38,6 +41,68 @@ fn account_update(
         curve_finality: CurveFinality::Finalized,
         source: UpdateSource::GeyserAccountUpdate,
     }
+}
+
+#[test]
+fn provider_metadata_is_additive_and_does_not_change_canonical_state() {
+    let pool_amm_id = pk(31);
+    let base_mint = pk(32);
+    let bonding_curve = pk(33);
+    let baseline = account_update(
+        pool_amm_id,
+        base_mint,
+        bonding_curve,
+        42_500_000_000,
+        1_000_000,
+        10,
+        1_000,
+        1,
+    );
+    let mut with_provenance = baseline.clone();
+    with_provenance.provider_id = Some("raw-primary".to_string());
+    with_provenance.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
+    with_provenance.txn_signature = Some(solana_sdk::signature::Signature::new_unique());
+
+    let baseline_reducer = AccountStateReducer::new();
+    let provenance_reducer = AccountStateReducer::new();
+    assert_eq!(
+        baseline_reducer.apply_account_update(baseline),
+        AccountUpdateResult::Applied
+    );
+    assert_eq!(
+        provenance_reducer.apply_account_update(with_provenance),
+        AccountUpdateResult::Applied
+    );
+    assert_eq!(
+        baseline_reducer.get_canonical_state(&base_mint),
+        provenance_reducer.get_canonical_state(&base_mint),
+        "provider metadata and txn_signature must not steer AccountStateCore in PR 1A"
+    );
+}
+
+#[test]
+fn old_account_state_update_json_defaults_new_metadata_to_none() {
+    let update = account_update(
+        pk(41),
+        pk(42),
+        pk(43),
+        42_500_000_000,
+        1_000_000,
+        10,
+        1_000,
+        1,
+    );
+    let value = serde_json::to_value(&update).expect("serialize baseline account update");
+    let object = value.as_object().expect("account update object");
+    assert!(!object.contains_key("provider_id"));
+    assert!(!object.contains_key("provider_role"));
+    assert!(!object.contains_key("txn_signature"));
+
+    let decoded: AccountStateUpdate =
+        serde_json::from_value(value).expect("deserialize old account update shape");
+    assert_eq!(decoded.provider_id, None);
+    assert_eq!(decoded.provider_role, None);
+    assert_eq!(decoded.txn_signature, None);
 }
 
 #[test]

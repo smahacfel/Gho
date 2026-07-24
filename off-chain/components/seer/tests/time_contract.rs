@@ -10,6 +10,8 @@ fn make_tx_event(
     arrival_ts_ms: Option<u64>,
 ) -> GeyserEvent {
     GeyserEvent::Transaction {
+        provider_id: None,
+        provider_role: None,
         slot: Some(42),
         tx_index: None,
         event_ts_ms,

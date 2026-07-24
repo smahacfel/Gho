@@ -492,6 +492,8 @@ mod tests {
 
     fn sample_update(slot: u64, receive_seq: u64) -> AccountStateUpdate {
         AccountStateUpdate {
+            provider_id: None,
+            provider_role: None,
             pool_amm_id: Pubkey::new_unique(),
             base_mint: Pubkey::new_unique(),
             bonding_curve: Pubkey::new_unique(),
@@ -500,6 +502,7 @@ mod tests {
             is_complete: 0,
             slot,
             write_version: Some(slot),
+            txn_signature: None,
             source_account_pubkey: None,
             source_account_owner_or_program: None,
             account_data_len: None,

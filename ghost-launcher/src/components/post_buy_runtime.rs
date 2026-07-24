@@ -639,6 +639,8 @@ async fn refresh_shadow_market_target(
     }
 
     let apply_result = account_state_core.apply_rpc_refresh(AccountStateUpdate {
+        provider_id: None,
+        provider_role: None,
         pool_amm_id: target.pool_amm_id,
         base_mint: target.base_mint,
         bonding_curve: target.bonding_curve,
@@ -650,6 +652,7 @@ async fn refresh_shadow_market_target(
         // ordering proof. `apply_rpc_refresh` deliberately keeps it out of
         // the canonical Geyser monotonic guard.
         write_version: Some(0),
+        txn_signature: None,
         source_account_pubkey: Some(target.bonding_curve),
         source_account_owner_or_program: Some(account.owner),
         account_data_len: Some(account.data.len() as u64),
@@ -7707,6 +7710,8 @@ sys.exit(0)
         token_reserves: u64,
     ) {
         let update = AccountStateUpdate {
+            provider_id: None,
+            provider_role: None,
             pool_amm_id: Pubkey::new_unique(),
             base_mint: mint,
             bonding_curve: Pubkey::new_unique(),
@@ -7715,6 +7720,7 @@ sys.exit(0)
             is_complete: 0,
             slot: 42,
             write_version: Some(1),
+            txn_signature: None,
             source_account_pubkey: None,
             source_account_owner_or_program: None,
             account_data_len: None,

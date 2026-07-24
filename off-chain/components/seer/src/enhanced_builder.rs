@@ -134,6 +134,8 @@ mod tests {
     fn test_build_enhanced_candidate() {
         let candidate_pool = CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            provider_id: None,
+            provider_role: None,
             slot: Some(12345),
             tx_index: None,
             event_ts_ms: None,
@@ -155,6 +157,8 @@ mod tests {
         };
 
         let event = GeyserEvent::Transaction {
+            provider_id: None,
+            provider_role: None,
             slot: Some(12345),
             tx_index: None,
             event_ts_ms: None,

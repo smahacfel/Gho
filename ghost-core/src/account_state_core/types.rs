@@ -226,6 +226,15 @@ pub struct AccountStateUpdate {
     pub receive_seq: u64,
     pub curve_finality: CurveFinality,
     pub source: UpdateSource,
+    // Appended, rather than inserted in the legacy positional layout, to
+    // retain the historical bincode failure behaviour of the pre-existing
+    // fixture while keeping JSON/JSONL additive and omission-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_role: Option<crate::RawProviderRoleV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txn_signature: Option<solana_sdk::signature::Signature>,
 }
 
 /// Canonical feature bundle derived from account state and passed onward.

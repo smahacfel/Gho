@@ -11140,6 +11140,8 @@ mod tests {
         receive_ts_ms: u64,
     ) {
         let apply_result = account_state_core.apply_account_update(AccountStateUpdate {
+            provider_id: None,
+            provider_role: None,
             pool_amm_id: Pubkey::new_unique(),
             base_mint: mint,
             bonding_curve,
@@ -11148,6 +11150,7 @@ mod tests {
             is_complete: 0,
             slot,
             write_version: Some(1),
+            txn_signature: None,
             source_account_pubkey: None,
             source_account_owner_or_program: None,
             account_data_len: None,
@@ -11174,6 +11177,8 @@ mod tests {
         let source_account_pubkey = Pubkey::new_unique();
         let source_owner = Pubkey::new_unique();
         let apply_result = account_state_core.apply_account_update(AccountStateUpdate {
+            provider_id: None,
+            provider_role: None,
             pool_amm_id: Pubkey::new_unique(),
             base_mint: mint,
             bonding_curve,
@@ -11182,6 +11187,7 @@ mod tests {
             is_complete: 0,
             slot,
             write_version: Some(17),
+            txn_signature: None,
             source_account_pubkey: Some(source_account_pubkey),
             source_account_owner_or_program: Some(source_owner),
             account_data_len: Some(512),
@@ -11222,6 +11228,8 @@ mod tests {
         let mut vitality = TimeStopV2State::from_registration(Some(&initial));
 
         let refresh = AccountStateUpdate {
+            provider_id: None,
+            provider_role: None,
             pool_amm_id: canonical.pool_amm_id,
             base_mint: mint,
             bonding_curve,
@@ -11232,6 +11240,7 @@ mod tests {
             // canonical state.  This must refresh only the quote boundary.
             slot: 500,
             write_version: Some(0),
+            txn_signature: None,
             source_account_pubkey: canonical.source_account_pubkey,
             source_account_owner_or_program: canonical.source_account_owner_or_program,
             account_data_len: canonical.account_data_len,
