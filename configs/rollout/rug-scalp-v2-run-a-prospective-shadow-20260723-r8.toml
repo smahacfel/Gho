@@ -1,0 +1,105 @@
+# Frozen prospective Run A.  The process remains shadow-only and records
+# latency stages while the runtime collects the observations needed to derive
+# PRIMARY/STRESS deterministically; it never submits a live transaction.
+
+mode = "production"
+ghost_brain_config_path = "../../ghost-brain/ghost_brain_config.toml"
+
+[seer]
+enabled = true
+source_mode = "grpc"
+commitment = "processed"
+stream_mode = "single_global"
+tx_filter_strategy = "per_pool"
+funding_lane_mode = "disabled"
+grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
+grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+grpc_auth_header = "x-api-key"
+rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"
+enable_pumpfun = true
+enable_bonkfun = false
+enable_raydium = false
+
+[trigger]
+enabled = true
+rpc_url = "${GHOST_TRIGGER_RPC_URL}"
+entry_mode = "shadow_only"
+max_concurrent_positions = 1
+max_position_size_sol = 0.10
+emergency_floor_sol = 0.0001
+position_size_buffer_sol = 0.0001
+slippage_tolerance = 0.20
+
+[trigger.shadow_run]
+enabled = true
+payer_strategy = "ephemeral"
+shadow_rpc_url = "${GHOST_TRIGGER_SHADOW_RPC_URL}"
+commitment = "processed"
+sig_verify = false
+replace_recent_blockhash = true
+timeout_ms = 1600
+max_retries = 1
+max_concurrent = 1
+output_path = "/root/Gho_dynamic_exit_v1_pr2b/logs/rug_scalp_v2/run_a_20260723_r8/shadow_entries.jsonl"
+emit_event_bus = true
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+tx_build_compensation_ms = 250
+max_quote_age_ms = 1500
+entry_log_path = "/root/Gho_dynamic_exit_v1_pr2b/logs/rug_scalp_v2/run_a_20260723_r8/shadow_entries.jsonl"
+lifecycle_log_path = "/root/Gho_dynamic_exit_v1_pr2b/logs/rug_scalp_v2/run_a_20260723_r8/shadow_lifecycle.jsonl"
+timing_model = "prepared_entry_mirror"
+stale_policy = "emit_warning"
+
+[execution.events]
+output_dir = "/root/Gho_dynamic_exit_v1_pr2b/datasets/events/rug_scalp_v2/run_a_20260723_r8"
+rotation_interval_ms = 300000
+flush_interval_ms = 1000
+max_file_size_bytes = 50000000
+enable_aem_ticks = true
+enable_optional_events = false
+
+[p37_shadow_probe]
+enabled = false
+
+[rug_scalp_v2]
+enabled = true
+mode = "observe_only"
+lifecycle_log_path = "/root/Gho_dynamic_exit_v1_pr2b/logs/rug_scalp_v2/run_a_20260723_r8/rug_scalp_position_events_v2.jsonl"
+signal_assessment_log_path = "/root/Gho_dynamic_exit_v1_pr2b/logs/rug_scalp_v2/run_a_20260723_r8/rug_scalp_signal_assessments_v2.jsonl"
+entry_log_path = "/root/Gho_dynamic_exit_v1_pr2b/logs/rug_scalp_v2/run_a_20260723_r8/rug_scalp_probe_entries_v2.jsonl"
+outcome_log_path = "/root/Gho_dynamic_exit_v1_pr2b/logs/rug_scalp_v2/run_a_20260723_r8/rug_scalp_outcomes_v2.jsonl"
+
+[rug_scalp_v2.validation_tape]
+enabled = true
+technical_capture = true
+log_path = "/root/Gho_dynamic_exit_v1_pr2b/logs/rug_scalp_v2/run_a_20260723_r8/rug_scalp_validation_tape_v1.jsonl"
+run_id = "rug-scalp-v2-prospective-shadow-20260723-r8"
+code_hash = "sha256:2ceb7bbd24eacc6a7d0f5785fd183daaeba6ad8f176563d91d7379f1baa3656f"
+
+[account_state_core]
+enable = true
+
+[durability]
+wal_enabled = false
+
+[metrics]
+enabled = false
+
+[gui_backend]
+enabled = false
+bind_address = "127.0.0.1"
+port = 8848
+
+[logging]
+level = "info"
+console_enabled = true
+json_format = false
+file_enabled = true
+file_path = "/root/Gho_dynamic_exit_v1_pr2b/logs/rug_scalp_v2/run_a_20260723_r8/system.log"
+oracle_log_enabled = true
+oracle_log_path = "/root/Gho_dynamic_exit_v1_pr2b/logs/rug_scalp_v2/run_a_20260723_r8/oracle.log"
+oracle_json_format = false

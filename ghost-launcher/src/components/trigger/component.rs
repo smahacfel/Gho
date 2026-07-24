@@ -41,6 +41,7 @@ use ghost_core::{
     account_state_core::reducer::AccountStateReducer,
     market_state::{BondingCurve, ShadowBondingCurve},
     shadow_ledger::{apply_slippage_bps, ShadowLedger},
+    PumpRouteVariant,
 };
 use metrics::gauge;
 use seer::new_async_rpc_client;
@@ -72,7 +73,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, Semaphore};
 use tracing::{debug, info, warn};
 use trigger::direct_buy_builder::{TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID};
-use trigger::DirectBuyBuilder;
+use trigger::{
+    require_pump_route_execution_authorization, DirectBuyBuilder, PumpV2RouteAccounts,
+    PumpV2RouteBuilder, SPL_TOKEN_PROGRAM_ID, WRAPPED_SOL_MINT,
+};
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 const BUY_BALANCE_FEE_BUFFER_LAMPORTS: u64 = 50_000;
@@ -272,11 +276,29 @@ pub struct BuyBuildProfile {
     pub trade_value_sol: f64,
     pub pre_submit_token_balance: Option<u64>,
     pub buy_variant: trigger::PumpfunBuyVariant,
+    /// Present only for a route constructed through the typed Pump V2
+    /// boundary.  Compatibility builders must leave this `None`; consumers
+    /// can therefore never infer typed execution from the historical enum.
+    pub typed_route_variant: Option<PumpRouteVariant>,
     pub entry_token_amount_raw: Option<u64>,
     pub min_tokens_out: u64,
     pub token_param_role: &'static str,
     pub ata_instruction: Option<Instruction>,
     pub buy_instruction: Instruction,
+}
+
+/// Canonical account evidence needed by the RUG SCALP `buy_v2` route.  The
+/// payer is deliberately absent: `TriggerComponent` resolves it itself and
+/// binds it as the route user, so a caller cannot construct a transaction for
+/// a different wallet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RugScalpBuyV2RouteEvidence {
+    pub quote_mint: Pubkey,
+    pub base_token_program: Pubkey,
+    pub quote_token_program: Pubkey,
+    pub creator: Pubkey,
+    pub fee_recipient: Pubkey,
+    pub buyback_fee_recipient: Pubkey,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2890,6 +2912,7 @@ impl TriggerComponent {
             trade_value_sol: amount_lamports as f64 / LAMPORTS_PER_SOL,
             pre_submit_token_balance,
             buy_variant,
+            typed_route_variant: None,
             entry_token_amount_raw: resolved_token_param.entry_token_amount_raw,
             min_tokens_out,
             token_param_role,
@@ -4473,6 +4496,204 @@ impl TriggerComponent {
         Ok(request)
     }
 
+    /// Builds the sole RUG SCALP entry route: Pump `buy_v2` exact-base-out.
+    ///
+    /// This deliberately does not call `prepare_buy_request_*` or
+    /// `DirectBuyBuilder`.  Those compatibility APIs model an exact-SOL-in
+    /// route and accepting their output here would turn `max_sol_cost` into an
+    /// imaginary curve input.  The supplied `requested_token_amount_raw` and
+    /// wallet cap must already come from `PumpQuoteV1` for the same canonical
+    /// reserve state and fee schedule.
+    pub async fn prepare_rug_scalp_buy_v2_request(
+        &self,
+        mint: &Pubkey,
+        route_evidence: RugScalpBuyV2RouteEvidence,
+        requested_token_amount_raw: u64,
+        max_sol_cost: u64,
+        expected_total_wallet_debit_lamports: u64,
+        decision_ts_ms: u64,
+    ) -> Result<PreparedBuyRequest> {
+        require_pump_route_execution_authorization(PumpRouteVariant::BuyV2).map_err(|error| {
+            anyhow::anyhow!("RUG SCALP buy_v2 is not execution-authorized: {error}")
+        })?;
+        if requested_token_amount_raw == 0 || max_sol_cost == 0 {
+            bail!("RUG SCALP buy_v2 requires a positive exact token amount and max_sol_cost");
+        }
+        if expected_total_wallet_debit_lamports < max_sol_cost {
+            bail!(
+                "RUG SCALP total entry debit {} is smaller than buy_v2 wallet cap {}",
+                expected_total_wallet_debit_lamports,
+                max_sol_cost
+            );
+        }
+        if route_evidence.quote_mint != WRAPPED_SOL_MINT {
+            bail!(
+                "RUG SCALP buy_v2 requires wrapped-SOL quote mint, got {}",
+                route_evidence.quote_mint
+            );
+        }
+
+        let payer_load_started_at = Instant::now();
+        let ResolvedTriggerPayer {
+            payer,
+            provenance: payer_provenance,
+            requires_balance_preflight,
+        } = self.load_payer()?;
+        let payer_pubkey = payer.pubkey();
+        let rpc = self.preparation_rpc();
+        let mint_fetch_started_at = Instant::now();
+        let mint_account = self
+            .fetch_mint_account_with_retry(mint, rpc)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("RUG SCALP failed to fetch canonical mint: {error}")
+            })?;
+        let canonical_base_token_program = Self::resolve_buy_token_program(&mint_account.owner)?;
+        if canonical_base_token_program != route_evidence.base_token_program {
+            bail!(
+                "RUG SCALP buy_v2 base token program mismatch: canonical={} route={}",
+                canonical_base_token_program,
+                route_evidence.base_token_program
+            );
+        }
+        if route_evidence.quote_token_program != SPL_TOKEN_PROGRAM_ID {
+            bail!(
+                "RUG SCALP buy_v2 wrapped-SOL quote token program must be SPL Token, got {}",
+                route_evidence.quote_token_program
+            );
+        }
+        let route_accounts = PumpV2RouteAccounts {
+            base_mint: *mint,
+            quote_mint: route_evidence.quote_mint,
+            base_token_program: canonical_base_token_program,
+            quote_token_program: route_evidence.quote_token_program,
+            user: payer_pubkey,
+            creator: route_evidence.creator,
+            fee_recipient: route_evidence.fee_recipient,
+            buyback_fee_recipient: route_evidence.buyback_fee_recipient,
+        };
+        route_accounts
+            .validate()
+            .map_err(|error| anyhow::anyhow!("RUG SCALP invalid buy_v2 route evidence: {error}"))?;
+
+        let user_ata = get_associated_token_address_with_program_id(
+            &payer_pubkey,
+            mint,
+            &canonical_base_token_program,
+        );
+        let ata_probe = self
+            .probe_user_ata_pre_submit(mint, user_ata, &canonical_base_token_program, rpc)
+            .await?;
+        if requires_balance_preflight {
+            let (payer_balance_lamports, payer_account) = tokio::try_join!(
+                self.fetch_payer_balance_with_retry(&payer_pubkey, rpc),
+                self.fetch_payer_account_with_retry(&payer_pubkey, rpc),
+            )
+            .map_err(|error| anyhow::anyhow!("RUG SCALP payer preflight failed: {error}"))?;
+            Self::validate_payer_account_for_fee(&payer_pubkey, &payer_account)?;
+            let required_lamports = expected_total_wallet_debit_lamports
+                .saturating_add(ata_probe.expected_ata_rent_lamports);
+            Self::validate_payer_balance_for_buy(
+                &payer_pubkey,
+                payer_balance_lamports,
+                required_lamports,
+                0,
+            )?;
+        }
+
+        let blockhash_fetch_started_at = Instant::now();
+        let (blockhash_snapshot, blockhash_source) =
+            self.resolve_live_blockhash(rpc).await.map_err(|error| {
+                anyhow::anyhow!("RUG SCALP failed to fetch recent blockhash: {error}")
+            })?;
+        let tip_account = select_sender_tip_account(
+            format!("{mint}:{}", blockhash_snapshot.blockhash).as_bytes(),
+        );
+        let buy_instruction = PumpV2RouteBuilder::build_buy_v2(
+            &route_accounts,
+            requested_token_amount_raw,
+            max_sol_cost,
+        )
+        .map_err(|error| anyhow::anyhow!("RUG SCALP failed to build buy_v2: {error}"))?;
+        let account_overrides = BuyAccountOverrides {
+            fee_recipient: Some(route_evidence.fee_recipient),
+            token_program: Some(canonical_base_token_program),
+            creator_pubkey: Some(route_evidence.creator),
+            creator_pubkey_source: Some("rug_scalp_v2_canonical_route_evidence".to_string()),
+            creator_pubkey_authoritative: Some(true),
+            route_account_manifest_source: Some("rug_scalp_v2_typed_buy_v2".to_string()),
+            execution_account_contract_status: Some("typed_buy_v2".to_string()),
+            execution_account_contract_reason: Some(
+                "pump_v2_route_accounts_from_canonical_evidence".to_string(),
+            ),
+            ..BuyAccountOverrides::default()
+        };
+        let build_profile = BuyBuildProfile {
+            mint: *mint,
+            payer_pubkey,
+            user_ata,
+            token_program: canonical_base_token_program,
+            attach_idempotent_ata_create: true,
+            ata_missing_pre_submit: ata_probe.ata_missing_pre_submit,
+            account_overrides,
+            amount_lamports: max_sol_cost,
+            trade_value_sol: max_sol_cost as f64 / LAMPORTS_PER_SOL,
+            pre_submit_token_balance: ata_probe.pre_submit_token_balance,
+            // This compatibility enum remains only for generic transaction
+            // plumbing. `typed_route_variant` and the actual instruction are
+            // the execution authority for this request.
+            buy_variant: trigger::PumpfunBuyVariant::RoutedExactSolIn,
+            typed_route_variant: Some(PumpRouteVariant::BuyV2),
+            entry_token_amount_raw: Some(requested_token_amount_raw),
+            min_tokens_out: requested_token_amount_raw,
+            token_param_role: "exact_base_out",
+            ata_instruction: Some(create_associated_token_account_idempotent(
+                &payer_pubkey,
+                &payer_pubkey,
+                mint,
+                &canonical_base_token_program,
+            )),
+            buy_instruction,
+        };
+        let metadata = PreparedBuyRequestBuildMetadata::live(
+            &blockhash_snapshot,
+            blockhash_source,
+            saturating_elapsed_ms(blockhash_fetch_started_at),
+            0,
+            decision_ts_ms,
+        );
+        let priority_fee_micro_lamports = HELIUS_PRIORITY_FEE_FALLBACK_MICRO_LAMPORTS;
+        let (rpc_buy_tx, buy_tx) = self.build_buy_transaction_from_profile(
+            payer.as_ref(),
+            &build_profile,
+            priority_fee_micro_lamports,
+            &tip_account,
+            0,
+            metadata.recent_blockhash,
+        )?;
+        let mut request = self.assemble_prepared_buy_request_from_profile(
+            payer_provenance,
+            &build_profile,
+            0,
+            priority_fee_micro_lamports,
+            metadata,
+            rpc_buy_tx,
+            buy_tx,
+        );
+        request.preparation_telemetry = BuyPreparationTelemetry {
+            payer_load_ms: saturating_elapsed_ms(payer_load_started_at),
+            mint_account_fetch_ms: saturating_elapsed_ms(mint_fetch_started_at),
+            token_balance_probe_ms: ata_probe.elapsed_ms,
+            ata_rent_fetch_ms: ata_probe.ata_rent_fetch_ms,
+            priority_fee_cache_mode: "typed_route_static_fallback",
+            priority_fee_source: "typed_route_static_fallback",
+            ..BuyPreparationTelemetry::default()
+        };
+        Self::record_initial_buy_preparation_metrics(&request.preparation_telemetry);
+        Self::log_buy_preparation_breakdown(&request);
+        Ok(request)
+    }
+
     pub async fn dispatch_prepared_buy(
         &self,
         request: PreparedBuyRequest,
@@ -4562,10 +4783,15 @@ impl TriggerComponent {
                 .build_profile
                 .as_ref()
                 .map(|profile| {
+                    let user_volume_accumulator_index = match profile.typed_route_variant {
+                        Some(PumpRouteVariant::BuyV2) => 20,
+                        Some(_) => return false,
+                        None => 13,
+                    };
                     profile
                         .buy_instruction
                         .accounts
-                        .get(13)
+                        .get(user_volume_accumulator_index)
                         .map(|account| account.pubkey == *pubkey)
                         .unwrap_or(false)
                 })
@@ -4617,6 +4843,38 @@ impl TriggerComponent {
             .accounts
             .iter()
             .position(|account| account.pubkey == *pubkey)?;
+        if matches!(profile.typed_route_variant, Some(PumpRouteVariant::BuyV2)) {
+            return Some(match index {
+                0 => "global_config",
+                1 => "mint",
+                2 => "quote_mint",
+                3 => "token_program",
+                4 => "quote_token_program",
+                5 => "associated_token_program",
+                6 => "fee_recipient",
+                7 => "fee_recipient_quote_ata",
+                8 => "buyback_fee_recipient",
+                9 => "buyback_fee_recipient_quote_ata",
+                10 => "bonding_curve",
+                11 => "bonding_curve_base_ata",
+                12 => "bonding_curve_quote_ata",
+                13 => "payer_pubkey",
+                14 => "user_ata",
+                15 => "user_quote_ata",
+                16 => "creator_vault",
+                17 => "creator_vault_quote_ata",
+                18 => "sharing_config",
+                19 => "global_volume_accumulator",
+                20 => "user_volume_accumulator",
+                21 => "user_volume_accumulator_quote_ata",
+                22 => "fee_config",
+                23 => "fee_program",
+                24 => "system_program",
+                25 => "event_authority",
+                26 => "pump_program",
+                _ => "buy_v2_instruction_account",
+            });
+        }
         Some(match (profile.buy_variant, index) {
             (_, 0) => "global_config",
             (_, 1) => "fee_recipient",

@@ -36,6 +36,13 @@ use crate::components::trigger::safety::{PositionLimitTracker, PositionSlotId, S
 use crate::events::{
     EventBusReceiver, GhostEvent, PostBuySource, RuntimePlane, ShadowV2EntryBoundaryPayload,
 };
+use crate::rug_scalp_v2::{
+    append_rug_scalp_jsonl_record, RugScalpOutcomeRecordV2, RugScalpTerminalOutcomeV2,
+    RUG_SCALP_EXIT_PROFILE_ID, RUG_SCALP_V2_STRATEGY_ID,
+};
+use crate::rug_scalp_validation_tape::{
+    RugScalpValidationTapeBusV1, RugScalpValidationTapeEventV1, RugScalpValidationTerminalStatusV1,
+};
 use futures::{stream, StreamExt};
 use ghost_brain::config::ghost_brain_config::ShadowV2BurninConfig;
 use ghost_brain::events::{EventEmitter, EventWriterConfig};
@@ -54,8 +61,9 @@ use ghost_brain::guardian::post_buy::shadow_v2::{
 };
 use ghost_brain::guardian::post_buy::{
     validate_exit_policy_v1_config, validate_het_pm_v2_config, CrashGuardMode, ExitPolicyV1Status,
-    MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, ShadowMarketRefreshConfig,
-    ShadowMarketRefreshTarget, ShadowPositionBook, ShadowTerminalDisposition, SignalRouter,
+    MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, RugScalpFactIngressResultV1,
+    RugScalpMarketFactV1, ShadowMarketRefreshConfig, ShadowMarketRefreshTarget, ShadowPositionBook,
+    ShadowTerminalDisposition, ShadowUnresolvedReason, SignalRouter,
 };
 use ghost_brain::quotes::{ExecutableQuoteProvider, QuoteProviderConfig};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
@@ -221,15 +229,22 @@ pub enum DirectPostBuyHandoffAck {
     Rejected(&'static str),
 }
 
+/// Direct post-buy payload.  RUG facts intentionally bypass `GhostEvent`: a
+/// Position Manager does not need (and must not become owner of) raw trades.
+pub enum DirectPostBuyPayload {
+    Event(GhostEvent),
+    RugScalpMarketFact(RugScalpMarketFactV1),
+}
+
 pub struct DirectPostBuyHandoff {
-    event: GhostEvent,
+    payload: DirectPostBuyPayload,
     ack_tx: Option<oneshot::Sender<DirectPostBuyHandoffAck>>,
 }
 
 impl DirectPostBuyHandoff {
     pub fn without_ack(event: GhostEvent) -> Self {
         Self {
-            event,
+            payload: DirectPostBuyPayload::Event(event),
             ack_tx: None,
         }
     }
@@ -238,15 +253,27 @@ impl DirectPostBuyHandoff {
         let (ack_tx, ack_rx) = oneshot::channel();
         (
             Self {
-                event,
+                payload: DirectPostBuyPayload::Event(event),
                 ack_tx: Some(ack_tx),
             },
             ack_rx,
         )
     }
 
-    pub fn into_parts(self) -> (GhostEvent, Option<oneshot::Sender<DirectPostBuyHandoffAck>>) {
-        (self.event, self.ack_tx)
+    pub fn rug_scalp_market_fact_without_ack(fact: RugScalpMarketFactV1) -> Self {
+        Self {
+            payload: DirectPostBuyPayload::RugScalpMarketFact(fact),
+            ack_tx: None,
+        }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        DirectPostBuyPayload,
+        Option<oneshot::Sender<DirectPostBuyHandoffAck>>,
+    ) {
+        (self.payload, self.ack_tx)
     }
 }
 
@@ -313,6 +340,12 @@ pub struct PostBuyRuntimeConfig {
     pub shadow_lifecycle_log_path: Option<PathBuf>,
     /// Counterfactual probe lifecycle proof log path derived from p37_shadow_probe.*.
     pub probe_lifecycle_log_path: Option<PathBuf>,
+    /// Isolated RUG terminal-outcome stream.  It is written only by the RUG
+    /// adapter/PM terminal bridge, never by the generic post-buy lifecycle.
+    pub rug_scalp_outcome_log_path: Option<PathBuf>,
+    /// Bounded observer-only terminal telemetry for the RUG validation tape.
+    /// It carries PM evidence back to the tape but cannot influence PM.
+    pub rug_scalp_validation_tape_bus: Option<RugScalpValidationTapeBusV1>,
     /// Optional Shadow V2 logging-only validation config. This must never feed decisions.
     pub shadow_v2_burnin: Option<ShadowV2BurninConfig>,
 }
@@ -341,6 +374,8 @@ impl Default for PostBuyRuntimeConfig {
             shadow_market_refresh_rpc_url: None,
             shadow_lifecycle_log_path: None,
             probe_lifecycle_log_path: None,
+            rug_scalp_outcome_log_path: None,
+            rug_scalp_validation_tape_bus: None,
             shadow_v2_burnin: None,
         }
     }
@@ -3236,20 +3271,43 @@ pub async fn run(
             }, if direct_handoff_rx.is_some() => {
                 match direct_event {
                     Some(handoff) => {
-                        let (event, ack_tx) = handoff.into_parts();
-                        let ack = handle_post_buy_event(
-                            event,
-                            &config,
-                            &lifecycle,
-                            shadow_monitor.as_ref(),
-                            probe_monitor.as_ref(),
-                            &mut epoch_counter,
-                            &mut lifecycle_handles,
-                            &mut recent_handoffs,
-                            &shadow_v2_harness,
-                            admission_writer.as_ref(),
-                        )
-                        .await;
+                        let (payload, ack_tx) = handoff.into_parts();
+                        let ack = match payload {
+                            DirectPostBuyPayload::Event(event) => handle_post_buy_event(
+                                event,
+                                &config,
+                                &lifecycle,
+                                shadow_monitor.as_ref(),
+                                probe_monitor.as_ref(),
+                                &mut epoch_counter,
+                                &mut lifecycle_handles,
+                                &mut recent_handoffs,
+                                &shadow_v2_harness,
+                                admission_writer.as_ref(),
+                            )
+                            .await,
+                            DirectPostBuyPayload::RugScalpMarketFact(fact) => {
+                                match probe_monitor.as_ref() {
+                                    Some(monitor) => match monitor.observe_rug_scalp_market_fact(fact) {
+                                        RugScalpFactIngressResultV1::Applied
+                                        | RugScalpFactIngressResultV1::Duplicate
+                                        | RugScalpFactIngressResultV1::IgnoredPreEntry => {
+                                            DirectPostBuyHandoffAck::Accepted
+                                        }
+                                        RugScalpFactIngressResultV1::RejectedInvalidFact => {
+                                            DirectPostBuyHandoffAck::Rejected("rug_fact_invalid")
+                                        }
+                                        RugScalpFactIngressResultV1::RejectedUnknownPosition => {
+                                            DirectPostBuyHandoffAck::Rejected("rug_position_unknown")
+                                        }
+                                        RugScalpFactIngressResultV1::RejectedProfileMismatch => {
+                                            DirectPostBuyHandoffAck::Rejected("rug_profile_mismatch")
+                                        }
+                                    },
+                                    None => DirectPostBuyHandoffAck::Rejected("rug_pm_unavailable"),
+                                }
+                            }
+                        };
                         if let Some(ack_tx) = ack_tx {
                             let _ = ack_tx.send(ack);
                         }
@@ -3669,6 +3727,12 @@ async fn handle_post_buy_event(
             ),
         );
         let position_join_metadata = PositionJoinMetadata {
+            strategy_id: join_metadata.strategy_id.clone(),
+            exit_profile_id: join_metadata.exit_profile_id.clone(),
+            rug_scalp_entry_watermark_slot: join_metadata.rug_scalp_entry_watermark_slot,
+            rug_scalp_entry_watermark_tx_index: join_metadata.rug_scalp_entry_watermark_tx_index,
+            rug_scalp_entry_watermark_event_ordinal: join_metadata
+                .rug_scalp_entry_watermark_event_ordinal,
             ab_record_id: join_metadata.ab_record_id.clone(),
             source_ab_record_id: join_metadata.source_ab_record_id.clone(),
             probe_id: join_metadata.probe_id.clone(),
@@ -3861,7 +3925,7 @@ async fn handle_post_buy_event(
             probe_id = ?join_metadata.probe_id,
             "PostBuyRuntime: probe lifecycle monitor requested"
         );
-        let handoff = handle_shadow_post_buy_handoff(
+        let mut handoff = handle_shadow_post_buy_handoff(
             probe_monitor,
             &candidate_id,
             &pool_amm_id,
@@ -3873,6 +3937,23 @@ async fn handle_post_buy_event(
             entry_opened_at_ms,
             epoch,
             PositionJoinMetadata {
+                strategy_id: join_metadata.strategy_id.clone(),
+                exit_profile_id: join_metadata.exit_profile_id.clone(),
+                rug_scalp_entry_watermark_slot: join_metadata.rug_scalp_entry_watermark_slot,
+                rug_scalp_entry_watermark_tx_index: join_metadata
+                    .rug_scalp_entry_watermark_tx_index,
+                rug_scalp_entry_watermark_event_ordinal: join_metadata
+                    .rug_scalp_entry_watermark_event_ordinal,
+                rug_scalp_entry_total_debit_lamports: join_metadata
+                    .rug_scalp_entry_total_debit_lamports,
+                rug_scalp_entry_route_id: join_metadata.rug_scalp_entry_route_id.clone(),
+                rug_scalp_exit_route_id: join_metadata.rug_scalp_exit_route_id.clone(),
+                rug_scalp_entry_fee_schedule_id: join_metadata
+                    .rug_scalp_entry_fee_schedule_id
+                    .clone(),
+                rug_scalp_exit_fee_schedule_id: join_metadata
+                    .rug_scalp_exit_fee_schedule_id
+                    .clone(),
                 ab_record_id: join_metadata.ab_record_id.clone(),
                 source_ab_record_id: join_metadata.source_ab_record_id.clone(),
                 probe_id: join_metadata.probe_id.clone(),
@@ -3893,6 +3974,54 @@ async fn handle_post_buy_event(
         .await;
         match handoff.ack {
             DirectPostBuyHandoffAck::Accepted => {
+                if join_metadata.strategy_id.as_deref() == Some(RUG_SCALP_V2_STRATEGY_ID)
+                    && join_metadata.exit_profile_id.as_deref() == Some(RUG_SCALP_EXIT_PROFILE_ID)
+                {
+                    match (
+                        config.rug_scalp_outcome_log_path.clone(),
+                        handoff.terminal_rx.take(),
+                        handoff.position_id.clone(),
+                    ) {
+                        (Some(path), Some(terminal_rx), Some(position_id)) => {
+                            lifecycle_handles.push(spawn_rug_scalp_terminal_outcome_watcher(
+                                terminal_rx,
+                                path,
+                                RugScalpTerminalOutcomeContext {
+                                    candidate_id: candidate_id.clone(),
+                                    position_id,
+                                    pool_id: pool_amm_id.clone(),
+                                    mint: base_mint.clone(),
+                                    entry_route_id: join_metadata
+                                        .rug_scalp_entry_route_id
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    exit_route_id: join_metadata
+                                        .rug_scalp_exit_route_id
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    entry_fee_schedule_id: join_metadata
+                                        .rug_scalp_entry_fee_schedule_id
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    exit_fee_schedule_id: join_metadata
+                                        .rug_scalp_exit_fee_schedule_id
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    validation_tape_bus: config
+                                        .rug_scalp_validation_tape_bus
+                                        .clone(),
+                                },
+                            ));
+                        }
+                        _ => {
+                            warn!(
+                                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                                candidate_id = %candidate_id,
+                                "RUG_SCALP_PM_TERMINAL_OUTCOME_WATCHER_UNAVAILABLE"
+                            );
+                        }
+                    }
+                }
                 info!(
                     runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                     candidate_id = %candidate_id,
@@ -4794,11 +4923,21 @@ async fn handle_shadow_post_buy_handoff(
     } else {
         0
     };
-    let probe_position_id = join_metadata
-        .probe_id
-        .as_ref()
-        .filter(|_| join_metadata.dispatch_source.as_deref() == Some("counterfactual_shadow_probe"))
-        .map(|probe_id| format!("probe-position:{probe_id}"));
+    let probe_position_id = if join_metadata.exit_profile_id.as_deref()
+        == Some(ghost_brain::guardian::post_buy::RUG_SCALP_EXIT_PROFILE_ID)
+    {
+        // The RUG adapter owns this deterministic identity before facts begin
+        // flowing.  PM validates the same identity at registration.
+        Some(format!("rug-scalp-position:{candidate_id}"))
+    } else {
+        join_metadata
+            .probe_id
+            .as_ref()
+            .filter(|_| {
+                join_metadata.dispatch_source.as_deref() == Some("counterfactual_shadow_probe")
+            })
+            .map(|probe_id| format!("probe-position:{probe_id}"))
+    };
     let entry_order_id = if probe_position_id.is_some() {
         format!("probe-entry-{candidate_id}")
     } else {
@@ -4893,9 +5032,9 @@ fn spawn_shadow_terminal_watcher(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (disposition, action_id, reason) = match terminal_rx.await {
-            Ok(ShadowTerminalDisposition::SimulatedClosed { action_id, reason }) => {
-                ("simulated_closed", Some(action_id), reason)
-            }
+            Ok(ShadowTerminalDisposition::SimulatedClosed {
+                action_id, reason, ..
+            }) => ("simulated_closed", Some(action_id), reason),
             Ok(ShadowTerminalDisposition::SimulationBlocked { action_id, reason }) => (
                 "simulation_blocked",
                 Some(action_id),
@@ -4956,6 +5095,118 @@ fn spawn_shadow_terminal_watcher(
                 reason,
                 "PostBuyRuntime: shadow position slot released from typed terminal notification"
             );
+        }
+    })
+}
+
+#[derive(Debug, Clone)]
+struct RugScalpTerminalOutcomeContext {
+    candidate_id: String,
+    position_id: String,
+    pool_id: String,
+    mint: String,
+    entry_route_id: String,
+    exit_route_id: String,
+    entry_fee_schedule_id: String,
+    exit_fee_schedule_id: String,
+    validation_tape_bus: Option<RugScalpValidationTapeBusV1>,
+}
+
+/// The one-shot PM terminal receiver is the only close authority observed by
+/// the experiment outcome writer.  It prevents the launcher adapter from
+/// inventing a second lifecycle or a synthetic exit result.
+fn spawn_rug_scalp_terminal_outcome_watcher(
+    terminal_rx: oneshot::Receiver<ShadowTerminalDisposition>,
+    outcome_log_path: PathBuf,
+    context: RugScalpTerminalOutcomeContext,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (terminal_outcome, reason, exit_landed_slot, net_pnl_lamports) = match terminal_rx.await
+        {
+            Ok(ShadowTerminalDisposition::SimulatedClosed {
+                reason,
+                exit_landed_slot,
+                net_pnl_lamports,
+                ..
+            }) => (
+                RugScalpTerminalOutcomeV2::PositionClosed,
+                reason,
+                exit_landed_slot,
+                net_pnl_lamports,
+            ),
+            Ok(ShadowTerminalDisposition::SimulationBlocked { reason, .. }) => (
+                if matches!(reason, ShadowUnresolvedReason::BlockedByData) {
+                    RugScalpTerminalOutcomeV2::DataInvalidated
+                } else {
+                    RugScalpTerminalOutcomeV2::ExitUnavailable
+                },
+                reason.as_label().to_string(),
+                None,
+                None,
+            ),
+            Err(_) => (
+                RugScalpTerminalOutcomeV2::ExitUnavailable,
+                "pm_terminal_channel_dropped".to_string(),
+                None,
+                None,
+            ),
+        };
+        let record = RugScalpOutcomeRecordV2::position_terminal(
+            context.candidate_id,
+            context.position_id,
+            context.mint,
+            context.pool_id,
+            100_000_000,
+            200_000_000,
+            terminal_outcome,
+            reason,
+            exit_landed_slot,
+            net_pnl_lamports,
+            context.entry_route_id,
+            context.exit_route_id,
+            context.entry_fee_schedule_id,
+            context.exit_fee_schedule_id,
+        );
+        if let Err(error) = append_rug_scalp_jsonl_record(&outcome_log_path, &record).await {
+            warn!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                candidate_id = %record.candidate_id,
+                position_id = ?record.position_id,
+                error = %error,
+                "RUG_SCALP_TERMINAL_OUTCOME_WRITE_FAILED"
+            );
+        }
+        if let Some(bus) = context.validation_tape_bus.as_ref() {
+            let status = match &record.terminal_outcome {
+                RugScalpTerminalOutcomeV2::PositionClosed => {
+                    RugScalpValidationTerminalStatusV1::PositionClosed
+                }
+                RugScalpTerminalOutcomeV2::DataInvalidated => {
+                    RugScalpValidationTerminalStatusV1::DataInvalidated
+                }
+                RugScalpTerminalOutcomeV2::ExitUnavailable => {
+                    RugScalpValidationTerminalStatusV1::ExitUnavailable
+                }
+                RugScalpTerminalOutcomeV2::EntryUnknown => {
+                    RugScalpValidationTerminalStatusV1::EntryUnknown
+                }
+                RugScalpTerminalOutcomeV2::NoEntry | RugScalpTerminalOutcomeV2::EntryFailed => {
+                    RugScalpValidationTerminalStatusV1::EntryFailed
+                }
+            };
+            bus.emit(RugScalpValidationTapeEventV1::PmTerminal {
+                candidate_id: record.candidate_id.clone(),
+                position_id: record.position_id.clone().unwrap_or_default(),
+                status,
+                reason: record
+                    .exit_reason
+                    .clone()
+                    .or(record.failure_reason.clone())
+                    .unwrap_or_else(|| "pm_terminal_unclassified".to_string()),
+                exit_landed_slot: record.exit_landed_slot,
+                pm_owned_net_pnl_lamports: record.net_pnl_lamports,
+                observed_ingress_ms: now_ms(),
+            });
         }
     })
 }
@@ -5977,23 +6228,39 @@ fn retain_live_slot(slot_id: Option<PositionSlotId>, status: LiveExitStatus, rea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{create_event_bus, create_event_bus_with_capacity, GhostEvent};
+    use crate::events::{
+        create_event_bus, create_event_bus_with_capacity, DetectedPool, GhostEvent, PoolTransaction,
+    };
+    use crate::rug_scalp_v2::{
+        RugScalpCanonicalStateV2, RugScalpPumpFeeScheduleV1, RugScalpPumpQuoteAuthorityV1,
+        RugScalpRuntimeActionV2, RugScalpRuntimeAdapterV2, RugScalpV2Config, RUG_SCALP_ENTRY_ROUTE,
+        RUG_SCALP_EXIT_ROUTE,
+    };
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use ghost_brain::events::{EventKind, ExecutionEvent};
     use ghost_brain::guardian::post_buy::ShadowUnresolvedReason;
     use ghost_core::account_state_core::types::{
         AccountStateUpdate, CanonicalPoolState, StatePhase, UpdateSource,
     };
-    use ghost_core::{BondingCurve, CurveFinality};
+    use ghost_core::{
+        quote_exact_base_out, BondingCurve, CurveFinality, EventSemanticEnvelope, FeeRounding,
+        ProgramFeeRule, ProgramFeeSchedule, ProgramFeeScheduleEvidenceV1, PumpReserveState,
+        PumpRouteVariant, TransactionCosts,
+    };
     use metrics::{
         Counter, CounterFn, Gauge, Histogram, Key, KeyName, Recorder, SharedString, Unit,
     };
     use solana_sdk::pubkey::Pubkey;
+    use std::str::FromStr;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use trigger::{
+        decode_pump_route_instruction, DecodedPumpRouteInstruction, PumpV2RouteAccounts,
+        PumpV2RouteBuilder, SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, WRAPPED_SOL_MINT,
+    };
 
     fn complete_shadow_v2_burnin_config_for_test() -> ShadowV2BurninConfig {
         ShadowV2BurninConfig {
@@ -9043,8 +9310,10 @@ sys.exit(0)
             account_state_core: None,
             shadow_lifecycle_log_path: None,
             probe_lifecycle_log_path: None,
+            rug_scalp_outcome_log_path: None,
             shadow_v2_burnin: None,
             shadow_market_refresh_rpc_url: None,
+            rug_scalp_validation_tape_bus: None,
         };
 
         let runtime_handle = tokio::spawn(run(event_rx, shutdown_rx, None, config));
@@ -9145,8 +9414,10 @@ sys.exit(0)
             account_state_core: None,
             shadow_lifecycle_log_path: None,
             probe_lifecycle_log_path: None,
+            rug_scalp_outcome_log_path: None,
             shadow_v2_burnin: None,
             shadow_market_refresh_rpc_url: None,
+            rug_scalp_validation_tape_bus: None,
         };
 
         event_tx
@@ -9258,8 +9529,10 @@ sys.exit(0)
             account_state_core: None,
             shadow_lifecycle_log_path: None,
             probe_lifecycle_log_path: None,
+            rug_scalp_outcome_log_path: None,
             shadow_v2_burnin: None,
             shadow_market_refresh_rpc_url: None,
+            rug_scalp_validation_tape_bus: None,
         };
 
         drop(event_tx);
@@ -9354,8 +9627,10 @@ sys.exit(0)
             account_state_core: None,
             shadow_lifecycle_log_path: None,
             probe_lifecycle_log_path: None,
+            rug_scalp_outcome_log_path: None,
             shadow_v2_burnin: None,
             shadow_market_refresh_rpc_url: None,
+            rug_scalp_validation_tape_bus: None,
         };
 
         let runtime_handle = tokio::spawn(run(event_rx, shutdown_rx, Some(direct_rx), config));
@@ -9813,6 +10088,812 @@ sys.exit(0)
     }
 
     #[tokio::test]
+    async fn rug_scalp_probe_handoff_registers_one_profiled_position_and_accepts_only_typed_facts()
+    {
+        let config = PostBuyRuntimeConfig {
+            execution_mode: "shadow".to_string(),
+            shadow_ledger: Some(Arc::new(ShadowLedger::new())),
+            ..PostBuyRuntimeConfig::default()
+        };
+        let mut guardian_config = build_shadow_guardian_config(&config);
+        guardian_config.target_threshold = Some(50.0);
+        guardian_config.stoploss_threshold = Some(50.0);
+        guardian_config.rug_scalp_exit_v1.enabled = true;
+        let (signal_tx, _signal_rx) = mpsc::channel(guardian_config.signal_channel_buffer.max(1));
+        let mut monitoring_engine = MonitoringEngine::try_new(
+            guardian_config,
+            config
+                .shadow_ledger
+                .clone()
+                .expect("shadow ledger for RUG handoff"),
+            signal_tx,
+        )
+        .expect("valid RUG PM profile config");
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        monitoring_engine.set_account_state_core(Arc::clone(&account_state_core));
+        let monitoring_engine = Arc::new(monitoring_engine);
+
+        let pool_amm_id = Pubkey::new_unique().to_string();
+        let mint = Pubkey::new_unique();
+        let base_mint = mint.to_string();
+        // Make the handoff's canonical readiness check succeed synchronously.
+        apply_canonical_update(&account_state_core, mint, 30_000_000_000, 1_000_000_000_000);
+        let candidate_id = "rug-scalp-candidate-1";
+        let join = PositionJoinMetadata {
+            strategy_id: Some(RUG_SCALP_V2_STRATEGY_ID.to_string()),
+            exit_profile_id: Some(RUG_SCALP_EXIT_PROFILE_ID.to_string()),
+            rug_scalp_entry_total_debit_lamports: Some(100_000_000),
+            rug_scalp_entry_route_id: Some("buy_v2".to_string()),
+            rug_scalp_exit_route_id: Some("legacy_sell".to_string()),
+            rug_scalp_entry_fee_schedule_id: Some("test-buy-v2@0".to_string()),
+            rug_scalp_exit_fee_schedule_id: Some("test-legacy-sell@0".to_string()),
+            ..PositionJoinMetadata::default()
+        };
+
+        let first = handle_shadow_post_buy_handoff(
+            Some(&monitoring_engine),
+            candidate_id,
+            &pool_amm_id,
+            &base_mint,
+            0.10,
+            Some(1_000),
+            Some(42),
+            Some(42),
+            Some(1_000),
+            1,
+            join.clone(),
+        )
+        .await;
+        assert_eq!(first.ack, DirectPostBuyHandoffAck::Accepted);
+        assert_eq!(
+            first.position_id.as_deref(),
+            Some("rug-scalp-position:rug-scalp-candidate-1")
+        );
+        assert_eq!(monitoring_engine.active_position_count(), 1);
+
+        // A second handoff for the same primary candidate cannot create a
+        // second PM lifecycle, regardless of the counterfactual 0.20 SOL
+        // quote carried by the experiment evidence.
+        let duplicate = handle_shadow_post_buy_handoff(
+            Some(&monitoring_engine),
+            candidate_id,
+            &pool_amm_id,
+            &base_mint,
+            0.10,
+            Some(1_000),
+            Some(42),
+            Some(42),
+            Some(1_000),
+            2,
+            join,
+        )
+        .await;
+        assert_eq!(
+            duplicate.ack,
+            DirectPostBuyHandoffAck::Rejected("monitoring_rejected")
+        );
+        assert_eq!(monitoring_engine.active_position_count(), 1);
+
+        let position_id = first.position_id.expect("RUG PM position id");
+        let complete = |slot| RugScalpMarketFactV1 {
+            position_id: position_id.clone(),
+            mint,
+            slot,
+            tx_index: None,
+            event_ordinal: None,
+            fact_kind: ghost_brain::guardian::post_buy::RugScalpMarketFactKindV1::SlotComplete,
+            successful_buy_count_in_slot: 0,
+            sell_quote_lamports: None,
+            reserve_before: None,
+            reserve_after: None,
+            executable_position_value_before: None,
+            executable_position_value_after: None,
+            data_completeness:
+                ghost_brain::guardian::post_buy::RugScalpDataCompletenessV1::Complete,
+        };
+        let first_empty = complete(43);
+        assert_eq!(
+            monitoring_engine.observe_rug_scalp_market_fact(first_empty.clone()),
+            RugScalpFactIngressResultV1::Applied
+        );
+        assert_eq!(
+            monitoring_engine.observe_rug_scalp_market_fact(first_empty),
+            RugScalpFactIngressResultV1::Duplicate,
+            "duplicate typed fact cannot create a second exit"
+        );
+        assert_eq!(
+            monitoring_engine.observe_rug_scalp_market_fact(complete(44)),
+            RugScalpFactIngressResultV1::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn rug_scalp_typed_pump_e2e_fixture_has_one_pm_owned_lifecycle_and_terminal_outcome() {
+        fn schedule(
+            route_variant: PumpRouteVariant,
+            schedule_id: &str,
+            rules: Vec<ProgramFeeRule>,
+        ) -> RugScalpPumpFeeScheduleV1 {
+            RugScalpPumpFeeScheduleV1 {
+                route_variant,
+                schedule: ProgramFeeSchedule {
+                    fee_schedule_id: schedule_id.to_string(),
+                    effective_slot: 0,
+                    evidence: ProgramFeeScheduleEvidenceV1::OnChainConfig {
+                        config_pubkey: format!("canonical-pump-fee-config-{schedule_id}"),
+                        owner_program: "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ".to_string(),
+                        account_data_hash: format!("canonical-pump-fee-hash-{schedule_id}"),
+                        observed_slot: 0,
+                    },
+                    rules,
+                },
+            }
+        }
+
+        fn typed_authority() -> RugScalpPumpQuoteAuthorityV1 {
+            RugScalpPumpQuoteAuthorityV1 {
+                schedules: vec![
+                    schedule(
+                        RUG_SCALP_ENTRY_ROUTE,
+                        "onchain-buy-v2-e2e@0",
+                        vec![ProgramFeeRule {
+                            component_id: "protocol_and_buyback".to_string(),
+                            numerator: 95,
+                            denominator: 10_000,
+                            rounding: FeeRounding::Ceil,
+                        }],
+                    ),
+                    schedule(
+                        RUG_SCALP_EXIT_ROUTE,
+                        "onchain-legacy-sell-e2e@0",
+                        vec![
+                            ProgramFeeRule {
+                                component_id: "lp_fee".to_string(),
+                                numerator: 3,
+                                denominator: 1_000,
+                                rounding: FeeRounding::Ceil,
+                            },
+                            ProgramFeeRule {
+                                component_id: "protocol_fee_recipient".to_string(),
+                                numerator: 95,
+                                denominator: 20_000,
+                                rounding: FeeRounding::Ceil,
+                            },
+                            ProgramFeeRule {
+                                component_id: "buyback_fee_recipient".to_string(),
+                                numerator: 95,
+                                denominator: 20_000,
+                                rounding: FeeRounding::Floor,
+                            },
+                            ProgramFeeRule {
+                                component_id: "creator_fee".to_string(),
+                                numerator: 395,
+                                denominator: 40_000,
+                                rounding: FeeRounding::Floor,
+                            },
+                        ],
+                    ),
+                ],
+                entry_transaction_costs: TransactionCosts::default(),
+                exit_transaction_costs: TransactionCosts::default(),
+            }
+        }
+
+        fn enabled_rug_config(authority: RugScalpPumpQuoteAuthorityV1) -> RugScalpV2Config {
+            RugScalpV2Config {
+                enabled: true,
+                min_prev_slot_buys: 1,
+                min_current_slot_buys: 1,
+                min_two_slot_buys: 2,
+                min_two_slot_unique_users: 1,
+                min_two_slot_effective_quote_sol: 0.50,
+                min_current_to_previous_quote_ratio: 0.0,
+                max_top1_quote_share: 1.0,
+                max_position_to_recent_flow_ratio: 1.0,
+                max_entry_self_impact_bps: 10_000,
+                max_required_flow_to_recent_flow_ratio: 1.0,
+                primary_entry_latency_slots: Some(0),
+                primary_exit_latency_slots: Some(0),
+                entry_fixed_cost_lamports: Some(0),
+                exit_fixed_cost_lamports: Some(0),
+                pump_quote_authority: Some(authority),
+                ..RugScalpV2Config::default()
+            }
+        }
+
+        fn canonical_curve() -> BondingCurve {
+            BondingCurve {
+                discriminator: 0,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                virtual_sol_reserves: 30_000_000_000,
+                real_token_reserves: 793_100_000_000_000,
+                real_sol_reserves: 0,
+                token_total_supply: 1_000_000_000_000_000,
+                complete: 0,
+                _padding: [0; 7],
+            }
+        }
+
+        fn birth(mint: &Pubkey, pool: &Pubkey, slot: u64) -> DetectedPool {
+            DetectedPool {
+                semantic: EventSemanticEnvelope::default(),
+                pool_amm_id: pool.to_string(),
+                base_mint: mint.to_string(),
+                quote_mint: "SOL".to_string(),
+                amm_program: "pumpfun".to_string(),
+                bonding_curve: "curve".to_string(),
+                creator: "creator".to_string(),
+                slot: Some(slot),
+                tx_index: Some(0),
+                timestamp_ms: 1_000,
+                event_time: Default::default(),
+                detected_wall_ts_ms: Some(1_000),
+                initial_liquidity_sol: None,
+                signature: "rug-e2e-birth".to_string(),
+            }
+        }
+
+        fn trade(
+            mint: &Pubkey,
+            slot: u64,
+            tx_index: u32,
+            signature: &str,
+            signer: &str,
+            is_buy: bool,
+            success: bool,
+            volume_sol: f64,
+        ) -> PoolTransaction {
+            PoolTransaction {
+                semantic: EventSemanticEnvelope::default(),
+                pool_amm_id: "pool".to_string(),
+                slot: Some(slot),
+                event_ordinal: Some(0),
+                tx_index: Some(tx_index),
+                outer_instruction_index: None,
+                inner_group_index: None,
+                outer_program_id: None,
+                cpi_stack_height: None,
+                timestamp_ms: 1_000 + tx_index as u64,
+                event_time: Default::default(),
+                arrival_ts_ms: 1_000 + tx_index as u64,
+                signer: signer.to_string(),
+                is_buy,
+                volume_sol,
+                sol_amount_lamports: Some((volume_sol * LAMPORTS_PER_SOL as f64).round() as u64),
+                token_amount_units: Some(1),
+                reserve_base: None,
+                reserve_quote: None,
+                price_quote: None,
+                is_dev_buy: false,
+                dev_buy_lamports: 0,
+                signature: signature.to_string(),
+                success,
+                error_code: None,
+                compute_units_consumed: None,
+                owner_token_deltas: vec![],
+                mpcf_payload: vec![],
+                mpcf_payload_missing_reason: Default::default(),
+                token_mint: Some(mint.to_string()),
+                v_tokens_in_bonding_curve: None,
+                v_sol_in_bonding_curve: None,
+                virtual_sol_reserves: None,
+                virtual_token_reserves: None,
+                real_sol_reserves: None,
+                real_token_reserves: None,
+                complete: None,
+                market_cap_sol: None,
+                global_config: None,
+                fee_recipient: None,
+                token_program: None,
+                buy_variant: None,
+                associated_bonding_curve: None,
+                creator_vault: None,
+                bonding_curve_v2: None,
+                bonding_curve_v2_provenance: None,
+                buy_remaining_accounts: vec![],
+                is_mayhem_mode: None,
+                cu_price_micro_lamports: None,
+                compute_unit_limit: None,
+                inner_ix_count: None,
+                cpi_depth: None,
+                ata_create_count: None,
+                signer_pre_balance_lamports: None,
+                signer_post_balance_lamports: None,
+                jito_tip_detected: None,
+                toolchain_fingerprint: Default::default(),
+                curve_data_known: true,
+                curve_finality: Default::default(),
+            }
+        }
+
+        let authority = typed_authority();
+        let rug_config = enabled_rug_config(authority.clone());
+        rug_config
+            .validate_enabled_contract()
+            .expect("canonical runtime fee evidence must authorise the RUG fixture");
+
+        // Negative evidence belongs in the same end-to-end contract: an
+        // offline canonical fixture and a typed-but-unauthorised route cannot
+        // reach signal execution or PM registration.
+        let mut fixture_only = authority.clone();
+        fixture_only.schedules[0].schedule.evidence =
+            ProgramFeeScheduleEvidenceV1::CanonicalFixture {
+                fixture_id: "offline-only-buy-v2".to_string(),
+                transaction_signature: "fixture-signature".to_string(),
+                observed_slot: 0,
+            };
+        assert!(matches!(
+            enabled_rug_config(fixture_only).validate_enabled_contract(),
+            Err(crate::rug_scalp_v2::RugScalpConfigError::InvalidPumpQuoteAuthority)
+        ));
+        let mut missing_exit_schedule = authority.clone();
+        missing_exit_schedule
+            .schedules
+            .retain(|entry| entry.route_variant != RUG_SCALP_EXIT_ROUTE);
+        let missing_exit_config = enabled_rug_config(missing_exit_schedule);
+        let mut unauthorised_route = authority.clone();
+        unauthorised_route.schedules.push(schedule(
+            PumpRouteVariant::SellV2,
+            "onchain-sell-v2-not-authorised@0",
+            vec![ProgramFeeRule {
+                component_id: "unused".to_string(),
+                numerator: 1,
+                denominator: 10_000,
+                rounding: FeeRounding::Floor,
+            }],
+        ));
+        assert!(matches!(
+            enabled_rug_config(unauthorised_route).validate_enabled_contract(),
+            Err(crate::rug_scalp_v2::RugScalpConfigError::InvalidPumpQuoteAuthority)
+        ));
+
+        let mint = Pubkey::from_str("6P1EKxhPB1ZBMmduhuHZ9DcMVcgHqzj7frPNSduZpump")
+            .expect("current BuyV2 fixture mint");
+        let pool = Pubkey::new_unique();
+        let canonical = RugScalpCanonicalStateV2 {
+            state_clean: true,
+            ordering_known: true,
+            accepted_window_has_gap: false,
+        };
+        let curve_before_sell = canonical_curve();
+        let first_buy = trade(&mint, 2, 1, "rug-e2e-buy-1", "buyer-a", true, true, 10.0);
+        let second_buy = trade(&mint, 3, 1, "rug-e2e-buy-2", "buyer-b", true, true, 10.0);
+        let mut adapter_without_exit_schedule = RugScalpRuntimeAdapterV2::new(missing_exit_config);
+        adapter_without_exit_schedule.on_birth(&birth(&mint, &pool, 1), 1_000);
+        let _ = adapter_without_exit_schedule.on_trade(
+            &first_buy,
+            1_100,
+            canonical,
+            Some(curve_before_sell),
+        );
+        assert!(
+            !adapter_without_exit_schedule
+                .on_trade(&second_buy, 1_200, canonical, Some(curve_before_sell))
+                .iter()
+                .any(|action| matches!(action, RugScalpRuntimeActionV2::EntryIntent(_))),
+            "missing execution-authorised LegacySell fee evidence must fail closed before entry"
+        );
+
+        let mut adapter = RugScalpRuntimeAdapterV2::new(rug_config.clone());
+        adapter.on_birth(&birth(&mint, &pool, 1), 1_000);
+        let _ = adapter.on_trade(&first_buy, 1_100, canonical, Some(curve_before_sell));
+        let entry_intents: Vec<_> = adapter
+            .on_trade(&second_buy, 1_200, canonical, Some(curve_before_sell))
+            .into_iter()
+            .filter_map(|action| match action {
+                RugScalpRuntimeActionV2::EntryIntent(intent) => Some(intent),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            entry_intents.len(),
+            1,
+            "0.20 SOL sensitivity cannot create a second entry/lifecycle intent"
+        );
+        let intent = entry_intents
+            .into_iter()
+            .next()
+            .expect("canonical fee evidence and RUG signal must emit one primary intent");
+        assert_eq!(intent.primary_notional_lamports, 100_000_000);
+        assert_eq!(
+            intent
+                .assessment
+                .sensitivity_quote
+                .as_ref()
+                .map(|quote| quote.notional_lamports),
+            Some(200_000_000),
+            "0.20 SOL remains a counterfactual quote, not an entry intent"
+        );
+        assert_eq!(intent.entry_route_id, "buy_v2");
+        assert_eq!(intent.exit_route_id, "legacy_sell");
+        assert_eq!(intent.entry_fee_schedule_id, "onchain-buy-v2-e2e@0");
+        assert_eq!(intent.exit_fee_schedule_id, "onchain-legacy-sell-e2e@0");
+
+        // The entry debit must be the explicit BuyV2 settlement under the
+        // 95-bps canonical schedule.  This catches a historical 100-bps
+        // fallback even if a caller otherwise supplies the correct route ID.
+        let entry_schedule = rug_config
+            .pump_quote_authority
+            .as_ref()
+            .expect("typed authority")
+            .schedules
+            .iter()
+            .find(|entry| entry.route_variant == RUG_SCALP_ENTRY_ROUTE)
+            .expect("BuyV2 fee schedule");
+        let independent_entry_quote = quote_exact_base_out(
+            PumpRouteVariant::BuyV2,
+            PumpReserveState {
+                virtual_base_reserves: curve_before_sell.virtual_token_reserves,
+                virtual_quote_reserves: curve_before_sell.virtual_sol_reserves,
+                real_base_reserves: curve_before_sell.real_token_reserves,
+                real_quote_reserves: curve_before_sell.real_sol_reserves,
+            },
+            intent.expected_entry_token_amount_raw,
+            intent.entry_wallet_debit_lamports,
+            &entry_schedule.schedule,
+        )
+        .expect("canonical BuyV2 quote");
+        assert!(independent_entry_quote.instruction_limit_check.passed);
+        assert_eq!(
+            independent_entry_quote
+                .program_settlement
+                .wallet_debit_or_credit,
+            intent.entry_wallet_debit_lamports
+        );
+        let curve_quote = independent_entry_quote.curve_quote_amount as u128;
+        let expected_95_bps_fee = ((curve_quote * 95) + 9_999) / 10_000;
+        let historical_100_bps_fee = ((curve_quote * 100) + 9_999) / 10_000;
+        assert_eq!(
+            independent_entry_quote.program_settlement.program_fee_total as u128,
+            expected_95_bps_fee
+        );
+        assert_ne!(expected_95_bps_fee, historical_100_bps_fee);
+        assert!(
+            !include_str!("../rug_scalp_v2.rs").contains("FEE_BPS"),
+            "the RUG adapter must not retain a historical FEE_BPS authority"
+        );
+
+        // This is the exact current BuyV2 builder from PR #79.  The test does
+        // not claim an RPC simulation is an inclusion; the modelled fill below
+        // remains explicitly shadow-only.
+        let route_accounts = PumpV2RouteAccounts {
+            base_mint: mint,
+            quote_mint: WRAPPED_SOL_MINT,
+            base_token_program: TOKEN_2022_PROGRAM_ID,
+            quote_token_program: SPL_TOKEN_PROGRAM_ID,
+            user: Pubkey::from_str("56S29mZ3wqvw8hATuUUFqKhGcSGYFASRRFNT38W8q7G3")
+                .expect("fixture user"),
+            creator: Pubkey::from_str("79iC1835GFEruVVoh1tp6mcmAo3tVdR3V6TCs1BXBXWY")
+                .expect("fixture creator"),
+            fee_recipient: Pubkey::from_str("FWsW1xNtWscwNmKv6wVsU1iTzRN6wmmk3MjxRP5tT7hz")
+                .expect("fixture fee recipient"),
+            buyback_fee_recipient: Pubkey::from_str("9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7")
+                .expect("fixture buyback recipient"),
+        };
+        let buy_instruction = PumpV2RouteBuilder::build_buy_v2(
+            &route_accounts,
+            intent.expected_entry_token_amount_raw,
+            intent.entry_wallet_debit_lamports,
+        )
+        .expect("BuyV2 is the only execution-authorised RUG entry route");
+        assert!(matches!(
+            decode_pump_route_instruction(&buy_instruction.data),
+            Ok(DecodedPumpRouteInstruction::BuyV2 {
+                amount,
+                max_sol_cost,
+            }) if amount == intent.expected_entry_token_amount_raw
+                && max_sol_cost == intent.entry_wallet_debit_lamports
+        ));
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outcome_path = tmp.path().join("rug_scalp_outcomes.jsonl");
+        let lifecycle_path = tmp.path().join("rug_scalp_lifecycle.jsonl");
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        apply_canonical_update(
+            &account_state_core,
+            mint,
+            curve_before_sell.virtual_sol_reserves,
+            curve_before_sell.virtual_token_reserves,
+        );
+        let mut guardian_config = PostBuyGuardianConfig::default();
+        guardian_config.enabled = true;
+        guardian_config.tick_interval_ms = 5;
+        guardian_config.target_threshold = Some(50.0);
+        guardian_config.stoploss_threshold = Some(50.0);
+        guardian_config.rug_scalp_exit_v1 = rug_config
+            .position_manager_exit_profile()
+            .expect("validated RUG config projects one PM exit profile");
+        let (signal_tx, _signal_rx) = mpsc::channel(guardian_config.signal_channel_buffer.max(1));
+        let mut monitoring_engine =
+            MonitoringEngine::try_new(guardian_config, Arc::new(ShadowLedger::new()), signal_tx)
+                .expect("RUG PM profile must be valid");
+        monitoring_engine.set_account_state_core(Arc::clone(&account_state_core));
+        monitoring_engine.set_shadow_lifecycle_log_path(Some(lifecycle_path.clone()));
+        let terminal_harness =
+            init_probe_position_manager_terminal_harness(tmp.path(), "rug-scalp-e2e-terminal")
+                .expect("PM terminal harness");
+        monitoring_engine
+            .set_shadow_v2_validation_harness(Arc::new(ParkingMutex::new(terminal_harness)));
+        let monitoring_engine = Arc::new(monitoring_engine);
+
+        // PM registration is deliberately after the modelled-fill boundary.
+        // No adapter fact may be accepted before this ACK returns.
+        let join_metadata = PositionJoinMetadata {
+            strategy_id: Some(RUG_SCALP_V2_STRATEGY_ID.to_string()),
+            exit_profile_id: Some(RUG_SCALP_EXIT_PROFILE_ID.to_string()),
+            rug_scalp_entry_watermark_slot: Some(42),
+            rug_scalp_entry_total_debit_lamports: Some(intent.entry_total_debit_lamports),
+            rug_scalp_entry_route_id: Some(intent.entry_route_id.clone()),
+            rug_scalp_exit_route_id: Some(intent.exit_route_id.clone()),
+            rug_scalp_entry_fee_schedule_id: Some(intent.entry_fee_schedule_id.clone()),
+            rug_scalp_exit_fee_schedule_id: Some(intent.exit_fee_schedule_id.clone()),
+            ..PositionJoinMetadata::default()
+        };
+        let mut handoff = handle_shadow_post_buy_handoff(
+            Some(&monitoring_engine),
+            &intent.candidate_id,
+            &pool.to_string(),
+            &mint.to_string(),
+            intent.entry_total_debit_lamports as f64 / LAMPORTS_PER_SOL as f64,
+            Some(intent.expected_entry_token_amount_raw),
+            Some(42),
+            Some(42),
+            Some(now_ms()),
+            1,
+            join_metadata,
+        )
+        .await;
+        assert_eq!(handoff.ack, DirectPostBuyHandoffAck::Accepted);
+        assert_eq!(monitoring_engine.active_position_count(), 1);
+        let position_id = handoff.position_id.clone().expect("one PM position id");
+        let terminal_rx = handoff
+            .terminal_rx
+            .take()
+            .expect("registered PM position has one terminal receiver");
+        let terminal_watcher = spawn_rug_scalp_terminal_outcome_watcher(
+            terminal_rx,
+            outcome_path.clone(),
+            RugScalpTerminalOutcomeContext {
+                candidate_id: intent.candidate_id.clone(),
+                position_id: position_id.clone(),
+                pool_id: pool.to_string(),
+                mint: mint.to_string(),
+                entry_route_id: intent.entry_route_id.clone(),
+                exit_route_id: intent.exit_route_id.clone(),
+                entry_fee_schedule_id: intent.entry_fee_schedule_id.clone(),
+                exit_fee_schedule_id: intent.exit_fee_schedule_id.clone(),
+                validation_tape_bus: None,
+            },
+        );
+        assert!(adapter
+            .bind_confirmed_or_modelled_fill(
+                &mint.to_string(),
+                &intent.candidate_id,
+                position_id.clone(),
+                intent.expected_entry_token_amount_raw,
+                ghost_brain::guardian::post_buy::RugScalpEntryWatermarkV1::modelled(42),
+            )
+            .expect("PM ACK binds the retained fact stream")
+            .is_empty());
+
+        let mut curve_after_sell = curve_before_sell;
+        curve_after_sell.virtual_sol_reserves = curve_after_sell
+            .virtual_sol_reserves
+            .saturating_sub(2_000_000_000);
+        let post_fill_sell = trade(
+            &mint,
+            43,
+            1,
+            "rug-e2e-post-fill-sell",
+            "seller",
+            false,
+            true,
+            0.10,
+        );
+        let slot_advance = trade(
+            &mint,
+            44,
+            1,
+            "rug-e2e-slot-complete",
+            "advance",
+            false,
+            false,
+            0.0,
+        );
+        let facts: Vec<_> = [&post_fill_sell, &slot_advance]
+            .into_iter()
+            .flat_map(|trade| adapter.on_trade(trade, 1_300, canonical, Some(curve_after_sell)))
+            .filter_map(|action| match action {
+                RugScalpRuntimeActionV2::MarketFact(fact) => Some(fact),
+                _ => None,
+            })
+            .collect();
+        assert!(facts.iter().any(|fact| matches!(
+            fact.fact_kind,
+            ghost_brain::guardian::post_buy::RugScalpMarketFactKindV1::SuccessfulSell
+        )));
+        assert!(facts.iter().any(|fact| matches!(
+            fact.fact_kind,
+            ghost_brain::guardian::post_buy::RugScalpMarketFactKindV1::SlotComplete
+        )));
+        let duplicate_after_close = facts
+            .iter()
+            .find(|fact| {
+                matches!(
+                    fact.fact_kind,
+                    ghost_brain::guardian::post_buy::RugScalpMarketFactKindV1::SuccessfulSell
+                )
+            })
+            .cloned()
+            .expect("post-fill sell fact");
+        for fact in facts {
+            assert_eq!(
+                monitoring_engine.observe_rug_scalp_market_fact(fact),
+                RugScalpFactIngressResultV1::Applied,
+                "typed facts are accepted only by the registered PM position"
+            );
+        }
+
+        let runtime_handle = Arc::clone(&monitoring_engine).start();
+        let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if monitoring_engine.active_position_count() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        runtime_handle.abort();
+        let _ = runtime_handle.await;
+        terminal.expect("PM must commit exactly one terminal close");
+        assert_eq!(monitoring_engine.active_position_count(), 0);
+        assert_eq!(
+            monitoring_engine.observe_rug_scalp_market_fact(duplicate_after_close),
+            RugScalpFactIngressResultV1::RejectedUnknownPosition,
+            "a closed PM position cannot create a second exit intent"
+        );
+        terminal_watcher
+            .await
+            .expect("one PM terminal outcome watcher completes");
+
+        let outcome_rows: Vec<serde_json::Value> = std::fs::read_to_string(&outcome_path)
+            .expect("RUG terminal outcome JSONL")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid RUG terminal outcome"))
+            .collect();
+        assert_eq!(outcome_rows.len(), 1);
+        let outcome = &outcome_rows[0];
+        assert_eq!(outcome["terminal_outcome"], "position_closed");
+        assert_eq!(outcome["position_id"], position_id);
+        assert_eq!(outcome["exit_reason"], "material_sell_emergency");
+        assert!(outcome["net_pnl_lamports"].as_i64().is_some());
+        assert_eq!(outcome["entry_route_id"], "buy_v2");
+        assert_eq!(outcome["exit_route_id"], "legacy_sell");
+        assert_eq!(outcome["entry_fee_schedule_id"], "onchain-buy-v2-e2e@0");
+        assert_eq!(outcome["exit_fee_schedule_id"], "onchain-legacy-sell-e2e@0");
+        assert_eq!(outcome["sensitivity_notional_lamports"], 200_000_000);
+        let lifecycle_rows: Vec<serde_json::Value> = std::fs::read_to_string(&lifecycle_path)
+            .expect("PM lifecycle JSONL")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid PM lifecycle row"))
+            .collect();
+        assert!(lifecycle_rows
+            .iter()
+            .all(|row| row["position_id"] == position_id));
+        assert_eq!(
+            lifecycle_rows
+                .iter()
+                .filter(|row| row["record_type"] == "exit_filled")
+                .count(),
+            1,
+            "one PM exit leg is emitted for the primary lifecycle"
+        );
+        assert_eq!(
+            lifecycle_rows
+                .iter()
+                .filter(|row| row["record_type"] == "position_closed")
+                .count(),
+            1,
+            "one position id produces one PM exit intent and one terminal close"
+        );
+    }
+
+    #[tokio::test]
+    async fn rug_scalp_terminal_watcher_writes_pm_owned_pnl_and_one_terminal_position() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outcome_path = tmp.path().join("rug_scalp_outcomes.jsonl");
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let watcher = spawn_rug_scalp_terminal_outcome_watcher(
+            terminal_rx,
+            outcome_path.clone(),
+            RugScalpTerminalOutcomeContext {
+                candidate_id: "rug-candidate-1".to_string(),
+                position_id: "rug-scalp-position:rug-candidate-1".to_string(),
+                pool_id: "pool-1".to_string(),
+                mint: Pubkey::new_unique().to_string(),
+                entry_route_id: "buy_v2".to_string(),
+                exit_route_id: "legacy_sell".to_string(),
+                entry_fee_schedule_id: "test-entry-schedule".to_string(),
+                exit_fee_schedule_id: "test-exit-schedule".to_string(),
+                validation_tape_bus: None,
+            },
+        );
+        terminal_tx
+            .send(ShadowTerminalDisposition::SimulatedClosed {
+                action_id: "pm-exit-1".to_string(),
+                reason: "flow_exhausted".to_string(),
+                net_pnl_lamports: Some(-5_000_000),
+                exit_landed_slot: Some(77),
+            })
+            .expect("RUG watcher still active");
+        watcher.await.expect("RUG watcher completes");
+
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&outcome_path)
+            .expect("outcome JSONL")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("outcome row"))
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["terminal_outcome"], "position_closed");
+        assert_eq!(rows[0]["position_id"], "rug-scalp-position:rug-candidate-1");
+        assert_eq!(rows[0]["primary_notional_lamports"], 100_000_000);
+        assert_eq!(rows[0]["sensitivity_notional_lamports"], 200_000_000);
+        assert_eq!(rows[0]["net_pnl_lamports"], -5_000_000);
+        assert_eq!(rows[0]["exit_landed_slot"], 77);
+        assert_eq!(rows[0]["entry_route_id"], "buy_v2");
+        assert_eq!(rows[0]["exit_route_id"], "legacy_sell");
+        assert_eq!(rows[0]["entry_fee_schedule_id"], "test-entry-schedule");
+        assert_eq!(rows[0]["exit_fee_schedule_id"], "test-exit-schedule");
+        assert_eq!(rows[0]["ev_disposition"], "eligible");
+        assert_eq!(rows[0]["invalidates_smoke_or_run"], false);
+    }
+
+    #[tokio::test]
+    async fn rug_scalp_terminal_watcher_classifies_pm_data_block_as_data_invalidated() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outcome_path = tmp.path().join("rug_scalp_outcomes.jsonl");
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let watcher = spawn_rug_scalp_terminal_outcome_watcher(
+            terminal_rx,
+            outcome_path.clone(),
+            RugScalpTerminalOutcomeContext {
+                candidate_id: "rug-candidate-gap".to_string(),
+                position_id: "rug-scalp-position:rug-candidate-gap".to_string(),
+                pool_id: "pool-gap".to_string(),
+                mint: Pubkey::new_unique().to_string(),
+                entry_route_id: "buy_v2".to_string(),
+                exit_route_id: "legacy_sell".to_string(),
+                entry_fee_schedule_id: "test-entry-schedule".to_string(),
+                exit_fee_schedule_id: "test-exit-schedule".to_string(),
+                validation_tape_bus: None,
+            },
+        );
+        terminal_tx
+            .send(ShadowTerminalDisposition::SimulationBlocked {
+                action_id: "rug-scalp-data-invalidated:1".to_string(),
+                reason: ShadowUnresolvedReason::BlockedByData,
+            })
+            .expect("RUG watcher still active");
+        watcher.await.expect("RUG watcher completes");
+
+        let row: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&outcome_path)
+                .expect("outcome JSONL")
+                .lines()
+                .next()
+                .expect("outcome row"),
+        )
+        .expect("valid outcome row");
+        assert_eq!(row["terminal_outcome"], "data_invalidated");
+        assert_eq!(row["exit_reason"], "blocked_by_data");
+        assert!(row["net_pnl_lamports"].is_null());
+        assert!(row["exit_landed_slot"].is_null());
+        assert_eq!(row["ev_disposition"], "excluded_data_invalidated");
+        assert_eq!(row["invalidates_smoke_or_run"], true);
+    }
+
+    #[tokio::test]
     async fn shadow_terminal_watcher_releases_reserved_slot_after_blocked_outcome() {
         let pool_amm_id = Pubkey::new_unique().to_string();
         let mint_pubkey = Pubkey::new_unique();
@@ -9879,6 +10960,8 @@ sys.exit(0)
             .send(ShadowTerminalDisposition::SimulatedClosed {
                 action_id: "shadow-action:closed".to_string(),
                 reason: "target".to_string(),
+                net_pnl_lamports: Some(10),
+                exit_landed_slot: Some(42),
             })
             .expect("terminal receiver must remain active");
         watcher.await.expect("watcher should finish");
@@ -9920,6 +11003,8 @@ sys.exit(0)
             .send(ShadowTerminalDisposition::SimulatedClosed {
                 action_id: "shadow-action:closed".to_string(),
                 reason: "target".to_string(),
+                net_pnl_lamports: Some(10),
+                exit_landed_slot: Some(42),
             })
             .expect("terminal receiver must remain active");
         watcher.await.expect("watcher should finish");

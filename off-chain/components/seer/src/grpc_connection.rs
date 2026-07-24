@@ -4053,6 +4053,7 @@ async fn fetch_gap_backfill_events(
         let ingress_wall_ts_ms = crate::types::ingress_epoch_ms();
         out.push(GeyserEvent::Transaction {
             slot: crate::types::normalize_slot(Some(slot)),
+            tx_index: None,
             event_ts_ms: crate::types::event_ts_from_block_time(tx.block_time),
             arrival_ts_ms: Some(arrival_ts_ms),
             event_time: ghost_core::EventTimeMetadata::new(
@@ -4172,6 +4173,14 @@ fn tx_update_to_geyser_event(
         .transaction
         .as_ref()
         .ok_or_else(|| SeerError::ParseError("missing tx_info".into()))?;
+    // Yellowstone supplies the canonical transaction position in the slot.
+    // Zero is valid: it is the first transaction in that slot.
+    let tx_index = u32::try_from(tx_info.index).map_err(|_| {
+        SeerError::ParseError(format!(
+            "Yellowstone transaction index {} exceeds u32",
+            tx_info.index
+        ))
+    })?;
     let tx = tx_info
         .transaction
         .as_ref()
@@ -4306,6 +4315,7 @@ fn tx_update_to_geyser_event(
 
     Ok(GeyserEvent::Transaction {
         slot: Some(slot),
+        tx_index: Some(tx_index),
         event_ts_ms: Some(compat_tx_event_ts_ms(block_time, ingress_ts_ms)),
         arrival_ts_ms: Some(arrival_ts_ms),
         event_time: ghost_core::EventTimeMetadata::new(
@@ -5864,6 +5874,7 @@ mod tests {
     fn make_decoded_tx(signature: Signature, slot: u64, source: &str) -> GeyserEvent {
         GeyserEvent::Transaction {
             slot: Some(slot),
+            tx_index: None,
             event_ts_ms: Some(slot * 1000),
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -5891,6 +5902,10 @@ mod tests {
     /// Build minimal valid SubscribeUpdateTransaction proto bytes carrying `signature`.
     /// Used in tests that inject PumpEvent::Transaction with raw bytes.
     fn make_raw_tx(signature: Signature, slot: u64) -> Vec<u8> {
+        make_raw_tx_with_index(signature, slot, 0)
+    }
+
+    fn make_raw_tx_with_index(signature: Signature, slot: u64, index: u64) -> Vec<u8> {
         use prost::Message as _;
         use yellowstone_grpc_proto::prelude::{
             Message as GrpcMessage, SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
@@ -5913,7 +5928,7 @@ mod tests {
                     }),
                 }),
                 meta: None,
-                index: 0,
+                index,
             }),
             slot,
         };
@@ -5963,6 +5978,7 @@ mod tests {
             GeyserEvent::Transaction {
                 signature: observed,
                 slot,
+                tx_index,
                 source,
                 mpcf_payload_bytes,
                 mpcf_payload_missing_reason,
@@ -5970,6 +5986,7 @@ mod tests {
             } => {
                 assert_eq!(observed, signature);
                 assert_eq!(slot, Some(321));
+                assert_eq!(tx_index, Some(0), "Yellowstone index=0 is canonical");
                 assert_eq!(source, GRPC_GLOBAL_STREAM_SOURCE_LABEL);
                 assert_eq!(mpcf_payload_bytes, Some(expected_raw));
                 assert_eq!(
@@ -5978,6 +5995,27 @@ mod tests {
                 );
             }
             other => panic!("expected tx event, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn raw_yellowstone_transaction_index_is_preserved_for_zero_and_nonzero_values() {
+        for (index, expected) in [(0_u64, 0_u32), (37_u64, 37_u32)] {
+            let signature = Signature::new_unique();
+            let event = decode_tx_to_geyser_event(
+                make_raw_tx_with_index(signature, 777, index),
+                &signature.to_string(),
+                777,
+                GRPC_GLOBAL_STREAM_SOURCE_LABEL,
+                None,
+            )
+            .expect("raw Yellowstone transaction must decode");
+            match event {
+                GeyserEvent::Transaction { tx_index, .. } => {
+                    assert_eq!(tx_index, Some(expected));
+                }
+                other => panic!("expected transaction, got {other:?}"),
+            }
         }
     }
 

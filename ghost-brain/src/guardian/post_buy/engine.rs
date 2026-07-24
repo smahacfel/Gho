@@ -94,6 +94,13 @@ use super::exit_replay::{
 #[cfg(test)]
 use super::integration::SHADOW_VIRTUAL_MAGAZINE_TIME_STOP_SECS;
 use super::integration::{PositionRuntimeRouter, ShadowPositionBookAemAdapter};
+use super::rug_scalp::{
+    evaluate_rug_scalp_exit_v1, RugScalpEntryWatermarkV1, RugScalpExitProfileConfigErrorV1,
+    RugScalpExitReasonV1, RugScalpFactIngressResultV1, RugScalpMarketFactStateV1,
+    RugScalpMarketFactV1, RUG_SCALP_EXIT_PROFILE_ID, RUG_SCALP_V2_STRATEGY_ID,
+};
+#[cfg(test)]
+use super::rug_scalp::{RugScalpDataCompletenessV1, RugScalpMarketFactKindV1};
 #[cfg(test)]
 use super::shadow_v2::ShadowV2ValidationHarnessConfig;
 use super::shadow_v2::{
@@ -776,6 +783,19 @@ struct MonitoredPosition {
     last_het_pm_v2_comparison_id: Option<String>,
     last_het_pm_v2_candidate_gate: Option<String>,
     last_het_pm_v2_candidate_at_ms: Option<u64>,
+    /// Position-owned typed RUG market evidence.  `None` means this is not a
+    /// RUG profile position; generic PM positions never consume RUG facts.
+    rug_scalp_facts: Option<RugScalpMarketFactStateV1>,
+    /// First slot in which a RUG exit condition was canonically observed.
+    /// The profile keeps this pending until the frozen primary exit-latency
+    /// boundary is reached, then submits one normal PM intent.
+    rug_scalp_pending_exit: Option<RugScalpPendingExitV1>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RugScalpPendingExitV1 {
+    reason: RugScalpExitReasonV1,
+    observed_slot: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2014,6 +2034,12 @@ pub enum ShadowTerminalDisposition {
     SimulatedClosed {
         action_id: String,
         reason: String,
+        /// Exact net result materialized by Position Manager at its terminal
+        /// lifecycle boundary.  `None` remains distinct from a zero PnL.
+        net_pnl_lamports: Option<i64>,
+        /// Modelled landing slot for the PM-owned exit, if the canonical
+        /// executable evidence supplied one.
+        exit_landed_slot: Option<u64>,
     },
     SimulationBlocked {
         action_id: String,
@@ -2079,6 +2105,21 @@ pub struct PositionEventContext {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PositionJoinMetadata {
+    pub strategy_id: Option<String>,
+    pub exit_profile_id: Option<String>,
+    /// Canonical entry ordering evidence for RUG market-fact ingress.  A
+    /// modelled fill intentionally carries only the slot, which makes any
+    /// same-slot trade a typed ambiguity instead of a guessed post-entry fact.
+    pub rug_scalp_entry_watermark_slot: Option<u64>,
+    pub rug_scalp_entry_watermark_tx_index: Option<u32>,
+    pub rug_scalp_entry_watermark_event_ordinal: Option<u32>,
+    /// Exact full entry debit (Pump settlement plus transaction envelope) for
+    /// the typed RUG route.  It is the denominator for PM-owned net PnL.
+    pub rug_scalp_entry_total_debit_lamports: Option<u64>,
+    pub rug_scalp_entry_route_id: Option<String>,
+    pub rug_scalp_exit_route_id: Option<String>,
+    pub rug_scalp_entry_fee_schedule_id: Option<String>,
+    pub rug_scalp_exit_fee_schedule_id: Option<String>,
     pub ab_record_id: Option<String>,
     pub source_ab_record_id: Option<String>,
     pub probe_id: Option<String>,
@@ -2618,6 +2659,8 @@ pub enum MonitoringEngineConfigError {
     ExitPolicyV1(#[from] ExitPolicyConfigError),
     #[error(transparent)]
     HetPmV2(#[from] HetPmV2ConfigError),
+    #[error(transparent)]
+    RugScalpExitProfile(#[from] RugScalpExitProfileConfigErrorV1),
     #[error("TimeStop V2 projection config could not be serialized for hashing")]
     TimeStopV2ConfigHashSerialization,
 }
@@ -2747,6 +2790,9 @@ impl MonitoringEngine {
     ) -> Result<Self, MonitoringEngineConfigError> {
         let exit_policy_v1 = EffectiveExitPolicyV1Config::from_guardian(&config)?;
         let het_pm_v2 = EffectiveHetPmV2Config::from_guardian(&config)?;
+        if config.rug_scalp_exit_v1.enabled {
+            config.rug_scalp_exit_v1.validate()?;
+        }
         let time_stop_v2_config_hash = config
             .time_stop_v2
             .projection_config_hash()
@@ -3726,7 +3772,14 @@ impl MonitoringEngine {
         }
 
         pos.realized_exit_value_sol += truth.exit_value_sol;
-        pos.estimated_costs_sol += truth.estimated_costs_sol;
+        // `rug_scalp_exit_v1` freezes the complete entry+exit fixed-cost
+        // model at registration, and its quote path is deliberately invoked
+        // with zero generic costs.  Do not add another generic estimate here:
+        // it would make the emitted net PnL disagree with the +10%/-5%
+        // profile lattice.  Other PM profiles preserve their existing path.
+        if pos.rug_scalp_facts.is_none() {
+            pos.estimated_costs_sol += truth.estimated_costs_sol;
+        }
         pos.realized_pnl_sol += truth.gross_pnl_sol;
         if pos.entry_value_sol > 0.0 {
             pos.realized_pnl_pct = (pos.realized_pnl_sol / pos.entry_value_sol) * 100.0;
@@ -6217,6 +6270,66 @@ impl MonitoringEngine {
             .clone()
             .unwrap_or_else(|| format!("{}:{}:{}", pool_amm_id, base_mint, now_ms));
         let position_epoch = event_context.position_epoch.unwrap_or(1_u64);
+        let requested_rug_profile = event_context.join_metadata.exit_profile_id.as_deref()
+            == Some(RUG_SCALP_EXIT_PROFILE_ID);
+        let requested_rug_strategy =
+            event_context.join_metadata.strategy_id.as_deref() == Some(RUG_SCALP_V2_STRATEGY_ID);
+        // `rug_scalp_exit_v1` belongs exclusively to the isolated V2 adapter.
+        // Reject either half of the pair rather than accepting a profile that
+        // a different strategy could use to acquire PM lifecycle authority.
+        if requested_rug_profile != requested_rug_strategy {
+            warn!(
+                position_id = %position_id,
+                base_mint = %base_mint,
+                strategy_id = ?event_context.join_metadata.strategy_id,
+                exit_profile_id = ?event_context.join_metadata.exit_profile_id,
+                "PostBuyGuardian: refused incomplete RUG SCALP strategy/profile join"
+            );
+            return None;
+        }
+        let is_rug_scalp_position = requested_rug_profile;
+        if is_rug_scalp_position && !self.config.rug_scalp_exit_v1.enabled {
+            warn!(
+                position_id = %position_id,
+                base_mint = %base_mint,
+                "PostBuyGuardian: refused RUG SCALP position because rug_scalp_exit_v1 is disabled"
+            );
+            return None;
+        }
+        if is_rug_scalp_position
+            && (event_context
+                .join_metadata
+                .rug_scalp_entry_total_debit_lamports
+                .filter(|value| *value > 0)
+                .is_none()
+                || event_context
+                    .join_metadata
+                    .rug_scalp_entry_route_id
+                    .as_deref()
+                    != Some("buy_v2")
+                || event_context
+                    .join_metadata
+                    .rug_scalp_exit_route_id
+                    .as_deref()
+                    != Some("legacy_sell")
+                || event_context
+                    .join_metadata
+                    .rug_scalp_entry_fee_schedule_id
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || event_context
+                    .join_metadata
+                    .rug_scalp_exit_fee_schedule_id
+                    .as_deref()
+                    .is_none_or(str::is_empty))
+        {
+            warn!(
+                position_id = %position_id,
+                base_mint = %base_mint,
+                "PostBuyGuardian: refused RUG position without typed Pump route/economics evidence"
+            );
+            return None;
+        }
         if matches!(event_context.lane, Lane::Shadow) {
             let valid_entry_price =
                 entry_price_sol.is_some_and(|price| price.is_finite() && price > 0.0);
@@ -6256,7 +6369,14 @@ impl MonitoringEngine {
             entry_time: Instant::now(),
             entry_unix_ms: opened_at_ms,
             entry_price_sol,
-            entry_size_lamports: entry_amount_lamports.unwrap_or(0),
+            entry_size_lamports: if is_rug_scalp_position {
+                event_context
+                    .join_metadata
+                    .rug_scalp_entry_total_debit_lamports
+                    .unwrap_or_default()
+            } else {
+                entry_amount_lamports.unwrap_or(0)
+            },
             entry_token_amount_raw: entry_token_amount_raw.unwrap_or(0),
             remaining_token_amount_raw: entry_token_amount_raw.unwrap_or(0),
             position_id: position_id.clone(),
@@ -6284,8 +6404,19 @@ impl MonitoringEngine {
             last_tcf_score: 1.0,
             last_tradability: 1.0,
             recent_signals: Vec::with_capacity(64),
-            entry_value_sol: entry_amount_lamports.unwrap_or(0) as f64 / 1_000_000_000.0,
+            entry_value_sol: if is_rug_scalp_position {
+                event_context
+                    .join_metadata
+                    .rug_scalp_entry_total_debit_lamports
+                    .unwrap_or_default() as f64
+                    / 1_000_000_000.0
+            } else {
+                entry_amount_lamports.unwrap_or(0) as f64 / 1_000_000_000.0
+            },
             realized_exit_value_sol: 0.0,
+            // RUG's entry total and fact values already include their
+            // non-program transaction ledgers.  Keeping this zero prevents a
+            // second deduction at terminal PnL materialisation.
             estimated_costs_sol: 0.0,
             realized_pnl_sol: 0.0,
             realized_pnl_pct: 0.0,
@@ -6325,6 +6456,31 @@ impl MonitoringEngine {
             last_het_pm_v2_comparison_id: None,
             last_het_pm_v2_candidate_gate: None,
             last_het_pm_v2_candidate_at_ms: None,
+            rug_scalp_facts: is_rug_scalp_position.then(|| {
+                let watermark = event_context
+                    .join_metadata
+                    .rug_scalp_entry_watermark_slot
+                    .map(|slot| RugScalpEntryWatermarkV1 {
+                        slot,
+                        tx_index: event_context
+                            .join_metadata
+                            .rug_scalp_entry_watermark_tx_index,
+                        event_ordinal: event_context
+                            .join_metadata
+                            .rug_scalp_entry_watermark_event_ordinal,
+                    });
+                watermark.map_or_else(
+                    || RugScalpMarketFactStateV1::new(position_id.clone(), base_mint),
+                    |watermark| {
+                        RugScalpMarketFactStateV1::with_entry_watermark(
+                            position_id.clone(),
+                            base_mint,
+                            watermark,
+                        )
+                    },
+                )
+            }),
+            rug_scalp_pending_exit: None,
         };
 
         let exit_replay_tracker = self.build_exit_replay_tracker(&position);
@@ -6426,6 +6582,23 @@ impl MonitoringEngine {
     /// Returns the number of currently monitored positions.
     pub fn active_position_count(&self) -> usize {
         self.positions.read().len()
+    }
+
+    /// Applies one canonical, typed RUG market fact to the matching active
+    /// RUG position.  The PM receives no raw trade object and therefore
+    /// cannot become a second ingest or signal authority.
+    pub fn observe_rug_scalp_market_fact(
+        &self,
+        fact: RugScalpMarketFactV1,
+    ) -> RugScalpFactIngressResultV1 {
+        let mut positions = self.positions.write();
+        let Some(position) = positions.get_mut(&fact.mint) else {
+            return RugScalpFactIngressResultV1::RejectedUnknownPosition;
+        };
+        let Some(facts) = position.rug_scalp_facts.as_mut() else {
+            return RugScalpFactIngressResultV1::RejectedProfileMismatch;
+        };
+        facts.apply_fact(fact, &self.config.rug_scalp_exit_v1)
     }
 
     /// Lightweight lifecycle query for launcher-owned background helpers.
@@ -8299,6 +8472,19 @@ impl MonitoringEngine {
         latest: Option<&MarketSnapshot>,
         now_ms: u64,
     ) {
+        // RUG positions select an immutable per-position exit profile.  They
+        // never enter the generic HET/V1 policy lattice, so neither
+        // CrashGuard nor TimeStop can be mistaken for their typed facts.
+        if self
+            .positions
+            .read()
+            .get(base_mint)
+            .is_some_and(|position| position.rug_scalp_facts.is_some())
+        {
+            self.prepare_and_run_rug_scalp_runtime_tick(base_mint, latest, now_ms)
+                .await;
+            return;
+        }
         let Some(het_policy) = self.het_pm_v2.as_ref().filter(|policy| policy.enabled()) else {
             self.prepare_and_run_shadow_runtime_tick_v1(base_mint, latest, now_ms)
                 .await;
@@ -8407,6 +8593,341 @@ impl MonitoringEngine {
         } else {
             self.enqueue_nonterminal_het_pm_v2_comparison(&prepared_comparison);
         }
+    }
+
+    /// Executes only the `rug_scalp_exit_v1` precedence lattice, then hands a
+    /// single typed candidate to the existing guarded PM exit executor.  The
+    /// profile computes target/stop from a full executable quote; it never
+    /// treats the mark price as a fill or maps its facts to legacy policies.
+    async fn prepare_and_run_rug_scalp_runtime_tick(
+        &self,
+        base_mint: &Pubkey,
+        latest: Option<&MarketSnapshot>,
+        now_ms: u64,
+    ) {
+        if self.has_pending_terminal_commit(base_mint) {
+            self.retry_pending_terminal_commit(base_mint, now_ms).await;
+            return;
+        }
+        let Some(_policy) = self.exit_policy_v1.as_ref() else {
+            return;
+        };
+        let Some((facts, entry_slot, entry_size_lamports)) =
+            self.positions.read().get(base_mint).and_then(|position| {
+                position
+                    .rug_scalp_facts
+                    .clone()
+                    .map(|facts| (facts, position.slot, position.entry_size_lamports))
+            })
+        else {
+            return;
+        };
+        // A gap or incomplete route transition is not a trade signal and
+        // must not be reinterpreted as a later TimeStop.  Position Manager
+        // owns the terminal unresolved lifecycle: there is no sell intent,
+        // no synthetic PnL and no second launcher-owned close path.
+        if facts.blocker_active() {
+            self.stage_rug_scalp_data_invalidated_terminal(base_mint, now_ms);
+            self.retry_pending_terminal_commit(base_mint, now_ms).await;
+            return;
+        }
+        if let Some(latest) = latest {
+            self.remember_shadow_snapshot(base_mint, latest);
+        }
+        let Some((snapshot, latest_snapshot, _crash_evidence_snapshot)) =
+            self.materialize_post_buy_decision_snapshot(base_mint, now_ms)
+        else {
+            // Missing canonical state is a typed data blocker.  We do not
+            // create a synthetic time-stop or mark-price exit here.
+            return;
+        };
+        let profile = &self.config.rug_scalp_exit_v1;
+        // RUG must not fall back to PriceTruthResolver / BondingCurve's
+        // historical 1% model.  The adapter supplies the full-position value
+        // quoted through `LegacySell`, after current program settlement and
+        // the explicit exit transaction-cost ledger.  The entry amount is the
+        // corresponding `BuyV2` wallet debit plus its envelope cost.
+        let net_return_bps =
+            facts
+                .latest_executable_position_value_lamports()
+                .and_then(|exit_value_lamports| {
+                    let intended_lamports = entry_size_lamports as i128;
+                    (intended_lamports > 0).then(|| {
+                        (exit_value_lamports as i128)
+                            .saturating_sub(intended_lamports)
+                            .saturating_mul(10_000)
+                            .saturating_div(intended_lamports)
+                            .clamp(i32::MIN as i128, i32::MAX as i128)
+                            as i32
+                    })
+                });
+        // A typed RUG fact, not a generic mark, is the primary lifecycle
+        // clock.  A later canonical snapshot may advance the frozen latency
+        // boundary, but an older snapshot can never move the fact backwards.
+        let observed_slot = match (
+            facts.latest_observed_slot(),
+            latest_snapshot.as_ref().and_then(|sample| sample.slot),
+        ) {
+            (Some(fact_slot), Some(snapshot_slot)) => Some(fact_slot.max(snapshot_slot)),
+            (Some(fact_slot), None) => Some(fact_slot),
+            (None, snapshot_slot) => snapshot_slot,
+        };
+        let reason = evaluate_rug_scalp_exit_v1(
+            &facts,
+            profile,
+            snapshot.has_pending_proposal(),
+            false,
+            net_return_bps,
+            entry_slot,
+            observed_slot,
+            snapshot.absolute_age_ms(),
+        );
+        // A condition is observed at one canonical slot, but the PRIMARY
+        // model must submit from the first later state that covers the frozen
+        // exit-latency boundary.  This is position-owned PM state, not a
+        // second reducer/lifecycle in the launcher.
+        let candidate_reason = observed_slot.and_then(|current_slot| {
+            let requires_exit = matches!(
+                reason,
+                RugScalpExitReasonV1::MaterialSellEmergency
+                    | RugScalpExitReasonV1::TargetReached10PctNet
+                    | RugScalpExitReasonV1::BaselineHardLoss5PctNet
+                    | RugScalpExitReasonV1::FlowExhausted
+                    | RugScalpExitReasonV1::MaxHold
+            );
+            if !requires_exit {
+                return None;
+            }
+            let mut positions = self.positions.write();
+            let position = positions.get_mut(base_mint)?;
+            match position.rug_scalp_pending_exit {
+                None => {
+                    position.rug_scalp_pending_exit = Some(RugScalpPendingExitV1 {
+                        reason,
+                        observed_slot: current_slot,
+                    });
+                }
+                Some(pending)
+                    if matches!(reason, RugScalpExitReasonV1::MaterialSellEmergency)
+                        && !matches!(
+                            pending.reason,
+                            RugScalpExitReasonV1::MaterialSellEmergency
+                        ) =>
+                {
+                    // A completed same-slot dump is the sole override of an
+                    // earlier lower-priority pending condition (DUMP_WINS).
+                    position.rug_scalp_pending_exit = Some(RugScalpPendingExitV1 {
+                        reason,
+                        observed_slot: current_slot,
+                    });
+                }
+                Some(_) => {}
+            }
+            position.rug_scalp_pending_exit.and_then(|pending| {
+                (current_slot
+                    >= pending
+                        .observed_slot
+                        .saturating_add(profile.primary_exit_latency_slots))
+                .then_some(pending.reason)
+            })
+        });
+        let candidate = match candidate_reason {
+            Some(RugScalpExitReasonV1::MaterialSellEmergency) => Some(ExitCandidate::from_reason(
+                ExitCandidateReason::RugScalpMaterialSellEmergency,
+            )),
+            Some(RugScalpExitReasonV1::TargetReached10PctNet) => Some(ExitCandidate::from_reason(
+                ExitCandidateReason::RugScalpTargetReached10PctNet,
+            )),
+            Some(RugScalpExitReasonV1::BaselineHardLoss5PctNet) => Some(
+                ExitCandidate::from_reason(ExitCandidateReason::RugScalpBaselineHardLoss5PctNet),
+            ),
+            Some(RugScalpExitReasonV1::FlowExhausted) => Some(ExitCandidate::from_reason(
+                ExitCandidateReason::RugScalpFlowExhausted,
+            )),
+            Some(RugScalpExitReasonV1::MaxHold) => Some(ExitCandidate::from_reason(
+                ExitCandidateReason::RugScalpMaxHold,
+            )),
+            Some(RugScalpExitReasonV1::PendingReconciliation)
+            | Some(RugScalpExitReasonV1::DataIdentityRouteBlocked)
+            | Some(RugScalpExitReasonV1::Hold)
+            | None => None,
+        };
+        if let Some(candidate) = candidate {
+            self.run_rug_scalp_typed_exit(base_mint, &snapshot, candidate, now_ms);
+        }
+        if self.has_pending_terminal_commit(base_mint) {
+            self.retry_pending_terminal_commit(base_mint, now_ms).await;
+        }
+    }
+
+    /// Commit one RUG terminal through the existing Position Manager guarded
+    /// proposal/apply/terminal pipeline.  Unlike generic V1 exits, this path
+    /// accepts only the adapter's typed `LegacySell` value; it never asks the
+    /// old generic quote resolver to re-price the position.
+    fn run_rug_scalp_typed_exit(
+        &self,
+        base_mint: &Pubkey,
+        snapshot: &PostBuyDecisionSnapshot,
+        candidate: ExitCandidate,
+        now_ms: u64,
+    ) {
+        let Some((exit_value_lamports, exit_value_slot, entry_value_lamports)) =
+            self.positions.read().get(base_mint).and_then(|position| {
+                position.rug_scalp_facts.as_ref().and_then(|facts| {
+                    facts
+                        .latest_executable_position_value_lamports()
+                        .zip(facts.latest_executable_position_value_slot())
+                        .map(|(value, slot)| (value, slot, position.entry_size_lamports))
+                })
+            })
+        else {
+            return;
+        };
+        if entry_value_lamports == 0 || snapshot.remaining_token_amount_raw() == 0 {
+            return;
+        }
+        let action = match self.begin_exit_proposal(
+            base_mint,
+            snapshot.guard(),
+            &candidate,
+            snapshot.snapshot_id(),
+            snapshot.inactivity_age_ms(),
+            None,
+            None,
+            now_ms,
+        ) {
+            Ok(action) => action,
+            Err(
+                PositionApplyError::ConcurrentActionPending | PositionApplyError::StaleRevision,
+            ) => {
+                return;
+            }
+            Err(error) => {
+                debug!(base_mint = %base_mint, error = %error, "PostBuyGuardian: typed RUG exit proposal rejected");
+                return;
+            }
+        };
+        let entry_value_sol = entry_value_lamports as f64 / SHADOW_LAMPORTS_PER_SOL_F64;
+        let exit_value_sol = exit_value_lamports as f64 / SHADOW_LAMPORTS_PER_SOL_F64;
+        let gross_pnl_sol = exit_value_sol - entry_value_sol;
+        let pnl_pct = (gross_pnl_sol / entry_value_sol) * 100.0;
+        let quantity = snapshot.remaining_token_amount_raw();
+        // The valuation itself is the adapter's canonical `LegacySell`
+        // settlement.  Do not mislabel a missing generic MarketSnapshot as a
+        // semantic violation, and do not claim a mark price supplied the
+        // exit economics.
+        let evidence = PriceTruthEvidence {
+            source: self.snapshot_source_for_position(base_mint),
+            status: PriceTruthStatus::Resolved,
+            detail: Some("rug_scalp_pump_quote_v1_legacy_sell".to_string()),
+            slot: Some(exit_value_slot),
+            timestamp_ms: None,
+            age_ms: None,
+            price_state: None,
+            price_reason: None,
+        };
+        let truth = ShadowExitTruth {
+            exit_price_sol: exit_value_sol / quantity as f64,
+            exit_token_amount_raw: quantity,
+            entry_value_sol,
+            exit_value_sol,
+            gross_pnl_sol,
+            net_pnl_sol: gross_pnl_sol,
+            estimated_costs_sol: 0.0,
+            pnl_pct,
+            evidence,
+        };
+        if let Err(error) = self.apply_shadow_quote_outcome(&action, snapshot, &truth) {
+            debug!(action_id = %action.action_id, error = %error, "PostBuyGuardian: typed RUG quote apply rejected");
+            return;
+        }
+        let exit = super::integration::ShadowExitExecution {
+            position_id: action.position_id.clone(),
+            position_epoch: action.position_epoch,
+            fraction_bps: 10_000,
+            remaining_fraction_bps: 0,
+            fill_price: truth.exit_price_sol,
+        };
+        self.emit_shadow_exit_for_action(&action, &exit, &truth, now_ms);
+        self.finish_resolved_shadow_position(action, now_ms);
+    }
+
+    /// A typed RUG data/identity/route blocker has no executable sell fact.
+    /// It therefore terminates as a PM-owned unresolved lifecycle record
+    /// rather than fabricating a quote, an exit attempt, or generic legacy
+    /// stop semantics.  The normal pending-terminal persistence path still
+    /// makes the outcome one-shot and durable before the launcher is told.
+    fn stage_rug_scalp_data_invalidated_terminal(&self, base_mint: &Pubkey, now_ms: u64) {
+        let mut positions = self.positions.write();
+        let Some(position) = positions.get_mut(base_mint) else {
+            return;
+        };
+        if position.rug_scalp_facts.is_none()
+            || position.pending_terminal_commit.is_some()
+            || position.last_shadow_outcome.is_some()
+        {
+            return;
+        }
+        let action_id = format!(
+            "rug-scalp-data-invalidated:{}:{}",
+            position.position_id, position.state_revision
+        );
+        let evidence = PriceTruthEvidence {
+            source: position.last_snapshot_source,
+            status: PriceTruthStatus::SemanticViolation,
+            detail: Some("rug_scalp_typed_data_or_route_blocker".to_string()),
+            slot: position
+                .last_shadow_snapshot
+                .as_ref()
+                .and_then(|sample| sample.slot)
+                .or(position.slot),
+            timestamp_ms: Some(now_ms),
+            age_ms: None,
+            price_state: None,
+            price_reason: None,
+        };
+        position.last_price_truth = Some(evidence.clone());
+        position.last_applied_action_id = Some(action_id.clone());
+        position.last_source_snapshot_id = Some("rug_scalp_data_invalidated".to_string());
+        position.last_shadow_outcome = Some(ShadowOutcomeKind::BlockedByData);
+        position.pending_exit_proposal = None;
+        position.state_revision = position.state_revision.saturating_add(1);
+
+        let mut record = self.shadow_lifecycle_record_base(
+            position,
+            ShadowLifecycleRecordType::PositionUnresolved,
+            now_ms,
+            &evidence,
+        );
+        record.action_id = Some(action_id.clone());
+        record.source_snapshot_id = Some("rug_scalp_data_invalidated".to_string());
+        record.terminal_reason_v2 =
+            Some(ShadowUnresolvedReason::BlockedByData.terminal_reason_v2());
+        record.exit_policy_reason_code = Some("rug_scalp_data_invalidated".to_string());
+        record.terminal_disposition = Some("simulation_blocked".to_string());
+        record.recovery_elapsed_ms = Some(0);
+        record.remaining_token_amount_raw = Some(position.remaining_token_amount_raw);
+        record.final_pnl = None;
+        record.final_pnl_pct = None;
+        record.gross_pnl_sol = None;
+        record.net_pnl_sol = None;
+        record.exit_price = None;
+        record.exit_value_sol = None;
+        record.exit_token_amount_raw = None;
+        record.exit_landed_slot = None;
+        record.exit_landed_slot_source = None;
+        position.pending_terminal_commit = Some(PendingTerminalCommit {
+            action_id: action_id.clone(),
+            record,
+            disposition: ShadowTerminalDisposition::SimulationBlocked {
+                action_id,
+                reason: ShadowUnresolvedReason::BlockedByData,
+            },
+            last_attempt_ms: None,
+            lifecycle_jsonl_committed: false,
+            prepared_het_comparison: None,
+            het_comparison_write_status: HetComparisonWriteStatusV1::NotApplicable,
+        });
     }
 
     async fn prepare_and_run_shadow_runtime_tick_v1(
@@ -9079,9 +9600,16 @@ impl MonitoringEngine {
         let Some(terminal) = terminal else {
             return;
         };
+        let net_pnl_lamports = terminal.net_pnl_sol.and_then(|net_pnl_sol| {
+            let lamports = net_pnl_sol * SHADOW_LAMPORTS_PER_SOL_F64;
+            (lamports.is_finite() && lamports >= i64::MIN as f64 && lamports <= i64::MAX as f64)
+                .then(|| lamports.round() as i64)
+        });
         let disposition = ShadowTerminalDisposition::SimulatedClosed {
             action_id: action.action_id.clone(),
             reason: action.reason.reason_code().to_string(),
+            net_pnl_lamports,
+            exit_landed_slot: terminal.exit_landed_slot,
         };
         let _ = self.stage_terminal_commit(&action, terminal, disposition);
     }
@@ -10006,6 +10534,19 @@ mod tests {
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str::<Value>(line).expect("valid json row"))
             .collect()
+    }
+
+    fn typed_rug_scalp_join_metadata(total_entry_debit_lamports: u64) -> PositionJoinMetadata {
+        PositionJoinMetadata {
+            strategy_id: Some(RUG_SCALP_V2_STRATEGY_ID.to_string()),
+            exit_profile_id: Some(RUG_SCALP_EXIT_PROFILE_ID.to_string()),
+            rug_scalp_entry_total_debit_lamports: Some(total_entry_debit_lamports),
+            rug_scalp_entry_route_id: Some("buy_v2".to_string()),
+            rug_scalp_exit_route_id: Some("legacy_sell".to_string()),
+            rug_scalp_entry_fee_schedule_id: Some("test-buy-v2@0".to_string()),
+            rug_scalp_exit_fee_schedule_id: Some("test-legacy-sell@0".to_string()),
+            ..PositionJoinMetadata::default()
+        }
     }
 
     #[test]
@@ -11239,6 +11780,333 @@ mod tests {
         assert_eq!(
             path_row["payload"]["record"]["source_quality"],
             "ACCOUNT_STATE_CORE_CANONICAL_STALENESS_MARKED"
+        );
+    }
+
+    #[tokio::test]
+    async fn rug_scalp_data_gap_ends_as_one_pm_owned_data_invalidated_terminal() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_path = tmp.path().join("shadow_lifecycle.jsonl");
+        let mut config = PostBuyGuardianConfig::default();
+        config.target_threshold = Some(50.0);
+        config.stoploss_threshold = Some(50.0);
+        config.rug_scalp_exit_v1.enabled = true;
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::try_new(config, Arc::new(ShadowLedger::new()), tx)
+            .expect("valid RUG PM profile");
+        enable_terminal_truth_harness(&mut engine, tmp.path());
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_path.clone()));
+        let mint = Pubkey::new_unique();
+        let position_id = "rug-scalp-position:data-gap".to_string();
+        let registered = engine
+            .register_shadow_position_with_terminal(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(0.0001),
+                Some(100_000_000),
+                Some(1_000_000),
+                PositionEventContext {
+                    join_metadata: typed_rug_scalp_join_metadata(1_000_000),
+                    candidate_id: "rug-scalp-data-gap".to_string(),
+                    entry_order_id: "rug-scalp-entry-data-gap".to_string(),
+                    quote_id: "rug-scalp-quote-data-gap".to_string(),
+                    slot: Some(70),
+                    lane: Lane::Shadow,
+                    position_id: Some(position_id.clone()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(1_000),
+                },
+            )
+            .expect("RUG position registration");
+        assert_eq!(
+            engine.observe_rug_scalp_market_fact(RugScalpMarketFactV1 {
+                position_id: position_id.clone(),
+                mint,
+                slot: 71,
+                tx_index: None,
+                event_ordinal: None,
+                fact_kind: RugScalpMarketFactKindV1::DataGap,
+                successful_buy_count_in_slot: 0,
+                sell_quote_lamports: None,
+                reserve_before: None,
+                reserve_after: None,
+                executable_position_value_before: None,
+                executable_position_value_after: None,
+                data_completeness: RugScalpDataCompletenessV1::Gap,
+            }),
+            RugScalpFactIngressResultV1::Applied
+        );
+
+        let engine = Arc::new(engine);
+        engine.run_shadow_runtime_tick(&mint, None, 1_100).await;
+        assert_eq!(engine.active_position_count(), 0);
+        let (_, terminal_rx) = registered.into_parts();
+        assert!(matches!(
+            terminal_rx.await,
+            Ok(ShadowTerminalDisposition::SimulationBlocked {
+                reason: ShadowUnresolvedReason::BlockedByData,
+                ..
+            })
+        ));
+        let lifecycle_rows = read_jsonl_rows(&lifecycle_path);
+        assert_eq!(
+            lifecycle_rows
+                .iter()
+                .filter(|row| row["record_type"] == "position_unresolved")
+                .count(),
+            1
+        );
+        let terminal = lifecycle_rows
+            .iter()
+            .find(|row| row["record_type"] == "position_unresolved")
+            .expect("data-invalidated terminal record");
+        assert_eq!(
+            terminal["exit_policy_reason_code"],
+            "rug_scalp_data_invalidated"
+        );
+        assert_eq!(terminal["terminal_reason_v2"], "BLOCKED_BY_DATA");
+    }
+
+    #[tokio::test]
+    async fn rug_scalp_same_slot_replayed_material_sell_closes_once_after_entry_watermark() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_path = tmp.path().join("shadow_lifecycle.jsonl");
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let mut config = PostBuyGuardianConfig::default();
+        config.target_threshold = Some(50.0);
+        config.stoploss_threshold = Some(50.0);
+        config.rug_scalp_exit_v1.enabled = true;
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::try_new(config, Arc::clone(&shadow_ledger), tx)
+            .expect("valid RUG PM profile");
+        enable_terminal_truth_harness(&mut engine, tmp.path());
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_path.clone()));
+        let mint = Pubkey::new_unique();
+        let position_id = "rug-scalp-position:replayed-material-sell".to_string();
+        let now_ms = current_time_ms();
+        let registered = engine
+            .register_shadow_position_with_terminal(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(0.000_000_1),
+                Some(100_000_000),
+                Some(1_000_000),
+                PositionEventContext {
+                    join_metadata: PositionJoinMetadata {
+                        rug_scalp_entry_watermark_slot: Some(71),
+                        rug_scalp_entry_watermark_tx_index: Some(1),
+                        rug_scalp_entry_watermark_event_ordinal: Some(0),
+                        ..typed_rug_scalp_join_metadata(1_000)
+                    },
+                    candidate_id: "rug-scalp-replayed-material-sell".to_string(),
+                    entry_order_id: "rug-scalp-entry-replayed-material-sell".to_string(),
+                    quote_id: "rug-scalp-quote-replayed-material-sell".to_string(),
+                    slot: Some(70),
+                    lane: Lane::Shadow,
+                    position_id: Some(position_id.clone()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(now_ms.saturating_sub(1)),
+                },
+            )
+            .expect("RUG position registration");
+        let sell_fact = |tx_index, event_ordinal, reserve_after| RugScalpMarketFactV1 {
+            position_id: position_id.clone(),
+            mint,
+            slot: 71,
+            tx_index: Some(tx_index),
+            event_ordinal: Some(event_ordinal),
+            fact_kind: RugScalpMarketFactKindV1::SuccessfulSell,
+            successful_buy_count_in_slot: 0,
+            sell_quote_lamports: Some(reserve_after),
+            reserve_before: Some(1_000),
+            reserve_after: Some(reserve_after),
+            executable_position_value_before: Some(1_000),
+            executable_position_value_after: Some(reserve_after),
+            data_completeness: RugScalpDataCompletenessV1::Complete,
+        };
+        assert_eq!(
+            engine.observe_rug_scalp_market_fact(sell_fact(0, 0, 800)),
+            RugScalpFactIngressResultV1::IgnoredPreEntry,
+            "same-slot fact before fill watermark cannot become dump evidence"
+        );
+        assert_eq!(
+            engine.observe_rug_scalp_market_fact(sell_fact(2, 0, 800)),
+            RugScalpFactIngressResultV1::Applied
+        );
+        assert_eq!(
+            engine.observe_rug_scalp_market_fact(RugScalpMarketFactV1 {
+                position_id: position_id.clone(),
+                mint,
+                slot: 71,
+                tx_index: None,
+                event_ordinal: None,
+                fact_kind: RugScalpMarketFactKindV1::SlotComplete,
+                successful_buy_count_in_slot: 0,
+                sell_quote_lamports: None,
+                reserve_before: None,
+                reserve_after: None,
+                executable_position_value_before: None,
+                executable_position_value_after: None,
+                data_completeness: RugScalpDataCompletenessV1::Complete,
+            }),
+            RugScalpFactIngressResultV1::Applied
+        );
+        let canonical_snapshot = MarketSnapshot {
+            slot: Some(71),
+            timestamp_ms: now_ms,
+            price_sol_per_token: 0.000_000_1,
+            price_state: PriceState::Valid,
+            market_cap_sol: 1.0,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 0.1,
+            ..MarketSnapshot::default()
+        };
+        shadow_ledger.set_snapshots(mint, vec![canonical_snapshot.clone()]);
+        let engine = Arc::new(engine);
+        engine
+            .run_shadow_runtime_tick(&mint, Some(&canonical_snapshot), now_ms)
+            .await;
+        assert_eq!(engine.active_position_count(), 0);
+        let (_, terminal_rx) = registered.into_parts();
+        match terminal_rx.await.expect("one PM terminal disposition") {
+            ShadowTerminalDisposition::SimulatedClosed { reason, .. } => {
+                assert_eq!(reason, "material_sell_emergency");
+            }
+            other => panic!("expected PM material-sell close, got {other:?}"),
+        }
+        let lifecycle_rows = read_jsonl_rows(&lifecycle_path);
+        assert_eq!(
+            lifecycle_rows
+                .iter()
+                .filter(|row| row["record_type"] == "position_closed")
+                .count(),
+            1,
+            "replay and duplicate direct ingress cannot create a second terminal close"
+        );
+        let closed = lifecycle_rows
+            .iter()
+            .find(|row| row["record_type"] == "position_closed")
+            .expect("material sell lifecycle");
+        assert_eq!(closed["exit_policy_reason_code"], "material_sell_emergency");
+    }
+
+    #[tokio::test]
+    async fn rug_scalp_two_complete_empty_slots_produce_one_pm_flow_exit_and_close() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_path = tmp.path().join("shadow_lifecycle.jsonl");
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let mut config = PostBuyGuardianConfig::default();
+        config.target_threshold = Some(50.0);
+        config.stoploss_threshold = Some(50.0);
+        config.rug_scalp_exit_v1.enabled = true;
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = MonitoringEngine::try_new(config, Arc::clone(&shadow_ledger), tx)
+            .expect("valid RUG PM profile");
+        enable_terminal_truth_harness(&mut engine, tmp.path());
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_path.clone()));
+        let mint = Pubkey::new_unique();
+        let position_id = "rug-scalp-position:flow-exit".to_string();
+        let now_ms = current_time_ms();
+        let registered = engine
+            .register_shadow_position_with_terminal(
+                Pubkey::new_unique(),
+                mint,
+                Pubkey::new_unique(),
+                Some(0.000_000_1),
+                Some(100_000_000),
+                Some(1_000_000),
+                PositionEventContext {
+                    join_metadata: typed_rug_scalp_join_metadata(1_000_300),
+                    candidate_id: "rug-scalp-flow-exit".to_string(),
+                    entry_order_id: "rug-scalp-entry-flow-exit".to_string(),
+                    quote_id: "rug-scalp-quote-flow-exit".to_string(),
+                    slot: Some(70),
+                    lane: Lane::Shadow,
+                    position_id: Some(position_id.clone()),
+                    position_epoch: Some(1),
+                    opened_at_ms: Some(now_ms.saturating_sub(1)),
+                },
+            )
+            .expect("RUG position registration");
+        let complete = |slot| RugScalpMarketFactV1 {
+            position_id: position_id.clone(),
+            mint,
+            slot,
+            tx_index: None,
+            event_ordinal: None,
+            fact_kind: RugScalpMarketFactKindV1::SlotComplete,
+            successful_buy_count_in_slot: 0,
+            sell_quote_lamports: None,
+            reserve_before: None,
+            reserve_after: None,
+            executable_position_value_before: None,
+            executable_position_value_after: Some(1_000_000),
+            data_completeness: RugScalpDataCompletenessV1::Complete,
+        };
+        assert_eq!(
+            engine.observe_rug_scalp_market_fact(complete(71)),
+            RugScalpFactIngressResultV1::Applied
+        );
+        let second_empty = complete(72);
+        assert_eq!(
+            engine.observe_rug_scalp_market_fact(second_empty.clone()),
+            RugScalpFactIngressResultV1::Applied
+        );
+        let canonical_snapshot = MarketSnapshot {
+            slot: Some(72),
+            timestamp_ms: now_ms,
+            price_sol_per_token: 0.000_000_1,
+            price_state: PriceState::Valid,
+            market_cap_sol: 1.0,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 0.1,
+            ..MarketSnapshot::default()
+        };
+        shadow_ledger.set_snapshots(mint, vec![canonical_snapshot.clone()]);
+
+        let engine = Arc::new(engine);
+        engine
+            .run_shadow_runtime_tick(&mint, Some(&canonical_snapshot), now_ms)
+            .await;
+        assert_eq!(engine.active_position_count(), 0);
+        let (_, terminal_rx) = registered.into_parts();
+        match terminal_rx.await.expect("one PM terminal disposition") {
+            ShadowTerminalDisposition::SimulatedClosed {
+                reason,
+                net_pnl_lamports,
+                exit_landed_slot,
+                ..
+            } => {
+                assert_eq!(reason, "flow_exhausted");
+                assert_eq!(net_pnl_lamports, Some(-300));
+                assert_eq!(exit_landed_slot, Some(73));
+            }
+            other => panic!("expected PM flow close, got {other:?}"),
+        }
+        assert_eq!(
+            engine.observe_rug_scalp_market_fact(second_empty),
+            RugScalpFactIngressResultV1::RejectedUnknownPosition,
+            "a duplicate after terminal close cannot start another exit"
+        );
+        let lifecycle_rows = read_jsonl_rows(&lifecycle_path);
+        assert_eq!(
+            lifecycle_rows
+                .iter()
+                .filter(|row| row["record_type"] == "position_closed")
+                .count(),
+            1
+        );
+        let closed = lifecycle_rows
+            .iter()
+            .find(|row| row["record_type"] == "position_closed")
+            .expect("flow close lifecycle");
+        assert_eq!(closed["exit_policy_reason_code"], "flow_exhausted");
+        assert!(
+            (closed["net_pnl_sol"].as_f64().expect("net PnL SOL") + 0.000_000_3).abs()
+                < f64::EPSILON,
+            "the authoritative assertion is the exact -300 lamport result above; JSON SOL is a display projection"
         );
     }
 

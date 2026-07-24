@@ -771,6 +771,22 @@ pub struct PoolTransaction {
     #[serde(default)]
     pub v_sol_in_bonding_curve: Option<f64>,
 
+    /// Raw post-trade virtual SOL reserves, when the canonical parser supplied them.
+    #[serde(default)]
+    pub virtual_sol_reserves: Option<u64>,
+    /// Raw post-trade virtual token reserves, when the canonical parser supplied them.
+    #[serde(default)]
+    pub virtual_token_reserves: Option<u64>,
+    /// Raw post-trade real SOL reserves, when the canonical parser supplied them.
+    #[serde(default)]
+    pub real_sol_reserves: Option<u64>,
+    /// Raw post-trade real token reserves, when the canonical parser supplied them.
+    #[serde(default)]
+    pub real_token_reserves: Option<u64>,
+    /// Raw post-trade Pump completion state, when the canonical parser supplied it.
+    #[serde(default)]
+    pub complete: Option<bool>,
+
     /// Market cap in SOL as reported by data source.
     /// PumpPortal: `marketCapSol`
     /// Yellowstone: computed from reserves
@@ -1039,6 +1055,12 @@ pub struct AccountUpdateEvent {
     pub sol_reserves: u64,
     /// Virtual token reserves from the on-chain bonding-curve account.
     pub token_reserves: u64,
+    /// Raw real SOL reserves from the same canonical bonding-curve account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_sol_reserves: Option<u64>,
+    /// Raw real token reserves from the same canonical bonding-curve account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_token_reserves: Option<u64>,
     /// Curve completion flag (1 = graduated, 0 = active).
     pub complete: u8,
     /// Slot at which this AccountUpdate was observed.
@@ -1093,6 +1115,33 @@ pub struct PoolScoredEvent {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionJoinMetadata {
+    /// Immutable strategy authority of the entry handoff.  Optional for
+    /// compatibility with existing Gatekeeper/P37 handoffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_id: Option<String>,
+    /// Immutable Position Manager profile selected by the entry adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_profile_id: Option<String>,
+    /// Canonical order boundary for RUG fact replay.  Modelled fills carry
+    /// only the slot; confirmed fills may carry all three coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_watermark_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_watermark_tx_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_watermark_event_ordinal: Option<u32>,
+    /// Immutable typed Pump economics selected by the RUG reducer.  They are
+    /// evidence fields only; Position Manager remains the terminal owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_total_debit_lamports: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_route_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_exit_route_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_entry_fee_schedule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_scalp_exit_fee_schedule_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ab_record_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1135,7 +1184,17 @@ pub struct ExecutionJoinMetadata {
 
 impl ExecutionJoinMetadata {
     pub fn is_empty(&self) -> bool {
-        self.ab_record_id.is_none()
+        self.strategy_id.is_none()
+            && self.exit_profile_id.is_none()
+            && self.rug_scalp_entry_watermark_slot.is_none()
+            && self.rug_scalp_entry_watermark_tx_index.is_none()
+            && self.rug_scalp_entry_watermark_event_ordinal.is_none()
+            && self.rug_scalp_entry_total_debit_lamports.is_none()
+            && self.rug_scalp_entry_route_id.is_none()
+            && self.rug_scalp_exit_route_id.is_none()
+            && self.rug_scalp_entry_fee_schedule_id.is_none()
+            && self.rug_scalp_exit_fee_schedule_id.is_none()
+            && self.ab_record_id.is_none()
             && self.source_ab_record_id.is_none()
             && self.probe_id.is_none()
             && self.dispatch_source.is_none()
@@ -1709,6 +1768,11 @@ mod tests {
     #[test]
     fn execution_join_metadata_probe_fields_roundtrip() {
         let metadata = ExecutionJoinMetadata {
+            strategy_id: None,
+            exit_profile_id: None,
+            rug_scalp_entry_watermark_slot: None,
+            rug_scalp_entry_watermark_tx_index: None,
+            rug_scalp_entry_watermark_event_ordinal: None,
             ab_record_id: Some("probe-ab".to_string()),
             source_ab_record_id: Some("source-ab".to_string()),
             probe_id: Some("probe-id".to_string()),
@@ -1730,6 +1794,7 @@ mod tests {
             source_decision_row_sha256: Some("row-sha".to_string()),
             source_v3_feature_snapshot_hash: Some("feature-hash".to_string()),
             source_v3_policy_config_hash: Some("policy-hash".to_string()),
+            ..ExecutionJoinMetadata::default()
         };
 
         let json = serde_json::to_string(&metadata).unwrap();
@@ -1912,6 +1977,8 @@ mod tests {
             curve_finality: CurveFinality::Provisional,
             sol_reserves: 10,
             token_reserves: 20,
+            real_sol_reserves: None,
+            real_token_reserves: None,
             complete: 0,
             slot: 42,
             write_version: Some(7),
@@ -2329,4 +2396,5 @@ pub enum PostBuySource {
     LiveBuy,
     Recovery,
     CounterfactualShadowProbe,
+    RugScalpV2Probe,
 }

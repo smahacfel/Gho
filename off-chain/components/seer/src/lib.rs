@@ -1142,6 +1142,8 @@ enum PendingCurveUpdateStoreOutcome {
 pub struct CanonicalAccountUpdatePayload {
     sol_reserves: u64,
     token_reserves: u64,
+    real_sol_reserves: Option<u64>,
+    real_token_reserves: Option<u64>,
     complete: u8,
     token_mint: Option<Pubkey>,
 }
@@ -1155,6 +1157,16 @@ impl CanonicalAccountUpdatePayload {
     #[inline]
     pub fn token_reserves(&self) -> u64 {
         self.token_reserves
+    }
+
+    #[inline]
+    pub fn real_sol_reserves(&self) -> Option<u64> {
+        self.real_sol_reserves
+    }
+
+    #[inline]
+    pub fn real_token_reserves(&self) -> Option<u64> {
+        self.real_token_reserves
     }
 
     #[inline]
@@ -1176,6 +1188,8 @@ pub fn decode_canonical_account_update(
         PumpAccountState::BondingCurve(curve) => Ok(CanonicalAccountUpdatePayload {
             sol_reserves: curve.virtual_sol_reserves,
             token_reserves: curve.virtual_token_reserves,
+            real_sol_reserves: Some(curve.real_sol_reserves),
+            real_token_reserves: Some(curve.real_token_reserves),
             complete: u8::from(curve.complete),
             token_mint: None,
         }),
@@ -1186,6 +1200,8 @@ pub fn decode_canonical_account_update(
                 Ok(CanonicalAccountUpdatePayload {
                     sol_reserves: pool.base_amount,
                     token_reserves: pool.quote_amount,
+                    real_sol_reserves: None,
+                    real_token_reserves: None,
                     complete: 1,
                     token_mint: Some(quote_mint),
                 })
@@ -1193,6 +1209,8 @@ pub fn decode_canonical_account_update(
                 Ok(CanonicalAccountUpdatePayload {
                     sol_reserves: pool.quote_amount,
                     token_reserves: pool.base_amount,
+                    real_sol_reserves: None,
+                    real_token_reserves: None,
                     complete: 1,
                     token_mint: Some(base_mint),
                 })
@@ -1206,6 +1224,8 @@ pub fn decode_canonical_account_update(
             .map(|curve| CanonicalAccountUpdatePayload {
                 sol_reserves: curve.virtual_sol_reserves,
                 token_reserves: curve.virtual_token_reserves,
+                real_sol_reserves: Some(curve.real_sol_reserves),
+                real_token_reserves: Some(curve.real_token_reserves),
                 complete: curve.complete,
                 token_mint: None,
             })
@@ -3052,6 +3072,8 @@ impl Seer {
                         ghost_core::CurveFinality::Provisional,
                         update_payload.sol_reserves,
                         update_payload.token_reserves,
+                        update_payload.real_sol_reserves,
+                        update_payload.real_token_reserves,
                         update_payload.complete,
                         replay.slot,
                         replay.write_version,
@@ -3372,6 +3394,8 @@ impl Seer {
                     self.config.commitment.curve_finality(),
                     update_payload.sol_reserves,
                     update_payload.token_reserves,
+                    update_payload.real_sol_reserves,
+                    update_payload.real_token_reserves,
                     update_payload.complete,
                     slot,
                     write_version,
@@ -5208,6 +5232,7 @@ mod tests {
         }
         types::GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(1_005),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -5340,6 +5365,11 @@ mod tests {
             mpcf_payload_missing_reason: types::RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: Some(10.0),
             v_sol_in_bonding_curve: Some(1.0),
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -5371,6 +5401,7 @@ mod tests {
             .expect("serialize synthetic pool");
         types::GeyserEvent::Transaction {
             slot: pool.slot,
+            tx_index: None,
             event_ts_ms: pool.event_ts_ms,
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: pool.event_time,
@@ -5445,6 +5476,7 @@ mod tests {
 
         types::GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
             arrival_ts_ms: Some(1_777_777_777_123),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -5504,6 +5536,7 @@ mod tests {
         (
             types::GeyserEvent::Transaction {
                 slot: Some(77),
+                tx_index: None,
                 event_ts_ms: Some(1_666_666_666_000),
                 arrival_ts_ms: Some(1_666_666_666_123),
                 event_time: ghost_core::EventTimeMetadata::default(),
@@ -6115,6 +6148,7 @@ mod tests {
         let recipient = Pubkey::new_unique();
         let event = types::GeyserEvent::Transaction {
             slot: Some(88),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
             arrival_ts_ms: Some(1_777_777_777_123),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -6166,6 +6200,7 @@ mod tests {
         let mint = Pubkey::new_unique();
         let event = types::GeyserEvent::Transaction {
             slot: Some(89),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_778_000),
             arrival_ts_ms: Some(1_777_777_778_123),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -6805,6 +6840,7 @@ mod tests {
             .expect("serialize synthetic pool");
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -6860,6 +6896,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::Transaction {
             slot: Some(7),
+            tx_index: None,
             event_ts_ms: Some(11_111),
             arrival_ts_ms: Some(11_222),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -7330,6 +7367,8 @@ mod tests {
         assert_eq!(event.bonding_curve, bonding_curve);
         assert_eq!(event.sol_reserves, curve.virtual_sol_reserves);
         assert_eq!(event.token_reserves, curve.virtual_token_reserves);
+        assert_eq!(event.real_sol_reserves, Some(curve.real_sol_reserves));
+        assert_eq!(event.real_token_reserves, Some(curve.real_token_reserves));
         assert_eq!(event.complete, curve.complete);
         assert_eq!(event.slot, 42);
     }
@@ -8015,6 +8054,7 @@ mod tests {
             Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8053,6 +8093,7 @@ mod tests {
             Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8097,6 +8138,7 @@ mod tests {
             Pubkey::from_str("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8133,6 +8175,7 @@ mod tests {
             Pubkey::from_str("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8169,6 +8212,7 @@ mod tests {
             Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8208,6 +8252,7 @@ mod tests {
             Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9057,6 +9102,7 @@ mod tests {
         let payload = bincode::serialize(&types::SyntheticPayload::Trade(trade.clone())).unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9134,6 +9180,7 @@ mod tests {
         let payload = bincode::serialize(&types::SyntheticPayload::InitializePool(pool)).unwrap();
         let event = types::GeyserEvent::Transaction {
             slot: Some(99),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9193,6 +9240,7 @@ mod tests {
             bincode::serialize(&types::SyntheticPayload::InitializePool(pool_new)).unwrap();
         let event_new = types::GeyserEvent::Transaction {
             slot: Some(101),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             arrival_ts_ms: Some(types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),

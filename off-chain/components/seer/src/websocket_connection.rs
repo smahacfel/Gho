@@ -745,6 +745,7 @@ impl WebSocketConnection {
                                                 let ingress_wall_ts_ms = crate::types::ingress_epoch_ms();
                                                 let event = GeyserEvent::Transaction {
                                                     slot: crate::types::normalize_slot(Some(tx.slot)),
+                                                    tx_index: None,
                                                     event_ts_ms: crate::types::event_ts_from_block_time(tx.block_time),
                                                     arrival_ts_ms: Some(arrival_ts_ms),
                                                     event_time: ghost_core::EventTimeMetadata::new(

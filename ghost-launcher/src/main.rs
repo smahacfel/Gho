@@ -56,6 +56,11 @@ use ghost_launcher::{
     logging::{OracleDecisionFormatter, StandardFormatter},
     metric_contracts::resolve_metric_contract_effective_config_v1,
     oracle_metrics, oracle_runtime,
+    rug_reality_capture::{
+        write_rug_reality_capture_run_manifest_new, RugRealityCaptureRunManifestV1,
+    },
+    rug_scalp_v2::materialize_rug_scalp_runtime_fee_authority_v1,
+    rug_scalp_validation_tape::{RugScalpValidationRunContextV1, RugScalpValidationTapeBusV1},
     tx_intelligence::TxIntelligenceConfig,
     wal_recovery,
 };
@@ -71,7 +76,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::signal;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
@@ -789,6 +794,66 @@ async fn run_preflight(
         }
     }
 
+    let rug_scalp_result = config
+        .rug_scalp_v2
+        .validate_enabled_contract()
+        .and_then(|()| {
+            if config.rug_scalp_v2.enabled && config.p37_shadow_probe.enabled {
+                Err(ghost_launcher::rug_scalp_v2::RugScalpConfigError::IsolatedProbeLaneRequired)
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(anyhow::Error::msg);
+    match rug_scalp_result {
+        Ok(()) if config.rug_scalp_v2.technical_validation_capture_enabled() => {
+            println!(
+                "[ok] rug_scalp_v2: observe_only, technical validation capture; latency freeze pending"
+            )
+        }
+        Ok(()) if config.rug_scalp_v2.enabled => {
+            println!("[ok] rug_scalp_v2: observe_only, frozen entry/exit latency slots")
+        }
+        Ok(()) => println!("[ok] rug_scalp_v2: disabled"),
+        Err(err) => {
+            eprintln!("[fail] rug_scalp_v2: {err}");
+            failures.push(format!("rug_scalp_v2: {err}"));
+        }
+    }
+
+    let rug_reality_result = config
+        .rug_reality_capture
+        .validate_enabled_contract()
+        .and_then(|()| {
+            if config.rug_reality_capture.enabled && config.rug_scalp_v2.enabled {
+                bail!(
+                    "rug_reality_capture.enabled and rug_scalp_v2.enabled are mutually exclusive"
+                );
+            }
+            if config.rug_reality_capture.enabled
+                && config.execution.execution_mode != ExecutionMode::Shadow
+            {
+                bail!("rug_reality_capture.enabled requires execution.execution_mode=shadow");
+            }
+            if config.rug_reality_capture.enabled && config.trigger.enabled {
+                bail!("rug_reality_capture.enabled requires trigger.enabled=false");
+            }
+            if config.rug_reality_capture.enabled && config.p37_shadow_probe.enabled {
+                bail!("rug_reality_capture.enabled requires p37_shadow_probe.enabled=false");
+            }
+            Ok(())
+        });
+    match rug_reality_result {
+        Ok(()) if config.rug_reality_capture.enabled => {
+            println!("[ok] rug_reality_capture: observe-only full-universe tape; detector disabled")
+        }
+        Ok(()) => println!("[ok] rug_reality_capture: disabled"),
+        Err(err) => {
+            eprintln!("[fail] rug_reality_capture: {err}");
+            failures.push(format!("rug_reality_capture: {err}"));
+        }
+    }
+
     let grpc_result = config.validate_grpc_config().map_err(anyhow::Error::msg);
     match grpc_result {
         Ok(()) => println!(
@@ -949,7 +1014,13 @@ async fn run_preflight(
         && config.trigger.entry_mode == TriggerEntryMode::ShadowOnly
         && config.trigger.shadow_run.enabled
         && config.trigger.shadow_run.payer_strategy == TriggerShadowPayerStrategy::Ephemeral;
-    let payer = if uses_ephemeral_shadow_payer {
+    let payer = if !config.trigger.enabled {
+        // A full-universe reality capture is explicitly observe-only.  It has
+        // no Trigger authority, so a keypair/balance check would validate an
+        // execution path that cannot be reached and falsely block capture.
+        println!("[ok] trigger.keypair: not required because trigger.enabled=false");
+        None
+    } else if uses_ephemeral_shadow_payer {
         println!("[ok] trigger.keypair: not required for shadow_only ephemeral payer");
         None
     } else {
@@ -1116,6 +1187,9 @@ async fn run_preflight(
 /// the manager is active there and no legacy/default fallback is valid.
 fn validate_post_buy_manager_preflight(config: &LauncherConfig) -> Result<()> {
     if config.execution.execution_mode != ExecutionMode::Shadow {
+        if config.rug_scalp_v2.enabled {
+            bail!("rug_scalp_v2.enabled requires execution.execution_mode=shadow");
+        }
         return Ok(());
     }
 
@@ -1126,7 +1200,17 @@ fn validate_post_buy_manager_preflight(config: &LauncherConfig) -> Result<()> {
             brain_path.display()
         )
     })?;
-    let guardian = &brain.post_buy_guardian;
+    // RUG's profile is projected from the experiment config only after its
+    // own fail-closed validation.  Preflight must validate that *effective*
+    // manager config, not the dormant profile stored in the base brain TOML.
+    let mut guardian = brain.post_buy_guardian.clone();
+    if config.rug_scalp_v2.enabled {
+        guardian.rug_scalp_exit_v1 = config
+            .rug_scalp_v2
+            .position_manager_exit_profile()
+            .map_err(anyhow::Error::msg)
+            .context("invalid rug_scalp_exit_v1 Position Manager profile")?;
+    }
 
     if !guardian.enabled {
         bail!("shadow mode requires post_buy_guardian.enabled=true");
@@ -1134,10 +1218,10 @@ fn validate_post_buy_manager_preflight(config: &LauncherConfig) -> Result<()> {
     if guardian.aem.enabled {
         bail!("Position Manager Lite V1 requires post_buy_guardian.aem.enabled=false");
     }
-    validate_exit_policy_v1_config(guardian).map_err(|error| {
+    validate_exit_policy_v1_config(&guardian).map_err(|error| {
         anyhow::anyhow!("invalid Position Manager Lite V1 configuration: {error}")
     })?;
-    validate_het_pm_v2_config(guardian)
+    validate_het_pm_v2_config(&guardian)
         .map_err(|error| anyhow::anyhow!("invalid HET-PM V2 configuration: {error}"))?;
     if guardian.shadow_market_refresh.enabled
         && config.trigger.shadow_run.shadow_rpc_url.trim().is_empty()
@@ -1359,6 +1443,103 @@ async fn run_launcher() -> Result<()> {
     let _log_guards = init_logging(&config)?;
 
     configure_rpc_http_auth_from_secret_env(&config, &config_path)?;
+
+    // A reality capture must be inert before any component is constructed:
+    // no V2 reducer, P37 probe, or generic Trigger can coexist with its
+    // full-universe evidence lane.
+    if config.rug_reality_capture.enabled {
+        config.rug_reality_capture.validate_enabled_contract()?;
+        if config.rug_scalp_v2.enabled {
+            bail!("rug_reality_capture.enabled and rug_scalp_v2.enabled are mutually exclusive");
+        }
+        if config.execution.execution_mode != ExecutionMode::Shadow {
+            bail!("rug_reality_capture.enabled requires execution.execution_mode=shadow");
+        }
+        if config.trigger.enabled {
+            bail!("rug_reality_capture.enabled requires trigger.enabled=false");
+        }
+        if config.p37_shadow_probe.enabled {
+            bail!("rug_reality_capture.enabled requires p37_shadow_probe.enabled=false");
+        }
+    }
+
+    // The rejected V2 detector and the full-universe reality capture share
+    // the same typed Pump fee authority.  Both materialise it from the two
+    // canonical accounts; neither accepts a serialized schedule as authority.
+    let (runtime_fee_authority_manifest, runtime_fee_authority_costs) = if config
+        .rug_scalp_v2
+        .enabled
+        || config.rug_reality_capture.enabled
+    {
+        let (entry_transaction_costs, exit_transaction_costs, serialized_schedule_present) =
+            if config.rug_scalp_v2.enabled {
+                let supplied_envelope = config
+                    .rug_scalp_v2
+                    .pump_quote_authority
+                    .clone()
+                    .unwrap_or_default();
+                (
+                    supplied_envelope.entry_transaction_costs,
+                    supplied_envelope.exit_transaction_costs,
+                    !supplied_envelope.schedules.is_empty(),
+                )
+            } else {
+                (
+                    config
+                        .rug_reality_capture
+                        .cost_profile
+                        .entry_transaction_costs,
+                    config
+                        .rug_reality_capture
+                        .cost_profile
+                        .exit_transaction_costs,
+                    false,
+                )
+            };
+        if serialized_schedule_present {
+            warn!(
+                "RUG_SCALP_SERIALIZED_FEE_SCHEDULES_IGNORED; runtime authority comes only from current on-chain config"
+            );
+        }
+        let runtime_fee_rpc = new_async_rpc_client(config.seer.rpc_endpoint.clone());
+        let (authority, manifest) = materialize_rug_scalp_runtime_fee_authority_v1(
+            &runtime_fee_rpc,
+            entry_transaction_costs,
+            exit_transaction_costs,
+        )
+        .await
+        .context("RUG_SCALP_RUNTIME_FEE_AUTHORITY_UNAVAILABLE")?;
+        info!(
+            observed_slot = manifest.observed_slot,
+            effective_slot = manifest.effective_slot,
+            evidence_hash = %manifest.evidence_hash,
+            buy_v2_fee_schedule_id = %manifest.buy_v2_fee_schedule_id,
+            legacy_sell_fee_schedule_id = %manifest.legacy_sell_fee_schedule_id,
+            "RUG_SCALP_RUNTIME_FEE_AUTHORITY_MATERIALIZED"
+        );
+        if config.rug_scalp_v2.enabled {
+            config.rug_scalp_v2.pump_quote_authority = Some(authority);
+        }
+        (
+            Some(manifest),
+            Some((entry_transaction_costs, exit_transaction_costs)),
+        )
+    } else {
+        (None, None)
+    };
+    let rug_scalp_fee_authority_watch = runtime_fee_authority_manifest
+        .as_ref()
+        .zip(runtime_fee_authority_costs)
+        .map(
+            |(manifest, (entry_transaction_costs, exit_transaction_costs))| {
+                (
+                    config.seer.rpc_endpoint.clone(),
+                    entry_transaction_costs,
+                    exit_transaction_costs,
+                    manifest.evidence_hash.clone(),
+                )
+            },
+        );
 
     // ── CONFIG FINGERPRINT (always, single INFO line) ───────────────
     config.log_config_fingerprint();
@@ -1996,6 +2177,100 @@ async fn run_launcher() -> Result<()> {
 
     // Create Oracle Runtime (per-pool state management and scoring coordination)
     use oracle_runtime::OracleRuntime;
+    // This is a full-universe evidence run, not a validation tape or a
+    // lifecycle. Its manifest is immutable and is written before the stream
+    // starts so later replay cannot alter route, fee, or cost authority.
+    let _rug_reality_capture_run_manifest = if config.rug_reality_capture.enabled {
+        let config_hash = blake3::hash(&std::fs::read(&config_path).with_context(|| {
+            format!("read RUG reality rollout config: {}", config_path.display())
+        })?)
+        .to_hex()
+        .to_string();
+        let binary_path =
+            std::env::current_exe().context("resolve launcher binary for RUG reality capture")?;
+        let binary_hash = blake3::hash(&std::fs::read(&binary_path).with_context(|| {
+            format!(
+                "read launcher binary for RUG reality capture: {}",
+                binary_path.display()
+            )
+        })?)
+        .to_hex()
+        .to_string();
+        let runtime_fee_authority = runtime_fee_authority_manifest.clone().ok_or_else(|| {
+            anyhow::anyhow!("RUG_REALITY_CAPTURE_RUNTIME_FEE_AUTHORITY_UNAVAILABLE")
+        })?;
+        let manifest = RugRealityCaptureRunManifestV1 {
+            schema_version: 1,
+            run_id: config.rug_reality_capture.run_id.clone(),
+            observe_only: true,
+            signal_detector: "rug_scalp_signal_v2_rejected_overconstrained".to_string(),
+            entry_route_id: "buy_v2".to_string(),
+            exit_route_id: "legacy_sell".to_string(),
+            config_hash,
+            code_hash: config.rug_reality_capture.code_hash.clone(),
+            binary_hash,
+            cost_profile: config.rug_reality_capture.cost_profile.clone(),
+            runtime_fee_authority,
+        };
+        let manifest_path = PathBuf::from(&config.rug_reality_capture.manifest_path);
+        write_rug_reality_capture_run_manifest_new(&manifest_path, &manifest)?;
+        info!(
+            run_id = %manifest.run_id,
+            manifest_path = %manifest_path.display(),
+            fee_evidence_hash = %manifest.runtime_fee_authority.evidence_hash,
+            "RUG_REALITY_CAPTURE_MANIFEST_FROZEN"
+        );
+        Some(manifest)
+    } else {
+        None
+    };
+    let rug_scalp_validation_run_context = if config.rug_scalp_v2.validation_tape.enabled {
+        let config_hash = blake3::hash(&std::fs::read(&config_path).with_context(|| {
+            format!("read validation rollout config: {}", config_path.display())
+        })?)
+        .to_hex()
+        .to_string();
+        let code_hash = config
+            .rug_scalp_v2
+            .validation_tape
+            .code_hash
+            .trim()
+            .to_string();
+        if code_hash.is_empty() {
+            bail!("rug_scalp_v2.validation_tape.code_hash is required when validation tape is enabled");
+        }
+        let binary_path =
+            std::env::current_exe().context("resolve launcher binary for validation tape")?;
+        let binary_hash = blake3::hash(&std::fs::read(&binary_path).with_context(|| {
+            format!(
+                "read launcher binary for validation tape: {}",
+                binary_path.display()
+            )
+        })?)
+        .to_hex()
+        .to_string();
+        let run_id = if config.rug_scalp_v2.validation_tape.run_id.trim().is_empty() {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            format!("rug-scalp-v2-technical-{timestamp}")
+        } else {
+            config.rug_scalp_v2.validation_tape.run_id.clone()
+        };
+        Some(RugScalpValidationRunContextV1 {
+            run_id,
+            config_hash,
+            code_hash,
+            binary_hash,
+            runtime_fee_authority: runtime_fee_authority_manifest.clone(),
+        })
+    } else {
+        None
+    };
+    let rug_scalp_validation_tape_bus = rug_scalp_validation_run_context
+        .as_ref()
+        .map(|_| RugScalpValidationTapeBusV1::new());
     let mut oracle_runtime_config =
         oracle_runtime::OracleRuntimeConfig::from_shadow_ledger_config(&config.shadow_ledger);
     oracle_runtime_config.session = config.session.clone();
@@ -2042,6 +2317,12 @@ async fn run_launcher() -> Result<()> {
         .as_ref()
         .is_some_and(|brain| brain.metric_contract_pr2c_enabled);
     oracle_runtime_config.p37_shadow_probe = config.p37_shadow_probe.clone();
+    oracle_runtime_config.rug_scalp_v2 = config.rug_scalp_v2.clone();
+    oracle_runtime_config.rug_scalp_validation_run_context =
+        rug_scalp_validation_run_context.clone();
+    oracle_runtime_config.rug_scalp_validation_tape_bus = rug_scalp_validation_tape_bus.clone();
+    oracle_runtime_config.full_universe_reality_capture_enabled =
+        config.rug_reality_capture.enabled;
     oracle_runtime_config.selector = config.selector.clone();
     oracle_runtime_config.run_id = (!config.p37_shadow_probe.run_id.trim().is_empty())
         .then(|| config.p37_shadow_probe.run_id.clone());
@@ -2234,11 +2515,21 @@ async fn run_launcher() -> Result<()> {
         PathBuf::from(&config.execution.events.output_dir).join("live_positions.jsonl"),
     );
     let shadow_lifecycle_log_path = effective_shadow_lifecycle_log_path(&config);
-    let probe_lifecycle_log_path = config
-        .p37_shadow_probe
-        .enabled
-        .then(|| PathBuf::from(&config.p37_shadow_probe.lifecycle_log_path));
+    let probe_lifecycle_log_path = if config.rug_scalp_v2.enabled {
+        Some(PathBuf::from(&config.rug_scalp_v2.lifecycle_log_path))
+    } else if config.p37_shadow_probe.enabled {
+        Some(PathBuf::from(&config.p37_shadow_probe.lifecycle_log_path))
+    } else {
+        None
+    };
 
+    let rug_scalp_exit_profile = config
+        .rug_scalp_v2
+        .enabled
+        .then(|| config.rug_scalp_v2.position_manager_exit_profile())
+        .transpose()
+        .map_err(anyhow::Error::msg)
+        .context("invalid rug_scalp_exit_v1 Position Manager profile")?;
     let post_buy_config = ghost_launcher::components::post_buy_runtime::PostBuyRuntimeConfig {
         events_output_path: PathBuf::from(&config.execution.events.output_dir),
         paper_fill_delay_min_ms: config.execution.paper.fill_delay_ms_min,
@@ -2255,14 +2546,30 @@ async fn run_launcher() -> Result<()> {
         slippage_tolerance: config.trigger.slippage_tolerance,
         live_exit_take_profit_pct: config.trigger.live_exit_take_profit_pct,
         live_exit_stop_loss_pct: config.trigger.live_exit_stop_loss_pct,
-        shadow_guardian: ghost_brain_config
-            .as_ref()
-            .map(|brain| brain.post_buy_guardian.clone()),
+        shadow_guardian: {
+            // A RUG primary cannot be registered without its PM-owned profile.
+            // When no explicit brain config is loaded, materialize the same
+            // safe default guardian and project the profile into it; this is
+            // still shadow-only and does not create a second manager.
+            let mut guardian = ghost_brain_config
+                .as_ref()
+                .map(|brain| brain.post_buy_guardian.clone())
+                .unwrap_or_default();
+            if let Some(profile) = rug_scalp_exit_profile.as_ref() {
+                guardian.rug_scalp_exit_v1 = profile.clone();
+            }
+            (ghost_brain_config.is_some() || rug_scalp_exit_profile.is_some()).then_some(guardian)
+        },
         shadow_ledger: Some(Arc::clone(&shadow_ledger)),
         account_state_core: Some(Arc::clone(oracle_runtime.account_state_core())),
         shadow_market_refresh_rpc_url: Some(config.trigger.shadow_run.shadow_rpc_url.clone()),
         shadow_lifecycle_log_path,
         probe_lifecycle_log_path,
+        rug_scalp_outcome_log_path: config
+            .rug_scalp_v2
+            .enabled
+            .then(|| PathBuf::from(&config.rug_scalp_v2.outcome_log_path)),
+        rug_scalp_validation_tape_bus: rug_scalp_validation_tape_bus.clone(),
         shadow_v2_burnin: shadow_v2_burnin_config
             .enabled
             .then(|| shadow_v2_burnin_config.clone()),
@@ -2713,6 +3020,57 @@ async fn run_launcher() -> Result<()> {
         ));
     }
 
+    // The snapshot authority is immutable for a run. Polling the exact two
+    // canonical accounts is deliberately narrow: a data/owner/layout change
+    // does not hot-swap economic rules under an existing attempt. Instead it
+    // ends the capture fail-closed, so the next clean run must rematerialise a
+    // new registry and manifest before any RUG quote can be emitted.
+    let (rug_scalp_fee_authority_changed_tx, mut rug_scalp_fee_authority_changed_rx) =
+        oneshot::channel::<String>();
+    let rug_scalp_fee_authority_watch_enabled = if let Some((
+        rpc_url,
+        entry_transaction_costs,
+        exit_transaction_costs,
+        initial_evidence_hash,
+    )) = rug_scalp_fee_authority_watch
+    {
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let authority_watch_handle = tokio::spawn(async move {
+            let rpc = new_async_rpc_client(rpc_url);
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    _ = ticker.tick() => {
+                        let outcome = materialize_rug_scalp_runtime_fee_authority_v1(
+                            &rpc,
+                            entry_transaction_costs,
+                            exit_transaction_costs,
+                        ).await;
+                        let reason = match outcome {
+                            Ok((_, manifest)) if manifest.evidence_hash == initial_evidence_hash => continue,
+                            Ok((_, manifest)) => format!(
+                                "runtime_fee_authority_changed:old={} new={} observed_slot={}",
+                                initial_evidence_hash,
+                                manifest.evidence_hash,
+                                manifest.observed_slot,
+                            ),
+                            Err(error) => format!("runtime_fee_authority_refresh_failed:{error}"),
+                        };
+                        error!(reason = %reason, "RUG_SCALP_RUNTIME_FEE_AUTHORITY_INVALIDATED");
+                        let _ = rug_scalp_fee_authority_changed_tx.send(reason);
+                        break;
+                    }
+                }
+            }
+        });
+        handles.push(("RugScalpRuntimeFeeAuthorityWatch", authority_watch_handle));
+        true
+    } else {
+        false
+    };
+
     // ── STARTUP GUARD: gRPC subscribe-proof within 5 s ──────────────
     if is_grpc_mode {
         let guard_health = Arc::clone(&health);
@@ -2750,6 +3108,12 @@ async fn run_launcher() -> Result<()> {
             error!(
                 "Shadow V2 artifact budget guard requested shutdown; stopping all components..."
             );
+        }
+        authority_change = &mut rug_scalp_fee_authority_changed_rx, if rug_scalp_fee_authority_watch_enabled => {
+            let reason = authority_change.unwrap_or_else(|_| {
+                "runtime_fee_authority_watch_terminated_without_a_result".to_string()
+            });
+            error!(reason = %reason, "RUG_SCALP_RUNTIME_FEE_AUTHORITY_CHANGE_REQUESTED_CONTROLLED_SHUTDOWN");
         }
         oracle_result = &mut oracle_handle => {
             match oracle_result {

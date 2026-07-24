@@ -951,6 +951,11 @@ impl PumpPortalConnection {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: new_token.v_tokens_in_bonding_curve,
             v_sol_in_bonding_curve: new_token.v_sol_in_bonding_curve,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: new_token.market_cap_sol,
             global_config: None,
             fee_recipient: None,
@@ -1116,6 +1121,11 @@ impl PumpPortalConnection {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: trade.v_tokens_in_bonding_curve,
             v_sol_in_bonding_curve: trade.v_sol_in_bonding_curve,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: trade.market_cap_sol.or(trade.new_market_cap_sol),
             global_config: None,
             fee_recipient: None,
@@ -1169,6 +1179,7 @@ impl PumpPortalConnection {
         let ingress_wall_ts_ms = crate::types::ingress_epoch_ms();
         GeyserEvent::Transaction {
             slot: event.slot,
+            tx_index: None,
             event_ts_ms: crate::types::event_ts_from_block_time(event.block_time),
             arrival_ts_ms: Some(arrival_ts_ms),
             event_time: ghost_core::EventTimeMetadata::new(
@@ -1232,6 +1243,7 @@ impl PumpPortalConnection {
         let ingress_wall_ts_ms = crate::types::ingress_epoch_ms();
         GeyserEvent::Transaction {
             slot: event.slot,
+            tx_index: None,
             event_ts_ms: Some(event.timestamp_ms),
             arrival_ts_ms: Some(arrival_ts_ms),
             event_time: ghost_core::EventTimeMetadata::new(

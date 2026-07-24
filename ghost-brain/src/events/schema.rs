@@ -307,9 +307,34 @@ pub struct PoolTransactionPayload {
     /// Canonical SOL amount in lamports when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sol_amount_lamports: Option<u64>,
+    /// Actual Pump curve quote amount in lamports from the observed successful
+    /// trade event. This stays absent when raw-chain quote evidence is absent;
+    /// it is never reconstructed from price or an instruction limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_curve_quote_lamports: Option<u64>,
     /// Canonical token amount in base units when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_amount_units: Option<u64>,
+    /// Canonical virtual SOL reserves in raw lamports at the state snapshot
+    /// attached to this trade row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_sol_reserves: Option<u64>,
+    /// Canonical virtual token reserves in raw base-token units at the state
+    /// snapshot attached to this trade row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_token_reserves: Option<u64>,
+    /// Canonical real SOL reserves in raw lamports at the state snapshot
+    /// attached to this trade row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub real_sol_reserves: Option<u64>,
+    /// Canonical real token reserves in raw base-token units at the state
+    /// snapshot attached to this trade row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub real_token_reserves: Option<u64>,
+    /// Pump curve completion state. `None` means the canonical state was not
+    /// available; `Some(false)` is a valid incomplete curve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
     /// Updated base reserve, if available from ingest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserve_base: Option<f64>,
@@ -759,7 +784,13 @@ mod tests {
             quote_amount_sol: 0.42,
             volume_sol: 0.42,
             sol_amount_lamports: Some(420_000_000),
+            effective_curve_quote_lamports: Some(420_000_000),
             token_amount_units: Some(123),
+            virtual_sol_reserves: Some(30_420_000_000),
+            virtual_token_reserves: Some(1_000_000_000_000),
+            real_sol_reserves: Some(420_000_000),
+            real_token_reserves: Some(123_000_000),
+            complete: Some(false),
             reserve_base: None,
             reserve_quote: None,
             price_quote: None,
@@ -847,7 +878,13 @@ mod tests {
                     quote_amount_sol: 1.0,
                     volume_sol: 1.0,
                     sol_amount_lamports: Some(1_000_000_000),
+                    effective_curve_quote_lamports: Some(1_000_000_000),
                     token_amount_units: Some(100),
+                    virtual_sol_reserves: Some(31_000_000_000),
+                    virtual_token_reserves: Some(1_000_000_000_000),
+                    real_sol_reserves: Some(1_000_000_000),
+                    real_token_reserves: Some(100),
+                    complete: Some(false),
                     reserve_base: None,
                     reserve_quote: None,
                     price_quote: None,

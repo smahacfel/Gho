@@ -9,7 +9,7 @@ pub mod tip_guard;
 pub(crate) use component::BuyBuildProfile;
 pub use component::{
     run, run_with_oracle, BuyAccountOverrides, PendingShadowSimulation, PreparedBuyRequest,
-    TriggerComponent, TriggerDispatchFailureContext, TriggerDispatchReceipt,
-    TriggerPrewarmAdvisory,
+    RugScalpBuyV2RouteEvidence, TriggerComponent, TriggerDispatchFailureContext,
+    TriggerDispatchReceipt, TriggerPrewarmAdvisory,
 };
 pub use shadow_run::{ShadowBuySimulationReport, TriggerBuyOutcome};

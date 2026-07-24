@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::{env, fmt};
 use uuid::Uuid;
 
+use crate::rug_reality_capture::RugRealityCaptureConfigV1;
+use crate::rug_scalp_v2::RugScalpV2Config;
+
 const DEFAULT_SECRET_ENV_FILE: &str = ".env";
 const OPERATOR_NLN_GRPC_ENDPOINT: &str = "grpc.nln.clr3.org:443";
 const OPERATOR_NLN_API_KEY_PARTS: [&str; 3] = ["sk_", "live_iZYygGfzsaf1hgB9i", "M6QplZcTuXa5KZd"];
@@ -55,6 +58,16 @@ pub struct LauncherConfig {
     /// P3.7-J3 counterfactual shadow-only probe plane.
     #[serde(default)]
     pub p37_shadow_probe: P37ShadowProbeConfig,
+
+    /// Prospective RUG SCALP V2 experiment. It is disabled by default and
+    /// may only use the isolated shadow/probe lane.
+    #[serde(default)]
+    pub rug_scalp_v2: RugScalpV2Config,
+
+    /// Observe-only full-universe Pump tape used to determine whether the
+    /// rejected V2 detector's underlying RUG hypothesis is physically viable.
+    #[serde(default)]
+    pub rug_reality_capture: RugRealityCaptureConfigV1,
 
     /// Selector/simcov diagnostic runtime knobs.
     #[serde(default)]
@@ -3876,6 +3889,8 @@ impl LauncherConfig {
                 shadow_run: TriggerShadowRunConfig::default(),
             },
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            rug_scalp_v2: RugScalpV2Config::default(),
+            rug_reality_capture: RugRealityCaptureConfigV1::default(),
             selector: SelectorRuntimeConfig::default(),
             execution: ExecutionConfig::default(),
             gui_backend: GuiBackendComponentConfig {

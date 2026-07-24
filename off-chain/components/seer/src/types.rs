@@ -172,6 +172,12 @@ pub enum GeyserEvent {
     Transaction {
         /// Slot number when transaction was processed (if known)
         slot: Option<u64>,
+        /// Authoritative transaction index within the slot from the source stream.
+        ///
+        /// `Some(0)` is the first transaction in a slot and is valid. `None`
+        /// means the source did not provide a canonical transaction index.
+        #[serde(default)]
+        tx_index: Option<u32>,
         /// Compatibility event timestamp in milliseconds (if known).
         #[serde(default)]
         event_ts_ms: Option<u64>,
@@ -593,6 +599,22 @@ pub struct TradeEvent {
     #[serde(default)]
     pub v_sol_in_bonding_curve: Option<f64>,
 
+    /// Raw post-trade virtual SOL reserves from the canonical Pump trade event.
+    #[serde(default)]
+    pub virtual_sol_reserves: Option<u64>,
+    /// Raw post-trade virtual token reserves from the canonical Pump trade event.
+    #[serde(default)]
+    pub virtual_token_reserves: Option<u64>,
+    /// Raw post-trade real SOL reserves from the canonical Pump trade event.
+    #[serde(default)]
+    pub real_sol_reserves: Option<u64>,
+    /// Raw post-trade real token reserves from the canonical Pump trade event.
+    #[serde(default)]
+    pub real_token_reserves: Option<u64>,
+    /// Raw post-trade Pump completion flag from the canonical Pump trade event.
+    #[serde(default)]
+    pub complete: Option<bool>,
+
     /// Market cap in SOL as reported by PumpPortal.
     /// PumpPortal: `marketCapSol`
     #[serde(default)]
@@ -970,6 +992,7 @@ mod tests {
     fn grpc_transaction_event(event_ts_ms: Option<u64>, block_time: Option<i64>) -> GeyserEvent {
         GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms,
             arrival_ts_ms: Some(77),
             event_time: EventTimeMetadata::default(),

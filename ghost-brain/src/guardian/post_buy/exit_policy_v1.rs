@@ -381,6 +381,16 @@ pub(super) enum ExitCandidateReason {
     CrashGuard,
     ExecutableTrailing,
     VitalityDecay,
+    /// `rug_scalp_exit_v1` only.  This is intentionally not CrashGuard.
+    RugScalpMaterialSellEmergency,
+    /// `rug_scalp_exit_v1` only.  Exact executable net return reached +10%.
+    RugScalpTargetReached10PctNet,
+    /// `rug_scalp_exit_v1` only.  Exact executable net return reached -5%.
+    RugScalpBaselineHardLoss5PctNet,
+    /// `rug_scalp_exit_v1` only.  Two complete zero-buy slots.
+    RugScalpFlowExhausted,
+    /// `rug_scalp_exit_v1` only.  Earlier of 8 slots / 5000 ms.
+    RugScalpMaxHold,
 }
 
 impl ExitCandidateReason {
@@ -394,6 +404,11 @@ impl ExitCandidateReason {
             Self::CrashGuard => "crash_guard",
             Self::ExecutableTrailing => "executable_trailing",
             Self::VitalityDecay => "vitality_decay",
+            Self::RugScalpMaterialSellEmergency => "rug_scalp_material_sell_emergency",
+            Self::RugScalpTargetReached10PctNet => "rug_scalp_target_reached_10pct_net",
+            Self::RugScalpBaselineHardLoss5PctNet => "rug_scalp_baseline_hard_loss_5pct_net",
+            Self::RugScalpFlowExhausted => "rug_scalp_flow_exhausted",
+            Self::RugScalpMaxHold => "rug_scalp_max_hold",
         }
     }
 
@@ -406,6 +421,11 @@ impl ExitCandidateReason {
             Self::CrashGuard => "crash_guard",
             Self::ExecutableTrailing => "executable_trailing",
             Self::VitalityDecay => "vitality_decay",
+            Self::RugScalpMaterialSellEmergency => "material_sell_emergency",
+            Self::RugScalpTargetReached10PctNet => "target_reached_10pct_net",
+            Self::RugScalpBaselineHardLoss5PctNet => "baseline_hard_loss_5pct_net",
+            Self::RugScalpFlowExhausted => "flow_exhausted",
+            Self::RugScalpMaxHold => "max_hold",
         }
     }
 }

@@ -156,6 +156,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(12345),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),

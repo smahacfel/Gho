@@ -11,6 +11,7 @@ fn make_tx_event(
 ) -> GeyserEvent {
     GeyserEvent::Transaction {
         slot: Some(42),
+        tx_index: None,
         event_ts_ms,
         arrival_ts_ms,
         event_time: ghost_core::EventTimeMetadata::default(),

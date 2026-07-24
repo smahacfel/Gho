@@ -672,7 +672,13 @@ mod tests {
                 quote_amount_sol: 0.42,
                 volume_sol: 0.42,
                 sol_amount_lamports: Some(420_000_000),
+                effective_curve_quote_lamports: Some(420_000_000),
                 token_amount_units: Some(123),
+                virtual_sol_reserves: Some(30_420_000_000),
+                virtual_token_reserves: Some(1_000_000_000_000),
+                real_sol_reserves: Some(420_000_000),
+                real_token_reserves: Some(123_000_000),
+                complete: Some(false),
                 reserve_base: None,
                 reserve_quote: None,
                 price_quote: None,
@@ -704,6 +710,12 @@ mod tests {
         assert_eq!(parsed["kind"]["payload"]["side"], "buy");
         assert_eq!(parsed["kind"]["payload"]["signer"], "wallet");
         assert_eq!(parsed["kind"]["payload"]["quote_amount_sol"], 0.42);
+        assert_eq!(
+            parsed["kind"]["payload"]["effective_curve_quote_lamports"],
+            420_000_000
+        );
+        assert_eq!(parsed["kind"]["payload"]["real_sol_reserves"], 420_000_000);
+        assert_eq!(parsed["kind"]["payload"]["complete"], false);
         assert_eq!(
             parsed["kind"]["payload"]["curve_progress_status"],
             "unavailable_missing_curve_state_source"

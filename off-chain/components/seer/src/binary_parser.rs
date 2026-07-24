@@ -285,8 +285,17 @@ fn decode_anchor_event_kind_with_len(
     payload: &[u8],
 ) -> Option<(ParsedEventKind, usize)> {
     match disc {
-        DISC_EVENT_TRADE => borsh_read_with_len::<EventTrade>(payload)
-            .map(|(event, consumed_len)| (ParsedEventKind::CpiTrade(event), consumed_len)),
+        DISC_EVENT_TRADE => {
+            borsh_read_with_len::<EventTrade>(payload).map(|(event, consumed_len)| {
+                (
+                    ParsedEventKind::CpiTrade {
+                        event,
+                        canonical_reserves: None,
+                    },
+                    consumed_len,
+                )
+            })
+        }
         DISC_EVENT_CREATE => borsh_read_with_len::<EventCreate>(payload)
             .map(|(event, consumed_len)| (ParsedEventKind::CpiCreate(event), consumed_len)),
         DISC_EVENT_COMPLETE => borsh_read_with_len::<EventComplete>(payload)
@@ -464,7 +473,10 @@ fn has_matching_pumpfun_cpi(
     cm_reg: &CurveMintRegistry,
 ) -> bool {
     events.iter().any(|event| {
-        let ParsedEventKind::CpiTrade(cpi_trade) = &event.kind else {
+        let ParsedEventKind::CpiTrade {
+            event: cpi_trade, ..
+        } = &event.kind
+        else {
             return false;
         };
         if cpi_trade.is_buy != matches!(side, TradeSide::Buy) {
@@ -481,6 +493,79 @@ fn has_matching_pumpfun_cpi(
             None => true,
         }
     })
+}
+
+fn canonical_reserves_from_unique_matching_ix_trade(
+    events: &[ParsedPumpEvent],
+    cpi_trade: &EventTrade,
+    cm_reg: &CurveMintRegistry,
+) -> Option<CanonicalPumpTradeReserveState> {
+    let cpi_mint = Pubkey::new_from_array(cpi_trade.mint);
+    let canonical_curve = cm_reg.curve_for_mint_pk(&cpi_mint);
+    let mut matched = None;
+
+    for event in events {
+        let ParsedEventKind::Trade {
+            side,
+            mint,
+            bonding_curve,
+            virtual_token_reserves,
+            virtual_sol_reserves,
+            real_token_reserves,
+            real_sol_reserves,
+            is_complete,
+            ..
+        } = &event.kind
+        else {
+            continue;
+        };
+
+        if *side
+            != if cpi_trade.is_buy {
+                TradeSide::Buy
+            } else {
+                TradeSide::Sell
+            }
+            || Pubkey::from_str(mint).ok() != Some(cpi_mint)
+        {
+            continue;
+        }
+        if let Some(canonical_curve) = canonical_curve {
+            if Pubkey::from_str(bonding_curve).ok() != Some(canonical_curve) {
+                continue;
+            }
+        }
+
+        // `ParsedEventKind::Trade` is built from the instruction/meta path.
+        // On the current Yellowstone surface that path has no post-transaction
+        // curve account bytes: `enrich_trade` can recover the SOL delta, but
+        // initializes reserve fields to zero.  Zero is not a post-trade Pump
+        // reserve snapshot and must not override the canonical CPI event
+        // reserves below.  Retain fail-closed absence instead.
+        if *virtual_sol_reserves == 0 || *virtual_token_reserves == 0 {
+            continue;
+        }
+
+        // Keep the reserve transfer identity identical to the structural
+        // predicate that deduplicates this instruction-level trade in favour
+        // of the CPI event: (side, mint, canonical curve).  The instruction
+        // field can be an input cap while the event carries a settled amount,
+        // so matching those amount surfaces would discard state from a row
+        // that the deduplicator already selected as canonical.  More than one
+        // structural candidate remains intentionally non-evaluable below.
+        let candidate = CanonicalPumpTradeReserveState {
+            virtual_sol_reserves: *virtual_sol_reserves,
+            virtual_token_reserves: *virtual_token_reserves,
+            real_sol_reserves: *real_sol_reserves,
+            real_token_reserves: *real_token_reserves,
+            complete: *is_complete,
+        };
+        if matched.replace(candidate).is_some() {
+            return None;
+        }
+    }
+
+    matched
 }
 
 fn has_matching_pumpswap_cpi(
@@ -576,7 +661,7 @@ fn parsed_event_kind_label(kind: &ParsedEventKind) -> &'static str {
     match kind {
         ParsedEventKind::Trade { .. } => "trade",
         ParsedEventKind::SwapTrade { .. } => "swap_trade",
-        ParsedEventKind::CpiTrade(_) => "cpi_trade",
+        ParsedEventKind::CpiTrade { .. } => "cpi_trade",
         ParsedEventKind::CpiSwapBuy(_) => "cpi_swap_buy",
         ParsedEventKind::CpiSwapSell(_) => "cpi_swap_sell",
         _ => "other",
@@ -638,7 +723,7 @@ fn summarize_parsed_event_kinds(events: &[ParsedPumpEvent]) -> String {
         match &event.kind {
             ParsedEventKind::Trade { .. } => trade += 1,
             ParsedEventKind::SwapTrade { .. } => swap_trade += 1,
-            ParsedEventKind::CpiTrade(_) => cpi_trade += 1,
+            ParsedEventKind::CpiTrade { .. } => cpi_trade += 1,
             ParsedEventKind::CpiSwapBuy(_) => cpi_swap_buy += 1,
             ParsedEventKind::CpiSwapSell(_) => cpi_swap_sell += 1,
             _ => other += 1,
@@ -896,7 +981,15 @@ fn dedup_trade_events(out: &mut Vec<ParsedPumpEvent>, cm_reg: &CurveMintRegistry
     let mut deduped = Vec::with_capacity(out.len());
     record_trade_event_dedup_stage("input", snapshot.len());
 
-    for event in out.drain(..) {
+    for mut event in out.drain(..) {
+        if let ParsedEventKind::CpiTrade {
+            event: cpi_trade,
+            canonical_reserves,
+        } = &mut event.kind
+        {
+            *canonical_reserves =
+                canonical_reserves_from_unique_matching_ix_trade(&snapshot, cpi_trade, cm_reg);
+        }
         let (should_drop, reason) = match &event.kind {
             ParsedEventKind::Trade {
                 side,
@@ -943,7 +1036,7 @@ fn dedup_trade_events(out: &mut Vec<ParsedPumpEvent>, cm_reg: &CurveMintRegistry
                     },
                 )
             }
-            ParsedEventKind::CpiTrade(_) => (false, "keep_cpi_trade_as_structural_candidate"),
+            ParsedEventKind::CpiTrade { .. } => (false, "keep_cpi_trade_as_structural_candidate"),
             ParsedEventKind::CpiSwapBuy(_) | ParsedEventKind::CpiSwapSell(_) => {
                 (false, "keep_cpi_swap_as_structural_candidate")
             }
@@ -1236,6 +1329,18 @@ pub enum TradeSide {
     Sell,
 }
 
+/// Full post-trade bonding-curve state decoded from the same canonical Pump
+/// transaction. It can be retained on a CPI event only when exactly one
+/// matching instruction-level trade exists; otherwise the state remains absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalPumpTradeReserveState {
+    pub virtual_sol_reserves: u64,
+    pub virtual_token_reserves: u64,
+    pub real_sol_reserves: u64,
+    pub real_token_reserves: u64,
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradeSource {
     BondingCurve, // direct Pump.fun instruction
@@ -1312,7 +1417,10 @@ pub enum ParsedEventKind {
         mint: Option<String>,
         bonding_curve: Option<String>,
     },
-    CpiTrade(EventTrade),
+    CpiTrade {
+        event: EventTrade,
+        canonical_reserves: Option<CanonicalPumpTradeReserveState>,
+    },
     CpiCreate(EventCreate),
     CpiComplete(EventComplete),
     /// PumpSwap BuyEvent — double-discriminator Anchor CPI event log.
@@ -4110,16 +4218,17 @@ impl BinaryParser {
             matches!(
                 p.kind,
                 ParsedEventKind::Trade { .. }
-                    | ParsedEventKind::CpiTrade(_)
+                    | ParsedEventKind::CpiTrade { .. }
                     | ParsedEventKind::SwapTrade { .. }
                     | ParsedEventKind::CpiSwapBuy(_)
                     | ParsedEventKind::CpiSwapSell(_)
             )
         });
 
-        let (sig, slot_val, arrival_ts) = if let GeyserEvent::Transaction {
+        let (sig, slot_val, tx_index, arrival_ts) = if let GeyserEvent::Transaction {
             ref signature,
             slot,
+            tx_index,
             arrival_ts_ms,
             ..
         } = event
@@ -4127,10 +4236,16 @@ impl BinaryParser {
             (
                 *signature,
                 *slot,
+                *tx_index,
                 arrival_ts_ms.unwrap_or_else(crate::types::arrival_time_ms),
             )
         } else {
-            (solana_sdk::signature::Signature::default(), Some(0), 0)
+            (
+                solana_sdk::signature::Signature::default(),
+                Some(0),
+                None,
+                0,
+            )
         };
 
         for p in parsed {
@@ -4150,19 +4265,26 @@ impl BinaryParser {
                     sol_amount,
                     virtual_token_reserves,
                     virtual_sol_reserves,
-                    real_token_reserves: _,
-                    real_sol_reserves: _,
+                    real_token_reserves,
+                    real_sol_reserves,
                     market_cap_sol,
                     progress: _,
-                    is_complete: _,
+                    is_complete,
                     ..
                 } => {
+                    // The instruction/meta path has no authoritative
+                    // post-transaction curve-account snapshot.  In the
+                    // current Yellowstone client its unavailable reserves are
+                    // represented as zero by `enrich_trade`; preserve that as
+                    // absent evidence, never as a valid zero-reserve state.
+                    let has_nonzero_virtual_reserves =
+                        virtual_token_reserves > 0 && virtual_sol_reserves > 0;
                     trades.push(TradeEvent {
                         semantic: ghost_core::EventSemanticEnvelope::default(),
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4202,6 +4324,15 @@ impl BinaryParser {
                         } else {
                             None
                         },
+                        virtual_sol_reserves: has_nonzero_virtual_reserves
+                            .then_some(virtual_sol_reserves),
+                        virtual_token_reserves: has_nonzero_virtual_reserves
+                            .then_some(virtual_token_reserves),
+                        real_sol_reserves: has_nonzero_virtual_reserves
+                            .then_some(real_sol_reserves),
+                        real_token_reserves: has_nonzero_virtual_reserves
+                            .then_some(real_token_reserves),
+                        complete: has_nonzero_virtual_reserves.then_some(is_complete),
                         market_cap_sol: if market_cap_sol > 0.0 {
                             Some(market_cap_sol)
                         } else {
@@ -4239,7 +4370,10 @@ impl BinaryParser {
                         is_pumpswap: false,
                     });
                 }
-                ParsedEventKind::CpiTrade(ref et) => {
+                ParsedEventKind::CpiTrade {
+                    event: et,
+                    canonical_reserves,
+                } => {
                     let mint_pk = Pubkey::try_from(et.mint.as_slice()).unwrap_or_default();
                     let user_pk = Pubkey::try_from(et.user.as_slice()).unwrap_or_default();
                     let bc = self
@@ -4251,7 +4385,7 @@ impl BinaryParser {
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4272,6 +4406,16 @@ impl BinaryParser {
                         mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
                         v_tokens_in_bonding_curve: Some(et.virtual_token_reserves as f64 / 1e6),
                         v_sol_in_bonding_curve: Some(et.virtual_sol_reserves as f64 / 1e9),
+                        virtual_sol_reserves: canonical_reserves
+                            .map(|state| state.virtual_sol_reserves)
+                            .or(Some(et.virtual_sol_reserves)),
+                        virtual_token_reserves: canonical_reserves
+                            .map(|state| state.virtual_token_reserves)
+                            .or(Some(et.virtual_token_reserves)),
+                        real_sol_reserves: canonical_reserves.map(|state| state.real_sol_reserves),
+                        real_token_reserves: canonical_reserves
+                            .map(|state| state.real_token_reserves),
+                        complete: canonical_reserves.map(|state| state.complete),
                         market_cap_sol: None,
                         global_config: None,
                         fee_recipient: None,
@@ -4340,7 +4484,7 @@ impl BinaryParser {
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4361,6 +4505,11 @@ impl BinaryParser {
                         mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
                         v_tokens_in_bonding_curve: None,
                         v_sol_in_bonding_curve: None,
+                        virtual_sol_reserves: None,
+                        virtual_token_reserves: None,
+                        real_sol_reserves: None,
+                        real_token_reserves: None,
+                        complete: None,
                         market_cap_sol: None,
                         global_config: None,
                         fee_recipient: None,
@@ -4420,7 +4569,7 @@ impl BinaryParser {
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4441,6 +4590,11 @@ impl BinaryParser {
                         mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
                         v_tokens_in_bonding_curve: None,
                         v_sol_in_bonding_curve: None,
+                        virtual_sol_reserves: None,
+                        virtual_token_reserves: None,
+                        real_sol_reserves: None,
+                        real_token_reserves: None,
+                        complete: None,
                         market_cap_sol: None,
                         global_config: None,
                         fee_recipient: None,
@@ -4533,7 +4687,7 @@ impl BinaryParser {
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4554,6 +4708,11 @@ impl BinaryParser {
                         mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
                         v_tokens_in_bonding_curve: v_tok,
                         v_sol_in_bonding_curve: v_sol,
+                        virtual_sol_reserves: None,
+                        virtual_token_reserves: None,
+                        real_sol_reserves: None,
+                        real_token_reserves: None,
+                        complete: None,
                         market_cap_sol: None,
                         global_config: None,
                         fee_recipient: None,
@@ -4646,7 +4805,7 @@ impl BinaryParser {
                         slot: slot_val,
                         signature: sig,
                         event_ordinal,
-                        tx_index: None,
+                        tx_index,
                         provenance: provenance.clone(),
                         timestamp_ms: effective_runtime_ts_ms,
                         arrival_ts_ms: arrival_ts,
@@ -4667,6 +4826,11 @@ impl BinaryParser {
                         mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
                         v_tokens_in_bonding_curve: v_tok,
                         v_sol_in_bonding_curve: v_sol,
+                        virtual_sol_reserves: None,
+                        virtual_token_reserves: None,
+                        real_sol_reserves: None,
+                        real_token_reserves: None,
+                        complete: None,
                         market_cap_sol: None,
                         global_config: None,
                         fee_recipient: None,
@@ -4709,6 +4873,7 @@ impl BinaryParser {
                 &runtime_ctx,
                 sig,
                 slot_val,
+                tx_index,
                 arrival_ts,
             ));
         }
@@ -4732,6 +4897,7 @@ impl BinaryParser {
         runtime_ctx: &RuntimeTradeContext,
         signature: solana_sdk::signature::Signature,
         slot_val: Option<u64>,
+        tx_index: Option<u32>,
         arrival_ts: u64,
     ) -> Vec<TradeEvent> {
         let GeyserEvent::Transaction {
@@ -4780,7 +4946,7 @@ impl BinaryParser {
                 slot: slot_val,
                 signature,
                 event_ordinal: Some(hint.outer_instruction_index),
-                tx_index: None,
+                tx_index,
                 provenance: Some(InstructionProvenance {
                     outer_instruction_index: Some(hint.outer_instruction_index),
                     inner_group_index: None,
@@ -4816,6 +4982,11 @@ impl BinaryParser {
                 mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
                 v_tokens_in_bonding_curve: None,
                 v_sol_in_bonding_curve: None,
+                virtual_sol_reserves: None,
+                virtual_token_reserves: None,
+                real_sol_reserves: None,
+                real_token_reserves: None,
+                complete: None,
                 market_cap_sol: None,
                 global_config: None,
                 fee_recipient: None,
@@ -6957,6 +7128,7 @@ mod tests {
     ) -> GeyserEvent {
         GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -7014,6 +7186,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -7110,6 +7287,7 @@ mod tests {
 
         GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -7914,8 +8092,14 @@ mod tests {
             }],
         );
 
-        if let GeyserEvent::Transaction { event_ts_ms, .. } = &mut event {
+        if let GeyserEvent::Transaction {
+            event_ts_ms,
+            tx_index,
+            ..
+        } = &mut event
+        {
             *event_ts_ms = Some(1_777_777_777_000);
+            *tx_index = Some(0);
         }
 
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -7923,6 +8107,7 @@ mod tests {
         let trades = parser.parse_trades(&event).expect("trade should parse");
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].timestamp_ms, 1_777_777_777_000);
+        assert_eq!(trades[0].tx_index, Some(0));
     }
 
     #[test]
@@ -7991,6 +8176,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
             arrival_ts_ms: Some(9_999),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8039,6 +8225,7 @@ mod tests {
         accounts[PUMP_IDX_USER] = user;
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8089,6 +8276,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_100),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8190,6 +8378,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_200),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8284,6 +8473,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_300),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8386,6 +8576,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_400),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8454,6 +8645,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: Some(1_777_777_777_500),
             arrival_ts_ms: Some(12_345),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8597,6 +8789,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8740,6 +8933,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8903,6 +9097,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9044,6 +9239,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9390,7 +9586,7 @@ mod tests {
     }
 
     #[test]
-    fn parsed_event_dedup_keeps_higher_confidence_cpi() {
+    fn parsed_event_dedup_transfers_reserves_when_cpi_settlement_amounts_differ() {
         let cm = CurveMintRegistry::new();
         let curve = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
@@ -9433,23 +9629,116 @@ mod tests {
                 provenance: None,
                 from_cpi: true,
                 is_backfill: false,
-                kind: ParsedEventKind::CpiTrade(EventTrade {
-                    mint: mint.to_bytes(),
-                    sol_amount: 456,
-                    token_amount: 123,
-                    is_buy: true,
-                    user: Pubkey::new_unique().to_bytes(),
-                    timestamp: 1,
-                    virtual_sol_reserves: 1,
-                    virtual_token_reserves: 1,
-                }),
+                kind: ParsedEventKind::CpiTrade {
+                    event: EventTrade {
+                        mint: mint.to_bytes(),
+                        // Program-event settlement amounts need not equal the
+                        // instruction's exact-out / max-input parameters.
+                        sol_amount: 999,
+                        token_amount: 777,
+                        is_buy: true,
+                        user: Pubkey::new_unique().to_bytes(),
+                        timestamp: 1,
+                        virtual_sol_reserves: 1,
+                        virtual_token_reserves: 1,
+                    },
+                    canonical_reserves: None,
+                },
             },
         ];
 
         dedup_trade_events(&mut out, &cm);
 
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0].kind, ParsedEventKind::CpiTrade(_)));
+        assert!(matches!(
+            out[0].kind,
+            ParsedEventKind::CpiTrade {
+                canonical_reserves: Some(CanonicalPumpTradeReserveState {
+                    real_sol_reserves: 1,
+                    real_token_reserves: 1,
+                    complete: false,
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parsed_event_dedup_does_not_override_cpi_reserves_with_zero_instruction_enrichment() {
+        let cm = CurveMintRegistry::new();
+        let curve = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        cm.insert(curve.to_string(), mint.to_string());
+
+        let mut out = vec![
+            ParsedPumpEvent {
+                received_at: Instant::now(),
+                slot: 1,
+                signature: None,
+                event_ordinal: None,
+                provenance: None,
+                from_cpi: false,
+                is_backfill: false,
+                kind: ParsedEventKind::Trade {
+                    side: TradeSide::Buy,
+                    source: TradeSource::BondingCurve,
+                    mint: mint.to_string(),
+                    bonding_curve: curve.to_string(),
+                    user: Pubkey::new_unique().to_string(),
+                    token_amount: 123,
+                    sol_amount: 456,
+                    // `enrich_trade` uses this shape when Yellowstone does
+                    // not expose post-transaction account bytes.
+                    virtual_token_reserves: 0,
+                    virtual_sol_reserves: 0,
+                    real_token_reserves: 0,
+                    real_sol_reserves: 0,
+                    market_cap_sol: 0.0,
+                    global_config: None,
+                    fee_recipient: None,
+                    token_program: None,
+                    progress: 0.0,
+                    is_complete: false,
+                },
+            },
+            ParsedPumpEvent {
+                received_at: Instant::now(),
+                slot: 1,
+                signature: None,
+                event_ordinal: None,
+                provenance: None,
+                from_cpi: true,
+                is_backfill: false,
+                kind: ParsedEventKind::CpiTrade {
+                    event: EventTrade {
+                        mint: mint.to_bytes(),
+                        sol_amount: 456,
+                        token_amount: 123,
+                        is_buy: true,
+                        user: Pubkey::new_unique().to_bytes(),
+                        timestamp: 1,
+                        virtual_sol_reserves: 31_000_000_000,
+                        virtual_token_reserves: 1_000_000_000_000_000,
+                    },
+                    canonical_reserves: None,
+                },
+            },
+        ];
+
+        dedup_trade_events(&mut out, &cm);
+
+        assert!(matches!(
+            out[0].kind,
+            ParsedEventKind::CpiTrade {
+                event: EventTrade {
+                    virtual_sol_reserves: 31_000_000_000,
+                    virtual_token_reserves: 1_000_000_000_000_000,
+                    ..
+                },
+                canonical_reserves: None,
+            }
+        ));
     }
 
     #[test]
@@ -9499,16 +9788,19 @@ mod tests {
                 provenance: None,
                 from_cpi: true,
                 is_backfill: false,
-                kind: ParsedEventKind::CpiTrade(EventTrade {
-                    mint: mint.to_bytes(),
-                    sol_amount: 456,
-                    token_amount: 123,
-                    is_buy: true,
-                    user: Pubkey::new_unique().to_bytes(),
-                    timestamp: 1,
-                    virtual_sol_reserves: 1,
-                    virtual_token_reserves: 1,
-                }),
+                kind: ParsedEventKind::CpiTrade {
+                    event: EventTrade {
+                        mint: mint.to_bytes(),
+                        sol_amount: 456,
+                        token_amount: 123,
+                        is_buy: true,
+                        user: Pubkey::new_unique().to_bytes(),
+                        timestamp: 1,
+                        virtual_sol_reserves: 1,
+                        virtual_token_reserves: 1,
+                    },
+                    canonical_reserves: None,
+                },
             },
         ];
 
@@ -9698,7 +9990,7 @@ mod tests {
         let parsed = parser.parse_pump_events(&event);
         let cpi_trade = parsed
             .iter()
-            .find(|event| matches!(event.kind, ParsedEventKind::CpiTrade(_)))
+            .find(|event| matches!(event.kind, ParsedEventKind::CpiTrade { .. }))
             .expect("cpi trade should exist");
         let provenance = cpi_trade.provenance.as_ref().expect("cpi provenance");
 
@@ -9859,6 +10151,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(42),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: Some(crate::types::arrival_time_ms()),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -10017,6 +10310,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: Some(1.0),
             v_sol_in_bonding_curve: Some(2.0),
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -10068,6 +10366,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -10136,6 +10439,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -10288,6 +10596,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: Some(1.0),
             v_sol_in_bonding_curve: Some(2.0),
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -10464,6 +10777,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -11040,6 +11358,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -11143,6 +11466,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -11256,6 +11584,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -11352,6 +11685,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -11462,6 +11800,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -11845,7 +12188,10 @@ mod tests {
         assert!(ev.is_some(), "wrapped pump.fun trade event should decode");
         assert!(matches!(
             ev.unwrap().kind,
-            ParsedEventKind::CpiTrade(EventTrade { is_buy: true, .. })
+            ParsedEventKind::CpiTrade {
+                event: EventTrade { is_buy: true, .. },
+                ..
+            }
         ));
     }
 
@@ -11871,7 +12217,7 @@ mod tests {
         let events = PumpParser::parse_entry_raw(&raw, 7, Instant::now(), 0);
         let cpi_trade_count = events
             .iter()
-            .filter(|event| matches!(event.kind, ParsedEventKind::CpiTrade(_)))
+            .filter(|event| matches!(event.kind, ParsedEventKind::CpiTrade { .. }))
             .count();
 
         assert_eq!(
@@ -12022,6 +12368,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: None,
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -12116,6 +12463,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: None,
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -12210,6 +12558,7 @@ mod tests {
 
         let event = GeyserEvent::Transaction {
             slot: Some(2),
+            tx_index: None,
             event_ts_ms: None,
             arrival_ts_ms: None,
             event_time: ghost_core::EventTimeMetadata::default(),

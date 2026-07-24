@@ -27,6 +27,16 @@ use crate::events::{
     AccountUpdateEvent, DetectedPool, EventBusSender, ExecutionJoinMetadata,
     FundingTransferObserved, GhostEvent, PoolTransaction, PostBuySource,
 };
+use crate::rug_scalp_v2::{
+    append_rug_scalp_jsonl_record, RugScalpCanonicalStateV2, RugScalpEntryAttemptRecordV2,
+    RugScalpEntryIntentV2, RugScalpOutcomeRecordV2, RugScalpRuntimeActionV2,
+    RugScalpRuntimeAdapterV2, RugScalpTerminalOutcomeV2, RugScalpV2Config,
+    RUG_SCALP_EXIT_PROFILE_ID, RUG_SCALP_V2_STRATEGY_ID,
+};
+use crate::rug_scalp_validation_tape::{
+    RugScalpCanonicalOrderKeyV1, RugScalpValidationRunContextV1, RugScalpValidationTapeBusV1,
+    RugScalpValidationTapeRecordV1, RugScalpValidationTapeV1,
+};
 use crate::session::{
     OpenSessionRequest, PoolObservationSession, SessionConfig, SessionManager, SharedSession,
 };
@@ -34,6 +44,7 @@ use crate::tx_intelligence::{CrossPoolVelocityConfig, FundingSourceConfig};
 use ghost_brain::config::PanicConfig;
 use ghost_brain::execution::backend::Lane;
 use ghost_brain::fast_pipeline::EnhancedCandidate;
+use ghost_brain::guardian::post_buy::RugScalpEntryWatermarkV1;
 use ghost_brain::oracle::hyper_prediction::{HyperPredictionOracle, HyperPredictionResult};
 use ghost_brain::oracle::tx_metrics::IntervalSource;
 use ghost_brain::oracle::ultrafast::PanicTx;
@@ -120,7 +131,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::{broadcast, watch, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
 // =============================================================================
@@ -128,6 +139,7 @@ use tracing::{debug, error, info, trace, warn};
 // =============================================================================
 
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
+const RUG_SCALP_ENTRY_EVIDENCE_CAP: usize = 64;
 const PUMPFUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -1940,6 +1952,16 @@ pub struct OracleRuntimeConfig {
     /// activation is additionally restricted to dedicated shadow mode.
     pub metric_contract_pr2c_enabled: bool,
     pub p37_shadow_probe: P37ShadowProbeConfig,
+    /// Isolated prospective RUG SCALP V2 adapter configuration.  It is read
+    /// once and never derives authority from a Gatekeeper decision.
+    pub rug_scalp_v2: RugScalpV2Config,
+    /// Additive observe-only tape context. It carries frozen identity hashes
+    /// but cannot change reducer, PM, or execution behaviour.
+    pub rug_scalp_validation_run_context: Option<RugScalpValidationRunContextV1>,
+    pub rug_scalp_validation_tape_bus: Option<RugScalpValidationTapeBusV1>,
+    /// Enables only the bounded evidence join used by the observe-only
+    /// full-universe RUG reality capture.  It has no policy or lifecycle role.
+    pub full_universe_reality_capture_enabled: bool,
     pub selector: SelectorRuntimeConfig,
     pub run_id: Option<String>,
     pub session_id: Option<String>,
@@ -1991,6 +2013,10 @@ impl OracleRuntimeConfig {
             metric_contract_funding_source_producer_config: None,
             metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            rug_scalp_v2: RugScalpV2Config::default(),
+            rug_scalp_validation_run_context: None,
+            rug_scalp_validation_tape_bus: None,
+            full_universe_reality_capture_enabled: false,
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -2013,6 +2039,10 @@ impl OracleRuntimeConfig {
             metric_contract_funding_source_producer_config: None,
             metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            rug_scalp_v2: RugScalpV2Config::default(),
+            rug_scalp_validation_run_context: None,
+            rug_scalp_validation_tape_bus: None,
+            full_universe_reality_capture_enabled: false,
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -2076,6 +2106,10 @@ impl Default for OracleRuntimeConfig {
             metric_contract_funding_source_producer_config: None,
             metric_contract_pr2c_enabled: false,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            rug_scalp_v2: RugScalpV2Config::default(),
+            rug_scalp_validation_run_context: None,
+            rug_scalp_validation_tape_bus: None,
+            full_universe_reality_capture_enabled: false,
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -7016,6 +7050,11 @@ fn p37_shadow_probe_join_metadata(
     record: &P37ShadowProbeSelectionRecord,
 ) -> Option<ExecutionJoinMetadata> {
     Some(ExecutionJoinMetadata {
+        strategy_id: None,
+        exit_profile_id: None,
+        rug_scalp_entry_watermark_slot: None,
+        rug_scalp_entry_watermark_tx_index: None,
+        rug_scalp_entry_watermark_event_ordinal: None,
         ab_record_id: record.ab_record_id.clone(),
         source_ab_record_id: record.source_ab_record_id.clone(),
         probe_id: record.probe_id.clone(),
@@ -7035,6 +7074,7 @@ fn p37_shadow_probe_join_metadata(
         source_decision_row_sha256: record.source_decision_row_sha256.clone(),
         source_v3_feature_snapshot_hash: record.source_v3_feature_snapshot_hash.clone(),
         source_v3_policy_config_hash: record.source_v3_policy_config_hash.clone(),
+        ..ExecutionJoinMetadata::default()
     })
 }
 
@@ -16767,14 +16807,317 @@ fn pool_transaction_evidence_candidate_id(
     }
 }
 
+/// The only admissible account-state supplementation for the full-universe
+/// reality tape.  A state is joined to a trade only after their raw post-trade
+/// virtual reserve tuple, physical curve and slot agree exactly.  This keeps
+/// the writer out of the mutable AccountStateCore / mark-price path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FullUniverseCanonicalReserveState {
+    virtual_sol_reserves: u64,
+    virtual_token_reserves: u64,
+    real_sol_reserves: u64,
+    real_token_reserves: u64,
+    complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FullUniverseReserveJoinKey {
+    slot: u64,
+    bonding_curve: Pubkey,
+    virtual_sol_reserves: u64,
+    virtual_token_reserves: u64,
+}
+
+#[derive(Debug)]
+struct PendingFullUniverseTradeEvidence {
+    tx: Arc<PoolTransaction>,
+    pool_id: Pubkey,
+    base_mint: Option<Pubkey>,
+    queued_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FullUniverseReserveStateEntry {
+    Unique {
+        state: FullUniverseCanonicalReserveState,
+        observed_at: Instant,
+    },
+    Ambiguous {
+        observed_at: Instant,
+    },
+}
+
+#[derive(Debug)]
+struct FullUniverseEvidenceEmission {
+    tx: Arc<PoolTransaction>,
+    pool_id: Pubkey,
+    base_mint: Option<Pubkey>,
+    supplemental_state: Option<FullUniverseCanonicalReserveState>,
+}
+
+impl FullUniverseEvidenceEmission {
+    fn emit(self, emitter: &EventEmitter) {
+        emit_pool_transaction_evidence_event(
+            emitter,
+            &self.tx,
+            self.pool_id,
+            self.base_mint.as_ref(),
+            self.supplemental_state.as_ref(),
+        );
+    }
+}
+
+const FULL_UNIVERSE_RESERVE_JOIN_TTL: Duration = Duration::from_secs(2);
+const FULL_UNIVERSE_RESERVE_JOIN_CAP: usize = 2_048;
+
+/// A bounded, evidence-only join between a parsed trade and a canonical Pump
+/// account update.  It never changes routing, session state or execution
+/// policy.  Any missing, conflicting or expired evidence is emitted without
+/// real reserves rather than guessed from a later mutable state.
+#[derive(Default)]
+struct FullUniverseReserveJoiner {
+    pending_trades: HashMap<FullUniverseReserveJoinKey, PendingFullUniverseTradeEvidence>,
+    account_states: HashMap<FullUniverseReserveJoinKey, FullUniverseReserveStateEntry>,
+}
+
+impl FullUniverseReserveJoiner {
+    fn trade_key(tx: &PoolTransaction) -> Option<FullUniverseReserveJoinKey> {
+        Some(FullUniverseReserveJoinKey {
+            slot: tx.slot?,
+            bonding_curve: Pubkey::from_str(&tx.pool_amm_id).ok()?,
+            virtual_sol_reserves: tx.virtual_sol_reserves?,
+            virtual_token_reserves: tx.virtual_token_reserves?,
+        })
+    }
+
+    fn has_complete_raw_state(tx: &PoolTransaction) -> bool {
+        tx.virtual_sol_reserves.is_some()
+            && tx.virtual_token_reserves.is_some()
+            && tx.real_sol_reserves.is_some()
+            && tx.real_token_reserves.is_some()
+            && tx.complete.is_some()
+    }
+
+    fn state_from_account_update(
+        event: &AccountUpdateEvent,
+    ) -> Option<(
+        FullUniverseReserveJoinKey,
+        FullUniverseCanonicalReserveState,
+    )> {
+        let complete = match event.complete {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        Some((
+            FullUniverseReserveJoinKey {
+                slot: event.slot,
+                bonding_curve: event.bonding_curve,
+                virtual_sol_reserves: event.sol_reserves,
+                virtual_token_reserves: event.token_reserves,
+            },
+            FullUniverseCanonicalReserveState {
+                virtual_sol_reserves: event.sol_reserves,
+                virtual_token_reserves: event.token_reserves,
+                real_sol_reserves: event.real_sol_reserves?,
+                real_token_reserves: event.real_token_reserves?,
+                complete,
+            },
+        ))
+    }
+
+    fn emission(
+        tx: Arc<PoolTransaction>,
+        pool_id: Pubkey,
+        base_mint: Option<Pubkey>,
+        supplemental_state: Option<FullUniverseCanonicalReserveState>,
+    ) -> FullUniverseEvidenceEmission {
+        FullUniverseEvidenceEmission {
+            tx,
+            pool_id,
+            base_mint,
+            supplemental_state,
+        }
+    }
+
+    fn observe_trade(
+        &mut self,
+        tx: Arc<PoolTransaction>,
+        pool_id: Pubkey,
+        base_mint: Option<Pubkey>,
+    ) -> Vec<FullUniverseEvidenceEmission> {
+        if Self::has_complete_raw_state(&tx) {
+            return vec![Self::emission(tx, pool_id, base_mint, None)];
+        }
+
+        let Some(key) = Self::trade_key(&tx) else {
+            return vec![Self::emission(tx, pool_id, base_mint, None)];
+        };
+
+        match self.account_states.remove(&key) {
+            Some(FullUniverseReserveStateEntry::Unique { state, .. }) => {
+                vec![Self::emission(tx, pool_id, base_mint, Some(state))]
+            }
+            Some(FullUniverseReserveStateEntry::Ambiguous { .. }) => {
+                vec![Self::emission(tx, pool_id, base_mint, None)]
+            }
+            None => {
+                let mut emissions = self.flush_to_capacity();
+                let pending = PendingFullUniverseTradeEvidence {
+                    tx,
+                    pool_id,
+                    base_mint,
+                    queued_at: Instant::now(),
+                };
+                if let Some(conflicting) = self.pending_trades.remove(&key) {
+                    // Two trades with the identical raw post-trade state cannot
+                    // be assigned to an account update unambiguously.
+                    emissions.push(Self::emission(
+                        conflicting.tx,
+                        conflicting.pool_id,
+                        conflicting.base_mint,
+                        None,
+                    ));
+                    emissions.push(Self::emission(
+                        pending.tx,
+                        pending.pool_id,
+                        pending.base_mint,
+                        None,
+                    ));
+                } else {
+                    self.pending_trades.insert(key, pending);
+                }
+                emissions
+            }
+        }
+    }
+
+    fn observe_account_update(
+        &mut self,
+        event: &AccountUpdateEvent,
+    ) -> Vec<FullUniverseEvidenceEmission> {
+        let Some((key, state)) = Self::state_from_account_update(event) else {
+            return Vec::new();
+        };
+
+        if let Some(pending) = self.pending_trades.remove(&key) {
+            return vec![Self::emission(
+                pending.tx,
+                pending.pool_id,
+                pending.base_mint,
+                Some(state),
+            )];
+        }
+
+        let mut emissions = self.flush_to_capacity();
+        let observed_at = Instant::now();
+        match self.account_states.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(FullUniverseReserveStateEntry::Unique { state, observed_at });
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                // Multiple account updates for one exact key are not selected
+                // by arrival order.  A later matching trade remains non-evaluable.
+                entry.insert(FullUniverseReserveStateEntry::Ambiguous { observed_at });
+            }
+        }
+        emissions
+    }
+
+    fn flush_to_capacity(&mut self) -> Vec<FullUniverseEvidenceEmission> {
+        let mut emissions = Vec::new();
+        while self.pending_trades.len() >= FULL_UNIVERSE_RESERVE_JOIN_CAP {
+            let Some(key) = self
+                .pending_trades
+                .iter()
+                .min_by_key(|(_, pending)| pending.queued_at)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            if let Some(pending) = self.pending_trades.remove(&key) {
+                emissions.push(Self::emission(
+                    pending.tx,
+                    pending.pool_id,
+                    pending.base_mint,
+                    None,
+                ));
+            }
+        }
+        while self.account_states.len() >= FULL_UNIVERSE_RESERVE_JOIN_CAP {
+            let Some(key) = self
+                .account_states
+                .iter()
+                .min_by_key(|(_, entry)| match entry {
+                    FullUniverseReserveStateEntry::Unique { observed_at, .. }
+                    | FullUniverseReserveStateEntry::Ambiguous { observed_at } => *observed_at,
+                })
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.account_states.remove(&key);
+        }
+        emissions
+    }
+
+    fn flush_expired(&mut self) -> Vec<FullUniverseEvidenceEmission> {
+        let now = Instant::now();
+        self.account_states.retain(|_, entry| {
+            let observed_at = match entry {
+                FullUniverseReserveStateEntry::Unique { observed_at, .. }
+                | FullUniverseReserveStateEntry::Ambiguous { observed_at } => *observed_at,
+            };
+            now.duration_since(observed_at) < FULL_UNIVERSE_RESERVE_JOIN_TTL
+        });
+        let expired = self
+            .pending_trades
+            .iter()
+            .filter_map(|(key, pending)| {
+                (now.duration_since(pending.queued_at) >= FULL_UNIVERSE_RESERVE_JOIN_TTL)
+                    .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        expired
+            .into_iter()
+            .filter_map(|key| self.pending_trades.remove(&key))
+            .map(|pending| Self::emission(pending.tx, pending.pool_id, pending.base_mint, None))
+            .collect()
+    }
+
+    fn flush_all(&mut self) -> Vec<FullUniverseEvidenceEmission> {
+        self.account_states.clear();
+        self.pending_trades
+            .drain()
+            .map(|(_, pending)| {
+                Self::emission(pending.tx, pending.pool_id, pending.base_mint, None)
+            })
+            .collect()
+    }
+}
+
 fn emit_pool_transaction_evidence_event(
     emitter: &EventEmitter,
     tx: &PoolTransaction,
     pool_id: Pubkey,
     base_mint: Option<&Pubkey>,
+    supplemental_state: Option<&FullUniverseCanonicalReserveState>,
 ) {
     let event_ts_ms = tx_event_ts_ms(tx);
     let candidate_id = pool_transaction_evidence_candidate_id(tx, &pool_id, base_mint, event_ts_ms);
+    emitter.emit_pool_transaction(
+        &candidate_id,
+        pool_transaction_evidence_payload(tx, pool_id, base_mint, supplemental_state),
+    );
+}
+
+fn pool_transaction_evidence_payload(
+    tx: &PoolTransaction,
+    pool_id: Pubkey,
+    base_mint: Option<&Pubkey>,
+    supplemental_state: Option<&FullUniverseCanonicalReserveState>,
+) -> PoolTransactionPayload {
+    let event_ts_ms = tx_event_ts_ms(tx);
     let canonical_pool = pool_id.to_string();
     let source_pool = tx.pool_amm_id.clone();
     let base_mint_string = base_mint
@@ -16786,53 +17129,76 @@ fn emit_pool_transaction_evidence_event(
         .map(|lamports| lamports as f64 / 1_000_000_000.0)
         .unwrap_or(tx.volume_sol.abs());
     let (contract_status, contract_reason) = pool_transaction_contract_status(tx);
-    emitter.emit_pool_transaction(
-        &candidate_id,
-        PoolTransactionPayload {
-            schema_version: "v1".to_string(),
-            pool_amm_id: canonical_pool.clone(),
-            pool_id: canonical_pool.clone(),
-            source_pool_amm_id: (source_pool != canonical_pool).then_some(source_pool),
-            base_mint: base_mint_string.clone(),
-            mint_id: base_mint_string.clone(),
-            token_mint: base_mint_string,
-            quote_mint: Some("So11111111111111111111111111111111111111112".to_string()),
-            bonding_curve: canonical_pool,
-            signature: tx.signature.clone(),
-            event_slot: tx.slot,
-            slot: tx.slot,
-            tx_index: tx.tx_index,
-            event_ordinal: tx.event_ordinal,
-            outer_instruction_index: tx.outer_instruction_index,
-            inner_group_index: tx.inner_group_index,
-            event_ts_ms,
-            timestamp_ms: event_ts_ms,
-            arrival_ts_ms: tx.arrival_ts_ms,
-            source: pool_transaction_source_label(tx).to_string(),
-            side: side.clone(),
-            is_buy: tx.is_buy,
-            success: tx.success,
-            error_code: tx.error_code.clone(),
-            signer: tx.signer.clone(),
-            wallet: tx.signer.clone(),
-            quote_amount_sol,
-            volume_sol: tx.volume_sol.abs(),
-            sol_amount_lamports: tx.sol_amount_lamports,
-            token_amount_units: tx.token_amount_units,
-            reserve_base: tx.reserve_base,
-            reserve_quote: tx.reserve_quote,
-            price_quote: tx.price_quote,
-            v_tokens_in_bonding_curve: tx.v_tokens_in_bonding_curve,
-            v_sol_in_bonding_curve: tx.v_sol_in_bonding_curve,
-            market_cap_sol: tx.market_cap_sol,
-            curve_progress_pct: None,
-            curve_progress_status: "unavailable_missing_curve_state_source".to_string(),
-            curve_finality: format!("{:?}", tx.curve_finality).to_lowercase(),
-            curve_data_known: tx.curve_data_known,
-            execution_account_contract_status: contract_status,
-            execution_account_contract_reason: contract_reason,
-        },
-    );
+    PoolTransactionPayload {
+        schema_version: "v1".to_string(),
+        pool_amm_id: canonical_pool.clone(),
+        pool_id: canonical_pool.clone(),
+        source_pool_amm_id: (source_pool != canonical_pool).then_some(source_pool),
+        base_mint: base_mint_string.clone(),
+        mint_id: base_mint_string.clone(),
+        token_mint: base_mint_string,
+        quote_mint: Some("So11111111111111111111111111111111111111112".to_string()),
+        bonding_curve: canonical_pool,
+        signature: tx.signature.clone(),
+        event_slot: tx.slot,
+        slot: tx.slot,
+        tx_index: tx.tx_index,
+        event_ordinal: tx.event_ordinal,
+        outer_instruction_index: tx.outer_instruction_index,
+        inner_group_index: tx.inner_group_index,
+        event_ts_ms,
+        timestamp_ms: event_ts_ms,
+        arrival_ts_ms: tx.arrival_ts_ms,
+        source: pool_transaction_source_label(tx).to_string(),
+        side: side.clone(),
+        is_buy: tx.is_buy,
+        success: tx.success,
+        error_code: tx.error_code.clone(),
+        signer: tx.signer.clone(),
+        wallet: tx.signer.clone(),
+        quote_amount_sol,
+        volume_sol: tx.volume_sol.abs(),
+        sol_amount_lamports: tx.sol_amount_lamports,
+        // This raw amount comes from the successful observed Pump trade
+        // event / curve-account delta. It is intentionally not derived
+        // from `price_quote`, and absent evidence stays absent.
+        effective_curve_quote_lamports: (tx.success
+            && !tx.semantic.event_truth_kind.is_synthetic())
+        .then_some(tx.sol_amount_lamports)
+        .flatten(),
+        token_amount_units: tx.token_amount_units,
+        // Raw parser state is temporally tied to this event and takes
+        // precedence.  Supplementation, when present, came from an exact
+        // `(slot, curve, virtual reserves)` account-update join; the writer
+        // never reads a mutable latest-state cache or price as a fallback.
+        virtual_sol_reserves: tx
+            .virtual_sol_reserves
+            .or_else(|| supplemental_state.map(|state| state.virtual_sol_reserves)),
+        virtual_token_reserves: tx
+            .virtual_token_reserves
+            .or_else(|| supplemental_state.map(|state| state.virtual_token_reserves)),
+        real_sol_reserves: tx
+            .real_sol_reserves
+            .or_else(|| supplemental_state.map(|state| state.real_sol_reserves)),
+        real_token_reserves: tx
+            .real_token_reserves
+            .or_else(|| supplemental_state.map(|state| state.real_token_reserves)),
+        complete: tx
+            .complete
+            .or_else(|| supplemental_state.map(|state| state.complete)),
+        reserve_base: tx.reserve_base,
+        reserve_quote: tx.reserve_quote,
+        price_quote: tx.price_quote,
+        v_tokens_in_bonding_curve: tx.v_tokens_in_bonding_curve,
+        v_sol_in_bonding_curve: tx.v_sol_in_bonding_curve,
+        market_cap_sol: tx.market_cap_sol,
+        curve_progress_pct: None,
+        curve_progress_status: "unavailable_missing_curve_state_source".to_string(),
+        curve_finality: format!("{:?}", tx.curve_finality).to_lowercase(),
+        curve_data_known: tx.curve_data_known,
+        execution_account_contract_status: contract_status,
+        execution_account_contract_reason: contract_reason,
+    }
 }
 
 // =============================================================================
@@ -22514,6 +22880,534 @@ async fn send_probe_post_buy_handoff(
     send_direct_shadow_post_buy_handoff(post_buy_tx, &handoff_event, pool_amm_id, "probe").await
 }
 
+#[derive(Debug)]
+enum RugScalpAdapterCompletionV2 {
+    BindRegisteredPosition {
+        mint: String,
+        candidate_id: String,
+        position_id: String,
+        entry_token_amount_raw: u64,
+        entry_total_debit_lamports: u64,
+        entry_watermark: RugScalpEntryWatermarkV1,
+    },
+}
+
+fn rug_scalp_join_metadata(intent: &RugScalpEntryIntentV2) -> ExecutionJoinMetadata {
+    ExecutionJoinMetadata {
+        strategy_id: Some(RUG_SCALP_V2_STRATEGY_ID.to_string()),
+        exit_profile_id: Some(RUG_SCALP_EXIT_PROFILE_ID.to_string()),
+        rug_scalp_entry_total_debit_lamports: Some(intent.entry_total_debit_lamports),
+        rug_scalp_entry_route_id: Some(intent.entry_route_id.clone()),
+        rug_scalp_exit_route_id: Some(intent.exit_route_id.clone()),
+        rug_scalp_entry_fee_schedule_id: Some(intent.entry_fee_schedule_id.clone()),
+        rug_scalp_exit_fee_schedule_id: Some(intent.exit_fee_schedule_id.clone()),
+        probe_id: Some(format!("rug-scalp-probe:{}", intent.candidate_id)),
+        dispatch_source: Some("rug_scalp_v2_isolated_shadow_adapter".to_string()),
+        collection_plane: Some("rug_scalp_v2".to_string()),
+        probe_plane: Some("rug_scalp_v2_primary_010_sol".to_string()),
+        decision_plane: Some("rug_scalp_signal_reducer_v2".to_string()),
+        ..ExecutionJoinMetadata::default()
+    }
+}
+
+fn rug_scalp_join_metadata_with_entry_watermark(
+    intent: &RugScalpEntryIntentV2,
+    entry_watermark: RugScalpEntryWatermarkV1,
+) -> ExecutionJoinMetadata {
+    let mut metadata = rug_scalp_join_metadata(intent);
+    metadata.rug_scalp_entry_watermark_slot = Some(entry_watermark.slot);
+    metadata.rug_scalp_entry_watermark_tx_index = entry_watermark.tx_index;
+    metadata.rug_scalp_entry_watermark_event_ordinal = entry_watermark.event_ordinal;
+    metadata
+}
+
+async fn append_rug_scalp_entry_attempt(
+    path: &std::path::Path,
+    record: &RugScalpEntryAttemptRecordV2,
+) {
+    if let Err(error) = append_rug_scalp_jsonl_record(path, record).await {
+        warn!(
+            candidate_id = %record.candidate_id,
+            error = %error,
+            "RUG_SCALP_ENTRY_ATTEMPT_WRITE_FAILED"
+        );
+    }
+}
+
+/// A bounded sidecar writer for validation evidence. A full queue is never
+/// treated as a successful observation: callers must invalidate active tape
+/// attempts through `mark_stream_gap` before continuing.
+fn enqueue_rug_scalp_validation_records(
+    sender: &mpsc::Sender<RugScalpValidationTapeRecordV1>,
+    records: Vec<RugScalpValidationTapeRecordV1>,
+) -> bool {
+    for record in records {
+        if sender.try_send(record).is_err() {
+            warn!("RUG_SCALP_VALIDATION_TAPE_WRITER_QUEUE_GAP");
+            return false;
+        }
+    }
+    true
+}
+
+async fn append_rug_scalp_entry_terminal(
+    path: &std::path::Path,
+    intent: &RugScalpEntryIntentV2,
+    outcome: RugScalpTerminalOutcomeV2,
+    status: &str,
+    reason: impl Into<String>,
+) {
+    let record =
+        RugScalpOutcomeRecordV2::entry_terminal(intent, outcome, status, Some(reason.into()));
+    if let Err(error) = append_rug_scalp_jsonl_record(path, &record).await {
+        warn!(
+            candidate_id = %record.candidate_id,
+            error = %error,
+            "RUG_SCALP_ENTRY_TERMINAL_WRITE_FAILED"
+        );
+    }
+}
+
+/// Waits only on canonical AccountStateCore updates until the frozen primary
+/// slot latency is covered.  This does not use a Gatekeeper verdict, wall-clock
+/// proxy, or an external synthetic quote.
+async fn wait_for_rug_scalp_entry_latency(
+    oracle_runtime: &OracleRuntime,
+    mint: Pubkey,
+    signal_slot: u64,
+    latency_slots: u64,
+    max_wait_ms: u64,
+) -> Result<(), String> {
+    let target_slot = signal_slot.saturating_add(latency_slots);
+    let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
+    let mut readiness_rx = oracle_runtime.subscribe_canonical_readiness(&mint);
+    loop {
+        if oracle_runtime.account_state_core().is_canonical(&mint)
+            && oracle_runtime
+                .account_state_core()
+                .get_canonical_state(&mint)
+                .is_some_and(|state| state.last_update_slot >= target_slot)
+        {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("entry_latency_slot_timeout_target={target_slot}"));
+        }
+        match tokio::time::timeout(remaining, readiness_rx.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err("canonical_readiness_notifier_closed".to_string()),
+            Err(_) => return Err(format!("entry_latency_slot_timeout_target={target_slot}")),
+        }
+    }
+}
+
+async fn send_rug_scalp_post_buy_handoff(
+    post_buy_tx: Option<&DirectPostBuySender>,
+    pool_amm_id: Pubkey,
+    pool_data: &DetectedPool,
+    shadow_event: &crate::events::ShadowBuySimulationEvent,
+    request: &crate::components::trigger::PreparedBuyRequest,
+    epoch: u64,
+    intent: &RugScalpEntryIntentV2,
+    entry_watermark: RugScalpEntryWatermarkV1,
+) -> Result<DirectPostBuyHandoffAck, String> {
+    let sender = post_buy_tx.ok_or_else(|| "post_buy_direct_lane_unavailable".to_string())?;
+    let event = GhostEvent::PostBuySubmitted {
+        // This identity is allocated by the RUG reducer before the asynchronous
+        // probe begins and is reused by PM for the one position lifecycle.
+        candidate_id: intent.candidate_id.clone(),
+        pool_amm_id: pool_amm_id.to_string(),
+        base_mint: pool_data.base_mint.clone(),
+        signature: shadow_event
+            .live_signature
+            .clone()
+            .unwrap_or_else(|| format!("rug-scalp-modelled:{}", intent.candidate_id)),
+        // PM owns PnL against the exact typed `BuyV2` debit plus entry
+        // envelope cost, not against the historical request cap.
+        amount_sol: intent.entry_total_debit_lamports as f64 / 1_000_000_000.0,
+        tip_lamports: request.tip_lamports,
+        lane: "probe".to_string(),
+        epoch_id: epoch,
+        position_slot_id: None,
+        source: PostBuySource::RugScalpV2Probe,
+        min_tokens_out: Some(request.min_tokens_out),
+        entry_token_amount_raw: shadow_event
+            .entry_token_amount_raw
+            .or(request.entry_token_amount_raw),
+        buy_landed_slot: Some(shadow_event.rpc_slot),
+        entry_simulation_rpc_slot: Some(shadow_event.rpc_slot),
+        entry_opened_at_ms: Some(shadow_event.decision_ts_ms),
+        creator_pubkey: Pubkey::from_str(&pool_data.creator)
+            .ok()
+            .map(|pubkey| pubkey.to_string()),
+        join_metadata: rug_scalp_join_metadata_with_entry_watermark(intent, entry_watermark),
+        shadow_v2_entry_boundary: request.shadow_v2_entry_boundary.clone(),
+    };
+    let (handoff, ack_rx) = DirectPostBuyHandoff::with_ack(event);
+    sender
+        .send(handoff)
+        .await
+        .map_err(|_| "post_buy_direct_lane_closed".to_string())?;
+    // Do not turn a queued-but-slow PM registration into ENTRY_UNKNOWN.  A
+    // timeout here would allow the caller to write an unknown terminal while
+    // the direct lane later registers the same position and emits a second
+    // PM terminal.  The entry semaphore bounds the one in-flight RUG handoff;
+    // after a successful enqueue, only the definitive PM ACK may decide
+    // whether the adapter binds the fact stream.  A closed receiver means no
+    // ACK was delivered and remains fail-closed.
+    ack_rx
+        .await
+        .map_err(|_| "post_buy_handoff_ack_channel_closed".to_string())
+}
+
+/// Materializes the exact, independently-authorized `buy_v2` account surface
+/// for the RUG entry adapter.  This is intentionally not the historical
+/// `BuyAccountOverrides` execution path: the latter can describe a routed
+/// exact-SOL-in instruction and is only used here as retained canonical
+/// account evidence.  Missing or ambiguous evidence has no legacy fallback.
+fn rug_scalp_buy_v2_route_evidence_from_canonical(
+    ctx: &PoolObservationContext,
+    mint: Pubkey,
+    pool_data: &DetectedPool,
+    entry_evidence_txs: &[Arc<PoolTransaction>],
+) -> Result<crate::components::trigger::RugScalpBuyV2RouteEvidence, String> {
+    let overrides =
+        derive_active_buy_account_overrides_from_evidence(ctx, mint, pool_data, entry_evidence_txs);
+    let quote_mint = match pool_data.quote_mint.as_str() {
+        "SOL" | "sol" | "WSOL" | "wsol" => trigger::WRAPPED_SOL_MINT,
+        encoded => Pubkey::from_str(encoded)
+            .map_err(|_| format!("unsupported_or_invalid_quote_mint:{encoded}"))?,
+    };
+    if quote_mint != trigger::WRAPPED_SOL_MINT {
+        return Err(format!("unsupported_quote_mint:{quote_mint}"));
+    }
+    let base_token_program = overrides
+        .token_program
+        .ok_or_else(|| "missing_canonical_base_token_program".to_string())?;
+    let creator = overrides
+        .creator_pubkey
+        .filter(|_| overrides.creator_pubkey_authoritative == Some(true))
+        .ok_or_else(|| "missing_authoritative_creator".to_string())?;
+    let fee_recipient = overrides
+        .fee_recipient
+        .ok_or_else(|| "missing_canonical_fee_recipient".to_string())?;
+    // The current observed Pump manifest places the BCV2 account first and
+    // the buyback fee recipient second.  We never derive a replacement from
+    // payer/mint: absent retained route evidence blocks the isolated entry.
+    let buyback_fee_recipient = overrides
+        .buy_remaining_accounts
+        .get(1)
+        .copied()
+        .ok_or_else(|| "missing_observed_buyback_fee_recipient".to_string())?;
+    Ok(crate::components::trigger::RugScalpBuyV2RouteEvidence {
+        quote_mint,
+        base_token_program,
+        quote_token_program: trigger::SPL_TOKEN_PROGRAM_ID,
+        creator,
+        fee_recipient,
+        buyback_fee_recipient,
+    })
+}
+
+/// Executes exactly one isolated, modelled shadow entry for a reducer-owned
+/// intent.  It reuses only the canonical Pump route/builder materialization;
+/// no P37 selection record or Gatekeeper verdict enters this function.
+async fn run_rug_scalp_v2_entry_adapter(
+    ctx: Arc<PoolObservationContext>,
+    intent: RugScalpEntryIntentV2,
+    pool_data: Arc<DetectedPool>,
+    entry_evidence_txs: Vec<Arc<PoolTransaction>>,
+    completion_tx: tokio::sync::mpsc::Sender<RugScalpAdapterCompletionV2>,
+    validation_tape_bus: Option<RugScalpValidationTapeBusV1>,
+) {
+    let config = &ctx.oracle_runtime.config.rug_scalp_v2;
+    let entry_log_path = std::path::PathBuf::from(&config.entry_log_path);
+    let outcome_log_path = std::path::PathBuf::from(&config.outcome_log_path);
+    let mut entry_record = RugScalpEntryAttemptRecordV2::from_intent(&intent, "accepted_intent");
+    macro_rules! append_terminal {
+        ($outcome:expr, $status:expr, $reason:expr) => {{
+            let terminal_outcome = $outcome;
+            let terminal_reason = ($reason).to_string();
+            append_rug_scalp_entry_terminal(
+                &outcome_log_path,
+                &intent,
+                terminal_outcome.clone(),
+                $status,
+                terminal_reason.clone(),
+            )
+            .await;
+            if let Some(bus) = validation_tape_bus.as_ref() {
+                let status = match terminal_outcome {
+                    RugScalpTerminalOutcomeV2::NoEntry | RugScalpTerminalOutcomeV2::EntryFailed => {
+                        crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::EntryFailed
+                    }
+                    RugScalpTerminalOutcomeV2::EntryUnknown => {
+                        crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::EntryUnknown
+                    }
+                    RugScalpTerminalOutcomeV2::DataInvalidated => {
+                        crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::DataInvalidated
+                    }
+                    RugScalpTerminalOutcomeV2::PositionClosed => {
+                        crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::PositionClosed
+                    }
+                    RugScalpTerminalOutcomeV2::ExitUnavailable => {
+                        crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::ExitUnavailable
+                    }
+                };
+                bus.emit(crate::rug_scalp_validation_tape::RugScalpValidationTapeEventV1::EntryTerminal {
+                    candidate_id: intent.candidate_id.clone(),
+                    status,
+                    reason: terminal_reason,
+                    observed_ingress_ms: current_time_ms(),
+                });
+            }
+        }};
+    }
+    let mint = match Pubkey::from_str(&intent.assessment.mint) {
+        Ok(mint) => mint,
+        Err(_) => {
+            entry_record.dispatch_status = "data_invalidated".to_string();
+            entry_record.failure_reason = Some("invalid_mint_identity".to_string());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_terminal!(
+                RugScalpTerminalOutcomeV2::DataInvalidated,
+                "not_submitted",
+                "invalid_mint_identity"
+            );
+            return;
+        }
+    };
+    let Some(trigger_component) = ctx.trigger.as_ref().map(Arc::clone) else {
+        entry_record.dispatch_status = "entry_failed".to_string();
+        entry_record.failure_reason = Some("authoritative_pump_builder_unavailable".to_string());
+        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+        append_terminal!(
+            RugScalpTerminalOutcomeV2::EntryFailed,
+            "not_submitted",
+            "authoritative_pump_builder_unavailable"
+        );
+        return;
+    };
+    let Some(signal_slot) = intent.assessment.signal_slot else {
+        entry_record.dispatch_status = "data_invalidated".to_string();
+        entry_record.failure_reason = Some("signal_slot_missing".to_string());
+        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+        append_terminal!(
+            RugScalpTerminalOutcomeV2::DataInvalidated,
+            "not_submitted",
+            "signal_slot_missing"
+        );
+        return;
+    };
+    if let Some(latency_slots) = config.primary_entry_latency_slots {
+        if let Err(reason) = wait_for_rug_scalp_entry_latency(
+            ctx.oracle_runtime.as_ref(),
+            mint,
+            signal_slot,
+            latency_slots,
+            config.max_hold_ms,
+        )
+        .await
+        {
+            entry_record.dispatch_status = "entry_unknown".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_terminal!(
+                RugScalpTerminalOutcomeV2::EntryUnknown,
+                "latency_wait_unresolved",
+                reason
+            );
+            return;
+        }
+    } else if !config.technical_validation_capture_enabled() {
+        entry_record.dispatch_status = "data_invalidated".to_string();
+        entry_record.failure_reason = Some("primary_entry_latency_not_frozen".to_string());
+        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+        append_terminal!(
+            RugScalpTerminalOutcomeV2::DataInvalidated,
+            "not_submitted",
+            "primary_entry_latency_not_frozen"
+        );
+        return;
+    }
+
+    let route_evidence = match rug_scalp_buy_v2_route_evidence_from_canonical(
+        ctx.as_ref(),
+        mint,
+        pool_data.as_ref(),
+        &entry_evidence_txs,
+    ) {
+        Ok(evidence) => evidence,
+        Err(reason) => {
+            let reason = format!("route_not_execution_authorized:{reason}");
+            entry_record.dispatch_status = "entry_failed".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_terminal!(
+                RugScalpTerminalOutcomeV2::EntryFailed,
+                "route_evidence_incomplete",
+                reason
+            );
+            return;
+        }
+    };
+    let request = match trigger_component
+        .prepare_rug_scalp_buy_v2_request(
+            &mint,
+            route_evidence,
+            intent.expected_entry_token_amount_raw,
+            intent.entry_wallet_debit_lamports,
+            intent.entry_total_debit_lamports,
+            intent.assessment.signal_ingress_ms,
+        )
+        .await
+    {
+        Ok(request) => request.with_join_metadata(rug_scalp_join_metadata(&intent)),
+        Err(error) => {
+            let reason = format!("authoritative_pump_prepare_failed:{error}");
+            entry_record.dispatch_status = "entry_failed".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_terminal!(
+                RugScalpTerminalOutcomeV2::EntryFailed,
+                "prepare_failed",
+                reason
+            );
+            return;
+        }
+    };
+    if let Some(bus) = validation_tape_bus.as_ref() {
+        bus.emit(crate::rug_scalp_validation_tape::RugScalpValidationTapeEventV1::EntryStage {
+            candidate_id: intent.candidate_id.clone(),
+            stage: crate::rug_scalp_validation_tape::RugScalpValidationLatencyStageV1::EntryBuildCompleted,
+            observed_ingress_ms: current_time_ms(),
+            observed_slot: Some(signal_slot),
+        });
+        bus.emit(crate::rug_scalp_validation_tape::RugScalpValidationTapeEventV1::EntryStage {
+            candidate_id: intent.candidate_id.clone(),
+            stage: crate::rug_scalp_validation_tape::RugScalpValidationLatencyStageV1::EntrySubmitReady,
+            observed_ingress_ms: current_time_ms(),
+            observed_slot: Some(signal_slot),
+        });
+    }
+    let report = match trigger_component
+        .simulate_counterfactual_shadow_probe(&request)
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            let reason = format!("isolated_shadow_submission_failed:{error}");
+            entry_record.dispatch_status = "entry_failed".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_terminal!(
+                RugScalpTerminalOutcomeV2::EntryFailed,
+                "submission_failed",
+                reason
+            );
+            return;
+        }
+    };
+    let shadow_event = crate::components::trigger::shadow_run::shadow_buy_event_from_report(
+        &intent.assessment.pool_id,
+        &intent.assessment.mint,
+        report,
+    );
+    entry_record.simulation_rpc_slot = Some(shadow_event.rpc_slot);
+    if let Some(error) = shadow_event.err.as_deref() {
+        let reason = format!("modelled_fill_rejected:{error}");
+        entry_record.dispatch_status = "entry_failed".to_string();
+        entry_record.failure_reason = Some(reason.clone());
+        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+        append_terminal!(
+            RugScalpTerminalOutcomeV2::EntryFailed,
+            "modelled_fill_rejected",
+            reason
+        );
+        return;
+    }
+    let entry_token_amount_raw = shadow_event
+        .entry_token_amount_raw
+        .or(request.entry_token_amount_raw)
+        .filter(|amount| *amount > 0);
+    let Some(entry_token_amount_raw) = entry_token_amount_raw else {
+        entry_record.dispatch_status = "entry_unknown".to_string();
+        entry_record.failure_reason = Some("modelled_fill_quantity_missing".to_string());
+        append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+        append_terminal!(
+            RugScalpTerminalOutcomeV2::EntryUnknown,
+            "modelled_fill_unresolved",
+            "modelled_fill_quantity_missing"
+        );
+        return;
+    };
+    // The isolated shadow simulator proves the canonical RPC slot but does
+    // not invent a tx/event ordinal.  Same-slot facts therefore remain a
+    // typed ambiguity until a confirmed fill can supply the full watermark.
+    let entry_watermark = RugScalpEntryWatermarkV1::modelled(shadow_event.rpc_slot);
+    let epoch = ctx.post_buy_epoch.fetch_add(1, Ordering::Relaxed);
+    let handoff = send_rug_scalp_post_buy_handoff(
+        ctx.post_buy_tx.as_ref(),
+        Pubkey::from_str(&intent.assessment.pool_id).unwrap_or(mint),
+        pool_data.as_ref(),
+        &shadow_event,
+        &request,
+        epoch,
+        &intent,
+        entry_watermark,
+    )
+    .await;
+    match handoff {
+        Ok(DirectPostBuyHandoffAck::Accepted) => {
+            let position_id = format!("rug-scalp-position:{}", intent.candidate_id);
+            entry_record.dispatch_status = "modelled_fill_registered".to_string();
+            entry_record.entry_token_amount_raw = Some(entry_token_amount_raw);
+            entry_record.position_id = Some(position_id.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            // This bounded handoff is deliberately awaited after PM has
+            // acknowledged registration.  With the one-entry semaphore its
+            // capacity cannot grow with accepted signals, and a registered
+            // position never has its adapter bind silently discarded.
+            if completion_tx
+                .send(RugScalpAdapterCompletionV2::BindRegisteredPosition {
+                    mint: intent.assessment.mint.clone(),
+                    candidate_id: intent.candidate_id,
+                    position_id,
+                    entry_token_amount_raw,
+                    entry_total_debit_lamports: intent.entry_total_debit_lamports,
+                    entry_watermark,
+                })
+                .await
+                .is_err()
+            {
+                warn!("RUG_SCALP_ADAPTER_COMPLETION_CHANNEL_CLOSED");
+            }
+        }
+        Ok(DirectPostBuyHandoffAck::Rejected(reason)) => {
+            let reason = format!("pm_registration_rejected:{reason}");
+            entry_record.dispatch_status = "entry_failed".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_terminal!(
+                RugScalpTerminalOutcomeV2::EntryFailed,
+                "pm_registration_rejected",
+                reason
+            );
+        }
+        Err(reason) => {
+            entry_record.dispatch_status = "entry_unknown".to_string();
+            entry_record.failure_reason = Some(reason.clone());
+            append_rug_scalp_entry_attempt(&entry_log_path, &entry_record).await;
+            append_terminal!(
+                RugScalpTerminalOutcomeV2::EntryUnknown,
+                "pm_handoff_unresolved",
+                reason
+            );
+        }
+    }
+}
+
 async fn apply_trigger_buy_outcome(
     event_tx: &crate::events::EventBusSender,
     post_buy_tx: Option<&DirectPostBuySender>,
@@ -23170,6 +24064,7 @@ fn build_seer_geyser_event_from_confirmed_tx(
 
     Some(SeerGeyserEvent::Transaction {
         slot: seer::types::normalize_slot(Some(tx.slot)),
+        tx_index: None,
         event_ts_ms: seer::types::event_ts_from_block_time(tx.block_time),
         arrival_ts_ms: None,
         event_time: ghost_core::EventTimeMetadata::new(
@@ -25133,6 +26028,79 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         dry_run,
         ab_window_ms: analysis_window_ms,
     });
+    // RUG SCALP has a deliberately separate reducer/adapter state.  It is
+    // neither a Gatekeeper policy input nor a P37 selection state.  The small
+    // bounded outbox protects PM fact order without handing raw trades to PM.
+    let mut rug_scalp_adapter =
+        RugScalpRuntimeAdapterV2::new(oracle_runtime.config.rug_scalp_v2.clone());
+    let mut rug_scalp_entry_evidence: HashMap<String, VecDeque<Arc<PoolTransaction>>> =
+        HashMap::new();
+    let mut rug_scalp_fact_outbox =
+        VecDeque::<ghost_brain::guardian::post_buy::RugScalpMarketFactV1>::new();
+    // There can be at most one active isolated entry task.  Keep completion
+    // transport bounded nevertheless, so a broken main loop cannot turn
+    // accepted assessments into an unbounded in-memory queue.
+    let (rug_scalp_completion_tx, mut rug_scalp_completion_rx) =
+        mpsc::channel::<RugScalpAdapterCompletionV2>(2);
+    let rug_scalp_entry_semaphore = Arc::new(Semaphore::new(1));
+    let (rug_scalp_assessment_tx, mut rug_scalp_assessment_rx) =
+        mpsc::channel::<crate::rug_scalp_v2::RugScalpEntryAssessmentV2>(256);
+    if oracle_runtime.config.rug_scalp_v2.enabled {
+        let assessment_path = std::path::PathBuf::from(
+            &oracle_runtime
+                .config
+                .rug_scalp_v2
+                .signal_assessment_log_path,
+        );
+        tokio::spawn(async move {
+            while let Some(assessment) = rug_scalp_assessment_rx.recv().await {
+                if let Err(error) =
+                    append_rug_scalp_jsonl_record(&assessment_path, &assessment).await
+                {
+                    warn!(
+                        mint = %assessment.mint,
+                        error = %error,
+                        "RUG_SCALP_SIGNAL_ASSESSMENT_WRITE_FAILED"
+                    );
+                }
+            }
+        });
+    }
+    let mut rug_scalp_validation_tape = oracle_runtime
+        .config
+        .rug_scalp_validation_run_context
+        .clone()
+        .filter(|_| oracle_runtime.config.rug_scalp_v2.validation_tape.enabled)
+        .map(|context| RugScalpValidationTapeV1::new(&oracle_runtime.config.rug_scalp_v2, context));
+    // Reality capture is the only consumer of this bounded join.  The normal
+    // runtime continues to receive the original events unchanged; this state
+    // exists solely to write exact durable reserve evidence.
+    let mut full_universe_reserve_joiner = oracle_runtime
+        .config
+        .full_universe_reality_capture_enabled
+        .then(FullUniverseReserveJoiner::default);
+    let rug_scalp_validation_tape_bus = oracle_runtime.config.rug_scalp_validation_tape_bus.clone();
+    let (rug_scalp_validation_tx, mut rug_scalp_validation_rx) =
+        mpsc::channel::<RugScalpValidationTapeRecordV1>(2_048);
+    if rug_scalp_validation_tape.is_some() {
+        let validation_path =
+            std::path::PathBuf::from(&oracle_runtime.config.rug_scalp_v2.validation_tape.log_path);
+        tokio::spawn(async move {
+            while let Some(record) = rug_scalp_validation_rx.recv().await {
+                if let Err(error) = append_rug_scalp_jsonl_record(&validation_path, &record).await {
+                    warn!(error = %error, "RUG_SCALP_VALIDATION_TAPE_WRITE_FAILED");
+                }
+            }
+        });
+    }
+    if let Some(tape) = rug_scalp_validation_tape.as_ref() {
+        if !enqueue_rug_scalp_validation_records(
+            &rug_scalp_validation_tx,
+            vec![tape.run_manifest_record()],
+        ) {
+            warn!("RUG_SCALP_VALIDATION_MANIFEST_QUEUE_UNAVAILABLE");
+        }
+    }
     let (account_update_work_tx, account_update_work_rx) =
         tokio::sync::mpsc::unbounded_channel::<AccountUpdateEvent>();
     let account_update_queue_depth = Arc::new(AtomicUsize::new(0));
@@ -25145,6 +26113,8 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     let mut fsc_coverage_window_tick =
         tokio::time::interval(Duration::from_millis(FSC_COVERAGE_WINDOW_POLL_INTERVAL_MS));
     fsc_coverage_window_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut rug_scalp_validation_tape_tick = tokio::time::interval(Duration::from_millis(100));
+    rug_scalp_validation_tape_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_fsc_gate_status = None;
     refresh_fsc_authoritative_buy_gate_status(
         ctx.session_manager.as_ref(),
@@ -25156,6 +26126,52 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     );
 
     loop {
+        if let (Some(joiner), Some(emitter)) = (
+            full_universe_reserve_joiner.as_mut(),
+            ctx.event_emitter.as_ref(),
+        ) {
+            for emission in joiner.flush_expired() {
+                emission.emit(emitter);
+            }
+        }
+        // Drain in original adapter order.  Facts are small and bounded; on a
+        // full direct lane they remain queued rather than being silently
+        // discarded or converted into synthetic empty slots.
+        while let Some(fact) = rug_scalp_fact_outbox.front().cloned() {
+            let Some(sender) = ctx.post_buy_tx.as_ref() else {
+                warn!(
+                    position_id = %fact.position_id,
+                    "RUG_SCALP_PM_FACT_LANE_UNAVAILABLE; invalidating adapter stream"
+                );
+                rug_scalp_fact_outbox.clear();
+                let _ = rug_scalp_adapter.mark_stream_gap();
+                break;
+            };
+            match sender.try_send(DirectPostBuyHandoff::rug_scalp_market_fact_without_ack(
+                fact,
+            )) {
+                Ok(()) => {
+                    rug_scalp_fact_outbox.pop_front();
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("RUG_SCALP_PM_FACT_LANE_CLOSED; invalidating adapter stream");
+                    rug_scalp_fact_outbox.clear();
+                    let _ = rug_scalp_adapter.mark_stream_gap();
+                    break;
+                }
+            }
+        }
+        if let (Some(tape), Some(bus)) = (
+            rug_scalp_validation_tape.as_mut(),
+            rug_scalp_validation_tape_bus.as_ref(),
+        ) {
+            let records = tape.drain_external_events(bus);
+            if !enqueue_rug_scalp_validation_records(&rug_scalp_validation_tx, records) {
+                let terminals = tape.mark_stream_gap("validation_writer_queue_gap");
+                let _ = enqueue_rug_scalp_validation_records(&rug_scalp_validation_tx, terminals);
+            }
+        }
         tokio::select! {
             shutdown = async {
                 match shutdown_rx.as_mut() {
@@ -25227,12 +26243,105 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                 );
             }
 
+            _ = rug_scalp_validation_tape_tick.tick(), if rug_scalp_validation_tape.is_some() => {
+                if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                    let records = tape.on_clock(current_time_ms());
+                    if !enqueue_rug_scalp_validation_records(&rug_scalp_validation_tx, records) {
+                        let terminals = tape.mark_stream_gap("validation_writer_queue_gap");
+                        let _ = enqueue_rug_scalp_validation_records(
+                            &rug_scalp_validation_tx,
+                            terminals,
+                        );
+                    }
+                }
+            }
+
+            Some(completion) = rug_scalp_completion_rx.recv() => {
+                let actions = match completion {
+                    RugScalpAdapterCompletionV2::BindRegisteredPosition {
+                        mint,
+                        candidate_id,
+                        position_id,
+                        entry_token_amount_raw,
+                        entry_total_debit_lamports,
+                        entry_watermark,
+                    } => {
+                        if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                            let records = tape.bind_modelled_entry(
+                                &candidate_id,
+                                position_id.clone(),
+                                entry_token_amount_raw,
+                                entry_total_debit_lamports,
+                                entry_watermark.slot,
+                                current_time_ms(),
+                            );
+                            if !enqueue_rug_scalp_validation_records(
+                                &rug_scalp_validation_tx,
+                                records,
+                            ) {
+                                let terminals = tape.mark_stream_gap(
+                                    "validation_writer_queue_gap",
+                                );
+                                let _ = enqueue_rug_scalp_validation_records(
+                                    &rug_scalp_validation_tx,
+                                    terminals,
+                                );
+                            }
+                        }
+                        rug_scalp_adapter.bind_confirmed_or_modelled_fill(
+                            &mint,
+                            &candidate_id,
+                            position_id,
+                            entry_token_amount_raw,
+                            entry_watermark,
+                        )
+                    }
+                };
+                match actions {
+                    Ok(actions) => {
+                        for action in actions {
+                            if let RugScalpRuntimeActionV2::MarketFact(fact) = action {
+                                if rug_scalp_fact_outbox.len() >= 256 {
+                                    warn!("RUG_SCALP_PM_FACT_OUTBOX_OVERFLOW; emitting DATA_GAP");
+                                    rug_scalp_fact_outbox.clear();
+                                    rug_scalp_fact_outbox.extend(
+                                        rug_scalp_adapter.mark_stream_gap().into_iter().filter_map(|action| {
+                                            match action {
+                                                RugScalpRuntimeActionV2::MarketFact(fact) => Some(fact),
+                                                _ => None,
+                                            }
+                                        }),
+                                    );
+                                    break;
+                                }
+                                rug_scalp_fact_outbox.push_back(fact);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "RUG_SCALP_PM_BIND_REJECTED_AFTER_ACCEPTED_HANDOFF");
+                    }
+                }
+            }
+
             event_result = event_rx.recv() => {
                 let event = match event_result {
                     Ok(e) => e,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!("LAG ORACLE by {} messages", n);
                         ctx.session_manager.mark_metric_contract_stream_gap();
+                        if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                            let records = tape.mark_stream_gap("oracle_broadcast_lag");
+                            let _ = enqueue_rug_scalp_validation_records(
+                                &rug_scalp_validation_tx,
+                                records,
+                            );
+                        }
+                        for action in rug_scalp_adapter.mark_stream_gap() {
+                            if let RugScalpRuntimeActionV2::MarketFact(fact) = action {
+                                rug_scalp_fact_outbox.push_back(fact);
+                            }
+                        }
                         continue;
                     }
                     Err(_) => break,
@@ -25248,6 +26357,13 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                             emit_new_pool_detected_evidence_event(emitter, &pool_data);
                         }
                         let registered_wall_ts_ms = current_time_ms();
+                        rug_scalp_adapter.on_birth(pool_data.as_ref(), registered_wall_ts_ms);
+                        if let Some(tape) = rug_scalp_validation_tape.as_ref() {
+                            let _ = enqueue_rug_scalp_validation_records(
+                                &rug_scalp_validation_tx,
+                                tape.on_birth(pool_data.as_ref(), registered_wall_ts_ms),
+                            );
+                        }
 
                         if let Ok(candidate) = build_enhanced_candidate_from_pool_data(
                             &pool_data,
@@ -25386,16 +26502,292 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                 tx.as_ref(),
                             );
 
+                            // RUG signal ownership is intentionally parallel to
+                            // Gatekeeper routing.  It sees canonical evidence,
+                            // but its accepted intent does not alter a BUY/REJECT
+                            // verdict, primary capacity, or P37 selection.
+                            if oracle_runtime.config.rug_scalp_v2.enabled {
+                                if let Some(mint_text) = tx.token_mint.as_ref() {
+                                    let evidence = rug_scalp_entry_evidence
+                                        .entry(mint_text.clone())
+                                        .or_default();
+                                    if evidence.len() >= RUG_SCALP_ENTRY_EVIDENCE_CAP {
+                                        evidence.pop_front();
+                                    }
+                                    evidence.push_back(Arc::clone(&tx));
+                                    let canonical = base_mint.map_or_else(
+                                        RugScalpCanonicalStateV2::default,
+                                        |mint| RugScalpCanonicalStateV2 {
+                                            state_clean: oracle_runtime
+                                                .account_state_core()
+                                                .is_canonical(&mint),
+                                            ordering_known: tx.slot.is_some()
+                                                && tx.tx_index.is_some()
+                                                && tx.event_ordinal.is_some(),
+                                            accepted_window_has_gap: false,
+                                        },
+                                    );
+                                    let canonical_curve = base_mint
+                                        .filter(|mint| oracle_runtime.account_state_core().is_canonical(mint))
+                                        .and_then(|mint| oracle_runtime.account_state_core().bonding_curve(&mint));
+                                    let observed_ingress_ms = current_time_ms();
+                                    if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                                        let records = tape.observe_trade(
+                                            tx.as_ref(),
+                                            observed_ingress_ms,
+                                            canonical,
+                                            canonical_curve,
+                                        );
+                                        if !enqueue_rug_scalp_validation_records(
+                                            &rug_scalp_validation_tx,
+                                            records,
+                                        ) {
+                                            let terminals = tape.mark_stream_gap(
+                                                "validation_writer_queue_gap",
+                                            );
+                                            let _ = enqueue_rug_scalp_validation_records(
+                                                &rug_scalp_validation_tx,
+                                                terminals,
+                                            );
+                                        }
+                                    }
+                                    let signal_order = match (tx.slot, tx.tx_index, tx.event_ordinal) {
+                                        (Some(slot), Some(tx_index), Some(event_ordinal)) => Some(
+                                            RugScalpCanonicalOrderKeyV1 {
+                                                slot,
+                                                tx_index,
+                                                event_ordinal,
+                                            },
+                                        ),
+                                        _ => None,
+                                    };
+                                    let actions = rug_scalp_adapter.on_trade(
+                                        tx.as_ref(),
+                                        observed_ingress_ms,
+                                        canonical,
+                                        canonical_curve,
+                                    );
+                                    let mut assessment_delivery_failed = false;
+                                    for action in actions {
+                                        match action {
+                                            RugScalpRuntimeActionV2::Assessment(assessment) => {
+                                                if let (Some(tape), Some(signal_order)) = (
+                                                    rug_scalp_validation_tape.as_mut(),
+                                                    signal_order,
+                                                ) {
+                                                    let records = tape.on_assessment(&assessment, signal_order);
+                                                    if !enqueue_rug_scalp_validation_records(
+                                                        &rug_scalp_validation_tx,
+                                                        records,
+                                                    ) {
+                                                        let terminals = tape.mark_stream_gap(
+                                                            "validation_writer_queue_gap",
+                                                        );
+                                                        let _ = enqueue_rug_scalp_validation_records(
+                                                            &rug_scalp_validation_tx,
+                                                            terminals,
+                                                        );
+                                                    }
+                                                }
+                                                if rug_scalp_assessment_tx.try_send(assessment).is_err() {
+                                                    warn!("RUG_SCALP_SIGNAL_ASSESSMENT_QUEUE_GAP");
+                                                    assessment_delivery_failed = true;
+                                                    if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                                                        let records = tape.mark_stream_gap(
+                                                            "signal_assessment_delivery_gap",
+                                                        );
+                                                        let _ = enqueue_rug_scalp_validation_records(
+                                                            &rug_scalp_validation_tx,
+                                                            records,
+                                                        );
+                                                    }
+                                                    for gap_action in rug_scalp_adapter.mark_stream_gap() {
+                                                        if let RugScalpRuntimeActionV2::MarketFact(fact) = gap_action {
+                                                            rug_scalp_fact_outbox.push_back(fact);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            RugScalpRuntimeActionV2::MarketFact(fact) => {
+                                                if rug_scalp_fact_outbox.len() >= 256 {
+                                                    warn!("RUG_SCALP_PM_FACT_OUTBOX_OVERFLOW; emitting DATA_GAP");
+                                                    rug_scalp_fact_outbox.clear();
+                                                    rug_scalp_fact_outbox.extend(
+                                                        rug_scalp_adapter.mark_stream_gap().into_iter().filter_map(|gap_action| {
+                                                            match gap_action {
+                                                                RugScalpRuntimeActionV2::MarketFact(fact) => Some(fact),
+                                                                _ => None,
+                                                            }
+                                                        }),
+                                                    );
+                                                } else {
+                                                    rug_scalp_fact_outbox.push_back(fact);
+                                                }
+                                            }
+                                            RugScalpRuntimeActionV2::EntryIntent(intent) => {
+                                                if let (Some(tape), Some(signal_order)) = (
+                                                    rug_scalp_validation_tape.as_mut(),
+                                                    signal_order,
+                                                ) {
+                                                    let records = tape.on_accepted_intent(
+                                                        &intent,
+                                                        signal_order,
+                                                    );
+                                                    if !enqueue_rug_scalp_validation_records(
+                                                        &rug_scalp_validation_tx,
+                                                        records,
+                                                    ) {
+                                                        let terminals = tape.mark_stream_gap(
+                                                            "validation_writer_queue_gap",
+                                                        );
+                                                        let _ = enqueue_rug_scalp_validation_records(
+                                                            &rug_scalp_validation_tx,
+                                                            terminals,
+                                                        );
+                                                    }
+                                                }
+                                                if assessment_delivery_failed {
+                                                    if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                                                        let records = tape.finish_candidate(
+                                                            intent.candidate_id.clone(),
+                                                            crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::DataInvalidated,
+                                                            "signal_assessment_delivery_gap".to_string(),
+                                                            None,
+                                                            None,
+                                                            current_time_ms(),
+                                                        );
+                                                        let _ = enqueue_rug_scalp_validation_records(
+                                                            &rug_scalp_validation_tx,
+                                                            records,
+                                                        );
+                                                    }
+                                                    let outcome_path = std::path::PathBuf::from(
+                                                        &oracle_runtime.config.rug_scalp_v2.outcome_log_path,
+                                                    );
+                                                    tokio::spawn(async move {
+                                                        append_rug_scalp_entry_terminal(
+                                                            &outcome_path,
+                                                            &intent,
+                                                            RugScalpTerminalOutcomeV2::DataInvalidated,
+                                                            "adapter_blocked",
+                                                            "signal_assessment_delivery_gap",
+                                                        )
+                                                        .await;
+                                                    });
+                                                    continue;
+                                                }
+                                                let pool_data = oracle_runtime.lookup_detected_pool(&pool_id);
+                                                let entry_evidence_txs = rug_scalp_entry_evidence
+                                                    .get(&intent.assessment.mint)
+                                                    .map(|txs| txs.iter().cloned().collect::<Vec<_>>())
+                                                    .unwrap_or_default();
+                                                match (
+                                                    pool_data,
+                                                    Arc::clone(&rug_scalp_entry_semaphore).try_acquire_owned(),
+                                                ) {
+                                                    (Some(pool_data), Ok(permit)) => {
+                                                        let ctx = Arc::clone(&ctx);
+                                                        let completion_tx = rug_scalp_completion_tx.clone();
+                                                        let validation_tape_bus = rug_scalp_validation_tape_bus.clone();
+                                                        tokio::spawn(async move {
+                                                            let _permit = permit;
+                                                            run_rug_scalp_v2_entry_adapter(
+                                                                ctx,
+                                                                intent,
+                                                                pool_data,
+                                                                entry_evidence_txs,
+                                                                completion_tx,
+                                                                validation_tape_bus,
+                                                            )
+                                                            .await;
+                                                        });
+                                                    }
+                                                    (None, _) => {
+                                                        if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                                                            let records = tape.finish_candidate(
+                                                                intent.candidate_id.clone(),
+                                                                crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::EntryFailed,
+                                                                "pool_metadata_unavailable".to_string(),
+                                                                None,
+                                                                None,
+                                                                current_time_ms(),
+                                                            );
+                                                            let _ = enqueue_rug_scalp_validation_records(
+                                                                &rug_scalp_validation_tx,
+                                                                records,
+                                                            );
+                                                        }
+                                                        let outcome_path = std::path::PathBuf::from(
+                                                            &oracle_runtime.config.rug_scalp_v2.outcome_log_path,
+                                                        );
+                                                        tokio::spawn(async move {
+                                                            append_rug_scalp_entry_terminal(
+                                                                &outcome_path,
+                                                                &intent,
+                                                                RugScalpTerminalOutcomeV2::NoEntry,
+                                                                "adapter_blocked",
+                                                                "pool_metadata_unavailable",
+                                                            )
+                                                            .await;
+                                                        });
+                                                    }
+                                                    (Some(_), Err(_)) => {
+                                                        if let Some(tape) = rug_scalp_validation_tape.as_mut() {
+                                                            let records = tape.finish_candidate(
+                                                                intent.candidate_id.clone(),
+                                                                crate::rug_scalp_validation_tape::RugScalpValidationTerminalStatusV1::EntryFailed,
+                                                                "isolated_entry_capacity_exhausted".to_string(),
+                                                                None,
+                                                                None,
+                                                                current_time_ms(),
+                                                            );
+                                                            let _ = enqueue_rug_scalp_validation_records(
+                                                                &rug_scalp_validation_tx,
+                                                                records,
+                                                            );
+                                                        }
+                                                        let outcome_path = std::path::PathBuf::from(
+                                                            &oracle_runtime.config.rug_scalp_v2.outcome_log_path,
+                                                        );
+                                                        tokio::spawn(async move {
+                                                            append_rug_scalp_entry_terminal(
+                                                                &outcome_path,
+                                                                &intent,
+                                                                RugScalpTerminalOutcomeV2::NoEntry,
+                                                                "adapter_blocked",
+                                                                "isolated_entry_capacity_exhausted",
+                                                            )
+                                                            .await;
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             // Durable selector feature evidence is intentionally
                             // emitted before runtime rejected-pool filtering.  The
                             // artifact writer is not a session/dispatch unlock path.
                             if let Some(emitter) = ctx.event_emitter.as_ref() {
-                                emit_pool_transaction_evidence_event(
-                                    emitter,
-                                    &tx,
-                                    pool_id,
-                                    base_mint.as_ref(),
-                                );
+                                if let Some(joiner) = full_universe_reserve_joiner.as_mut() {
+                                    for emission in joiner.observe_trade(
+                                        Arc::clone(&tx),
+                                        pool_id,
+                                        base_mint,
+                                    ) {
+                                        emission.emit(emitter);
+                                    }
+                                } else {
+                                    emit_pool_transaction_evidence_event(
+                                        emitter,
+                                        &tx,
+                                        pool_id,
+                                        base_mint.as_ref(),
+                                        None,
+                                    );
+                                }
                             }
 
                             // Skip rejected pools for active runtime routing.
@@ -25532,6 +26924,14 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                     // data flows here from Seer and feeds AccountStateCore while
                     // ReconciliationRuntime remains monitoring-only.
                     GhostEvent::AccountUpdate(event) => {
+                        if let (Some(joiner), Some(emitter)) = (
+                            full_universe_reserve_joiner.as_mut(),
+                            ctx.event_emitter.as_ref(),
+                        ) {
+                            for emission in joiner.observe_account_update(&event) {
+                                emission.emit(emitter);
+                            }
+                        }
                         if canonical_account_update_relay_enabled {
                             if rejected_pools.contains(&event.base_mint)
                                 || rejected_pools.contains(&event.bonding_curve)
@@ -25607,6 +27007,15 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
             }
         }
     } // loop
+
+    if let (Some(joiner), Some(emitter)) = (
+        full_universe_reserve_joiner.as_mut(),
+        ctx.event_emitter.as_ref(),
+    ) {
+        for emission in joiner.flush_all() {
+            emission.emit(emitter);
+        }
+    }
 
     // No new terminal producers can be admitted after the router loop exits.
     // Closing every per-pool sender forces a final evaluation on its frozen
@@ -32452,6 +33861,7 @@ mod tests {
             trade_value_sol: amount_lamports as f64 / LAMPORTS_PER_SOL,
             pre_submit_token_balance: Some(0),
             buy_variant: trigger::PumpfunBuyVariant::RoutedExactSolIn,
+            typed_route_variant: None,
             entry_token_amount_raw: Some(min_tokens_out),
             min_tokens_out,
             token_param_role: "min_tokens_out",
@@ -32590,6 +34000,7 @@ mod tests {
             trade_value_sol: amount_lamports as f64 / LAMPORTS_PER_SOL,
             pre_submit_token_balance: Some(0),
             buy_variant: trigger::PumpfunBuyVariant::LegacyBuy,
+            typed_route_variant: None,
             entry_token_amount_raw: Some(min_tokens_out),
             min_tokens_out,
             token_param_role: "token_amount",
@@ -32674,6 +34085,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -32696,6 +34112,149 @@ mod tests {
             toolchain_fingerprint: seer::types::ToolchainFingerprintInput::default(),
             curve_data_known: false,
         })
+    }
+
+    #[test]
+    fn full_universe_durable_row_preserves_canonical_reserves_and_order_key() {
+        let pool_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut tx = (*test_pool_observation_tx("full-universe-reserve-row")).clone();
+        tx.pool_amm_id = pool_id.to_string();
+        tx.token_mint = Some(mint.to_string());
+        tx.slot = Some(4242);
+        tx.tx_index = Some(0);
+        tx.event_ordinal = Some(3);
+        tx.sol_amount_lamports = Some(91_000_000);
+        tx.price_quote = Some(999_999.0);
+        // The parser's post-trade Pump event state is authoritative for this
+        // row and must not be replaced with a later AccountStateCore snapshot.
+        tx.virtual_sol_reserves = Some(32_000_000_000);
+        tx.virtual_token_reserves = Some(1_072_000_000_000);
+        tx.real_sol_reserves = Some(1_400_000_000);
+        tx.real_token_reserves = Some(792_000_000_000);
+        tx.complete = Some(false);
+
+        let payload = pool_transaction_evidence_payload(&tx, pool_id, Some(&mint), None);
+
+        assert_eq!(payload.slot, Some(4242));
+        assert_eq!(payload.tx_index, Some(0));
+        assert_eq!(payload.event_ordinal, Some(3));
+        assert_eq!(payload.effective_curve_quote_lamports, Some(91_000_000));
+        assert_eq!(payload.virtual_sol_reserves, Some(32_000_000_000));
+        assert_eq!(payload.virtual_token_reserves, Some(1_072_000_000_000));
+        assert_eq!(payload.real_sol_reserves, Some(1_400_000_000));
+        assert_eq!(payload.real_token_reserves, Some(792_000_000_000));
+        assert_eq!(payload.complete, Some(false));
+        assert_ne!(
+            payload.effective_curve_quote_lamports,
+            tx.price_quote.map(|v| v as u64)
+        );
+    }
+
+    #[test]
+    fn full_universe_durable_row_does_not_fallback_to_mark_price() {
+        let pool_id = Pubkey::new_unique();
+        let mut tx = (*test_pool_observation_tx("full-universe-no-price-fallback")).clone();
+        tx.sol_amount_lamports = None;
+        tx.volume_sol = 123.0;
+        tx.price_quote = Some(777.0);
+
+        let payload = pool_transaction_evidence_payload(&tx, pool_id, None, None);
+
+        assert_eq!(payload.effective_curve_quote_lamports, None);
+        assert_eq!(payload.real_sol_reserves, None);
+        assert_eq!(payload.complete, None);
+    }
+
+    fn full_universe_account_update(
+        bonding_curve: Pubkey,
+        slot: u64,
+        virtual_sol_reserves: u64,
+        virtual_token_reserves: u64,
+        real_sol_reserves: u64,
+        real_token_reserves: u64,
+    ) -> AccountUpdateEvent {
+        AccountUpdateEvent {
+            semantic: Default::default(),
+            event_time: ghost_core::EventTimeMetadata::default(),
+            base_mint: Pubkey::new_unique(),
+            bonding_curve,
+            curve_finality: CurveFinality::Provisional,
+            sol_reserves: virtual_sol_reserves,
+            token_reserves: virtual_token_reserves,
+            real_sol_reserves: Some(real_sol_reserves),
+            real_token_reserves: Some(real_token_reserves),
+            complete: 0,
+            slot,
+            write_version: Some(1),
+            account_data_hash: Some("raw-account-state".to_string()),
+            account_data_len: Some(64),
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap()),
+            replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
+            replay_buffer_dwell_ms: None,
+            detected_at: SystemTime::now(),
+            sequence_number: 1,
+        }
+    }
+
+    #[test]
+    fn full_universe_reserve_join_uses_only_exact_post_trade_account_state() {
+        let curve = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut tx = (*test_pool_observation_tx("exact-reserve-join")).clone();
+        tx.pool_amm_id = curve.to_string();
+        tx.slot = Some(4242);
+        tx.virtual_sol_reserves = Some(31_000_000_000);
+        tx.virtual_token_reserves = Some(900_000_000_000);
+
+        let mut joiner = FullUniverseReserveJoiner::default();
+        assert!(joiner
+            .observe_trade(Arc::new(tx), curve, Some(mint))
+            .is_empty());
+
+        let emissions = joiner.observe_account_update(&full_universe_account_update(
+            curve,
+            4242,
+            31_000_000_000,
+            900_000_000_000,
+            1_500_000_000,
+            790_000_000_000,
+        ));
+        assert_eq!(emissions.len(), 1);
+        let state = emissions[0]
+            .supplemental_state
+            .expect("exact tuple must authorize evidence supplementation");
+        assert_eq!(state.real_sol_reserves, 1_500_000_000);
+        assert_eq!(state.real_token_reserves, 790_000_000_000);
+        assert!(!state.complete);
+    }
+
+    #[test]
+    fn full_universe_reserve_join_rejects_wrong_tuple_without_fallback() {
+        let curve = Pubkey::new_unique();
+        let mut tx = (*test_pool_observation_tx("wrong-reserve-join")).clone();
+        tx.pool_amm_id = curve.to_string();
+        tx.slot = Some(4242);
+        tx.virtual_sol_reserves = Some(31_000_000_000);
+        tx.virtual_token_reserves = Some(900_000_000_000);
+
+        let mut joiner = FullUniverseReserveJoiner::default();
+        assert!(joiner.observe_trade(Arc::new(tx), curve, None).is_empty());
+        assert!(joiner
+            .observe_account_update(&full_universe_account_update(
+                curve,
+                4242,
+                31_000_000_001,
+                900_000_000_000,
+                1_500_000_000,
+                790_000_000_000,
+            ))
+            .is_empty());
+
+        let emissions = joiner.flush_all();
+        assert_eq!(emissions.len(), 1);
+        assert!(emissions[0].supplemental_state.is_none());
     }
 
     fn test_detected_pool(pool_id: Pubkey) -> Arc<DetectedPool> {
@@ -39258,6 +40817,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::Unknown,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -39358,6 +40922,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: Some(Pubkey::new_unique().to_string()),
             fee_recipient: Some(Pubkey::new_unique().to_string()),
@@ -39419,6 +40988,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: Some(expected_global.to_string()),
             fee_recipient: Some(expected_fee.to_string()),
@@ -39513,6 +41087,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: Some(known_bad.to_string()),
@@ -39666,6 +41245,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: Some(current_fee.to_string()),
@@ -39742,6 +41326,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: Some(reserved_fee.to_string()),
@@ -39816,6 +41405,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: Some(Pubkey::new_unique().to_string()),
@@ -39890,6 +41484,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: Some(Pubkey::new_unique().to_string()),
             fee_recipient: None,
@@ -41358,6 +42957,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -41495,6 +43099,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -41723,6 +43332,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -41831,6 +43445,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: Some(1_073_000_000.0),
             v_sol_in_bonding_curve: Some(30.0),
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: Some(30.0),
             global_config: None,
             fee_recipient: None,
@@ -41913,6 +43532,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -42009,6 +43633,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -42137,6 +43766,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -42237,6 +43871,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -43484,6 +45123,8 @@ mod tests {
                 curve_finality: CurveFinality::Speculative,
                 sol_reserves: 9_000_000_000,
                 token_reserves: 888_000_000_000_000,
+                real_sol_reserves: None,
+                real_token_reserves: None,
                 complete: 0,
                 slot: 2,
                 write_version: Some(1),
@@ -43566,6 +45207,8 @@ mod tests {
             curve_finality: CurveFinality::Speculative,
             sol_reserves: 9_000_000_000,
             token_reserves: 888_000_000_000_000,
+            real_sol_reserves: None,
+            real_token_reserves: None,
             complete: 0,
             slot: 2,
             write_version: Some(7),
@@ -44420,6 +46063,11 @@ mod tests {
             token_mint: Some(token_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -44487,6 +46135,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -44630,6 +46283,11 @@ mod tests {
             token_mint: Some(token_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -44712,6 +46370,11 @@ mod tests {
             token_mint: Some(token_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -44792,6 +46455,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -44856,6 +46524,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -44926,6 +46599,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -44995,6 +46673,8 @@ mod tests {
             curve_finality: CurveFinality::Provisional,
             sol_reserves: 10,
             token_reserves: 20,
+            real_sol_reserves: None,
+            real_token_reserves: None,
             complete: 0,
             slot: 42,
             write_version: Some(7),
@@ -45081,6 +46761,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -45145,6 +46830,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -45355,6 +47045,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -45740,6 +47435,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -46706,6 +48406,8 @@ mod tests {
             curve_finality: CurveFinality::Speculative,
             sol_reserves: sol,
             token_reserves: tok,
+            real_sol_reserves: None,
+            real_token_reserves: None,
             complete: 0,
             slot: 51,
             write_version: None,
@@ -47034,6 +48736,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -47155,6 +48862,11 @@ mod tests {
             token_mint: Some(valid_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -47303,6 +49015,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -47464,6 +49181,11 @@ mod tests {
             token_mint: Some(valid_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -47551,6 +49273,11 @@ mod tests {
             token_mint: None, // no mint — already known
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -47626,6 +49353,8 @@ mod tests {
             curve_finality: CurveFinality::Provisional,
             sol_reserves: 30_000_000_000 + slot,
             token_reserves: 900_000_000_000_000,
+            real_sol_reserves: None,
+            real_token_reserves: None,
             complete: 0,
             slot,
             write_version,
@@ -47867,6 +49596,8 @@ mod tests {
                     curve_finality: CurveFinality::Speculative,
                     sol_reserves: drifted_sol,
                     token_reserves: initial_tok,
+                    real_sol_reserves: None,
+                    real_token_reserves: None,
                     complete: 0,
                     slot: 101,
                     write_version: None,
