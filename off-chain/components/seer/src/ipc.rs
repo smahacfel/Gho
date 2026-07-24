@@ -969,6 +969,10 @@ impl IpcSender {
         let send_result = match policy {
             BackpressurePolicy::Block => {
                 // Block until space is available
+                #[cfg(test)]
+                if self.sender.capacity() == 0 {
+                    crate::hot_path_metrics::record_ipc_blocking_wait();
+                }
                 self.sender
                     .send(event)
                     .await
@@ -1020,6 +1024,10 @@ impl IpcSender {
                             })
                         } else {
                             // Block for Normal/High priority
+                            #[cfg(test)]
+                            if self.sender.capacity() == 0 {
+                                crate::hot_path_metrics::record_ipc_blocking_wait();
+                            }
                             self.sender
                                 .send(event)
                                 .await

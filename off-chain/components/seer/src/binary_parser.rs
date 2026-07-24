@@ -1876,6 +1876,8 @@ impl PumpParser {
     ) -> Vec<ParsedPumpEvent> {
         use yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction;
 
+        #[cfg(test)]
+        crate::hot_path_metrics::record_live_transaction_parser_decode();
         let update = match SubscribeUpdateTransaction::decode(raw) {
             Ok(u) => u,
             Err(e) => {
@@ -4041,6 +4043,18 @@ pub struct BinaryParser {
     bcv2_hydrator: Option<Bcv2HydrationService>,
 }
 
+/// Combined parser output used by the PR1B harness and, after the single-pass
+/// refactor, by the active Seer runtime.
+///
+/// In the baseline implementation this deliberately delegates to the two
+/// existing compatibility entry points. That preserves runtime behavior while
+/// making the duplicated work directly measurable before PR1B changes it.
+#[derive(Debug, Clone)]
+pub struct ParsedTransactionBundle {
+    pub initialize_pool: Option<InitializePoolEvent>,
+    pub trades: Vec<TradeEvent>,
+}
+
 impl BinaryParser {
     pub fn new(verbose: bool) -> Self {
         Self::with_account_registry_and_bcv2_hydration(verbose, AccountRegistry::new(), None)
@@ -4239,6 +4253,22 @@ impl BinaryParser {
             }
         }
         Ok(None)
+    }
+
+    /// Parse all transaction-level Pump outputs through one typed call.
+    ///
+    /// B0 is measurement-only: the baseline implementation intentionally calls
+    /// both legacy entry points so the harness captures the existing double
+    /// scan. B1 replaces this body with one instruction-tree walk and wires the
+    /// active runtime to this method.
+    pub fn parse_transaction_bundle(
+        &self,
+        event: &GeyserEvent,
+    ) -> SeerResult<ParsedTransactionBundle> {
+        Ok(ParsedTransactionBundle {
+            initialize_pool: self.parse_initialize_pool(event)?,
+            trades: self.parse_trades(event)?,
+        })
     }
 
     /// Parse a GeyserEvent for trade events.
@@ -5248,6 +5278,8 @@ impl BinaryParser {
     /// `parse_transaction_raw`; a full elimination of the second decode requires
     /// restructuring PumpParser to accept pre-decoded fields, left as a future P1.
     fn parse_pump_events(&self, event: &GeyserEvent) -> Vec<ParsedPumpEvent> {
+        #[cfg(test)]
+        crate::hot_path_metrics::record_full_instruction_tree_scan();
         match event {
             GeyserEvent::Transaction {
                 mpcf_payload_bytes: Some(raw),

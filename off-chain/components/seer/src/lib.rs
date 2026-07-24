@@ -63,6 +63,10 @@ pub mod enhanced_builder;
 pub mod errors;
 pub mod grpc_connection;
 pub mod helius_websocket_adapter;
+#[cfg(test)]
+mod hot_path_harness;
+#[cfg(test)]
+pub(crate) mod hot_path_metrics;
 pub mod ipc;
 pub mod metrics;
 pub mod nln_program_streams;
@@ -2074,6 +2078,11 @@ impl Seer {
             return;
         }
 
+        #[cfg(test)]
+        {
+            crate::hot_path_metrics::record_wal_append();
+            crate::hot_path_metrics::apply_synthetic_wal_delay();
+        }
         if let Err(err) = wal.append_with_clock(&record, clock) {
             if is_no_space_error(&err) {
                 if !self.wal_disabled_due_to_enospc.swap(true, Relaxed) {

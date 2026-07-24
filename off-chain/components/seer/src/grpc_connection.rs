@@ -279,6 +279,22 @@ impl DualLaneChannel {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_capacities(
+        fast_capacity: usize,
+        overflow_capacity: usize,
+    ) -> (Self, DualLaneReceiver) {
+        let (fast, fast_rx) = bounded(fast_capacity);
+        let (overflow, overflow_rx) = bounded(overflow_capacity);
+        (
+            Self { fast, overflow },
+            DualLaneReceiver {
+                fast: fast_rx,
+                overflow: overflow_rx,
+            },
+        )
+    }
+
     /// Send to fast lane; if full, spill to overflow.
     /// Returns `true` if sent to fast, `false` if spilled.
     ///
@@ -325,6 +341,11 @@ impl DualLaneChannel {
     #[inline(always)]
     pub fn overflow_len(&self) -> usize {
         self.overflow.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn depth(&self) -> usize {
+        self.fast.len().saturating_add(self.overflow.len())
     }
 }
 
@@ -3103,6 +3124,8 @@ fn route_update(
             }
 
             let sig = extract_sig(&t);
+            #[cfg(test)]
+            crate::hot_path_metrics::record_live_transaction_prost_encode();
             let raw = encode_proto(&t);
             stats.bump_tx();
 
@@ -3234,6 +3257,42 @@ fn route_update(
         // Pong handled upstream; everything else silently ignored.
         _ => {}
     }
+}
+
+#[cfg(test)]
+pub(crate) fn route_update_for_hot_path_harness(
+    msg: yellowstone_grpc_proto::prelude::SubscribeUpdate,
+) -> SeerResult<GeyserEvent> {
+    let (channel, receiver) = DualLaneChannel::with_capacities(64, 64);
+    let stats = Arc::new(TransportStats::default());
+    let slots = Arc::new(SlotTracker::default());
+    let (gap_tx, _gap_rx) = tokio::sync::mpsc::unbounded_channel();
+    let latest_block_time_secs = Arc::new(AtomicI64::new(0));
+    let registry = AccountRegistry::new();
+
+    route_update(
+        "pr1b-hot-path-harness",
+        msg,
+        "pr1b-primary",
+        ghost_core::RawProviderRoleV1::PrimaryAuthority,
+        &channel,
+        &stats,
+        &slots,
+        &gap_tx,
+        &latest_block_time_secs,
+        &registry,
+    );
+
+    let event = receiver
+        .fast
+        .try_recv()
+        .or_else(|_| receiver.overflow.try_recv())
+        .map_err(|_| {
+            SeerError::ParseError("PR1B harness route_update emitted no event".to_string())
+        })?;
+    pump_event_to_geyser_event(event, GRPC_GLOBAL_STREAM_SOURCE_LABEL, None).ok_or_else(|| {
+        SeerError::ParseError("PR1B harness event has no normalized mapping".to_string())
+    })?
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -4362,7 +4421,7 @@ async fn fetch_gap_backfill_events(
 /// Returns None only for future transport-only events that do not map to the
 /// public `GeyserEvent` stream. `EntryUpdate` maps to `EntryAnchor` because it
 /// is part of Yellowstone coverage/gap provenance.
-fn pump_event_to_geyser_event(
+pub(crate) fn pump_event_to_geyser_event(
     ev: PumpEvent,
     live_source_label: &'static str,
     block_time: Option<i64>,
@@ -4459,6 +4518,8 @@ fn decode_tx_to_geyser_event(
     use yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction;
 
     let result = (|| {
+        #[cfg(test)]
+        crate::hot_path_metrics::record_live_transaction_normalizer_decode();
         let update = <SubscribeUpdateTransaction as prost::Message>::decode(raw.as_slice())
             .map_err(|e| SeerError::ParseError(format!("proto decode Tx: {e}")))?;
         tx_update_to_geyser_event(
