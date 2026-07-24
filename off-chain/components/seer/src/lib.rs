@@ -1142,6 +1142,8 @@ enum PendingCurveUpdateStoreOutcome {
 pub struct CanonicalAccountUpdatePayload {
     sol_reserves: u64,
     token_reserves: u64,
+    real_sol_reserves: Option<u64>,
+    real_token_reserves: Option<u64>,
     complete: u8,
     token_mint: Option<Pubkey>,
 }
@@ -1155,6 +1157,16 @@ impl CanonicalAccountUpdatePayload {
     #[inline]
     pub fn token_reserves(&self) -> u64 {
         self.token_reserves
+    }
+
+    #[inline]
+    pub fn real_sol_reserves(&self) -> Option<u64> {
+        self.real_sol_reserves
+    }
+
+    #[inline]
+    pub fn real_token_reserves(&self) -> Option<u64> {
+        self.real_token_reserves
     }
 
     #[inline]
@@ -1176,6 +1188,8 @@ pub fn decode_canonical_account_update(
         PumpAccountState::BondingCurve(curve) => Ok(CanonicalAccountUpdatePayload {
             sol_reserves: curve.virtual_sol_reserves,
             token_reserves: curve.virtual_token_reserves,
+            real_sol_reserves: Some(curve.real_sol_reserves),
+            real_token_reserves: Some(curve.real_token_reserves),
             complete: u8::from(curve.complete),
             token_mint: None,
         }),
@@ -1186,6 +1200,8 @@ pub fn decode_canonical_account_update(
                 Ok(CanonicalAccountUpdatePayload {
                     sol_reserves: pool.base_amount,
                     token_reserves: pool.quote_amount,
+                    real_sol_reserves: None,
+                    real_token_reserves: None,
                     complete: 1,
                     token_mint: Some(quote_mint),
                 })
@@ -1193,6 +1209,8 @@ pub fn decode_canonical_account_update(
                 Ok(CanonicalAccountUpdatePayload {
                     sol_reserves: pool.quote_amount,
                     token_reserves: pool.base_amount,
+                    real_sol_reserves: None,
+                    real_token_reserves: None,
                     complete: 1,
                     token_mint: Some(base_mint),
                 })
@@ -1206,6 +1224,8 @@ pub fn decode_canonical_account_update(
             .map(|curve| CanonicalAccountUpdatePayload {
                 sol_reserves: curve.virtual_sol_reserves,
                 token_reserves: curve.virtual_token_reserves,
+                real_sol_reserves: Some(curve.real_sol_reserves),
+                real_token_reserves: Some(curve.real_token_reserves),
                 complete: curve.complete,
                 token_mint: None,
             })
@@ -3052,6 +3072,8 @@ impl Seer {
                         ghost_core::CurveFinality::Provisional,
                         update_payload.sol_reserves,
                         update_payload.token_reserves,
+                        update_payload.real_sol_reserves,
+                        update_payload.real_token_reserves,
                         update_payload.complete,
                         replay.slot,
                         replay.write_version,
@@ -3372,6 +3394,8 @@ impl Seer {
                     self.config.commitment.curve_finality(),
                     update_payload.sol_reserves,
                     update_payload.token_reserves,
+                    update_payload.real_sol_reserves,
+                    update_payload.real_token_reserves,
                     update_payload.complete,
                     slot,
                     write_version,
@@ -5341,6 +5365,11 @@ mod tests {
             mpcf_payload_missing_reason: types::RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: Some(10.0),
             v_sol_in_bonding_curve: Some(1.0),
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -7338,6 +7367,8 @@ mod tests {
         assert_eq!(event.bonding_curve, bonding_curve);
         assert_eq!(event.sol_reserves, curve.virtual_sol_reserves);
         assert_eq!(event.token_reserves, curve.virtual_token_reserves);
+        assert_eq!(event.real_sol_reserves, Some(curve.real_sol_reserves));
+        assert_eq!(event.real_token_reserves, Some(curve.real_token_reserves));
         assert_eq!(event.complete, curve.complete);
         assert_eq!(event.slot, 42);
     }

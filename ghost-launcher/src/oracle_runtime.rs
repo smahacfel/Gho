@@ -1959,6 +1959,9 @@ pub struct OracleRuntimeConfig {
     /// but cannot change reducer, PM, or execution behaviour.
     pub rug_scalp_validation_run_context: Option<RugScalpValidationRunContextV1>,
     pub rug_scalp_validation_tape_bus: Option<RugScalpValidationTapeBusV1>,
+    /// Enables only the bounded evidence join used by the observe-only
+    /// full-universe RUG reality capture.  It has no policy or lifecycle role.
+    pub full_universe_reality_capture_enabled: bool,
     pub selector: SelectorRuntimeConfig,
     pub run_id: Option<String>,
     pub session_id: Option<String>,
@@ -2013,6 +2016,7 @@ impl OracleRuntimeConfig {
             rug_scalp_v2: RugScalpV2Config::default(),
             rug_scalp_validation_run_context: None,
             rug_scalp_validation_tape_bus: None,
+            full_universe_reality_capture_enabled: false,
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -2038,6 +2042,7 @@ impl OracleRuntimeConfig {
             rug_scalp_v2: RugScalpV2Config::default(),
             rug_scalp_validation_run_context: None,
             rug_scalp_validation_tape_bus: None,
+            full_universe_reality_capture_enabled: false,
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -2104,6 +2109,7 @@ impl Default for OracleRuntimeConfig {
             rug_scalp_v2: RugScalpV2Config::default(),
             rug_scalp_validation_run_context: None,
             rug_scalp_validation_tape_bus: None,
+            full_universe_reality_capture_enabled: false,
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
@@ -16801,14 +16807,317 @@ fn pool_transaction_evidence_candidate_id(
     }
 }
 
+/// The only admissible account-state supplementation for the full-universe
+/// reality tape.  A state is joined to a trade only after their raw post-trade
+/// virtual reserve tuple, physical curve and slot agree exactly.  This keeps
+/// the writer out of the mutable AccountStateCore / mark-price path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FullUniverseCanonicalReserveState {
+    virtual_sol_reserves: u64,
+    virtual_token_reserves: u64,
+    real_sol_reserves: u64,
+    real_token_reserves: u64,
+    complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FullUniverseReserveJoinKey {
+    slot: u64,
+    bonding_curve: Pubkey,
+    virtual_sol_reserves: u64,
+    virtual_token_reserves: u64,
+}
+
+#[derive(Debug)]
+struct PendingFullUniverseTradeEvidence {
+    tx: Arc<PoolTransaction>,
+    pool_id: Pubkey,
+    base_mint: Option<Pubkey>,
+    queued_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FullUniverseReserveStateEntry {
+    Unique {
+        state: FullUniverseCanonicalReserveState,
+        observed_at: Instant,
+    },
+    Ambiguous {
+        observed_at: Instant,
+    },
+}
+
+#[derive(Debug)]
+struct FullUniverseEvidenceEmission {
+    tx: Arc<PoolTransaction>,
+    pool_id: Pubkey,
+    base_mint: Option<Pubkey>,
+    supplemental_state: Option<FullUniverseCanonicalReserveState>,
+}
+
+impl FullUniverseEvidenceEmission {
+    fn emit(self, emitter: &EventEmitter) {
+        emit_pool_transaction_evidence_event(
+            emitter,
+            &self.tx,
+            self.pool_id,
+            self.base_mint.as_ref(),
+            self.supplemental_state.as_ref(),
+        );
+    }
+}
+
+const FULL_UNIVERSE_RESERVE_JOIN_TTL: Duration = Duration::from_secs(2);
+const FULL_UNIVERSE_RESERVE_JOIN_CAP: usize = 2_048;
+
+/// A bounded, evidence-only join between a parsed trade and a canonical Pump
+/// account update.  It never changes routing, session state or execution
+/// policy.  Any missing, conflicting or expired evidence is emitted without
+/// real reserves rather than guessed from a later mutable state.
+#[derive(Default)]
+struct FullUniverseReserveJoiner {
+    pending_trades: HashMap<FullUniverseReserveJoinKey, PendingFullUniverseTradeEvidence>,
+    account_states: HashMap<FullUniverseReserveJoinKey, FullUniverseReserveStateEntry>,
+}
+
+impl FullUniverseReserveJoiner {
+    fn trade_key(tx: &PoolTransaction) -> Option<FullUniverseReserveJoinKey> {
+        Some(FullUniverseReserveJoinKey {
+            slot: tx.slot?,
+            bonding_curve: Pubkey::from_str(&tx.pool_amm_id).ok()?,
+            virtual_sol_reserves: tx.virtual_sol_reserves?,
+            virtual_token_reserves: tx.virtual_token_reserves?,
+        })
+    }
+
+    fn has_complete_raw_state(tx: &PoolTransaction) -> bool {
+        tx.virtual_sol_reserves.is_some()
+            && tx.virtual_token_reserves.is_some()
+            && tx.real_sol_reserves.is_some()
+            && tx.real_token_reserves.is_some()
+            && tx.complete.is_some()
+    }
+
+    fn state_from_account_update(
+        event: &AccountUpdateEvent,
+    ) -> Option<(
+        FullUniverseReserveJoinKey,
+        FullUniverseCanonicalReserveState,
+    )> {
+        let complete = match event.complete {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        Some((
+            FullUniverseReserveJoinKey {
+                slot: event.slot,
+                bonding_curve: event.bonding_curve,
+                virtual_sol_reserves: event.sol_reserves,
+                virtual_token_reserves: event.token_reserves,
+            },
+            FullUniverseCanonicalReserveState {
+                virtual_sol_reserves: event.sol_reserves,
+                virtual_token_reserves: event.token_reserves,
+                real_sol_reserves: event.real_sol_reserves?,
+                real_token_reserves: event.real_token_reserves?,
+                complete,
+            },
+        ))
+    }
+
+    fn emission(
+        tx: Arc<PoolTransaction>,
+        pool_id: Pubkey,
+        base_mint: Option<Pubkey>,
+        supplemental_state: Option<FullUniverseCanonicalReserveState>,
+    ) -> FullUniverseEvidenceEmission {
+        FullUniverseEvidenceEmission {
+            tx,
+            pool_id,
+            base_mint,
+            supplemental_state,
+        }
+    }
+
+    fn observe_trade(
+        &mut self,
+        tx: Arc<PoolTransaction>,
+        pool_id: Pubkey,
+        base_mint: Option<Pubkey>,
+    ) -> Vec<FullUniverseEvidenceEmission> {
+        if Self::has_complete_raw_state(&tx) {
+            return vec![Self::emission(tx, pool_id, base_mint, None)];
+        }
+
+        let Some(key) = Self::trade_key(&tx) else {
+            return vec![Self::emission(tx, pool_id, base_mint, None)];
+        };
+
+        match self.account_states.remove(&key) {
+            Some(FullUniverseReserveStateEntry::Unique { state, .. }) => {
+                vec![Self::emission(tx, pool_id, base_mint, Some(state))]
+            }
+            Some(FullUniverseReserveStateEntry::Ambiguous { .. }) => {
+                vec![Self::emission(tx, pool_id, base_mint, None)]
+            }
+            None => {
+                let mut emissions = self.flush_to_capacity();
+                let pending = PendingFullUniverseTradeEvidence {
+                    tx,
+                    pool_id,
+                    base_mint,
+                    queued_at: Instant::now(),
+                };
+                if let Some(conflicting) = self.pending_trades.remove(&key) {
+                    // Two trades with the identical raw post-trade state cannot
+                    // be assigned to an account update unambiguously.
+                    emissions.push(Self::emission(
+                        conflicting.tx,
+                        conflicting.pool_id,
+                        conflicting.base_mint,
+                        None,
+                    ));
+                    emissions.push(Self::emission(
+                        pending.tx,
+                        pending.pool_id,
+                        pending.base_mint,
+                        None,
+                    ));
+                } else {
+                    self.pending_trades.insert(key, pending);
+                }
+                emissions
+            }
+        }
+    }
+
+    fn observe_account_update(
+        &mut self,
+        event: &AccountUpdateEvent,
+    ) -> Vec<FullUniverseEvidenceEmission> {
+        let Some((key, state)) = Self::state_from_account_update(event) else {
+            return Vec::new();
+        };
+
+        if let Some(pending) = self.pending_trades.remove(&key) {
+            return vec![Self::emission(
+                pending.tx,
+                pending.pool_id,
+                pending.base_mint,
+                Some(state),
+            )];
+        }
+
+        let mut emissions = self.flush_to_capacity();
+        let observed_at = Instant::now();
+        match self.account_states.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(FullUniverseReserveStateEntry::Unique { state, observed_at });
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                // Multiple account updates for one exact key are not selected
+                // by arrival order.  A later matching trade remains non-evaluable.
+                entry.insert(FullUniverseReserveStateEntry::Ambiguous { observed_at });
+            }
+        }
+        emissions
+    }
+
+    fn flush_to_capacity(&mut self) -> Vec<FullUniverseEvidenceEmission> {
+        let mut emissions = Vec::new();
+        while self.pending_trades.len() >= FULL_UNIVERSE_RESERVE_JOIN_CAP {
+            let Some(key) = self
+                .pending_trades
+                .iter()
+                .min_by_key(|(_, pending)| pending.queued_at)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            if let Some(pending) = self.pending_trades.remove(&key) {
+                emissions.push(Self::emission(
+                    pending.tx,
+                    pending.pool_id,
+                    pending.base_mint,
+                    None,
+                ));
+            }
+        }
+        while self.account_states.len() >= FULL_UNIVERSE_RESERVE_JOIN_CAP {
+            let Some(key) = self
+                .account_states
+                .iter()
+                .min_by_key(|(_, entry)| match entry {
+                    FullUniverseReserveStateEntry::Unique { observed_at, .. }
+                    | FullUniverseReserveStateEntry::Ambiguous { observed_at } => *observed_at,
+                })
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.account_states.remove(&key);
+        }
+        emissions
+    }
+
+    fn flush_expired(&mut self) -> Vec<FullUniverseEvidenceEmission> {
+        let now = Instant::now();
+        self.account_states.retain(|_, entry| {
+            let observed_at = match entry {
+                FullUniverseReserveStateEntry::Unique { observed_at, .. }
+                | FullUniverseReserveStateEntry::Ambiguous { observed_at } => *observed_at,
+            };
+            now.duration_since(observed_at) < FULL_UNIVERSE_RESERVE_JOIN_TTL
+        });
+        let expired = self
+            .pending_trades
+            .iter()
+            .filter_map(|(key, pending)| {
+                (now.duration_since(pending.queued_at) >= FULL_UNIVERSE_RESERVE_JOIN_TTL)
+                    .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        expired
+            .into_iter()
+            .filter_map(|key| self.pending_trades.remove(&key))
+            .map(|pending| Self::emission(pending.tx, pending.pool_id, pending.base_mint, None))
+            .collect()
+    }
+
+    fn flush_all(&mut self) -> Vec<FullUniverseEvidenceEmission> {
+        self.account_states.clear();
+        self.pending_trades
+            .drain()
+            .map(|(_, pending)| {
+                Self::emission(pending.tx, pending.pool_id, pending.base_mint, None)
+            })
+            .collect()
+    }
+}
+
 fn emit_pool_transaction_evidence_event(
     emitter: &EventEmitter,
     tx: &PoolTransaction,
     pool_id: Pubkey,
     base_mint: Option<&Pubkey>,
+    supplemental_state: Option<&FullUniverseCanonicalReserveState>,
 ) {
     let event_ts_ms = tx_event_ts_ms(tx);
     let candidate_id = pool_transaction_evidence_candidate_id(tx, &pool_id, base_mint, event_ts_ms);
+    emitter.emit_pool_transaction(
+        &candidate_id,
+        pool_transaction_evidence_payload(tx, pool_id, base_mint, supplemental_state),
+    );
+}
+
+fn pool_transaction_evidence_payload(
+    tx: &PoolTransaction,
+    pool_id: Pubkey,
+    base_mint: Option<&Pubkey>,
+    supplemental_state: Option<&FullUniverseCanonicalReserveState>,
+) -> PoolTransactionPayload {
+    let event_ts_ms = tx_event_ts_ms(tx);
     let canonical_pool = pool_id.to_string();
     let source_pool = tx.pool_amm_id.clone();
     let base_mint_string = base_mint
@@ -16820,53 +17129,76 @@ fn emit_pool_transaction_evidence_event(
         .map(|lamports| lamports as f64 / 1_000_000_000.0)
         .unwrap_or(tx.volume_sol.abs());
     let (contract_status, contract_reason) = pool_transaction_contract_status(tx);
-    emitter.emit_pool_transaction(
-        &candidate_id,
-        PoolTransactionPayload {
-            schema_version: "v1".to_string(),
-            pool_amm_id: canonical_pool.clone(),
-            pool_id: canonical_pool.clone(),
-            source_pool_amm_id: (source_pool != canonical_pool).then_some(source_pool),
-            base_mint: base_mint_string.clone(),
-            mint_id: base_mint_string.clone(),
-            token_mint: base_mint_string,
-            quote_mint: Some("So11111111111111111111111111111111111111112".to_string()),
-            bonding_curve: canonical_pool,
-            signature: tx.signature.clone(),
-            event_slot: tx.slot,
-            slot: tx.slot,
-            tx_index: tx.tx_index,
-            event_ordinal: tx.event_ordinal,
-            outer_instruction_index: tx.outer_instruction_index,
-            inner_group_index: tx.inner_group_index,
-            event_ts_ms,
-            timestamp_ms: event_ts_ms,
-            arrival_ts_ms: tx.arrival_ts_ms,
-            source: pool_transaction_source_label(tx).to_string(),
-            side: side.clone(),
-            is_buy: tx.is_buy,
-            success: tx.success,
-            error_code: tx.error_code.clone(),
-            signer: tx.signer.clone(),
-            wallet: tx.signer.clone(),
-            quote_amount_sol,
-            volume_sol: tx.volume_sol.abs(),
-            sol_amount_lamports: tx.sol_amount_lamports,
-            token_amount_units: tx.token_amount_units,
-            reserve_base: tx.reserve_base,
-            reserve_quote: tx.reserve_quote,
-            price_quote: tx.price_quote,
-            v_tokens_in_bonding_curve: tx.v_tokens_in_bonding_curve,
-            v_sol_in_bonding_curve: tx.v_sol_in_bonding_curve,
-            market_cap_sol: tx.market_cap_sol,
-            curve_progress_pct: None,
-            curve_progress_status: "unavailable_missing_curve_state_source".to_string(),
-            curve_finality: format!("{:?}", tx.curve_finality).to_lowercase(),
-            curve_data_known: tx.curve_data_known,
-            execution_account_contract_status: contract_status,
-            execution_account_contract_reason: contract_reason,
-        },
-    );
+    PoolTransactionPayload {
+        schema_version: "v1".to_string(),
+        pool_amm_id: canonical_pool.clone(),
+        pool_id: canonical_pool.clone(),
+        source_pool_amm_id: (source_pool != canonical_pool).then_some(source_pool),
+        base_mint: base_mint_string.clone(),
+        mint_id: base_mint_string.clone(),
+        token_mint: base_mint_string,
+        quote_mint: Some("So11111111111111111111111111111111111111112".to_string()),
+        bonding_curve: canonical_pool,
+        signature: tx.signature.clone(),
+        event_slot: tx.slot,
+        slot: tx.slot,
+        tx_index: tx.tx_index,
+        event_ordinal: tx.event_ordinal,
+        outer_instruction_index: tx.outer_instruction_index,
+        inner_group_index: tx.inner_group_index,
+        event_ts_ms,
+        timestamp_ms: event_ts_ms,
+        arrival_ts_ms: tx.arrival_ts_ms,
+        source: pool_transaction_source_label(tx).to_string(),
+        side: side.clone(),
+        is_buy: tx.is_buy,
+        success: tx.success,
+        error_code: tx.error_code.clone(),
+        signer: tx.signer.clone(),
+        wallet: tx.signer.clone(),
+        quote_amount_sol,
+        volume_sol: tx.volume_sol.abs(),
+        sol_amount_lamports: tx.sol_amount_lamports,
+        // This raw amount comes from the successful observed Pump trade
+        // event / curve-account delta. It is intentionally not derived
+        // from `price_quote`, and absent evidence stays absent.
+        effective_curve_quote_lamports: (tx.success
+            && !tx.semantic.event_truth_kind.is_synthetic())
+        .then_some(tx.sol_amount_lamports)
+        .flatten(),
+        token_amount_units: tx.token_amount_units,
+        // Raw parser state is temporally tied to this event and takes
+        // precedence.  Supplementation, when present, came from an exact
+        // `(slot, curve, virtual reserves)` account-update join; the writer
+        // never reads a mutable latest-state cache or price as a fallback.
+        virtual_sol_reserves: tx
+            .virtual_sol_reserves
+            .or_else(|| supplemental_state.map(|state| state.virtual_sol_reserves)),
+        virtual_token_reserves: tx
+            .virtual_token_reserves
+            .or_else(|| supplemental_state.map(|state| state.virtual_token_reserves)),
+        real_sol_reserves: tx
+            .real_sol_reserves
+            .or_else(|| supplemental_state.map(|state| state.real_sol_reserves)),
+        real_token_reserves: tx
+            .real_token_reserves
+            .or_else(|| supplemental_state.map(|state| state.real_token_reserves)),
+        complete: tx
+            .complete
+            .or_else(|| supplemental_state.map(|state| state.complete)),
+        reserve_base: tx.reserve_base,
+        reserve_quote: tx.reserve_quote,
+        price_quote: tx.price_quote,
+        v_tokens_in_bonding_curve: tx.v_tokens_in_bonding_curve,
+        v_sol_in_bonding_curve: tx.v_sol_in_bonding_curve,
+        market_cap_sol: tx.market_cap_sol,
+        curve_progress_pct: None,
+        curve_progress_status: "unavailable_missing_curve_state_source".to_string(),
+        curve_finality: format!("{:?}", tx.curve_finality).to_lowercase(),
+        curve_data_known: tx.curve_data_known,
+        execution_account_contract_status: contract_status,
+        execution_account_contract_reason: contract_reason,
+    }
 }
 
 // =============================================================================
@@ -25740,6 +26072,13 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         .clone()
         .filter(|_| oracle_runtime.config.rug_scalp_v2.validation_tape.enabled)
         .map(|context| RugScalpValidationTapeV1::new(&oracle_runtime.config.rug_scalp_v2, context));
+    // Reality capture is the only consumer of this bounded join.  The normal
+    // runtime continues to receive the original events unchanged; this state
+    // exists solely to write exact durable reserve evidence.
+    let mut full_universe_reserve_joiner = oracle_runtime
+        .config
+        .full_universe_reality_capture_enabled
+        .then(FullUniverseReserveJoiner::default);
     let rug_scalp_validation_tape_bus = oracle_runtime.config.rug_scalp_validation_tape_bus.clone();
     let (rug_scalp_validation_tx, mut rug_scalp_validation_rx) =
         mpsc::channel::<RugScalpValidationTapeRecordV1>(2_048);
@@ -25787,6 +26126,14 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     );
 
     loop {
+        if let (Some(joiner), Some(emitter)) = (
+            full_universe_reserve_joiner.as_mut(),
+            ctx.event_emitter.as_ref(),
+        ) {
+            for emission in joiner.flush_expired() {
+                emission.emit(emitter);
+            }
+        }
         // Drain in original adapter order.  Facts are small and bounded; on a
         // full direct lane they remain queued rather than being silently
         // discarded or converted into synthetic empty slots.
@@ -26424,12 +26771,23 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                             // emitted before runtime rejected-pool filtering.  The
                             // artifact writer is not a session/dispatch unlock path.
                             if let Some(emitter) = ctx.event_emitter.as_ref() {
-                                emit_pool_transaction_evidence_event(
-                                    emitter,
-                                    &tx,
-                                    pool_id,
-                                    base_mint.as_ref(),
-                                );
+                                if let Some(joiner) = full_universe_reserve_joiner.as_mut() {
+                                    for emission in joiner.observe_trade(
+                                        Arc::clone(&tx),
+                                        pool_id,
+                                        base_mint,
+                                    ) {
+                                        emission.emit(emitter);
+                                    }
+                                } else {
+                                    emit_pool_transaction_evidence_event(
+                                        emitter,
+                                        &tx,
+                                        pool_id,
+                                        base_mint.as_ref(),
+                                        None,
+                                    );
+                                }
                             }
 
                             // Skip rejected pools for active runtime routing.
@@ -26566,6 +26924,14 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                     // data flows here from Seer and feeds AccountStateCore while
                     // ReconciliationRuntime remains monitoring-only.
                     GhostEvent::AccountUpdate(event) => {
+                        if let (Some(joiner), Some(emitter)) = (
+                            full_universe_reserve_joiner.as_mut(),
+                            ctx.event_emitter.as_ref(),
+                        ) {
+                            for emission in joiner.observe_account_update(&event) {
+                                emission.emit(emitter);
+                            }
+                        }
                         if canonical_account_update_relay_enabled {
                             if rejected_pools.contains(&event.base_mint)
                                 || rejected_pools.contains(&event.bonding_curve)
@@ -26641,6 +27007,15 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
             }
         }
     } // loop
+
+    if let (Some(joiner), Some(emitter)) = (
+        full_universe_reserve_joiner.as_mut(),
+        ctx.event_emitter.as_ref(),
+    ) {
+        for emission in joiner.flush_all() {
+            emission.emit(emitter);
+        }
+    }
 
     // No new terminal producers can be admitted after the router loop exits.
     // Closing every per-pool sender forces a final evaluation on its frozen
@@ -33710,6 +34085,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -33732,6 +34112,149 @@ mod tests {
             toolchain_fingerprint: seer::types::ToolchainFingerprintInput::default(),
             curve_data_known: false,
         })
+    }
+
+    #[test]
+    fn full_universe_durable_row_preserves_canonical_reserves_and_order_key() {
+        let pool_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut tx = (*test_pool_observation_tx("full-universe-reserve-row")).clone();
+        tx.pool_amm_id = pool_id.to_string();
+        tx.token_mint = Some(mint.to_string());
+        tx.slot = Some(4242);
+        tx.tx_index = Some(0);
+        tx.event_ordinal = Some(3);
+        tx.sol_amount_lamports = Some(91_000_000);
+        tx.price_quote = Some(999_999.0);
+        // The parser's post-trade Pump event state is authoritative for this
+        // row and must not be replaced with a later AccountStateCore snapshot.
+        tx.virtual_sol_reserves = Some(32_000_000_000);
+        tx.virtual_token_reserves = Some(1_072_000_000_000);
+        tx.real_sol_reserves = Some(1_400_000_000);
+        tx.real_token_reserves = Some(792_000_000_000);
+        tx.complete = Some(false);
+
+        let payload = pool_transaction_evidence_payload(&tx, pool_id, Some(&mint), None);
+
+        assert_eq!(payload.slot, Some(4242));
+        assert_eq!(payload.tx_index, Some(0));
+        assert_eq!(payload.event_ordinal, Some(3));
+        assert_eq!(payload.effective_curve_quote_lamports, Some(91_000_000));
+        assert_eq!(payload.virtual_sol_reserves, Some(32_000_000_000));
+        assert_eq!(payload.virtual_token_reserves, Some(1_072_000_000_000));
+        assert_eq!(payload.real_sol_reserves, Some(1_400_000_000));
+        assert_eq!(payload.real_token_reserves, Some(792_000_000_000));
+        assert_eq!(payload.complete, Some(false));
+        assert_ne!(
+            payload.effective_curve_quote_lamports,
+            tx.price_quote.map(|v| v as u64)
+        );
+    }
+
+    #[test]
+    fn full_universe_durable_row_does_not_fallback_to_mark_price() {
+        let pool_id = Pubkey::new_unique();
+        let mut tx = (*test_pool_observation_tx("full-universe-no-price-fallback")).clone();
+        tx.sol_amount_lamports = None;
+        tx.volume_sol = 123.0;
+        tx.price_quote = Some(777.0);
+
+        let payload = pool_transaction_evidence_payload(&tx, pool_id, None, None);
+
+        assert_eq!(payload.effective_curve_quote_lamports, None);
+        assert_eq!(payload.real_sol_reserves, None);
+        assert_eq!(payload.complete, None);
+    }
+
+    fn full_universe_account_update(
+        bonding_curve: Pubkey,
+        slot: u64,
+        virtual_sol_reserves: u64,
+        virtual_token_reserves: u64,
+        real_sol_reserves: u64,
+        real_token_reserves: u64,
+    ) -> AccountUpdateEvent {
+        AccountUpdateEvent {
+            semantic: Default::default(),
+            event_time: ghost_core::EventTimeMetadata::default(),
+            base_mint: Pubkey::new_unique(),
+            bonding_curve,
+            curve_finality: CurveFinality::Provisional,
+            sol_reserves: virtual_sol_reserves,
+            token_reserves: virtual_token_reserves,
+            real_sol_reserves: Some(real_sol_reserves),
+            real_token_reserves: Some(real_token_reserves),
+            complete: 0,
+            slot,
+            write_version: Some(1),
+            account_data_hash: Some("raw-account-state".to_string()),
+            account_data_len: Some(64),
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap()),
+            replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
+            replay_buffer_dwell_ms: None,
+            detected_at: SystemTime::now(),
+            sequence_number: 1,
+        }
+    }
+
+    #[test]
+    fn full_universe_reserve_join_uses_only_exact_post_trade_account_state() {
+        let curve = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut tx = (*test_pool_observation_tx("exact-reserve-join")).clone();
+        tx.pool_amm_id = curve.to_string();
+        tx.slot = Some(4242);
+        tx.virtual_sol_reserves = Some(31_000_000_000);
+        tx.virtual_token_reserves = Some(900_000_000_000);
+
+        let mut joiner = FullUniverseReserveJoiner::default();
+        assert!(joiner
+            .observe_trade(Arc::new(tx), curve, Some(mint))
+            .is_empty());
+
+        let emissions = joiner.observe_account_update(&full_universe_account_update(
+            curve,
+            4242,
+            31_000_000_000,
+            900_000_000_000,
+            1_500_000_000,
+            790_000_000_000,
+        ));
+        assert_eq!(emissions.len(), 1);
+        let state = emissions[0]
+            .supplemental_state
+            .expect("exact tuple must authorize evidence supplementation");
+        assert_eq!(state.real_sol_reserves, 1_500_000_000);
+        assert_eq!(state.real_token_reserves, 790_000_000_000);
+        assert!(!state.complete);
+    }
+
+    #[test]
+    fn full_universe_reserve_join_rejects_wrong_tuple_without_fallback() {
+        let curve = Pubkey::new_unique();
+        let mut tx = (*test_pool_observation_tx("wrong-reserve-join")).clone();
+        tx.pool_amm_id = curve.to_string();
+        tx.slot = Some(4242);
+        tx.virtual_sol_reserves = Some(31_000_000_000);
+        tx.virtual_token_reserves = Some(900_000_000_000);
+
+        let mut joiner = FullUniverseReserveJoiner::default();
+        assert!(joiner.observe_trade(Arc::new(tx), curve, None).is_empty());
+        assert!(joiner
+            .observe_account_update(&full_universe_account_update(
+                curve,
+                4242,
+                31_000_000_001,
+                900_000_000_000,
+                1_500_000_000,
+                790_000_000_000,
+            ))
+            .is_empty());
+
+        let emissions = joiner.flush_all();
+        assert_eq!(emissions.len(), 1);
+        assert!(emissions[0].supplemental_state.is_none());
     }
 
     fn test_detected_pool(pool_id: Pubkey) -> Arc<DetectedPool> {
@@ -40294,6 +40817,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::Unknown,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -40394,6 +40922,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: Some(Pubkey::new_unique().to_string()),
             fee_recipient: Some(Pubkey::new_unique().to_string()),
@@ -40455,6 +40988,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: Some(expected_global.to_string()),
             fee_recipient: Some(expected_fee.to_string()),
@@ -40549,6 +41087,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: Some(known_bad.to_string()),
@@ -40702,6 +41245,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: Some(current_fee.to_string()),
@@ -40778,6 +41326,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: Some(reserved_fee.to_string()),
@@ -40852,6 +41405,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: Some(Pubkey::new_unique().to_string()),
@@ -40926,6 +41484,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: Some(Pubkey::new_unique().to_string()),
             fee_recipient: None,
@@ -42394,6 +42957,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -42531,6 +43099,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -42759,6 +43332,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -42867,6 +43445,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: Some(1_073_000_000.0),
             v_sol_in_bonding_curve: Some(30.0),
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: Some(30.0),
             global_config: None,
             fee_recipient: None,
@@ -42949,6 +43532,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -43045,6 +43633,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -43173,6 +43766,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -43273,6 +43871,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -44520,6 +45123,8 @@ mod tests {
                 curve_finality: CurveFinality::Speculative,
                 sol_reserves: 9_000_000_000,
                 token_reserves: 888_000_000_000_000,
+                real_sol_reserves: None,
+                real_token_reserves: None,
                 complete: 0,
                 slot: 2,
                 write_version: Some(1),
@@ -44602,6 +45207,8 @@ mod tests {
             curve_finality: CurveFinality::Speculative,
             sol_reserves: 9_000_000_000,
             token_reserves: 888_000_000_000_000,
+            real_sol_reserves: None,
+            real_token_reserves: None,
             complete: 0,
             slot: 2,
             write_version: Some(7),
@@ -45456,6 +46063,11 @@ mod tests {
             token_mint: Some(token_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -45523,6 +46135,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -45666,6 +46283,11 @@ mod tests {
             token_mint: Some(token_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -45748,6 +46370,11 @@ mod tests {
             token_mint: Some(token_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -45828,6 +46455,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -45892,6 +46524,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -45962,6 +46599,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -46031,6 +46673,8 @@ mod tests {
             curve_finality: CurveFinality::Provisional,
             sol_reserves: 10,
             token_reserves: 20,
+            real_sol_reserves: None,
+            real_token_reserves: None,
             complete: 0,
             slot: 42,
             write_version: Some(7),
@@ -46117,6 +46761,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -46181,6 +46830,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -46391,6 +47045,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -46776,6 +47435,11 @@ mod tests {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -47742,6 +48406,8 @@ mod tests {
             curve_finality: CurveFinality::Speculative,
             sol_reserves: sol,
             token_reserves: tok,
+            real_sol_reserves: None,
+            real_token_reserves: None,
             complete: 0,
             slot: 51,
             write_version: None,
@@ -48070,6 +48736,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -48191,6 +48862,11 @@ mod tests {
             token_mint: Some(valid_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -48339,6 +49015,11 @@ mod tests {
             token_mint: None,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -48500,6 +49181,11 @@ mod tests {
             token_mint: Some(valid_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -48587,6 +49273,11 @@ mod tests {
             token_mint: None, // no mint — already known
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -48662,6 +49353,8 @@ mod tests {
             curve_finality: CurveFinality::Provisional,
             sol_reserves: 30_000_000_000 + slot,
             token_reserves: 900_000_000_000_000,
+            real_sol_reserves: None,
+            real_token_reserves: None,
             complete: 0,
             slot,
             write_version,
@@ -48903,6 +49596,8 @@ mod tests {
                     curve_finality: CurveFinality::Speculative,
                     sol_reserves: drifted_sol,
                     token_reserves: initial_tok,
+                    real_sol_reserves: None,
+                    real_token_reserves: None,
                     complete: 0,
                     slot: 101,
                     write_version: None,

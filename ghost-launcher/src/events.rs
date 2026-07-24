@@ -771,6 +771,22 @@ pub struct PoolTransaction {
     #[serde(default)]
     pub v_sol_in_bonding_curve: Option<f64>,
 
+    /// Raw post-trade virtual SOL reserves, when the canonical parser supplied them.
+    #[serde(default)]
+    pub virtual_sol_reserves: Option<u64>,
+    /// Raw post-trade virtual token reserves, when the canonical parser supplied them.
+    #[serde(default)]
+    pub virtual_token_reserves: Option<u64>,
+    /// Raw post-trade real SOL reserves, when the canonical parser supplied them.
+    #[serde(default)]
+    pub real_sol_reserves: Option<u64>,
+    /// Raw post-trade real token reserves, when the canonical parser supplied them.
+    #[serde(default)]
+    pub real_token_reserves: Option<u64>,
+    /// Raw post-trade Pump completion state, when the canonical parser supplied it.
+    #[serde(default)]
+    pub complete: Option<bool>,
+
     /// Market cap in SOL as reported by data source.
     /// PumpPortal: `marketCapSol`
     /// Yellowstone: computed from reserves
@@ -1039,6 +1055,12 @@ pub struct AccountUpdateEvent {
     pub sol_reserves: u64,
     /// Virtual token reserves from the on-chain bonding-curve account.
     pub token_reserves: u64,
+    /// Raw real SOL reserves from the same canonical bonding-curve account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_sol_reserves: Option<u64>,
+    /// Raw real token reserves from the same canonical bonding-curve account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_token_reserves: Option<u64>,
     /// Curve completion flag (1 = graduated, 0 = active).
     pub complete: u8,
     /// Slot at which this AccountUpdate was observed.
@@ -1955,6 +1977,8 @@ mod tests {
             curve_finality: CurveFinality::Provisional,
             sol_reserves: 10,
             token_reserves: 20,
+            real_sol_reserves: None,
+            real_token_reserves: None,
             complete: 0,
             slot: 42,
             write_version: Some(7),

@@ -3756,6 +3756,8 @@ fn emit_account_update_to_event_bus(
         curve_finality: update.curve_finality,
         sol_reserves: update.sol_reserves,
         token_reserves: update.token_reserves,
+        real_sol_reserves: update.real_sol_reserves,
+        real_token_reserves: update.real_token_reserves,
         complete: update.complete,
         slot: update.slot,
         write_version: update.write_version,
@@ -4948,6 +4950,11 @@ pub fn trade_event_to_pool_transaction(
         token_mint: (trade.mint != Pubkey::default()).then(|| trade.mint.to_string()),
         v_tokens_in_bonding_curve: trade.v_tokens_in_bonding_curve,
         v_sol_in_bonding_curve: trade.v_sol_in_bonding_curve,
+        virtual_sol_reserves: trade.virtual_sol_reserves,
+        virtual_token_reserves: trade.virtual_token_reserves,
+        real_sol_reserves: trade.real_sol_reserves,
+        real_token_reserves: trade.real_token_reserves,
+        complete: trade.complete,
         market_cap_sol: trade.market_cap_sol,
         global_config: trade.global_config.map(|value| value.to_string()),
         fee_recipient: trade.fee_recipient.map(|value| value.to_string()),
@@ -5750,6 +5757,11 @@ mod tests {
             mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
             v_tokens_in_bonding_curve: Some(10.0),
             v_sol_in_bonding_curve: Some(1.0),
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -5894,6 +5906,8 @@ mod tests {
             curve_finality: CurveFinality::Provisional,
             sol_reserves: 10,
             token_reserves: 20,
+            real_sol_reserves: Some(3),
+            real_token_reserves: Some(4),
             complete: 0,
             slot: 42,
             write_version: Some(7),
@@ -6025,6 +6039,24 @@ mod tests {
         let tx = trade_event_to_pool_transaction(&trade);
 
         assert_eq!(tx.tx_index, Some(37));
+    }
+
+    #[test]
+    fn bridge_preserves_canonical_post_trade_pump_reserves() {
+        let mut trade = make_trade(Pubkey::new_unique(), Pubkey::new_unique());
+        trade.virtual_sol_reserves = Some(31_000_000_000);
+        trade.virtual_token_reserves = Some(1_073_000_000_000);
+        trade.real_sol_reserves = Some(1_500_000_000);
+        trade.real_token_reserves = Some(793_000_000_000);
+        trade.complete = Some(false);
+
+        let tx = trade_event_to_pool_transaction(&trade);
+
+        assert_eq!(tx.virtual_sol_reserves, trade.virtual_sol_reserves);
+        assert_eq!(tx.virtual_token_reserves, trade.virtual_token_reserves);
+        assert_eq!(tx.real_sol_reserves, trade.real_sol_reserves);
+        assert_eq!(tx.real_token_reserves, trade.real_token_reserves);
+        assert_eq!(tx.complete, trade.complete);
     }
 
     #[test]
@@ -6376,6 +6408,8 @@ mod tests {
         assert_eq!(event.source_account_pubkey, Some(curve));
         assert_eq!(event.source_account_owner_or_program, Some(owner));
         assert_eq!(event.write_version, Some(7));
+        assert_eq!(event.real_sol_reserves, Some(3));
+        assert_eq!(event.real_token_reserves, Some(4));
     }
 
     #[test]

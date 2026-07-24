@@ -599,6 +599,22 @@ pub struct TradeEvent {
     #[serde(default)]
     pub v_sol_in_bonding_curve: Option<f64>,
 
+    /// Raw post-trade virtual SOL reserves from the canonical Pump trade event.
+    #[serde(default)]
+    pub virtual_sol_reserves: Option<u64>,
+    /// Raw post-trade virtual token reserves from the canonical Pump trade event.
+    #[serde(default)]
+    pub virtual_token_reserves: Option<u64>,
+    /// Raw post-trade real SOL reserves from the canonical Pump trade event.
+    #[serde(default)]
+    pub real_sol_reserves: Option<u64>,
+    /// Raw post-trade real token reserves from the canonical Pump trade event.
+    #[serde(default)]
+    pub real_token_reserves: Option<u64>,
+    /// Raw post-trade Pump completion flag from the canonical Pump trade event.
+    #[serde(default)]
+    pub complete: Option<bool>,
+
     /// Market cap in SOL as reported by PumpPortal.
     /// PumpPortal: `marketCapSol`
     #[serde(default)]

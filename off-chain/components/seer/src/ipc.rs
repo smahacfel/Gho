@@ -353,6 +353,16 @@ pub struct DetectedAccountUpdateEvent {
     /// Virtual token reserves as reported on-chain.
     pub token_reserves: u64,
 
+    /// Raw real SOL reserves from the canonical bonding-curve account.
+    /// `None` is retained for account layouts that do not expose Pump real reserves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_sol_reserves: Option<u64>,
+
+    /// Raw real token reserves from the canonical bonding-curve account.
+    /// `None` is retained for account layouts that do not expose Pump real reserves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_token_reserves: Option<u64>,
+
     /// Curve completion flag (1 = graduated, 0 = active).
     pub complete: u8,
 
@@ -824,6 +834,8 @@ impl IpcSender {
         curve_finality: CurveFinality,
         sol_reserves: u64,
         token_reserves: u64,
+        real_sol_reserves: Option<u64>,
+        real_token_reserves: Option<u64>,
         complete: u8,
         slot: u64,
         write_version: Option<u64>,
@@ -846,6 +858,8 @@ impl IpcSender {
             curve_finality,
             sol_reserves,
             token_reserves,
+            real_sol_reserves,
+            real_token_reserves,
             complete,
             slot,
             write_version,
@@ -1154,6 +1168,8 @@ mod tests {
                 ghost_core::CurveFinality::Provisional,
                 1_000,
                 2_000,
+                Some(300),
+                Some(400),
                 0,
                 123,
                 Some(7),
@@ -1175,6 +1191,8 @@ mod tests {
         assert_eq!(event.source_account_pubkey, Some(bonding_curve));
         assert_eq!(event.source_account_owner_or_program, Some(owner));
         assert_eq!(event.write_version, Some(7));
+        assert_eq!(event.real_sol_reserves, Some(300));
+        assert_eq!(event.real_token_reserves, Some(400));
     }
 
     #[test]
@@ -1187,6 +1205,8 @@ mod tests {
             curve_finality: ghost_core::CurveFinality::Provisional,
             sol_reserves: 1_000,
             token_reserves: 2_000,
+            real_sol_reserves: None,
+            real_token_reserves: None,
             complete: 0,
             slot: 123,
             write_version: Some(7),
@@ -1328,6 +1348,11 @@ mod tests {
             mpcf_payload_missing_reason: crate::types::RawBytesMissingReason::Unknown,
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
