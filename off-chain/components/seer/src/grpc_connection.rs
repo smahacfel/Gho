@@ -96,10 +96,12 @@ pub const AMM_POOL_DISC: [u8; 8] = [0xf1, 0x9a, 0x6d, 0x28, 0x1c, 0x37, 0xe4, 0x
 
 /// One bounded ingress/work queue.
 ///
-/// The B0 release harness measured 2,117 events/s. A 250 ms burst is 530
-/// events; the next power of two is 1,024, providing a measured ~483 ms bound
-/// without turning the queue into a long-lived backlog.
-const PRIMARY_CHANNEL_CAP: usize = 1_024;
+/// Backward-compatible default for programmatic constructors.
+///
+/// Production wiring uses `SeerConfig::ingress_queue_capacity`. The default is
+/// the complete 2,048-event frozen concurrent burst used by the PR1B harness;
+/// capacity is no longer inferred from parser throughput.
+const DEFAULT_PRIMARY_CHANNEL_CAP: usize = 2_048;
 
 const BACKOFF_INIT_MS: u64 = 50;
 const BACKOFF_MAX_MS: u64 = 5_000;
@@ -280,7 +282,7 @@ impl DualLaneReceiver {
 
 impl DualLaneChannel {
     pub fn new() -> (Self, DualLaneReceiver) {
-        Self::with_capacity(PRIMARY_CHANNEL_CAP)
+        Self::with_capacity(DEFAULT_PRIMARY_CHANNEL_CAP)
     }
 
     fn with_capacity(capacity: usize) -> (Self, DualLaneReceiver) {
@@ -1655,6 +1657,7 @@ pub struct GrpcConfig {
     pub circuit_breaker_cooldown_ms: u64,
     pub subscription_profile: GrpcSubscriptionProfile,
     pub registry_resubscribe_mode: RegistryResubscribeMode,
+    pub ingress_queue_capacity: usize,
 }
 
 impl Default for GrpcConfig {
@@ -1670,6 +1673,7 @@ impl Default for GrpcConfig {
             circuit_breaker_cooldown_ms: DEFAULT_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS,
             subscription_profile: GrpcSubscriptionProfile::default(),
             registry_resubscribe_mode: RegistryResubscribeMode::HealthTickOnly,
+            ingress_queue_capacity: DEFAULT_PRIMARY_CHANNEL_CAP,
         }
     }
 }
@@ -1917,7 +1921,7 @@ impl YellowstoneConnector {
         DualLaneReceiver,
         tokio::sync::mpsc::UnboundedReceiver<SlotGap>,
     ) {
-        let (ch, rx) = DualLaneChannel::new();
+        let (ch, rx) = DualLaneChannel::with_capacity(config.ingress_queue_capacity);
         let (gap_tx, gap_rx) = tokio::sync::mpsc::unbounded_channel();
         let availability_tracker = Arc::new(LaneAvailabilityTracker::default());
         let c = Self {
@@ -3658,6 +3662,7 @@ impl GrpcConnection {
             circuit_breaker_cooldown_ms: DEFAULT_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS,
             subscription_profile: GrpcSubscriptionProfile::PrimaryGlobal,
             registry_resubscribe_mode: RegistryResubscribeMode::HealthTickOnly,
+            ingress_queue_capacity: DEFAULT_PRIMARY_CHANNEL_CAP,
         };
 
         let (connector, rx, gap_rx) = YellowstoneConnector::new(cfg.clone());
@@ -3724,6 +3729,19 @@ impl GrpcConnection {
         if let Some(connector) = self.connector.get_mut().as_mut() {
             connector.config.resub_debounce_ms = resub_debounce_ms;
             connector.config.registry_resubscribe_mode = registry_resubscribe_mode;
+        }
+        self
+    }
+
+    pub fn with_ingress_queue_capacity(mut self, capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        let (channel, receiver) = DualLaneChannel::with_capacity(capacity);
+        self.config.ingress_queue_capacity = capacity;
+        self.injector = channel.clone();
+        *self.rx.get_mut() = Some(receiver);
+        if let Some(connector) = self.connector.get_mut().as_mut() {
+            connector.config.ingress_queue_capacity = capacity;
+            connector.channel = channel;
         }
         self
     }
@@ -3935,6 +3953,10 @@ impl GrpcConnection {
             let mut sig_order: VecDeque<String> = VecDeque::with_capacity(2048);
             loop {
                 if shutdown.load(Ordering::Relaxed) {
+                    rx.local_gap.close_open_without_after();
+                    while let Some(gap) = rx.local_gap.take_completed() {
+                        yield Ok(GeyserEvent::LocalCoverageGap { gap });
+                    }
                     break;
                 }
 

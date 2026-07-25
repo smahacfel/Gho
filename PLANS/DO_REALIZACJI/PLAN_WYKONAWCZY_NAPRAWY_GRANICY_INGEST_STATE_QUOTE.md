@@ -1256,8 +1256,14 @@ Kolejność realizacji jest normatywna:
    - JSON, Base58 i evidence hash przenieść do bounded evidence writera;
    - oczekiwanie na downstream IPC przenieść do jednego bounded egress
      dispatchera;
+   - canonical `AccountUpdate` zachować w osobnej bounded latest-state lane per
+     bonding curve, uporządkowanej przez `(slot, write_version)`, aby pełna
+     wspólna kolejka business IPC nie usuwała primary state feedu;
    - event worker używa wyłącznie nieblokujących enqueue;
-   - wszystkie dispatchery mają stałą liczbę workerów i bounded capacity.
+   - wszystkie dispatchery mają stałą liczbę workerów i bounded capacity;
+   - każdy dispatcher musi mieć `stop accepting -> drain -> flush -> join` i
+     raportować typed failure, jeżeli zaakceptowana praca nie została
+     dostarczona lub utrwalona.
 
 3. Dopiero po usunięciu powielonej pracy i blokujących sinków obsłużyć
    rzeczywiste przeciążenie:
@@ -1266,24 +1272,39 @@ Kolejność realizacji jest normatywna:
      FIFO ingress;
    - dodać typed local saturation outcome;
    - jeden ciągły epizod tworzy jeden deterministyczny LocalCoverageGap;
+   - gap zapisuje `missing_event_count`, `first_dropped` i `last_dropped`;
+   - ingress, WAL, evidence i IPC przekazują markery do jednego centralnego
+     audit routera i rezerwowanej ścieżki WAL, niezależnej od normalnej kolejki
+     `WalJob`;
    - segment z nieodzyskaną luką jest fail-closed i NonEvaluable;
    - local processing gap nie jest provider slot gap i sam nie uruchamia
      reconnectu ani backfillu.
 
-Pojemność ingress w PR1B wynosi 1 024 eventy. Wynika z baseline release
-2 117,317 eventów/s × 250 ms = około 530 eventów, zaokrąglonych w górę do
-najbliższej potęgi dwóch. WAL, evidence i IPC mają po jednej jawnej bounded
-kolejce; nie ma kaskadowych overflow queues ani per-event task spawning.
+Pojemność ingress jest konfigurowalna przez serde-default
+`ingress_queue_capacity`; wartość domyślna wynosi 2 048 eventów. Pierwotne
+wyliczenie `średni throughput × 250 ms` było nieprawidłowe i nie jest już
+podstawą capacity. Równoległy zamrożony protobuf replay z rzeczywistym
+konsumentem normalizacji/parsera zmierzył peak ingress 73 482,008 eventów/s,
+sustained drain 2 650,976 eventów/s, high-water 1 992 i zero utraconych eventów
+przy capacity 2 048. WAL, evidence i IPC mają jawne bounded kolejki; nie ma
+kaskadowych overflow queues ani per-event task spawning.
 
-Status PR1B (2026-07-24):
+Status PR1B po korekcie review (2026-07-25):
 
 - live Yellowstone: 0 application-level prost decode;
 - capture off: 0 prost encode; capture wymagany: najwyżej 1 prost encode;
 - 1 pełny scan outer + inner na transakcję;
-- business differential digest zachowany:
-  `062d36ab094fb470909fd9836318fee85d89dbed8f1a9a86080041f20a399ee2`;
+- pełny `CanonicalParserParitySnapshotV1` digest zachowany na B0 i finalnym
+  PR1B:
+  `549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202`;
 - receiver i parser worker nie blokują na ingress, WAL, evidence ani IPC;
-- saturacja ma jawny missing count i deterministyczny local gap;
+- pełna normalna kolejka IPC nie usuwa canonical `AccountUpdate`;
+- saturacja ma trwały missing count, pierwszą/ostatnią odrzuconą granicę i
+  deterministyczny local gap;
+- wszystkie cztery domeny gapów trafiają do niezależnego audit WAL;
+- WAL/evidence/IPC/audit mają kontrolowany drain, final flush i join;
+- diagnostyczny evidence jest globalnym warunkiem runu tylko przy
+  `artifact_required_for_run = true`;
 - brak dowodu lokalnego recovery pozostawia segment niewiarygodny;
 - authority, strategia, MFS, Gatekeeper i quote math pozostają bez zmian.
 
@@ -1293,10 +1314,14 @@ PASS:
 receiver_blocked_on_writer = 0
 receiver_blocked_on_overflow = 0
 parser_worker_blocked_on_ipc = 0
+canonical_account_update_lost_on_full_business_ipc = 0
 live_transaction_prost_decode = 0
 full_instruction_scans_per_transaction = 1
 silent_drop_reported_as_success = 0
 one saturation episode = one deterministic local gap
+gap_missing_event_count_and_boundaries = durable
+all_local_gap_domains = reserved audit WAL
+accepted_dispatcher_jobs = drained, flushed, joined
 unrecovered local gap = non-evaluable
 ```
 

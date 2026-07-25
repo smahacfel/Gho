@@ -69,6 +69,17 @@ pub struct LocalCoverageGapV1 {
     pub before: LocalCoverageBoundaryV1,
     #[serde(default)]
     pub after: LocalCoverageBoundaryV1,
+    /// Number of local events rejected during this continuous saturation
+    /// episode. This is part of the durable audit contract, not a process-local
+    /// transport metric.
+    #[serde(default)]
+    pub missing_event_count: u64,
+    /// Boundary of the first event rejected during the episode.
+    #[serde(default)]
+    pub first_dropped: LocalCoverageBoundaryV1,
+    /// Boundary of the last event rejected during the episode.
+    #[serde(default)]
+    pub last_dropped: LocalCoverageBoundaryV1,
     pub queue_high_water: usize,
     pub started_at_ms: u64,
     pub ended_at_ms: u64,
@@ -220,6 +231,28 @@ impl ObservationProvenanceV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_local_gap_json_defaults_new_missing_event_evidence() {
+        let value = serde_json::json!({
+            "gap_id_blake3": vec![0_u8; 32],
+            "provider_id": "primary",
+            "stream_epoch": 7,
+            "episode_sequence": 3,
+            "reason": "ingress_queue_saturated",
+            "before": {"slot": 10},
+            "after": {"slot": 12},
+            "queue_high_water": 1024,
+            "started_at_ms": 100,
+            "ended_at_ms": 101,
+            "recovered": false
+        });
+        let gap: LocalCoverageGapV1 =
+            serde_json::from_value(value).expect("deserialize prior LocalCoverageGapV1 shape");
+        assert_eq!(gap.missing_event_count, 0);
+        assert_eq!(gap.first_dropped, LocalCoverageBoundaryV1::default());
+        assert_eq!(gap.last_dropped, LocalCoverageBoundaryV1::default());
+    }
 
     fn locator(signature: Signature, ordinal: u32) -> RawPumpMutationLocatorV1 {
         RawPumpMutationLocatorV1 {

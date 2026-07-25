@@ -60,12 +60,14 @@ impl E2EPipeline {
                 min_initial_liquidity_sol: self.config.seer.min_liquidity_sol,
             },
             channel_buffer_size: 1000,
+            ingress_queue_capacity: seer::config::SeerConfig::default_ingress_queue_capacity(),
             ipc_config: seer::ipc::IpcChannelConfig {
                 buffer_size: 1000,
                 backpressure_policy: seer::ipc::BackpressurePolicy::Block,
                 log_drops: false,
                 log_overflows: false,
                 warning_threshold_percent: 80.0,
+                ..seer::ipc::IpcChannelConfig::default()
             },
             metrics_port: 9091, // Different from E2E metrics port
             ultrafast_enter_threshold: 80.0,

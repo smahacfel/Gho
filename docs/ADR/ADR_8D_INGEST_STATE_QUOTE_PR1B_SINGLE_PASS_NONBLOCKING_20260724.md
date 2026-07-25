@@ -1,7 +1,7 @@
 # ADR-8D — PR1B: single-pass ingest i nieblokujące granice sinków
 
-**Data:** 2026-07-24
-**Status:** Implemented, Draft PR
+**Data:** 2026-07-24; korekta po review: 2026-07-25
+**Status:** Implemented, Draft PR — skorygowano blokery trwałości PR #83
 **Zakres:** Yellowstone live ingest → normalizacja → Pump parser → WAL/evidence → IPC
 **Poza zakresem:** authority, strategia, MFS, Gatekeeper, quote math, execution, PR1C, PR1D
 
@@ -99,30 +99,42 @@ Capture jest kodowany najwyżej raz i nigdy nie jest dekodowany przez aktywny
 live parser. Jawnie kompatybilne/backfill helpery mogą nadal dekodować własne
 wejście, ale nie są callsite’em live.
 
-## 4. Wyniki tego samego harnessu przed i po
+## 4. Parity i pomiar po korekcie review
 
-Business digest pozostał identyczny:
+Pierwotny digest `062d...` obejmował tylko strukturalny podzbiór eventów i nie
+stanowił pełnego dowodu parity. Został zastąpiony przez
+`CanonicalParserParitySnapshotV1`, który serializuje pełne typed
+`InitializePoolEvent` i `TradeEvent`, z wyzerowaniem wyłącznie lokalnych,
+niedeterministycznych timestampów ingress.
+
+Ten sam pełny snapshot uruchomiony na B0 (`5136319`) i na finalnym PR1B daje:
 
 ```text
-062d36ab094fb470909fd9836318fee85d89dbed8f1a9a86080041f20a399ee2
+549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202
 ```
 
-| Metryka release | B0 clean parent | Final PR1B | Zmiana |
-|---|---:|---:|---:|
-| Throughput | 2,117.317 events/s | 2,529.194 events/s | +19.453% |
-| receive→normalize p50 | 22,976 ns | 20,662 ns | |
-| receive→normalize p95 | 38,558 ns | 35,562 ns | |
-| receive→normalize p99 | 53,377 ns | 44,751 ns | -16.161% |
-| normalize→bundle p50 | 448,334 ns | 390,216 ns | |
-| normalize→bundle p95 | 577,705 ns | 468,555 ns | |
-| normalize→bundle p99 | 610,701 ns | 513,846 ns | -15.860% |
-| Queue high-water | 2,048 | 1,024 | -50.000% |
-| Najstarszy event | 4,104,891 ns | 3,999,365 ns | |
-| Steady-state RSS | 71,764 KiB | 24,140 KiB | -66.362% |
-| CPU time | unavailable | unavailable | brak twierdzenia |
+Test negatywny zmienia pole ekonomiczne eventu i potwierdza zmianę digestu.
+Parity obejmuje zatem kwoty i limity, rezerwy, success/error, complete, signer,
+route/buy variant, token deltas oraz pełne provenance zawarte w typed eventach.
 
-To porównanie jednego deterministycznego harnessu na tym hoście, nie deklaracja
-produkcyjnej capacity, losslessness ani gwarancji opóźnienia.
+Po przebudowie capacity testu finalny release harness na tym hoście raportuje:
+
+| Metryka release | Final PR1B |
+|---|---:|
+| Throughput pełnego replay parsera | 2,429.975 events/s |
+| receive→normalize p50 / p95 / p99 | 20,121 / 39,841 / 48,608 ns |
+| normalize→bundle p50 / p95 / p99 | 394,084 / 555,250 / 840,725 ns |
+| Burst input / capacity / missing | 2,048 / 2,048 / 0 |
+| Queue high-water | 1,992 |
+| Zmierzony peak ingress | 73,482.008 events/s |
+| Zmierzony sustained drain | 2,650.976 events/s |
+| Najstarszy event w kolejce | 744,241,363 ns |
+| Steady-state RSS | 17,144 KiB |
+
+To jest dowód dla zamrożonego, deterministycznego protobuf replay workloadu z
+równoległym producentem i rzeczywistym konsumentem normalizującym oraz
+wywołującym `parse_transaction_bundle`. Nie jest to uniwersalna deklaracja
+produkcyjnej capacity, losslessness ani gwarancji opóźnienia Yellowstone.
 
 ## 5. Dokładna liczba encode/decode/scan
 
@@ -149,31 +161,39 @@ BUY, wiele mutacji w jednej signature, PumpSwap inner instructions,
 
 ```text
 Yellowstone receiver
-  -> ingress FIFO: bounded 1,024
+  -> ingress FIFO: bounded, configurable; default 2,048
   -> event workers
        -> WAL queue: bounded 1,024 -> one fixed OS writer
        -> evidence queue: bounded 1,024 -> one fixed writer task
-       -> IPC egress: bounded configured capacity -> one fixed dispatcher
+       -> IPC normal events: bounded configured capacity
+       -> IPC canonical AccountUpdate:
+            bounded latest-state lane per bonding curve
+            ordering/freshness key = (slot, write_version)
+       -> one fixed IPC dispatcher merges both lanes by retained sequence
 ```
 
-Pojemność ingress wynika z pomiaru:
+Pierwotne wyliczenie `throughput × 250 ms = 1,024` zostało odrzucone. Capacity
+jest teraz polem serde-default konfiguracji (`ingress_queue_capacity`, domyślnie
+`2,048`). Zamrożony replay uruchamia producenta i konsumenta równolegle,
+raportuje peak ingress, sustained drain, high-water i najstarszy backlog, a dla
+capacity `2,048` kończy z `missing_event_count = 0`.
 
-```text
-2,117.317 events/s × 0.250 s = 529.329 events
-next power of two = 1,024 events
-```
+Dedykowana AccountUpdate lane ma capacity powiązaną w launcherze z bounded
+limitem obserwowanych pul. Pełna wspólna kolejka business eventów nie usuwa
+canonical state update. Nowszy stan dla tej samej krzywej może zastąpić
+oczekujący starszy stan według `(slot, write_version)` bez oczekiwania hot path.
 
 Nie ma `fast + overflow`, ogólnego spill queue, unbounded channel ani
 per-event `tokio::spawn`. Event worker nie wykonuje fizycznego WAL append,
 evidence JSON ani await na downstream IPC capacity.
 
-Slow-sink harness:
+Slow-sink harness po korekcie:
 
 ```text
-slow WAL enqueue = 611,032 ns
-physical writer elapsed = 8,166,808 ns
-event-worker WAL blocking waits = 0
-slow IPC enqueue = 8,016 ns
+slow WAL enqueue = 761,345 ns
+physical writer elapsed = 7,196,949 ns
+physical writer calls/waits = 2/2, wyłącznie po stronie writera
+slow IPC enqueue = 11,995 ns
 parser-worker IPC blocking waits = 0
 ```
 
@@ -187,8 +207,8 @@ Każda lokalna domena utraty ma typed reason:
 - `ipc_egress_queue_saturated`.
 
 `LocalCoverageGapV1` zapisuje provider ID, stream epoch, episode sequence,
-granice slot/signature przed i po, queue high-water, czas początku/końca,
-reason oraz `recovered`.
+granice slot/signature przed i po, `missing_event_count`, `first_dropped`,
+`last_dropped`, queue high-water, czas początku/końca, reason oraz `recovered`.
 
 Gap ID jest BLAKE3 stabilnych pól epizodu; nie zawiera losowego UUID ani
 timestampu diagnostycznego. Powtarzalne wejście daje ten sam ID. Jeden ciągły
@@ -202,7 +222,9 @@ blocking_wait_ns = 0
 explicit_missing = 2
 local_gap_count = 1
 silent_success = 0
-gap_id = HRXk4UWUX3dQpf6RwftCizfPHPuxSwEPNuPrUYHKdxhC
+gap.missing_event_count = 2
+gap.first_dropped.slot = 2
+gap.last_dropped.slot = 3
 recovered = false
 ```
 
@@ -213,7 +235,25 @@ pozostaje forwardowany, aby transportowa diagnostyka PR1B nie zmieniła
 AccountStateCore authority.
 
 Nowy `WalRecord::LocalCoverageGap` jest addytywny i nie jest recovery-critical.
-Replay liczy go jako audit evidence, ale nie mutuje odtwarzanego stanu.
+Wszystkie cztery domeny — ingress, normalny WAL, evidence i IPC — przekazują
+zamknięte markery do jednego centralnego routera. Osobna, rezerwowana kolejka i
+dedykowany writer zapisują markery bez zależności od pełnej normalnej kolejki
+WAL. Replay liczy je jako audit evidence, ale nie mutuje odtwarzanego stanu.
+
+Evidence jest globalnym warunkiem poprawności wyłącznie przy
+`artifact_required_for_run = true`. Saturacja diagnostycznego,
+best-effort evidence nadal tworzy typed gap i audit marker, ale nie unieważnia
+canonical candidate path.
+
+Każdy dispatcher ma jawny lifecycle:
+
+```text
+stop accepting -> drain accepted -> final flush -> join -> typed failure
+```
+
+Launcher zachowuje IPC receiver podczas drainu i raportuje błąd, jeżeli
+zaakceptowany event nie został dostarczony albo trwały sink nie został
+domknięty.
 
 ## 8. Zachowane inwarianty
 
@@ -224,6 +264,7 @@ Replay liczy go jako audit evidence, ale nie mutuje odtwarzanego stanu.
 - create-before-trade ordering;
 - semantyka BUY/SELL i istniejące route variants;
 - account update forwarding;
+- canonical AccountUpdate zachowany mimo pełnego wspólnego IPC;
 - PR1A payload hash i old JSON/config compatibility;
 - shadow/live boundary;
 - authority i AccountStateCore arbitration;
@@ -244,6 +285,11 @@ cargo test -p seer --lib pr1b_ -- --nocapture
 cargo test -p seer --lib one_continuous_saturation_episode_produces_one_deterministic_gap -- --nocapture
 cargo test -p seer --lib bounded_ingress_saturation_is_nonblocking_and_emits_one_gap -- --nocapture
 cargo test -p seer --lib ipc::tests -- --nocapture
+cargo test -p seer --lib canonical_account_update_survives_full_downstream_and_arrives_once -- --nocapture
+cargo test -p seer --lib reserved_audit_lane_persists_every_local_gap_domain -- --nocapture
+cargo test -p seer --lib wal_dispatcher_shutdown_drains_flushes_and_joins_all_accepted_jobs -- --nocapture
+cargo test -p seer --lib raw_evidence_shutdown_drains_and_final_flushes_accepted_event -- --nocapture
+cargo test -p seer --lib shutdown_fails_if_a_gap_cannot_reach_a_configured_audit_wal -- --nocapture
 cargo test -p seer --lib provider_metadata -- --nocapture
 cargo test -p seer --lib account_update_preserves_provider_and_optional_transaction_signature -- --nocapture
 cargo test -p ghost-launcher --lib local_coverage_gap_replays_as_audit_only_record -- --nocapture
@@ -280,8 +326,8 @@ reconnect/backfill state machine dla semantycznie dowodliwego provider gap.
 
 ## 11. Rollback
 
-Rollback całego PR1B polega na odwróceniu trzech logicznych commitów do merge
-parenta `ea7d31a228f8db0b7ed0779dea70b696895e66c2`.
+Rollback całego PR1B polega na odwróceniu trzech logicznych commitów oraz
+korekty review do merge parenta `ea7d31a228f8db0b7ed0779dea70b696895e66c2`.
 
 Nie należy częściowo przywracać starego parser transportu przy zachowaniu
 nowych dispatcherów ani usuwać fail-closed gap semantics przy pozostawieniu
@@ -297,5 +343,5 @@ B2 nonblocking sinks/local gap
 ```
 
 B0 jest diagnostyczny i może pozostać, jeżeli potrzebny jest jedynie rollback
-behavior. Rollback nie wymaga migracji configu ani strategii, ponieważ PR1B nie
-wprowadza nowych pól aktywnej konfiguracji i nie zmienia authority.
+behavior. Nowe pola konfiguracji mają serde-default, więc stare konfiguracje
+pozostają czytelne. Rollback nie zmienia strategii ani authority.

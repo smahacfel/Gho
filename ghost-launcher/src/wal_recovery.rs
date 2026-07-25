@@ -420,6 +420,15 @@ mod tests {
                 slot: Some(44),
                 signature: Some(Signature::new_unique()),
             },
+            missing_event_count: 3,
+            first_dropped: LocalCoverageBoundaryV1 {
+                slot: Some(41),
+                signature: Some(Signature::new_unique()),
+            },
+            last_dropped: LocalCoverageBoundaryV1 {
+                slot: Some(43),
+                signature: Some(Signature::new_unique()),
+            },
             queue_high_water: 1_024,
             started_at_ms: 1_000,
             ended_at_ms: 1_100,

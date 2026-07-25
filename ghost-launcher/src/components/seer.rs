@@ -4035,6 +4035,35 @@ pub async fn run(
 ) -> Result<()> {
     info!("Seer: Initializing component");
 
+    if config.program_streams.artifact_required_for_run
+        && !config.program_streams.artifact_capture_enabled
+    {
+        return Err(anyhow::anyhow!(
+            "seer.program_streams.artifact_required_for_run=true requires artifact_capture_enabled=true"
+        ));
+    }
+    if config.program_streams.artifact_required_for_run
+        && config
+            .program_streams
+            .artifact_capture_dir
+            .as_deref()
+            .is_none_or(|path| path.trim().is_empty())
+    {
+        return Err(anyhow::anyhow!(
+            "seer.program_streams.artifact_required_for_run=true requires a non-empty artifact_capture_dir"
+        ));
+    }
+    if config.ingress_queue_capacity == 0 {
+        return Err(anyhow::anyhow!(
+            "seer.ingress_queue_capacity must be greater than zero"
+        ));
+    }
+    if config.ipc_buffer_size == 0 {
+        return Err(anyhow::anyhow!(
+            "seer.ipc_buffer_size must be greater than zero"
+        ));
+    }
+
     if snapshot_engine.is_some() {
         info!("Seer: 📸 SnapshotEngine integration enabled");
     }
@@ -4123,6 +4152,7 @@ pub async fn run(
             min_initial_liquidity_sol: None,
         },
         channel_buffer_size: config.ipc_buffer_size,
+        ingress_queue_capacity: config.ingress_queue_capacity,
         ipc_config: IpcChannelConfig {
             buffer_size: config.ipc_buffer_size,
             backpressure_policy: match config.ipc_backpressure_policy.to_lowercase().as_str() {
@@ -4135,6 +4165,7 @@ pub async fn run(
             log_drops: true,
             log_overflows: true,
             warning_threshold_percent: 80.0,
+            account_update_coalescing_capacity: config.watched_pools_cap,
         },
         metrics_port: config.metrics_port,
         ultrafast_enter_threshold: 80.0,
@@ -4181,6 +4212,8 @@ pub async fn run(
                 .clone(),
             system_transfers_topic: config.program_streams.system_transfers_topic.clone(),
             artifact_capture_dir: config.program_streams.artifact_capture_dir.clone(),
+            artifact_capture_enabled: config.program_streams.artifact_capture_enabled,
+            artifact_required_for_run: config.program_streams.artifact_required_for_run,
             trade_resolver_ttl_ms: config.program_streams.trade_resolver_ttl_ms,
             trade_resolver_per_mint_cap: config.program_streams.trade_resolver_per_mint_cap,
             trade_resolver_global_cap: config.program_streams.trade_resolver_global_cap,
@@ -4233,6 +4266,20 @@ pub async fn run(
         seer_config.grpc_commitment_fallback_to_websocket
     );
     info!("  stream_mode: {:?}", seer_config.stream_mode);
+    info!(
+        "  ingress_queue_capacity: {}",
+        seer_config.ingress_queue_capacity
+    );
+    info!(
+        "  ipc_buffer_size: {} account_update_coalescing_capacity: {}",
+        seer_config.ipc_config.buffer_size,
+        seer_config.ipc_config.account_update_coalescing_capacity
+    );
+    info!(
+        "  raw_instruction_artifact: enabled={} required_for_run={}",
+        seer_config.program_streams.artifact_capture_enabled,
+        seer_config.program_streams.artifact_required_for_run
+    );
     info!("  tx_filter_strategy: {:?}", seer_config.tx_filter_strategy);
     info!(
         "  funding_lane_mode: {}",
@@ -4354,7 +4401,7 @@ pub async fn run(
     // Process IPC events and emit to event bus
     let health_ipc = health.clone();
     let nln_trade_pool_resolver_ipc = nln_trade_pool_resolver.clone();
-    let ipc_handle = tokio::spawn(async move {
+    let mut ipc_handle = tokio::spawn(async move {
         let detected_pool_ttl = Duration::from_millis(seer_config.watched_pools_ttl_ms.max(1));
         let detected_pool_cap = seer_config.watched_pools_cap.max(1);
         let mut session_trade_bridge = SessionPoolTradeBridge::from_runtime_config(
@@ -4824,8 +4871,10 @@ pub async fn run(
     let _ = shutdown_rx.recv().await;
     info!("Seer: Shutdown signal received");
     seer.request_shutdown();
+    let mut shutdown_failures = Vec::new();
 
-    // Cancel tasks
+    // Stop the producers first. A bounded abort remains only as a failure
+    // fallback and is reported instead of being presented as graceful success.
     match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, &mut seer_handle).await {
         Ok(Ok(())) => {
             info!("Seer: Core event loop stopped after shutdown request");
@@ -4839,6 +4888,7 @@ pub async fn run(
                     join_err
                 );
             }
+            shutdown_failures.push(format!("Seer core event loop join failed: {join_err}"));
         }
         Err(_) => {
             warn!(
@@ -4851,15 +4901,48 @@ pub async fn run(
                     error!("Seer: Core event loop abort join failed: {}", join_err);
                 }
             }
+            shutdown_failures.push(format!(
+                "Seer core event loop did not stop within {:?}",
+                SEER_CORE_SHUTDOWN_TIMEOUT
+            ));
         }
     }
-    ipc_handle.abort();
+
+    if let Err(err) = seer.shutdown_dispatchers().await {
+        error!("Seer: dispatcher drain/flush/join failed: {}", err);
+        shutdown_failures.push(format!(
+            "Seer dispatcher shutdown did not preserve all accepted work: {err}"
+        ));
+    }
+
+    match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, &mut ipc_handle).await {
+        Ok(Ok(())) => {
+            info!("Seer: IPC receiver drained and stopped");
+        }
+        Ok(Err(join_err)) => {
+            shutdown_failures.push(format!(
+                "Seer IPC receiver join failed after dispatcher drain: {join_err}"
+            ));
+        }
+        Err(_) => {
+            ipc_handle.abort();
+            let _ = ipc_handle.await;
+            shutdown_failures.push(format!(
+                "Seer IPC receiver did not drain within {:?}",
+                SEER_CORE_SHUTDOWN_TIMEOUT
+            ));
+        }
+    }
     if let Some(handle) = nln_program_streams_handle {
         handle.abort();
     }
 
     info!("Seer: Component stopped");
-    Ok(())
+    if shutdown_failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(shutdown_failures.join("; ")))
+    }
 }
 
 /// Canonical bridge: maps a Seer-parsed `TradeEvent` into the `PoolTransaction` input

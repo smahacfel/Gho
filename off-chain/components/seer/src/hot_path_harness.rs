@@ -5,6 +5,7 @@ use std::{
 };
 
 use ghost_core::{wal::Wal, RawProviderRoleV1};
+use serde::Serialize;
 use serde_json::{json, Value};
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use tempfile::tempdir;
@@ -22,20 +23,20 @@ use crate::{
     },
     config::SeerConfig,
     grpc_connection::{
-        route_update_for_hot_path_harness, route_update_for_hot_path_harness_with_capture,
-        DualLaneChannel, PumpEvent, TransportStats, GRPC_GLOBAL_STREAM_SOURCE_LABEL,
-        PUMP_FUN_PROGRAM_ID, PUMP_SWAP_PROGRAM_ID,
+        pump_event_to_geyser_event, route_update_for_hot_path_harness,
+        route_update_for_hot_path_harness_with_capture, DualLaneChannel, PumpEvent, TransportStats,
+        GRPC_GLOBAL_STREAM_SOURCE_LABEL, PUMP_FUN_PROGRAM_ID, PUMP_SWAP_PROGRAM_ID,
     },
     hot_path_metrics,
     ipc::{create_ipc_channel, BackpressurePolicy, EventPriority, IpcChannelConfig, IpcError},
-    types::{GeyserEvent, RawBytesMissingReason},
+    types::{GeyserEvent, InitializePoolEvent, RawBytesMissingReason, TradeEvent},
     Seer,
 };
 
 const HARNESS_ITERATIONS: usize = 200;
 const BURST_EVENTS: usize = 2_048;
-const BASELINE_BUSINESS_DIGEST: &str =
-    "062d36ab094fb470909fd9836318fee85d89dbed8f1a9a86080041f20a399ee2";
+const BASELINE_CANONICAL_PARITY_DIGEST: &str =
+    "549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202";
 
 #[derive(Clone, Copy, Debug)]
 enum FixtureKind {
@@ -259,29 +260,49 @@ fn steady_state_rss_kib() -> Option<u64> {
     })
 }
 
-fn business_summary(name: &str, bundle: &ParsedTransactionBundle) -> Value {
-    json!({
-        "fixture": name,
-        "initialize_pool": bundle.initialize_pool.as_ref().map(|pool| json!({
-            "signature": pool.signature.to_string(),
-            "slot": pool.slot,
-            "pool": pool.pool_amm_id.to_string(),
-            "mint": pool.base_mint.to_string(),
-            "provider_id": pool.provider_id,
-            "provider_role": pool.provider_role.map(|role| role.as_str()),
-        })),
-        "trades": bundle.trades.iter().map(|trade| json!({
-            "signature": trade.signature.to_string(),
-            "slot": trade.slot,
-            "pool": trade.pool_amm_id.to_string(),
-            "mint": trade.mint.to_string(),
-            "is_buy": trade.is_buy,
-            "event_ordinal": trade.event_ordinal,
-            "provider_id": trade.provider_id,
-            "provider_role": trade.provider_role.map(|role| role.as_str()),
-            "from_cpi": trade.provenance.as_ref().is_some_and(|provenance| provenance.from_cpi),
-        })).collect::<Vec<_>>(),
-    })
+#[derive(Clone, Debug, Serialize)]
+struct CanonicalParserParitySnapshotV1 {
+    schema: &'static str,
+    fixture: String,
+    initialize_pool: Option<InitializePoolEvent>,
+    trades: Vec<TradeEvent>,
+}
+
+fn canonical_parser_parity_snapshot(
+    name: &str,
+    bundle: &ParsedTransactionBundle,
+) -> CanonicalParserParitySnapshotV1 {
+    let mut initialize_pool = bundle.initialize_pool.clone();
+    if let Some(pool) = initialize_pool.as_mut() {
+        pool.event_ts_ms = pool.event_time.chain_event_ts_ms;
+        pool.event_time.ingress_wall_ts_ms = None;
+        pool.event_time.ingress_monotonic_ts_ms = None;
+    }
+
+    let mut trades = bundle.trades.clone();
+    for trade in &mut trades {
+        trade.timestamp_ms = trade.event_time.chain_event_ts_ms.unwrap_or_default();
+        trade.arrival_ts_ms = 0;
+        trade.event_time.ingress_wall_ts_ms = None;
+        trade.event_time.ingress_monotonic_ts_ms = None;
+    }
+
+    CanonicalParserParitySnapshotV1 {
+        schema: "canonical_parser_parity_snapshot_v1",
+        fixture: name.to_string(),
+        initialize_pool,
+        trades,
+    }
+}
+
+fn canonical_parity_digest(snapshots: &[CanonicalParserParitySnapshotV1]) -> String {
+    blake3::hash(
+        serde_json::to_vec(snapshots)
+            .expect("canonical parser parity snapshot JSON")
+            .as_slice(),
+    )
+    .to_hex()
+    .to_string()
 }
 
 fn minimal_account_event() -> GeyserEvent {
@@ -299,33 +320,87 @@ fn queued_account_event(account_event: &GeyserEvent, slot: u64) -> PumpEvent {
     }
 }
 
+fn queued_transaction_event(seed: u8, kind: FixtureKind) -> PumpEvent {
+    let update = transaction_update(seed, kind);
+    let Some(UpdateOneof::Transaction(decoded)) = update.update_oneof else {
+        panic!("transaction workload fixture");
+    };
+    PumpEvent::Transaction {
+        provider_id: Some("pr1b-primary".to_string()),
+        provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
+        signature: deterministic_signature(seed).to_string(),
+        slot: decoded.slot,
+        received_at: Instant::now(),
+        decoded: Box::new(decoded),
+        capture_payload: false,
+    }
+}
+
 fn queue_burst_measurement() -> (Value, GeyserEvent) {
-    let (channel, receiver) = DualLaneChannel::new();
+    let capacity = SeerConfig::default_ingress_queue_capacity();
+    let (channel, receiver) = DualLaneChannel::with_capacities(capacity, 0);
     let stats = Arc::new(TransportStats::default());
     let account_event = minimal_account_event();
-    let mut high_water = 0usize;
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let consumer_barrier = Arc::clone(&barrier);
+    let high_water = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let producer_high_water = Arc::clone(&high_water);
 
+    let consumer = std::thread::spawn(move || {
+        let parser = BinaryParser::new(false);
+        let mut max_dwell_ns = 0_u64;
+        consumer_barrier.wait();
+        let started = Instant::now();
+        for _ in 0..BURST_EVENTS {
+            let event = receiver.queue.recv().expect("frozen burst event");
+            max_dwell_ns = max_dwell_ns.max(event.received_at().elapsed().as_nanos() as u64);
+            let normalized =
+                pump_event_to_geyser_event(event, GRPC_GLOBAL_STREAM_SOURCE_LABEL, None)
+                    .expect("transaction event mapping")
+                    .expect("transaction normalization");
+            parser
+                .parse_transaction_bundle(&normalized)
+                .expect("real parser consumer");
+        }
+        (started.elapsed(), max_dwell_ns)
+    });
+
+    barrier.wait();
+    let producer_started = Instant::now();
     for index in 0..BURST_EVENTS {
-        channel.send(
-            queued_account_event(&account_event, 30_000 + index as u64),
-            &stats,
+        let kind = match index % 5 {
+            0 => FixtureKind::PumpBuy,
+            1 => FixtureKind::PumpSell,
+            2 => FixtureKind::CreateAndInitialBuy,
+            3 => FixtureKind::MultiplePumpMutations,
+            _ => FixtureKind::PumpSwapInnerTrade,
+        };
+        assert!(
+            channel.send(queued_transaction_event(index as u8, kind), &stats),
+            "configured ingress capacity must absorb the frozen concurrent burst"
         );
-        high_water = high_water.max(channel.depth());
+        producer_high_water.fetch_max(channel.depth(), std::sync::atomic::Ordering::Relaxed);
     }
-
-    let oldest_age_ns = receiver
-        .queue
-        .try_iter()
-        .map(|event| event.received_at().elapsed().as_nanos() as u64)
-        .max()
-        .unwrap_or_default();
+    let producer_elapsed = producer_started.elapsed();
+    let (consumer_elapsed, oldest_age_ns) = consumer.join().expect("concurrent parser consumer");
+    let high_water = high_water.load(std::sync::atomic::Ordering::Relaxed);
+    let peak_ingress_events_per_second =
+        BURST_EVENTS as f64 / producer_elapsed.as_secs_f64().max(f64::EPSILON);
+    let sustained_drain_events_per_second =
+        BURST_EVENTS as f64 / consumer_elapsed.as_secs_f64().max(f64::EPSILON);
 
     (
         json!({
             "input_events": BURST_EVENTS,
+            "configured_capacity": capacity,
             "queue_high_water": high_water,
             "oldest_event_age_ns": oldest_age_ns,
+            "peak_ingress_events_per_second": peak_ingress_events_per_second,
+            "sustained_drain_events_per_second": sustained_drain_events_per_second,
+            "backlog_growth_events": high_water,
             "spilled_events": stats.msgs_spilled.load(std::sync::atomic::Ordering::Relaxed),
+            "missing_events": stats.msgs_overflow_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            "concurrent_real_parser_consumer": true,
         }),
         account_event,
     )
@@ -355,7 +430,9 @@ fn saturation_measurement(account_event: GeyserEvent) -> Value {
         "gap_id_blake3": bs58::encode(gap.gap_id_blake3).into_string(),
         "gap_reason": gap.reason.as_str(),
         "gap_recovered": gap.recovered,
-        "explicit_missing_event_count": stats.msgs_overflow_dropped.load(std::sync::atomic::Ordering::Relaxed),
+        "explicit_missing_event_count": gap.missing_event_count,
+        "first_dropped": gap.first_dropped,
+        "last_dropped": gap.last_dropped,
         "silent_drop_count": 0,
     })
 }
@@ -396,6 +473,33 @@ fn pr1b_single_pass_live_transaction_contract() {
     let counts = hot_path_metrics::snapshot();
     assert_eq!(counts.live_transaction_prost_encodes, 1);
     assert_eq!(counts.live_transaction_normalizer_decodes, 0);
+}
+
+#[test]
+fn canonical_parity_snapshot_detects_economic_and_state_drift() {
+    let parser = BinaryParser::new(false);
+    let event = normalize_transaction(7, FixtureKind::PumpBuy);
+    let bundle = parser
+        .parse_transaction_bundle(&event)
+        .expect("parity fixture bundle");
+    let baseline = canonical_parser_parity_snapshot("pump_buy", &bundle);
+    let baseline_digest = canonical_parity_digest(std::slice::from_ref(&baseline));
+
+    let mut economic_drift = baseline.clone();
+    economic_drift.trades[0].amount = economic_drift.trades[0].amount.saturating_add(1);
+    assert_ne!(
+        baseline_digest,
+        canonical_parity_digest(&[economic_drift]),
+        "amount drift must change the canonical parity digest"
+    );
+
+    let mut state_drift = baseline.clone();
+    state_drift.trades[0].virtual_sol_reserves = Some(123_456);
+    assert_ne!(
+        baseline_digest,
+        canonical_parity_digest(&[state_drift]),
+        "reserve-state drift must change the canonical parity digest"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -508,17 +612,20 @@ async fn pr1b_hot_path_harness() {
         let bundle = parser
             .parse_transaction_bundle(&event)
             .expect("fixture bundle must parse");
-        business.push(business_summary(name, &bundle));
+        business.push(canonical_parser_parity_snapshot(name, &bundle));
         normalized.push((kind, seed, event));
     }
 
-    assert_eq!(business[0]["trades"].as_array().unwrap().len(), 1);
-    assert_eq!(business[1]["trades"].as_array().unwrap().len(), 1);
-    assert!(!business[2]["initialize_pool"].is_null());
-    assert_eq!(business[2]["trades"].as_array().unwrap().len(), 1);
-    assert_eq!(business[3]["trades"].as_array().unwrap().len(), 2);
-    assert_eq!(business[4]["trades"].as_array().unwrap().len(), 1);
-    assert_eq!(business[4]["trades"][0]["from_cpi"], true);
+    assert_eq!(business[0].trades.len(), 1);
+    assert_eq!(business[1].trades.len(), 1);
+    assert!(business[2].initialize_pool.is_some());
+    assert_eq!(business[2].trades.len(), 1);
+    assert_eq!(business[3].trades.len(), 2);
+    assert_eq!(business[4].trades.len(), 1);
+    assert!(business[4].trades[0]
+        .provenance
+        .as_ref()
+        .is_some_and(|provenance| provenance.from_cpi));
 
     let operation_counts = hot_path_metrics::snapshot();
 
@@ -622,31 +729,35 @@ async fn pr1b_hot_path_harness() {
     ipc_receiver.recv().await.expect("drain seeded IPC event");
     let ipc_counts = hot_path_metrics::snapshot();
 
-    let business_digest = blake3::hash(
-        serde_json::to_vec(&business)
-            .expect("business summary JSON")
-            .as_slice(),
-    )
-    .to_hex()
-    .to_string();
+    let business_digest = canonical_parity_digest(&business);
     assert_eq!(
-        business_digest, BASELINE_BUSINESS_DIGEST,
-        "PR1B must preserve frozen-corpus business semantics"
+        business_digest, BASELINE_CANONICAL_PARITY_DIGEST,
+        "PR1B must preserve the full frozen-corpus canonical parser snapshot"
     );
+    let fixture_summary = business
+        .iter()
+        .map(|snapshot| {
+            json!({
+                "fixture": snapshot.fixture,
+                "initialize_pool": snapshot.initialize_pool.is_some(),
+                "trade_count": snapshot.trades.len(),
+            })
+        })
+        .collect::<Vec<_>>();
 
     let report = json!({
         "schema": "ghost_pr1b_ingest_hot_path_harness_v1",
         "workload": {
             "iterations": HARNESS_ITERATIONS,
             "transaction_events": processed,
-            "fixtures": business,
+            "fixtures": fixture_summary,
             "account_update": true,
             "burst_input": BURST_EVENTS,
             "slow_wal_sink": true,
             "slow_ipc_consumer": true,
             "queue_saturation": true,
         },
-        "business_digest_blake3": business_digest,
+        "canonical_parser_parity_digest_blake3": business_digest,
         "throughput_events_per_second": throughput_events_per_second,
         "receive_to_normalize": latency_summary(&receive_to_normalize_ns),
         "normalize_to_parsed_bundle": latency_summary(&normalize_to_bundle_ns),

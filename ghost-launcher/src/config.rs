@@ -1734,6 +1734,10 @@ pub struct SeerComponentConfig {
     #[serde(default = "default_ipc_buffer_size")]
     pub ipc_buffer_size: usize,
 
+    /// Capacity of Seer's single bounded Yellowstone ingress/work queue.
+    #[serde(default = "default_ingress_queue_capacity")]
+    pub ingress_queue_capacity: usize,
+
     /// IPC backpressure policy (block, drop_oldest, drop_new, drop_by_priority)
     #[serde(default = "default_backpressure_policy")]
     pub ipc_backpressure_policy: String,
@@ -1919,6 +1923,11 @@ pub struct SeerProgramStreamsComponentConfig {
     #[serde(default)]
     pub artifact_capture_enabled: bool,
 
+    /// Promote the raw instruction artifact lane from diagnostic best-effort to
+    /// required run evidence. Saturation then invalidates the current segment.
+    #[serde(default)]
+    pub artifact_required_for_run: bool,
+
     /// Directory for live NLN capture JSONL inputs consumed by the offline PR8
     /// artifact builder.
     #[serde(default)]
@@ -1972,6 +1981,7 @@ impl Default for SeerProgramStreamsComponentConfig {
             transfer_dedupe_ttl_ms: default_program_streams_transfer_dedupe_ttl_ms(),
             transfer_dedupe_max_entries: default_program_streams_transfer_dedupe_max_entries(),
             artifact_capture_enabled: false,
+            artifact_required_for_run: false,
             artifact_capture_dir: None,
             artifact_queue_capacity: default_program_streams_artifact_queue_capacity(),
             artifact_flush_interval_ms: default_program_streams_artifact_flush_interval_ms(),
@@ -3044,6 +3054,10 @@ fn default_ipc_buffer_size() -> usize {
     10000
 }
 
+fn default_ingress_queue_capacity() -> usize {
+    2_048
+}
+
 fn default_backpressure_policy() -> String {
     "block".to_string()
 }
@@ -3874,6 +3888,7 @@ impl LauncherConfig {
                 bonk_program_id: default_bonk_program_id(),
                 metrics_port: default_seer_metrics_port(),
                 ipc_buffer_size: default_ipc_buffer_size(),
+                ingress_queue_capacity: default_ingress_queue_capacity(),
                 ipc_backpressure_policy: default_backpressure_policy(),
                 stream_mode: default_stream_mode(),
                 tx_filter_strategy: default_tx_filter_strategy(),
@@ -4764,11 +4779,19 @@ enabled = true
             .expect("seer config must serialize as an object");
         object.remove("primary_raw_provider_id");
         object.remove("secondary_raw_provider_ids");
+        object.remove("ingress_queue_capacity");
+        object
+            .get_mut("program_streams")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("program_streams config object")
+            .remove("artifact_required_for_run");
 
         let decoded: SeerComponentConfig =
             serde_json::from_value(value).expect("old launcher config must remain readable");
         assert_eq!(decoded.primary_raw_provider_id, "primary");
         assert!(decoded.secondary_raw_provider_ids.is_empty());
+        assert_eq!(decoded.ingress_queue_capacity, 2_048);
+        assert!(!decoded.program_streams.artifact_required_for_run);
     }
 
     #[test]
@@ -4846,6 +4869,10 @@ artifact_transfer_sample_rate = 50
             "prod.rpc.solana.system.transfers"
         );
         assert!(config.artifact_capture_enabled);
+        assert!(
+            !config.artifact_required_for_run,
+            "omitted field must preserve diagnostic best-effort behavior"
+        );
         assert_eq!(
             config.artifact_capture_dir.as_deref(),
             Some("logs/nln_capture/test")
@@ -4876,6 +4903,7 @@ artifact_transfer_sample_rate = 50
     fn test_seer_commitment_defaults_to_processed() {
         let config = LauncherConfig::default();
         assert_eq!(config.seer.commitment, SeerCommitment::Processed);
+        assert_eq!(config.seer.ingress_queue_capacity, 2_048);
     }
 
     #[test]
@@ -5769,6 +5797,7 @@ enabled = true
         assert_eq!(config.seer.program_streams.api_key_env, "NLN_API_KEY");
         assert_eq!(config.seer.program_streams.format, "JSON");
         assert!(config.seer.program_streams.artifact_capture_enabled);
+        assert!(!config.seer.program_streams.artifact_required_for_run);
         assert_eq!(
             config.seer.program_streams.artifact_capture_dir.as_deref(),
             Some("logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-r1")
