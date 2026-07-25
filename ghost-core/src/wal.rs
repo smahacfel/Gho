@@ -92,7 +92,8 @@ impl WalReplayEntry {
             },
             WalRecord::RawTx { .. }
             | WalRecord::ParsedEvent { .. }
-            | WalRecord::Decision { .. } => ReplayOrderKey::NotRecoveryCritical,
+            | WalRecord::Decision { .. }
+            | WalRecord::LocalCoverageGap { .. } => ReplayOrderKey::NotRecoveryCritical,
         }
     }
 }
@@ -151,6 +152,11 @@ pub enum WalRecord {
         slot: u64,
         rollback: RollbackReevalSeedRecord,
     },
+    LocalCoverageGap {
+        ts_ms: u64,
+        slot: u64,
+        gap: crate::LocalCoverageGapV1,
+    },
 }
 
 impl WalRecord {
@@ -169,7 +175,8 @@ impl WalRecord {
             | WalRecord::CommitStaged { ts_ms, .. }
             | WalRecord::CommitPersisted { ts_ms, .. }
             | WalRecord::RollbackReevalSeed { ts_ms, .. }
-            | WalRecord::ShadowLedgerCurveUpdate { ts_ms, .. } => *ts_ms,
+            | WalRecord::ShadowLedgerCurveUpdate { ts_ms, .. }
+            | WalRecord::LocalCoverageGap { ts_ms, .. } => *ts_ms,
         }
     }
 
@@ -224,7 +231,8 @@ impl WalRecord {
             },
             WalRecord::RawTx { .. }
             | WalRecord::ParsedEvent { .. }
-            | WalRecord::Decision { .. } => ReplayOrderKey::NotRecoveryCritical,
+            | WalRecord::Decision { .. }
+            | WalRecord::LocalCoverageGap { .. } => ReplayOrderKey::NotRecoveryCritical,
         }
     }
 }

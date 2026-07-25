@@ -21,6 +21,8 @@ pub struct WalReplaySummary {
     pub raw_txs: u64,
     pub parsed_events: u64,
     pub decisions: u64,
+    /// Audit-only local loss records. They never mutate recovered runtime state.
+    pub local_coverage_gaps: u64,
     pub curve_updates_restored: u64,
     pub staged_commits_restored: u64,
     pub committed_pools_restored: u64,
@@ -78,6 +80,9 @@ pub fn replay_shared_wal(
             }
             WalRecord::Decision { .. } => {
                 summary.decisions = summary.decisions.saturating_add(1);
+            }
+            WalRecord::LocalCoverageGap { .. } => {
+                summary.local_coverage_gaps = summary.local_coverage_gaps.saturating_add(1);
             }
             WalRecord::ShadowLedgerCurveUpdate { slot, update, .. } => {
                 apply_curve_update(&shadow_ledger, slot, &update);
@@ -302,7 +307,10 @@ mod tests {
     use ghost_brain::oracle::hyper_prediction::HyperPredictionOracle;
     use ghost_core::market_state::BondingCurve;
     use ghost_core::shadow_ledger::{LivePipeline, LivePipelineConfig, ShadowLedger, TradeSide};
-    use ghost_core::{BaseMint, BondingCurveKey, PoolId};
+    use ghost_core::{
+        BaseMint, BondingCurveKey, LocalCoverageBoundaryV1, LocalCoverageGapReasonV1,
+        LocalCoverageGapV1, PoolId,
+    };
     use solana_sdk::signature::Signature;
     use tempfile::tempdir;
 
@@ -392,6 +400,59 @@ mod tests {
             write_wall_ts_ms,
         )
         .expect("append wal record");
+    }
+
+    #[test]
+    fn local_coverage_gap_replays_as_audit_only_record() {
+        let wal_dir = tempdir().expect("wal tempdir");
+        let wal = Wal::new(wal_dir.path(), 60_000, 60_000).expect("wal init");
+        let gap = LocalCoverageGapV1 {
+            gap_id_blake3: [7; 32],
+            provider_id: "primary-a".to_string(),
+            stream_epoch: 3,
+            episode_sequence: 0,
+            reason: LocalCoverageGapReasonV1::IngressQueueSaturated,
+            before: LocalCoverageBoundaryV1 {
+                slot: Some(40),
+                signature: Some(Signature::new_unique()),
+            },
+            after: LocalCoverageBoundaryV1 {
+                slot: Some(44),
+                signature: Some(Signature::new_unique()),
+            },
+            missing_event_count: 3,
+            first_dropped: LocalCoverageBoundaryV1 {
+                slot: Some(41),
+                signature: Some(Signature::new_unique()),
+            },
+            last_dropped: LocalCoverageBoundaryV1 {
+                slot: Some(43),
+                signature: Some(Signature::new_unique()),
+            },
+            queue_high_water: 1_024,
+            started_at_ms: 1_000,
+            ended_at_ms: 1_100,
+            recovered: false,
+        };
+        wal.append(&WalRecord::LocalCoverageGap {
+            ts_ms: gap.ended_at_ms,
+            slot: gap.after.slot.unwrap_or_default(),
+            gap,
+        })
+        .expect("append local coverage gap");
+        wal.flush().expect("flush local coverage gap");
+
+        let shadow_ledger = std::sync::Arc::new(ShadowLedger::new());
+        let live_pipeline =
+            std::sync::Arc::new(LivePipeline::with_config(LivePipelineConfig::default()));
+        let runtime = build_runtime(std::sync::Arc::clone(&shadow_ledger), live_pipeline);
+
+        let summary = replay_shared_wal(&wal, runtime.as_ref(), None).expect("wal replay");
+        assert_eq!(summary.total_records, 1);
+        assert_eq!(summary.local_coverage_gaps, 1);
+        assert_eq!(summary.curve_updates_restored, 0);
+        assert_eq!(summary.staged_commits_restored, 0);
+        assert_eq!(runtime.commit_coordinator().active_buffer_count(), 0);
     }
 
     #[test]

@@ -90,6 +90,10 @@ pub struct SeerConfig {
     /// Channel buffer size for candidate forwarding (deprecated, use ipc_config)
     pub channel_buffer_size: usize,
 
+    /// Capacity of the single bounded Yellowstone ingress/work queue.
+    #[serde(default = "SeerConfig::default_ingress_queue_capacity")]
+    pub ingress_queue_capacity: usize,
+
     /// IPC channel configuration for Seer→Trigger communication
     pub ipc_config: IpcChannelConfig,
 
@@ -381,6 +385,19 @@ pub struct ProgramStreamsConfig {
     #[serde(default)]
     pub artifact_capture_dir: Option<String>,
 
+    /// Enable the raw Pump.fun instruction evidence artifact writer.
+    ///
+    /// This is separate from Program Streams transport enablement so merely
+    /// configuring NLN topics cannot silently add a required local sink.
+    #[serde(default)]
+    pub artifact_capture_enabled: bool,
+
+    /// When true, loss of raw instruction evidence invalidates the current run
+    /// segment. When false, the writer is diagnostic best-effort: it emits a
+    /// durable local gap marker but does not block canonical candidate emission.
+    #[serde(default)]
+    pub artifact_required_for_run: bool,
+
     /// TTL for NLN trade rows waiting for Ghost birth-lane pool identity.
     #[serde(default = "ProgramStreamsConfig::default_trade_resolver_ttl_ms")]
     pub trade_resolver_ttl_ms: u64,
@@ -433,6 +450,8 @@ impl Default for ProgramStreamsConfig {
             pumpfun_buy_exact_sol_in_topic: Self::default_pumpfun_buy_exact_sol_in_topic(),
             system_transfers_topic: Self::default_system_transfers_topic(),
             artifact_capture_dir: None,
+            artifact_capture_enabled: false,
+            artifact_required_for_run: false,
             trade_resolver_ttl_ms: Self::default_trade_resolver_ttl_ms(),
             trade_resolver_per_mint_cap: Self::default_trade_resolver_per_mint_cap(),
             trade_resolver_global_cap: Self::default_trade_resolver_global_cap(),
@@ -590,6 +609,7 @@ impl Default for SeerConfig {
             verbose: false,
             filter: FilterConfig::default(),
             channel_buffer_size: 1000, // Kept for backward compatibility
+            ingress_queue_capacity: Self::default_ingress_queue_capacity(),
             ipc_config: IpcChannelConfig::default(),
             metrics_port: 9090,
             ultrafast_enter_threshold: 80.0,
@@ -610,6 +630,10 @@ impl Default for SeerConfig {
 }
 
 impl SeerConfig {
+    pub const fn default_ingress_queue_capacity() -> usize {
+        2_048
+    }
+
     /// Get the effective source mode, deriving from connection_mode if source_mode is None
     pub fn effective_source_mode(&self) -> SeerSourceMode {
         match &self.source_mode {
@@ -805,7 +829,10 @@ mod tests {
         assert_eq!(config.stream_mode, StreamMode::SingleGlobal);
         assert_eq!(config.tx_filter_strategy, TxFilterStrategy::PerPool);
         assert_eq!(config.funding_lane_mode, FundingLaneMode::Disabled);
+        assert_eq!(config.ingress_queue_capacity, 2_048);
         assert!(!config.program_streams.enabled);
+        assert!(!config.program_streams.artifact_capture_enabled);
+        assert!(!config.program_streams.artifact_required_for_run);
         assert_eq!(config.program_streams.endpoint, "stream-1.nln.clr3.org:443");
         assert_eq!(
             config.program_streams.format,
@@ -834,11 +861,19 @@ mod tests {
             .expect("config must serialize as an object");
         object.remove("primary_raw_provider_id");
         object.remove("secondary_raw_provider_ids");
+        object.remove("ingress_queue_capacity");
+        object
+            .get_mut("program_streams")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("program_streams config object")
+            .remove("artifact_required_for_run");
 
         let decoded: SeerConfig =
             serde_json::from_value(value).expect("old config must remain readable");
         assert_eq!(decoded.primary_raw_provider_id, "primary");
         assert!(decoded.secondary_raw_provider_ids.is_empty());
+        assert_eq!(decoded.ingress_queue_capacity, 2_048);
+        assert!(!decoded.program_streams.artifact_required_for_run);
     }
 
     #[test]
@@ -1048,6 +1083,8 @@ mod tests {
         assert!(config.enabled_topics.is_empty());
         assert!(config.optional_topics.is_empty());
         assert!(config.disabled_optional_topics.is_empty());
+        assert!(!config.artifact_capture_enabled);
+        assert!(!config.artifact_required_for_run);
         assert_eq!(config.trade_resolver_ttl_ms, 30_000);
         assert_eq!(config.trade_resolver_per_mint_cap, 256);
         assert_eq!(config.trade_resolver_global_cap, 50_000);

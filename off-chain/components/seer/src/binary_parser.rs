@@ -1774,10 +1774,10 @@ impl PumpParser {
                 signature,
                 slot,
                 received_at,
-                raw,
+                decoded,
                 ..
-            } => Self::parse_transaction_raw(
-                raw,
+            } => Self::parse_transaction_update(
+                decoded,
                 Some(signature),
                 *slot,
                 *received_at,
@@ -1876,6 +1876,8 @@ impl PumpParser {
     ) -> Vec<ParsedPumpEvent> {
         use yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction;
 
+        #[cfg(test)]
+        crate::hot_path_metrics::record_live_transaction_parser_decode();
         let update = match SubscribeUpdateTransaction::decode(raw) {
             Ok(u) => u,
             Err(e) => {
@@ -1884,6 +1886,28 @@ impl PumpParser {
             }
         };
 
+        Self::parse_transaction_update(
+            &update,
+            sig_str,
+            slot,
+            received_at,
+            is_backfill,
+            cm_reg,
+            ar_reg,
+            rq,
+        )
+    }
+
+    fn parse_transaction_update(
+        update: &yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction,
+        sig_str: Option<&String>,
+        slot: u64,
+        received_at: Instant,
+        is_backfill: bool,
+        cm_reg: &CurveMintRegistry,
+        ar_reg: &AccountRegistry,
+        rq: &ResolveQueue,
+    ) -> Vec<ParsedPumpEvent> {
         let tx_info = match update.transaction.as_ref() {
             Some(t) => t,
             None => return vec![],
@@ -4041,6 +4065,18 @@ pub struct BinaryParser {
     bcv2_hydrator: Option<Bcv2HydrationService>,
 }
 
+/// Combined parser output used by the PR1B harness and, after the single-pass
+/// refactor, by the active Seer runtime.
+///
+/// In the baseline implementation this deliberately delegates to the two
+/// existing compatibility entry points. That preserves runtime behavior while
+/// making the duplicated work directly measurable before PR1B changes it.
+#[derive(Debug, Clone)]
+pub struct ParsedTransactionBundle {
+    pub initialize_pool: Option<InitializePoolEvent>,
+    pub trades: Vec<TradeEvent>,
+}
+
 impl BinaryParser {
     pub fn new(verbose: bool) -> Self {
         Self::with_account_registry_and_bcv2_hydration(verbose, AccountRegistry::new(), None)
@@ -4085,10 +4121,18 @@ impl BinaryParser {
         &self,
         event: &GeyserEvent,
     ) -> SeerResult<Option<InitializePoolEvent>> {
+        let parsed = self.parse_pump_events(event);
+        self.initialize_pool_from_parsed(event, parsed)
+    }
+
+    fn initialize_pool_from_parsed(
+        &self,
+        event: &GeyserEvent,
+        parsed: Vec<ParsedPumpEvent>,
+    ) -> SeerResult<Option<InitializePoolEvent>> {
         let event_time = crate::types::transaction_event_time(event);
         let event_ts_ms = event.compat_event_ts_ms();
         let (provider_id, provider_role) = transaction_provider_metadata(event);
-        let parsed = self.parse_pump_events(event);
         // Priority: CpiCreate (Borsh event log, ec.user is always correct) >
         //           Create (direct instruction, account index may shift across Pump.fun versions) >
         //           SwapPoolCreated.
@@ -4241,11 +4285,36 @@ impl BinaryParser {
         Ok(None)
     }
 
+    /// Parse all transaction-level Pump outputs through one typed call.
+    ///
+    /// B0 is measurement-only: the baseline implementation intentionally calls
+    /// both legacy entry points so the harness captures the existing double
+    /// scan. B1 replaces this body with one instruction-tree walk and wires the
+    /// active runtime to this method.
+    pub fn parse_transaction_bundle(
+        &self,
+        event: &GeyserEvent,
+    ) -> SeerResult<ParsedTransactionBundle> {
+        let parsed = self.parse_pump_events(event);
+        Ok(ParsedTransactionBundle {
+            initialize_pool: self.initialize_pool_from_parsed(event, parsed.clone())?,
+            trades: self.trades_from_parsed(event, parsed)?,
+        })
+    }
+
     /// Parse a GeyserEvent for trade events.
     ///
     /// Returns all Buy/Sell trades found in the transaction.
     pub fn parse_trades(&self, event: &GeyserEvent) -> SeerResult<Vec<TradeEvent>> {
         let parsed = self.parse_pump_events(event);
+        self.trades_from_parsed(event, parsed)
+    }
+
+    fn trades_from_parsed(
+        &self,
+        event: &GeyserEvent,
+        parsed: Vec<ParsedPumpEvent>,
+    ) -> SeerResult<Vec<TradeEvent>> {
         let mut trades = Vec::new();
         let runtime_ctx = extract_runtime_trade_context(event);
         let (provider_id, provider_role) = transaction_provider_metadata(event);
@@ -5240,36 +5309,16 @@ impl BinaryParser {
         out
     }
 
-    /// Internal: extract raw proto bytes from GeyserEvent and run through PumpParser.
+    /// Parse the already-normalized transaction fields exactly once.
     ///
-    /// RC-1.5: avoids a second Vec<u8> allocation by passing the raw bytes slice
-    /// directly to `parse_transaction_raw` instead of re-wrapping in a PumpEvent
-    /// (which would clone the bytes). The proto is still decoded once inside
-    /// `parse_transaction_raw`; a full elimination of the second decode requires
-    /// restructuring PumpParser to accept pre-decoded fields, left as a future P1.
+    /// `mpcf_payload_bytes` is capture evidence for WAL/audit consumers. It is
+    /// deliberately not a parser transport and is never decoded by the live
+    /// transaction parser.
     fn parse_pump_events(&self, event: &GeyserEvent) -> Vec<ParsedPumpEvent> {
+        #[cfg(test)]
+        crate::hot_path_metrics::record_full_instruction_tree_scan();
         match event {
             GeyserEvent::Transaction {
-                mpcf_payload_bytes: Some(raw),
-                signature,
-                slot,
-                ..
-            } => {
-                let sig_str = signature.to_string();
-                // Pass raw bytes slice directly — no clone.
-                PumpParser::parse_transaction_raw(
-                    raw,
-                    Some(&sig_str),
-                    slot.unwrap_or(0),
-                    Instant::now(),
-                    false,
-                    &self.curve_mint_reg,
-                    &self.account_reg,
-                    &self.resolve_queue,
-                )
-            }
-            GeyserEvent::Transaction {
-                mpcf_payload_bytes: None,
                 signature,
                 slot,
                 accounts,

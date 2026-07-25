@@ -44,12 +44,15 @@ fn default_test_config() -> SeerConfig {
             min_initial_liquidity_sol: None,
         },
         channel_buffer_size: 100,
+        ingress_queue_capacity: SeerConfig::default().ingress_queue_capacity,
         ipc_config: seer::ipc::IpcChannelConfig {
             buffer_size: 1000,
             backpressure_policy: seer::ipc::BackpressurePolicy::Block,
             log_drops: true,
             log_overflows: true,
             warning_threshold_percent: 80.0,
+            account_update_queue_capacity: seer::ipc::IpcChannelConfig::default()
+                .account_update_queue_capacity,
         },
         metrics_port: 9091,
         ultrafast_enter_threshold: 0.8,

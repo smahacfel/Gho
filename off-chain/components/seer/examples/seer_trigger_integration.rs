@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         log_drops: true,
         log_overflows: true,
         warning_threshold_percent: 80.0,
+        account_update_queue_capacity: IpcChannelConfig::default().account_update_queue_capacity,
     };
 
     info!("IPC Configuration:");
