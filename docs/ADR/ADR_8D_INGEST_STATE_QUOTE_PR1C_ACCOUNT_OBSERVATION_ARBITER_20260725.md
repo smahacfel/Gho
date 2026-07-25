@@ -1,6 +1,6 @@
 # ADR-8D: Ingest State Quote PR1C — AccountObservationArbiter
 
-Status: `IMPLEMENTED / FOLLOW-UP REVIEW REMEDIATION / BASE COMMIT 91e3a6d`
+Status: `IMPLEMENTED / FOLLOW-UP REVIEW REMEDIATION / BASE COMMIT e3b991a`
 
 Typ: ADR-8D / PR1C / idempotentna arbitrażowa granica `AccountStateCore`
 
@@ -158,6 +158,12 @@ potwierdzeniu, że primary jest kwalifikujący się do canonical ordering.
 `OlderObservation` oraz `WriteVersionUnknown` od primary zwracają typed no-op
 bez rezerwowania primary lane; historyczny replay nie może przez to wyczerpać
 capacity potrzebnej późniejszemu primary.
+Jeżeli jednak dla dokładnie tego samego version key istnieje już retained
+secondary witness, stale albo unorderable primary jest dopisywany wyłącznie do
+tego witness record. Same hash daje `PrimarySecondaryAgreement`, różny hash
+tworzy `PrimarySecondaryConflict` oraz bounded conflict evidence; w obu
+przypadkach `canonical_apply = false` i primary watermark lane nie jest
+zużywany.
 
 Primary watermark starszy od current latest może zostać jawnie pruned również
 wtedy, gdy ma conflict: pełny conflict snapshot pozostaje wcześniej zapisany
@@ -201,13 +207,15 @@ wyłącznie na granicy arbitrażu account observation.
 PASS  cargo fmt --all --check
 PASS  git diff --check
 PASS  cargo test -p ghost-core account_state_core::observation_arbiter --lib -- --nocapture
-      (16 testów: secondary-first conflict bez veta, nasycenie witness lane
+      (19 testów: secondary-first conflict bez veta, nasycenie witness lane
       per-version i per-index bez veta, conflict-store saturation nie blokuje
       późniejszego primary watermark V3, stale primary V1..V9 nie zapełnia
       authority lane przed V11, overflow conflict store wykryty przez primary
-      V3 degraduje evidence bez zmiany `AppliedNewMutation`, retained first
-      rejected overflow provenance dla secondary i primary, in-process
-      exactly-once, `None != Some(0)` oraz backward-compatible serde)
+      V3 degraduje evidence bez zmiany `AppliedNewMutation`, stale i
+      unorderable primary korelują się z retained secondary jako agreement lub
+      conflict bez canonical apply, retained first rejected overflow provenance
+      dla secondary i primary, in-process exactly-once, `None != Some(0)` oraz
+      backward-compatible serde)
 PASS  cargo test -p ghost-core --test account_observation_arbiter_corpus_tests --test account_state_core_tests -- --nocapture
       (2 replay corpus + 9 testów integracyjnych AccountStateCore, w tym
       kontrolowana migracja Pump.fun -> PumpSwap)

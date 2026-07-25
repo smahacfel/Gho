@@ -822,6 +822,17 @@ impl AccountObservationArbiter {
             relation,
             VersionRelation::Older | VersionRelation::WriteVersionUnknown
         ) {
+            // A stale/unorderable primary cannot move canonical state, but it
+            // may still complete or contradict an already retained secondary
+            // witness for the exact same version.  Correlate it in the
+            // witness lane without promoting it into `primary_versions`.
+            if self.secondary_witness_versions.contains_key(&version) {
+                return self.arbitrate_noncanonical_primary_witness_version(
+                    version,
+                    observation.evidence,
+                    relation,
+                );
+            }
             return self.record_decision(decision_for_primary_relation(
                 relation,
                 AccountProviderAgreementV1::NotObserved,
@@ -1029,6 +1040,89 @@ impl AccountObservationArbiter {
             );
         }
         self.record_decision(decision)
+    }
+
+    /// Correlate a primary that is known not to be canonical-order eligible
+    /// with previously retained witness evidence for its exact version.  This
+    /// preserves agreement/conflict facts without consuming primary ordering
+    /// capacity or changing canonical state.
+    fn arbitrate_noncanonical_primary_witness_version(
+        &mut self,
+        version: AccountMutationVersionV1,
+        evidence: AccountObservationEvidenceV1,
+        relation: VersionRelation,
+    ) -> AccountObservationDecisionV1 {
+        debug_assert!(matches!(
+            relation,
+            VersionRelation::Older | VersionRelation::WriteVersionUnknown
+        ));
+        let payload_hash = evidence.identity.data_hash_blake3;
+        let recorded = {
+            let record = self.secondary_witness_versions.get_mut(&version).expect(
+                "noncanonical primary correlation requires a retained secondary witness record",
+            );
+            record.try_record(&evidence, self.limits.max_unique_observations_per_version)
+        };
+        let recorded = match recorded {
+            Ok(recorded) => recorded,
+            Err(()) => {
+                let retained_count = self
+                    .secondary_witness_versions
+                    .get(&version)
+                    .map_or(0, VersionEvidence::retained_observation_count);
+                return self.evidence_capacity_decision(
+                    AccountObservationEvidenceOverflowScopeV1::VersionObservations,
+                    &evidence,
+                    retained_count,
+                );
+            }
+        };
+
+        let (agreement, conflict_present, has_secondary, observations) = self
+            .secondary_witness_versions
+            .get(&version)
+            .map(|record| {
+                (
+                    record.provider_agreement(),
+                    record.has_payload_conflict,
+                    record.has_secondary,
+                    record.observations.clone(),
+                )
+            })
+            .expect("secondary witness record remains present after primary correlation");
+
+        if conflict_present && !self.retain_provider_conflict_evidence(&version, &observations) {
+            return self.evidence_capacity_decision_with_secondary_loss(
+                AccountObservationEvidenceOverflowScopeV1::ProviderConflictEvidence,
+                &evidence,
+                self.provider_conflicts.len(),
+                has_secondary,
+            );
+        }
+
+        if recorded.introduced_payload_conflict {
+            return self.finish(
+                AccountObservationClassificationV1::SameVersionDifferentHashConflict,
+                AccountObservationOutcomeV1::ProviderConflict,
+                false,
+                agreement,
+                Some(version),
+                Some(payload_hash),
+            );
+        }
+
+        self.finish(
+            if recorded.exact_duplicate {
+                AccountObservationClassificationV1::ExactDuplicate
+            } else {
+                AccountObservationClassificationV1::SameVersionSameHash
+            },
+            AccountObservationOutcomeV1::DuplicateObservation,
+            false,
+            agreement,
+            Some(version),
+            Some(payload_hash),
+        )
     }
 
     fn arbitrate_secondary_witness_version(
@@ -1324,7 +1418,7 @@ impl AccountObservationArbiter {
         rejected_observation: &AccountObservationEvidenceV1,
         retained_count: usize,
     ) -> AccountObservationDecisionV1 {
-        self.note_evidence_overflow(
+        self.evidence_capacity_decision_with_secondary_loss(
             scope,
             rejected_observation,
             retained_count,
@@ -1332,6 +1426,21 @@ impl AccountObservationArbiter {
                 rejected_observation.provider_role,
                 RawProviderRoleV1::SecondaryWitness
             ),
+        )
+    }
+
+    fn evidence_capacity_decision_with_secondary_loss(
+        &mut self,
+        scope: AccountObservationEvidenceOverflowScopeV1,
+        rejected_observation: &AccountObservationEvidenceV1,
+        retained_count: usize,
+        secondary_evidence_lost: bool,
+    ) -> AccountObservationDecisionV1 {
+        self.note_evidence_overflow(
+            scope,
+            rejected_observation,
+            retained_count,
+            secondary_evidence_lost,
         );
         self.finish(
             AccountObservationClassificationV1::EvidenceCapacityExceeded,
@@ -2173,6 +2282,228 @@ mod tests {
                 .data_hash_blake3,
             [6; 32]
         );
+    }
+
+    #[test]
+    fn stale_primary_correlates_with_secondary_conflict_without_authority_capacity() {
+        let account = Pubkey::new_unique();
+        let mut arbiter =
+            AccountObservationArbiter::with_limits(AccountObservationArbiterLimitsV1 {
+                max_versions_per_account: 2,
+                max_unique_observations_per_version: 2,
+                max_identity_conflicts_per_account: 1,
+                max_identity_transitions_per_account: 1,
+            });
+
+        let primary_v10 = update(
+            account,
+            10,
+            Some(10),
+            1,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        assert!(arbiter.arbitrate(&primary_v10).canonical_apply);
+
+        let secondary_v9 = update(
+            account,
+            9,
+            Some(9),
+            2,
+            "secondary",
+            RawProviderRoleV1::SecondaryWitness,
+        );
+        assert_eq!(
+            arbiter.arbitrate(&secondary_v9).outcome,
+            AccountObservationOutcomeV1::SecondaryWitnessRecorded
+        );
+
+        let primary_v9 = update(
+            account,
+            9,
+            Some(9),
+            3,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        let conflict = arbiter.arbitrate(&primary_v9);
+        assert_eq!(
+            conflict.classification,
+            AccountObservationClassificationV1::SameVersionDifferentHashConflict
+        );
+        assert_eq!(
+            conflict.outcome,
+            AccountObservationOutcomeV1::ProviderConflict
+        );
+        assert_eq!(
+            conflict.provider_agreement,
+            AccountProviderAgreementV1::PrimarySecondaryConflict
+        );
+        assert!(!conflict.canonical_apply);
+        assert_eq!(
+            arbiter.primary_versions.len(),
+            1,
+            "a stale primary correlation must not consume primary ordering capacity"
+        );
+
+        let primary_v11 = update(
+            account,
+            11,
+            Some(11),
+            4,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        assert!(arbiter.arbitrate(&primary_v11).canonical_apply);
+
+        let snapshot = arbiter.snapshot();
+        assert_eq!(snapshot.counters.canonical_mutation_count, 2);
+        assert_eq!(snapshot.conflicts.len(), 1);
+        assert_eq!(snapshot.conflicts[0].mutation_version.slot, 9);
+        assert_eq!(
+            snapshot
+                .latest_primary_canonical
+                .expect("V11 must become the latest canonical primary mutation")
+                .mutation_version
+                .slot,
+            11
+        );
+    }
+
+    #[test]
+    fn stale_primary_correlates_with_secondary_agreement_without_canonical_apply() {
+        let account = Pubkey::new_unique();
+        let mut arbiter =
+            AccountObservationArbiter::with_limits(AccountObservationArbiterLimitsV1 {
+                max_versions_per_account: 2,
+                max_unique_observations_per_version: 2,
+                max_identity_conflicts_per_account: 1,
+                max_identity_transitions_per_account: 1,
+            });
+
+        let primary_v10 = update(
+            account,
+            10,
+            Some(10),
+            1,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        assert!(arbiter.arbitrate(&primary_v10).canonical_apply);
+
+        let secondary_v9 = update(
+            account,
+            9,
+            Some(9),
+            2,
+            "secondary",
+            RawProviderRoleV1::SecondaryWitness,
+        );
+        assert_eq!(
+            arbiter.arbitrate(&secondary_v9).outcome,
+            AccountObservationOutcomeV1::SecondaryWitnessRecorded
+        );
+
+        let primary_v9_same_hash = update(
+            account,
+            9,
+            Some(9),
+            2,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        let agreement = arbiter.arbitrate(&primary_v9_same_hash);
+        assert_eq!(
+            agreement.classification,
+            AccountObservationClassificationV1::SameVersionSameHash
+        );
+        assert_eq!(
+            agreement.outcome,
+            AccountObservationOutcomeV1::DuplicateObservation
+        );
+        assert_eq!(
+            agreement.provider_agreement,
+            AccountProviderAgreementV1::PrimarySecondaryAgreement
+        );
+        assert!(!agreement.canonical_apply);
+        assert_eq!(arbiter.primary_versions.len(), 1);
+        assert!(arbiter.snapshot().conflicts.is_empty());
+
+        let primary_v11 = update(
+            account,
+            11,
+            Some(11),
+            3,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        assert!(arbiter.arbitrate(&primary_v11).canonical_apply);
+        let snapshot = arbiter.snapshot();
+        assert_eq!(snapshot.counters.canonical_mutation_count, 2);
+        assert_eq!(
+            snapshot
+                .latest_primary_canonical
+                .expect("V11 must become the latest canonical primary mutation")
+                .mutation_version
+                .slot,
+            11
+        );
+    }
+
+    #[test]
+    fn unorderable_primary_correlates_with_secondary_without_authority_capacity() {
+        let account = Pubkey::new_unique();
+        let mut arbiter =
+            AccountObservationArbiter::with_limits(AccountObservationArbiterLimitsV1 {
+                max_versions_per_account: 2,
+                max_unique_observations_per_version: 2,
+                max_identity_conflicts_per_account: 1,
+                max_identity_transitions_per_account: 1,
+            });
+
+        let primary_known = update(
+            account,
+            10,
+            Some(10),
+            1,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        assert!(arbiter.arbitrate(&primary_known).canonical_apply);
+
+        let secondary_unknown = update(
+            account,
+            10,
+            None,
+            2,
+            "secondary",
+            RawProviderRoleV1::SecondaryWitness,
+        );
+        assert_eq!(
+            arbiter.arbitrate(&secondary_unknown).classification,
+            AccountObservationClassificationV1::WriteVersionUnknown
+        );
+
+        let primary_unknown_same_hash = update(
+            account,
+            10,
+            None,
+            2,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        let agreement = arbiter.arbitrate(&primary_unknown_same_hash);
+        assert_eq!(
+            agreement.classification,
+            AccountObservationClassificationV1::SameVersionSameHash
+        );
+        assert_eq!(
+            agreement.provider_agreement,
+            AccountProviderAgreementV1::PrimarySecondaryAgreement
+        );
+        assert!(!agreement.canonical_apply);
+        assert_eq!(arbiter.primary_versions.len(), 1);
+        assert_eq!(arbiter.snapshot().counters.canonical_mutation_count, 1);
     }
 
     #[test]
