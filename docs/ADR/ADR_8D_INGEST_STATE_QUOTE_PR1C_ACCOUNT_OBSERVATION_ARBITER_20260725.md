@@ -1,6 +1,6 @@
 # ADR-8D: Ingest State Quote PR1C — AccountObservationArbiter
 
-Status: `IMPLEMENTED / FOLLOW-UP REVIEW REMEDIATION / BASE COMMIT 3726fbd`
+Status: `IMPLEMENTED / FOLLOW-UP REVIEW REMEDIATION / BASE COMMIT 91e3a6d`
 
 Typ: ADR-8D / PR1C / idempotentna arbitrażowa granica `AccountStateCore`
 
@@ -152,6 +152,13 @@ Evidence jest ograniczone na mint w trzech niezależnych pasach:
 
 W ramach jednego version key jest do 32 unique observations primary i osobno
 do 32 unique observations secondary. Exact replay nie zużywa nowego wpisu.
+Primary watermark lane zawiera wyłącznie record potrzebny do canonical
+ordering: applied primary mutation albo witness record promowany dopiero po
+potwierdzeniu, że primary jest kwalifikujący się do canonical ordering.
+`OlderObservation` oraz `WriteVersionUnknown` od primary zwracają typed no-op
+bez rezerwowania primary lane; historyczny replay nie może przez to wyczerpać
+capacity potrzebnej późniejszemu primary.
+
 Primary watermark starszy od current latest może zostać jawnie pruned również
 wtedy, gdy ma conflict: pełny conflict snapshot pozostaje wcześniej zapisany
 w osobnym bounded store. Witness records ani conflict evidence nie są cicho
@@ -165,6 +172,14 @@ watermark lane: nawet po kolejnych conflictach V1/V2, secondary-first conflict
 V3 i pełnym conflict store kwalifikujący się primary V3 jest nadal zapisywany
 i aplikuje canonical mutation dokładnie raz. Nasycenie samego pasa primary
 pozostaje fail-closed, ale nie jest veto sterowanym przez secondary.
+
+Jeżeli pełny conflict store zostanie wykryty dopiero podczas przyjęcia
+kwalifikującego się primary (secondary V3 już istnieje, a primary V3 tworzy
+conflict), decision pozostaje `AppliedNewMutation`. Jednocześnie arbiter
+niezależnie inkrementuje overflow counter, ustawia
+`secondary_evidence_complete = false` i zachowuje pierwszy nieutrwalony
+snapshot conflict observation. Brak możliwości retencji dowodu nigdy nie jest
+przemilczany ani nie zamienia primary authority w veto secondary.
 
 ## D4. Poza zakresem
 
@@ -186,11 +201,13 @@ wyłącznie na granicy arbitrażu account observation.
 PASS  cargo fmt --all --check
 PASS  git diff --check
 PASS  cargo test -p ghost-core account_state_core::observation_arbiter --lib -- --nocapture
-      (14 testów: secondary-first conflict bez veta, nasycenie witness lane
+      (16 testów: secondary-first conflict bez veta, nasycenie witness lane
       per-version i per-index bez veta, conflict-store saturation nie blokuje
-      późniejszego primary watermark V3, retained first rejected overflow
-      provenance dla secondary i primary, in-process exactly-once,
-      `None != Some(0)` oraz backward-compatible serde)
+      późniejszego primary watermark V3, stale primary V1..V9 nie zapełnia
+      authority lane przed V11, overflow conflict store wykryty przez primary
+      V3 degraduje evidence bez zmiany `AppliedNewMutation`, retained first
+      rejected overflow provenance dla secondary i primary, in-process
+      exactly-once, `None != Some(0)` oraz backward-compatible serde)
 PASS  cargo test -p ghost-core --test account_observation_arbiter_corpus_tests --test account_state_core_tests -- --nocapture
       (2 replay corpus + 9 testów integracyjnych AccountStateCore, w tym
       kontrolowana migracja Pump.fun -> PumpSwap)

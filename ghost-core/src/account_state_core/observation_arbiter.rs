@@ -812,9 +812,28 @@ impl AccountObservationArbiter {
             );
         }
 
+        // The primary ordering lane is a canonical watermark, not a cache of
+        // every primary delivery.  A known-stale or unorderable primary has no
+        // possible canonical effect, so retaining it here would let replay
+        // traffic exhaust capacity needed by a later newer primary mutation.
+        // Any matching secondary witness remains in its separate bounded lane.
+        let relation = relation_to_latest(&version, latest.as_ref());
+        if matches!(
+            relation,
+            VersionRelation::Older | VersionRelation::WriteVersionUnknown
+        ) {
+            return self.record_decision(decision_for_primary_relation(
+                relation,
+                AccountProviderAgreementV1::NotObserved,
+                version,
+                payload_hash,
+            ));
+        }
+
         // Promote retained secondary evidence into the primary-capable lane
-        // before recording the first primary. The dedicated primary lane is
-        // never consumed by witness-only traffic.
+        // only once its version is eligible for canonical ordering. The
+        // dedicated primary lane is never consumed by witness-only or stale
+        // primary traffic.
         if let Some(record) = self.secondary_witness_versions.remove(&version) {
             if !self.reserve_primary_version_slot() {
                 self.secondary_witness_versions
@@ -843,7 +862,6 @@ impl AccountObservationArbiter {
             );
         }
 
-        let relation = relation_to_latest(&version, latest.as_ref());
         let mut record = VersionEvidence::new(observation.evidence.clone());
         let agreement = record.provider_agreement();
         let decision =
@@ -895,7 +913,7 @@ impl AccountObservationArbiter {
             }
         };
 
-        let (agreement, primary_applied_hash, conflict_present, observations) = self
+        let (agreement, primary_applied_hash, conflict_present, has_secondary, observations) = self
             .primary_versions
             .get(&version)
             .map(|record| {
@@ -903,6 +921,7 @@ impl AccountObservationArbiter {
                     record.provider_agreement(),
                     record.primary_applied_hash,
                     record.has_payload_conflict,
+                    record.has_secondary,
                     record.observations.clone(),
                 )
             })
@@ -923,6 +942,17 @@ impl AccountObservationArbiter {
                     self.provider_conflicts.len(),
                 );
             }
+            // The primary mutation must still apply, but the missing retained
+            // conflict evidence is observable.  In this branch a secondary
+            // has already supplied a competing payload, so the witness-side
+            // completeness bit must degrade even though the rejected snapshot
+            // is the eligible primary observation that exposed saturation.
+            self.note_evidence_overflow(
+                AccountObservationEvidenceOverflowScopeV1::ProviderConflictEvidence,
+                &evidence,
+                self.provider_conflicts.len(),
+                has_secondary,
+            );
         }
 
         if matches!(evidence.provider_role, RawProviderRoleV1::SecondaryWitness) {
@@ -1294,15 +1324,41 @@ impl AccountObservationArbiter {
         rejected_observation: &AccountObservationEvidenceV1,
         retained_count: usize,
     ) -> AccountObservationDecisionV1 {
+        self.note_evidence_overflow(
+            scope,
+            rejected_observation,
+            retained_count,
+            matches!(
+                rejected_observation.provider_role,
+                RawProviderRoleV1::SecondaryWitness
+            ),
+        );
+        self.finish(
+            AccountObservationClassificationV1::EvidenceCapacityExceeded,
+            AccountObservationOutcomeV1::EvidenceCapacityExceeded,
+            false,
+            AccountProviderAgreementV1::NotObserved,
+            Some(rejected_observation.identity.mutation_version.clone()),
+            Some(rejected_observation.identity.data_hash_blake3),
+        )
+    }
+
+    /// Record an evidence-retention loss without necessarily changing the
+    /// canonical decision.  A conflict-store overflow discovered while an
+    /// eligible primary applies is degraded evidence, not a secondary veto.
+    fn note_evidence_overflow(
+        &mut self,
+        scope: AccountObservationEvidenceOverflowScopeV1,
+        rejected_observation: &AccountObservationEvidenceV1,
+        retained_count: usize,
+        secondary_evidence_lost: bool,
+    ) {
         self.counters.evidence_capacity_exceeded_count = self
             .counters
             .evidence_capacity_exceeded_count
             .saturating_add(1);
         let overflow_count = self.counters.evidence_capacity_exceeded_count;
-        if matches!(
-            rejected_observation.provider_role,
-            RawProviderRoleV1::SecondaryWitness
-        ) {
+        if secondary_evidence_lost {
             self.secondary_evidence_complete = false;
         }
         let mutation_version = Some(rejected_observation.identity.mutation_version.clone());
@@ -1314,14 +1370,6 @@ impl AccountObservationArbiter {
                 retained_count,
                 overflow_count,
             });
-        self.finish(
-            AccountObservationClassificationV1::EvidenceCapacityExceeded,
-            AccountObservationOutcomeV1::EvidenceCapacityExceeded,
-            false,
-            AccountProviderAgreementV1::NotObserved,
-            mutation_version,
-            Some(rejected_observation.identity.data_hash_blake3),
-        )
     }
 
     fn invalid_decision(
@@ -2121,6 +2169,164 @@ mod tests {
             first_overflow
                 .first_rejected_observation
                 .expect("overflow must retain the rejected secondary witness")
+                .identity
+                .data_hash_blake3,
+            [6; 32]
+        );
+    }
+
+    #[test]
+    fn stale_primary_replays_never_consume_primary_watermark_capacity() {
+        let account = Pubkey::new_unique();
+        let mut arbiter =
+            AccountObservationArbiter::with_limits(AccountObservationArbiterLimitsV1 {
+                max_versions_per_account: 2,
+                max_unique_observations_per_version: 2,
+                max_identity_conflicts_per_account: 1,
+                max_identity_transitions_per_account: 1,
+            });
+
+        let primary_v10 = update(
+            account,
+            10,
+            Some(10),
+            10,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        assert!(arbiter.arbitrate(&primary_v10).canonical_apply);
+
+        for stale_slot in 1..10 {
+            let stale = update(
+                account,
+                stale_slot,
+                Some(stale_slot),
+                stale_slot as u8,
+                "primary",
+                RawProviderRoleV1::PrimaryAuthority,
+            );
+            let decision = arbiter.arbitrate(&stale);
+            assert_eq!(
+                decision.classification,
+                AccountObservationClassificationV1::OlderObservation
+            );
+            assert!(!decision.canonical_apply);
+        }
+
+        let primary_v11 = update(
+            account,
+            11,
+            Some(11),
+            11,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        let applied = arbiter.arbitrate(&primary_v11);
+        assert_eq!(
+            applied.outcome,
+            AccountObservationOutcomeV1::AppliedNewMutation
+        );
+        assert!(applied.canonical_apply);
+
+        let snapshot = arbiter.snapshot();
+        assert_eq!(snapshot.counters.canonical_mutation_count, 2);
+        assert_eq!(snapshot.counters.stale_observation_count, 9);
+        assert_eq!(
+            snapshot
+                .latest_primary_canonical
+                .expect("newer primary must advance the canonical watermark")
+                .mutation_version
+                .slot,
+            11
+        );
+        assert!(
+            snapshot.first_evidence_overflow.is_none(),
+            "stale primary replays are classified no-ops, not authority-lane overflow"
+        );
+    }
+
+    #[test]
+    fn primary_conflict_store_overflow_degrades_evidence_without_veto() {
+        let account = Pubkey::new_unique();
+        let mut arbiter =
+            AccountObservationArbiter::with_limits(AccountObservationArbiterLimitsV1 {
+                max_versions_per_account: 2,
+                max_unique_observations_per_version: 2,
+                max_identity_conflicts_per_account: 1,
+                max_identity_transitions_per_account: 1,
+            });
+
+        for (slot, primary_hash, secondary_hash) in [(10, 1, 2), (11, 3, 4)] {
+            let primary = update(
+                account,
+                slot,
+                Some(slot),
+                primary_hash,
+                "primary",
+                RawProviderRoleV1::PrimaryAuthority,
+            );
+            let mut secondary = primary.clone();
+            secondary.provider_id = Some("secondary".to_owned());
+            secondary.provider_role = Some(RawProviderRoleV1::SecondaryWitness);
+            secondary.account_data_hash = Some(hash(secondary_hash));
+
+            assert!(arbiter.arbitrate(&primary).canonical_apply);
+            assert_eq!(
+                arbiter.arbitrate(&secondary).outcome,
+                AccountObservationOutcomeV1::ProviderConflict
+            );
+        }
+        assert_eq!(arbiter.snapshot().conflicts.len(), 2);
+
+        let secondary_v3 = update(
+            account,
+            12,
+            Some(12),
+            5,
+            "secondary",
+            RawProviderRoleV1::SecondaryWitness,
+        );
+        assert_eq!(
+            arbiter.arbitrate(&secondary_v3).outcome,
+            AccountObservationOutcomeV1::SecondaryWitnessRecorded
+        );
+
+        let primary_v3 = update(
+            account,
+            12,
+            Some(12),
+            6,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        let decision = arbiter.arbitrate(&primary_v3);
+        assert_eq!(
+            decision.outcome,
+            AccountObservationOutcomeV1::AppliedNewMutation
+        );
+        assert!(
+            decision.canonical_apply,
+            "a full conflict-evidence store must not veto an eligible primary"
+        );
+
+        let snapshot = arbiter.snapshot();
+        assert_eq!(snapshot.counters.canonical_mutation_count, 3);
+        assert_eq!(snapshot.counters.evidence_capacity_exceeded_count, 1);
+        assert!(
+            !snapshot.secondary_evidence_complete,
+            "unretained secondary/primary conflict evidence must be explicit"
+        );
+        let overflow = snapshot
+            .first_evidence_overflow
+            .expect("the full conflict store must retain an overflow marker");
+        assert_eq!(
+            overflow.scope,
+            AccountObservationEvidenceOverflowScopeV1::ProviderConflictEvidence
+        );
+        assert_eq!(
+            overflow
+                .first_rejected_observation
+                .expect("overflow must retain the first unretained conflict observation")
                 .identity
                 .data_hash_blake3,
             [6; 32]
