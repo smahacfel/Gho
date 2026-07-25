@@ -11,8 +11,10 @@ use solana_sdk::{pubkey::Pubkey, signature::Signature};
 
 /// Configured role of a raw Yellowstone provider.
 ///
-/// The role is carried as observation metadata in PR 1A.  Runtime arbitration
-/// remains unchanged until the dedicated arbiter work in later PR 1 commits.
+/// The role is captured as provider provenance. PR1C's
+/// `AccountObservationArbiter` uses it only to enforce primary raw account
+/// authority and retain secondary-witness evidence; it does not alter
+/// Gatekeeper, materialization, quote, or execution authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RawProviderRoleV1 {

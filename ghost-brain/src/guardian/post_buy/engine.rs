@@ -11140,8 +11140,8 @@ mod tests {
         receive_ts_ms: u64,
     ) {
         let apply_result = account_state_core.apply_account_update(AccountStateUpdate {
-            provider_id: None,
-            provider_role: None,
+            provider_id: Some("test-primary".to_string()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             pool_amm_id: Pubkey::new_unique(),
             base_mint: mint,
             bonding_curve,
@@ -11151,10 +11151,13 @@ mod tests {
             slot,
             write_version: Some(1),
             txn_signature: None,
-            source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            account_data_len: None,
-            account_data_hash: None,
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(bonding_curve),
+            account_data_len: Some(56),
+            account_data_hash: Some(format!(
+                "{slot:016x}{receive_ts_ms:016x}{:016x}{:016x}",
+                210_000_000_000_u64, 760_000_000_000_000_u64
+            )),
             receive_ts_ms,
             receive_seq: 1,
             curve_finality: CurveFinality::Provisional,
@@ -11177,8 +11180,10 @@ mod tests {
         let source_account_pubkey = Pubkey::new_unique();
         let source_owner = Pubkey::new_unique();
         let apply_result = account_state_core.apply_account_update(AccountStateUpdate {
-            provider_id: None,
-            provider_role: None,
+            // This helper intentionally creates a canonical raw-primary
+            // mutation. RPC refreshes that follow it are observation-only.
+            provider_id: Some("test-primary".to_string()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             pool_amm_id: Pubkey::new_unique(),
             base_mint: mint,
             bonding_curve,
@@ -11191,7 +11196,9 @@ mod tests {
             source_account_pubkey: Some(source_account_pubkey),
             source_account_owner_or_program: Some(source_owner),
             account_data_len: Some(512),
-            account_data_hash: Some("test-blake3-account-data-hash".to_string()),
+            account_data_hash: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
             receive_ts_ms,
             receive_seq: 1,
             curve_finality: CurveFinality::Provisional,
@@ -11205,7 +11212,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_rpc_refresh_updates_quote_observation_without_vitality_activity() {
+    fn unchanged_rpc_refresh_is_observation_only_without_vitality_activity() {
         let account_state_core = AccountStateReducer::new();
         let mint = Pubkey::new_unique();
         let bonding_curve = Pubkey::new_unique();
@@ -11237,7 +11244,8 @@ mod tests {
             token_reserves: 760_000_000_000_000,
             is_complete: 0,
             // A node may be far ahead of the Geyser event that supplied the
-            // canonical state.  This must refresh only the quote boundary.
+            // canonical state. This is diagnostic evidence only: it cannot
+            // refresh a canonical quote boundary or lifecycle timestamp.
             slot: 500,
             write_version: Some(0),
             txn_signature: None,
@@ -11252,7 +11260,7 @@ mod tests {
         };
         assert_eq!(
             account_state_core.apply_rpc_refresh(refresh),
-            RpcRefreshResult::ObservationRefreshed
+            RpcRefreshResult::ObservationMatchesCanonical
         );
 
         let refreshed_state = account_state_core
@@ -11262,7 +11270,7 @@ mod tests {
             .ingest_canonical_state(&refreshed_state, 8, 60_000)
             .clone();
 
-        assert_eq!(refreshed.timestamp_ms, 4_000);
+        assert_eq!(refreshed.timestamp_ms, initial.timestamp_ms);
         assert_eq!(refreshed.tx_count, initial.tx_count);
         assert_eq!(timeline.clone_snapshots().len(), 1);
         assert!(
@@ -11760,7 +11768,7 @@ mod tests {
             .expect("runtime pool state sample row");
         assert_eq!(
             pool_state_row["payload"]["record"]["account_data_hash"],
-            "test-blake3-account-data-hash"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert_eq!(
             pool_state_row["payload"]["record"]["source_account_slot"],

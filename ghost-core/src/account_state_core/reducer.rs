@@ -1,4 +1,8 @@
-use super::monotonic_guard::MonotonicUpdateGuard;
+use super::observation_arbiter::{
+    AccountMutationVersionV1, AccountObservationApplyResultV1, AccountObservationArbiter,
+    AccountObservationArbiterSnapshotV1, AccountObservationClassificationV1,
+    AccountObservationDecisionV1, AccountObservationOutcomeV1, AccountProviderAgreementV1,
+};
 use super::types::{
     AccountStateFeatures, AccountStateReserveVelocitySnapshotV1, AccountStateUpdate,
     AccountUpdateRejectReason, AccountUpdateResult, BootstrapHints, BootstrapPoolState,
@@ -8,7 +12,10 @@ use crate::market_state::BondingCurve;
 use crate::PROTOCOL_GENESIS_TOKEN_TOTAL_SUPPLY;
 use dashmap::DashMap;
 use solana_sdk::pubkey::Pubkey;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
@@ -17,7 +24,7 @@ const PUMP_TOKEN_DECIMAL_FACTOR_F64: f64 = 1_000_000.0;
 #[derive(Debug, Default)]
 pub struct AccountStateReducer {
     states: DashMap<Pubkey, CanonicalPoolState>,
-    update_guards: DashMap<Pubkey, MonotonicUpdateGuard>,
+    account_observation_arbiters: DashMap<Pubkey, Arc<Mutex<AccountObservationArbiter>>>,
     bootstrap_states: DashMap<Pubkey, BootstrapPoolState>,
     reserve_velocity_evidence: DashMap<Pubkey, AccountStateReserveVelocitySnapshotV1>,
     recv_seq_counter: AtomicU64,
@@ -52,21 +59,75 @@ impl AccountStateReducer {
         );
     }
 
+    /// Compatibility wrapper for existing callers that only need the legacy
+    /// applied/rejected shape.  New active ingest code should use
+    /// [`Self::apply_account_observation`] to retain the typed decision.
     #[must_use]
     pub fn apply_account_update(&self, update: AccountStateUpdate) -> AccountUpdateResult {
-        let mut guard = self.update_guards.entry(update.base_mint).or_default();
-        let last_slot = guard.last_accepted_slot;
-        let last_recv_seq = guard.last_accepted_recv_seq;
-        if !guard.accept(update.slot, update.write_version, update.receive_seq) {
-            return AccountUpdateResult::Rejected(rejection_reason(
-                last_slot,
-                last_recv_seq,
-                update.slot,
-                update.receive_seq,
-            ));
-        }
-        drop(guard);
+        self.apply_account_observation(update)
+            .into_account_update_result()
+    }
 
+    /// Classify one raw account observation exactly once and apply it to
+    /// canonical state only when the arbiter returns `AppliedNewMutation`.
+    ///
+    /// The per-mint mutex is intentionally held through the infallible reducer
+    /// mutation.  This prevents two concurrently delivered observations of the
+    /// same account from both passing arbitration and then reordering their
+    /// canonical writes.  It is never held across an async await point.
+    #[must_use]
+    pub fn apply_account_observation(
+        &self,
+        update: AccountStateUpdate,
+    ) -> AccountObservationApplyResultV1 {
+        let arbiter = self
+            .account_observation_arbiters
+            .entry(update.base_mint)
+            .or_insert_with(|| Arc::new(Mutex::new(AccountObservationArbiter::default())))
+            .clone();
+        let mut arbiter = match arbiter.lock() {
+            Ok(guard) => guard,
+            // Do not recover a potentially partial version/hash watermark.
+            // Creating a fresh arbiter, or applying through poisoned state,
+            // could both double-apply a canonical mutation.  Fail closed
+            // instead and retain the poisoned map entry for diagnosis.
+            Err(_) => {
+                let decision = AccountObservationDecisionV1 {
+                    classification: AccountObservationClassificationV1::ArbiterStateUnavailable,
+                    outcome: AccountObservationOutcomeV1::RejectedInvalidObservation,
+                    canonical_apply: false,
+                    provider_agreement: AccountProviderAgreementV1::NotObserved,
+                    mutation_version: Some(AccountMutationVersionV1 {
+                        pubkey: update.source_account_pubkey.unwrap_or(update.bonding_curve),
+                        slot: update.slot,
+                        write_version: update.write_version,
+                    }),
+                    data_hash_blake3: None,
+                };
+                self.record_account_observation_decision_metric(&decision);
+                return AccountObservationApplyResultV1 {
+                    decision,
+                    canonical_result: None,
+                };
+            }
+        };
+        let decision = arbiter.arbitrate(&update);
+        self.record_account_observation_decision_metric(&decision);
+        if !decision.canonical_apply {
+            return AccountObservationApplyResultV1 {
+                decision,
+                canonical_result: None,
+            };
+        }
+
+        let canonical_result = self.apply_canonical_account_mutation(update);
+        AccountObservationApplyResultV1 {
+            decision,
+            canonical_result: Some(canonical_result),
+        }
+    }
+
+    fn apply_canonical_account_mutation(&self, update: AccountStateUpdate) -> AccountUpdateResult {
         let bootstrap = self
             .bootstrap_states
             .get(&update.base_mint)
@@ -91,7 +152,16 @@ impl AccountStateReducer {
         let market_cap_sol = normalized_market_cap_sol(&curve);
         let bonding_curve_progress = curve.get_bonding_progress() as f64 / 100.0;
         let is_complete = update.is_complete != 0;
-        let state_phase = if is_complete {
+        // A Pump.fun completion promotes the pool to `Migrated`. Later raw
+        // PumpSwap observations may legitimately carry a layout-local
+        // `is_complete = 0`; they must never demote the canonical lifecycle
+        // back to `Canonical` merely because they originate from the new
+        // source account.
+        let state_phase = if is_complete
+            || previous_state
+                .as_ref()
+                .is_some_and(|state| matches!(state.state_phase, StatePhase::Migrated))
+        {
             StatePhase::Migrated
         } else {
             StatePhase::Canonical
@@ -229,12 +299,15 @@ impl AccountStateReducer {
         }
     }
 
-    /// Apply a processed-RPC point observation for an already canonical pool.
+    /// Observe a processed-RPC point for an already canonical pool.
     ///
-    /// The RPC context slot says only that a node observed the account at that
-    /// slot.  It is intentionally excluded from `update_guards` and from the
-    /// reducer-wide Geyser ordering watermark: allowing it to advance either
-    /// would let polling reject a later-delivered real account write.
+    /// This method intentionally does not mutate [`CanonicalPoolState`]. A
+    /// processed RPC reply has neither a raw provider role nor a Yellowstone
+    /// account-write version, so allowing it to alter reserves, account hash,
+    /// phase, counters, velocity, or freshness would create a second canonical
+    /// authority beside the raw-primary arbiter. The result only tells the
+    /// polling caller whether the captured payload agrees with the current
+    /// raw-primary state.
     #[must_use]
     pub fn apply_rpc_refresh(&self, update: AccountStateUpdate) -> RpcRefreshResult {
         if !matches!(update.source, UpdateSource::RpcRefresh) {
@@ -246,7 +319,7 @@ impl AccountStateReducer {
             );
         };
 
-        let mut state = match self.states.get_mut(&update.base_mint) {
+        let state = match self.states.get(&update.base_mint) {
             Some(state) => state,
             None => {
                 return RpcRefreshResult::Rejected(
@@ -260,99 +333,39 @@ impl AccountStateReducer {
             );
         }
 
-        let next_observation_ts_ms = state.last_observed_ts_ms.max(update.receive_ts_ms);
-        let next_observation_slot = state.last_observed_slot.max(update.slot);
-        let next_observation_count = state
-            .observation_count
-            .max(state.update_count)
-            .saturating_add(1);
         let same_account_data = state.account_data_hash.as_deref() == Some(account_data_hash);
         if same_account_data {
-            state.last_observed_slot = next_observation_slot;
-            state.last_observed_ts_ms = next_observation_ts_ms;
-            state.last_observation_source = UpdateSource::RpcRefresh;
-            state.observation_count = next_observation_count;
-            return RpcRefreshResult::ObservationRefreshed;
-        }
-
-        let token_total_supply = state.token_total_supply;
-        let curve = bonding_curve_from_update(&update, token_total_supply);
-        let price_sol = normalized_price_sol(&curve);
-        let market_cap_sol = normalized_market_cap_sol(&curve);
-        let bonding_curve_progress = curve.get_bonding_progress() as f64 / 100.0;
-        let is_complete = update.is_complete != 0;
-        let next_phase = if is_complete {
-            StatePhase::Migrated
-        } else {
-            StatePhase::Canonical
-        };
-        if !state.state_phase.can_transition_to(next_phase) {
-            return RpcRefreshResult::Rejected(
-                AccountUpdateRejectReason::RpcRefreshPhaseRegression,
+            metrics::counter!(
+                "account_rpc_refresh_observation_total",
+                1_u64,
+                "agreement" => "matches_canonical"
             );
+            return RpcRefreshResult::ObservationMatchesCanonical;
         }
-
-        let previous_real_sol_reserves = state.real_sol_reserves;
-        let previous_data_change_ts_ms = state.last_data_change_ts_ms.max(state.last_update_ts_ms);
-        let reserve_velocity_sol_per_sec = compute_reserve_velocity_sol_per_sec(
-            previous_real_sol_reserves,
-            curve.real_sol_reserves,
-            previous_data_change_ts_ms,
-            update.receive_ts_ms,
+        metrics::counter!(
+            "account_rpc_refresh_observation_total",
+            1_u64,
+            "agreement" => "diverges_from_canonical"
         );
-        let interval_ms = update.receive_ts_ms.checked_sub(previous_data_change_ts_ms);
-        let reserve_velocity_status = match interval_ms {
-            Some(0) => crate::metric_contracts::ReserveVelocityStatusV1::ZeroDeltaTime,
-            Some(_) => crate::metric_contracts::ReserveVelocityStatusV1::Measured,
-            None => crate::metric_contracts::ReserveVelocityStatusV1::Unavailable,
-        };
-        let previous_data_change_count = state.data_change_count.max(state.update_count);
-        let data_change_count = previous_data_change_count.saturating_add(1);
-        let initial_price_sol = normalize_initial_price(state.initial_price_sol, state.price_sol);
-
-        state.virtual_sol_reserves = curve.virtual_sol_reserves;
-        state.virtual_token_reserves = curve.virtual_token_reserves;
-        state.real_sol_reserves = curve.real_sol_reserves;
-        state.real_token_reserves = curve.real_token_reserves;
-        state.bonding_curve_progress = bonding_curve_progress;
-        state.price_sol = price_sol;
-        state.market_cap_sol = market_cap_sol;
-        state.is_complete = is_complete;
-        state.source_account_pubkey = update.source_account_pubkey;
-        state.source_account_owner_or_program = update.source_account_owner_or_program;
-        state.account_data_len = update.account_data_len;
-        state.account_data_hash = update.account_data_hash;
-        state.curve_finality = update.curve_finality;
-        state.state_phase = next_phase;
-        state.update_count = data_change_count;
-        state.initial_price_sol = initial_price_sol;
-        state.price_change_since_t0_pct = compute_price_change_pct(initial_price_sol, price_sol);
-        state.reserve_velocity_sol_per_sec = reserve_velocity_sol_per_sec;
-        state.last_observed_slot = next_observation_slot;
-        state.last_observed_ts_ms = next_observation_ts_ms;
-        state.last_observation_source = UpdateSource::RpcRefresh;
-        state.observation_count = next_observation_count;
-        state.last_data_change_ts_ms = update.receive_ts_ms;
-        state.last_data_change_source = UpdateSource::RpcRefresh;
-        state.data_change_count = data_change_count;
-
-        self.reserve_velocity_evidence.insert(
-            update.base_mint,
-            AccountStateReserveVelocitySnapshotV1 {
-                legacy_velocity_sol_per_sec: reserve_velocity_sol_per_sec,
-                previous_real_sol_reserves_lamports: Some(previous_real_sol_reserves),
-                current_real_sol_reserves_lamports: Some(curve.real_sol_reserves),
-                interval_ms,
-                accepted_update_count: data_change_count,
-                status: reserve_velocity_status,
-            },
-        );
-        RpcRefreshResult::DataChanged
+        RpcRefreshResult::ObservationDivergesFromCanonical
     }
 
     #[must_use]
     pub fn get_canonical_state(&self, mint: &Pubkey) -> Option<CanonicalPoolState> {
         self.states.get(mint).map(|entry| entry.clone())
+    }
+
+    /// Read-only arbitration evidence for one pool/mint.  This diagnostic
+    /// snapshot is intentionally outside `CanonicalPoolState` and cannot
+    /// affect feature materialization or policy evaluation.
+    #[must_use]
+    pub fn account_observation_arbiter_snapshot(
+        &self,
+        mint: &Pubkey,
+    ) -> Option<AccountObservationArbiterSnapshotV1> {
+        let arbiter = self.account_observation_arbiters.get(mint)?.clone();
+        let guard = arbiter.lock().ok()?;
+        Some(guard.snapshot())
     }
 
     #[must_use]
@@ -438,6 +451,9 @@ impl AccountStateReducer {
             .unwrap_or(false)
     }
 
+    /// Allocates local transport metadata.  It is deliberately not part of
+    /// account chain ordering, duplicate identity, or canonical state
+    /// authority.
     #[must_use]
     pub fn next_recv_seq(&self) -> u64 {
         self.recv_seq_counter.fetch_add(1, Ordering::Relaxed) + 1
@@ -454,7 +470,7 @@ impl AccountStateReducer {
     pub fn remove_pool(&self, mint: &Pubkey) {
         self.states.remove(mint);
         self.bootstrap_states.remove(mint);
-        self.update_guards.remove(mint);
+        self.account_observation_arbiters.remove(mint);
     }
 
     #[must_use]
@@ -466,20 +482,18 @@ impl AccountStateReducer {
     pub fn bootstrap_pool_count(&self) -> usize {
         self.bootstrap_states.len()
     }
-}
 
-fn rejection_reason(
-    last_slot: u64,
-    last_recv_seq: u64,
-    slot: u64,
-    recv_seq: u64,
-) -> AccountUpdateRejectReason {
-    if slot < last_slot {
-        AccountUpdateRejectReason::OlderSlot
-    } else {
-        let _ = last_recv_seq;
-        let _ = recv_seq;
-        AccountUpdateRejectReason::OlderOrDuplicateReceiveSeq
+    fn record_account_observation_decision_metric(&self, decision: &AccountObservationDecisionV1) {
+        metrics::counter!(
+            "account_observation_arbiter_decision_total",
+            1u64,
+            "classification" => decision.classification.as_str(),
+            "outcome" => decision.outcome.as_str(),
+            "provider_agreement" => decision.provider_agreement.as_str(),
+        );
+        if decision.canonical_apply {
+            metrics::counter!("account_observation_arbiter_canonical_mutation_total", 1u64);
+        }
     }
 }
 
@@ -487,13 +501,13 @@ fn rejection_reason(
 mod tests {
     use super::*;
     use crate::account_state_core::types::UpdateSource;
-    use crate::CurveFinality;
+    use crate::{CurveFinality, RawProviderRoleV1};
     use solana_sdk::pubkey::Pubkey;
 
     fn sample_update(slot: u64, receive_seq: u64) -> AccountStateUpdate {
         AccountStateUpdate {
-            provider_id: None,
-            provider_role: None,
+            provider_id: Some("test-primary".to_owned()),
+            provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
             pool_amm_id: Pubkey::new_unique(),
             base_mint: Pubkey::new_unique(),
             bonding_curve: Pubkey::new_unique(),
@@ -503,10 +517,13 @@ mod tests {
             slot,
             write_version: Some(slot),
             txn_signature: None,
+            // Tests which overwrite `bonding_curve` intentionally leave this
+            // absent so the arbiter exercises its deterministic curve-key
+            // compatibility fallback instead of inventing a second account.
             source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            account_data_len: None,
-            account_data_hash: None,
+            source_account_owner_or_program: Some(Pubkey::new_unique()),
+            account_data_len: Some(56),
+            account_data_hash: Some(format!("{slot:064x}")),
             receive_ts_ms: slot.saturating_mul(1000),
             receive_seq,
             curve_finality: CurveFinality::Provisional,
@@ -525,7 +542,9 @@ mod tests {
             receive_ts_ms: ts_ms,
             receive_seq: 999,
             source: UpdateSource::RpcRefresh,
-            account_data_hash: Some("rpc-account-data".to_string()),
+            account_data_hash: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
             account_data_len: Some(16),
             source_account_pubkey: Some(canonical.bonding_curve),
             ..canonical.clone()
@@ -533,10 +552,11 @@ mod tests {
     }
 
     #[test]
-    fn identical_rpc_refresh_updates_observation_without_activity_or_geyser_ordering() {
+    fn matching_rpc_refresh_is_observation_only_and_does_not_change_canonical_state() {
         let reducer = AccountStateReducer::new();
         let mut canonical = sample_update(100, 1);
-        canonical.account_data_hash = Some("rpc-account-data".to_string());
+        canonical.account_data_hash =
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
         canonical.account_data_len = Some(16);
         canonical.source_account_pubkey = Some(canonical.bonding_curve);
         assert_eq!(
@@ -553,21 +573,12 @@ mod tests {
         let refresh = rpc_refresh_from(&canonical, 500, 500_000);
         assert_eq!(
             reducer.apply_rpc_refresh(refresh),
-            RpcRefreshResult::ObservationRefreshed
+            RpcRefreshResult::ObservationMatchesCanonical
         );
         let after = reducer
             .get_canonical_state(&canonical.base_mint)
             .expect("canonical state after refresh");
-        assert_eq!(after.last_observed_slot, 500);
-        assert_eq!(after.last_observed_ts_ms, 500_000);
-        assert_eq!(after.last_observation_source, UpdateSource::RpcRefresh);
-        assert_eq!(after.last_data_change_ts_ms, before.last_data_change_ts_ms);
-        assert_eq!(after.data_change_count, before.data_change_count);
-        assert_eq!(after.update_count, before.update_count);
-        assert_eq!(
-            after.reserve_velocity_sol_per_sec,
-            before.reserve_velocity_sol_per_sec
-        );
+        assert_eq!(after, before);
         assert_eq!(
             reducer.get_reserve_velocity_snapshot(&canonical.base_mint),
             Some(velocity_before)
@@ -587,10 +598,11 @@ mod tests {
     }
 
     #[test]
-    fn changed_rpc_refresh_updates_data_change_without_advancing_geyser_guard() {
+    fn diverging_rpc_refresh_cannot_overwrite_raw_primary_or_break_duplicate_suppression() {
         let reducer = AccountStateReducer::new();
         let mut canonical = sample_update(100, 1);
-        canonical.account_data_hash = Some("canonical-account-data".to_string());
+        canonical.account_data_hash =
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string());
         canonical.account_data_len = Some(16);
         canonical.source_account_pubkey = Some(canonical.bonding_curve);
         assert_eq!(
@@ -599,20 +611,26 @@ mod tests {
         );
 
         let mut refresh = rpc_refresh_from(&canonical, 500, 500_000);
-        refresh.account_data_hash = Some("changed-rpc-account-data".to_string());
+        refresh.account_data_hash =
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string());
         refresh.sol_reserves = refresh.sol_reserves.saturating_add(1_000);
         assert_eq!(
             reducer.apply_rpc_refresh(refresh),
-            RpcRefreshResult::DataChanged
+            RpcRefreshResult::ObservationDivergesFromCanonical
         );
         let state = reducer
             .get_canonical_state(&canonical.base_mint)
             .expect("canonical state after changed refresh");
-        assert_eq!(state.last_update_slot, 100);
-        assert_eq!(state.last_observed_slot, 500);
-        assert_eq!(state.last_data_change_source, UpdateSource::RpcRefresh);
-        assert_eq!(state.data_change_count, 2);
+        assert_eq!(state.account_data_hash, canonical.account_data_hash);
+        assert_eq!(state.virtual_sol_reserves, canonical.sol_reserves);
+        assert_eq!(state.update_count, 1);
+        assert_eq!(state.data_change_count, 1);
         assert_eq!(reducer.latest_observed_slot(), Some(100));
+        assert_eq!(
+            reducer.apply_account_update(canonical),
+            AccountUpdateResult::Rejected(AccountUpdateRejectReason::DuplicateObservation),
+            "a raw-primary replay must remain a duplicate after a divergent RPC observation"
+        );
     }
 
     #[test]
@@ -638,7 +656,7 @@ mod tests {
         stale.pool_amm_id = pool_amm_id;
         assert_eq!(
             reducer.apply_account_update(stale),
-            AccountUpdateResult::Rejected(AccountUpdateRejectReason::OlderSlot)
+            AccountUpdateResult::Rejected(AccountUpdateRejectReason::StaleObservation)
         );
         assert_eq!(reducer.latest_observed_slot(), Some(100));
 
@@ -662,7 +680,8 @@ mod tests {
         update.source_account_pubkey = Some(source_account_pubkey);
         update.source_account_owner_or_program = Some(source_owner);
         update.account_data_len = Some(56);
-        update.account_data_hash = Some("blake3-raw-account-bytes".to_string());
+        update.account_data_hash =
+            Some("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string());
 
         assert_eq!(
             reducer.apply_account_update(update.clone()),
@@ -678,7 +697,7 @@ mod tests {
         assert_eq!(state.account_data_len, Some(56));
         assert_eq!(
             state.account_data_hash.as_deref(),
-            Some("blake3-raw-account-bytes")
+            Some("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
         );
     }
 
@@ -690,8 +709,6 @@ mod tests {
         let pool_amm_id = Pubkey::new_unique();
         let source_account_pubkey_a = Pubkey::new_unique();
         let source_owner_a = Pubkey::new_unique();
-        let source_account_pubkey_b = Pubkey::new_unique();
-        let source_owner_b = Pubkey::new_unique();
 
         let mut first = sample_update(200, 1);
         first.base_mint = mint;
@@ -701,7 +718,8 @@ mod tests {
         first.source_account_pubkey = Some(source_account_pubkey_a);
         first.source_account_owner_or_program = Some(source_owner_a);
         first.account_data_len = Some(111);
-        first.account_data_hash = Some("blake3-hash-a".to_string());
+        first.account_data_hash =
+            Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string());
         assert_eq!(
             reducer.apply_account_update(first),
             AccountUpdateResult::Applied
@@ -712,10 +730,13 @@ mod tests {
         second.bonding_curve = bonding_curve;
         second.pool_amm_id = pool_amm_id;
         second.write_version = Some(9);
-        second.source_account_pubkey = Some(source_account_pubkey_b);
-        second.source_account_owner_or_program = Some(source_owner_b);
+        // A pool/mint is bound to one observed account pubkey.  A changed
+        // source account is an identity conflict, not a newer mutation.
+        second.source_account_pubkey = Some(source_account_pubkey_a);
+        second.source_account_owner_or_program = Some(source_owner_a);
         second.account_data_len = Some(222);
-        second.account_data_hash = Some("blake3-hash-b".to_string());
+        second.account_data_hash =
+            Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string());
         assert_eq!(
             reducer.apply_account_update(second),
             AccountUpdateResult::Applied
@@ -726,10 +747,13 @@ mod tests {
             .expect("canonical state should exist after latest update");
         assert_eq!(state.last_update_slot, 201);
         assert_eq!(state.source_write_version, Some(9));
-        assert_eq!(state.source_account_pubkey, Some(source_account_pubkey_b));
-        assert_eq!(state.source_account_owner_or_program, Some(source_owner_b));
+        assert_eq!(state.source_account_pubkey, Some(source_account_pubkey_a));
+        assert_eq!(state.source_account_owner_or_program, Some(source_owner_a));
         assert_eq!(state.account_data_len, Some(222));
-        assert_eq!(state.account_data_hash.as_deref(), Some("blake3-hash-b"));
+        assert_eq!(
+            state.account_data_hash.as_deref(),
+            Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        );
     }
 
     #[test]

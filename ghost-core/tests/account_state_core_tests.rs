@@ -3,8 +3,12 @@ use ghost_core::account_state_core::types::{
     AccountStateUpdate, AccountUpdateRejectReason, AccountUpdateResult, BootstrapHints, StatePhase,
     UpdateSource,
 };
-use ghost_core::CurveFinality;
+use ghost_core::account_state_core::{
+    AccountObservationClassificationV1, AccountObservationOutcomeV1,
+};
+use ghost_core::{CurveFinality, RawProviderRoleV1};
 use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
 
 fn pk(seed: u8) -> Pubkey {
     Pubkey::new_from_array([seed; 32])
@@ -21,8 +25,8 @@ fn account_update(
     receive_seq: u64,
 ) -> AccountStateUpdate {
     AccountStateUpdate {
-        provider_id: None,
-        provider_role: None,
+        provider_id: Some("test-primary".to_owned()),
+        provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
         pool_amm_id,
         base_mint,
         bonding_curve,
@@ -30,12 +34,15 @@ fn account_update(
         token_reserves,
         is_complete: 0,
         slot,
-        write_version: None,
+        write_version: Some(slot),
         txn_signature: None,
         source_account_pubkey: None,
-        source_account_owner_or_program: None,
-        account_data_len: None,
-        account_data_hash: None,
+        source_account_owner_or_program: Some(pk(250)),
+        account_data_len: Some(56),
+        account_data_hash: Some(format!(
+            "{slot:016x}{sol_reserves:016x}{token_reserves:016x}{:016x}",
+            0_u64
+        )),
         receive_ts_ms,
         receive_seq,
         curve_finality: CurveFinality::Finalized,
@@ -44,11 +51,11 @@ fn account_update(
 }
 
 #[test]
-fn provider_metadata_is_additive_and_does_not_change_canonical_state() {
+fn missing_provider_provenance_fails_closed_without_creating_canonical_state() {
     let pool_amm_id = pk(31);
     let base_mint = pk(32);
     let bonding_curve = pk(33);
-    let baseline = account_update(
+    let mut without_provenance = account_update(
         pool_amm_id,
         base_mint,
         bonding_curve,
@@ -58,31 +65,68 @@ fn provider_metadata_is_additive_and_does_not_change_canonical_state() {
         1_000,
         1,
     );
-    let mut with_provenance = baseline.clone();
-    with_provenance.provider_id = Some("raw-primary".to_string());
-    with_provenance.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
-    with_provenance.txn_signature = Some(solana_sdk::signature::Signature::new_unique());
+    without_provenance.provider_id = None;
+    without_provenance.provider_role = None;
+    let primary = account_update(
+        pool_amm_id,
+        base_mint,
+        bonding_curve,
+        42_500_000_000,
+        1_000_000,
+        10,
+        1_000,
+        1,
+    );
+    let reducer = AccountStateReducer::new();
+    assert_eq!(
+        reducer.apply_account_update(without_provenance),
+        AccountUpdateResult::Rejected(AccountUpdateRejectReason::MissingProviderProvenance)
+    );
+    assert!(reducer.get_canonical_state(&base_mint).is_none());
+    assert_eq!(
+        reducer.apply_account_update(primary),
+        AccountUpdateResult::Applied
+    );
+    assert!(reducer.get_canonical_state(&base_mint).is_some());
+}
 
-    let baseline_reducer = AccountStateReducer::new();
-    let provenance_reducer = AccountStateReducer::new();
+#[test]
+fn transaction_observed_bootstrap_cannot_bypass_raw_account_arbitration() {
+    let pool_amm_id = pk(34);
+    let base_mint = pk(35);
+    let bonding_curve = pk(36);
+    let mut tx_derived = account_update(
+        pool_amm_id,
+        base_mint,
+        bonding_curve,
+        42_500_000_000,
+        1_000_000,
+        10,
+        1_000,
+        1,
+    );
+    tx_derived.source = UpdateSource::TxObservedBootstrap;
+
+    let reducer = AccountStateReducer::new();
+    let result = reducer.apply_account_observation(tx_derived);
     assert_eq!(
-        baseline_reducer.apply_account_update(baseline),
-        AccountUpdateResult::Applied
+        result.decision.classification,
+        AccountObservationClassificationV1::UnsupportedUpdateSource
     );
     assert_eq!(
-        provenance_reducer.apply_account_update(with_provenance),
-        AccountUpdateResult::Applied
+        result.decision.outcome,
+        AccountObservationOutcomeV1::RejectedInvalidObservation
     );
-    assert_eq!(
-        baseline_reducer.get_canonical_state(&base_mint),
-        provenance_reducer.get_canonical_state(&base_mint),
-        "provider metadata and txn_signature must not steer AccountStateCore in PR 1A"
+    assert!(!result.did_apply());
+    assert!(
+        reducer.get_canonical_state(&base_mint).is_none(),
+        "parsed transaction data must not become canonical AccountStateCore authority"
     );
 }
 
 #[test]
 fn old_account_state_update_json_defaults_new_metadata_to_none() {
-    let update = account_update(
+    let mut update = account_update(
         pk(41),
         pk(42),
         pk(43),
@@ -92,6 +136,9 @@ fn old_account_state_update_json_defaults_new_metadata_to_none() {
         1_000,
         1,
     );
+    update.provider_id = None;
+    update.provider_role = None;
+    update.txn_signature = None;
     let value = serde_json::to_value(&update).expect("serialize baseline account update");
     let object = value.as_object().expect("account update object");
     assert!(!object.contains_key("provider_id"));
@@ -163,7 +210,7 @@ fn bootstrap_state_stays_non_canonical_until_first_account_update() {
 }
 
 #[test]
-fn reducer_rejects_out_of_order_updates_without_mutating_state() {
+fn reducer_classifies_same_version_same_hash_as_duplicate_without_mutating_state() {
     let reducer = AccountStateReducer::new();
     let base_mint = pk(4);
 
@@ -186,13 +233,13 @@ fn reducer_rejects_out_of_order_updates_without_mutating_state() {
             pk(5),
             base_mint,
             pk(6),
-            999,
+            10,
             20,
             100,
             1_100,
-            1,
+            99,
         )),
-        AccountUpdateResult::Rejected(AccountUpdateRejectReason::OlderOrDuplicateReceiveSeq)
+        AccountUpdateResult::Rejected(AccountUpdateRejectReason::DuplicateObservation)
     );
 
     let state = reducer
@@ -202,6 +249,80 @@ fn reducer_rejects_out_of_order_updates_without_mutating_state() {
     assert_eq!(state.update_count, 1);
     assert_eq!(state.last_update_slot, 100);
     assert_eq!(state.last_update_ts_ms, 1_000);
+}
+
+#[test]
+fn raw_primary_pumpfun_completion_allows_controlled_pumpswap_account_identity_transition() {
+    const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+    const PUMP_SWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+
+    let reducer = AccountStateReducer::new();
+    let mint = pk(70);
+    let pumpfun_curve = pk(71);
+    let pumpswap_pool = pk(72);
+    let pumpfun_owner = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("valid pump.fun ID");
+    let pumpswap_owner = Pubkey::from_str(PUMP_SWAP_PROGRAM_ID).expect("valid PumpSwap ID");
+
+    let mut canonical = account_update(pk(73), mint, pumpfun_curve, 10_000, 20_000, 100, 1_000, 1);
+    canonical.source_account_pubkey = Some(pumpfun_curve);
+    canonical.source_account_owner_or_program = Some(pumpfun_owner);
+    assert_eq!(
+        reducer.apply_account_update(canonical.clone()),
+        AccountUpdateResult::Applied
+    );
+
+    let mut completion = canonical.clone();
+    completion.slot = 101;
+    completion.write_version = Some(2);
+    completion.receive_ts_ms = 2_000;
+    completion.receive_seq = 2;
+    completion.is_complete = 1;
+    completion.account_data_hash =
+        Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned());
+    assert_eq!(
+        reducer.apply_account_update(completion),
+        AccountUpdateResult::Applied
+    );
+    assert_eq!(
+        reducer
+            .get_canonical_state(&mint)
+            .expect("completion state")
+            .state_phase,
+        StatePhase::Migrated
+    );
+
+    let mut pumpswap = canonical;
+    pumpswap.pool_amm_id = pk(74);
+    pumpswap.bonding_curve = pumpswap_pool;
+    pumpswap.source_account_pubkey = Some(pumpswap_pool);
+    pumpswap.source_account_owner_or_program = Some(pumpswap_owner);
+    pumpswap.slot = 102;
+    pumpswap.write_version = Some(3);
+    pumpswap.receive_ts_ms = 3_000;
+    pumpswap.receive_seq = 3;
+    // PumpSwap's local layout does not need to reuse Pump.fun's completion
+    // bit. The canonical phase must stay migrated after the proven transition.
+    pumpswap.is_complete = 0;
+    pumpswap.account_data_hash =
+        Some("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned());
+    pumpswap.sol_reserves = 30_000;
+    assert_eq!(
+        reducer.apply_account_update(pumpswap),
+        AccountUpdateResult::Applied
+    );
+
+    let state = reducer
+        .get_canonical_state(&mint)
+        .expect("PumpSwap state must be canonical after controlled transition");
+    assert_eq!(state.bonding_curve, pumpswap_pool);
+    assert_eq!(state.source_account_pubkey, Some(pumpswap_pool));
+    assert_eq!(state.source_account_owner_or_program, Some(pumpswap_owner));
+    assert_eq!(state.state_phase, StatePhase::Migrated);
+    let snapshot = reducer
+        .account_observation_arbiter_snapshot(&mint)
+        .expect("arbiter snapshot");
+    assert_eq!(snapshot.bound_account_pubkey, Some(pumpswap_pool));
+    assert_eq!(snapshot.identity_transitions.len(), 1);
 }
 
 #[test]
@@ -320,7 +441,7 @@ fn reducer_rejects_older_slot_even_when_receive_seq_is_newer() {
             1_100,
             99,
         )),
-        AccountUpdateResult::Rejected(AccountUpdateRejectReason::OlderSlot)
+        AccountUpdateResult::Rejected(AccountUpdateRejectReason::StaleObservation)
     );
 
     let state = reducer

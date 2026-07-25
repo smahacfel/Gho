@@ -13,7 +13,7 @@ use ghost_core::tx_intelligence::types::{
     CPV_ROLLING_STATE_UNAVAILABLE_REASON, FTDI_INSUFFICIENT_BUYS_REASON,
     SFD_PARTIAL_BALANCE_COVERAGE_REASON,
 };
-use ghost_core::{CurveFinality, CurveFreshnessState, EventSemanticEnvelope};
+use ghost_core::{CurveFinality, CurveFreshnessState, EventSemanticEnvelope, RawProviderRoleV1};
 use ghost_launcher::components::gatekeeper::{
     GatekeeperIngressOutcome, GatekeeperVerdict, GatekeeperVerdictType, ProsperityRejectTrigger,
     SybilInterferencePattern, SybilLeadSignal,
@@ -909,8 +909,8 @@ fn account_update(
     token_reserves: u64,
 ) -> AccountStateUpdate {
     AccountStateUpdate {
-        provider_id: None,
-        provider_role: None,
+        provider_id: Some("test-primary".to_owned()),
+        provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
         pool_amm_id: pool_id,
         base_mint,
         bonding_curve,
@@ -920,10 +920,13 @@ fn account_update(
         slot: 1,
         write_version: Some(receive_ts_ms),
         txn_signature: None,
-        source_account_pubkey: None,
-        source_account_owner_or_program: None,
-        account_data_len: None,
-        account_data_hash: None,
+        source_account_pubkey: Some(bonding_curve),
+        source_account_owner_or_program: Some(bonding_curve),
+        account_data_len: Some(56),
+        account_data_hash: Some(format!(
+            "{receive_ts_ms:016x}{sol_reserves:016x}{token_reserves:016x}{:016x}",
+            0_u64
+        )),
         receive_ts_ms,
         receive_seq: receive_ts_ms,
         curve_finality: CurveFinality::Finalized,

@@ -468,34 +468,6 @@ fn merge_tx_price_context(
     (reserve_base, reserve_quote, price_quote)
 }
 
-fn raw_tx_curve_reserves(tx: &PoolTransaction) -> Option<(u64, u64)> {
-    if !tx.curve_data_known {
-        return None;
-    }
-
-    let reserve_base = tx.v_tokens_in_bonding_curve.or(tx.reserve_base)?;
-    let reserve_quote = tx.v_sol_in_bonding_curve.or(tx.reserve_quote)?;
-    if !reserve_base.is_finite()
-        || reserve_base <= MIN_RESERVE_THRESHOLD
-        || !reserve_quote.is_finite()
-        || reserve_quote <= MIN_RESERVE_THRESHOLD
-    {
-        return None;
-    }
-
-    let token_reserves = (reserve_base * PUMP_TOKEN_DECIMAL_FACTOR).round();
-    let sol_reserves = (reserve_quote * LAMPORTS_PER_SOL).round();
-    if !token_reserves.is_finite()
-        || token_reserves <= 0.0
-        || !sol_reserves.is_finite()
-        || sol_reserves <= 0.0
-    {
-        return None;
-    }
-
-    Some((sol_reserves as u64, token_reserves as u64))
-}
-
 fn is_no_space_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -3106,49 +3078,23 @@ impl OracleRuntime {
         })
     }
 
-    /// Backward-compatible builder for sources which do not expose raw-provider
-    /// provenance or an account-update transaction signature.
-    fn build_account_state_update(
-        &self,
-        base_mint: &Pubkey,
-        on_chain_sol: u64,
-        on_chain_tok: u64,
-        on_chain_complete: u8,
-        slot: u64,
-        write_version: Option<u64>,
-        account_data_hash: Option<String>,
-        account_data_len: Option<u64>,
-        source_account_pubkey: Option<Pubkey>,
-        source_account_owner_or_program: Option<Pubkey>,
-        curve_finality: CurveFinality,
-        source: UpdateSource,
-        bonding_curve_hint: Option<&Pubkey>,
-    ) -> Option<AccountStateUpdate> {
-        self.build_account_state_update_with_provenance(
-            None,
-            None,
-            base_mint,
-            on_chain_sol,
-            on_chain_tok,
-            on_chain_complete,
-            slot,
-            write_version,
-            None,
-            account_data_hash,
-            account_data_len,
-            source_account_pubkey,
-            source_account_owner_or_program,
-            curve_finality,
-            source,
-            bonding_curve_hint,
-        )
-    }
-
     fn apply_account_state_update(
         &self,
         update: &AccountStateUpdate,
     ) -> ghost_core::account_state_core::types::AccountUpdateResult {
-        let apply_result = self.account_state_core.apply_account_update(update.clone());
+        let observation_result = self
+            .account_state_core
+            .apply_account_observation(update.clone());
+        let canonical_applied = observation_result.did_apply();
+        let decision = observation_result.decision.clone();
+        ::metrics::counter!(
+            "account_update_observation_decision_total",
+            1u64,
+            "classification" => decision.classification.as_str(),
+            "outcome" => decision.outcome.as_str(),
+            "provider_agreement" => decision.provider_agreement.as_str()
+        );
+        let apply_result = observation_result.into_account_update_result();
         match &apply_result {
             ghost_core::account_state_core::types::AccountUpdateResult::Applied => {
                 ::metrics::counter!("account_update_apply_result_total", 1u64, "result" => "applied");
@@ -3183,11 +3129,7 @@ impl OracleRuntime {
                 );
             }
         }
-        if matches!(
-            apply_result,
-            ghost_core::account_state_core::types::AccountUpdateResult::Applied
-                | ghost_core::account_state_core::types::AccountUpdateResult::PromotedFromBootstrap
-        ) {
+        if canonical_applied {
             self.canonical_readiness_notifier
                 .notify_ready(&update.base_mint);
             self.sync_shadow_from_canonical_state(update);
@@ -3198,56 +3140,71 @@ impl OracleRuntime {
             bonding_curve = %update.bonding_curve,
             slot = update.slot,
             source = ?update.source,
+            observation_classification = decision.classification.as_str(),
+            observation_outcome = decision.outcome.as_str(),
+            provider_agreement = decision.provider_agreement.as_str(),
             apply_result = ?apply_result,
             "DIAG_ACCOUNT_UPDATE_APPLIED"
         );
-        if let Some(session) = self.lookup_pool_session(&update.pool_amm_id) {
-            increment_counter!(
-                "oracle_runtime_account_update_session_resolution_total",
-                "status" => "refreshed"
-            );
-            info!(
-                pool = %update.pool_amm_id,
-                base_mint = %update.base_mint,
-                "DIAG_ACCOUNT_UPDATE_SESSION_FOUND"
-            );
-            session
-                .write()
-                .on_account_state_core_updated_from_update(update);
-        } else {
-            let deferred_session_refresh = self.lookup_pool_identity(&update.pool_amm_id).is_some()
-                || self
-                    .lookup_pool_identity_by_base_mint(&update.base_mint)
-                    .is_some()
-                || self
-                    .lookup_pool_identity_by_bonding_curve(&update.bonding_curve)
-                    .is_some()
-                || self.lookup_detected_pool(&update.pool_amm_id).is_some();
-            increment_counter!(
-                "oracle_runtime_account_update_session_resolution_total",
-                "status" => if deferred_session_refresh {
-                    "deferred"
-                } else {
-                    "miss"
-                }
-            );
-            if deferred_session_refresh {
+        if canonical_applied {
+            if let Some(session) = self.lookup_pool_session(&update.pool_amm_id) {
+                increment_counter!(
+                    "oracle_runtime_account_update_session_resolution_total",
+                    "status" => "refreshed"
+                );
                 info!(
                     pool = %update.pool_amm_id,
                     base_mint = %update.base_mint,
-                    bonding_curve = %update.bonding_curve,
-                    slot = update.slot,
-                    "DIAG_ACCOUNT_UPDATE_SESSION_DEFERRED"
+                    "DIAG_ACCOUNT_UPDATE_SESSION_FOUND"
                 );
+                session
+                    .write()
+                    .on_account_state_core_updated_from_update(update);
             } else {
-                warn!(
-                    pool = %update.pool_amm_id,
-                    base_mint = %update.base_mint,
-                    bonding_curve = %update.bonding_curve,
-                    slot = update.slot,
-                    "DIAG_ACCOUNT_UPDATE_SESSION_MISS"
+                let deferred_session_refresh =
+                    self.lookup_pool_identity(&update.pool_amm_id).is_some()
+                        || self
+                            .lookup_pool_identity_by_base_mint(&update.base_mint)
+                            .is_some()
+                        || self
+                            .lookup_pool_identity_by_bonding_curve(&update.bonding_curve)
+                            .is_some()
+                        || self.lookup_detected_pool(&update.pool_amm_id).is_some();
+                increment_counter!(
+                    "oracle_runtime_account_update_session_resolution_total",
+                    "status" => if deferred_session_refresh {
+                        "deferred"
+                    } else {
+                        "miss"
+                    }
                 );
+                if deferred_session_refresh {
+                    info!(
+                        pool = %update.pool_amm_id,
+                        base_mint = %update.base_mint,
+                        bonding_curve = %update.bonding_curve,
+                        slot = update.slot,
+                        "DIAG_ACCOUNT_UPDATE_SESSION_DEFERRED"
+                    );
+                } else {
+                    warn!(
+                        pool = %update.pool_amm_id,
+                        base_mint = %update.base_mint,
+                        bonding_curve = %update.bonding_curve,
+                        slot = update.slot,
+                        "DIAG_ACCOUNT_UPDATE_SESSION_MISS"
+                    );
+                }
             }
+        } else {
+            // A duplicate, stale observation, secondary witness, or conflict
+            // must not create session activity evidence or a price-series row.
+            ::metrics::counter!(
+                "oracle_runtime_account_update_session_refresh_suppressed_total",
+                1u64,
+                "classification" => decision.classification.as_str(),
+                "outcome" => decision.outcome.as_str()
+            );
         }
         apply_result
     }
@@ -3543,70 +3500,27 @@ impl OracleRuntime {
 
     fn maybe_materialize_canonical_state_from_observed_tx(
         &self,
-        pool_id: Pubkey,
-        base_mint_hint: Option<Pubkey>,
-        tx: &PoolTransaction,
+        _pool_id: Pubkey,
+        _base_mint_hint: Option<Pubkey>,
+        _tx: &PoolTransaction,
     ) -> Option<ghost_core::account_state_core::types::AccountUpdateResult> {
-        let (sol_reserves, token_reserves) = raw_tx_curve_reserves(tx)?;
-        let slot = tx.slot?;
-        let base_mint = parse_tx_base_mint(tx, base_mint_hint)?;
-        if self
-            .account_state_core
-            .get_canonical_state(&base_mint)
-            .is_some()
-        {
-            return None;
-        }
-
-        let identity = self.lookup_pool_identity(&pool_id)?;
-        let update = self.build_account_state_update(
-            &base_mint,
-            sol_reserves,
-            token_reserves,
-            0,
-            slot,
-            Some(0),
-            None,
-            None,
-            None,
-            None,
-            tx.curve_finality,
-            UpdateSource::TxObservedBootstrap,
-            Some(identity.bonding_curve.as_ref()),
-        )?;
-        let apply_result = self.apply_account_state_update(&update);
-        if matches!(
-            apply_result,
-            ghost_core::account_state_core::types::AccountUpdateResult::Applied
-                | ghost_core::account_state_core::types::AccountUpdateResult::PromotedFromBootstrap
-        ) {
-            coverage_audit().record_canonical_update_observed(
-                &pool_id.to_string(),
-                self.canonical_materialization_latency_ms(&pool_id),
-            );
-            info!(
-                pool = %pool_id,
-                base_mint = %base_mint,
-                slot,
-                sol_reserves,
-                token_reserves,
-                curve_finality = %tx.curve_finality.as_str(),
-                "DIAG_TX_BOOTSTRAP_CANONICALIZED"
-            );
-        }
-        Some(apply_result)
+        // A parsed transaction may carry a reserve tuple, but it is not a
+        // raw provider AccountUpdate with an account version, captured payload
+        // hash, and provider-role provenance.  PR1C therefore never lets this
+        // compatibility hook mutate AccountStateCore or satisfy canonical
+        // readiness.  Raw primary AccountUpdate observations are the sole
+        // live account-state authority; PR1D owns later reconciliation work.
+        None
     }
 
-    /// Feed an on-chain AccountUpdate for `base_mint` into the canonical
-    /// AccountStateCore and diagnostic reconciliation loop.
+    /// Compatibility entry point lacking raw-provider provenance.
     ///
-    /// This is the **production AccountUpdate integration point** for PR7.
-    /// Every confirmed on-chain AccountUpdate must first hydrate
-    /// `AccountStateCore`, then optionally feed an active observation session,
-    /// and finally run diagnostic-only drift monitoring against `ShadowLedger`.
-    ///
-    /// Returns the reconciliation outcome, or `None` if `base_mint` is not
-    /// tracked by the runtime identity registry.
+    /// Production Yellowstone traffic must enter through
+    /// [`process_runtime_account_update_event`], which forwards its complete
+    /// [`AccountUpdateEvent`] to the arbiter.  This legacy-shaped helper is
+    /// intentionally fail-closed because it cannot prove a provider role or
+    /// captured account payload hash.  Tests requiring canonical mutation
+    /// construct an explicit raw-primary `AccountUpdateEvent` instead.
     pub fn process_account_update(
         &self,
         base_mint: &Pubkey,
@@ -27305,6 +27219,152 @@ mod tests {
         keypair
     }
 
+    fn test_account_payload_hash(
+        base_mint: Pubkey,
+        bonding_curve: Pubkey,
+        sol_reserves: u64,
+        token_reserves: u64,
+        complete: u8,
+    ) -> String {
+        // This is the captured-payload stand-in for tests.  It intentionally
+        // excludes slot, write version, finality, and receive metadata: those
+        // are not bytes of the observed account payload.
+        blake3::hash(
+            format!(
+                "test-account-payload-v1:{base_mint}:{bonding_curve}:{sol_reserves}:{token_reserves}:{complete}"
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string()
+    }
+
+    fn test_raw_primary_account_update_event(
+        base_mint: Pubkey,
+        bonding_curve: Pubkey,
+        sol_reserves: u64,
+        token_reserves: u64,
+        complete: u8,
+        slot: u64,
+        write_version: Option<u64>,
+        curve_finality: CurveFinality,
+    ) -> AccountUpdateEvent {
+        AccountUpdateEvent {
+            provider_id: Some("test-raw-primary".to_owned()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+            semantic: Default::default(),
+            event_time: ghost_core::EventTimeMetadata::default(),
+            base_mint,
+            bonding_curve,
+            curve_finality,
+            sol_reserves,
+            token_reserves,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete,
+            slot,
+            write_version,
+            // Missing Yellowstone transaction signatures are valid and must
+            // remain `None` through the arbiter's retained evidence.
+            txn_signature: None,
+            account_data_hash: Some(test_account_payload_hash(
+                base_mint,
+                bonding_curve,
+                sol_reserves,
+                token_reserves,
+                complete,
+            )),
+            account_data_len: Some(56),
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(Pubkey::new_from_array(
+                *blake3::hash(b"test-account-owner-v1").as_bytes(),
+            )),
+            replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
+            replay_buffer_dwell_ms: None,
+            detected_at: SystemTime::now(),
+            sequence_number: slot,
+        }
+    }
+
+    fn process_test_raw_primary_account_update(
+        runtime: &OracleRuntime,
+        base_mint: &Pubkey,
+        sol_reserves: u64,
+        token_reserves: u64,
+        complete: u8,
+        slot: u64,
+        write_version: Option<u64>,
+        curve_finality: CurveFinality,
+    ) -> Option<ghost_core::shadow_ledger::reconciliation::ReconciliationOutcome> {
+        let identity = runtime.lookup_pool_identity_by_base_mint(base_mint)?;
+        let bonding_curve: Pubkey = identity.bonding_curve.into();
+        let event = test_raw_primary_account_update_event(
+            *base_mint,
+            bonding_curve,
+            sol_reserves,
+            token_reserves,
+            complete,
+            slot,
+            write_version,
+            curve_finality,
+        );
+        runtime.process_account_update_with_explicit_source(
+            base_mint,
+            sol_reserves,
+            token_reserves,
+            complete,
+            slot,
+            curve_finality,
+            UpdateSource::GeyserAccountUpdate,
+            Some(&event),
+            false,
+        )
+    }
+
+    fn build_test_raw_primary_account_state_update(
+        runtime: &OracleRuntime,
+        base_mint: &Pubkey,
+        sol_reserves: u64,
+        token_reserves: u64,
+        complete: u8,
+        slot: u64,
+        write_version: Option<u64>,
+        curve_finality: CurveFinality,
+    ) -> AccountStateUpdate {
+        let identity = runtime
+            .lookup_pool_identity_by_base_mint(base_mint)
+            .expect("test raw account update requires registered identity");
+        let bonding_curve: Pubkey = identity.bonding_curve.into();
+        runtime
+            .build_account_state_update_with_provenance(
+                Some("test-raw-primary".to_owned()),
+                Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+                base_mint,
+                sol_reserves,
+                token_reserves,
+                complete,
+                slot,
+                write_version,
+                None,
+                Some(test_account_payload_hash(
+                    *base_mint,
+                    bonding_curve,
+                    sol_reserves,
+                    token_reserves,
+                    complete,
+                )),
+                Some(56),
+                Some(bonding_curve),
+                Some(Pubkey::new_from_array(
+                    *blake3::hash(b"test-account-owner-v1").as_bytes(),
+                )),
+                curve_finality,
+                UpdateSource::GeyserAccountUpdate,
+                Some(&bonding_curve),
+            )
+            .expect("test raw account update should build for registered identity")
+    }
+
     fn test_bcv2_execution_account_evidence(
         account_pubkey: Pubkey,
         source: ExecutionAccountEvidenceSource,
@@ -32540,8 +32600,8 @@ mod tests {
         bonding_curve: Pubkey,
     ) {
         let update = ghost_core::account_state_core::types::AccountStateUpdate {
-            provider_id: None,
-            provider_role: None,
+            provider_id: Some("test-primary".to_owned()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             pool_amm_id: bonding_curve,
             base_mint: mint,
             bonding_curve,
@@ -32551,10 +32611,13 @@ mod tests {
             slot: 100,
             write_version: Some(1),
             txn_signature: None,
-            source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            account_data_len: None,
-            account_data_hash: None,
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(bonding_curve),
+            account_data_len: Some(56),
+            account_data_hash: Some(format!(
+                "{:016x}{:016x}{:016x}{:016x}",
+                100_u64, 30_000_000_000_u64, 1_073_000_000_000_000_u64, 0_u64
+            )),
             receive_ts_ms: 1_000,
             receive_seq: 1,
             curve_finality: ghost_core::CurveFinality::Provisional,
@@ -36825,7 +36888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_buy_path_waits_for_tx_bootstrap_canonical_readiness_before_trigger_dispatch() {
+    async fn live_buy_path_does_not_treat_tx_curve_as_canonical_readiness() {
         let runtime = Arc::new(OracleRuntime::new(
             Arc::new(HyperPredictionOracle::default()),
             "pump_program".to_string(),
@@ -36904,19 +36967,22 @@ mod tests {
             observed_tx.v_tokens_in_bonding_curve = Some(900_000_000.0);
             tx.send(PoolObservationMsg::Transaction(Arc::new(observed_tx)))
                 .await
-                .expect("tx bootstrap send");
+                .expect("transaction observation send");
         });
 
         let outcome = join.await.expect("buy path join");
-        assert_eq!(outcome.shadow_execution_outcome, "trigger_dispatch_failed");
+        assert_eq!(
+            outcome.shadow_execution_outcome,
+            "trigger_canonical_not_ready"
+        );
         assert_eq!(
             trigger.prepared_request_invocations(),
-            1,
-            "live trigger should run once canonical readiness gate is satisfied"
+            0,
+            "live trigger must not run from transaction-derived reserve data"
         );
         assert!(
-            runtime.is_live_trigger_canonical_ready(&base_mint),
-            "tx-observed bootstrap should satisfy live trigger readiness"
+            !runtime.is_live_trigger_canonical_ready(&base_mint),
+            "only a raw primary AccountUpdate may satisfy live trigger readiness"
         );
     }
 
@@ -43751,8 +43817,8 @@ mod tests {
             BootstrapHints::default(),
         );
         let result = account_state_core.apply_account_update(AccountStateUpdate {
-            provider_id: None,
-            provider_role: None,
+            provider_id: Some("test-primary".to_owned()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             pool_amm_id: pool_id,
             base_mint,
             bonding_curve,
@@ -43762,10 +43828,12 @@ mod tests {
             slot: 7,
             write_version: None,
             txn_signature: None,
-            source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            account_data_len: None,
-            account_data_hash: None,
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(bonding_curve),
+            account_data_len: Some(56),
+            account_data_hash: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
             receive_ts_ms: ghost_core::shadow_ledger::current_time_ms(),
             receive_seq: account_state_core.next_recv_seq(),
             curve_finality: CurveFinality::Speculative,
@@ -44016,12 +44084,14 @@ mod tests {
             100,
         );
 
-        let outcome = runtime.process_account_update(
+        let outcome = process_test_raw_primary_account_update(
+            &runtime,
             &base_mint,
             55_000_000_000,
             777_000_000_000_000,
             0,
             2,
+            Some(1),
             CurveFinality::Speculative,
         );
         assert!(
@@ -44085,12 +44155,14 @@ mod tests {
             None,
         );
 
-        let outcome = runtime.process_account_update(
+        let outcome = process_test_raw_primary_account_update(
+            &runtime,
             &base_mint,
             55_000_000_000,
             777_000_000_000_000,
             0,
             2,
+            Some(1),
             CurveFinality::Speculative,
         );
         assert!(
@@ -44145,23 +44217,16 @@ mod tests {
             .expect("session should open");
 
         let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
-        let update = runtime
-            .build_account_state_update(
-                &base_mint,
-                31_000_000_000,
-                888_000_000_000_000,
-                0,
-                2,
-                None,
-                None,
-                None,
-                None,
-                None,
-                CurveFinality::Speculative,
-                UpdateSource::GeyserAccountUpdate,
-                None,
-            )
-            .expect("tracked mint should build canonical account-state update");
+        let update = build_test_raw_primary_account_state_update(
+            runtime.as_ref(),
+            &base_mint,
+            31_000_000_000,
+            888_000_000_000_000,
+            0,
+            2,
+            Some(1),
+            CurveFinality::Speculative,
+        );
         let apply_result = runtime.apply_account_state_update(&update);
         assert!(
             matches!(
@@ -44179,15 +44244,39 @@ mod tests {
             "runtime-owned AccountStateCore must be hydrated"
         );
 
+        {
+            let session = runtime
+                .lookup_pool_session(&pool_id)
+                .expect("active session should still exist");
+            let session = session.read();
+            let materialized = session.materialize_features();
+            assert_eq!(materialized.account_features.update_count, 1);
+            assert!(
+                materialized.curve_readiness.is_ready,
+                "active session should observe canonical curve readiness from account updates"
+            );
+        }
+
+        // A reconnect replay changes only transport metadata.  It must not
+        // enter session evidence, reserve velocity, or canonical state again.
+        let mut reconnect_replay = update.clone();
+        reconnect_replay.receive_ts_ms = reconnect_replay.receive_ts_ms.saturating_add(1);
+        reconnect_replay.receive_seq = reconnect_replay.receive_seq.saturating_add(100);
+        assert_eq!(
+            runtime.apply_account_state_update(&reconnect_replay),
+            ghost_core::account_state_core::types::AccountUpdateResult::Rejected(
+                ghost_core::account_state_core::types::AccountUpdateRejectReason::DuplicateObservation
+            )
+        );
+
         let session = runtime
             .lookup_pool_session(&pool_id)
-            .expect("active session should still exist");
+            .expect("active session should still exist after duplicate");
         let session = session.read();
         let materialized = session.materialize_features();
-        assert_eq!(materialized.account_features.update_count, 1);
-        assert!(
-            materialized.curve_readiness.is_ready,
-            "active session should observe canonical curve readiness from account updates"
+        assert_eq!(
+            materialized.account_features.update_count, 1,
+            "duplicate must not materialize a second account-state mutation into the session"
         );
     }
 
@@ -44231,7 +44320,9 @@ mod tests {
                 2,
                 Some(17),
                 Some(txn_signature),
-                Some("raw-blake3".to_string()),
+                Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                ),
                 Some(56),
                 Some(source_account_pubkey),
                 Some(source_owner),
@@ -44248,13 +44339,18 @@ mod tests {
             Some(ghost_core::RawProviderRoleV1::PrimaryAuthority)
         );
         assert_eq!(update.txn_signature, Some(txn_signature));
-        assert_eq!(update.account_data_hash.as_deref(), Some("raw-blake3"));
+        assert_eq!(
+            update.account_data_hash.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert_eq!(update.account_data_len, Some(56));
         assert_eq!(update.source_account_pubkey, Some(source_account_pubkey));
         assert_eq!(update.source_account_owner_or_program, Some(source_owner));
 
         let update_without_provenance = runtime
-            .build_account_state_update(
+            .build_account_state_update_with_provenance(
+                None,
+                None,
                 &base_mint,
                 9_000_000_000,
                 888_000_000_000_000,
@@ -44265,14 +44361,53 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 CurveFinality::Speculative,
                 UpdateSource::GeyserAccountUpdate,
                 Some(&bonding_curve),
             )
-            .expect("legacy builder should remain available");
+            .expect("provenance-aware builder should preserve absent compatibility metadata");
         assert_eq!(update_without_provenance.provider_id, None);
         assert_eq!(update_without_provenance.provider_role, None);
         assert_eq!(update_without_provenance.txn_signature, None);
+    }
+
+    #[test]
+    fn legacy_account_update_without_raw_provenance_fails_closed() {
+        let hyper_oracle = Arc::new(HyperPredictionOracle::default());
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let runtime = OracleRuntime::new(
+            hyper_oracle,
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            shadow_ledger,
+        );
+
+        let pool_id = Pubkey::new_unique();
+        let detected_pool = test_detected_pool(pool_id);
+        let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+        register_test_detected_pool(&runtime, detected_pool.as_ref());
+
+        assert!(
+            runtime
+                .process_account_update(
+                    &base_mint,
+                    9_000_000_000,
+                    888_000_000_000_000,
+                    0,
+                    12,
+                    CurveFinality::Speculative,
+                )
+                .is_none(),
+            "the legacy-shaped helper cannot authorize reconciliation without raw provenance"
+        );
+        assert!(
+            runtime
+                .account_state_core()
+                .get_canonical_state(&base_mint)
+                .is_none(),
+            "the legacy-shaped helper must not mutate canonical account state"
+        );
     }
 
     #[test]
@@ -44528,23 +44663,16 @@ mod tests {
         };
         assert!(runtime.register_new_pool(pool_id, base_mint, candidate, None));
 
-        let update = runtime
-            .build_account_state_update(
-                &base_mint,
-                9_000_000_000,
-                888_000_000_000_000,
-                0,
-                2,
-                None,
-                None,
-                None,
-                None,
-                None,
-                CurveFinality::Speculative,
-                UpdateSource::GeyserAccountUpdate,
-                None,
-            )
-            .expect("tracked mint should build canonical account-state update");
+        let update = build_test_raw_primary_account_state_update(
+            &runtime,
+            &base_mint,
+            9_000_000_000,
+            888_000_000_000_000,
+            0,
+            2,
+            Some(1),
+            CurveFinality::Speculative,
+        );
         let apply_result = runtime.apply_account_state_update(&update);
         assert!(
             matches!(
@@ -44581,23 +44709,16 @@ mod tests {
         assert!(runtime.register_new_pool(pool_id, base_mint, candidate, None));
 
         let mut readiness_rx = runtime.subscribe_canonical_readiness(&base_mint);
-        let update = runtime
-            .build_account_state_update(
-                &base_mint,
-                9_000_000_000,
-                888_000_000_000_000,
-                0,
-                2,
-                None,
-                None,
-                None,
-                None,
-                None,
-                CurveFinality::Speculative,
-                UpdateSource::GeyserAccountUpdate,
-                None,
-            )
-            .expect("tracked mint should build canonical account-state update");
+        let update = build_test_raw_primary_account_state_update(
+            &runtime,
+            &base_mint,
+            9_000_000_000,
+            888_000_000_000_000,
+            0,
+            2,
+            Some(1),
+            CurveFinality::Speculative,
+        );
         let apply_result = runtime.apply_account_state_update(&update);
 
         assert!(
@@ -44676,16 +44797,17 @@ mod tests {
 
         let on_chain_sol = 34_050_617_285;
         let on_chain_tok = 945_357_311_246_644;
-        let outcome = runtime
-            .process_account_update(
-                &base_mint,
-                on_chain_sol,
-                on_chain_tok,
-                0,
-                410_723_624,
-                CurveFinality::Speculative,
-            )
-            .expect("tracked mint must reconcile");
+        let outcome = process_test_raw_primary_account_update(
+            &runtime,
+            &base_mint,
+            on_chain_sol,
+            on_chain_tok,
+            0,
+            410_723_624,
+            Some(1),
+            CurveFinality::Speculative,
+        )
+        .expect("tracked mint must reconcile");
 
         assert_eq!(
             outcome.severity,
@@ -44779,16 +44901,17 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let outcome = runtime
-                .process_account_update(
-                    &base_mint,
-                    sol_reserves,
-                    token_reserves,
-                    0,
-                    slot,
-                    CurveFinality::Provisional,
-                )
-                .expect("tracked mint must reconcile");
+            let outcome = process_test_raw_primary_account_update(
+                &runtime,
+                &base_mint,
+                sol_reserves,
+                token_reserves,
+                0,
+                slot,
+                Some(idx as u64 + 1),
+                CurveFinality::Provisional,
+            )
+            .expect("tracked mint must reconcile");
 
             let canonical = runtime
                 .account_state_core()
@@ -44887,12 +45010,14 @@ mod tests {
         };
         assert!(runtime.register_new_pool(pool_id, base_mint, candidate, None));
 
-        let outcome = runtime.process_account_update(
+        let outcome = process_test_raw_primary_account_update(
+            &runtime,
             &base_mint,
             30_987_654_320,
             945_357_311_246_644,
             0,
             410_748_305,
+            Some(1),
             CurveFinality::Provisional,
         );
         assert!(
@@ -44904,17 +45029,19 @@ mod tests {
             .get_old(&bonding_curve)
             .expect("first canonical sync must store shadow curve");
 
-        let duplicate = runtime.process_account_update(
+        let duplicate = process_test_raw_primary_account_update(
+            &runtime,
             &base_mint,
             30_987_654_320,
             945_357_311_246_644,
             0,
             410_748_305,
+            Some(1),
             CurveFinality::Provisional,
         );
         assert!(
-            duplicate.is_some(),
-            "duplicate canonical update should still reconcile"
+            duplicate.is_none(),
+            "duplicate raw observation must not invoke reconciliation a second time"
         );
 
         let second = shadow_ledger
@@ -44931,7 +45058,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_account_update_same_slot_finality_refresh_updates_shadow() {
+    fn test_process_account_update_same_mutation_finality_replay_is_noop_for_shadow() {
         let hyper_oracle = Arc::new(HyperPredictionOracle::default());
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let runtime = OracleRuntime::new(
@@ -44955,12 +45082,14 @@ mod tests {
         };
         assert!(runtime.register_new_pool(pool_id, base_mint, candidate, None));
 
-        let provisional = runtime.process_account_update(
+        let provisional = process_test_raw_primary_account_update(
+            &runtime,
             &base_mint,
             31_944_839_345,
             945_357_311_246_644,
             0,
             410_748_308,
+            Some(1),
             CurveFinality::Provisional,
         );
         assert!(
@@ -44976,15 +45105,20 @@ mod tests {
             CurveFinality::Provisional
         );
 
-        let finalized = runtime.process_account_update(
+        let finalized = process_test_raw_primary_account_update(
+            &runtime,
             &base_mint,
             31_944_839_345,
             945_357_311_246_644,
             0,
             410_748_308,
+            Some(1),
             CurveFinality::Finalized,
         );
-        assert!(finalized.is_some(), "finalized refresh should be accepted");
+        assert!(
+            finalized.is_none(),
+            "same payload/version replay must not reapply state merely to upgrade finality"
+        );
 
         let after_finality_refresh = shadow_ledger
             .get_old(&bonding_curve)
@@ -44999,22 +45133,22 @@ mod tests {
         );
         assert_eq!(
             after_finality_refresh.curve_finality,
-            CurveFinality::Finalized
+            CurveFinality::Provisional
         );
         assert_eq!(
             after_finality_refresh.write_reason,
-            ShadowLedgerWriteReason::FinalityRefresh,
-            "same-slot canonical finality upgrade should be tracked as a finality refresh"
+            ShadowLedgerWriteReason::ConfirmedBootstrap,
+            "same-version replay must preserve the original canonical shadow write"
         );
         assert_eq!(
             after_finality_refresh.write_strength,
-            ShadowLedgerWriteStrength::Repair,
-            "same-slot finality refresh should use repair precedence over prior confirmed bootstrap"
+            ShadowLedgerWriteStrength::ConfirmedBootstrap,
+            "same-version replay must not produce a second repair write"
         );
     }
 
     #[test]
-    fn test_tx_observed_bootstrap_materializes_canonical_state_before_live_account_update() {
+    fn test_tx_observed_curve_snapshot_does_not_materialize_canonical_state() {
         let hyper_oracle = Arc::new(HyperPredictionOracle::default());
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let runtime = OracleRuntime::new(
@@ -45047,29 +45181,26 @@ mod tests {
         tx.v_sol_in_bonding_curve = Some(31.0);
         tx.v_tokens_in_bonding_curve = Some(900_000_000.0);
 
-        let apply_result = runtime
-            .maybe_materialize_canonical_state_from_observed_tx(pool_id, Some(base_mint), &tx)
-            .expect("tx bootstrap should build an account update");
-        assert!(
-            matches!(
-                apply_result,
-                ghost_core::account_state_core::types::AccountUpdateResult::Applied
-                    | ghost_core::account_state_core::types::AccountUpdateResult::PromotedFromBootstrap
+        assert_eq!(
+            runtime.maybe_materialize_canonical_state_from_observed_tx(
+                pool_id,
+                Some(base_mint),
+                &tx,
             ),
-            "first tx with curve truth should materialize canonical state"
+            None,
+            "parsed transaction reserve fields are not raw AccountUpdate authority"
         );
-
-        let state = runtime
-            .account_state_core()
-            .get_canonical_state(&base_mint)
-            .expect("canonical state after tx bootstrap");
-        assert_eq!(state.virtual_sol_reserves, 31_000_000_000);
-        assert_eq!(state.virtual_token_reserves, 900_000_000_000_000);
-        assert_eq!(state.update_count, 1);
+        assert!(
+            runtime
+                .account_state_core()
+                .get_canonical_state(&base_mint)
+                .is_none(),
+            "transaction-derived reserve data must not materialize canonical account state"
+        );
     }
 
     #[test]
-    fn test_live_account_update_same_slot_overrides_tx_bootstrap_state() {
+    fn test_live_primary_account_update_materializes_state_after_tx_observation_is_ignored() {
         let hyper_oracle = Arc::new(HyperPredictionOracle::default());
         let shadow_ledger = Arc::new(ShadowLedger::new());
         let runtime = OracleRuntime::new(
@@ -45101,36 +45232,30 @@ mod tests {
         tx.curve_finality = CurveFinality::Speculative;
         tx.v_sol_in_bonding_curve = Some(31.0);
         tx.v_tokens_in_bonding_curve = Some(900_000_000.0);
-        let _ = runtime.maybe_materialize_canonical_state_from_observed_tx(
-            pool_id,
-            Some(base_mint),
-            &tx,
+        assert!(
+            runtime
+                .maybe_materialize_canonical_state_from_observed_tx(pool_id, Some(base_mint), &tx)
+                .is_none(),
+            "transaction observation must not create canonical state"
         );
 
-        let live_update = runtime
-            .build_account_state_update(
-                &base_mint,
-                32_000_000_000,
-                899_000_000_000_000,
-                0,
-                22,
-                Some(1),
-                None,
-                None,
-                None,
-                None,
-                CurveFinality::Finalized,
-                UpdateSource::GeyserAccountUpdate,
-                Some(&bonding_curve),
-            )
-            .expect("tracked mint should build live account-state update");
+        let live_update = build_test_raw_primary_account_state_update(
+            &runtime,
+            &base_mint,
+            32_000_000_000,
+            899_000_000_000_000,
+            0,
+            22,
+            Some(1),
+            CurveFinality::Finalized,
+        );
         let apply_result = runtime.apply_account_state_update(&live_update);
         assert!(
             matches!(
                 apply_result,
                 ghost_core::account_state_core::types::AccountUpdateResult::Applied
             ),
-            "same-slot live account update must outrank tx bootstrap"
+            "raw primary account update must be the first canonical authority"
         );
 
         let state = runtime
@@ -45139,7 +45264,7 @@ mod tests {
             .expect("canonical state after live update");
         assert_eq!(state.virtual_sol_reserves, 32_000_000_000);
         assert_eq!(state.virtual_token_reserves, 899_000_000_000_000);
-        assert_eq!(state.update_count, 2);
+        assert_eq!(state.update_count, 1);
         assert_eq!(state.curve_finality, CurveFinality::Finalized);
     }
 
@@ -45198,6 +45323,16 @@ mod tests {
         let pool_id = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
         let bonding_curve = Pubkey::new_unique();
+        let pending_event = test_raw_primary_account_update_event(
+            base_mint,
+            bonding_curve,
+            9_000_000_000,
+            888_000_000_000_000,
+            0,
+            2,
+            Some(1),
+            CurveFinality::Speculative,
+        );
         let outcome_before_registration = runtime.process_account_update_with_explicit_source(
             &base_mint,
             9_000_000_000,
@@ -45206,31 +45341,7 @@ mod tests {
             2,
             CurveFinality::Speculative,
             UpdateSource::GeyserAccountUpdate,
-            Some(&AccountUpdateEvent {
-                provider_id: None,
-                provider_role: None,
-                semantic: Default::default(),
-                event_time: ghost_core::EventTimeMetadata::default(),
-                base_mint,
-                bonding_curve,
-                curve_finality: CurveFinality::Speculative,
-                sol_reserves: 9_000_000_000,
-                token_reserves: 888_000_000_000_000,
-                real_sol_reserves: None,
-                real_token_reserves: None,
-                complete: 0,
-                slot: 2,
-                write_version: Some(1),
-                txn_signature: None,
-                account_data_hash: None,
-                account_data_len: None,
-                source_account_pubkey: None,
-                source_account_owner_or_program: None,
-                replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
-                replay_buffer_dwell_ms: None,
-                detected_at: SystemTime::now(),
-                sequence_number: 1,
-            }),
+            Some(&pending_event),
             true,
         );
         assert!(
@@ -45293,31 +45404,19 @@ mod tests {
         let base_mint = Pubkey::new_unique();
         let bonding_curve = Pubkey::new_unique();
 
-        runtime.enqueue_pre_identity_account_update(&AccountUpdateEvent {
-            provider_id: None,
-            provider_role: None,
-            semantic: Default::default(),
-            event_time: ghost_core::EventTimeMetadata::default(),
+        let mut pending_event = test_raw_primary_account_update_event(
             base_mint,
             bonding_curve,
-            curve_finality: CurveFinality::Speculative,
-            sol_reserves: 9_000_000_000,
-            token_reserves: 888_000_000_000_000,
-            real_sol_reserves: None,
-            real_token_reserves: None,
-            complete: 0,
-            slot: 2,
-            write_version: Some(7),
-            txn_signature: None,
-            account_data_hash: None,
-            account_data_len: None,
-            source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            replay_origin: seer::ipc::AccountUpdateReplayOrigin::PendingReplay,
-            replay_buffer_dwell_ms: Some(10),
-            detected_at: SystemTime::now(),
-            sequence_number: 1,
-        });
+            9_000_000_000,
+            888_000_000_000_000,
+            0,
+            2,
+            Some(7),
+            CurveFinality::Speculative,
+        );
+        pending_event.replay_origin = seer::ipc::AccountUpdateReplayOrigin::PendingReplay;
+        pending_event.replay_buffer_dwell_ms = Some(10);
+        runtime.enqueue_pre_identity_account_update(&pending_event);
 
         runtime.replay_pre_identity_account_updates(pool_id, base_mint);
 
@@ -45556,16 +45655,17 @@ mod tests {
             10,
         );
 
-        let outcome = runtime
-            .process_account_update(
-                &base_mint,
-                70_000_000_000,
-                1_000_000_000_000,
-                0,
-                11,
-                CurveFinality::Speculative,
-            )
-            .expect("tracked mint should return reconciliation outcome");
+        let outcome = process_test_raw_primary_account_update(
+            &runtime,
+            &base_mint,
+            70_000_000_000,
+            1_000_000_000_000,
+            0,
+            11,
+            Some(1),
+            CurveFinality::Speculative,
+        )
+        .expect("tracked mint should return reconciliation outcome");
         assert_eq!(outcome.action, ReconciliationAction::Logged);
 
         let status = runtime.reconciliation_status();
@@ -48244,9 +48344,9 @@ mod tests {
 
     /// F.4 – AccountUpdate integration through OracleRuntime feeds reconciliation.
     ///
-    /// Verifies that process_account_update on OracleRuntime correctly delegates
-    /// to the reconciliation runtime, updates drift counters, and returns an
-    /// outcome for a pool whose mint is tracked by the Shadow Ledger.
+    /// Verifies that a fully-provenanced raw-primary AccountUpdate on
+    /// OracleRuntime correctly delegates to reconciliation and returns an
+    /// outcome for a tracked pool.
     #[test]
     fn test_oracle_runtime_process_account_update_feeds_reconciliation() {
         use ghost_brain::oracle::hyper_prediction::HyperPredictionOracle;
@@ -48283,9 +48383,17 @@ mod tests {
         register_runtime_pool_for_base_mint(runtime.as_ref(), mint, mint);
 
         // F.4a: no-drift AccountUpdate — no repair
-        let outcome = runtime
-            .process_account_update(&mint, sol, tok, 0, 101, CurveFinality::Speculative)
-            .expect("must return outcome for known mint");
+        let outcome = process_test_raw_primary_account_update(
+            runtime.as_ref(),
+            &mint,
+            sol,
+            tok,
+            0,
+            101,
+            Some(1),
+            CurveFinality::Speculative,
+        )
+        .expect("must return outcome for known mint");
         assert_eq!(
             outcome.action,
             ReconciliationAction::NoAction,
@@ -48295,7 +48403,7 @@ mod tests {
         let status = runtime.reconciliation_status();
         assert_eq!(
             status.total_checks, 1,
-            "total_checks must increment after process_account_update via OracleRuntime"
+            "total_checks must increment after raw AccountUpdate via OracleRuntime"
         );
         assert_eq!(
             status.total_diagnostic_signals, 0,
@@ -48304,9 +48412,17 @@ mod tests {
 
         // F.4b: severe-drift AccountUpdate — diagnostic-only logging
         let on_chain_sol = sol + 2_000_000_000; // 2 SOL drift
-        let outcome = runtime
-            .process_account_update(&mint, on_chain_sol, tok, 0, 102, CurveFinality::Speculative)
-            .expect("must return outcome for known mint");
+        let outcome = process_test_raw_primary_account_update(
+            runtime.as_ref(),
+            &mint,
+            on_chain_sol,
+            tok,
+            0,
+            102,
+            Some(2),
+            CurveFinality::Speculative,
+        )
+        .expect("must return outcome for known mint");
         assert_eq!(
             outcome.action,
             ReconciliationAction::Logged,
@@ -48408,9 +48524,17 @@ mod tests {
 
         // Small noise drift — must NOT overwrite Shadow Ledger state
         let noise_sol = sol + 100_000; // tiny noise, below SEVERE threshold
-        let outcome = runtime
-            .process_account_update(&mint, noise_sol, tok, 0, 101, CurveFinality::Speculative)
-            .expect("must return outcome for tracked mint");
+        let outcome = process_test_raw_primary_account_update(
+            runtime.as_ref(),
+            &mint,
+            noise_sol,
+            tok,
+            0,
+            101,
+            Some(1),
+            CurveFinality::Speculative,
+        )
+        .expect("must return outcome for tracked mint");
 
         assert_ne!(
             outcome.action,
@@ -48451,15 +48575,14 @@ mod tests {
     // =========================================================================
     // These tests prove that the live AccountUpdate-driven reconciliation path
     // works end-to-end: from GhostEvent::AccountUpdate arriving on the event bus
-    // through OracleRuntime::process_account_update(...) to drift/read-only status
+    // through the raw AccountUpdate ingress to drift/read-only status
     // changes becoming visible. They also verify key-resolution correctness
     // and non-regression guarantees (diagnostic reconciliation stays read-only).
 
-    /// Wire.A – `GhostEvent::AccountUpdate` drives `OracleRuntime::process_account_update`.
+    /// Wire.A – `GhostEvent::AccountUpdate` drives raw-primary arbitration and reconciliation.
     ///
     /// Simulates the production path: a `GhostEvent::AccountUpdate` event is
-    /// constructed and sent to the oracle runtime, verifying that
-    /// `process_account_update` is invoked with the correct reserve data.
+    /// constructed and routed through the production explicit-source helper.
     #[test]
     fn test_ghost_event_account_update_drives_reconciliation() {
         use ghost_brain::oracle::hyper_prediction::HyperPredictionOracle;
@@ -48498,42 +48621,32 @@ mod tests {
 
         // Simulate what start_oracle_runtime_task does when it receives
         // GhostEvent::AccountUpdate from the event bus.
-        let event = GhostEvent::AccountUpdate(crate::events::AccountUpdateEvent {
-            provider_id: None,
-            provider_role: None,
-            semantic: Default::default(),
-            event_time: ghost_core::EventTimeMetadata::default(),
+        let event = GhostEvent::AccountUpdate(test_raw_primary_account_update_event(
             base_mint,
-            bonding_curve: Pubkey::new_unique(),
-            curve_finality: CurveFinality::Speculative,
-            sol_reserves: sol,
-            token_reserves: tok,
-            real_sol_reserves: None,
-            real_token_reserves: None,
-            complete: 0,
-            slot: 51,
-            write_version: None,
-            txn_signature: None,
-            account_data_hash: None,
-            account_data_len: None,
-            source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
-            replay_buffer_dwell_ms: None,
-            detected_at: std::time::SystemTime::now(),
-            sequence_number: 1,
-        });
+            base_mint,
+            sol,
+            tok,
+            0,
+            51,
+            Some(1),
+            CurveFinality::Speculative,
+        ));
 
-        // Extract the fields (mirroring the match arm in start_oracle_runtime_task).
+        // Extract the fields through the same explicit-source boundary used by
+        // the production AccountUpdate worker.
         let outcome = match event {
-            GhostEvent::AccountUpdate(event) => runtime.process_account_update(
-                &event.base_mint,
-                event.sol_reserves,
-                event.token_reserves,
-                event.complete,
-                event.slot,
-                event.curve_finality,
-            ),
+            GhostEvent::AccountUpdate(event) => runtime
+                .process_account_update_with_explicit_source(
+                    &event.base_mint,
+                    event.sol_reserves,
+                    event.token_reserves,
+                    event.complete,
+                    event.slot,
+                    event.curve_finality,
+                    UpdateSource::GeyserAccountUpdate,
+                    Some(&event),
+                    false,
+                ),
             _ => panic!("unexpected event variant"),
         };
 
@@ -48612,12 +48725,14 @@ mod tests {
         );
 
         // Correct key — must produce Some.
-        let result = runtime.process_account_update(
+        let result = process_test_raw_primary_account_update(
+            &runtime,
             &tracked_mint,
             sol,
             tok,
             0,
             20,
+            Some(1),
             CurveFinality::Speculative,
         );
         assert!(
@@ -48670,16 +48785,17 @@ mod tests {
 
         // Large divergence — triggers severe-drift logging through the live AccountUpdate path.
         let diverged_sol = 1_000_000_000_000; // 1000 SOL — severe drift
-        let outcome = runtime
-            .process_account_update(
-                &base_mint,
-                diverged_sol,
-                tok,
-                0,
-                101,
-                CurveFinality::Speculative,
-            )
-            .expect("tracked mint must return outcome");
+        let outcome = process_test_raw_primary_account_update(
+            &runtime,
+            &base_mint,
+            diverged_sol,
+            tok,
+            0,
+            101,
+            Some(1),
+            CurveFinality::Speculative,
+        )
+        .expect("tracked mint must return outcome");
 
         assert_eq!(
             outcome.action,
@@ -48741,16 +48857,17 @@ mod tests {
 
         // Tiny noise — below SEVERE threshold, must NOT overwrite.
         let noise_sol = sol + 50_000; // < 1 SOL difference
-        let outcome = runtime
-            .process_account_update(
-                &base_mint,
-                noise_sol,
-                tok,
-                0,
-                201,
-                CurveFinality::Speculative,
-            )
-            .expect("tracked mint must return outcome");
+        let outcome = process_test_raw_primary_account_update(
+            &runtime,
+            &base_mint,
+            noise_sol,
+            tok,
+            0,
+            201,
+            Some(1),
+            CurveFinality::Speculative,
+        )
+        .expect("tracked mint must return outcome");
 
         assert_ne!(
             outcome.action,
@@ -49444,35 +49561,23 @@ mod tests {
 
     fn dispatch_test_account_update_event(
         base_mint: Pubkey,
+        bonding_curve: Pubkey,
         slot: u64,
         write_version: Option<u64>,
         sequence_number: u64,
     ) -> AccountUpdateEvent {
-        AccountUpdateEvent {
-            provider_id: None,
-            provider_role: None,
-            semantic: Default::default(),
-            event_time: ghost_core::EventTimeMetadata::default(),
+        let mut event = test_raw_primary_account_update_event(
             base_mint,
-            bonding_curve: Pubkey::new_unique(),
-            curve_finality: CurveFinality::Provisional,
-            sol_reserves: 30_000_000_000 + slot,
-            token_reserves: 900_000_000_000_000,
-            real_sol_reserves: None,
-            real_token_reserves: None,
-            complete: 0,
+            bonding_curve,
+            30_000_000_000 + slot,
+            900_000_000_000_000,
+            0,
             slot,
             write_version,
-            txn_signature: None,
-            account_data_hash: None,
-            account_data_len: None,
-            source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
-            replay_buffer_dwell_ms: None,
-            detected_at: std::time::SystemTime::now(),
-            sequence_number,
-        }
+            CurveFinality::Provisional,
+        );
+        event.sequence_number = sequence_number;
+        event
     }
 
     #[tokio::test]
@@ -49573,13 +49678,13 @@ mod tests {
             false, // authoritative_funding_stream_available = false
         ));
 
-        let mut first_update = dispatch_test_account_update_event(base_mint, 101, Some(1), 1);
-        first_update.bonding_curve = bonding_curve;
+        let mut first_update =
+            dispatch_test_account_update_event(base_mint, bonding_curve, 101, Some(1), 1);
         first_update.sol_reserves = 31_000_000_000;
         first_update.token_reserves = 950_000_000_000_000;
 
-        let mut second_update = dispatch_test_account_update_event(base_mint, 102, Some(2), 2);
-        second_update.bonding_curve = bonding_curve;
+        let mut second_update =
+            dispatch_test_account_update_event(base_mint, bonding_curve, 102, Some(2), 2);
         second_update.sol_reserves = 32_500_000_000;
         second_update.token_reserves = 900_000_000_000_000;
 

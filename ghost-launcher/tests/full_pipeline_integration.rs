@@ -2,7 +2,7 @@ use ghost_brain::config::{GatekeeperMode, GatekeeperV2Config};
 use ghost_brain::fast_pipeline::EnhancedCandidate;
 use ghost_core::account_state_core::types::{AccountStateUpdate, StatePhase, UpdateSource};
 use ghost_core::session::types::SessionStatus;
-use ghost_core::{CurveFinality, CurveFreshnessState, EventSemanticEnvelope};
+use ghost_core::{CurveFinality, CurveFreshnessState, EventSemanticEnvelope, RawProviderRoleV1};
 use ghost_launcher::components::gatekeeper::{
     GatekeeperBuffer, GatekeeperVerdict, GatekeeperVerdictType,
 };
@@ -248,8 +248,8 @@ fn account_update(
     token_reserves: u64,
 ) -> AccountStateUpdate {
     AccountStateUpdate {
-        provider_id: None,
-        provider_role: None,
+        provider_id: Some("test-primary".to_owned()),
+        provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
         pool_amm_id: pool_id,
         base_mint,
         bonding_curve,
@@ -259,10 +259,12 @@ fn account_update(
         slot,
         write_version: Some(receive_ts_ms),
         txn_signature: None,
-        source_account_pubkey: None,
-        source_account_owner_or_program: None,
-        account_data_len: None,
-        account_data_hash: None,
+        source_account_pubkey: Some(bonding_curve),
+        source_account_owner_or_program: Some(bonding_curve),
+        account_data_len: Some(56),
+        account_data_hash: Some(format!(
+            "{slot:016x}{receive_ts_ms:016x}{sol_reserves:016x}{token_reserves:016x}"
+        )),
         receive_ts_ms,
         receive_seq,
         curve_finality: CurveFinality::Finalized,
