@@ -54,7 +54,7 @@ Harness konstruuje deterministyczne protobuf fixtures i obejmuje:
 - `tx_index=Some(0)`;
 - provider provenance i event ordinal;
 - AccountUpdate;
-- 2,048-eventowy concurrent ingress replay;
+- 3,072-eventowy operational microburst replay (24 × 128, co 50 ms);
 - slow WAL;
 - slow IPC;
 - capacity-two saturation episode.
@@ -109,7 +109,7 @@ decoded SubscribeUpdateTransaction
        normal WAL queue -> fixed writer
        evidence queue   -> fixed writer task
        normal IPC lane  -> fixed dispatcher
-       AccountUpdate    -> bounded latest-state lane per bonding curve
+       AccountUpdate    -> bounded FIFO wszystkich przyjętych obserwacji
        all local gaps   -> reserved audit router -> dedicated WAL writer
 ```
 
@@ -134,28 +134,35 @@ Finalny release result na tym hoście:
 
 | Metric | Final PR1B |
 |---|---:|
-| Input | 2,048 events |
+| Input | 3,072 events |
+| Batch profile | 24 × 128 events, 50 ms interval |
 | Configured ingress capacity | 2,048 |
-| Peak ingress | 73,482.008 events/s |
-| Sustained drain | 2,650.976 events/s |
-| Queue high-water | 1,992 |
-| Oldest queued event | 744,241,363 ns |
+| Peak batch ingress | 73,873.871 events/s |
+| Operational ingress | 2,535.427 events/s |
+| Sustained drain | 2,442.683 events/s |
+| Queue high-water | 134 |
+| Queue dwell p99 / SLA | 47,209,510 / 250,000,000 ns — PASS |
+| Oldest queued event / SLA | 54,277,899 / 500,000,000 ns — PASS |
 | Missing events | 0 |
-| Replay parser throughput | 2,429.975 events/s |
-| receive-to-normalize p50 | 20,121 ns |
-| receive-to-normalize p95 | 39,841 ns |
-| receive-to-normalize p99 | 48,608 ns |
-| normalize-to-bundle p50 | 394,084 ns |
-| normalize-to-bundle p95 | 555,250 ns |
-| normalize-to-bundle p99 | 840,725 ns |
-| Steady-state RSS | 17,144 KiB |
+| Replay parser throughput | 2,476.122 events/s |
+| receive-to-normalize p50 | 20,632 ns |
+| receive-to-normalize p95 | 33,016 ns |
+| receive-to-normalize p99 | 47,886 ns |
+| normalize-to-bundle p50 | 397,400 ns |
+| normalize-to-bundle p95 | 484,697 ns |
+| normalize-to-bundle p99 | 520,419 ns |
+| Steady-state RSS | 13,716 KiB |
 
 Domyślna `ingress_queue_capacity = 2_048` jest serde-compatible i
-konfigurowalna. Dla zamrożonego replay workloadu:
+konfigurowalna. Workload ma celowo inną liczebność niż capacity, a bramka
+sprawdza opóźnienie, nie tylko brak utraty:
 
 ```text
-observed backlog high-water = 1,992
-next bounded power-of-two   = 2,048
+workload                    = 3,072
+configured capacity         = 2,048
+observed backlog high-water = 134
+queue dwell p99             = 47,209,510 ns <= 250,000,000 ns
+oldest event age            = 54,277,899 ns <= 500,000,000 ns
 missing                     = 0
 ```
 
@@ -166,11 +173,11 @@ mniejszą wartość bez zmiany kodu.
 ## 7. Slow sink receipt
 
 ```text
-slow IPC hot-path enqueue       = 11,995 ns
+slow IPC hot-path enqueue       = 7,074 ns
 IPC hot-path blocking waits     = 0
 
-slow WAL hot-path enqueue       = 761,345 ns
-physical WAL writer elapsed     = 7,196,949 ns
+slow WAL hot-path enqueue       = 621,944 ns
+physical WAL writer elapsed     = 7,148,472 ns
 physical writer calls/waits     = 2/2
 event-worker WAL blocking waits = 0
 ```
@@ -180,12 +187,15 @@ event-worker WAL blocking waits = 0
 `AccountUpdate` nie konkuruje już o pełną normalną kolejkę business IPC.
 Dedicated bounded state lane:
 
-- jest keyed przez bonding curve;
-- zachowuje latest pending update;
-- używa `(slot, write_version)` jako freshness key;
-- zachowuje sequence number do merge z normalnym egress;
+- jest FIFO wszystkich przyjętych obserwacji;
+- nie wykonuje deduplikacji ani freshness arbitration;
+- zachowuje osobno `write_version=None` i `Some(0)`;
+- zachowuje same-version/different-hash observations dla PR1C;
+- nadaje sequence atomowo pod tym samym lockiem co enqueue;
+- scala się z normalnym FIFO według globalnego sequence number;
 - nie czeka na downstream capacity w hot path;
-- jest bounded przez `watched_pools_cap`.
+- jest bounded przez `account_update_queue_capacity` (stara nazwa
+  `account_update_coalescing_capacity` pozostaje deserialize aliasem).
 
 Obowiązkowy test:
 
@@ -194,6 +204,12 @@ downstream capacity = 1 i jest pełne
 -> AccountUpdate enqueue kończy się bez oczekiwania
 -> state pozostaje w dedicated lane
 -> po zwolnieniu downstream dociera dokładnie raz
+
+ta sama krzywa/slot/write_version
+-> None, Some(0), hash A i hash B pozostają osobnymi obserwacjami
+
+64 równoległych producentów, obie lane
+-> odbiór sequence_number = 0..63
 ```
 
 ## 9. Durable local-gap receipt
@@ -271,6 +287,11 @@ enqueue 32 records
 Launcher zatrzymuje najpierw producenta Seer, potem dispatchery. IPC receiver
 pozostaje żywy do końca egress drain. Timeout, panic, append failure, final
 flush failure lub early downstream close stają się błędem shutdownu.
+Każdy dispatcher otrzymuje pozostały budżet ze wspólnego czterosekundowego
+deadline’u Seer; launcher ma niezależny pięciosekundowy outer timeout.
+IPC nie używa już `blocking_send`: pełny downstream jest obsługiwany przez
+`try_send` + bounded retry do deadline’u. Test zatrzymanego konsumenta kończy
+się `IpcError::ShutdownTimeout` w zadanym budżecie.
 
 ## 12. Verification
 
@@ -281,6 +302,9 @@ cargo fmt --all --check
 git diff --check
 cargo test -p ghost-core ingest_integrity -- --nocapture
 cargo test -p seer --lib canonical_account_update_survives_full_downstream_and_arrives_once -- --nocapture
+cargo test -p seer --lib account_update_fifo_retains_same_version_conflicts_and_none_separately -- --nocapture
+cargo test -p seer --lib concurrent_multi_lane_enqueue_is_globally_sequence_ordered -- --nocapture
+cargo test -p seer --lib shutdown_is_bounded_when_downstream_stops_consuming -- --nocapture
 cargo test -p seer --lib reserved_audit_lane_persists_every_local_gap_domain -- --nocapture
 cargo test -p seer --lib diagnostic_evidence_saturation_does_not_block_canonical_runtime -- --nocapture
 cargo test -p seer --lib required_evidence_saturation_invalidates_run_segment -- --nocapture
@@ -297,8 +321,9 @@ timeout 900s cargo build --release --workspace
 Wszystkie powyższe scoped gates przeszły, w tym finalny release workspace
 build. Harness potwierdził pełny digest
 `549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202`,
-`missing_event_count=0` przy wejściu/capacity `2,048` oraz jawny dwueventowy
-gap w próbie saturacji.
+`missing_event_count=0` dla workloadu `3,072` przy capacity `2,048`, queue
+dwell p99 `47,209,510 ns <= 250 ms`, oldest `54,277,899 ns <= 500 ms` oraz
+jawny dwueventowy gap w próbie saturacji.
 
 Pełne test suites zachowują istniejący poza zakresem failure signature:
 
@@ -314,6 +339,21 @@ Pełne test suites zachowują istniejący poza zakresem failure signature:
   `ghost-launcher/tests/oracle_continuous_sampling.rs:34`.
 
 Korekta PR1B nie rozszerza scope’u o naprawę tych fixture’ów.
+
+Zdalne workflowy zostały porównane z bieżącym `main`, a nie tylko opisane jako
+„znany baseline”:
+
+- `main` head i merge-base PR: `ea7d31a228f8db0b7ed0779dea70b696895e66c2`;
+- Restore Lifecycle Guard na `main`, run `30119079249`: failure `E0063` w
+  nietkniętym initializerze `PoolTransaction`;
+- PR run `30141277590`: ta sama klasa `E0063` w innych nietkniętych fixture’ach
+  testowych;
+- PR Metric Contracts run `30141277591`: ta sama klasa `E0063`;
+- `git diff origin/main...HEAD` dla trzech wskazanych przez CI fixture’ów jest
+  pusty.
+
+To formalnie klasyfikuje czerwone checks jako istniejący baseline tej samej
+klasy kompilacji, nie jako zielony wynik PR.
 
 ## 13. Scope boundary
 

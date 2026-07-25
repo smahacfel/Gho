@@ -12,7 +12,7 @@ use std::{
         Arc, Mutex,
     },
     thread::JoinHandle,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use ghost_core::{
@@ -211,11 +211,22 @@ impl LocalGapAuditDispatcher {
         }
     }
 
-    pub(crate) fn shutdown_and_join(&self) -> Result<(), String> {
+    pub(crate) fn shutdown_and_join(&self, timeout: Duration) -> Result<(), String> {
         self.router.stop_accepting();
         let _ = self.stop.try_send(());
         let handle = self.join.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(handle) = handle {
+            let deadline = Instant::now() + timeout;
+            while !handle.is_finished() {
+                if Instant::now() >= deadline {
+                    drop(handle);
+                    return Err(format!(
+                        "local-gap audit dispatcher did not drain/flush within {} ms",
+                        timeout.as_millis()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             handle
                 .join()
                 .map_err(|_| "local-gap audit dispatcher panicked".to_string())?;
@@ -526,7 +537,7 @@ mod tests {
         }
 
         dispatcher
-            .shutdown_and_join()
+            .shutdown_and_join(Duration::from_secs(1))
             .expect("reserved audit lane should drain and flush");
 
         let mut persisted_reasons = Vec::new();

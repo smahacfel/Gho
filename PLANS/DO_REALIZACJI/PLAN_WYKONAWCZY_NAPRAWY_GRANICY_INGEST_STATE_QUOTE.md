@@ -1256,9 +1256,13 @@ Kolejność realizacji jest normatywna:
    - JSON, Base58 i evidence hash przenieść do bounded evidence writera;
    - oczekiwanie na downstream IPC przenieść do jednego bounded egress
      dispatchera;
-   - canonical `AccountUpdate` zachować w osobnej bounded latest-state lane per
-     bonding curve, uporządkowanej przez `(slot, write_version)`, aby pełna
-     wspólna kolejka business IPC nie usuwała primary state feedu;
+   - canonical `AccountUpdate` zachować w osobnej bounded FIFO wszystkich
+     przyjętych obserwacji, bez deduplikacji i freshness arbitration w PR1B,
+     aby pełna wspólna kolejka business IPC nie usuwała primary state feedu i
+     aby PR1C otrzymał `None`, `Some(0)`, multi-provider oraz
+     same-version/different-hash;
+   - sequence number nadawać atomowo pod tym samym lockiem co enqueue, a obie
+     lane scalać według ich frontowego sequence number;
    - event worker używa wyłącznie nieblokujących enqueue;
    - wszystkie dispatchery mają stałą liczbę workerów i bounded capacity;
    - każdy dispatcher musi mieć `stop accepting -> drain -> flush -> join` i
@@ -1283,11 +1287,14 @@ Kolejność realizacji jest normatywna:
 Pojemność ingress jest konfigurowalna przez serde-default
 `ingress_queue_capacity`; wartość domyślna wynosi 2 048 eventów. Pierwotne
 wyliczenie `średni throughput × 250 ms` było nieprawidłowe i nie jest już
-podstawą capacity. Równoległy zamrożony protobuf replay z rzeczywistym
-konsumentem normalizacji/parsera zmierzył peak ingress 73 482,008 eventów/s,
-sustained drain 2 650,976 eventów/s, high-water 1 992 i zero utraconych eventów
-przy capacity 2 048. WAL, evidence i IPC mają jawne bounded kolejki; nie ma
-kaskadowych overflow queues ani per-event task spawning.
+podstawą capacity. Równoległy zamrożony protobuf replay ma workload 3 072
+eventów (24 × 128 co 50 ms), czyli nie jest równy capacity. Z rzeczywistym
+konsumentem normalizacji/parsera zmierzył peak batch 73 873,871 eventów/s,
+operational ingress 2 535,427 eventów/s, sustained drain 2 442,683 eventów/s,
+high-water 134 i zero utraconych eventów przy capacity 2 048. Twarde bramki:
+queue dwell p99 47 209 510 ns <= 250 ms oraz oldest age 54 277 899 ns <=
+500 ms. WAL, evidence i IPC mają jawne bounded kolejki; nie ma kaskadowych
+overflow queues ani per-event task spawning.
 
 Status PR1B po korekcie review (2026-07-25):
 
@@ -1299,10 +1306,14 @@ Status PR1B po korekcie review (2026-07-25):
   `549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202`;
 - receiver i parser worker nie blokują na ingress, WAL, evidence ani IPC;
 - pełna normalna kolejka IPC nie usuwa canonical `AccountUpdate`;
+- AccountUpdate FIFO nie usuwa obserwacji tej samej wersji/krzywej i nie
+  wykonuje arbitrażu przed PR1C;
+- 64-producer test potwierdza globalny sequence ordering obu IPC lane;
 - saturacja ma trwały missing count, pierwszą/ostatnią odrzuconą granicę i
   deterministyczny local gap;
 - wszystkie cztery domeny gapów trafiają do niezależnego audit WAL;
 - WAL/evidence/IPC/audit mają kontrolowany drain, final flush i join;
+- shutdown ma wspólny deadline i typed timeout; IPC nie używa blocking_send;
 - diagnostyczny evidence jest globalnym warunkiem runu tylko przy
   `artifact_required_for_run = true`;
 - brak dowodu lokalnego recovery pozostawia segment niewiarygodny;

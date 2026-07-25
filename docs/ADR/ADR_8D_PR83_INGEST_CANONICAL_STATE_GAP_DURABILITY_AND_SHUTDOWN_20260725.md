@@ -35,23 +35,29 @@ normal business lane
   bounded VecDeque<SeerEvent>
 
 canonical state lane
-  bounded HashMap<bonding_curve, latest AccountUpdate>
-  BTreeMap<sequence_number, bonding_curve>
-  freshness = (slot, write_version)
+  bounded VecDeque<SeerEvent>
+  FIFO wszystkich przyjętych AccountUpdate
+  bez deduplikacji i freshness arbitration
 
 single fixed dispatcher
-  wybiera najniższy zachowany sequence_number
-  blocking_send wyłącznie poza hot path
+  wybiera niższy front sequence_number z obu FIFO
+  try_send + bounded retry poza hot path
 ```
 
 Pełna normalna kolejka nie odbiera capacity canonical state lane. Dla tej samej
-krzywej oczekujący starszy stan może zostać zastąpiony przez nowszy według
-`(slot, write_version)`. Lane jest bounded; launcher ustawia jej capacity na
-`watched_pools_cap`. Brak wolnego klucza jest jawnym
+krzywej wszystkie obserwacje pozostają odrębne, w tym `write_version=None`,
+`Some(0)` oraz same-version/different-hash. PR1B nie wybiera zwycięskiego
+stanu przed AccountObservationArbiter PR1C. Lane jest bounded; launcher ustawia
+jej capacity przez `account_update_queue_capacity`. Stara nazwa
+`account_update_coalescing_capacity` pozostaje serde aliasem tylko dla odczytu.
+Brak miejsca jest jawnym
 `IpcEgressQueueSaturated`, a nie pozornym sukcesem.
 
-Dispatcher zachowuje `JoinHandle`. Zamknięcie downstream przed dostarczeniem
-zaakceptowanych eventów ustawia typed failure zwracany przez shutdown.
+Sequence number jest nadawany atomowo pod tym samym lockiem co enqueue, więc
+współbieżny producent nie może zakolejkować `N+1` przed `N`. Dispatcher
+zachowuje `JoinHandle`. Zamknięcie downstream lub przekroczenie deadline’u
+przed dostarczeniem zaakceptowanych eventów ustawia typed failure zwracany
+przez shutdown.
 
 ### 2.2. Gap zapisuje pełne rozliczenie lokalnej utraty
 
@@ -141,30 +147,25 @@ workloadu. Producent i rzeczywisty konsument działają równolegle; konsument
 wykonuje tę samą normalizację i `parse_transaction_bundle` co ścieżka
 produkcyjna.
 
-Ostatni pomiar release:
+Ostatni pomiar release używa 3,072 eventów, czyli workloadu celowo innego niż
+capacity, oraz twardych SLA:
 
 ```text
-input events             = 2,048
+input events             = 3,072 (24 × 128, interval 50 ms)
 configured capacity      = 2,048
-peak ingress             = 73,482.008 events/s
-sustained drain          = 2,650.976 events/s
-queue high-water         = 1,992
-oldest backlog age       = 744,241,363 ns
+peak batch ingress       = 73,873.871 events/s
+operational ingress      = 2,535.427 events/s
+sustained drain          = 2,442.683 events/s
+queue high-water         = 134
+queue dwell p99          = 47,209,510 ns <= 250,000,000 ns
+oldest backlog age       = 54,277,899 ns <= 500,000,000 ns
 missing_event_count      = 0
 ```
 
-Dla zmierzonego burstu:
-
-```text
-backlog growth ~= (peak ingress - sustained drain) * burst duration
-observed high-water = 1,992
-next bounded power-of-two = 2,048
-```
-
-To uzasadnia default dla zamrożonego replay workloadu, a nie gwarantuje
-capacity dla dowolnego przyszłego profilu Yellowstone. Pole pozostaje
-konfigurowalne, aby shadow/captured workload mógł wyznaczyć produkcyjną wartość
-bez zmiany kodu.
+Brama dowodzi braku utraty i bounded dwell dla konkretnego zamrożonego profilu,
+nie uniwersalnej capacity dla dowolnego przyszłego profilu Yellowstone. Pole
+pozostaje konfigurowalne, aby shadow/captured workload mógł wyznaczyć
+produkcyjną wartość bez zmiany kodu.
 
 ### 2.7. Każdy zaakceptowany job ma kontrolowany lifecycle
 
@@ -181,8 +182,12 @@ stop accepting
 
 Krótkie lifecycle mutexy wykluczają wyścig `accepted after final drain`.
 Launcher najpierw zatrzymuje producenta Seer, potem drenuje dispatchery, a IPC
-receiver pozostawia aktywny do chwili opróżnienia egressu. Timeout/abort jest
-raportowany jako błąd shutdownu.
+receiver pozostawia aktywny do chwili opróżnienia egressu. Każdy dispatcher
+otrzymuje pozostałą część wspólnego czterosekundowego deadline’u, a launcher
+nakłada niezależny pięciosekundowy outer timeout. OS-writer, który utknie w
+filesystem I/O, jest odłączany po deadline i powoduje typed shutdown failure;
+Tokio evidence writer jest abortowany. Timeout/abort nie może zostać
+raportowany jako sukces.
 
 ## 3. Zachowane inwarianty
 
@@ -264,8 +269,8 @@ z `E0063` w testach launchera.
 - Default `2,048` jest poparty zamrożonym replay workloadem, nie raw capture z
   każdego produkcyjnego reżimu. Produkcyjny rollout powinien kalibrować pole z
   shadow/captured peak i drain telemetry.
-- Coalescing zachowuje najnowszy oczekujący stan per bonding curve; pełna
-  arbitrażowa klasyfikacja duplicate/conflict pozostaje zakresem PR1C.
+- Transport zachowuje wszystkie przyjęte AccountUpdate; arbitrażowa
+  klasyfikacja duplicate/conflict pozostaje wyłącznie zakresem PR1C.
 - PR1B nadal nie dowodzi odzyskania local gap. Każda nieodzyskana luka pozostaje
   fail-closed.
 - Rezerwowana audit lane jest bounded. Jej wyczerpanie nie jest ukrywane:

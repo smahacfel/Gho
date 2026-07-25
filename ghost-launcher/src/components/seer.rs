@@ -4165,7 +4165,7 @@ pub async fn run(
             log_drops: true,
             log_overflows: true,
             warning_threshold_percent: 80.0,
-            account_update_coalescing_capacity: config.watched_pools_cap,
+            account_update_queue_capacity: config.watched_pools_cap,
         },
         metrics_port: config.metrics_port,
         ultrafast_enter_threshold: 80.0,
@@ -4271,9 +4271,8 @@ pub async fn run(
         seer_config.ingress_queue_capacity
     );
     info!(
-        "  ipc_buffer_size: {} account_update_coalescing_capacity: {}",
-        seer_config.ipc_config.buffer_size,
-        seer_config.ipc_config.account_update_coalescing_capacity
+        "  ipc_buffer_size: {} account_update_queue_capacity: {}",
+        seer_config.ipc_config.buffer_size, seer_config.ipc_config.account_update_queue_capacity
     );
     info!(
         "  raw_instruction_artifact: enabled={} required_for_run={}",
@@ -4908,11 +4907,24 @@ pub async fn run(
         }
     }
 
-    if let Err(err) = seer.shutdown_dispatchers().await {
-        error!("Seer: dispatcher drain/flush/join failed: {}", err);
-        shutdown_failures.push(format!(
-            "Seer dispatcher shutdown did not preserve all accepted work: {err}"
-        ));
+    match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, seer.shutdown_dispatchers()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            error!("Seer: dispatcher drain/flush/join failed: {}", err);
+            shutdown_failures.push(format!(
+                "Seer dispatcher shutdown did not preserve all accepted work: {err}"
+            ));
+        }
+        Err(_) => {
+            error!(
+                "Seer: dispatcher shutdown exceeded {:?}",
+                SEER_CORE_SHUTDOWN_TIMEOUT
+            );
+            shutdown_failures.push(format!(
+                "Seer dispatcher shutdown exceeded {:?}",
+                SEER_CORE_SHUTDOWN_TIMEOUT
+            ));
+        }
     }
 
     match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, &mut ipc_handle).await {

@@ -121,15 +121,17 @@ Po przebudowie capacity testu finalny release harness na tym hoście raportuje:
 
 | Metryka release | Final PR1B |
 |---|---:|
-| Throughput pełnego replay parsera | 2,429.975 events/s |
-| receive→normalize p50 / p95 / p99 | 20,121 / 39,841 / 48,608 ns |
-| normalize→bundle p50 / p95 / p99 | 394,084 / 555,250 / 840,725 ns |
-| Burst input / capacity / missing | 2,048 / 2,048 / 0 |
-| Queue high-water | 1,992 |
-| Zmierzony peak ingress | 73,482.008 events/s |
-| Zmierzony sustained drain | 2,650.976 events/s |
-| Najstarszy event w kolejce | 744,241,363 ns |
-| Steady-state RSS | 17,144 KiB |
+| Throughput pełnego replay parsera | 2,476.122 events/s |
+| receive→normalize p50 / p95 / p99 | 20,632 / 33,016 / 47,886 ns |
+| normalize→bundle p50 / p95 / p99 | 397,400 / 484,697 / 520,419 ns |
+| Operational input / capacity / missing | 3,072 / 2,048 / 0 |
+| Workload profile | 24 × 128 eventów, interval 50 ms |
+| Queue high-water | 134 |
+| Queue dwell p99 / SLA | 47,209,510 / 250,000,000 ns — PASS |
+| Najstarszy event / SLA | 54,277,899 / 500,000,000 ns — PASS |
+| Peak batch / operational ingress | 73,873.871 / 2,535.427 events/s |
+| Zmierzony sustained drain | 2,442.683 events/s |
+| Steady-state RSS | 13,716 KiB |
 
 To jest dowód dla zamrożonego, deterministycznego protobuf replay workloadu z
 równoległym producentem i rzeczywistym konsumentem normalizującym oraz
@@ -167,21 +169,24 @@ Yellowstone receiver
        -> evidence queue: bounded 1,024 -> one fixed writer task
        -> IPC normal events: bounded configured capacity
        -> IPC canonical AccountUpdate:
-            bounded latest-state lane per bonding curve
-            ordering/freshness key = (slot, write_version)
-       -> one fixed IPC dispatcher merges both lanes by retained sequence
+            bounded FIFO wszystkich przyjętych obserwacji
+            bez deduplikacji i freshness arbitration
+       -> one fixed IPC dispatcher merges both FIFO by sequence
 ```
 
 Pierwotne wyliczenie `throughput × 250 ms = 1,024` zostało odrzucone. Capacity
 jest teraz polem serde-default konfiguracji (`ingress_queue_capacity`, domyślnie
 `2,048`). Zamrożony replay uruchamia producenta i konsumenta równolegle,
-raportuje peak ingress, sustained drain, high-water i najstarszy backlog, a dla
-capacity `2,048` kończy z `missing_event_count = 0`.
+raportuje peak/operational ingress, sustained drain, high-water, p99 dwell i
+najstarszy backlog, a dla workloadu `3,072` przy capacity `2,048` kończy z
+`missing_event_count = 0` i przechodzi oba twarde SLA.
 
-Dedykowana AccountUpdate lane ma capacity powiązaną w launcherze z bounded
-limitem obserwowanych pul. Pełna wspólna kolejka business eventów nie usuwa
-canonical state update. Nowszy stan dla tej samej krzywej może zastąpić
-oczekujący starszy stan według `(slot, write_version)` bez oczekiwania hot path.
+Dedykowana AccountUpdate lane ma bounded capacity. Pełna wspólna kolejka
+business eventów nie usuwa canonical state update. Żaden stan tej samej
+krzywej nie zastępuje innego: `None`, `Some(0)` i
+same-version/different-hash pozostają materiałem wejściowym dla PR1C.
+Sequence number jest nadawany atomowo z enqueue, więc dispatcher zachowuje
+globalny porządek także przy współbieżnych producentach.
 
 Nie ma `fast + overflow`, ogólnego spill queue, unbounded channel ani
 per-event `tokio::spawn`. Event worker nie wykonuje fizycznego WAL append,
@@ -190,10 +195,10 @@ evidence JSON ani await na downstream IPC capacity.
 Slow-sink harness po korekcie:
 
 ```text
-slow WAL enqueue = 761,345 ns
-physical writer elapsed = 7,196,949 ns
+slow WAL enqueue = 621,944 ns
+physical writer elapsed = 7,148,472 ns
 physical writer calls/waits = 2/2, wyłącznie po stronie writera
-slow IPC enqueue = 11,995 ns
+slow IPC enqueue = 7,074 ns
 parser-worker IPC blocking waits = 0
 ```
 

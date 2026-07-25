@@ -51,8 +51,8 @@ fn default_test_config() -> SeerConfig {
             log_drops: true,
             log_overflows: true,
             warning_threshold_percent: 80.0,
-            account_update_coalescing_capacity: seer::ipc::IpcChannelConfig::default()
-                .account_update_coalescing_capacity,
+            account_update_queue_capacity: seer::ipc::IpcChannelConfig::default()
+                .account_update_queue_capacity,
         },
         metrics_port: 9091,
         ultrafast_enter_threshold: 0.8,

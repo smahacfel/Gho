@@ -14,10 +14,11 @@ use prometheus::{
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::VecDeque,
     str::FromStr,
     sync::{Arc, Condvar, Mutex},
     thread::JoinHandle,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -501,14 +502,17 @@ pub struct IpcChannelConfig {
     /// Warning threshold (percentage of buffer) for logging
     pub warning_threshold_percent: f64,
 
-    /// Maximum number of distinct tracked bonding curves whose latest
-    /// canonical AccountUpdate may wait in the dedicated coalescing lane.
+    /// Maximum number of canonical AccountUpdate observations that may wait in
+    /// the dedicated FIFO lane.
     ///
-    /// The launcher wires this to the bounded watched-pool capacity. Keeping a
-    /// latest value per tracked curve prevents a full business-event queue from
-    /// discarding canonical state without making the hot path await downstream.
-    #[serde(default = "IpcChannelConfig::default_account_update_coalescing_capacity")]
-    pub account_update_coalescing_capacity: usize,
+    /// PR1B transport deliberately performs no deduplication, freshness
+    /// arbitration, or latest-state coalescing. Every admitted observation is
+    /// retained for the downstream PR1C account arbiter.
+    #[serde(
+        default = "IpcChannelConfig::default_account_update_queue_capacity",
+        alias = "account_update_coalescing_capacity"
+    )]
+    pub account_update_queue_capacity: usize,
 }
 
 impl Default for IpcChannelConfig {
@@ -519,13 +523,13 @@ impl Default for IpcChannelConfig {
             log_drops: true,
             log_overflows: true,
             warning_threshold_percent: 80.0,
-            account_update_coalescing_capacity: Self::default_account_update_coalescing_capacity(),
+            account_update_queue_capacity: Self::default_account_update_queue_capacity(),
         }
     }
 }
 
 impl IpcChannelConfig {
-    const fn default_account_update_coalescing_capacity() -> usize {
+    const fn default_account_update_queue_capacity() -> usize {
         32_768
     }
 }
@@ -753,6 +757,9 @@ pub enum IpcError {
 
     #[error("Local IPC egress coverage gap: bounded dispatcher is saturated")]
     LocalProcessingGap,
+
+    #[error("IPC dispatcher did not drain within {timeout_ms} ms")]
+    ShutdownTimeout { timeout_ms: u64 },
 }
 
 #[derive(Debug)]
@@ -761,20 +768,15 @@ enum IpcQueueError {
     Closed(SeerEvent),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IpcEnqueueOutcome {
-    Queued,
-    Coalesced,
-    SupersededByPendingNewerState,
-}
-
 struct IpcEgressState {
     normal: VecDeque<SeerEvent>,
-    account_updates: HashMap<Pubkey, DetectedAccountUpdateEvent>,
-    account_order: BTreeMap<u64, Pubkey>,
+    account_updates: VecDeque<SeerEvent>,
+    next_sequence: u64,
     accepting: bool,
     shutdown_requested: bool,
+    shutdown_deadline: Option<Instant>,
     delivery_failed: bool,
+    delivery_timed_out: bool,
 }
 
 struct IpcEgressQueue {
@@ -789,11 +791,13 @@ impl IpcEgressQueue {
         Self {
             state: Mutex::new(IpcEgressState {
                 normal: VecDeque::with_capacity(normal_capacity),
-                account_updates: HashMap::with_capacity(account_update_capacity.min(1_024)),
-                account_order: BTreeMap::new(),
+                account_updates: VecDeque::with_capacity(account_update_capacity),
+                next_sequence: 0,
                 accepting: true,
                 shutdown_requested: false,
+                shutdown_deadline: None,
                 delivery_failed: false,
+                delivery_timed_out: false,
             }),
             ready: Condvar::new(),
             normal_capacity: normal_capacity.max(1),
@@ -801,47 +805,33 @@ impl IpcEgressQueue {
         }
     }
 
-    fn try_enqueue(&self, event: SeerEvent) -> Result<IpcEnqueueOutcome, IpcQueueError> {
+    fn try_enqueue(&self, mut event: SeerEvent) -> Result<(), IpcQueueError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.accepting || state.delivery_failed {
             return Err(IpcQueueError::Closed(event));
         }
 
-        if let SeerEvent::AccountUpdate(update) = event {
-            let curve = update.bonding_curve;
-            if let Some(pending) = state.account_updates.get(&curve) {
-                let pending_key = account_update_state_key(pending);
-                let incoming_key = account_update_state_key(&update);
-                if incoming_key <= pending_key {
-                    return Ok(IpcEnqueueOutcome::SupersededByPendingNewerState);
-                }
-
-                let old_sequence = pending.sequence_number;
-                let incoming_sequence = update.sequence_number;
-                state.account_order.remove(&old_sequence);
-                state.account_updates.insert(curve, update);
-                state.account_order.insert(incoming_sequence, curve);
-                self.ready.notify_one();
-                return Ok(IpcEnqueueOutcome::Coalesced);
-            }
-
+        if matches!(event, SeerEvent::AccountUpdate(_)) {
             if state.account_updates.len() >= self.account_update_capacity {
-                return Err(IpcQueueError::Full(SeerEvent::AccountUpdate(update)));
+                return Err(IpcQueueError::Full(event));
             }
-
-            let sequence = update.sequence_number;
-            state.account_updates.insert(curve, update);
-            state.account_order.insert(sequence, curve);
-            self.ready.notify_one();
-            return Ok(IpcEnqueueOutcome::Queued);
-        }
-
-        if state.normal.len() >= self.normal_capacity {
+        } else if state.normal.len() >= self.normal_capacity {
             return Err(IpcQueueError::Full(event));
         }
-        state.normal.push_back(event);
+
+        // Sequence allocation and queue insertion share the same lock. This is
+        // the ordering linearization point for every IPC lane, so concurrent
+        // producers cannot publish N+1 before N.
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        set_seer_event_sequence(&mut event, sequence);
+        if matches!(event, SeerEvent::AccountUpdate(_)) {
+            state.account_updates.push_back(event);
+        } else {
+            state.normal.push_back(event);
+        }
         self.ready.notify_one();
-        Ok(IpcEnqueueOutcome::Queued)
+        Ok(())
     }
 
     fn len(&self) -> usize {
@@ -852,26 +842,33 @@ impl IpcEgressQueue {
             .saturating_add(state.account_updates.len())
     }
 
-    fn begin_shutdown(&self) {
+    fn begin_shutdown(&self, timeout: Duration) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.accepting = false;
         state.shutdown_requested = true;
+        state.shutdown_deadline = Some(Instant::now() + timeout);
         self.ready.notify_all();
     }
 
-    fn mark_delivery_failed(&self) {
+    fn mark_delivery_failed(&self, timed_out: bool) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.accepting = false;
         state.shutdown_requested = true;
         state.delivery_failed = true;
+        state.delivery_timed_out |= timed_out;
         self.ready.notify_all();
     }
 
-    fn delivery_failed(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .delivery_failed
+    fn delivery_status(&self) -> (bool, bool) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (state.delivery_failed, state.delivery_timed_out)
+    }
+
+    fn shutdown_deadline_expired(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .shutdown_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     fn total_capacity(&self) -> usize {
@@ -883,20 +880,14 @@ impl IpcEgressQueue {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let normal_sequence = state.normal.front().map(seer_event_sequence);
-            let account_sequence = state.account_order.first_key_value().map(|(seq, _)| *seq);
+            let account_sequence = state.account_updates.front().map(seer_event_sequence);
 
             match (normal_sequence, account_sequence) {
                 (Some(normal), Some(account)) if account < normal => {
-                    let (_, curve) = state.account_order.pop_first()?;
-                    let update = state.account_updates.remove(&curve)?;
-                    return Some(SeerEvent::AccountUpdate(update));
+                    return state.account_updates.pop_front();
                 }
                 (Some(_), _) => return state.normal.pop_front(),
-                (None, Some(_)) => {
-                    let (_, curve) = state.account_order.pop_first()?;
-                    let update = state.account_updates.remove(&curve)?;
-                    return Some(SeerEvent::AccountUpdate(update));
-                }
+                (None, Some(_)) => return state.account_updates.pop_front(),
                 (None, None) if state.shutdown_requested => return None,
                 (None, None) => {
                     state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
@@ -904,10 +895,6 @@ impl IpcEgressQueue {
             }
         }
     }
-}
-
-fn account_update_state_key(update: &DetectedAccountUpdateEvent) -> (u64, u64) {
-    (update.slot, update.write_version.unwrap_or_default())
 }
 
 fn seer_event_sequence(event: &SeerEvent) -> u64 {
@@ -920,11 +907,21 @@ fn seer_event_sequence(event: &SeerEvent) -> u64 {
     }
 }
 
+fn set_seer_event_sequence(event: &mut SeerEvent, sequence: u64) {
+    match event {
+        SeerEvent::PoolDetected(event) => event.sequence_number = sequence,
+        SeerEvent::Trade(event) => event.sequence_number = sequence,
+        SeerEvent::FundingTransfer(event) => event.sequence_number = sequence,
+        SeerEvent::AccountUpdate(event) => event.sequence_number = sequence,
+        SeerEvent::ExecutionAccountEvidence(event) => event.sequence_number = sequence,
+    }
+}
+
 /// Sender wrapper with backpressure handling and metrics
 #[derive(Clone)]
 pub struct IpcSender {
-    /// One bounded nonblocking business-event lane plus one bounded
-    /// latest-state coalescing lane, drained by a single fixed dispatcher.
+    /// One bounded nonblocking business-event FIFO plus one bounded canonical
+    /// AccountUpdate FIFO, drained by a single fixed dispatcher.
     egress: Arc<IpcEgressQueue>,
     dispatcher: Arc<Mutex<Option<JoinHandle<()>>>>,
 
@@ -933,9 +930,6 @@ pub struct IpcSender {
 
     /// Metrics
     metrics: Arc<IpcMetrics>,
-
-    /// Sequence counter for events
-    sequence_counter: Arc<std::sync::atomic::AtomicU64>,
 
     local_gap: Arc<crate::local_gap::LocalGapTracker>,
     local_gap_audit: Arc<crate::local_gap::LocalGapAuditRouter>,
@@ -955,7 +949,6 @@ impl IpcSender {
             dispatcher,
             config,
             metrics,
-            sequence_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             local_gap: Arc::new(crate::local_gap::LocalGapTracker::new(
                 ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
             )),
@@ -982,14 +975,10 @@ impl IpcSender {
         candidate: CandidatePool,
         priority: EventPriority,
     ) -> Result<(), IpcError> {
-        let sequence = self
-            .sequence_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
         let event = SeerEvent::PoolDetected(DetectedPoolEvent {
             candidate,
             detected_at: std::time::SystemTime::now(),
-            sequence_number: sequence,
+            sequence_number: 0,
             priority,
         });
 
@@ -1002,14 +991,10 @@ impl IpcSender {
         trade: TradeEvent,
         priority: EventPriority,
     ) -> Result<(), IpcError> {
-        let sequence = self
-            .sequence_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
         let event = SeerEvent::Trade(DetectedTradeEvent {
             trade,
             detected_at: std::time::SystemTime::now(),
-            sequence_number: sequence,
+            sequence_number: 0,
             priority,
         });
 
@@ -1027,15 +1012,11 @@ impl IpcSender {
         transfer: FundingTransferEvent,
         priority: EventPriority,
     ) -> Result<(), IpcError> {
-        let sequence = self
-            .sequence_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
         let event = SeerEvent::FundingTransfer(DetectedFundingTransferEvent {
             transfer,
             lane_health: FundingLaneRuntimeHealth::default(),
             detected_at: std::time::SystemTime::now(),
-            sequence_number: sequence,
+            sequence_number: 0,
             priority,
         });
 
@@ -1049,10 +1030,10 @@ impl IpcSender {
     /// `OracleRuntime` / `AccountStateCore`.
     ///
     /// This is a critical path in the post-migration architecture. It never
-    /// waits for downstream capacity: the latest update per tracked bonding
-    /// curve is retained in a bounded coalescing lane ordered by
-    /// `(slot, write_version)` and merged back into egress by its retained
-    /// sequence number.
+    /// waits for downstream capacity: every admitted observation is retained
+    /// in a bounded FIFO. PR1B does not compare slot/write-version, hash,
+    /// provider, signature, or reserve content; that arbitration belongs to
+    /// PR1C.
     ///
     /// `sol_reserves` / `token_reserves` must be the canonical virtual reserves
     /// from the bonding-curve account, not the real balance subset.
@@ -1080,10 +1061,6 @@ impl IpcSender {
         replay_origin: AccountUpdateReplayOrigin,
         replay_buffer_dwell_ms: Option<u64>,
     ) -> Result<(), IpcError> {
-        let sequence = self
-            .sequence_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         let event = SeerEvent::AccountUpdate(DetectedAccountUpdateEvent {
             provider_id,
             provider_role,
@@ -1107,7 +1084,7 @@ impl IpcSender {
             replay_origin,
             replay_buffer_dwell_ms,
             detected_at: std::time::SystemTime::now(),
-            sequence_number: sequence,
+            sequence_number: 0,
         });
 
         self.send_event_with_policy(event, EventPriority::High, BackpressurePolicy::Block)
@@ -1123,14 +1100,10 @@ impl IpcSender {
         evidence: ExecutionAccountEvidence,
         priority: EventPriority,
     ) -> Result<(), IpcError> {
-        let sequence = self
-            .sequence_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         let event = SeerEvent::ExecutionAccountEvidence(DetectedExecutionAccountEvidenceEvent {
             evidence,
             detected_at: std::time::SystemTime::now(),
-            sequence_number: sequence,
+            sequence_number: 0,
             priority,
         });
 
@@ -1175,20 +1148,9 @@ impl IpcSender {
         let boundary = ipc_event_boundary(&event);
         let provider_id = ipc_event_provider_id(&event);
         let send_result = match self.egress.try_enqueue(event) {
-            Ok(outcome) => {
+            Ok(()) => {
                 self.local_gap.observe_admitted(boundary);
                 self.local_gap.flush_completed_to(&self.local_gap_audit);
-                match outcome {
-                    IpcEnqueueOutcome::Coalesced => {
-                        ::metrics::increment_counter!("seer_ipc_account_updates_coalesced_total");
-                    }
-                    IpcEnqueueOutcome::SupersededByPendingNewerState => {
-                        ::metrics::increment_counter!(
-                            "seer_ipc_account_updates_stale_suppressed_total"
-                        );
-                    }
-                    IpcEnqueueOutcome::Queued => {}
-                }
                 Ok(())
             }
             Err(IpcQueueError::Full(_event)) => {
@@ -1240,21 +1202,54 @@ impl IpcSender {
 
     /// Stop accepting new events, drain every accepted business/state event to
     /// the downstream receiver, and join the fixed dispatcher thread.
-    pub fn shutdown_and_join(&self) -> Result<(), IpcError> {
-        self.egress.begin_shutdown();
-        let handle = self
+    pub fn shutdown_and_join(&self, timeout: Duration) -> Result<(), IpcError> {
+        self.egress.begin_shutdown(timeout);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let finished = self
+                .dispatcher
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_none_or(JoinHandle::is_finished);
+            if finished {
+                break;
+            }
+            if Instant::now() >= deadline {
+                self.egress.mark_delivery_failed(true);
+                // Dropping a still-running handle detaches the fixed worker;
+                // it observes the same deadline and exits without a blocking send.
+                self.dispatcher
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                self.local_gap
+                    .close_open_and_flush_to(&self.local_gap_audit);
+                return Err(IpcError::ShutdownTimeout {
+                    timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if let Some(handle) = self
             .dispatcher
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(handle) = handle {
+            .take()
+        {
             handle
                 .join()
                 .map_err(|_| IpcError::SendError("IPC egress dispatcher panicked".to_string()))?;
         }
         self.local_gap
             .close_open_and_flush_to(&self.local_gap_audit);
-        if self.egress.delivery_failed() {
+        let (delivery_failed, delivery_timed_out) = self.egress.delivery_status();
+        if delivery_timed_out {
+            return Err(IpcError::ShutdownTimeout {
+                timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            });
+        }
+        if delivery_failed {
             return Err(IpcError::SendError(
                 "IPC downstream closed before all accepted events were delivered".to_string(),
             ));
@@ -1364,17 +1359,33 @@ pub fn create_ipc_channel(config: IpcChannelConfig) -> (IpcSender, IpcReceiver, 
     let local_gap_audit = Arc::new(crate::local_gap::LocalGapAuditRouter::new());
     let egress = Arc::new(IpcEgressQueue::new(
         config.buffer_size,
-        config.account_update_coalescing_capacity,
+        config.account_update_queue_capacity,
     ));
     let worker_egress = Arc::clone(&egress);
 
     let handle = std::thread::Builder::new()
         .name("seer-ipc-egress".to_string())
         .spawn(move || {
-            while let Some(event) = worker_egress.next_event() {
-                if downstream_tx.blocking_send(event).is_err() {
-                    worker_egress.mark_delivery_failed();
-                    break;
+            let mut pending = None;
+            loop {
+                let event = match pending.take().or_else(|| worker_egress.next_event()) {
+                    Some(event) => event,
+                    None => break,
+                };
+                match downstream_tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(event)) => {
+                        pending = Some(event);
+                        if worker_egress.shutdown_deadline_expired() {
+                            worker_egress.mark_delivery_failed(true);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_event)) => {
+                        worker_egress.mark_delivery_failed(false);
+                        break;
+                    }
                 }
             }
         })
@@ -1400,19 +1411,35 @@ mod tests {
     use solana_sdk::pubkey::Pubkey;
 
     #[test]
-    fn old_ipc_config_defaults_account_update_coalescing_capacity() {
+    fn old_ipc_config_defaults_account_update_queue_capacity() {
         let mut value =
             serde_json::to_value(IpcChannelConfig::default()).expect("serialize IPC config");
         value
             .as_object_mut()
             .expect("IPC config object")
-            .remove("account_update_coalescing_capacity");
+            .remove("account_update_queue_capacity");
         let decoded: IpcChannelConfig =
             serde_json::from_value(value).expect("deserialize old IPC config");
         assert_eq!(
-            decoded.account_update_coalescing_capacity,
-            IpcChannelConfig::default().account_update_coalescing_capacity
+            decoded.account_update_queue_capacity,
+            IpcChannelConfig::default().account_update_queue_capacity
         );
+    }
+
+    #[test]
+    fn legacy_coalescing_capacity_name_is_a_deserialize_only_alias() {
+        let defaults = IpcChannelConfig::default();
+        let value = serde_json::json!({
+            "buffer_size": defaults.buffer_size,
+            "backpressure_policy": defaults.backpressure_policy,
+            "log_drops": defaults.log_drops,
+            "log_overflows": defaults.log_overflows,
+            "warning_threshold_percent": defaults.warning_threshold_percent,
+            "account_update_coalescing_capacity": 123
+        });
+        let decoded: IpcChannelConfig =
+            serde_json::from_value(value).expect("deserialize legacy IPC config");
+        assert_eq!(decoded.account_update_queue_capacity, 123);
     }
 
     async fn wait_for_downstream_len(receiver: &IpcReceiver, expected: usize) {
@@ -1463,6 +1490,38 @@ mod tests {
             token_total_supply: Some(1_000_000),
             block_time: Some(1234567890),
         }
+    }
+
+    fn create_test_account_update(
+        bonding_curve: Pubkey,
+        write_version: Option<u64>,
+        account_data_hash: &str,
+    ) -> SeerEvent {
+        SeerEvent::AccountUpdate(DetectedAccountUpdateEvent {
+            provider_id: Some("raw-primary".to_string()),
+            provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
+            semantic: ghost_core::EventSemanticEnvelope::default(),
+            event_time: ghost_core::EventTimeMetadata::default(),
+            base_mint: Pubkey::new_unique(),
+            bonding_curve,
+            curve_finality: ghost_core::CurveFinality::Provisional,
+            sol_reserves: 1_000,
+            token_reserves: 2_000,
+            real_sol_reserves: Some(300),
+            real_token_reserves: Some(400),
+            complete: 0,
+            slot: 123,
+            write_version,
+            txn_signature: Some(solana_sdk::signature::Signature::new_unique()),
+            account_data_hash: Some(account_data_hash.to_string()),
+            account_data_len: Some(56),
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(Pubkey::new_unique()),
+            replay_origin: AccountUpdateReplayOrigin::Live,
+            replay_buffer_dwell_ms: None,
+            detected_at: std::time::SystemTime::now(),
+            sequence_number: u64::MAX,
+        })
     }
 
     #[tokio::test]
@@ -1547,7 +1606,7 @@ mod tests {
     async fn canonical_account_update_survives_full_downstream_and_arrives_once() {
         let config = IpcChannelConfig {
             buffer_size: 1,
-            account_update_coalescing_capacity: 4,
+            account_update_queue_capacity: 4,
             ..IpcChannelConfig::default()
         };
         let (sender, mut receiver, _metrics) = create_ipc_channel(config);
@@ -1620,8 +1679,134 @@ mod tests {
             "the preserved canonical update must arrive exactly once"
         );
         sender
-            .shutdown_and_join()
+            .shutdown_and_join(Duration::from_secs(1))
             .expect("IPC dispatcher should drain and join");
+    }
+
+    #[test]
+    fn account_update_fifo_retains_same_version_conflicts_and_none_separately() {
+        let queue = IpcEgressQueue::new(4, 4);
+        let bonding_curve = Pubkey::new_unique();
+
+        queue
+            .try_enqueue(create_test_account_update(bonding_curve, None, "hash-none"))
+            .expect("unknown write-version observation must be admitted");
+        queue
+            .try_enqueue(create_test_account_update(
+                bonding_curve,
+                Some(0),
+                "hash-zero-a",
+            ))
+            .expect("Some(0) observation must remain distinct from None");
+        queue
+            .try_enqueue(create_test_account_update(
+                bonding_curve,
+                Some(0),
+                "hash-zero-b",
+            ))
+            .expect("same-version/different-hash observation must be retained");
+
+        queue.begin_shutdown(Duration::from_secs(1));
+        let mut observations = Vec::new();
+        while let Some(SeerEvent::AccountUpdate(update)) = queue.next_event() {
+            observations.push((
+                update.sequence_number,
+                update.write_version,
+                update.account_data_hash,
+            ));
+        }
+
+        assert_eq!(
+            observations,
+            vec![
+                (0, None, Some("hash-none".to_string())),
+                (1, Some(0), Some("hash-zero-a".to_string())),
+                (2, Some(0), Some("hash-zero-b".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_multi_lane_enqueue_is_globally_sequence_ordered() {
+        const PRODUCERS: usize = 64;
+
+        let queue = Arc::new(IpcEgressQueue::new(PRODUCERS, PRODUCERS));
+        let barrier = Arc::new(std::sync::Barrier::new(PRODUCERS + 1));
+        let bonding_curve = Pubkey::new_unique();
+        let mut handles = Vec::with_capacity(PRODUCERS);
+
+        for producer in 0..PRODUCERS {
+            let queue = Arc::clone(&queue);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let event = if producer % 2 == 0 {
+                    create_test_account_update(
+                        bonding_curve,
+                        Some(producer as u64),
+                        &format!("hash-{producer}"),
+                    )
+                } else {
+                    SeerEvent::PoolDetected(DetectedPoolEvent {
+                        candidate: create_test_candidate(),
+                        detected_at: std::time::SystemTime::now(),
+                        sequence_number: u64::MAX,
+                        priority: EventPriority::Normal,
+                    })
+                };
+                barrier.wait();
+                queue.try_enqueue(event).expect("concurrent enqueue");
+            }));
+        }
+
+        barrier.wait();
+        for handle in handles {
+            handle.join().expect("producer thread");
+        }
+        queue.begin_shutdown(Duration::from_secs(1));
+
+        let mut observed_sequences = Vec::with_capacity(PRODUCERS);
+        while let Some(event) = queue.next_event() {
+            observed_sequences.push(seer_event_sequence(&event));
+        }
+        assert_eq!(
+            observed_sequences,
+            (0..PRODUCERS as u64).collect::<Vec<_>>(),
+            "dispatcher merge must preserve the enqueue linearization order"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_bounded_when_downstream_stops_consuming() {
+        let config = IpcChannelConfig {
+            buffer_size: 1,
+            account_update_queue_capacity: 1,
+            ..IpcChannelConfig::default()
+        };
+        let (sender, receiver, _metrics) = create_ipc_channel(config);
+
+        sender
+            .send(create_test_candidate(), EventPriority::Normal)
+            .await
+            .expect("fill downstream");
+        wait_for_downstream_len(&receiver, 1).await;
+        sender
+            .send(create_test_candidate(), EventPriority::Normal)
+            .await
+            .expect("dispatcher owns one pending event");
+        wait_for_dispatcher_len(&sender, 0).await;
+
+        let timeout = Duration::from_millis(40);
+        let started = Instant::now();
+        let result = sender.shutdown_and_join(timeout);
+        assert!(
+            matches!(result, Err(IpcError::ShutdownTimeout { .. })),
+            "stalled downstream must produce an explicit shutdown timeout: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "shutdown must not wait indefinitely for a stalled downstream"
+        );
+        drop(receiver);
     }
 
     #[test]

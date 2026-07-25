@@ -488,7 +488,7 @@ impl RawEvidenceDispatcher {
         }
     }
 
-    async fn shutdown_and_join(&self) -> Result<(), String> {
+    async fn shutdown_and_join(&self, timeout: Duration) -> Result<(), String> {
         {
             let _lifecycle = self.lifecycle.lock();
             self.accepting.store(false, Release);
@@ -499,10 +499,23 @@ impl RawEvidenceDispatcher {
             }
         }
         let handle = self.join.lock().take();
-        if let Some(handle) = handle {
-            handle
-                .await
-                .map_err(|err| format!("raw evidence dispatcher join failed: {err}"))?;
+        if let Some(mut handle) = handle {
+            match tokio::time::timeout(timeout, &mut handle).await {
+                Ok(result) => {
+                    result.map_err(|err| format!("raw evidence dispatcher join failed: {err}"))?
+                }
+                Err(_) => {
+                    handle.abort();
+                    let _ = handle.await;
+                    if self.required_for_run {
+                        self.local_segment_unreliable.store(true, Release);
+                    }
+                    return Err(format!(
+                        "raw evidence dispatcher did not drain/flush within {} ms",
+                        timeout.as_millis()
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -691,6 +704,9 @@ const PENDING_TRADE_TTL: Duration = Duration::from_millis(30);
 const PENDING_TRADES_PER_CURVE_MAX: usize = 1_024;
 const RAW_PUMPFUN_INSTRUCTION_EVIDENCE_QUEUE_CAP: usize = 1_024;
 const RAW_PUMPFUN_INSTRUCTION_EVIDENCE_FLUSH_MS: u64 = 1_000;
+// Keep the Seer-owned deadline below the launcher's five-second outer guard so
+// typed per-dispatcher failures can propagate before the caller fallback fires.
+const DISPATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 const RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT: usize = 16;
 const RAW_PUMPFUN_LEGACY_TAIL_COUNT: usize = 2;
 const RAW_PUMPFUN_ACCOUNT_ROLES: [&str; RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT] = [
@@ -1826,7 +1842,7 @@ impl WalDispatcher {
         }
     }
 
-    fn shutdown_and_join(&self) -> Result<(), String> {
+    fn shutdown_and_join(&self, timeout: Duration) -> Result<(), String> {
         {
             let _lifecycle = self.lifecycle.lock();
             self.accepting.store(false, Release);
@@ -1835,6 +1851,18 @@ impl WalDispatcher {
             let _ = self.stop.try_send(());
         }
         if let Some(handle) = self.join.lock().take() {
+            let deadline = Instant::now() + timeout;
+            while !handle.is_finished() {
+                if Instant::now() >= deadline {
+                    self.local_segment_unreliable.store(true, Release);
+                    drop(handle);
+                    return Err(format!(
+                        "WAL dispatcher did not drain/flush within {} ms",
+                        timeout.as_millis()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             handle
                 .join()
                 .map_err(|_| "WAL dispatcher panicked".to_string())?;
@@ -2538,37 +2566,64 @@ impl Seer {
     /// Call this only after the Seer event loop has stopped producing new work
     /// and while the launcher IPC receiver is still alive.
     pub async fn shutdown_dispatchers(&self) -> Result<(), String> {
+        self.shutdown_dispatchers_with_timeout(DISPATCHER_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn shutdown_dispatchers_with_timeout(&self, timeout: Duration) -> Result<(), String> {
         let mut failures = Vec::new();
+        let deadline = Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(Instant::now());
 
         if let Some(dispatcher) = self.raw_pumpfun_instruction_evidence_tx.as_ref() {
-            if let Err(err) = dispatcher.shutdown_and_join().await {
+            if let Err(err) = dispatcher.shutdown_and_join(remaining()).await {
                 failures.push(err);
             }
         }
 
         if let Some(dispatcher) = self.wal_dispatcher.clone() {
-            match tokio::task::spawn_blocking(move || dispatcher.shutdown_and_join()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => failures.push(err),
-                Err(err) => failures.push(format!("WAL shutdown task join failed: {err}")),
+            let step_timeout = remaining();
+            let task =
+                tokio::task::spawn_blocking(move || dispatcher.shutdown_and_join(step_timeout));
+            match tokio::time::timeout(step_timeout, task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(err))) => failures.push(err),
+                Ok(Err(err)) => failures.push(format!("WAL shutdown task join failed: {err}")),
+                Err(_) => failures.push(format!(
+                    "WAL shutdown exceeded global dispatcher deadline of {} ms",
+                    timeout.as_millis()
+                )),
             }
         }
 
         if let Some(sender) = self.ipc_sender.clone() {
-            match tokio::task::spawn_blocking(move || sender.shutdown_and_join()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => failures.push(format!("IPC shutdown failed: {err}")),
-                Err(err) => failures.push(format!("IPC shutdown task join failed: {err}")),
+            let step_timeout = remaining();
+            let task = tokio::task::spawn_blocking(move || sender.shutdown_and_join(step_timeout));
+            match tokio::time::timeout(step_timeout, task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(err))) => failures.push(format!("IPC shutdown failed: {err}")),
+                Ok(Err(err)) => failures.push(format!("IPC shutdown task join failed: {err}")),
+                Err(_) => failures.push(format!(
+                    "IPC shutdown exceeded global dispatcher deadline of {} ms",
+                    timeout.as_millis()
+                )),
             }
         }
 
         if let Some(dispatcher) = self.local_gap_audit_dispatcher.clone() {
-            match tokio::task::spawn_blocking(move || dispatcher.shutdown_and_join()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => failures.push(err),
-                Err(err) => {
+            let step_timeout = remaining();
+            let task =
+                tokio::task::spawn_blocking(move || dispatcher.shutdown_and_join(step_timeout));
+            match tokio::time::timeout(step_timeout, task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(err))) => failures.push(err),
+                Ok(Err(err)) => {
                     failures.push(format!("local-gap audit shutdown task join failed: {err}"))
                 }
+                Err(_) => failures.push(format!(
+                    "local-gap audit shutdown exceeded global dispatcher deadline of {} ms",
+                    timeout.as_millis()
+                )),
             }
         } else {
             let unpersisted_markers = self.local_gap_audit.pending_len();
@@ -5989,10 +6044,10 @@ mod tests {
         }
 
         dispatcher
-            .shutdown_and_join()
+            .shutdown_and_join(Duration::from_secs(1))
             .expect("WAL dispatcher must drain every accepted job");
         audit
-            .shutdown_and_join()
+            .shutdown_and_join(Duration::from_secs(1))
             .expect("audit dispatcher must flush after WAL shutdown");
 
         let mut slots = Vec::new();
@@ -6031,7 +6086,7 @@ mod tests {
             )))
         );
         dispatcher
-            .shutdown_and_join()
+            .shutdown_and_join(Duration::from_secs(1))
             .await
             .expect("raw evidence dispatcher must drain and flush");
         assert!(!unreliable.load(Acquire));
@@ -10021,8 +10076,8 @@ mod tests {
             log_drops: false,
             log_overflows: false,
             warning_threshold_percent: 50.0,
-            account_update_coalescing_capacity: IpcChannelConfig::default()
-                .account_update_coalescing_capacity,
+            account_update_queue_capacity: IpcChannelConfig::default()
+                .account_update_queue_capacity,
         };
         let (ipc_sender, mut ipc_receiver, _metrics) = create_ipc_channel(ipc_config);
         let seer = Seer::new_with_ipc(config, ipc_sender);

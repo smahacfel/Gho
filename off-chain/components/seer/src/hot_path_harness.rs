@@ -34,7 +34,11 @@ use crate::{
 };
 
 const HARNESS_ITERATIONS: usize = 200;
-const BURST_EVENTS: usize = 2_048;
+const BURST_EVENTS: usize = 3_072;
+const BURST_BATCH_EVENTS: usize = 128;
+const BURST_BATCH_INTERVAL: Duration = Duration::from_millis(50);
+const QUEUE_DWELL_P99_SLA_NS: u64 = 250_000_000;
+const QUEUE_OLDEST_EVENT_SLA_NS: u64 = 500_000_000;
 const BASELINE_CANONICAL_PARITY_DIGEST: &str =
     "549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202";
 
@@ -338,6 +342,15 @@ fn queued_transaction_event(seed: u8, kind: FixtureKind) -> PumpEvent {
 
 fn queue_burst_measurement() -> (Value, GeyserEvent) {
     let capacity = SeerConfig::default_ingress_queue_capacity();
+    assert_ne!(
+        BURST_EVENTS, capacity,
+        "capacity evidence must not define workload size"
+    );
+    assert_eq!(
+        BURST_EVENTS % BURST_BATCH_EVENTS,
+        0,
+        "frozen operational workload must contain complete batches"
+    );
     let (channel, receiver) = DualLaneChannel::with_capacities(capacity, 0);
     let stats = Arc::new(TransportStats::default());
     let account_event = minimal_account_event();
@@ -348,12 +361,18 @@ fn queue_burst_measurement() -> (Value, GeyserEvent) {
 
     let consumer = std::thread::spawn(move || {
         let parser = BinaryParser::new(false);
-        let mut max_dwell_ns = 0_u64;
+        let mut dwell_ns = Vec::with_capacity(BURST_EVENTS);
         consumer_barrier.wait();
         let started = Instant::now();
         for _ in 0..BURST_EVENTS {
             let event = receiver.queue.recv().expect("frozen burst event");
-            max_dwell_ns = max_dwell_ns.max(event.received_at().elapsed().as_nanos() as u64);
+            dwell_ns.push(
+                event
+                    .received_at()
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
             let normalized =
                 pump_event_to_geyser_event(event, GRPC_GLOBAL_STREAM_SOURCE_LABEL, None)
                     .expect("transaction event mapping")
@@ -362,44 +381,80 @@ fn queue_burst_measurement() -> (Value, GeyserEvent) {
                 .parse_transaction_bundle(&normalized)
                 .expect("real parser consumer");
         }
-        (started.elapsed(), max_dwell_ns)
+        (started.elapsed(), dwell_ns)
     });
 
     barrier.wait();
     let producer_started = Instant::now();
-    for index in 0..BURST_EVENTS {
-        let kind = match index % 5 {
-            0 => FixtureKind::PumpBuy,
-            1 => FixtureKind::PumpSell,
-            2 => FixtureKind::CreateAndInitialBuy,
-            3 => FixtureKind::MultiplePumpMutations,
-            _ => FixtureKind::PumpSwapInnerTrade,
-        };
-        assert!(
-            channel.send(queued_transaction_event(index as u8, kind), &stats),
-            "configured ingress capacity must absorb the frozen concurrent burst"
-        );
-        producer_high_water.fetch_max(channel.depth(), std::sync::atomic::Ordering::Relaxed);
+    let mut peak_batch_ingress_events_per_second = 0.0_f64;
+    for batch_start in (0..BURST_EVENTS).step_by(BURST_BATCH_EVENTS) {
+        let batch_end = (batch_start + BURST_BATCH_EVENTS).min(BURST_EVENTS);
+        let batch_started = Instant::now();
+        for index in batch_start..batch_end {
+            let kind = match index % 5 {
+                0 => FixtureKind::PumpBuy,
+                1 => FixtureKind::PumpSell,
+                2 => FixtureKind::CreateAndInitialBuy,
+                3 => FixtureKind::MultiplePumpMutations,
+                _ => FixtureKind::PumpSwapInnerTrade,
+            };
+            assert!(
+                channel.send(queued_transaction_event(index as u8, kind), &stats),
+                "configured ingress capacity must absorb the frozen operational workload"
+            );
+            producer_high_water.fetch_max(channel.depth(), std::sync::atomic::Ordering::Relaxed);
+        }
+        let batch_events = batch_end - batch_start;
+        peak_batch_ingress_events_per_second = peak_batch_ingress_events_per_second
+            .max(batch_events as f64 / batch_started.elapsed().as_secs_f64().max(f64::EPSILON));
+        if batch_end < BURST_EVENTS {
+            std::thread::sleep(BURST_BATCH_INTERVAL);
+        }
     }
     let producer_elapsed = producer_started.elapsed();
-    let (consumer_elapsed, oldest_age_ns) = consumer.join().expect("concurrent parser consumer");
+    let (consumer_elapsed, dwell_ns) = consumer.join().expect("concurrent parser consumer");
     let high_water = high_water.load(std::sync::atomic::Ordering::Relaxed);
-    let peak_ingress_events_per_second =
+    let operational_ingress_events_per_second =
         BURST_EVENTS as f64 / producer_elapsed.as_secs_f64().max(f64::EPSILON);
     let sustained_drain_events_per_second =
         BURST_EVENTS as f64 / consumer_elapsed.as_secs_f64().max(f64::EPSILON);
+    let queue_dwell_p99_ns = percentile(&dwell_ns, 99);
+    let oldest_event_age_ns = dwell_ns.iter().copied().max().unwrap_or_default();
+    let missing_events = stats
+        .msgs_overflow_dropped
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    assert_eq!(
+        missing_events, 0,
+        "frozen operational workload must not open an ingress coverage gap"
+    );
+    assert!(
+        queue_dwell_p99_ns <= QUEUE_DWELL_P99_SLA_NS,
+        "queue dwell p99 {queue_dwell_p99_ns} ns exceeds SLA {QUEUE_DWELL_P99_SLA_NS} ns"
+    );
+    assert!(
+        oldest_event_age_ns <= QUEUE_OLDEST_EVENT_SLA_NS,
+        "oldest event age {oldest_event_age_ns} ns exceeds SLA {QUEUE_OLDEST_EVENT_SLA_NS} ns"
+    );
 
     (
         json!({
             "input_events": BURST_EVENTS,
+            "batch_events": BURST_BATCH_EVENTS,
+            "batch_interval_ms": BURST_BATCH_INTERVAL.as_millis(),
             "configured_capacity": capacity,
             "queue_high_water": high_water,
-            "oldest_event_age_ns": oldest_age_ns,
-            "peak_ingress_events_per_second": peak_ingress_events_per_second,
+            "oldest_event_age_ns": oldest_event_age_ns,
+            "queue_dwell_p99_ns": queue_dwell_p99_ns,
+            "queue_dwell_p99_sla_ns": QUEUE_DWELL_P99_SLA_NS,
+            "oldest_event_age_sla_ns": QUEUE_OLDEST_EVENT_SLA_NS,
+            "dwell_sla_passed": true,
+            "peak_batch_ingress_events_per_second": peak_batch_ingress_events_per_second,
+            "operational_ingress_events_per_second": operational_ingress_events_per_second,
             "sustained_drain_events_per_second": sustained_drain_events_per_second,
             "backlog_growth_events": high_water,
             "spilled_events": stats.msgs_spilled.load(std::sync::atomic::Ordering::Relaxed),
-            "missing_events": stats.msgs_overflow_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            "missing_events": missing_events,
             "concurrent_real_parser_consumer": true,
         }),
         account_event,
