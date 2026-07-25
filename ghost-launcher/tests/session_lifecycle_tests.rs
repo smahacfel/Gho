@@ -6,7 +6,7 @@ use ghost_core::checkpoint::{
 };
 use ghost_core::session::types::{SessionStatus, VerdictOutcome};
 use ghost_core::EventSemanticEnvelope;
-use ghost_core::{CurveFinality, CurveFreshnessState};
+use ghost_core::{CurveFinality, CurveFreshnessState, RawProviderRoleV1};
 use ghost_launcher::events::{FundingTransferObserved, PoolTransaction, RawBytesMissingReason};
 use ghost_launcher::session::{OpenSessionRequest, SessionConfig, SessionManager};
 use ghost_launcher::tx_intelligence::FundingSourceConfig;
@@ -267,8 +267,12 @@ fn test_account_update(
     token_reserves: u64,
 ) -> AccountStateUpdate {
     AccountStateUpdate {
-        provider_id: None,
-        provider_role: None,
+        // This fixture exercises the canonical AccountStateCore boundary, so
+        // it must model the same fully-provenanced raw-primary update the
+        // production arbiter accepts. Missing provenance remains covered by
+        // dedicated fail-closed tests rather than being implicit here.
+        provider_id: Some("test-primary".to_owned()),
+        provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
         pool_amm_id: pool_id,
         base_mint,
         bonding_curve,
@@ -278,10 +282,13 @@ fn test_account_update(
         slot: 1,
         write_version: Some(receive_ts_ms),
         txn_signature: None,
-        source_account_pubkey: None,
-        source_account_owner_or_program: None,
-        account_data_len: None,
-        account_data_hash: None,
+        source_account_pubkey: Some(bonding_curve),
+        source_account_owner_or_program: Some(bonding_curve),
+        account_data_len: Some(56),
+        account_data_hash: Some(format!(
+            "{receive_ts_ms:016x}{sol_reserves:016x}{token_reserves:016x}{:016x}",
+            0_u64
+        )),
         receive_ts_ms,
         receive_seq: receive_ts_ms,
         curve_finality: CurveFinality::Finalized,

@@ -1,6 +1,6 @@
 # ADR-8D: Ingest State Quote PR1C — AccountObservationArbiter
 
-Status: `IMPLEMENTED / REVIEW REMEDIATED LOCALLY / NOT YET COMMITTED`
+Status: `IMPLEMENTED / FOLLOW-UP REVIEW REMEDIATION IN PROGRESS / BASE COMMIT 42e9db5`
 
 Typ: ADR-8D / PR1C / idempotentna arbitrażowa granica `AccountStateCore`
 
@@ -144,13 +144,20 @@ PR1C nie tworzy Observation Ledgera. Exactly-once oznacza wyłącznie
 watermark nie jest hydratowany i PR1D musi wprowadzić durable reconciliation.
 Jest to jawnie przetestowane, a nie deklarowane jako globalna gwarancja.
 
-Evidence jest ograniczone na mint: 64 version records, 32 unique observations
-na version, 16 identity conflicts i 4 identity transitions. Exact replay nie
-zużywa nowego wpisu. Non-conflict primary versions starsze od current latest
-mogą zostać jawnie pruned z licznikiem; conflict/pending witness evidence nigdy
-nie jest cicho wyrzucane. Gdy dalsze zachowanie dowodu przekroczyłoby limit,
-arbiter zwraca typed `evidence_capacity_exceeded`, zapisuje first-overflow
-evidence i fail-close bez canonical mutation.
+Evidence jest ograniczone na mint w niezależnych pasach authority/evidence:
+64 primary-capable version records oraz osobno 64 witness-only version records.
+W ramach jednego version key jest do 32 unique observations primary i osobno
+do 32 unique observations secondary. Exact replay nie zużywa nowego wpisu.
+Non-conflict primary versions starsze od current latest mogą zostać jawnie
+pruned z licznikiem; witness records nie są cicho wyrzucane.
+
+Nasycenie pasa secondary zapisuje typed `evidence_capacity_exceeded`, ustawia
+`secondary_evidence_complete = false` i zachowuje pełny immutable snapshot
+pierwszej odrzuconej obserwacji (hash, provider id/role, signature oraz
+context). Nie odbiera to capacity z pasa primary: późniejszy kwalifikujący się
+primary jest nadal zapisywany i może zastosować canonical mutation dokładnie
+raz. Nasycenie samego pasa primary pozostaje fail-closed, ale nie jest veto
+sterowanym przez secondary.
 
 ## D4. Poza zakresem
 
@@ -166,32 +173,35 @@ wyłącznie na granicy arbitrażu account observation.
 
 ## D5. Dowód i status weryfikacji
 
-Świeżo wykonano na roboczym diffie po korekcie review:
+Świeżo wykonano na roboczym diffie po follow-up review:
 
 ```text
 PASS  cargo fmt --all --check
 PASS  git diff --check
-PASS  cargo check -p ghost-core
-PASS  cargo test -p ghost-core --lib account_state_core::observation_arbiter::tests:: -- --nocapture
-      (9 testów: secondary-first conflict bez veta, in-process exactly-once,
-      bounded evidence/fail-close, `None != Some(0)`, identity transportu i
-      backward-compatible serde counterów)
+PASS  cargo test -p ghost-core account_state_core::observation_arbiter --lib -- --nocapture
+      (13 testów: secondary-first conflict bez veta, nasycenie witness lane
+      per-version i per-index bez veta, retained first rejected overflow
+      provenance dla secondary i primary, in-process exactly-once,
+      `None != Some(0)` oraz backward-compatible serde)
 PASS  cargo test -p ghost-core --test account_observation_arbiter_corpus_tests --test account_state_core_tests -- --nocapture
       (2 replay corpus + 9 testów integracyjnych AccountStateCore, w tym
       kontrolowana migracja Pump.fun -> PumpSwap)
 PASS  cargo check -p ghost-launcher --lib
 PASS  cargo check -p ghost-brain --tests
-PASS  cargo test -p ghost-brain --lib
-      unchanged_rpc_refresh_is_observation_only_without_vitality_activity
-      -- --nocapture
-PASS  cargo test -p seer --lib
-      test_pumpswap_account_update_forwards_primary_account_state_event
-      -- --nocapture
 PASS  timeout 900s cargo build --release --workspace
 
-Pierwszy pełny build release wykonał kompilację aktualnego diffu; bezpośredni
-rerun był cache-hit i również zakończył się kodem 0. Ostrzeżenia kompilatora
-są istniejące i nie zostały podniesione do statusu błędu przez żadną z bramek.
+`cargo check -p ghost-launcher --test session_lifecycle_tests` nadal kończy
+się przed wykonaniem testów na znanej baseline E0063 w initializerze
+`PoolTransaction` (brak starszych pól `complete`, `real_sol_reserves`,
+`real_token_reserves` i kolejnych) w `session_lifecycle_tests.rs:28`.
+Naprawiony helper `test_account_update` jest w tym samym targetcie, ale testy
+sesji nie mogą zostać uruchomione, dopóki ten niezwiązany fixture transakcji
+nie zostanie formalnie odblokowany poza zakresem PR1C.
+
+`cargo check -p ghost-launcher --test gatekeeper_policy_tests` ma tę samą
+baseline klasę E0063 w `gatekeeper_policy_tests.rs:845`. Żaden z tych
+`PoolTransaction` fixture’ów nie jest przedstawiany jako zielona bramka ani
+nie został przypadkowo naprawiony w PR1C.
 ```
 
 Poniższe pełne package/workspace testy należą do historycznego baseline

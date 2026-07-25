@@ -32600,8 +32600,8 @@ mod tests {
         bonding_curve: Pubkey,
     ) {
         let update = ghost_core::account_state_core::types::AccountStateUpdate {
-            provider_id: None,
-            provider_role: None,
+            provider_id: Some("test-primary".to_owned()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             pool_amm_id: bonding_curve,
             base_mint: mint,
             bonding_curve,
@@ -32611,10 +32611,13 @@ mod tests {
             slot: 100,
             write_version: Some(1),
             txn_signature: None,
-            source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            account_data_len: None,
-            account_data_hash: None,
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(bonding_curve),
+            account_data_len: Some(56),
+            account_data_hash: Some(format!(
+                "{:016x}{:016x}{:016x}{:016x}",
+                100_u64, 30_000_000_000_u64, 1_073_000_000_000_000_u64, 0_u64
+            )),
             receive_ts_ms: 1_000,
             receive_seq: 1,
             curve_finality: ghost_core::CurveFinality::Provisional,
@@ -43814,8 +43817,8 @@ mod tests {
             BootstrapHints::default(),
         );
         let result = account_state_core.apply_account_update(AccountStateUpdate {
-            provider_id: None,
-            provider_role: None,
+            provider_id: Some("test-primary".to_owned()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             pool_amm_id: pool_id,
             base_mint,
             bonding_curve,
@@ -43825,10 +43828,12 @@ mod tests {
             slot: 7,
             write_version: None,
             txn_signature: None,
-            source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            account_data_len: None,
-            account_data_hash: None,
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(bonding_curve),
+            account_data_len: Some(56),
+            account_data_hash: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
             receive_ts_ms: ghost_core::shadow_ledger::current_time_ms(),
             receive_seq: account_state_core.next_recv_seq(),
             curve_finality: CurveFinality::Speculative,

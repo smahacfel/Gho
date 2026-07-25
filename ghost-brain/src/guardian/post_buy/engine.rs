@@ -11151,10 +11151,13 @@ mod tests {
             slot,
             write_version: Some(1),
             txn_signature: None,
-            source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            account_data_len: None,
-            account_data_hash: None,
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(bonding_curve),
+            account_data_len: Some(56),
+            account_data_hash: Some(format!(
+                "{slot:016x}{receive_ts_ms:016x}{:016x}{:016x}",
+                210_000_000_000_u64, 760_000_000_000_000_u64
+            )),
             receive_ts_ms,
             receive_seq: 1,
             curve_finality: CurveFinality::Provisional,

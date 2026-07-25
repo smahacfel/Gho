@@ -6769,7 +6769,7 @@ sys.exit(0)
             data_change_count: 3,
             source_write_version: Some(11),
             source_account_pubkey: Some(Pubkey::new_unique()),
-            source_account_owner_or_program: Some(Pubkey::new_unique()),
+            source_account_owner_or_program: Some(bonding_curve),
             account_data_len: Some(b"entry-pool-state-test".len() as u64),
             account_data_hash: Some(
                 ghost_brain::guardian::post_buy::shadow_v2::account_data_hash_blake3(
@@ -7710,22 +7710,26 @@ sys.exit(0)
         sol_reserves: u64,
         token_reserves: u64,
     ) {
+        let bonding_curve = Pubkey::new_unique();
         let update = AccountStateUpdate {
-            provider_id: None,
-            provider_role: None,
+            provider_id: Some("test-primary".to_owned()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             pool_amm_id: Pubkey::new_unique(),
             base_mint: mint,
-            bonding_curve: Pubkey::new_unique(),
+            bonding_curve,
             sol_reserves,
             token_reserves,
             is_complete: 0,
             slot: 42,
             write_version: Some(1),
             txn_signature: None,
-            source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            account_data_len: None,
-            account_data_hash: None,
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(Pubkey::new_unique()),
+            account_data_len: Some(56),
+            account_data_hash: Some(format!(
+                "{:016x}{sol_reserves:016x}{token_reserves:016x}{:016x}",
+                42_u64, 0_u64
+            )),
             receive_ts_ms: now_ms(),
             receive_seq: 1,
             curve_finality: CurveFinality::Provisional,
