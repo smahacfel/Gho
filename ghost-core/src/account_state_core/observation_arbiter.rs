@@ -147,6 +147,10 @@ pub struct AccountIdentityTransitionEvidenceV1 {
 pub enum AccountObservationEvidenceOverflowScopeV1 {
     VersionIndex,
     VersionObservations,
+    /// The bounded provider-conflict evidence store is full. This store is
+    /// intentionally separate from the primary ordering watermark lane, so
+    /// evidence retention pressure cannot veto a newer eligible primary.
+    ProviderConflictEvidence,
     IdentityConflicts,
     IdentityTransitions,
 }
@@ -172,8 +176,10 @@ pub struct AccountObservationEvidenceOverflowV1 {
 /// incoming observation is rejected with a typed fail-closed outcome.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountObservationArbiterLimitsV1 {
-    /// Bound applied independently to primary-capable records and witness-only
-    /// records, so the latter cannot consume canonical authority capacity.
+    /// Bound applied independently to primary-capable records, witness-only
+    /// records and retained provider-conflict evidence. The three stores are
+    /// deliberately independent: witness or conflict retention pressure must
+    /// never consume canonical primary authority capacity.
     pub max_versions_per_account: usize,
     /// Bound applied independently to unique primary and secondary evidence
     /// inside one version record.
@@ -366,6 +372,9 @@ pub struct AccountObservationArbiterCountersV1 {
     #[serde(default)]
     pub evidence_capacity_exceeded_count: u64,
     #[serde(default)]
+    /// Historical serialized name retained for compatibility. It now counts
+    /// every pruned, non-latest applied primary watermark record; conflicts
+    /// are preserved in the separate bounded evidence store.
     pub pruned_non_conflict_version_count: u64,
     pub invalid_observation_count: u64,
 }
@@ -521,7 +530,11 @@ struct VersionEvidence {
     has_primary: bool,
     has_secondary: bool,
     primary_applied_hash: Option<[u8; 32]>,
-    conflict: Option<AccountProviderConflictEvidenceV1>,
+    /// This is only the local fact that incompatible payload hashes were seen.
+    /// The auditable payloads themselves live in `provider_conflicts`, outside
+    /// the bounded primary ordering lane, so a conflict cannot poison
+    /// primary-watermark pruneability.
+    has_payload_conflict: bool,
 }
 
 impl VersionEvidence {
@@ -546,7 +559,7 @@ impl VersionEvidence {
             has_primary,
             has_secondary,
             primary_applied_hash: None,
-            conflict: None,
+            has_payload_conflict: false,
         }
     }
 
@@ -587,10 +600,7 @@ impl VersionEvidence {
             .seen_payload_hashes
             .insert(observation.identity.data_hash_blake3);
         if self.seen_payload_hashes.len() > 1 {
-            self.conflict = Some(AccountProviderConflictEvidenceV1 {
-                mutation_version: self.first.identity.mutation_version.clone(),
-                observations: self.observations.clone(),
-            });
+            self.has_payload_conflict = true;
         }
         Ok(RecordedObservation {
             exact_duplicate: false,
@@ -607,7 +617,7 @@ impl VersionEvidence {
 
     #[must_use]
     const fn provider_agreement(&self) -> AccountProviderAgreementV1 {
-        if self.conflict.is_some() && self.has_primary && self.has_secondary {
+        if self.has_payload_conflict && self.has_primary && self.has_secondary {
             AccountProviderAgreementV1::PrimarySecondaryConflict
         } else if self.has_primary && self.has_secondary {
             AccountProviderAgreementV1::PrimarySecondaryAgreement
@@ -620,8 +630,7 @@ impl VersionEvidence {
 
     #[must_use]
     fn can_be_pruned(&self, latest: Option<&AccountObservationIdentityV1>) -> bool {
-        self.conflict.is_none()
-            && self.primary_applied_hash.is_some()
+        self.primary_applied_hash.is_some()
             && latest.is_some_and(|latest| {
                 latest.mutation_version != self.first.identity.mutation_version
             })
@@ -690,6 +699,11 @@ pub struct AccountObservationArbiter {
     /// witness saturation must degrade evidence completeness, never veto a
     /// later eligible primary mutation.
     secondary_witness_versions: BTreeMap<AccountMutationVersionV1, VersionEvidence>,
+    /// Bounded, append-only-within-process provider-conflict evidence. It is
+    /// intentionally separate from `primary_versions`: old primary ordering
+    /// watermarks may rotate even when a secondary has supplied a conflicting
+    /// payload for that version.
+    provider_conflicts: BTreeMap<AccountMutationVersionV1, AccountProviderConflictEvidenceV1>,
     secondary_evidence_complete: bool,
     counters: AccountObservationArbiterCountersV1,
     identity_conflicts: Vec<AccountIdentityConflictEvidenceV1>,
@@ -713,6 +727,7 @@ impl AccountObservationArbiter {
             primary_pumpfun_completion: None,
             primary_versions: BTreeMap::new(),
             secondary_witness_versions: BTreeMap::new(),
+            provider_conflicts: BTreeMap::new(),
             secondary_evidence_complete: true,
             counters: AccountObservationArbiterCountersV1::default(),
             identity_conflicts: Vec::new(),
@@ -880,17 +895,35 @@ impl AccountObservationArbiter {
             }
         };
 
-        let (agreement, primary_applied_hash, conflict_present) = self
+        let (agreement, primary_applied_hash, conflict_present, observations) = self
             .primary_versions
             .get(&version)
             .map(|record| {
                 (
                     record.provider_agreement(),
                     record.primary_applied_hash,
-                    record.conflict.is_some(),
+                    record.has_payload_conflict,
+                    record.observations.clone(),
                 )
             })
             .expect("primary record remains present after bounded observation recording");
+
+        if conflict_present && !self.retain_provider_conflict_evidence(&version, &observations) {
+            // A secondary conflict-store overflow is already visible as typed
+            // degraded evidence. It must not prevent the first eligible
+            // primary payload for this version from becoming canonical.
+            let primary_can_apply =
+                matches!(relation_to_latest(&version, latest), VersionRelation::Newer)
+                    && primary_applied_hash.is_none()
+                    && matches!(evidence.provider_role, RawProviderRoleV1::PrimaryAuthority);
+            if !primary_can_apply {
+                return self.evidence_capacity_decision(
+                    AccountObservationEvidenceOverflowScopeV1::ProviderConflictEvidence,
+                    &evidence,
+                    self.provider_conflicts.len(),
+                );
+            }
+        }
 
         if matches!(evidence.provider_role, RawProviderRoleV1::SecondaryWitness) {
             if recorded.introduced_payload_conflict {
@@ -997,11 +1030,25 @@ impl AccountObservationArbiter {
                     );
                 }
             };
-            let agreement = self
+            let (agreement, conflict_present, observations) = self
                 .secondary_witness_versions
                 .get(&version)
-                .map(VersionEvidence::provider_agreement)
+                .map(|record| {
+                    (
+                        record.provider_agreement(),
+                        record.has_payload_conflict,
+                        record.observations.clone(),
+                    )
+                })
                 .expect("secondary witness record remains present after recording");
+            if conflict_present && !self.retain_provider_conflict_evidence(&version, &observations)
+            {
+                return self.evidence_capacity_decision(
+                    AccountObservationEvidenceOverflowScopeV1::ProviderConflictEvidence,
+                    &evidence,
+                    self.provider_conflicts.len(),
+                );
+            }
             if recorded.introduced_payload_conflict {
                 return self.finish(
                     AccountObservationClassificationV1::SameVersionDifferentHashConflict,
@@ -1053,12 +1100,7 @@ impl AccountObservationArbiter {
             bound_account_pubkey: self.bound_account_identity.map(|bound| bound.pubkey),
             latest_primary_canonical: self.latest_primary_canonical.clone(),
             counters: self.counters.clone(),
-            conflicts: self
-                .primary_versions
-                .values()
-                .chain(self.secondary_witness_versions.values())
-                .filter_map(|record| record.conflict.clone())
-                .collect(),
+            conflicts: self.provider_conflicts.values().cloned().collect(),
             identity_conflicts: self.identity_conflicts.clone(),
             identity_transitions: self.identity_transitions.clone(),
             first_evidence_overflow: self.first_evidence_overflow.clone(),
@@ -1183,6 +1225,9 @@ impl AccountObservationArbiter {
             return false;
         };
         self.primary_versions.remove(&version);
+        // Conflict payloads were retained independently in
+        // `provider_conflicts`, so pruning this ordering watermark cannot
+        // silently discard a primary/secondary disagreement.
         self.counters.pruned_non_conflict_version_count = self
             .counters
             .pruned_non_conflict_version_count
@@ -1196,6 +1241,51 @@ impl AccountObservationArbiter {
     /// capacity.
     fn reserve_secondary_witness_version_slot(&self) -> bool {
         self.secondary_witness_versions.len() < self.limits.max_versions_per_account
+    }
+
+    /// Retains provider-conflict evidence without making it part of canonical
+    /// primary ordering capacity. The store has its own bounded version index
+    /// and per-role observation limits. Replays do not consume capacity.
+    fn retain_provider_conflict_evidence(
+        &mut self,
+        version: &AccountMutationVersionV1,
+        current_version_observations: &[AccountObservationEvidenceV1],
+    ) -> bool {
+        let max_unique_observations_per_version = self.limits.max_unique_observations_per_version;
+        if let Some(existing) = self.provider_conflicts.get_mut(version) {
+            for candidate in current_version_observations {
+                let candidate_key = candidate.provider_observation_identity();
+                if existing
+                    .observations
+                    .iter()
+                    .any(|evidence| evidence.provider_observation_identity() == candidate_key)
+                {
+                    continue;
+                }
+                let retained_in_same_role = existing
+                    .observations
+                    .iter()
+                    .filter(|evidence| evidence.provider_role == candidate.provider_role)
+                    .count();
+                if retained_in_same_role >= max_unique_observations_per_version {
+                    return false;
+                }
+                existing.observations.push(candidate.clone());
+            }
+            return true;
+        }
+
+        if self.provider_conflicts.len() >= self.limits.max_versions_per_account {
+            return false;
+        }
+        self.provider_conflicts.insert(
+            version.clone(),
+            AccountProviderConflictEvidenceV1 {
+                mutation_version: version.clone(),
+                observations: current_version_observations.to_vec(),
+            },
+        );
+        true
     }
 
     fn evidence_capacity_decision(
@@ -1912,6 +2002,128 @@ mod tests {
                 .mutation_version
                 .slot,
             13
+        );
+    }
+
+    #[test]
+    fn secondary_conflicts_cannot_poison_primary_watermark_rotation() {
+        let account = Pubkey::new_unique();
+        let mut arbiter =
+            AccountObservationArbiter::with_limits(AccountObservationArbiterLimitsV1 {
+                max_versions_per_account: 2,
+                max_unique_observations_per_version: 2,
+                max_identity_conflicts_per_account: 1,
+                max_identity_transitions_per_account: 1,
+            });
+
+        let primary_v1 = update(
+            account,
+            10,
+            Some(1),
+            1,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        let mut secondary_v1 = primary_v1.clone();
+        secondary_v1.provider_id = Some("secondary".to_owned());
+        secondary_v1.provider_role = Some(RawProviderRoleV1::SecondaryWitness);
+        secondary_v1.account_data_hash = Some(hash(2));
+
+        let primary_v2 = update(
+            account,
+            11,
+            Some(2),
+            3,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        let mut secondary_v2 = primary_v2.clone();
+        secondary_v2.provider_id = Some("secondary".to_owned());
+        secondary_v2.provider_role = Some(RawProviderRoleV1::SecondaryWitness);
+        secondary_v2.account_data_hash = Some(hash(4));
+
+        assert!(arbiter.arbitrate(&primary_v1).canonical_apply);
+        assert_eq!(
+            arbiter.arbitrate(&secondary_v1).outcome,
+            AccountObservationOutcomeV1::ProviderConflict
+        );
+        assert!(arbiter.arbitrate(&primary_v2).canonical_apply);
+        assert_eq!(
+            arbiter.arbitrate(&secondary_v2).outcome,
+            AccountObservationOutcomeV1::ProviderConflict
+        );
+
+        let secondary_v3_first = update(
+            account,
+            12,
+            Some(3),
+            5,
+            "secondary-1",
+            RawProviderRoleV1::SecondaryWitness,
+        );
+        let mut secondary_v3_conflict = secondary_v3_first.clone();
+        secondary_v3_conflict.provider_id = Some("secondary-2".to_owned());
+        secondary_v3_conflict.account_data_hash = Some(hash(6));
+        assert_eq!(
+            arbiter.arbitrate(&secondary_v3_first).outcome,
+            AccountObservationOutcomeV1::SecondaryWitnessRecorded
+        );
+        let secondary_overflow = arbiter.arbitrate(&secondary_v3_conflict);
+        assert_eq!(
+            secondary_overflow.classification,
+            AccountObservationClassificationV1::EvidenceCapacityExceeded,
+            "the full conflict store must degrade only secondary evidence"
+        );
+
+        let primary_v3 = update(
+            account,
+            12,
+            Some(3),
+            7,
+            "primary",
+            RawProviderRoleV1::PrimaryAuthority,
+        );
+        let primary_v3_decision = arbiter.arbitrate(&primary_v3);
+        assert_eq!(
+            primary_v3_decision.outcome,
+            AccountObservationOutcomeV1::AppliedNewMutation
+        );
+        assert!(
+            primary_v3_decision.canonical_apply,
+            "secondary conflicts for old versions must never veto a newer eligible primary"
+        );
+
+        let snapshot = arbiter.snapshot();
+        assert_eq!(snapshot.counters.canonical_mutation_count, 3);
+        assert_eq!(snapshot.conflicts.len(), 2);
+        assert!(
+            !snapshot.secondary_evidence_complete,
+            "overflowed witness conflict evidence must be explicit rather than vetoing primary"
+        );
+        assert_eq!(
+            snapshot
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.mutation_version.slot)
+                .collect::<Vec<_>>(),
+            vec![10, 11],
+            "pruned ordering records must leave their bounded conflict evidence behind"
+        );
+        assert_eq!(snapshot.counters.pruned_non_conflict_version_count, 1);
+        let first_overflow = snapshot
+            .first_evidence_overflow
+            .expect("conflict-store overflow must be retained");
+        assert_eq!(
+            first_overflow.scope,
+            AccountObservationEvidenceOverflowScopeV1::ProviderConflictEvidence
+        );
+        assert_eq!(
+            first_overflow
+                .first_rejected_observation
+                .expect("overflow must retain the rejected secondary witness")
+                .identity
+                .data_hash_blake3,
+            [6; 32]
         );
     }
 

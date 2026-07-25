@@ -1,6 +1,6 @@
 # ADR-8D: Ingest State Quote PR1C — AccountObservationArbiter
 
-Status: `IMPLEMENTED / FOLLOW-UP REVIEW REMEDIATION IN PROGRESS / BASE COMMIT 42e9db5`
+Status: `IMPLEMENTED / FOLLOW-UP REVIEW REMEDIATION / BASE COMMIT 3726fbd`
 
 Typ: ADR-8D / PR1C / idempotentna arbitrażowa granica `AccountStateCore`
 
@@ -144,20 +144,27 @@ PR1C nie tworzy Observation Ledgera. Exactly-once oznacza wyłącznie
 watermark nie jest hydratowany i PR1D musi wprowadzić durable reconciliation.
 Jest to jawnie przetestowane, a nie deklarowane jako globalna gwarancja.
 
-Evidence jest ograniczone na mint w niezależnych pasach authority/evidence:
-64 primary-capable version records oraz osobno 64 witness-only version records.
+Evidence jest ograniczone na mint w trzech niezależnych pasach:
+
+- 64 primary watermark/version records dla canonical ordering;
+- 64 witness-only version records;
+- 64 retained provider-conflict evidence records.
+
 W ramach jednego version key jest do 32 unique observations primary i osobno
 do 32 unique observations secondary. Exact replay nie zużywa nowego wpisu.
-Non-conflict primary versions starsze od current latest mogą zostać jawnie
-pruned z licznikiem; witness records nie są cicho wyrzucane.
+Primary watermark starszy od current latest może zostać jawnie pruned również
+wtedy, gdy ma conflict: pełny conflict snapshot pozostaje wcześniej zapisany
+w osobnym bounded store. Witness records ani conflict evidence nie są cicho
+wyrzucane.
 
-Nasycenie pasa secondary zapisuje typed `evidence_capacity_exceeded`, ustawia
-`secondary_evidence_complete = false` i zachowuje pełny immutable snapshot
-pierwszej odrzuconej obserwacji (hash, provider id/role, signature oraz
-context). Nie odbiera to capacity z pasa primary: późniejszy kwalifikujący się
-primary jest nadal zapisywany i może zastosować canonical mutation dokładnie
-raz. Nasycenie samego pasa primary pozostaje fail-closed, ale nie jest veto
-sterowanym przez secondary.
+Nasycenie witness lane albo conflict-evidence store zapisuje typed
+`evidence_capacity_exceeded`, ustawia `secondary_evidence_complete = false`
+i zachowuje pełny immutable snapshot pierwszej odrzuconej obserwacji (hash,
+provider id/role, signature oraz context). Nie odbiera to capacity z primary
+watermark lane: nawet po kolejnych conflictach V1/V2, secondary-first conflict
+V3 i pełnym conflict store kwalifikujący się primary V3 jest nadal zapisywany
+i aplikuje canonical mutation dokładnie raz. Nasycenie samego pasa primary
+pozostaje fail-closed, ale nie jest veto sterowanym przez secondary.
 
 ## D4. Poza zakresem
 
@@ -179,8 +186,9 @@ wyłącznie na granicy arbitrażu account observation.
 PASS  cargo fmt --all --check
 PASS  git diff --check
 PASS  cargo test -p ghost-core account_state_core::observation_arbiter --lib -- --nocapture
-      (13 testów: secondary-first conflict bez veta, nasycenie witness lane
-      per-version i per-index bez veta, retained first rejected overflow
+      (14 testów: secondary-first conflict bez veta, nasycenie witness lane
+      per-version i per-index bez veta, conflict-store saturation nie blokuje
+      późniejszego primary watermark V3, retained first rejected overflow
       provenance dla secondary i primary, in-process exactly-once,
       `None != Some(0)` oraz backward-compatible serde)
 PASS  cargo test -p ghost-core --test account_observation_arbiter_corpus_tests --test account_state_core_tests -- --nocapture
