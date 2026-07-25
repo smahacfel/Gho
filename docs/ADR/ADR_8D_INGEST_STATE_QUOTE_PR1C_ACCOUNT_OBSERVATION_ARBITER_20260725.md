@@ -1,6 +1,6 @@
 # ADR-8D: Ingest State Quote PR1C — AccountObservationArbiter
 
-Status: `IMPLEMENTED / FOLLOW-UP REVIEW REMEDIATION / BASE COMMIT e3b991a`
+Status: `IMPLEMENTED / FOLLOW-UP REVIEW REMEDIATION / BASE COMMIT b1470eb`
 
 Typ: ADR-8D / PR1C / idempotentna arbitrażowa granica `AccountStateCore`
 
@@ -147,7 +147,7 @@ Jest to jawnie przetestowane, a nie deklarowane jako globalna gwarancja.
 Evidence jest ograniczone na mint w trzech niezależnych pasach:
 
 - 64 primary watermark/version records dla canonical ordering;
-- 64 witness-only version records;
+- 64 noncanonical correlation version records;
 - 64 retained provider-conflict evidence records.
 
 W ramach jednego version key jest do 32 unique observations primary i osobno
@@ -158,11 +158,13 @@ potwierdzeniu, że primary jest kwalifikujący się do canonical ordering.
 `OlderObservation` oraz `WriteVersionUnknown` od primary zwracają typed no-op
 bez rezerwowania primary lane; historyczny replay nie może przez to wyczerpać
 capacity potrzebnej późniejszemu primary.
-Jeżeli jednak dla dokładnie tego samego version key istnieje już retained
-secondary witness, stale albo unorderable primary jest dopisywany wyłącznie do
-tego witness record. Same hash daje `PrimarySecondaryAgreement`, różny hash
-tworzy `PrimarySecondaryConflict` oraz bounded conflict evidence; w obu
-przypadkach `canonical_apply = false` i primary watermark lane nie jest
+Stale albo unorderable primary jest również zachowywany w tym bounded
+noncanonical correlation lane, jeżeli secondary jeszcze nie przybył. Dzięki
+temu oba porządki dostarczenia są równoważne: `secondary -> primary` oraz
+`primary -> secondary` dla dokładnie tego samego version key dopisują drugi
+dowód do tego samego recordu. Same hash daje `PrimarySecondaryAgreement`,
+różny hash tworzy `PrimarySecondaryConflict` oraz bounded conflict evidence;
+w obu przypadkach `canonical_apply = false` i primary watermark lane nie jest
 zużywany.
 
 Primary watermark starszy od current latest może zostać jawnie pruned również
@@ -170,7 +172,7 @@ wtedy, gdy ma conflict: pełny conflict snapshot pozostaje wcześniej zapisany
 w osobnym bounded store. Witness records ani conflict evidence nie są cicho
 wyrzucane.
 
-Nasycenie witness lane albo conflict-evidence store zapisuje typed
+Nasycenie noncanonical correlation lane albo conflict-evidence store zapisuje typed
 `evidence_capacity_exceeded`, ustawia `secondary_evidence_complete = false`
 i zachowuje pełny immutable snapshot pierwszej odrzuconej obserwacji (hash,
 provider id/role, signature oraz context). Nie odbiera to capacity z primary
@@ -207,15 +209,16 @@ wyłącznie na granicy arbitrażu account observation.
 PASS  cargo fmt --all --check
 PASS  git diff --check
 PASS  cargo test -p ghost-core account_state_core::observation_arbiter --lib -- --nocapture
-      (19 testów: secondary-first conflict bez veta, nasycenie witness lane
+      (23 testy: secondary-first conflict bez veta, nasycenie noncanonical lane
       per-version i per-index bez veta, conflict-store saturation nie blokuje
       późniejszego primary watermark V3, stale primary V1..V9 nie zapełnia
       authority lane przed V11, overflow conflict store wykryty przez primary
       V3 degraduje evidence bez zmiany `AppliedNewMutation`, stale i
       unorderable primary korelują się z retained secondary jako agreement lub
-      conflict bez canonical apply, retained first rejected overflow provenance
-      dla secondary i primary, in-process exactly-once, `None != Some(0)` oraz
-      backward-compatible serde)
+      conflict w obu arrival orders, stale primary-first saturation nie veto-uje
+      V11, retained first rejected overflow provenance dla secondary i primary,
+      in-process exactly-once, `None != Some(0)` oraz backward-compatible
+      serde)
 PASS  cargo test -p ghost-core --test account_observation_arbiter_corpus_tests --test account_state_core_tests -- --nocapture
       (2 replay corpus + 9 testów integracyjnych AccountStateCore, w tym
       kontrolowana migracja Pump.fun -> PumpSwap)
