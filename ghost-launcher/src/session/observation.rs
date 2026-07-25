@@ -430,8 +430,12 @@ impl PoolObservationSession {
     }
 
     pub fn on_account_update(&mut self, update: &AccountStateUpdate) {
-        let _ = self.account_state_core.apply_account_update(update.clone());
-        self.on_account_state_core_updated_at(Some(update.receive_ts_ms));
+        let result = self
+            .account_state_core
+            .apply_account_observation(update.clone());
+        if result.did_apply() {
+            self.on_account_state_core_updated_at(Some(update.receive_ts_ms));
+        }
     }
 
     pub fn on_account_state_core_updated(&mut self) {

@@ -52,6 +52,10 @@ pub enum UpdateSource {
     /// managed shadow position after its stream state became stale.
     RpcRefresh,
     WalReplay,
+    /// Historical compatibility marker for a reserve tuple inferred from a
+    /// parsed transaction.  PR1C deliberately rejects this source at the raw
+    /// account arbiter boundary: a parsed transaction is not a provider
+    /// AccountUpdate and cannot become live account-state authority.
     TxObservedBootstrap,
 }
 
@@ -80,8 +84,29 @@ pub struct BootstrapPoolState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountUpdateRejectReason {
+    /// Retained only for deserializing historical result records.  PR1C emits
+    /// [`Self::StaleObservation`] instead of comparing slots in a legacy
+    /// boolean guard.
     OlderSlot,
+    /// Retained only for deserializing historical result records.  Local
+    /// receive sequence is never a canonical ordering field in PR1C.
     OlderOrDuplicateReceiveSeq,
+    DuplicateObservation,
+    StaleObservation,
+    ProviderConflict,
+    UnorderableWithoutWriteVersion,
+    SecondaryWitness,
+    MissingProviderProvenance,
+    InvalidAccountDataHash,
+    UnsupportedAccountUpdateSource,
+    /// The per-account arbiter state is poisoned or otherwise unavailable.
+    /// This is fail-closed: a new observation must not recreate unknown
+    /// canonical ordering state.
+    ArbiterStateUnavailable,
+    /// The arbiter cannot retain a further unique observation or conflict
+    /// witness within its explicit in-process evidence bounds. This is
+    /// fail-closed; the update must not mutate canonical account state.
+    AccountObservationEvidenceCapacityExceeded,
     RpcRefreshInvalidSource,
     RpcRefreshMissingAccountDataHash,
     RpcRefreshWithoutCanonicalState,
@@ -95,6 +120,18 @@ impl AccountUpdateRejectReason {
         match self {
             Self::OlderSlot => "older_slot",
             Self::OlderOrDuplicateReceiveSeq => "older_or_duplicate_recv_seq",
+            Self::DuplicateObservation => "duplicate_observation",
+            Self::StaleObservation => "stale_observation",
+            Self::ProviderConflict => "provider_conflict",
+            Self::UnorderableWithoutWriteVersion => "unorderable_without_write_version",
+            Self::SecondaryWitness => "secondary_witness",
+            Self::MissingProviderProvenance => "missing_provider_provenance",
+            Self::InvalidAccountDataHash => "invalid_account_data_hash",
+            Self::UnsupportedAccountUpdateSource => "unsupported_account_update_source",
+            Self::ArbiterStateUnavailable => "arbiter_state_unavailable",
+            Self::AccountObservationEvidenceCapacityExceeded => {
+                "account_observation_evidence_capacity_exceeded"
+            }
             Self::RpcRefreshInvalidSource => "rpc_refresh_invalid_source",
             Self::RpcRefreshMissingAccountDataHash => "rpc_refresh_missing_account_data_hash",
             Self::RpcRefreshWithoutCanonicalState => "rpc_refresh_without_canonical_state",
@@ -112,14 +149,20 @@ pub enum AccountUpdateResult {
     Rejected(AccountUpdateRejectReason),
 }
 
-/// Result of the read-only RPC refresh path.  It is deliberately separate
-/// from [`AccountUpdateResult`]: an RPC context slot is an observation
-/// boundary, not a canonical account-write ordering key.
+/// Result of the observation-only RPC refresh path.
+///
+/// It is deliberately separate from [`AccountUpdateResult`]: an RPC context
+/// slot is neither a canonical account-write ordering key nor an authority to
+/// mutate reserves, state phase, counters, velocity, or account provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RpcRefreshResult {
-    ObservationRefreshed,
-    DataChanged,
+    /// The captured RPC payload is identical to the last raw-primary
+    /// canonical payload.
+    ObservationMatchesCanonical,
+    /// The captured RPC payload differs from the last raw-primary canonical
+    /// payload. The difference is surfaced to the caller but is not applied.
+    ObservationDivergesFromCanonical,
     Rejected(AccountUpdateRejectReason),
 }
 
@@ -148,9 +191,9 @@ pub struct CanonicalPoolState {
     pub is_complete: bool,
     pub last_update_slot: u64,
     pub last_update_ts_ms: u64,
-    /// Latest successful observation boundary.  This is suitable for quote
-    /// freshness, including read-only RPC refreshes; it is not market
-    /// activity or a Geyser write ordering proof.
+    /// Latest canonical raw-primary observation boundary. Processed RPC
+    /// refreshes are deliberately not written here: they are diagnostic
+    /// observations and never obtain authority over canonical account state.
     #[serde(default)]
     pub last_observed_slot: u64,
     #[serde(default)]
@@ -176,6 +219,9 @@ pub struct CanonicalPoolState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_data_len: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// BLAKE3 hexadecimal digest of the captured raw account payload handed
+    /// from the provider adapter to normalization.  A Geyser/WAL observation
+    /// without a valid 32-byte digest is rejected by `AccountObservationArbiter`.
     pub account_data_hash: Option<String>,
     pub curve_finality: CurveFinality,
     pub state_phase: StatePhase,

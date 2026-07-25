@@ -663,7 +663,8 @@ async fn refresh_shadow_market_target(
         source: UpdateSource::RpcRefresh,
     });
     match apply_result {
-        RpcRefreshResult::ObservationRefreshed | RpcRefreshResult::DataChanged => Ok(()),
+        RpcRefreshResult::ObservationMatchesCanonical
+        | RpcRefreshResult::ObservationDivergesFromCanonical => Ok(()),
         RpcRefreshResult::Rejected(reason) => {
             debug!(
                 base_mint = %target.base_mint,

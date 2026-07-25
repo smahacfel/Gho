@@ -1,6 +1,8 @@
-use ghost_core::account_state_core::monotonic_guard::MonotonicUpdateGuard;
 use ghost_core::account_state_core::types::{
     AccountStateFeatures, AccountStateUpdate, CanonicalPoolState, StatePhase, UpdateSource,
+};
+use ghost_core::account_state_core::{
+    AccountObservationArbiter, AccountObservationClassificationV1,
 };
 use ghost_core::checkpoint::types::{
     CheckpointDerivedFeatures, CheckpointTrigger, EvidenceStatus, MaterializedFeatureSet,
@@ -13,7 +15,7 @@ use ghost_core::tx_intelligence::types::{
     BurstWindow, RiskFlag, RiskSeverity, SybilResistanceFeatures, TxIntelFeatures,
     TxIntelligenceState,
 };
-use ghost_core::CurveFinality;
+use ghost_core::{CurveFinality, RawProviderRoleV1};
 use solana_sdk::pubkey::Pubkey;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -23,15 +25,42 @@ fn pk(seed: u8) -> Pubkey {
 }
 
 #[test]
-fn monotonic_update_guard_enforces_same_slot_tie_breaking() {
-    let mut guard = MonotonicUpdateGuard::default();
+fn account_observation_arbiter_never_orders_same_version_by_receive_sequence() {
+    let account = pk(42);
+    let mut arbiter = AccountObservationArbiter::default();
+    let first = AccountStateUpdate {
+        provider_id: Some("raw-primary".to_owned()),
+        provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
+        pool_amm_id: pk(1),
+        base_mint: pk(2),
+        bonding_curve: account,
+        sol_reserves: 11,
+        token_reserves: 22,
+        is_complete: 0,
+        slot: 120,
+        write_version: Some(3),
+        txn_signature: None,
+        source_account_pubkey: Some(account),
+        source_account_owner_or_program: Some(pk(3)),
+        account_data_len: Some(56),
+        account_data_hash: Some(
+            "abababababababababababababababababababababababababababababababab".to_owned(),
+        ),
+        receive_ts_ms: 1_700_000_000_000,
+        receive_seq: 1,
+        curve_finality: CurveFinality::Provisional,
+        source: UpdateSource::GeyserAccountUpdate,
+    };
+    let mut replay = first.clone();
+    replay.receive_seq = 999;
 
-    assert!(guard.accept(120, None, 1));
-    assert!(!guard.accept(119, None, 99));
-    assert!(!guard.accept(120, None, 1));
-    assert!(guard.accept(120, None, 2));
-    assert!(!guard.accept(120, None, 0));
-    assert!(guard.accept(121, None, 0));
+    assert!(arbiter.arbitrate(&first).canonical_apply);
+    let replay_decision = arbiter.arbitrate(&replay);
+    assert_eq!(
+        replay_decision.classification,
+        AccountObservationClassificationV1::ExactDuplicate
+    );
+    assert!(!replay_decision.canonical_apply);
 }
 
 #[test]
