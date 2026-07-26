@@ -1,5 +1,6 @@
 //! Seer component wrapper
 
+use crate::candidate_integrity::{CandidateIntegrityRegistry, CanonicalMutationApplyReceiptV1};
 use crate::config::{
     redact_endpoint_for_logs, ProgramStreamsQuotaPolicy as LauncherProgramStreamsQuotaPolicy,
     SeerCommitment, SeerComponentConfig,
@@ -13,7 +14,13 @@ use futures::StreamExt;
 use ghost_brain::oracle::{InitPoolEvent, SnapshotEngine};
 use ghost_core::health::RuntimeHealth;
 use ghost_core::shadow_ledger::ShadowLedger;
-use ghost_core::{ExecutionAccountRole, TimestampQuality, Wal};
+use ghost_core::{
+    ExecutionAccountRole, ObservationProvenanceV1, ObservationSourceFamilyV1,
+    ObservedPumpMutationV1, PumpMutationClaimsV1, PumpMutationFamilyV1,
+    PumpObservationClassificationV1, PumpObservationLedgerDecisionV1,
+    PumpObservationLedgerResultV1, PumpObservationLedgerV1, PumpRouteVariant, PumpTradeSideV1,
+    RawProviderRoleV1, TimestampQuality, Wal,
+};
 use metrics::increment_counter;
 use seer::{
     config::{
@@ -21,7 +28,10 @@ use seer::{
         ProgramStreamsConfig, ProgramStreamsQuotaPolicy as SeerProgramStreamsQuotaPolicy,
         PumpPortalConfig, SeerConfig, SeerSourceMode, StreamMode, TxFilterStrategy,
     },
-    ipc::{create_ipc_channel, BackpressurePolicy, FundingLaneRuntimeHealth, IpcChannelConfig},
+    ipc::{
+        create_ipc_channel, BackpressurePolicy, FundingLaneRuntimeHealth, IpcChannelConfig,
+        PoolDetectionRuntimeDispositionV1,
+    },
     nln_program_streams::{
         normalize_nln_event, NlnEvent, NlnFundingTransferCoverage, NlnProgramStreamMessage,
         NlnProgramStreamsClient, NlnPumpFunCreateEvent, NlnPumpFunTradeEvent,
@@ -34,6 +44,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::hash::Hash;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 // SystemTime is used transitively via event.detected_at.elapsed()
 use solana_sdk::pubkey::Pubkey;
@@ -107,11 +118,131 @@ enum NlnArtifactRecord {
 struct NlnArtifactWriter {
     tx: mpsc::Sender<NlnArtifactRecord>,
     transfer_sample_rate: u32,
+    delivery_state: Arc<NlnArtifactDeliveryState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NlnArtifactOverflowReasonV1 {
+    QueueFull = 1,
+    WriterClosed = 2,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NlnArtifactOverflowMetadataV1 {
+    label: &'static str,
+    reason: NlnArtifactOverflowReasonV1,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NlnArtifactDeliverySnapshotV1 {
+    artifact_segment_complete: bool,
+    overflow_count: u64,
+    first_overflow: Option<NlnArtifactOverflowMetadataV1>,
+}
+
+#[derive(Debug)]
+struct NlnArtifactDeliveryState {
+    artifact_segment_complete: AtomicBool,
+    overflow_count: AtomicU64,
+    first_overflow_code: AtomicU64,
+}
+
+impl Default for NlnArtifactDeliveryState {
+    fn default() -> Self {
+        Self {
+            artifact_segment_complete: AtomicBool::new(true),
+            overflow_count: AtomicU64::new(0),
+            first_overflow_code: AtomicU64::new(0),
+        }
+    }
+}
+
+impl NlnArtifactDeliveryState {
+    fn label_code(label: &'static str) -> u8 {
+        match label {
+            "pumpfun_create_raw_v1" => 1,
+            "pumpfun_trade_raw_v1" => 2,
+            "nln_pumpfun_buy_raw_v1" => 3,
+            "nln_pumpfun_buy_exact_sol_in_raw_v1" => 4,
+            "system_transfers_raw_v1" => 5,
+            "nln_normalization_errors_v1" => 6,
+            "nln_candidate_birth_v1" => 7,
+            "route_manifest_evidence_candidates_v1" => 8,
+            "funding_events_v1" => 9,
+            _ => u8::MAX,
+        }
+    }
+
+    #[cfg(test)]
+    fn label_from_code(code: u8) -> &'static str {
+        match code {
+            1 => "pumpfun_create_raw_v1",
+            2 => "pumpfun_trade_raw_v1",
+            3 => "nln_pumpfun_buy_raw_v1",
+            4 => "nln_pumpfun_buy_exact_sol_in_raw_v1",
+            5 => "system_transfers_raw_v1",
+            6 => "nln_normalization_errors_v1",
+            7 => "nln_candidate_birth_v1",
+            8 => "route_manifest_evidence_candidates_v1",
+            9 => "funding_events_v1",
+            _ => "unknown_nln_artifact_record",
+        }
+    }
+
+    fn encode_first_overflow(label: &'static str, reason: NlnArtifactOverflowReasonV1) -> u64 {
+        (u64::from(Self::label_code(label)) << 8) | reason as u64
+    }
+
+    #[cfg(test)]
+    fn decode_first_overflow(code: u64) -> Option<NlnArtifactOverflowMetadataV1> {
+        if code == 0 {
+            return None;
+        }
+        let label = Self::label_from_code(((code >> 8) & 0xff) as u8);
+        let reason = match (code & 0xff) as u8 {
+            1 => NlnArtifactOverflowReasonV1::QueueFull,
+            2 => NlnArtifactOverflowReasonV1::WriterClosed,
+            _ => return None,
+        };
+        Some(NlnArtifactOverflowMetadataV1 { label, reason })
+    }
+
+    fn record_overflow(&self, label: &'static str, reason: NlnArtifactOverflowReasonV1) -> bool {
+        self.artifact_segment_complete
+            .store(false, Ordering::Release);
+        self.overflow_count.fetch_add(1, Ordering::Relaxed);
+        self.first_overflow_code
+            .compare_exchange(
+                0,
+                Self::encode_first_overflow(label, reason),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> NlnArtifactDeliverySnapshotV1 {
+        NlnArtifactDeliverySnapshotV1 {
+            artifact_segment_complete: self.artifact_segment_complete.load(Ordering::Acquire),
+            overflow_count: self.overflow_count.load(Ordering::Relaxed),
+            first_overflow: Self::decode_first_overflow(
+                self.first_overflow_code.load(Ordering::Acquire),
+            ),
+        }
+    }
 }
 
 impl NlnArtifactWriter {
-    async fn send_lossless(&self, record: NlnArtifactRecord, label: &'static str) -> bool {
-        match self.tx.send(record).await {
+    /// Enqueue artifact evidence without ever awaiting the writer task.
+    ///
+    /// A full or closed queue marks the artifact segment incomplete and
+    /// retains the first typed overflow marker. It must never backpressure the
+    /// NLN receiver or affect raw Yellowstone coverage/canonical authority.
+    fn try_send_bounded(&self, record: NlnArtifactRecord, label: &'static str) -> bool {
+        match self.tx.try_send(record) {
             Ok(()) => {
                 metrics::counter!(
                     "seer_nln_program_streams_artifact_records_sent_total",
@@ -120,19 +251,46 @@ impl NlnArtifactWriter {
                 );
                 true
             }
-            Err(_) => {
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                metrics::counter!(
+                    "seer_nln_program_streams_artifact_queue_saturated_total",
+                    1,
+                    "label" => label
+                );
+                if self
+                    .delivery_state
+                    .record_overflow(label, NlnArtifactOverflowReasonV1::QueueFull)
+                {
+                    warn!(
+                        label = %label,
+                        "Seer: NLN artifact queue saturated; artifact segment is incomplete"
+                    );
+                }
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
                 metrics::counter!(
                     "seer_nln_program_streams_artifact_writer_closed_total",
                     1,
                     "label" => label
                 );
-                warn!(
-                    label = %label,
-                    "Seer: NLN artifact writer closed; required artifact record could not be persisted"
-                );
+                if self
+                    .delivery_state
+                    .record_overflow(label, NlnArtifactOverflowReasonV1::WriterClosed)
+                {
+                    warn!(
+                        label = %label,
+                        "Seer: NLN artifact writer closed; artifact segment is incomplete"
+                    );
+                }
                 false
             }
         }
+    }
+
+    #[cfg(test)]
+    fn delivery_snapshot(&self) -> NlnArtifactDeliverySnapshotV1 {
+        self.delivery_state.snapshot()
     }
 
     fn should_capture_transfer(&self, event: &NlnTransferEvent) -> bool {
@@ -1129,6 +1287,7 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
     Some(NlnArtifactWriter {
         tx,
         transfer_sample_rate,
+        delivery_state: Arc::new(NlnArtifactDeliveryState::default()),
     })
 }
 
@@ -1512,7 +1671,7 @@ async fn write_nln_program_stream_run_manifest(
     }
 }
 
-async fn capture_raw_nln_message(
+fn capture_raw_nln_message(
     writer: &NlnArtifactWriter,
     topic_kind: NlnProgramStreamCaptureTopic,
     message: &NlnProgramStreamMessage,
@@ -1520,48 +1679,30 @@ async fn capture_raw_nln_message(
     force: bool,
 ) -> bool {
     match topic_kind {
-        NlnProgramStreamCaptureTopic::PumpFunCreate => {
-            writer
-                .send_lossless(
-                    NlnArtifactRecord::PumpFunCreateRaw(raw_row.clone()),
-                    "pumpfun_create_raw_v1",
-                )
-                .await
-        }
-        NlnProgramStreamCaptureTopic::PumpFunTrade => {
-            writer
-                .send_lossless(
-                    NlnArtifactRecord::PumpFunTradeRaw(raw_row.clone()),
-                    "pumpfun_trade_raw_v1",
-                )
-                .await
-        }
-        NlnProgramStreamCaptureTopic::PumpFunBuy => {
-            writer
-                .send_lossless(
-                    NlnArtifactRecord::PumpFunBuyRaw(raw_row.clone()),
-                    "nln_pumpfun_buy_raw_v1",
-                )
-                .await
-        }
-        NlnProgramStreamCaptureTopic::PumpFunBuyExactSolIn => {
-            writer
-                .send_lossless(
-                    NlnArtifactRecord::PumpFunBuyExactSolInRaw(raw_row.clone()),
-                    "nln_pumpfun_buy_exact_sol_in_raw_v1",
-                )
-                .await
-        }
+        NlnProgramStreamCaptureTopic::PumpFunCreate => writer.try_send_bounded(
+            NlnArtifactRecord::PumpFunCreateRaw(raw_row.clone()),
+            "pumpfun_create_raw_v1",
+        ),
+        NlnProgramStreamCaptureTopic::PumpFunTrade => writer.try_send_bounded(
+            NlnArtifactRecord::PumpFunTradeRaw(raw_row.clone()),
+            "pumpfun_trade_raw_v1",
+        ),
+        NlnProgramStreamCaptureTopic::PumpFunBuy => writer.try_send_bounded(
+            NlnArtifactRecord::PumpFunBuyRaw(raw_row.clone()),
+            "nln_pumpfun_buy_raw_v1",
+        ),
+        NlnProgramStreamCaptureTopic::PumpFunBuyExactSolIn => writer.try_send_bounded(
+            NlnArtifactRecord::PumpFunBuyExactSolInRaw(raw_row.clone()),
+            "nln_pumpfun_buy_exact_sol_in_raw_v1",
+        ),
         NlnProgramStreamCaptureTopic::SystemTransfers => {
             if force || writer.should_capture_raw_transfer_message(message) {
                 let mut row = raw_row.clone();
                 add_nln_artifact_sampling(&mut row, writer.transfer_sample_rate);
-                writer
-                    .send_lossless(
-                        NlnArtifactRecord::SystemTransfersRaw(row),
-                        "system_transfers_raw_v1",
-                    )
-                    .await
+                writer.try_send_bounded(
+                    NlnArtifactRecord::SystemTransfersRaw(row),
+                    "system_transfers_raw_v1",
+                )
             } else {
                 false
             }
@@ -1578,6 +1719,9 @@ async fn run_nln_program_streams_topic_capture(
     health: Option<Arc<RuntimeHealth>>,
     artifact_writer: Option<NlnArtifactWriter>,
     trade_resolver: Option<Arc<Mutex<NlnTradePoolIdentityResolver>>>,
+    observation_ledger: Arc<Mutex<PumpObservationLedgerV1>>,
+    candidate_integrity_registry: Arc<CandidateIntegrityRegistry>,
+    observation_clock: Instant,
     authoritative_funding_stream_tx: Option<watch::Sender<bool>>,
 ) {
     let options = NlnSubscribeLoopOptions {
@@ -1658,7 +1802,7 @@ async fn run_nln_program_streams_topic_capture(
             .map(|_| nln_artifact_raw_row(&message, &config, "nln_program_stream_raw_v1"));
         let mut raw_captured = false;
         if let (Some(writer), Some(row)) = (artifact_writer.as_ref(), raw_row.as_ref()) {
-            raw_captured = capture_raw_nln_message(writer, topic_kind, &message, row, false).await;
+            raw_captured = capture_raw_nln_message(writer, topic_kind, &message, row, false);
         }
 
         if matches!(
@@ -1670,12 +1814,10 @@ async fn run_nln_program_streams_topic_capture(
                 artifact_writer.as_ref(),
                 nln_route_manifest_evidence_candidate_row(&message, topic_kind, &config),
             ) {
-                writer
-                    .send_lossless(
-                        NlnArtifactRecord::RouteManifestEvidenceCandidate(candidate),
-                        "route_manifest_evidence_candidates_v1",
-                    )
-                    .await;
+                writer.try_send_bounded(
+                    NlnArtifactRecord::RouteManifestEvidenceCandidate(candidate),
+                    "route_manifest_evidence_candidates_v1",
+                );
             }
             ::metrics::counter!(
                 "nln_program_route_evidence_captured_total",
@@ -1701,17 +1843,15 @@ async fn run_nln_program_streams_topic_capture(
                 if let Some(writer) = artifact_writer.as_ref() {
                     if let Some(row) = raw_row.as_ref() {
                         if !raw_captured {
-                            capture_raw_nln_message(writer, topic_kind, &message, row, true).await;
+                            capture_raw_nln_message(writer, topic_kind, &message, row, true);
                         }
                     }
-                    writer
-                        .send_lossless(
-                            NlnArtifactRecord::NormalizationError(nln_normalization_error_row(
-                                &message, topic_kind, &err,
-                            )),
-                            "nln_normalization_errors_v1",
-                        )
-                        .await;
+                    writer.try_send_bounded(
+                        NlnArtifactRecord::NormalizationError(nln_normalization_error_row(
+                            &message, topic_kind, &err,
+                        )),
+                        "nln_normalization_errors_v1",
+                    );
                 }
                 warn!(
                     topic = %message.topic,
@@ -1731,15 +1871,23 @@ async fn run_nln_program_streams_topic_capture(
         match (topic_kind, event) {
             (NlnProgramStreamCaptureTopic::PumpFunCreate, NlnEvent::PumpFunCreate(create)) => {
                 create_count = create_count.saturating_add(1);
+                let _ = ingest_pump_observation(
+                    &observation_ledger,
+                    &candidate_integrity_registry,
+                    nln_create_observation(&create),
+                    observation_clock
+                        .elapsed()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64,
+                    true,
+                );
                 if let Some(writer) = artifact_writer.as_ref() {
-                    writer
-                        .send_lossless(
-                            NlnArtifactRecord::CandidateBirth(nln_candidate_birth_artifact_row(
-                                &create,
-                            )),
-                            "nln_candidate_birth_v1",
-                        )
-                        .await;
+                    writer.try_send_bounded(
+                        NlnArtifactRecord::CandidateBirth(nln_candidate_birth_artifact_row(
+                            &create,
+                        )),
+                        "nln_candidate_birth_v1",
+                    );
                 }
                 if create_count == 1 || create_count % 1_000 == 0 {
                     info!(
@@ -1751,6 +1899,16 @@ async fn run_nln_program_streams_topic_capture(
             }
             (NlnProgramStreamCaptureTopic::PumpFunTrade, NlnEvent::PumpFunTrade(trade)) => {
                 trade_count = trade_count.saturating_add(1);
+                let _ = ingest_pump_observation(
+                    &observation_ledger,
+                    &candidate_integrity_registry,
+                    Some(nln_trade_observation(&trade)),
+                    observation_clock
+                        .elapsed()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64,
+                    true,
+                );
                 ::metrics::counter!("nln_trade_rows", 1);
                 increment_counter!("nln_trade_rows_total");
                 ::metrics::counter!("nln_events_received", 1, "topic" => topic.clone());
@@ -1759,7 +1917,8 @@ async fn run_nln_program_streams_topic_capture(
                     ::metrics::counter!("nln_trade_buy_rows", 1);
                     increment_counter!("nln_trade_buy_rows_total");
                 }
-                if let (Some(tx), Some(resolver)) = (event_bus_tx.as_ref(), trade_resolver.as_ref())
+                if let (Some(_tx), Some(resolver)) =
+                    (event_bus_tx.as_ref(), trade_resolver.as_ref())
                 {
                     let now = Instant::now();
                     let resolve = match resolver.lock() {
@@ -1806,17 +1965,8 @@ async fn run_nln_program_streams_topic_capture(
                         }
                         match resolve.decision {
                             NlnTradeResolveDecision::ForwardNow { pool_amm_id } => {
-                                let trade_event = trade.to_trade_event(pool_amm_id);
-                                emit_pool_transaction_to_event_bus(
-                                    tx,
-                                    &trade_event,
-                                    health.as_ref(),
-                                    false,
-                                );
                                 ::metrics::counter!("nln_trade_resolved_to_pool", 1);
-                                ::metrics::counter!("nln_trade_forwarded_pool_transaction", 1);
                                 increment_counter!("nln_trade_resolved_to_pool_total");
-                                increment_counter!("nln_trade_forwarded_pool_transaction_total");
                                 info!(
                                     topic = %topic,
                                     mint = %trade.mint,
@@ -1825,7 +1975,7 @@ async fn run_nln_program_streams_topic_capture(
                                     slot = trade.slot,
                                     side = ?trade.side,
                                     resolver_action = "forward_now",
-                                    "Seer: NLN pumpfun.trade forwarded to PoolTransaction"
+                                    "Seer: NLN pumpfun.trade resolved as witness-only; canonical forwarding disabled"
                                 );
                             }
                             NlnTradeResolveDecision::Buffered => {
@@ -1890,12 +2040,10 @@ async fn run_nln_program_streams_topic_capture(
                 {
                     let mut funding_row = nln_funding_event_artifact_row(&transfer);
                     add_nln_artifact_sampling(&mut funding_row, writer.transfer_sample_rate);
-                    writer
-                        .send_lossless(
-                            NlnArtifactRecord::FundingEvent(funding_row),
-                            "funding_events_v1",
-                        )
-                        .await;
+                    writer.try_send_bounded(
+                        NlnArtifactRecord::FundingEvent(funding_row),
+                        "funding_events_v1",
+                    );
                 }
 
                 if let Some(ref tx) = event_bus_tx {
@@ -1975,6 +2123,164 @@ fn sanitize_detected_creator(creator: Pubkey) -> String {
 
 fn trade_has_forwardable_identity(trade: &seer::types::TradeEvent) -> bool {
     trade.pool_amm_id != Pubkey::default() && trade.mint != Pubkey::default()
+}
+
+fn pool_candidate_matches_primary_observation(
+    candidate: &seer::types::CandidatePool,
+    observation: &ObservedPumpMutationV1,
+) -> bool {
+    if observation.provenance.source_family != ObservationSourceFamilyV1::RawYellowstone
+        || observation.raw_provider_role != Some(RawProviderRoleV1::PrimaryAuthority)
+    {
+        return true;
+    }
+    let Ok(signature) = solana_sdk::signature::Signature::from_str(&candidate.signature) else {
+        return false;
+    };
+    let Some(locator) = observation.locator_hint.as_ref() else {
+        return false;
+    };
+    let Some(order) = observation.canonical_order.as_ref() else {
+        return false;
+    };
+    let base_mint = candidate.base_mint.to_string();
+    let bonding_curve = candidate.bonding_curve.to_string();
+    if is_known_pump_fun_program_id(&base_mint)
+        || base_mint == "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM"
+        || is_known_pump_fun_program_id(&bonding_curve)
+        || bonding_curve == "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM"
+        || candidate.base_mint == candidate.amm_program_id
+    {
+        return false;
+    }
+    observation.mutation_family == PumpMutationFamilyV1::InitializePool
+        && observation.signature == signature
+        && locator.signature == signature
+        && locator.program_id == candidate.amm_program_id
+        && observation.claims.curve == Some(candidate.bonding_curve)
+        && observation.claims.mint == Some(candidate.base_mint)
+        && observation.claims.success == Some(true)
+        && observation.provenance.provider_id
+            == candidate.provider_id.as_deref().unwrap_or_default()
+        && candidate.provider_role == Some(RawProviderRoleV1::PrimaryAuthority)
+        && candidate.slot == Some(order.slot)
+        && candidate.tx_index == Some(order.tx_index)
+        && locator.outer_instruction_index == order.outer_instruction_index
+        && locator.inner_instruction_path == order.inner_instruction_path
+        && locator.semantic_event_ordinal == order.semantic_event_ordinal
+        && observation
+            .raw_transaction_mutation_count
+            .is_some_and(|count| count > 0)
+}
+
+fn launcher_trade_route_variant(trade: &seer::types::TradeEvent) -> Option<PumpRouteVariant> {
+    if trade.is_pumpswap {
+        return None;
+    }
+    match trade.buy_variant.as_deref() {
+        Some("legacy_buy") => Some(PumpRouteVariant::LegacyBuy),
+        Some("buy_v2") => Some(PumpRouteVariant::BuyV2),
+        Some("routed_exact_sol_in") | Some("buy_exact_quote_in_v2") => {
+            Some(PumpRouteVariant::BuyExactQuoteInV2)
+        }
+        Some("legacy_sell") => Some(PumpRouteVariant::LegacySell),
+        Some("sell_v2") => Some(PumpRouteVariant::SellV2),
+        _ => None,
+    }
+}
+
+fn launcher_trade_instruction_limit(
+    trade: &seer::types::TradeEvent,
+    route: Option<PumpRouteVariant>,
+) -> Option<ghost_core::PumpInstructionLimitV1> {
+    match route {
+        Some(PumpRouteVariant::LegacyBuy | PumpRouteVariant::BuyV2) if trade.max_sol_cost > 0 => {
+            Some(ghost_core::PumpInstructionLimitV1::MaxWalletDebitLamports(
+                trade.max_sol_cost,
+            ))
+        }
+        Some(PumpRouteVariant::BuyExactQuoteInV2) if trade.max_sol_cost > 0 => Some(
+            ghost_core::PumpInstructionLimitV1::ExactQuoteInputLamports(trade.max_sol_cost),
+        ),
+        Some(PumpRouteVariant::LegacySell | PumpRouteVariant::SellV2)
+            if trade.min_sol_output > 0 =>
+        {
+            Some(ghost_core::PumpInstructionLimitV1::MinWalletCreditLamports(
+                trade.min_sol_output,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn trade_matches_primary_observation(
+    trade: &seer::types::TradeEvent,
+    observation: &ObservedPumpMutationV1,
+) -> bool {
+    if observation.provenance.source_family != ObservationSourceFamilyV1::RawYellowstone
+        || observation.raw_provider_role != Some(RawProviderRoleV1::PrimaryAuthority)
+    {
+        return true;
+    }
+    let Some(locator) = observation.locator_hint.as_ref() else {
+        return false;
+    };
+    let Some(order) = observation.canonical_order.as_ref() else {
+        return false;
+    };
+    let Some(instruction_provenance) = trade.provenance.as_ref() else {
+        return false;
+    };
+    let Some(outer_instruction_index) = instruction_provenance
+        .outer_instruction_index
+        .and_then(|index| u16::try_from(index).ok())
+    else {
+        return false;
+    };
+    let Some(inner_instruction_path) = instruction_provenance.inner_instruction_path.as_ref()
+    else {
+        return false;
+    };
+    let Ok(invoked_program_id) = Pubkey::from_str(&instruction_provenance.invoked_program_id)
+    else {
+        return false;
+    };
+    let route = launcher_trade_route_variant(trade);
+    let route_is_complete =
+        route.is_some() || invoked_program_id.to_string() == PUMPSWAP_PROGRAM_ID_STR;
+
+    route_is_complete
+        && trade_has_forwardable_identity(trade)
+        && observation.mutation_family == PumpMutationFamilyV1::Trade
+        && observation.signature == trade.signature
+        && locator.signature == trade.signature
+        && locator.program_id == invoked_program_id
+        && locator.outer_instruction_index == outer_instruction_index
+        && locator.inner_instruction_path == *inner_instruction_path
+        && trade.event_ordinal == Some(locator.semantic_event_ordinal)
+        && trade.slot == Some(order.slot)
+        && trade.tx_index == Some(order.tx_index)
+        && order.outer_instruction_index == locator.outer_instruction_index
+        && order.inner_instruction_path == locator.inner_instruction_path
+        && order.semantic_event_ordinal == locator.semantic_event_ordinal
+        && observation.claims.curve == Some(trade.pool_amm_id)
+        && observation.claims.mint == Some(trade.mint)
+        && observation.claims.route_variant == route
+        && observation.claims.side
+            == Some(if trade.is_buy {
+                PumpTradeSideV1::Buy
+            } else {
+                PumpTradeSideV1::Sell
+            })
+        && observation.claims.success == Some(trade.success)
+        && observation.claims.error_code == trade.error_code
+        && observation.claims.token_amount_units == Some(trade.amount)
+        && observation.claims.instruction_limit == launcher_trade_instruction_limit(trade, route)
+        && observation.provenance.provider_id == trade.provider_id.as_deref().unwrap_or_default()
+        && trade.provider_role == Some(RawProviderRoleV1::PrimaryAuthority)
+        && observation
+            .raw_transaction_mutation_count
+            .is_some_and(|count| count > 0)
 }
 
 fn route_compatible_trade_bcv2_context(
@@ -3571,6 +3877,272 @@ fn session_bridge_prune_interval(ttl: Duration, detected_pool_ttl: Duration) -> 
         .max(Duration::from_millis(50))
 }
 
+fn pump_observation_classification_label(
+    classification: PumpObservationClassificationV1,
+) -> &'static str {
+    match classification {
+        PumpObservationClassificationV1::PrimaryCanonicalApplied => "primary_canonical_applied",
+        PumpObservationClassificationV1::PrimaryTransactionInventoryComplete => {
+            "primary_transaction_inventory_complete"
+        }
+        PumpObservationClassificationV1::ExactDuplicate => "exact_duplicate",
+        PumpObservationClassificationV1::SameMutationAgreement => "same_mutation_agreement",
+        PumpObservationClassificationV1::SecondaryWitnessOnly => "secondary_witness_only",
+        PumpObservationClassificationV1::ParsedWitnessPending => "parsed_witness_pending",
+        PumpObservationClassificationV1::ExactStructuralMatch => "exact_structural_match",
+        PumpObservationClassificationV1::UniqueSignatureSingletonMatch => {
+            "unique_signature_singleton_match"
+        }
+        PumpObservationClassificationV1::AmbiguousParsedWitness => "ambiguous_parsed_witness",
+        PumpObservationClassificationV1::UnmatchableParsedWitness => "unmatchable_parsed_witness",
+        PumpObservationClassificationV1::SourceReconciliationConflict => {
+            "source_reconciliation_conflict"
+        }
+        PumpObservationClassificationV1::PrimaryRawCoverageIncomplete => {
+            "primary_raw_coverage_incomplete"
+        }
+        PumpObservationClassificationV1::EvidenceCapacityExceeded => "evidence_capacity_exceeded",
+    }
+}
+
+fn emit_pump_observation_decision(
+    candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
+    decision: &PumpObservationLedgerDecisionV1,
+) -> bool {
+    ::metrics::counter!(
+        "pump_observation_ledger_decisions_total",
+        1u64,
+        "classification" => pump_observation_classification_label(decision.classification)
+    );
+    if decision.did_canonical_apply() {
+        ::metrics::counter!("pump_observation_ledger_canonical_mutations_total", 1u64);
+    }
+    let Some(signal) = decision.candidate_integrity_signal.clone() else {
+        return true;
+    };
+    if signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready {
+        ::metrics::counter!("candidate_integrity_ready_deferred_until_apply_total", 1u64);
+        return true;
+    }
+    match candidate_integrity_registry.record_signal(signal.clone()) {
+        Ok(result) => {
+            ::metrics::counter!(
+                "candidate_integrity_direct_signal_total",
+                1u64,
+                "outcome" => format!("{:?}", signal.outcome),
+                "action" => format!("{:?}", result.action)
+            );
+            true
+        }
+        Err(error) => {
+            ::metrics::counter!(
+                "candidate_integrity_direct_signal_failure_total",
+                1u64,
+                "error" => error.to_string()
+            );
+            error!(
+                candidate_pool = %signal.candidate.pool_amm_id,
+                candidate_mint = %signal.candidate.mint,
+                outcome = ?signal.outcome,
+                error = %error,
+                "Seer: direct CandidateIntegrity registry update failed; canonical emission fails closed"
+            );
+            false
+        }
+    }
+}
+
+fn ingest_pump_observation(
+    ledger: &Arc<Mutex<PumpObservationLedgerV1>>,
+    candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
+    observation: Option<ObservedPumpMutationV1>,
+    now_monotonic_ns: u64,
+    boundary_payload_aligned: bool,
+) -> Option<CanonicalMutationApplyReceiptV1> {
+    let Some(observation) = observation else {
+        ::metrics::counter!(
+            "pump_observation_ledger_missing_transport_observation_total",
+            1u64
+        );
+        warn!("Seer: Pump IPC event missing raw observation; canonical emission fails closed");
+        return None;
+    };
+    let result: PumpObservationLedgerResultV1 = match ledger.lock() {
+        Ok(mut ledger)
+            if !boundary_payload_aligned
+                && observation.provenance.source_family
+                    == ObservationSourceFamilyV1::RawYellowstone
+                && observation.raw_provider_role == Some(RawProviderRoleV1::PrimaryAuthority) =>
+        {
+            ledger.observe_primary_boundary_mismatch(observation)
+        }
+        Ok(mut ledger) => ledger.observe(observation, now_monotonic_ns),
+        Err(error) => {
+            ::metrics::counter!("pump_observation_ledger_unavailable_total", 1u64);
+            error!(
+                error = %error,
+                "Seer: Pump Observation Ledger mutex poisoned; canonical emission fails closed"
+            );
+            return None;
+        }
+    };
+
+    let decisions = std::iter::once(&result.observation_decision)
+        .chain(result.derived_decisions.iter())
+        .collect::<Vec<_>>();
+    let mut integrity_recorded = true;
+    for decision in decisions.iter().copied().filter(|decision| {
+        decision
+            .candidate_integrity_signal
+            .as_ref()
+            .is_none_or(|signal| signal.outcome != ghost_core::CandidateIntegrityOutcomeV1::Ready)
+    }) {
+        integrity_recorded &=
+            emit_pump_observation_decision(candidate_integrity_registry, decision);
+    }
+    for decision in decisions.iter().copied().filter(|decision| {
+        decision
+            .candidate_integrity_signal
+            .as_ref()
+            .is_some_and(|signal| signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready)
+    }) {
+        integrity_recorded &=
+            emit_pump_observation_decision(candidate_integrity_registry, decision);
+    }
+    let runtime_eligible = boundary_payload_aligned
+        && !matches!(
+            result.observation_decision.classification,
+            PumpObservationClassificationV1::PrimaryRawCoverageIncomplete
+                | PumpObservationClassificationV1::EvidenceCapacityExceeded
+                | PumpObservationClassificationV1::SourceReconciliationConflict
+        );
+    let canonical = (integrity_recorded && runtime_eligible)
+        .then(|| result.observation_decision.canonical_mutation.as_ref())
+        .flatten()?;
+    let receipt = match candidate_integrity_registry.stage_canonical_mutation(canonical) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            error!(
+                signature = %canonical.locator.signature,
+                locator = ?canonical.locator,
+                error = %error,
+                "Seer: canonical apply receipt staging failed; runtime emission fails closed"
+            );
+            return None;
+        }
+    };
+    let ready_signals = decisions
+        .iter()
+        .filter_map(|decision| decision.candidate_integrity_signal.as_ref())
+        .filter(|signal| signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !ready_signals.is_empty()
+        && candidate_integrity_registry
+            .seal_complete_transaction_inventory(receipt.signature, &ready_signals)
+            .is_err()
+    {
+        let _ = candidate_integrity_registry.fail_canonical_apply(&receipt);
+        error!(
+            signature = %receipt.signature,
+            locator = ?receipt.locator,
+            "Seer: complete transaction inventory could not seal apply fence; runtime emission fails closed"
+        );
+        return None;
+    }
+    Some(receipt)
+}
+
+fn finalize_pump_observation_ledger(
+    ledger: &Arc<Mutex<PumpObservationLedgerV1>>,
+    candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
+    now_monotonic_ns: u64,
+) {
+    let decisions = match ledger.lock() {
+        Ok(mut ledger) => ledger.finalize_expired(now_monotonic_ns),
+        Err(error) => {
+            ::metrics::counter!("pump_observation_ledger_unavailable_total", 1u64);
+            error!(
+                error = %error,
+                "Seer: Pump Observation Ledger mutex poisoned during correlation finalization"
+            );
+            return;
+        }
+    };
+    for decision in &decisions {
+        let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
+    }
+}
+
+fn nln_observation_provenance(
+    meta: &seer::nln_program_streams::NlnIngestMeta,
+) -> ObservationProvenanceV1 {
+    ObservationProvenanceV1 {
+        source_family: ObservationSourceFamilyV1::ParsedNln,
+        source_id: meta.topic.clone(),
+        provider_id: meta.provider.clone(),
+        schema_id: meta.payload_schema_id.clone(),
+        payload_hash_blake3: meta.payload_hash_blake3,
+        received_at_monotonic_ns: meta.recv_ts_ns,
+    }
+}
+
+fn nln_create_observation(create: &NlnPumpFunCreateEvent) -> Option<ObservedPumpMutationV1> {
+    let signature = solana_sdk::signature::Signature::from_str(&create.signature).ok()?;
+    Some(ObservedPumpMutationV1 {
+        mutation_family: PumpMutationFamilyV1::InitializePool,
+        signature,
+        locator_hint: None,
+        canonical_order: None,
+        raw_transaction_mutation_count: None,
+        claims: PumpMutationClaimsV1 {
+            curve: create.bonding_curve,
+            mint: Some(create.mint),
+            success: Some(true),
+            ..PumpMutationClaimsV1::default()
+        },
+        raw_provider_role: None,
+        provenance: nln_observation_provenance(&create.meta),
+    })
+}
+
+fn nln_trade_route_variant(trade: &NlnPumpFunTradeEvent) -> Option<PumpRouteVariant> {
+    match trade.ix_name.as_deref() {
+        Some("buy") | Some("legacy_buy") => Some(PumpRouteVariant::LegacyBuy),
+        Some("buy_v2") => Some(PumpRouteVariant::BuyV2),
+        Some("buy_exact_sol_in") | Some("buy_exact_quote_in_v2") => {
+            Some(PumpRouteVariant::BuyExactQuoteInV2)
+        }
+        Some("sell") | Some("legacy_sell") => Some(PumpRouteVariant::LegacySell),
+        Some("sell_v2") => Some(PumpRouteVariant::SellV2),
+        _ => None,
+    }
+}
+
+fn nln_trade_observation(trade: &NlnPumpFunTradeEvent) -> ObservedPumpMutationV1 {
+    ObservedPumpMutationV1 {
+        mutation_family: PumpMutationFamilyV1::Trade,
+        signature: trade.signature,
+        locator_hint: None,
+        canonical_order: None,
+        raw_transaction_mutation_count: None,
+        claims: PumpMutationClaimsV1 {
+            mint: Some(trade.mint),
+            route_variant: nln_trade_route_variant(trade),
+            side: Some(if trade.side.is_buy() {
+                PumpTradeSideV1::Buy
+            } else {
+                PumpTradeSideV1::Sell
+            }),
+            success: Some(true),
+            token_amount_units: Some(trade.token_amount_units),
+            ..PumpMutationClaimsV1::default()
+        },
+        raw_provider_role: None,
+        provenance: nln_observation_provenance(&trade.meta),
+    }
+}
+
 fn detected_pool_from_candidate(
     candidate: &seer::types::CandidatePool,
     detected_ms: u64,
@@ -3629,6 +4201,8 @@ fn process_trade_event_for_session_gate(
     trade: &seer::types::TradeEvent,
     health: Option<&Arc<RuntimeHealth>>,
     now: Instant,
+    apply_receipt: Option<&CanonicalMutationApplyReceiptV1>,
+    candidate_integrity_registry: Option<&Arc<CandidateIntegrityRegistry>>,
 ) -> SessionTradeIngressResult {
     let gating_result = session_trade_bridge.ingest_trade(trade, now);
     record_session_buffer_expired(gating_result.expired_count);
@@ -3636,11 +4210,20 @@ fn process_trade_event_for_session_gate(
 
     match gating_result.decision {
         SessionTradeDecision::ForwardNow => {
-            emit_pool_transaction_to_event_bus(tx, trade, health, false);
+            if !emit_pool_transaction_to_event_bus(tx, trade, health, false) {
+                if let (Some(receipt), Some(registry)) =
+                    (apply_receipt, candidate_integrity_registry)
+                {
+                    let _ = registry.fail_canonical_apply(receipt);
+                }
+            }
         }
         SessionTradeDecision::SilentDrop => {
             // Pool not yet registered in this session — discarded without event bus emission.
             increment_counter!("seer_bridge_session_pool_silent_drop_total");
+            if let (Some(receipt), Some(registry)) = (apply_receipt, candidate_integrity_registry) {
+                let _ = registry.fail_canonical_apply(receipt);
+            }
         }
     }
 
@@ -3654,6 +4237,8 @@ fn process_pool_detected_event_for_session_gate(
     health: Option<&Arc<RuntimeHealth>>,
     now: Instant,
     detected_ms: u64,
+    apply_receipt: Option<&CanonicalMutationApplyReceiptV1>,
+    candidate_integrity_registry: Option<&Arc<CandidateIntegrityRegistry>>,
 ) -> SessionTradeFlushResult {
     let detected_pool = detected_pool_from_candidate(candidate, detected_ms);
 
@@ -3667,6 +4252,9 @@ fn process_pool_detected_event_for_session_gate(
 
     if let Err(e) = tx.send(GhostEvent::new_pool_detected(detected_pool.clone())) {
         error!("Seer: ❌ Failed to emit NewPoolDetected event: {}", e);
+        if let (Some(receipt), Some(registry)) = (apply_receipt, candidate_integrity_registry) {
+            let _ = registry.fail_canonical_apply(receipt);
+        }
     } else {
         if let Some(health) = health {
             health.mark_bus_event();
@@ -3694,7 +4282,7 @@ fn process_pool_detected_event_for_session_gate(
             candidate.pool_amm_id
         );
         for trade in &flush_result.replay_ready {
-            emit_pool_transaction_to_event_bus(tx, trade, health, true);
+            let _ = emit_pool_transaction_to_event_bus(tx, trade, health, true);
         }
     }
 
@@ -3706,7 +4294,7 @@ fn emit_pool_transaction_to_event_bus(
     trade: &seer::types::TradeEvent,
     health: Option<&Arc<RuntimeHealth>>,
     replayed_from_session_buffer: bool,
-) {
+) -> bool {
     let pool_tx = trade_event_to_pool_transaction(trade);
 
     info!(
@@ -3719,6 +4307,7 @@ fn emit_pool_transaction_to_event_bus(
 
     if let Err(e) = tx.send(GhostEvent::pool_transaction(pool_tx)) {
         error!("Seer: ❌ Failed to emit PoolTransaction event: {}", e);
+        false
     } else {
         if let Some(health) = health {
             health.mark_bus_event();
@@ -3728,6 +4317,7 @@ fn emit_pool_transaction_to_event_bus(
             tx.receiver_count(),
             replayed_from_session_buffer
         );
+        true
     }
 }
 
@@ -3861,6 +4451,9 @@ fn spawn_nln_program_streams_capture(
     health: Option<Arc<RuntimeHealth>>,
     authoritative_funding_stream_tx: Option<watch::Sender<bool>>,
     trade_resolver: Arc<Mutex<NlnTradePoolIdentityResolver>>,
+    observation_ledger: Arc<Mutex<PumpObservationLedgerV1>>,
+    candidate_integrity_registry: Arc<CandidateIntegrityRegistry>,
+    observation_clock: Instant,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.enabled {
         return None;
@@ -3979,12 +4572,17 @@ fn spawn_nln_program_streams_capture(
                 subscription.topic_kind,
                 NlnProgramStreamCaptureTopic::PumpFunTrade
             );
-            let topic_event_bus_tx = if is_funding_topic || is_trade_topic {
+            let is_pump_observation_topic = matches!(
+                subscription.topic_kind,
+                NlnProgramStreamCaptureTopic::PumpFunCreate
+                    | NlnProgramStreamCaptureTopic::PumpFunTrade
+            );
+            let topic_event_bus_tx = if is_funding_topic || is_pump_observation_topic {
                 event_bus_tx.clone()
             } else {
                 None
             };
-            let topic_health = if is_funding_topic {
+            let topic_health = if is_funding_topic || is_pump_observation_topic {
                 health.clone()
             } else {
                 None
@@ -4001,6 +4599,9 @@ fn spawn_nln_program_streams_capture(
                 topic_health,
                 artifact_writer.clone(),
                 is_trade_topic.then(|| trade_resolver.clone()),
+                observation_ledger.clone(),
+                candidate_integrity_registry.clone(),
+                observation_clock,
                 topic_authoritative_funding_stream_tx,
             )));
         }
@@ -4032,6 +4633,7 @@ pub async fn run(
     health: Option<Arc<RuntimeHealth>>,
     authoritative_funding_stream_tx: Option<watch::Sender<bool>>,
     canonical_account_update_relay_enabled: bool,
+    candidate_integrity_registry: Arc<CandidateIntegrityRegistry>,
 ) -> Result<()> {
     info!("Seer: Initializing component");
 
@@ -4239,6 +4841,8 @@ pub async fn run(
     let nln_trade_pool_resolver = Arc::new(Mutex::new(
         NlnTradePoolIdentityResolver::from_program_streams_config(&program_streams_capture_config),
     ));
+    let pump_observation_ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+    let pump_observation_clock = Instant::now();
 
     info!("Seer: Configuration loaded");
     info!(
@@ -4395,11 +4999,17 @@ pub async fn run(
         health.clone(),
         nln_authoritative_funding_stream_tx,
         nln_trade_pool_resolver.clone(),
+        pump_observation_ledger.clone(),
+        candidate_integrity_registry.clone(),
+        pump_observation_clock,
     );
 
     // Process IPC events and emit to event bus
     let health_ipc = health.clone();
     let nln_trade_pool_resolver_ipc = nln_trade_pool_resolver.clone();
+    let pump_observation_ledger_ipc = pump_observation_ledger.clone();
+    let candidate_integrity_registry_ipc = candidate_integrity_registry;
+    let pump_observation_clock_ipc = pump_observation_clock;
     let mut ipc_handle = tokio::spawn(async move {
         let detected_pool_ttl = Duration::from_millis(seer_config.watched_pools_ttl_ms.max(1));
         let detected_pool_cap = seer_config.watched_pools_cap.max(1);
@@ -4428,6 +5038,14 @@ pub async fn run(
                         session_account_update_bridge.prune_expired(Instant::now());
                     record_session_account_update_expired(expired_updates);
                     record_session_account_update_detected_key_expired(expired_update_keys);
+                    finalize_pump_observation_ledger(
+                        &pump_observation_ledger_ipc,
+                        &candidate_integrity_registry_ipc,
+                        pump_observation_clock_ipc
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
                     continue;
                 }
                 maybe_event = ipc_receiver.recv() => match maybe_event {
@@ -4444,6 +5062,62 @@ pub async fn run(
             match seer_event {
                 seer::ipc::SeerEvent::PoolDetected(event) => {
                     let candidate = &event.candidate;
+                    let boundary_payload_aligned =
+                        event.observation.as_ref().is_some_and(|observation| {
+                            pool_candidate_matches_primary_observation(candidate, observation)
+                        });
+                    let Some(canonical_mutation) = ingest_pump_observation(
+                        &pump_observation_ledger_ipc,
+                        &candidate_integrity_registry_ipc,
+                        event.observation.clone(),
+                        pump_observation_clock_ipc
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64,
+                        boundary_payload_aligned,
+                    ) else {
+                        debug!(
+                            pool = %candidate.pool_amm_id,
+                            mint = %candidate.base_mint,
+                            signature = %candidate.signature,
+                            "Seer: PoolDetected observation is witness/duplicate/incomplete; canonical runtime emission suppressed"
+                        );
+                        continue;
+                    };
+                    match event.runtime_disposition {
+                        PoolDetectionRuntimeDispositionV1::Observe => {}
+                        PoolDetectionRuntimeDispositionV1::ContinuityOnly => {
+                            ::metrics::counter!(
+                                "seer_pool_detection_runtime_disposition_total",
+                                1u64,
+                                "disposition" => "continuity_only"
+                            );
+                            info!(
+                                pool = %candidate.pool_amm_id,
+                                mint = %candidate.base_mint,
+                                continuity_observation_pool = ?event.continuity_observation_pool,
+                                "Seer: canonical raw observation retained, but continuity-only pool is not admitted to runtime"
+                            );
+                            let _ = candidate_integrity_registry_ipc
+                                .fail_canonical_apply(&canonical_mutation);
+                            continue;
+                        }
+                        PoolDetectionRuntimeDispositionV1::Suppressed => {
+                            ::metrics::counter!(
+                                "seer_pool_detection_runtime_disposition_total",
+                                1u64,
+                                "disposition" => "suppressed"
+                            );
+                            info!(
+                                pool = %candidate.pool_amm_id,
+                                mint = %candidate.base_mint,
+                                "Seer: canonical raw observation retained, but suppressed pool is not admitted to runtime"
+                            );
+                            let _ = candidate_integrity_registry_ipc
+                                .fail_canonical_apply(&canonical_mutation);
+                            continue;
+                        }
+                    }
 
                     info!(
                         "Seer: Pool detected via IPC - pool={}, amm={}, priority={:?}",
@@ -4501,6 +5175,8 @@ pub async fn run(
                             bonding_curve_str,
                             amm_program_str
                         );
+                        let _ = candidate_integrity_registry_ipc
+                            .fail_canonical_apply(&canonical_mutation);
                         continue; // Skip this pool - do not emit, do not bootstrap
                     }
 
@@ -4516,6 +5192,8 @@ pub async fn run(
                             bonding_curve_str,
                             amm_program_str
                         );
+                        let _ = candidate_integrity_registry_ipc
+                            .fail_canonical_apply(&canonical_mutation);
                         continue;
                     }
 
@@ -4531,6 +5209,8 @@ pub async fn run(
                             bonding_curve_str,
                             amm_program_str
                         );
+                        let _ = candidate_integrity_registry_ipc
+                            .fail_canonical_apply(&canonical_mutation);
                         continue;
                     }
 
@@ -4546,6 +5226,8 @@ pub async fn run(
                             bonding_curve_str,
                             amm_program_str
                         );
+                        let _ = candidate_integrity_registry_ipc
+                            .fail_canonical_apply(&canonical_mutation);
                         continue;
                     }
 
@@ -4561,6 +5243,8 @@ pub async fn run(
                             bonding_curve_str,
                             amm_program_str
                         );
+                        let _ = candidate_integrity_registry_ipc
+                            .fail_canonical_apply(&canonical_mutation);
                         continue;
                     }
 
@@ -4609,6 +5293,8 @@ pub async fn run(
                             health_ipc.as_ref(),
                             now,
                             detected_ms,
+                            Some(&canonical_mutation),
+                            Some(&candidate_integrity_registry_ipc),
                         );
                         let nln_replay_ready = match nln_trade_pool_resolver_ipc.lock() {
                             Ok(mut resolver) => {
@@ -4637,24 +5323,16 @@ pub async fn run(
                                 Vec::new()
                             }
                         };
-                        for nln_trade in nln_replay_ready {
-                            let trade_event = nln_trade.to_trade_event(candidate.pool_amm_id);
-                            emit_pool_transaction_to_event_bus(
-                                tx,
-                                &trade_event,
-                                health_ipc.as_ref(),
-                                true,
+                        if !nln_replay_ready.is_empty() {
+                            ::metrics::counter!(
+                                "nln_trade_canonical_replay_suppressed_total",
+                                nln_replay_ready.len() as u64
                             );
-                            ::metrics::counter!("nln_trade_forwarded_pool_transaction", 1);
-                            increment_counter!("nln_trade_forwarded_pool_transaction_total");
                             info!(
-                                mint = %nln_trade.mint,
+                                mint = %candidate.base_mint,
                                 pool = %candidate.pool_amm_id,
-                                signature = %nln_trade.signature,
-                                slot = nln_trade.slot,
-                                side = ?nln_trade.side,
-                                resolver_action = "replay_after_candidate",
-                                "Seer: NLN pumpfun.trade replayed to PoolTransaction after Ghost birth"
+                                witness_count = nln_replay_ready.len(),
+                                "Seer: resolved NLN trade replay remains witness-only; zero PoolTransaction emissions"
                             );
                         }
                         let flush = session_account_update_bridge
@@ -4685,6 +5363,8 @@ pub async fn run(
                             );
                         }
                     } else {
+                        let _ = candidate_integrity_registry_ipc
+                            .fail_canonical_apply(&canonical_mutation);
                         let flush_result = session_trade_bridge
                             .register_detected_pool(candidate.pool_amm_id, Instant::now());
                         if let Ok(mut resolver) = nln_trade_pool_resolver_ipc.lock() {
@@ -4714,6 +5394,29 @@ pub async fn run(
 
                 seer::ipc::SeerEvent::Trade(trade_event) => {
                     let trade = &trade_event.trade;
+                    let boundary_payload_aligned =
+                        trade_event.observation.as_ref().is_some_and(|observation| {
+                            trade_matches_primary_observation(trade, observation)
+                        });
+                    let Some(canonical_mutation) = ingest_pump_observation(
+                        &pump_observation_ledger_ipc,
+                        &candidate_integrity_registry_ipc,
+                        trade_event.observation.clone(),
+                        pump_observation_clock_ipc
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64,
+                        boundary_payload_aligned,
+                    ) else {
+                        debug!(
+                            pool = %trade.pool_amm_id,
+                            mint = %trade.mint,
+                            signature = %trade.signature,
+                            event_ordinal = ?trade.event_ordinal,
+                            "Seer: Trade observation is witness/duplicate/incomplete; canonical runtime emission suppressed"
+                        );
+                        continue;
+                    };
 
                     if !trade_has_forwardable_identity(trade) {
                         warn!(
@@ -4723,6 +5426,8 @@ pub async fn run(
                             trade.mint,
                             trade.event_ordinal
                         );
+                        let _ = candidate_integrity_registry_ipc
+                            .fail_canonical_apply(&canonical_mutation);
                         continue;
                     }
 
@@ -4745,6 +5450,8 @@ pub async fn run(
                             trade,
                             health_ipc.as_ref(),
                             now,
+                            Some(&canonical_mutation),
+                            Some(&candidate_integrity_registry_ipc),
                         );
                         if gate.decision == SessionTradeDecision::ForwardNow {
                             let liveness =
@@ -4775,6 +5482,9 @@ pub async fn run(
                                 trade.signer
                             );
                         }
+                    } else {
+                        let _ = candidate_integrity_registry_ipc
+                            .fail_canonical_apply(&canonical_mutation);
                     }
                 }
 
@@ -5108,18 +5818,25 @@ mod tests {
     use super::{
         detected_pool_from_candidate, detection_clock_summary, emit_account_update_to_event_bus,
         emit_execution_account_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
-        nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
-        process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
-        pumpswap_program_id, select_nln_program_stream_subscriptions,
-        trade_event_to_pool_transaction, trade_has_forwardable_identity,
-        NlnProgramStreamCaptureTopic, NlnTradePoolIdentityResolver, NlnTradeResolveDecision,
-        SessionAccountUpdateBridge, SessionAccountUpdateDecision, SessionBcv2Context,
-        SessionExecutionAccountEvidenceDecision, SessionPoolTradeBridge, SessionTradeDecision,
-        TOKEN_PROGRAM_ID,
+        ingest_pump_observation, nln_normalization_error_row,
+        nln_route_manifest_evidence_candidate_row, process_pool_detected_event_for_session_gate,
+        process_trade_event_for_session_gate, pumpswap_program_id,
+        select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
+        trade_has_forwardable_identity, NlnArtifactDeliveryState, NlnArtifactOverflowReasonV1,
+        NlnArtifactRecord, NlnArtifactWriter, NlnProgramStreamCaptureTopic,
+        NlnTradePoolIdentityResolver, NlnTradeResolveDecision, SessionAccountUpdateBridge,
+        SessionAccountUpdateDecision, SessionBcv2Context, SessionExecutionAccountEvidenceDecision,
+        SessionPoolTradeBridge, SessionTradeDecision, TOKEN_PROGRAM_ID,
     };
+    use crate::candidate_integrity::CandidateIntegrityRegistry;
     use crate::events::{create_event_bus, GhostEvent};
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-    use ghost_core::CurveFinality;
+    use ghost_core::{
+        CandidateIntegrityOutcomeV1, CanonicalPumpOrderKeyV1, CurveFinality,
+        ObservationProvenanceV1, ObservationSourceFamilyV1, ObservedPumpMutationV1,
+        PumpCandidateIdentityV1, PumpMutationClaimsV1, PumpMutationFamilyV1,
+        PumpObservationLedgerV1, PumpTradeSideV1, RawProviderRoleV1, RawPumpMutationLocatorV1,
+    };
     use seer::config::{ProgramStreamsConfig, ProgramStreamsQuotaPolicy};
     use seer::ipc::{
         AccountUpdateReplayOrigin, DetectedAccountUpdateEvent,
@@ -5136,8 +5853,115 @@ mod tests {
     use serde_json::{json, Value};
     use solana_sdk::{pubkey::Pubkey, signature::Signature};
     use std::str::FromStr;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
-    use tokio::sync::broadcast;
+    use tokio::sync::{broadcast, mpsc};
+
+    #[test]
+    fn pr1d_ordering_ingest_never_publishes_ready_before_downstream_apply() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let signature = Signature::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        let locator = RawPumpMutationLocatorV1 {
+            program_id: program,
+            signature,
+            outer_instruction_index: 1,
+            inner_instruction_path: vec![0],
+            semantic_event_ordinal: 0,
+        };
+        let receipt = ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(ObservedPumpMutationV1 {
+                mutation_family: PumpMutationFamilyV1::Trade,
+                signature,
+                locator_hint: Some(locator.clone()),
+                canonical_order: Some(CanonicalPumpOrderKeyV1 {
+                    slot: 10,
+                    tx_index: 0,
+                    outer_instruction_index: 1,
+                    inner_instruction_path: vec![0],
+                    semantic_event_ordinal: 0,
+                }),
+                raw_transaction_mutation_count: Some(1),
+                claims: PumpMutationClaimsV1 {
+                    curve: Some(pool),
+                    mint: Some(mint),
+                    side: Some(PumpTradeSideV1::Buy),
+                    success: Some(true),
+                    token_amount_units: Some(1),
+                    ..PumpMutationClaimsV1::default()
+                },
+                raw_provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
+                provenance: ObservationProvenanceV1 {
+                    source_family: ObservationSourceFamilyV1::RawYellowstone,
+                    source_id: "yellowstone".to_string(),
+                    provider_id: "primary".to_string(),
+                    schema_id: "test".to_string(),
+                    payload_hash_blake3: [7; 32],
+                    received_at_monotonic_ns: 1,
+                },
+            }),
+            1,
+            true,
+        )
+        .expect("primary canonical receipt");
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint,
+        };
+        assert!(matches!(
+            registry.snapshot(candidate),
+            Err(crate::candidate_integrity::CandidateIntegrityErrorV1::CandidateMissing)
+        ));
+
+        let releases = registry
+            .mark_canonical_apply_succeeded(&receipt)
+            .expect("downstream apply acknowledgement");
+        assert_eq!(releases.len(), 1);
+        assert_eq!(
+            registry
+                .snapshot(candidate)
+                .expect("ready after apply")
+                .outcome,
+            CandidateIntegrityOutcomeV1::Ready
+        );
+    }
+
+    #[test]
+    fn nln_artifact_writer_never_waits_and_retains_first_overflow_metadata() {
+        let (tx, rx) = mpsc::channel(1);
+        let writer = NlnArtifactWriter {
+            tx,
+            transfer_sample_rate: 1,
+            delivery_state: Arc::new(NlnArtifactDeliveryState::default()),
+        };
+
+        assert!(writer.try_send_bounded(
+            NlnArtifactRecord::PumpFunCreateRaw(json!({"sequence": 1})),
+            "pumpfun_create_raw_v1",
+        ));
+        assert!(!writer.try_send_bounded(
+            NlnArtifactRecord::PumpFunTradeRaw(json!({"sequence": 2})),
+            "pumpfun_trade_raw_v1",
+        ));
+
+        drop(rx);
+        assert!(!writer.try_send_bounded(
+            NlnArtifactRecord::FundingEvent(json!({"sequence": 3})),
+            "funding_events_v1",
+        ));
+
+        let snapshot = writer.delivery_snapshot();
+        assert!(!snapshot.artifact_segment_complete);
+        assert_eq!(snapshot.overflow_count, 2);
+        let first = snapshot.first_overflow.expect("first overflow metadata");
+        assert_eq!(first.label, "pumpfun_trade_raw_v1");
+        assert_eq!(first.reason, NlnArtifactOverflowReasonV1::QueueFull);
+    }
 
     #[tokio::test]
     async fn seer_component_returns_after_global_shutdown_signal() {
@@ -5161,6 +5985,7 @@ mod tests {
             None,
             None,
             false,
+            Arc::new(CandidateIntegrityRegistry::default()),
         ));
 
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -5215,6 +6040,8 @@ mod tests {
                 signature: Some(signature.to_string()),
                 tx_index: Some(3),
                 instruction_index: Some(2),
+                payload_schema_id: "nln_program_stream_payload_json.v1".to_string(),
+                payload_hash_blake3: [7; 32],
             },
             signature,
             tx_index: Some(3),
@@ -5409,6 +6236,8 @@ mod tests {
             recv_ts_ms: 1_780_000_000_001,
             recv_ts_ns: 1_780_000_000_001_000_000,
             decode_ts_ms: 1_780_000_000_002,
+            payload_schema_id: "nln_program_stream_payload_json.v1".to_string(),
+            payload_hash_blake3: [8; 32],
             payload_json: payload,
         }
     }
@@ -5469,6 +6298,8 @@ mod tests {
             recv_ts_ms: 1_780_000_000_001,
             recv_ts_ns: 1_780_000_000_001_000_000,
             decode_ts_ms: 1_780_000_000_002,
+            payload_schema_id: "nln_program_stream_payload_json.v1".to_string(),
+            payload_hash_blake3: [9; 32],
             payload_json: payload,
         };
         (message, mint, bonding_curve, remaining_0)
@@ -5802,6 +6633,8 @@ mod tests {
             recv_ts_ms: 1_700_000_000_111,
             recv_ts_ns: 1_700_000_000_111_000_000,
             decode_ts_ms: 1_700_000_000_112,
+            payload_schema_id: "nln_program_stream_payload_json.v1".to_string(),
+            payload_hash_blake3: [10; 32],
             payload_json: serde_json::json!({
                 "signature": "sig-test",
                 "slot": "321",
@@ -6212,6 +7045,7 @@ mod tests {
             outer_program_id: Some("outer-program".to_string()),
             invoked_program_id: "invoked-program".to_string(),
             stack_height: Some(3),
+            inner_instruction_path: Some(vec![1, 0]),
             from_cpi: true,
         });
 
@@ -6847,6 +7681,7 @@ mod tests {
         let trade = make_trade(pool, Pubkey::new_unique());
         let trade_event = SeerEvent::Trade(DetectedTradeEvent {
             trade: trade.clone(),
+            observation: None,
             detected_at: SystemTime::now(),
             sequence_number: 1,
             priority: EventPriority::Normal,
@@ -6867,6 +7702,8 @@ mod tests {
                     &event.trade,
                     None,
                     Instant::now(),
+                    None,
+                    None,
                 );
                 assert_eq!(gating.decision, SessionTradeDecision::SilentDrop);
             }
@@ -6896,8 +7733,15 @@ mod tests {
             32,
         );
 
-        let gating =
-            process_trade_event_for_session_gate(&tx, &mut bridge, &trade, None, Instant::now());
+        let gating = process_trade_event_for_session_gate(
+            &tx,
+            &mut bridge,
+            &trade,
+            None,
+            Instant::now(),
+            None,
+            None,
+        );
         assert_eq!(gating.decision, SessionTradeDecision::SilentDrop);
 
         let detected_ms = SystemTime::now()
@@ -6911,6 +7755,8 @@ mod tests {
             None,
             Instant::now() + Duration::from_millis(1),
             detected_ms,
+            None,
+            None,
         );
         assert!(flush.replay_ready.is_empty());
 
@@ -6941,12 +7787,16 @@ mod tests {
         let candidate = make_candidate(pool, mint);
         let pool_event = SeerEvent::PoolDetected(DetectedPoolEvent {
             candidate: candidate.clone(),
+            observation: None,
+            runtime_disposition: seer::ipc::PoolDetectionRuntimeDispositionV1::Observe,
+            continuity_observation_pool: None,
             detected_at: SystemTime::now(),
             sequence_number: 1,
             priority: EventPriority::Normal,
         });
         let trade_event = SeerEvent::Trade(DetectedTradeEvent {
             trade: trade.clone(),
+            observation: None,
             detected_at: SystemTime::now(),
             sequence_number: 2,
             priority: EventPriority::Normal,
@@ -6974,6 +7824,8 @@ mod tests {
                     None,
                     Instant::now(),
                     detected_ms,
+                    None,
+                    None,
                 );
                 assert!(flush.replay_ready.is_empty());
             }
@@ -6989,6 +7841,8 @@ mod tests {
                     &event.trade,
                     None,
                     Instant::now(),
+                    None,
+                    None,
                 );
                 assert_eq!(gating.decision, SessionTradeDecision::ForwardNow);
             }
@@ -7121,6 +7975,8 @@ mod tests {
             None,
             now + Duration::from_millis(1),
             detected_ms,
+            None,
+            None,
         );
         let flush =
             account_bridge.register_detected_pool(&candidate, now + Duration::from_millis(1));

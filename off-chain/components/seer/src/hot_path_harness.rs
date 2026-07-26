@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ghost_core::{wal::Wal, RawProviderRoleV1};
+use ghost_core::{wal::Wal, ObservedPumpMutationV1, RawProviderRoleV1};
 use serde::Serialize;
 use serde_json::{json, Value};
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
@@ -39,8 +39,15 @@ const BURST_BATCH_EVENTS: usize = 128;
 const BURST_BATCH_INTERVAL: Duration = Duration::from_millis(50);
 const QUEUE_DWELL_P99_SLA_NS: u64 = 250_000_000;
 const QUEUE_OLDEST_EVENT_SLA_NS: u64 = 500_000_000;
-const BASELINE_CANONICAL_PARITY_DIGEST: &str =
+/// Frozen legacy projection from the PR1C parent.  It intentionally excludes
+/// fields introduced by PR1D while retaining the exact pre-PR1D JSON shape.
+const BASELINE_LEGACY_CANONICAL_PARITY_DIGEST_V1: &str =
     "549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202";
+/// Frozen full PR1D parser snapshot, including locator/order/provenance and
+/// raw transaction inventory evidence.  Captured from the deterministic
+/// release harness after the V1 projection proved parent parity.
+const BASELINE_FULL_PR1D_PARSER_SNAPSHOT_DIGEST_V2: &str =
+    "507b13704d5b90c3f724a395acbf0d0cc55fdc37a83fcb95cf67cceb6247569f";
 
 #[derive(Clone, Copy, Debug)]
 enum FixtureKind {
@@ -265,17 +272,17 @@ fn steady_state_rss_kib() -> Option<u64> {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct CanonicalParserParitySnapshotV1 {
+struct LegacyCanonicalParserProjectionV1 {
     schema: &'static str,
     fixture: String,
     initialize_pool: Option<InitializePoolEvent>,
     trades: Vec<TradeEvent>,
 }
 
-fn canonical_parser_parity_snapshot(
-    name: &str,
+/// PR1D snapshots must not depend on locally observed arrival clocks.
+fn normalized_parity_events(
     bundle: &ParsedTransactionBundle,
-) -> CanonicalParserParitySnapshotV1 {
+) -> (Option<InitializePoolEvent>, Vec<TradeEvent>) {
     let mut initialize_pool = bundle.initialize_pool.clone();
     if let Some(pool) = initialize_pool.as_mut() {
         pool.event_ts_ms = pool.event_time.chain_event_ts_ms;
@@ -291,7 +298,33 @@ fn canonical_parser_parity_snapshot(
         trade.event_time.ingress_monotonic_ts_ms = None;
     }
 
-    CanonicalParserParitySnapshotV1 {
+    (initialize_pool, trades)
+}
+
+/// Legacy V1 projection: exactly the serialized event fields available before
+/// PR1D.  This preserves the parent digest without treating the new structural
+/// evidence as a regression in pre-existing parser semantics.
+fn legacy_canonical_parser_projection_v1(
+    name: &str,
+    bundle: &ParsedTransactionBundle,
+) -> LegacyCanonicalParserProjectionV1 {
+    let (mut initialize_pool, mut trades) = normalized_parity_events(bundle);
+    if let Some(pool) = initialize_pool.as_mut() {
+        // These fields did not exist in the PR1C parent schema.  `None` skips
+        // their serde output and restores the exact V1 field order/shape.
+        pool.event_ordinal = None;
+        pool.tx_index = None;
+        pool.provenance = None;
+    }
+    for trade in &mut trades {
+        if let Some(provenance) = trade.provenance.as_mut() {
+            // `inner_instruction_path` is the PR1D addition to the existing
+            // nested provenance object and is serde-skipped when absent.
+            provenance.inner_instruction_path = None;
+        }
+    }
+
+    LegacyCanonicalParserProjectionV1 {
         schema: "canonical_parser_parity_snapshot_v1",
         fixture: name.to_string(),
         initialize_pool,
@@ -299,7 +332,50 @@ fn canonical_parser_parity_snapshot(
     }
 }
 
-fn canonical_parity_digest(snapshots: &[CanonicalParserParitySnapshotV1]) -> String {
+#[derive(Clone, Debug, Serialize)]
+struct FullPr1dParserSnapshotV2 {
+    schema: &'static str,
+    fixture: String,
+    initialize_pool: Option<InitializePoolEvent>,
+    initialize_pool_observation: Option<ObservedPumpMutationV1>,
+    trades: Vec<TradeEvent>,
+    trade_observations: Vec<Option<ObservedPumpMutationV1>>,
+}
+
+fn normalize_observation_provenance_time(observation: &mut ObservedPumpMutationV1) {
+    // This timestamp is explicitly diagnostic-only and must not enter a
+    // deterministic parser parity digest.
+    observation.provenance.received_at_monotonic_ns = 0;
+}
+
+/// Full PR1D snapshot.  Unlike the legacy projection this retains the exact
+/// raw observation evidence used for locator, order, provider provenance, and
+/// transaction-inventory contracts.
+fn full_pr1d_parser_snapshot_v2(
+    name: &str,
+    bundle: &ParsedTransactionBundle,
+) -> FullPr1dParserSnapshotV2 {
+    let (initialize_pool, trades) = normalized_parity_events(bundle);
+    let mut initialize_pool_observation = bundle.initialize_pool_observation.clone();
+    if let Some(observation) = initialize_pool_observation.as_mut() {
+        normalize_observation_provenance_time(observation);
+    }
+    let mut trade_observations = bundle.trade_observations.clone();
+    for observation in trade_observations.iter_mut().flatten() {
+        normalize_observation_provenance_time(observation);
+    }
+
+    FullPr1dParserSnapshotV2 {
+        schema: "canonical_parser_full_pr1d_snapshot_v2",
+        fixture: name.to_string(),
+        initialize_pool,
+        initialize_pool_observation,
+        trades,
+        trade_observations,
+    }
+}
+
+fn canonical_parity_digest<T: Serialize>(snapshots: &[T]) -> String {
     blake3::hash(
         serde_json::to_vec(snapshots)
             .expect("canonical parser parity snapshot JSON")
@@ -332,6 +408,7 @@ fn queued_transaction_event(seed: u8, kind: FixtureKind) -> PumpEvent {
     PumpEvent::Transaction {
         provider_id: Some("pr1b-primary".to_string()),
         provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
+        received_at_monotonic_ns: crate::types::arrival_time_ns(),
         signature: deterministic_signature(seed).to_string(),
         slot: decoded.slot,
         received_at: Instant::now(),
@@ -492,7 +569,13 @@ fn saturation_measurement(account_event: GeyserEvent) -> Value {
     })
 }
 
+/// Mandatory isolated gate for the process-global hot-path counters.
+///
+/// This test intentionally stays out of the ordinary parallel `seer` suite:
+/// its exact counter contract must be run in a dedicated process with
+/// `--exact --ignored --nocapture --test-threads=1`.
 #[test]
+#[ignore = "mandatory isolated PR1B/PR1D global-counter contract"]
 fn pr1b_single_pass_live_transaction_contract() {
     hot_path_metrics::reset();
     let parser = BinaryParser::new(false);
@@ -507,7 +590,10 @@ fn pr1b_single_pass_live_transaction_contract() {
     assert_eq!(bundle.trades.len(), 1);
 
     let counts = hot_path_metrics::snapshot();
-    assert_eq!(counts.live_transaction_prost_encodes, 0);
+    // PR1D hashes the captured adapter payload representation for every raw
+    // Yellowstone observation. MPCF byte retention remains disabled here, but
+    // one prost encoding is therefore mandatory for provenance.
+    assert_eq!(counts.live_transaction_prost_encodes, 1);
     assert_eq!(counts.live_transaction_normalizer_decodes, 0);
     assert_eq!(counts.live_transaction_parser_decodes, 0);
     assert_eq!(counts.full_instruction_tree_scans, 1);
@@ -537,7 +623,7 @@ fn canonical_parity_snapshot_detects_economic_and_state_drift() {
     let bundle = parser
         .parse_transaction_bundle(&event)
         .expect("parity fixture bundle");
-    let baseline = canonical_parser_parity_snapshot("pump_buy", &bundle);
+    let baseline = legacy_canonical_parser_projection_v1("pump_buy", &bundle);
     let baseline_digest = canonical_parity_digest(std::slice::from_ref(&baseline));
 
     let mut economic_drift = baseline.clone();
@@ -554,6 +640,21 @@ fn canonical_parity_snapshot_detects_economic_and_state_drift() {
         baseline_digest,
         canonical_parity_digest(&[state_drift]),
         "reserve-state drift must change the canonical parity digest"
+    );
+
+    let full = full_pr1d_parser_snapshot_v2("pump_buy", &bundle);
+    let observation = full.trade_observations[0]
+        .as_ref()
+        .expect("full PR1D snapshot retains raw observation");
+    assert!(
+        observation.locator_hint.is_some()
+            && observation.canonical_order.is_some()
+            && observation.raw_transaction_mutation_count.is_some(),
+        "full PR1D snapshot retains locator, order, and inventory evidence"
+    );
+    assert_eq!(
+        observation.provenance.received_at_monotonic_ns, 0,
+        "diagnostic arrival time must not make the PR1D digest nondeterministic"
     );
 }
 
@@ -639,7 +740,8 @@ async fn pr1b_hot_path_harness() {
     ];
 
     let mut normalized = Vec::with_capacity(fixtures.len());
-    let mut business = Vec::with_capacity(fixtures.len());
+    let mut legacy_business = Vec::with_capacity(fixtures.len());
+    let mut full_pr1d_business = Vec::with_capacity(fixtures.len());
     for (name, kind, seed) in fixtures {
         let event = normalize_transaction(seed, kind);
         match &event {
@@ -667,17 +769,18 @@ async fn pr1b_hot_path_harness() {
         let bundle = parser
             .parse_transaction_bundle(&event)
             .expect("fixture bundle must parse");
-        business.push(canonical_parser_parity_snapshot(name, &bundle));
+        legacy_business.push(legacy_canonical_parser_projection_v1(name, &bundle));
+        full_pr1d_business.push(full_pr1d_parser_snapshot_v2(name, &bundle));
         normalized.push((kind, seed, event));
     }
 
-    assert_eq!(business[0].trades.len(), 1);
-    assert_eq!(business[1].trades.len(), 1);
-    assert!(business[2].initialize_pool.is_some());
-    assert_eq!(business[2].trades.len(), 1);
-    assert_eq!(business[3].trades.len(), 2);
-    assert_eq!(business[4].trades.len(), 1);
-    assert!(business[4].trades[0]
+    assert_eq!(legacy_business[0].trades.len(), 1);
+    assert_eq!(legacy_business[1].trades.len(), 1);
+    assert!(legacy_business[2].initialize_pool.is_some());
+    assert_eq!(legacy_business[2].trades.len(), 1);
+    assert_eq!(legacy_business[3].trades.len(), 2);
+    assert_eq!(legacy_business[4].trades.len(), 1);
+    assert!(legacy_business[4].trades[0]
         .provenance
         .as_ref()
         .is_some_and(|provenance| provenance.from_cpi));
@@ -784,12 +887,17 @@ async fn pr1b_hot_path_harness() {
     ipc_receiver.recv().await.expect("drain seeded IPC event");
     let ipc_counts = hot_path_metrics::snapshot();
 
-    let business_digest = canonical_parity_digest(&business);
+    let legacy_business_digest = canonical_parity_digest(&legacy_business);
     assert_eq!(
-        business_digest, BASELINE_CANONICAL_PARITY_DIGEST,
-        "PR1B must preserve the full frozen-corpus canonical parser snapshot"
+        legacy_business_digest, BASELINE_LEGACY_CANONICAL_PARITY_DIGEST_V1,
+        "PR1D legacy projection must preserve the frozen pre-PR1D parser snapshot"
     );
-    let fixture_summary = business
+    let full_pr1d_business_digest = canonical_parity_digest(&full_pr1d_business);
+    assert_eq!(
+        full_pr1d_business_digest, BASELINE_FULL_PR1D_PARSER_SNAPSHOT_DIGEST_V2,
+        "PR1D full snapshot must preserve locator/order/provenance/inventory evidence"
+    );
+    let fixture_summary = legacy_business
         .iter()
         .map(|snapshot| {
             json!({
@@ -801,7 +909,7 @@ async fn pr1b_hot_path_harness() {
         .collect::<Vec<_>>();
 
     let report = json!({
-        "schema": "ghost_pr1b_ingest_hot_path_harness_v1",
+        "schema": "ghost_pr1b_ingest_hot_path_harness_v2",
         "workload": {
             "iterations": HARNESS_ITERATIONS,
             "transaction_events": processed,
@@ -812,7 +920,9 @@ async fn pr1b_hot_path_harness() {
             "slow_ipc_consumer": true,
             "queue_saturation": true,
         },
-        "canonical_parser_parity_digest_blake3": business_digest,
+        "canonical_parser_parity_digest_blake3": legacy_business_digest,
+        "canonical_parser_legacy_v1_digest_blake3": legacy_business_digest,
+        "canonical_parser_full_pr1d_v2_digest_blake3": full_pr1d_business_digest,
         "throughput_events_per_second": throughput_events_per_second,
         "receive_to_normalize": latency_summary(&receive_to_normalize_ns),
         "normalize_to_parsed_bundle": latency_summary(&normalize_to_bundle_ns),

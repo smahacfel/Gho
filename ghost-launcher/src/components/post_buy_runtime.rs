@@ -6745,10 +6745,13 @@ sys.exit(0)
         envelope.produced_at_slot = Some(430_000_010);
         envelope.temporal_class = TemporalClass::PostEntry;
         envelope.clock_domain = ClockDomain::StreamObservedMs;
+        // Baseline fixture: keep the account owner/program reference stable
+        // and explicit instead of referring to an out-of-scope identifier.
+        let bonding_curve = Pubkey::new_unique();
         let state = CanonicalPoolState {
             pool_amm_id: Pubkey::new_unique(),
             base_mint: Pubkey::new_unique(),
-            bonding_curve: Pubkey::new_unique(),
+            bonding_curve,
             virtual_sol_reserves: 30_000_000_000,
             virtual_token_reserves: 1_000_000_000_000,
             real_sol_reserves: 7_000_000_000,

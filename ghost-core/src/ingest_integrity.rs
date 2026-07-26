@@ -112,6 +112,18 @@ pub enum ObservationSourceFamilyV1 {
     ParsedNln,
 }
 
+/// Semantic family of one Pump mutation.
+///
+/// This is deliberately coarser than a route variant.  It is used to keep a
+/// create/initialize mutation distinct from a trade even when both mutations
+/// are carried by the same transaction signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PumpMutationFamilyV1 {
+    InitializePool,
+    Trade,
+}
+
 /// Source-neutral identity of one Pump mutation inside a transaction.
 ///
 /// Provider identity, arrival time, slot, transaction index and semantic
@@ -182,6 +194,10 @@ pub struct PumpMutationClaimsV1 {
     pub side: Option<PumpTradeSideV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
+    /// Provider-reported typed error/reason identifier.  This is not a
+    /// transport error and is compared only when both observations report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_amount_units: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +208,11 @@ pub struct PumpMutationClaimsV1 {
     pub reported_wallet_delta_lamports: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_fee_breakdown: Option<Vec<ProgramFeeCharge>>,
+    /// Provider-reported transaction-local post-state digest, when the source
+    /// exposes one.  PR1D retains and compares this claim but does not promote
+    /// it into an economic anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_post_state_hash_blake3: Option<[u8; 32]>,
 }
 
 /// Provenance of one provider observation.
@@ -228,6 +249,133 @@ impl ObservationProvenanceV1 {
     ) -> [u8; 32] {
         *blake3::hash(captured_provider_payload).as_bytes()
     }
+}
+
+/// One normalized provider observation submitted to the Pump Observation
+/// Ledger.
+///
+/// `signature` is retained explicitly because a parsed witness can lack a
+/// complete structural locator.  It is a correlation scope, never a dedupe
+/// key.  `raw_transaction_mutation_count` is meaningful only for raw
+/// Yellowstone observations and enables the bounded singleton rule.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedPumpMutationV1 {
+    pub mutation_family: PumpMutationFamilyV1,
+    pub signature: Signature,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator_hint: Option<RawPumpMutationLocatorV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_order: Option<CanonicalPumpOrderKeyV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_transaction_mutation_count: Option<u32>,
+    #[serde(default)]
+    pub claims: PumpMutationClaimsV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_provider_role: Option<RawProviderRoleV1>,
+    pub provenance: ObservationProvenanceV1,
+}
+
+/// Economic status attached to a structural canonical mutation.
+///
+/// PR1D intentionally creates only `PendingAnchor`.  The remaining economic
+/// certification states belong to the later account/quote anchoring work and
+/// are not inferred from parsed NLN claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PumpEconomicCertificationStatusV1 {
+    PendingAnchor,
+}
+
+/// One structural canonical Pump mutation.
+///
+/// Only a complete primary raw Yellowstone observation can construct this
+/// value through `PumpObservationLedgerV1`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuralCanonicalPumpMutationV1 {
+    pub mutation_family: PumpMutationFamilyV1,
+    pub locator: RawPumpMutationLocatorV1,
+    pub order: CanonicalPumpOrderKeyV1,
+    pub claims: PumpMutationClaimsV1,
+    pub primary_raw_provenance: ObservationProvenanceV1,
+    pub economics_status: PumpEconomicCertificationStatusV1,
+}
+
+/// Final correlation result for a parsed NLN witness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParsedWitnessCorrelationOutcomeV1 {
+    ExactStructuralMatch,
+    UniqueSignatureSingletonMatch,
+    Unmatchable,
+    Ambiguous,
+}
+
+/// Material fields compared after structural correlation.
+///
+/// Unknown (`None`) never conflicts with a concrete value.  These identifiers
+/// are evidence labels only and never become Gatekeeper reason codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PumpMutationConflictFieldV1 {
+    MutationFamily,
+    CanonicalOrder,
+    Curve,
+    Mint,
+    RouteVariant,
+    Side,
+    Success,
+    ErrorCode,
+    TokenAmountUnits,
+    InstructionLimit,
+    ReportedCurveQuoteLamports,
+    ReportedWalletDeltaLamports,
+    ReportedFeeBreakdown,
+    ReportedPostStateHashBlake3,
+}
+
+/// Agreement state between primary raw authority and a correlated witness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PumpProviderAgreementV1 {
+    NotObserved,
+    WitnessOnly,
+    PrimarySecondaryAgreement,
+    PrimarySecondaryConflict,
+}
+
+/// Canonical candidate identity derived only from primary raw claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PumpCandidateIdentityV1 {
+    pub pool_amm_id: Pubkey,
+    pub mint: Pubkey,
+}
+
+/// Technical integrity state carried ahead of MFS and Gatekeeper.
+///
+/// This is deliberately not a strategic verdict taxonomy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateIntegrityOutcomeV1 {
+    Ready,
+    PrimaryRawCoverageIncomplete,
+    AccountProviderConflict,
+    SourceReconciliationConflict,
+    AnchorMissing,
+    EconomicsNonEvaluable,
+}
+
+/// Immutable technical-integrity signal emitted by ingest/account boundaries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateIntegritySignalV1 {
+    pub candidate: PumpCandidateIdentityV1,
+    pub outcome: CandidateIntegrityOutcomeV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<RawPumpMutationLocatorV1>,
+    #[serde(default)]
+    pub conflict_fields: Vec<PumpMutationConflictFieldV1>,
+    pub evidence_hash_blake3: [u8; 32],
 }
 
 #[cfg(test)]
@@ -294,6 +442,7 @@ mod tests {
             reported_curve_quote_lamports: Some(150),
             reported_wallet_delta_lamports: Some(175),
             reported_fee_breakdown: None,
+            ..PumpMutationClaimsV1::default()
         };
         let payload_b = PumpMutationClaimsV1 {
             curve: Some(Pubkey::new_unique()),
@@ -397,6 +546,7 @@ mod tests {
             reported_curve_quote_lamports: Some(98),
             reported_wallet_delta_lamports: Some(100),
             reported_fee_breakdown: Some(Vec::new()),
+            ..PumpMutationClaimsV1::default()
         };
 
         let json = serde_json::to_value(&claims).expect("serialize complete claims");

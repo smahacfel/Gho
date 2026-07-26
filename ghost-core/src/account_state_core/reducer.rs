@@ -127,6 +127,50 @@ impl AccountStateReducer {
         }
     }
 
+    /// Retain and classify a raw provider observation after the candidate has
+    /// reached a terminal runtime state, without mutating canonical reserves.
+    ///
+    /// The arbiter watermark/evidence is intentionally preserved so a late
+    /// primary/secondary agreement or conflict can still produce an immutable
+    /// CandidateIntegrity audit marker. `AccountStateCore`, velocity counters,
+    /// bootstrap state and reconciliation inputs are never changed here.
+    #[must_use]
+    pub fn observe_account_evidence_only(
+        &self,
+        update: AccountStateUpdate,
+    ) -> AccountObservationDecisionV1 {
+        let arbiter = self
+            .account_observation_arbiters
+            .entry(update.base_mint)
+            .or_insert_with(|| Arc::new(Mutex::new(AccountObservationArbiter::default())))
+            .clone();
+        let mut arbiter = match arbiter.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let decision = AccountObservationDecisionV1 {
+                    classification: AccountObservationClassificationV1::ArbiterStateUnavailable,
+                    outcome: AccountObservationOutcomeV1::RejectedInvalidObservation,
+                    canonical_apply: false,
+                    provider_agreement: AccountProviderAgreementV1::NotObserved,
+                    mutation_version: Some(AccountMutationVersionV1 {
+                        pubkey: update.source_account_pubkey.unwrap_or(update.bonding_curve),
+                        slot: update.slot,
+                        write_version: update.write_version,
+                    }),
+                    data_hash_blake3: None,
+                };
+                self.record_account_observation_decision_metric(&decision);
+                return decision;
+            }
+        };
+        let mut decision = arbiter.arbitrate(&update);
+        // The arbiter may advance its bounded evidence watermark, but this
+        // terminal-audit API never grants reducer mutation authority.
+        decision.canonical_apply = false;
+        self.record_account_observation_decision_metric(&decision);
+        decision
+    }
+
     fn apply_canonical_account_mutation(&self, update: AccountStateUpdate) -> AccountUpdateResult {
         let bootstrap = self
             .bootstrap_states
@@ -470,7 +514,9 @@ impl AccountStateReducer {
     pub fn remove_pool(&self, mint: &Pubkey) {
         self.states.remove(mint);
         self.bootstrap_states.remove(mint);
-        self.account_observation_arbiters.remove(mint);
+        // Preserve the bounded in-process arbiter after terminal cleanup.
+        // Late provider agreement/conflict must remain auditable even though
+        // canonical runtime state and the observation session are gone.
     }
 
     #[must_use]

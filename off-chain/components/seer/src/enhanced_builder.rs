@@ -159,6 +159,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(12345),
             tx_index: None,
             event_ts_ms: None,

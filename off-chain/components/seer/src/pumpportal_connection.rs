@@ -893,6 +893,9 @@ impl PumpPortalConnection {
             provider_id: None,
             provider_role: None,
             slot: None,
+            event_ordinal: None,
+            tx_index: None,
+            provenance: None,
             event_ts_ms: Some(timestamp_ms as u64),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature,
@@ -1186,6 +1189,7 @@ impl PumpPortalConnection {
         GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: event.slot,
             tx_index: None,
             event_ts_ms: crate::types::event_ts_from_block_time(event.block_time),
@@ -1252,6 +1256,7 @@ impl PumpPortalConnection {
         GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: event.slot,
             tx_index: None,
             event_ts_ms: Some(event.timestamp_ms),

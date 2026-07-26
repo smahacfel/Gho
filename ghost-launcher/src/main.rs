@@ -2799,6 +2799,7 @@ async fn run_launcher() -> Result<()> {
         let seer_wal = shared_wal.clone();
         let seer_health = Arc::clone(&health);
         let seer_authoritative_funding_stream_tx = authoritative_funding_stream_tx.clone();
+        let seer_candidate_integrity_registry = oracle_runtime.candidate_integrity_registry();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = ghost_launcher::components::seer::run(
@@ -2812,6 +2813,7 @@ async fn run_launcher() -> Result<()> {
                 Some(seer_health),
                 seer_authoritative_funding_stream_tx,
                 canonical_account_update_relay_enabled,
+                seer_candidate_integrity_registry,
             )
             .await
             {

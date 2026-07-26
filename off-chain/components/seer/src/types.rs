@@ -3,7 +3,8 @@
 //! This module defines the data structures used for event processing and candidate creation.
 
 use ghost_core::{
-    CurveFinality, EventSemanticEnvelope, EventTimeMetadata, RawProviderRoleV1, SourceKind,
+    CurveFinality, EventSemanticEnvelope, EventTimeMetadata, ObservationProvenanceV1,
+    RawProviderRoleV1, SourceKind,
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,11 @@ static ARRIVAL_START: Lazy<Instant> = Lazy::new(Instant::now);
 /// Monotonic arrival timestamp (ms) from process start.
 pub fn arrival_time_ms() -> u64 {
     ARRIVAL_START.elapsed().as_millis() as u64
+}
+
+/// Monotonic arrival timestamp (ns) from process start.
+pub fn arrival_time_ns() -> u64 {
+    ARRIVAL_START.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
 /// Epoch timestamp in milliseconds captured at event ingress.
@@ -182,6 +188,12 @@ pub enum GeyserEvent {
         /// Configured role of the raw provider. This is metadata-only in PR 1A.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_role: Option<RawProviderRoleV1>,
+        /// Captured-provider payload provenance used by the PR1D observation
+        /// boundary. For Yellowstone this hashes the prost encoding of the
+        /// already-decoded `SubscribeUpdateTransaction`, not an original gRPC
+        /// wire frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observation_provenance: Option<ObservationProvenanceV1>,
         /// Slot number when transaction was processed (if known)
         slot: Option<u64>,
         /// Authoritative transaction index within the slot from the source stream.
@@ -362,6 +374,13 @@ pub struct InstructionProvenance {
     /// CPI stack height when provided by the source adapter.
     #[serde(default)]
     pub stack_height: Option<u32>,
+    /// Structural path inside the owning outer instruction's CPI execution
+    /// tree. Top-level instructions use `Some(vec![])`. Inner instructions use
+    /// sibling ordinals derived deterministically from the chain-provided
+    /// stack-height sequence. Missing or invalid stack-height structure
+    /// remains `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_instruction_path: Option<Vec<u16>>,
     /// Backward-compatible mirror of the legacy `from_cpi` flag.
     pub from_cpi: bool,
 }
@@ -490,6 +509,19 @@ pub struct InitializePoolEvent {
 
     /// Slot when the pool was initialized (if known)
     pub slot: Option<u64>,
+
+    /// Stable semantic ordinal within the source transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_ordinal: Option<u32>,
+
+    /// Canonical Yellowstone transaction index within the slot. `Some(0)` is
+    /// valid and must not be treated as missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u32>,
+
+    /// Execution-tree location of the initialize mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<InstructionProvenance>,
 
     /// Effective event timestamp in milliseconds, derived via provenance helpers.
     pub event_ts_ms: Option<u64>,
@@ -956,7 +988,7 @@ impl From<InitializePoolEvent> for CandidatePool {
             provider_id: event.provider_id,
             provider_role: event.provider_role,
             slot: event.slot,
-            tx_index: None,
+            tx_index: event.tx_index,
             event_ts_ms: event
                 .event_ts_ms
                 .or_else(|| event_ts_from_block_time(event.block_time)),
@@ -1058,6 +1090,7 @@ mod tests {
         GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms,

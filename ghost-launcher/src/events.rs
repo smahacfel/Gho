@@ -1347,6 +1347,10 @@ impl LegacyPathDescriptor {
 /// All inter-component communication flows through these events.
 #[derive(Debug, Clone)]
 pub enum GhostEvent {
+    /// Technical candidate-integrity state produced at ingest/account
+    /// boundaries. This is not a Gatekeeper verdict or a strategy event.
+    CandidateIntegrity(Arc<ghost_core::CandidateIntegritySignalV1>),
+
     /// A new pool was detected by Seer
     /// Uses Arc for zero-copy sharing across subscribers
     NewPoolDetected(Arc<DetectedPool>),
@@ -1477,6 +1481,11 @@ impl GhostEvent {
     /// Create a NewPoolDetected event from pool data
     pub fn new_pool_detected(pool: DetectedPool) -> Self {
         GhostEvent::NewPoolDetected(Arc::new(pool))
+    }
+
+    /// Create a technical candidate-integrity event.
+    pub fn candidate_integrity(signal: ghost_core::CandidateIntegritySignalV1) -> Self {
+        GhostEvent::CandidateIntegrity(Arc::new(signal))
     }
 
     /// Create a PoolTransaction event
@@ -1656,6 +1665,7 @@ impl GhostEvent {
     /// Get the event type as a string (for logging/metrics)
     pub fn event_type(&self) -> &'static str {
         match self {
+            GhostEvent::CandidateIntegrity(_) => "candidate_integrity",
             GhostEvent::NewPoolDetected(_) => "new_pool_detected",
             GhostEvent::PoolTransaction(_) => "pool_transaction",
             GhostEvent::FundingTransferObserved(_) => "funding_transfer_observed",

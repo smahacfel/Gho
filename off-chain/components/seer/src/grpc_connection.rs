@@ -33,7 +33,7 @@
 /// thiserror                = "1"
 /// tracing                  = "0.1"
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{hash_map::DefaultHasher, BTreeSet, HashMap, HashSet},
     future::Future,
     hash::{Hash, Hasher},
     str::FromStr,
@@ -80,6 +80,8 @@ pub const GRPC_GLOBAL_STREAM_SOURCE_LABEL: &str = "grpc_global_stream";
 pub const GRPC_FUNDING_LANE_PUMP_FILTERED_SOURCE_LABEL: &str = "grpc_funding_lane_pump_filtered";
 pub const GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL: &str = "grpc_funding_lane_full_chain";
 const DEFAULT_GRPC_AUTH_HEADER: &str = "x-token";
+const YELLOWSTONE_TRANSACTION_PAYLOAD_SCHEMA_ID: &str =
+    "yellowstone_subscribe_update_transaction.prost.v1";
 
 /// Bonding-curve account discriminator — used in memcmp filter so we receive
 /// account updates only for actual BondingCurve accounts, not every account
@@ -152,6 +154,8 @@ pub enum PumpEvent {
     Transaction {
         provider_id: Option<String>,
         provider_role: Option<ghost_core::RawProviderRoleV1>,
+        /// Monotonic timestamp captured at the adapter receive boundary.
+        received_at_monotonic_ns: u64,
         signature: String,
         slot: u64,
         received_at: Instant,
@@ -3122,6 +3126,7 @@ fn route_update(
     latest_block_time_secs: &Arc<AtomicI64>,
     registry: &AccountRegistry,
 ) {
+    let received_at_monotonic_ns = crate::types::arrival_time_ns();
     let received_at = Instant::now();
 
     match msg.update_oneof {
@@ -3156,6 +3161,7 @@ fn route_update(
                 PumpEvent::Transaction {
                     provider_id: Some(provider_id.to_string()),
                     provider_role: Some(provider_role),
+                    received_at_monotonic_ns,
                     signature: sig,
                     slot,
                     received_at,
@@ -3854,7 +3860,6 @@ impl GrpcConnection {
             self.gap_rx.lock().take().ok_or_else(|| {
                 SeerError::GrpcError("connect_geyser already called (gap_rx)".into())
             })?;
-        let dedup_dropped = Arc::clone(&self.dedup_dropped);
         let shutdown = Arc::clone(&self.shutdown);
         let shutdown_token = Arc::clone(&self.shutdown_token);
 
@@ -3948,9 +3953,6 @@ impl GrpcConnection {
         // Build an async stream that drains the DualLaneReceiver and converts
         // PumpEvent → GeyserEvent.  Priority: fast lane first, then overflow.
         let stream = async_stream::stream! {
-            const SIG_DEDUP_CAP: usize = 100_000;
-            let mut seen_sigs: HashSet<String> = HashSet::with_capacity(2048);
-            let mut sig_order: VecDeque<String> = VecDeque::with_capacity(2048);
             loop {
                 if shutdown.load(Ordering::Relaxed) {
                     rx.local_gap.close_open_without_after();
@@ -3978,33 +3980,6 @@ impl GrpcConnection {
                     }
                     DrainPick::Disconnected => break,
                 };
-
-                // Unified dedupe for live + backfill transactions by signature.
-                // Prevents duplicate replay when gap recovery overlaps live stream.
-                let maybe_sig = match &ev {
-                    PumpEvent::Transaction { signature, .. }
-                    | PumpEvent::BackfillTransaction { signature, .. } => Some(signature.as_str()),
-                    _ => None,
-                };
-                if let Some(sig) = maybe_sig {
-                    if !sig.is_empty() {
-                        if seen_sigs.contains(sig) {
-                            dedup_dropped.fetch_add(1, Ordering::Relaxed);
-                            ::metrics::increment_counter!("seer_tx_dedup_dropped_total");
-                            continue;
-                        }
-
-                        let sig_owned = sig.to_string();
-                        seen_sigs.insert(sig_owned.clone());
-                        sig_order.push_back(sig_owned);
-
-                        if sig_order.len() > SIG_DEDUP_CAP {
-                            if let Some(old) = sig_order.pop_front() {
-                                seen_sigs.remove(&old);
-                            }
-                        }
-                    }
-                }
 
                 let ingestion_latency_ms = ev.received_at().elapsed().as_secs_f64() * 1000.0;
                 // Use ingress_ts_ms (wall clock at gRPC decode time) as event_ts.
@@ -4404,6 +4379,7 @@ async fn fetch_gap_backfill_events(
         out.push(GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: crate::types::normalize_slot(Some(slot)),
             tx_index: None,
             event_ts_ms: crate::types::event_ts_from_block_time(tx.block_time),
@@ -4451,16 +4427,29 @@ pub(crate) fn pump_event_to_geyser_event(
         PumpEvent::Transaction {
             provider_id,
             provider_role,
+            received_at_monotonic_ns,
             signature,
             slot,
             received_at: _,
             decoded,
             capture_payload,
         } => {
+            // PR1D requires a stable captured-payload digest for every accepted
+            // Yellowstone transaction. The adapter hands normalization a decoded
+            // child, so the captured representation is its prost encoding rather
+            // than the original gRPC wire frame. WAL/MPCF capture remains opt-in:
+            // only the digest is unconditional.
+            #[cfg(test)]
+            crate::hot_path_metrics::record_live_transaction_prost_encode();
+            let normalized_payload = encode_proto(decoded.as_ref());
+            let observation_provenance = yellowstone_transaction_observation_provenance(
+                provider_id.as_deref(),
+                live_source_label,
+                &normalized_payload,
+                received_at_monotonic_ns,
+            );
             let captured_payload = if capture_payload {
-                #[cfg(test)]
-                crate::hot_path_metrics::record_live_transaction_prost_encode();
-                encode_proto(decoded.as_ref())
+                normalized_payload
             } else {
                 Vec::new()
             };
@@ -4473,6 +4462,7 @@ pub(crate) fn pump_event_to_geyser_event(
                 block_time,
                 provider_id,
                 provider_role,
+                observation_provenance,
             ))
         }
         PumpEvent::BackfillTransaction {
@@ -4551,6 +4541,12 @@ fn decode_tx_to_geyser_event(
         crate::hot_path_metrics::record_live_transaction_normalizer_decode();
         let update = <SubscribeUpdateTransaction as prost::Message>::decode(raw.as_slice())
             .map_err(|e| SeerError::ParseError(format!("proto decode Tx: {e}")))?;
+        let observation_provenance = yellowstone_transaction_observation_provenance(
+            provider_id.as_deref(),
+            source,
+            &raw,
+            crate::types::arrival_time_ns(),
+        );
         tx_update_to_geyser_event(
             update,
             sig_str,
@@ -4560,6 +4556,7 @@ fn decode_tx_to_geyser_event(
             block_time,
             provider_id,
             provider_role,
+            observation_provenance,
         )
     })();
     record_parser_malformed_tx_sample(result.is_err());
@@ -4575,6 +4572,7 @@ fn tx_update_to_geyser_event(
     block_time: Option<i64>,
     provider_id: Option<String>,
     provider_role: Option<ghost_core::RawProviderRoleV1>,
+    observation_provenance: Option<ghost_core::ObservationProvenanceV1>,
 ) -> SeerResult<GeyserEvent> {
     let arrival_ts_ms = crate::types::arrival_time_ms();
     let ingress_ts_ms = crate::types::ingress_epoch_ms();
@@ -4725,6 +4723,7 @@ fn tx_update_to_geyser_event(
     Ok(GeyserEvent::Transaction {
         provider_id,
         provider_role,
+        observation_provenance,
         slot: Some(slot),
         tx_index: Some(tx_index),
         event_ts_ms: Some(compat_tx_event_ts_ms(block_time, ingress_ts_ms)),
@@ -4752,6 +4751,28 @@ fn tx_update_to_geyser_event(
         inner_instructions,
         pre_token_balances,
         post_token_balances,
+    })
+}
+
+fn yellowstone_transaction_observation_provenance(
+    provider_id: Option<&str>,
+    source_id: &str,
+    captured_payload: &[u8],
+    received_at_monotonic_ns: u64,
+) -> Option<ghost_core::ObservationProvenanceV1> {
+    let provider_id = provider_id
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())?;
+    Some(ghost_core::ObservationProvenanceV1 {
+        source_family: ghost_core::ObservationSourceFamilyV1::RawYellowstone,
+        source_id: source_id.to_string(),
+        provider_id: provider_id.to_string(),
+        schema_id: YELLOWSTONE_TRANSACTION_PAYLOAD_SCHEMA_ID.to_string(),
+        payload_hash_blake3:
+            ghost_core::ObservationProvenanceV1::payload_hash_for_captured_provider_payload(
+                captured_payload,
+            ),
+        received_at_monotonic_ns,
     })
 }
 
@@ -6468,6 +6489,7 @@ mod tests {
         GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(slot),
             tx_index: None,
             event_ts_ms: Some(slot * 1000),
@@ -6622,6 +6644,7 @@ mod tests {
             PumpEvent::Transaction {
                 provider_id: None,
                 provider_role: None,
+                received_at_monotonic_ns: crate::types::arrival_time_ns(),
                 signature: signature.to_string(),
                 slot: 321,
                 received_at: Instant::now(),
@@ -6669,11 +6692,13 @@ mod tests {
         let provider_id = "raw-primary".to_string();
         let provider_role = ghost_core::RawProviderRoleV1::PrimaryAuthority;
         let raw = make_raw_pump_buy_tx(signature, 321);
+        let expected_payload_hash = *blake3::hash(&raw).as_bytes();
 
         let geyser_event = pump_event_to_geyser_event(
             PumpEvent::Transaction {
                 provider_id: Some(provider_id.clone()),
                 provider_role: Some(provider_role),
+                received_at_monotonic_ns: crate::types::arrival_time_ns(),
                 signature: signature.to_string(),
                 slot: 321,
                 received_at: Instant::now(),
@@ -6691,27 +6716,76 @@ mod tests {
                 provider_id: observed_provider_id,
                 provider_role: observed_provider_role,
                 tx_index,
+                observation_provenance,
                 ..
             } => {
                 assert_eq!(observed_provider_id.as_deref(), Some(provider_id.as_str()));
                 assert_eq!(*observed_provider_role, Some(provider_role));
                 assert_eq!(*tx_index, Some(0), "first transaction index is valid");
+                let provenance = observation_provenance
+                    .as_ref()
+                    .expect("raw Yellowstone observation provenance");
+                assert_eq!(
+                    provenance.source_family,
+                    ghost_core::ObservationSourceFamilyV1::RawYellowstone
+                );
+                assert_eq!(provenance.source_id, GRPC_GLOBAL_STREAM_SOURCE_LABEL);
+                assert_eq!(provenance.provider_id, provider_id);
+                assert_eq!(
+                    provenance.schema_id,
+                    YELLOWSTONE_TRANSACTION_PAYLOAD_SCHEMA_ID
+                );
+                assert_eq!(provenance.payload_hash_blake3, expected_payload_hash);
             }
             other => panic!("expected normalized transaction, got {other:?}"),
         }
 
         let parser = BinaryParser::new(false);
-        let mut trades = parser
-            .parse_trades(&geyser_event)
-            .expect("raw Pump buy must parse as a trade");
-        assert_eq!(trades.len(), 1, "fixture contains exactly one Pump buy");
-        let trade = trades.remove(0);
+        let bundle = parser
+            .parse_transaction_bundle(&geyser_event)
+            .expect("raw Pump buy bundle");
+        assert_eq!(
+            bundle.trades.len(),
+            1,
+            "fixture contains exactly one Pump buy"
+        );
+        assert_eq!(bundle.trade_observations.len(), bundle.trades.len());
+        let trade = bundle.trades.into_iter().next().expect("trade");
+        let observation = bundle
+            .trade_observations
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("aligned raw trade observation");
         assert_eq!(trade.provider_id.as_deref(), Some(provider_id.as_str()));
         assert_eq!(trade.provider_role, Some(provider_role));
+        assert_eq!(observation.signature, signature);
+        assert_eq!(observation.raw_provider_role, Some(provider_role));
+        assert_eq!(observation.raw_transaction_mutation_count, Some(1));
+        assert_eq!(observation.provenance.provider_id, provider_id);
+        assert_eq!(
+            observation.provenance.payload_hash_blake3,
+            expected_payload_hash
+        );
+        let locator = observation
+            .locator_hint
+            .as_ref()
+            .expect("raw structural locator");
+        let order = observation
+            .canonical_order
+            .as_ref()
+            .expect("raw canonical order");
+        assert_eq!(locator.signature, signature);
+        assert_eq!(locator.outer_instruction_index, 0);
+        assert!(locator.inner_instruction_path.is_empty());
+        assert_eq!(order.slot, 321);
+        assert_eq!(order.tx_index, 0);
+        assert_eq!(order.outer_instruction_index, 0);
+        assert!(order.inner_instruction_path.is_empty());
 
         let (sender, mut receiver, _) = create_ipc_channel(IpcChannelConfig::default());
         sender
-            .send_trade(trade, EventPriority::Normal)
+            .send_trade_with_observation(trade, Some(observation.clone()), EventPriority::Normal)
             .await
             .expect("trade provenance must cross the Seer IPC boundary");
         match receiver.recv().await.expect("IPC trade event") {
@@ -6721,6 +6795,7 @@ mod tests {
                     Some(provider_id.as_str())
                 );
                 assert_eq!(observed.trade.provider_role, Some(provider_role));
+                assert_eq!(observed.observation, Some(observation));
             }
             other => panic!("expected IPC trade, got {other:?}"),
         }
@@ -6782,6 +6857,7 @@ mod tests {
             PumpEvent::Transaction {
                 provider_id: None,
                 provider_role: None,
+                received_at_monotonic_ns: crate::types::arrival_time_ns(),
                 signature: signature.to_string(),
                 slot: 654,
                 received_at: Instant::now(),
@@ -6824,7 +6900,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_geyser_dedups_live_and_backfill_by_signature() {
+    async fn connect_geyser_preserves_live_and_backfill_observations_with_same_signature() {
         let conn = GrpcConnection::new(
             "http://127.0.0.1:10000".to_string(),
             None,
@@ -6844,6 +6920,7 @@ mod tests {
             PumpEvent::Transaction {
                 provider_id: None,
                 provider_role: None,
+                received_at_monotonic_ns: crate::types::arrival_time_ns(),
                 signature: signature_str.clone(),
                 slot: 321,
                 received_at: Instant::now(),
@@ -6878,17 +6955,21 @@ mod tests {
             other => panic!("expected tx event, got {:?}", other),
         }
 
-        let second = tokio::time::timeout(Duration::from_millis(100), stream.next()).await;
-        assert!(
-            second.is_err(),
-            "duplicate live/backfill tx with same signature should be suppressed"
-        );
-        assert_eq!(conn.dedup_dropped_total(), 1);
+        let second = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("second event timeout")
+            .expect("stream ended")
+            .expect("stream error");
+        assert!(matches!(
+            second,
+            GeyserEvent::Transaction { signature: observed, .. } if observed == signature
+        ));
+        assert_eq!(conn.dedup_dropped_total(), 0);
         conn.request_shutdown();
     }
 
     #[tokio::test]
-    async fn manual_backfill_worker_dedups_overlap_with_live_stream() {
+    async fn manual_backfill_worker_preserves_overlap_for_ledger_classification() {
         let conn = GrpcConnection::new(
             "http://127.0.0.1:10000".to_string(),
             None,
@@ -6912,6 +6993,7 @@ mod tests {
             PumpEvent::Transaction {
                 provider_id: None,
                 provider_role: None,
+                received_at_monotonic_ns: crate::types::arrival_time_ns(),
                 signature: signature_str.clone(),
                 slot: 500,
                 received_at: Instant::now(),
@@ -6976,12 +7058,16 @@ mod tests {
             other => panic!("expected live transaction first, got {:?}", other),
         }
 
-        let second = tokio::time::timeout(Duration::from_millis(100), stream.next()).await;
-        assert!(
-            second.is_err(),
-            "live transaction and overlapping backfill should collapse to one emitted tx"
-        );
-        assert_eq!(conn.dedup_dropped_total(), 1);
+        let second = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("backfill event timeout")
+            .expect("stream ended")
+            .expect("stream error");
+        assert!(matches!(
+            second,
+            GeyserEvent::Transaction { signature: observed, .. } if observed == signature
+        ));
+        assert_eq!(conn.dedup_dropped_total(), 0);
 
         worker.await.expect("worker join");
     }
