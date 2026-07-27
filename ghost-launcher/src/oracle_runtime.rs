@@ -108,7 +108,7 @@ use ghost_brain::oracle::window_spec::{ensure_epoch_ms, WindowCloseReason, Windo
 use ghost_core::account_state_core::observation_arbiter::AccountObservationClassificationV1;
 use ghost_core::account_state_core::reducer::AccountStateReducer;
 use ghost_core::account_state_core::types::{
-    AccountStateUpdate, BootstrapHints, CanonicalPoolState, UpdateSource,
+    AccountStateUpdate, AccountUpdateResult, BootstrapHints, CanonicalPoolState, UpdateSource,
 };
 use ghost_core::checkpoint::MaterializedFeatureSet;
 use ghost_core::features::coordination::{
@@ -2142,6 +2142,8 @@ struct TerminalPoolIdentityTombstones {
     pool_by_bonding_curve: HashMap<Pubkey, Pubkey>,
     fifo: VecDeque<Pubkey>,
     cap: usize,
+    eviction_count: u64,
+    first_evicted_identity: Option<DomainPoolIdentity>,
 }
 
 impl TerminalPoolIdentityTombstones {
@@ -2152,10 +2154,12 @@ impl TerminalPoolIdentityTombstones {
             pool_by_bonding_curve: HashMap::with_capacity(cap.min(4096)),
             fifo: VecDeque::with_capacity(cap.min(4096)),
             cap: cap.max(1),
+            eviction_count: 0,
+            first_evicted_identity: None,
         }
     }
 
-    fn insert(&mut self, identity: DomainPoolIdentity) {
+    fn insert(&mut self, identity: DomainPoolIdentity) -> Option<DomainPoolIdentity> {
         let pool_id: Pubkey = identity.pool_id.into();
         let base_mint: Pubkey = identity.base_mint.into();
         let bonding_curve: Pubkey = identity.bonding_curve.into();
@@ -2164,9 +2168,10 @@ impl TerminalPoolIdentityTombstones {
             self.by_pool.insert(pool_id, identity);
             self.pool_by_base_mint.insert(base_mint, pool_id);
             self.pool_by_bonding_curve.insert(bonding_curve, pool_id);
-            return;
+            return None;
         }
 
+        let mut evicted_identity = None;
         while self.by_pool.len() >= self.cap {
             let Some(evicted_pool) = self.fifo.pop_front() else {
                 break;
@@ -2180,7 +2185,12 @@ impl TerminalPoolIdentityTombstones {
                 if self.pool_by_bonding_curve.get(&evicted_bonding_curve) == Some(&evicted_pool) {
                     self.pool_by_bonding_curve.remove(&evicted_bonding_curve);
                 }
+                self.eviction_count = self.eviction_count.saturating_add(1);
+                if self.first_evicted_identity.is_none() {
+                    self.first_evicted_identity = Some(evicted);
+                }
                 ::metrics::counter!("terminal_pool_identity_tombstone_evicted_total", 1u64);
+                evicted_identity = Some(evicted);
                 break;
             }
         }
@@ -2189,6 +2199,7 @@ impl TerminalPoolIdentityTombstones {
         self.pool_by_base_mint.insert(base_mint, pool_id);
         self.pool_by_bonding_curve.insert(bonding_curve, pool_id);
         self.fifo.push_back(pool_id);
+        evicted_identity
     }
 
     fn get(
@@ -2208,6 +2219,30 @@ impl TerminalPoolIdentityTombstones {
                         .copied()
                 })
             })
+    }
+
+    #[cfg(test)]
+    fn retained_count(&self) -> usize {
+        self.by_pool.len()
+    }
+}
+
+fn retain_terminal_account_evidence(
+    terminal_pool_identities: &RwLock<TerminalPoolIdentityTombstones>,
+    account_state_core: &AccountStateReducer,
+    identity: DomainPoolIdentity,
+) {
+    let base_mint: Pubkey = identity.base_mint.into();
+    account_state_core.remove_pool_retaining_account_observation_arbiter(&base_mint);
+
+    // The tombstone and its evidence-only account arbiter share one bounded
+    // retention owner. Holding the tombstone write lock until the evicted
+    // arbiter is removed prevents a late observation from resolving an
+    // identity whose corresponding evidence lane has already been released.
+    let mut tombstones = terminal_pool_identities.write();
+    if let Some(evicted) = tombstones.insert(identity) {
+        let evicted_base_mint: Pubkey = evicted.base_mint.into();
+        account_state_core.remove_terminal_account_observation_arbiter(&evicted_base_mint);
     }
 }
 
@@ -4862,7 +4897,9 @@ impl OracleRuntime {
         if let Some(base_mint) = base_mint_key {
             self.shadow_ledger.cleanup_snapshots(&base_mint);
             self.shadow_ledger.remove_curve_alias(&base_mint);
-            self.account_state_core.remove_pool(&base_mint);
+            if identity.is_none() {
+                self.account_state_core.remove_pool(&base_mint);
+            }
             self.pending_account_updates.write().remove(&base_mint);
             if self.live_pipeline.remove_mint(&base_mint) {
                 info!(pool = %pool_amm_id, base_mint = %base_mint, reason, "🗑️  USUNIETO BASE MINT Z PIPELINE");
@@ -4884,7 +4921,11 @@ impl OracleRuntime {
                 .unregister_pool(&base_mint);
         }
         if let Some(identity) = identity {
-            self.terminal_pool_identities.write().insert(identity);
+            retain_terminal_account_evidence(
+                &self.terminal_pool_identities,
+                &self.account_state_core,
+                identity,
+            );
         }
         self.pool_identities.remove_by_pool(&pool_amm_id);
         self.runtime_pool_states.write().remove(&pool_amm_id);
@@ -46813,6 +46854,73 @@ mod tests {
             integrity.audit_markers.last().map(|marker| marker.action),
             Some(CandidateIntegrityConflictActionV1::TerminalVerdictImmutableAudit)
         );
+    }
+
+    #[test]
+    fn terminal_account_arbiters_are_evicted_with_their_bounded_identity_tombstones() {
+        let reducer = AccountStateReducer::new();
+        let tombstones = RwLock::new(TerminalPoolIdentityTombstones::new(2));
+        let mut identities = Vec::new();
+
+        for slot in 1..=3_u64 {
+            let pool_id = Pubkey::new_unique();
+            let base_mint = Pubkey::new_unique();
+            let bonding_curve = Pubkey::new_unique();
+            let identity = DomainPoolIdentity {
+                pool_id: PoolId::from(pool_id),
+                base_mint: BaseMint::from(base_mint),
+                bonding_curve: BondingCurveKey::from(bonding_curve),
+            };
+            let result = reducer.apply_account_update(AccountStateUpdate {
+                provider_id: Some("test-primary".to_owned()),
+                provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+                pool_amm_id: pool_id,
+                base_mint,
+                bonding_curve,
+                sol_reserves: 1_000_000_000 + slot,
+                token_reserves: 500_000_000_000 + slot,
+                is_complete: 0,
+                slot,
+                write_version: Some(slot),
+                txn_signature: None,
+                source_account_pubkey: Some(bonding_curve),
+                source_account_owner_or_program: Some(bonding_curve),
+                account_data_len: Some(56),
+                account_data_hash: Some(format!("{slot:064x}")),
+                receive_ts_ms: slot.saturating_mul(1_000),
+                receive_seq: slot,
+                curve_finality: CurveFinality::Provisional,
+                source: UpdateSource::GeyserAccountUpdate,
+            });
+            assert!(matches!(
+                result,
+                AccountUpdateResult::Applied | AccountUpdateResult::PromotedFromBootstrap
+            ));
+            retain_terminal_account_evidence(&tombstones, &reducer, identity);
+            identities.push(identity);
+        }
+
+        let retained = tombstones.read();
+        assert_eq!(retained.retained_count(), 2);
+        assert_eq!(retained.eviction_count, 1);
+        assert_eq!(retained.first_evicted_identity, Some(identities[0]));
+        drop(retained);
+
+        let first_mint: Pubkey = identities[0].base_mint.into();
+        let second_mint: Pubkey = identities[1].base_mint.into();
+        let third_mint: Pubkey = identities[2].base_mint.into();
+        assert!(
+            reducer
+                .account_observation_arbiter_snapshot(&first_mint)
+                .is_none(),
+            "evicted tombstone must release the paired terminal arbiter"
+        );
+        assert!(reducer
+            .account_observation_arbiter_snapshot(&second_mint)
+            .is_some());
+        assert!(reducer
+            .account_observation_arbiter_snapshot(&third_mint)
+            .is_some());
     }
 
     #[test]

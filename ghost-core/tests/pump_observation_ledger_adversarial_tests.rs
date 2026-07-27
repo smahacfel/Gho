@@ -2000,3 +2000,116 @@ fn secondary_raw_pending_correlation_does_not_use_parsed_nln_outcome() {
     );
     assert_eq!(ledger.snapshot().canonical_mutation_count, 1);
 }
+
+#[test]
+fn contradictory_same_identity_witness_replay_is_order_independent_conflict_evidence() {
+    let sig = signature(201);
+    let loc = locator(sig, 0);
+    let primary_claims = complete_claims(key(81), key(82));
+    let witness_a = secondary_raw(
+        loc.clone(),
+        primary_claims.clone(),
+        "raw-secondary-replay",
+        202,
+    );
+    let mut witness_b = witness_a.clone();
+    witness_b.claims.token_amount_units = Some(43);
+    let primary = primary_raw(loc, primary_claims, 203, Some(1));
+
+    let mut witness_first = PumpObservationLedgerV1::default();
+    assert_eq!(
+        witness_first
+            .observe(witness_a.clone(), 1)
+            .observation_decision
+            .classification,
+        PumpObservationClassificationV1::SecondaryWitnessOnly
+    );
+    assert_eq!(
+        witness_first
+            .observe(witness_b.clone(), 2)
+            .observation_decision
+            .classification,
+        PumpObservationClassificationV1::SecondaryWitnessOnly,
+        "same captured identity with a contradictory normalization is evidence, not an exact replay"
+    );
+    let witness_first_primary = witness_first.observe(primary.clone(), 3);
+    assert!(witness_first_primary
+        .derived_decisions
+        .iter()
+        .any(|decision| {
+            decision.classification == PumpObservationClassificationV1::SourceReconciliationConflict
+                && decision
+                    .conflict_fields
+                    .contains(&PumpMutationConflictFieldV1::TokenAmountUnits)
+        }));
+
+    let mut raw_first = PumpObservationLedgerV1::default();
+    assert!(raw_first
+        .observe(primary, 1)
+        .observation_decision
+        .did_canonical_apply());
+    raw_first.observe(witness_a, 2);
+    let raw_first_conflict = raw_first.observe(witness_b, 3).observation_decision;
+    assert_eq!(
+        raw_first_conflict.classification,
+        PumpObservationClassificationV1::SourceReconciliationConflict
+    );
+
+    assert_eq!(witness_first.snapshot(), raw_first.snapshot());
+    assert_eq!(
+        witness_first.retained_conflicts(),
+        raw_first.retained_conflicts()
+    );
+}
+
+#[test]
+fn secondary_witness_expiry_retains_bounded_identity_and_first_overflow_evidence() {
+    let sig = signature(204);
+    let loc = locator(sig, 0);
+    let claims = complete_claims(key(83), key(84));
+    let witness = secondary_raw(loc, claims, "raw-secondary-expiry-audit", 205);
+    let mut ledger =
+        PumpObservationLedgerV1::try_new(small_config(2, 1, 2, 2)).expect("valid config");
+
+    ledger.observe(witness.clone(), 0);
+    let first_expiry = ledger.finalize_expired(10);
+    assert_eq!(first_expiry.len(), 1);
+    assert_eq!(
+        first_expiry[0].classification,
+        PumpObservationClassificationV1::SecondaryWitnessExpired
+    );
+    assert_eq!(
+        first_expiry[0].expired_witness_observation.as_ref(),
+        Some(&witness)
+    );
+    assert_eq!(ledger.retained_expired_witnesses(), &[witness.clone()]);
+
+    let replay = ledger.observe(witness.clone(), 11).observation_decision;
+    assert_eq!(
+        replay.classification,
+        PumpObservationClassificationV1::SecondaryWitnessOnly,
+        "expiry releases correlation capacity without erasing its retained audit identity"
+    );
+    let second_expiry = ledger.finalize_expired(21);
+    assert_eq!(second_expiry.len(), 1);
+    assert_eq!(
+        second_expiry[0].expired_witness_observation.as_ref(),
+        Some(&witness)
+    );
+    assert!(!second_expiry[0].evidence_complete);
+
+    let snapshot = ledger.snapshot();
+    assert_eq!(snapshot.retained_expired_witness_count, 1);
+    assert_eq!(snapshot.expired_witness_audit_overflow_count, 1);
+    assert_eq!(
+        snapshot.first_rejected_expired_witness.as_ref(),
+        Some(&witness)
+    );
+    assert_eq!(
+        snapshot
+            .first_evidence_overflow
+            .as_ref()
+            .map(|overflow| overflow.lane),
+        Some(PumpObservationEvidenceLaneV1::ExpiredWitnessAudit)
+    );
+}

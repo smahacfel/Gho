@@ -1,19 +1,34 @@
-//! Frozen differential corpus gate for PR1D Pump Observation Ledger.
+//! Frozen differential corpus gates for the production PR1D Pump Observation
+//! Ledger.
 //!
-//! This test intentionally does not call the not-yet-implemented production
-//! ledger API. It freezes the pre-implementation schema, scenario inventory,
-//! expected outcomes, and exact fixture bytes. Executable replay is added
-//! after the ledger exists without rewriting this v1 fixture.
+//! V1 bytes remain immutable. The first test guards their schema and digest;
+//! the executable replay test separately adapts every frozen observation into
+//! the public production ledger and compares the real decisions with the
+//! frozen outcomes.
 
 #![allow(dead_code)]
 
+use ghost_core::{
+    CandidateIntegrityOutcomeV1, CanonicalPumpOrderKeyV1, ObservationProvenanceV1,
+    ObservationSourceFamilyV1, ObservedPumpMutationV1, ParsedWitnessCorrelationOutcomeV1,
+    ProgramFeeCharge, PumpInstructionLimitV1, PumpMutationClaimsV1, PumpMutationConflictFieldV1,
+    PumpMutationFamilyV1, PumpObservationClassificationV1, PumpObservationLedgerConfigV1,
+    PumpObservationLedgerDecisionV1, PumpObservationLedgerV1, PumpProviderAgreementV1,
+    PumpRouteVariant, PumpTradeSideV1, RawProviderRoleV1, RawPumpMutationLocatorV1,
+};
 use serde::Deserialize;
+use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use std::collections::{BTreeMap, BTreeSet};
 
 const CORPUS_BYTES: &[u8] = include_bytes!(
     "fixtures/pump_observation_ledger_v1/pump_observation_differential_corpus_v1.jsonl"
 );
 const CORPUS_BLAKE3_HEX: &str = "833de2bd384c964712f2e7127f9bc1db57745644633c1c66facef540cdf4c2a4";
+const CORPUS_V2_BYTES: &[u8] = include_bytes!(
+    "fixtures/pump_observation_ledger_v2/pump_observation_differential_corpus_v2.jsonl"
+);
+const CORPUS_V2_BLAKE3_HEX: &str =
+    "c81d7b4f0cc3792c2bb2c4e71bfd0634fcfdd69723758d741ee2405770603415";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,11 +111,13 @@ struct FixtureClaims {
     route_variant: Option<String>,
     side: Option<String>,
     success: Option<bool>,
+    error_code: Option<String>,
     token_amount_units: Option<u64>,
     instruction_limit: Option<InstructionLimit>,
     reported_curve_quote_lamports: Option<u64>,
     reported_wallet_delta_lamports: Option<u64>,
     reported_fee_breakdown: Option<Vec<FeeCharge>>,
+    reported_post_state_hash_blake3: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +217,653 @@ fn pump_observation_differential_corpus_v1_is_frozen_complete_and_self_consisten
     validate_material_claim_matrix(&scenarios);
     validate_arrival_order_symmetry(&scenarios);
     validate_scenario_specific_contracts(&scenarios);
+}
+
+#[test]
+fn pump_observation_differential_corpus_v1_replays_through_production_ledger() {
+    for scenario in parse_scenarios(CORPUS_BYTES) {
+        replay_scenario_through_production_ledger(&scenario);
+    }
+}
+
+#[test]
+fn pump_observation_differential_corpus_v2_replays_new_claims_and_expiry_audit() {
+    assert_eq!(
+        blake3::hash(CORPUS_V2_BYTES).to_hex().to_string(),
+        CORPUS_V2_BLAKE3_HEX,
+        "the PR1D v2 corpus changed; create a new corpus version instead of rewriting v2"
+    );
+    let scenarios = parse_scenarios(CORPUS_V2_BYTES);
+    assert_eq!(scenarios.len(), 3);
+    assert!(scenarios
+        .iter()
+        .all(|scenario| scenario.schema_version == 2));
+    assert_eq!(
+        scenarios
+            .iter()
+            .map(|scenario| scenario.scenario_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "material_conflict_error_code",
+            "material_conflict_reported_post_state_hash_blake3",
+            "secondary_witness_expiry_identity_audit",
+        ])
+    );
+
+    for scenario in scenarios
+        .iter()
+        .filter(|scenario| scenario.expected.finalize.is_none())
+    {
+        replay_scenario_through_production_ledger(scenario);
+    }
+
+    let expiry = scenarios
+        .iter()
+        .find(|scenario| scenario.scenario_id == "secondary_witness_expiry_identity_audit")
+        .expect("v2 expiry scenario");
+    let observation = fixture_observation(&expiry.observations[0], 0);
+    let mut ledger = PumpObservationLedgerV1::try_new(PumpObservationLedgerConfigV1 {
+        correlation_window_ns: 10,
+        max_pending_witnesses: 1,
+        ..PumpObservationLedgerConfigV1::default()
+    })
+    .expect("valid v2 expiry config");
+    let observed = ledger.observe(observation.clone(), 30);
+    assert_expected_observation_result(
+        expiry,
+        &expiry.observations[0],
+        &expiry.expected.decisions[0],
+        &observed.observation_decision,
+        &observed.derived_decisions,
+        ledger.snapshot().pending_witness_count,
+    );
+    let finalized = ledger.finalize_expired(40);
+    assert_eq!(finalized.len(), 1);
+    assert_eq!(
+        finalized[0].classification,
+        PumpObservationClassificationV1::SecondaryWitnessExpired
+    );
+    assert_eq!(
+        finalized[0].expired_witness_observation.as_ref(),
+        Some(&observation)
+    );
+    assert_eq!(ledger.retained_expired_witnesses(), &[observation]);
+    let snapshot = ledger.snapshot();
+    assert_eq!(snapshot.canonical_mutation_count, 0);
+    assert_eq!(snapshot.pending_witness_count, 0);
+    assert_eq!(snapshot.retained_expired_witness_count, 1);
+    assert!(snapshot.witness_evidence_complete);
+}
+
+fn parse_scenarios(bytes: &[u8]) -> Vec<CorpusScenario> {
+    std::str::from_utf8(bytes)
+        .expect("corpus must be UTF-8 JSONL")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("strict corpus record"))
+        .collect()
+}
+
+fn replay_scenario_through_production_ledger(scenario: &CorpusScenario) {
+    let mut config = PumpObservationLedgerConfigV1::default();
+    if let Some(profile) = &scenario.capacity_profile {
+        config.max_pending_witnesses = profile.max_pending_witnesses_per_signature;
+    }
+    let correlation_window_ns = config.correlation_window_ns;
+    let mut ledger = PumpObservationLedgerV1::try_new(config).expect("valid corpus capacity");
+    let mut last_correlation = "not_observed";
+    let mut integrity = CandidateIntegrityOutcomeV1::Ready;
+    let mut max_observation_time = 0_u64;
+
+    for (index, (fixture, expected)) in scenario
+        .observations
+        .iter()
+        .zip(&scenario.expected.decisions)
+        .enumerate()
+    {
+        let observation = fixture_observation(fixture, index);
+        let now = observation.provenance.received_at_monotonic_ns;
+        max_observation_time = max_observation_time.max(now);
+        let result = ledger.observe(observation, now);
+        let mut decisions = Vec::with_capacity(1 + result.derived_decisions.len());
+        decisions.push(&result.observation_decision);
+        decisions.extend(result.derived_decisions.iter());
+
+        assert_expected_observation_result(
+            scenario,
+            fixture,
+            expected,
+            &result.observation_decision,
+            &result.derived_decisions,
+            ledger.snapshot().pending_witness_count,
+        );
+        update_replay_outcomes(&decisions, &mut last_correlation, &mut integrity);
+    }
+
+    let finalized = ledger.finalize_expired(
+        max_observation_time
+            .saturating_add(correlation_window_ns)
+            .saturating_add(1),
+    );
+    if let Some(expected) = &scenario.expected.finalize {
+        assert!(
+            !finalized.is_empty(),
+            "expected a production finalization decision: {}",
+            scenario.scenario_id
+        );
+        for decision in &finalized {
+            assert_expected_finalize(scenario, expected, decision);
+        }
+    } else {
+        assert!(
+            finalized.is_empty(),
+            "unexpected production finalization decisions in {}: {finalized:?}",
+            scenario.scenario_id
+        );
+    }
+    update_replay_outcomes(
+        &finalized.iter().collect::<Vec<_>>(),
+        &mut last_correlation,
+        &mut integrity,
+    );
+
+    let snapshot = ledger.snapshot();
+    assert_eq!(
+        snapshot.canonical_mutation_count, scenario.expected.final_state.canonical_mutation_count,
+        "production canonical count drifted: {}",
+        scenario.scenario_id
+    );
+    assert_eq!(
+        snapshot.primary_evidence_complete && snapshot.witness_evidence_complete,
+        scenario.expected.final_state.evidence_complete,
+        "production evidence completeness drifted: {}",
+        scenario.scenario_id
+    );
+    assert_eq!(
+        last_correlation, scenario.expected.final_state.correlation_outcome,
+        "production correlation outcome drifted: {}",
+        scenario.scenario_id
+    );
+
+    let actual_integrity = scenario
+        .account_handoff
+        .as_ref()
+        .map(|handoff| handoff.registry_outcome.as_str())
+        .unwrap_or_else(|| candidate_integrity_label(integrity));
+    assert_eq!(
+        actual_integrity, scenario.expected.final_state.candidate_integrity,
+        "production CandidateIntegrity signal drifted: {}",
+        scenario.scenario_id
+    );
+}
+
+fn fixture_observation(fixture: &CorpusObservation, index: usize) -> ObservedPumpMutationV1 {
+    let source_family = match fixture.source_family.as_str() {
+        "raw_yellowstone" => ObservationSourceFamilyV1::RawYellowstone,
+        "parsed_nln" => ObservationSourceFamilyV1::ParsedNln,
+        other => panic!("unknown fixture source family {other}"),
+    };
+    let signature = fixture_signature(&fixture.signature);
+    let provenance = fixture
+        .provenance
+        .as_ref()
+        .map(|provenance| ObservationProvenanceV1 {
+            source_family,
+            source_id: provenance.source_id.clone(),
+            provider_id: provenance.provider_id.clone(),
+            schema_id: provenance.schema_id.clone(),
+            payload_hash_blake3: parse_digest(&provenance.payload_hash_blake3),
+            received_at_monotonic_ns: provenance.received_at_monotonic_ns,
+        })
+        .unwrap_or(ObservationProvenanceV1 {
+            source_family,
+            source_id: String::new(),
+            provider_id: String::new(),
+            schema_id: String::new(),
+            payload_hash_blake3: [0; 32],
+            received_at_monotonic_ns: index as u64,
+        });
+    let locator_hint = fixture
+        .locator
+        .as_ref()
+        .map(|locator| RawPumpMutationLocatorV1 {
+            program_id: fixture_pubkey(&locator.program_id),
+            signature,
+            outer_instruction_index: u16::try_from(locator.outer_instruction_index)
+                .expect("fixture outer index fits production contract"),
+            inner_instruction_path: locator
+                .inner_instruction_path
+                .iter()
+                .map(|index| u16::try_from(*index).expect("fixture path fits production contract"))
+                .collect(),
+            semantic_event_ordinal: locator.semantic_event_ordinal,
+        });
+    let canonical_order = fixture
+        .canonical_order
+        .as_ref()
+        .map(|order| CanonicalPumpOrderKeyV1 {
+            slot: order.slot,
+            tx_index: order.tx_index,
+            outer_instruction_index: u16::try_from(order.outer_instruction_index)
+                .expect("fixture outer index fits production contract"),
+            inner_instruction_path: order
+                .inner_instruction_path
+                .iter()
+                .map(|index| u16::try_from(*index).expect("fixture path fits production contract"))
+                .collect(),
+            semantic_event_ordinal: order.semantic_event_ordinal,
+        });
+
+    ObservedPumpMutationV1 {
+        mutation_family: match fixture.mutation_family.as_str() {
+            "initialize_pool" => PumpMutationFamilyV1::InitializePool,
+            "trade" => PumpMutationFamilyV1::Trade,
+            other => panic!("unknown fixture mutation family {other}"),
+        },
+        signature,
+        locator_hint,
+        canonical_order,
+        raw_transaction_mutation_count: fixture.raw_transaction_pump_mutation_count,
+        claims: fixture_claims(&fixture.claims),
+        raw_provider_role: match source_family {
+            ObservationSourceFamilyV1::ParsedNln => None,
+            ObservationSourceFamilyV1::RawYellowstone => {
+                Some(match fixture.provider_role.as_str() {
+                    "primary_authority" => RawProviderRoleV1::PrimaryAuthority,
+                    "secondary_witness" => RawProviderRoleV1::SecondaryWitness,
+                    other => panic!("unknown fixture provider role {other}"),
+                })
+            }
+        },
+        provenance,
+    }
+}
+
+fn fixture_claims(claims: &FixtureClaims) -> PumpMutationClaimsV1 {
+    PumpMutationClaimsV1 {
+        curve: claims.curve.as_deref().map(fixture_pubkey),
+        mint: claims.mint.as_deref().map(fixture_pubkey),
+        route_variant: claims
+            .route_variant
+            .as_deref()
+            .and_then(fixture_route_variant),
+        side: claims.side.as_deref().map(|side| match side {
+            "buy" => PumpTradeSideV1::Buy,
+            "sell" => PumpTradeSideV1::Sell,
+            other => panic!("unknown fixture trade side {other}"),
+        }),
+        success: claims.success,
+        error_code: claims.error_code.clone(),
+        token_amount_units: claims.token_amount_units,
+        instruction_limit: claims.instruction_limit.as_ref().map(|limit| {
+            match limit.kind.as_str() {
+                "max_sol_cost_lamports" => {
+                    PumpInstructionLimitV1::MaxWalletDebitLamports(limit.amount)
+                }
+                "min_sol_output_lamports" => {
+                    PumpInstructionLimitV1::MinWalletCreditLamports(limit.amount)
+                }
+                "exact_quote_input_lamports" => {
+                    PumpInstructionLimitV1::ExactQuoteInputLamports(limit.amount)
+                }
+                "min_token_output_units" => {
+                    PumpInstructionLimitV1::MinTokenOutputUnits(limit.amount)
+                }
+                other => panic!("unknown fixture instruction limit {other}"),
+            }
+        }),
+        reported_curve_quote_lamports: claims.reported_curve_quote_lamports,
+        reported_wallet_delta_lamports: claims.reported_wallet_delta_lamports,
+        reported_fee_breakdown: claims.reported_fee_breakdown.as_ref().map(|fees| {
+            fees.iter()
+                .map(|fee| ProgramFeeCharge {
+                    component_id: fee.recipient.clone(),
+                    amount: fee.lamports,
+                })
+                .collect()
+        }),
+        reported_post_state_hash_blake3: claims
+            .reported_post_state_hash_blake3
+            .as_deref()
+            .map(parse_digest),
+    }
+}
+
+fn fixture_route_variant(route: &str) -> Option<PumpRouteVariant> {
+    match route {
+        "pump_fun_initialize" => None,
+        "pump_fun_buy" => Some(PumpRouteVariant::LegacyBuy),
+        "pump_fun_sell" => Some(PumpRouteVariant::LegacySell),
+        other => panic!("unknown fixture route variant {other}"),
+    }
+}
+
+fn fixture_pubkey(label: &str) -> Pubkey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ghost.pr1d.corpus.pubkey.v1");
+    hasher.update(label.as_bytes());
+    Pubkey::new_from_array(*hasher.finalize().as_bytes())
+}
+
+fn fixture_signature(label: &str) -> Signature {
+    let mut bytes = [0_u8; 64];
+    for domain in 0..2_u8 {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ghost.pr1d.corpus.signature.v1");
+        hasher.update(&[domain]);
+        hasher.update(label.as_bytes());
+        let start = usize::from(domain) * 32;
+        bytes[start..start + 32].copy_from_slice(hasher.finalize().as_bytes());
+    }
+    Signature::from(bytes)
+}
+
+fn parse_digest(value: &str) -> [u8; 32] {
+    assert_lower_hex_digest(value);
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .expect("validated lower-case digest");
+    }
+    digest
+}
+
+fn assert_expected_observation_result(
+    scenario: &CorpusScenario,
+    fixture: &CorpusObservation,
+    expected: &ExpectedDecision,
+    observation_decision: &PumpObservationLedgerDecisionV1,
+    derived_decisions: &[PumpObservationLedgerDecisionV1],
+    pending_witness_count: usize,
+) {
+    assert!(
+        expected_classification_matches(
+            &expected.classification,
+            observation_decision.classification
+        ),
+        "production classification drifted in {} / {}: expected {}, got {:?}",
+        scenario.scenario_id,
+        fixture.observation_id,
+        expected.classification,
+        observation_decision.classification
+    );
+    assert_eq!(
+        observation_decision.did_canonical_apply(),
+        expected.canonical_apply,
+        "production canonical authority drifted in {} / {}",
+        scenario.scenario_id,
+        fixture.observation_id
+    );
+
+    let decisions = std::iter::once(observation_decision)
+        .chain(derived_decisions.iter())
+        .collect::<Vec<_>>();
+    assert!(
+        expected_correlation_observed(
+            &expected.correlation_outcome,
+            fixture,
+            &decisions,
+            pending_witness_count,
+        ),
+        "production correlation drifted in {} / {}: expected {}",
+        scenario.scenario_id,
+        fixture.observation_id,
+        expected.correlation_outcome
+    );
+    assert!(
+        expected_agreement_observed(
+            &expected.provider_agreement,
+            &decisions,
+            pending_witness_count,
+        ),
+        "production provider agreement drifted in {} / {}: expected {}",
+        scenario.scenario_id,
+        fixture.observation_id,
+        expected.provider_agreement
+    );
+
+    let actual_conflicts: Vec<_> = decisions
+        .iter()
+        .flat_map(|decision| decision.conflict_fields.iter().copied())
+        .collect();
+    if expected.classification == "primary_raw_coverage_incomplete" {
+        assert!(
+            actual_conflicts.is_empty(),
+            "coverage gaps are not material source conflicts"
+        );
+        for field in &expected.conflict_fields {
+            match field.as_str() {
+                "locator" => assert!(fixture.locator.is_none()),
+                "canonical_order" => assert!(fixture.canonical_order.is_none()),
+                "provenance" => assert!(fixture.provenance.is_none()),
+                other => panic!("unknown frozen coverage field {other}"),
+            }
+        }
+        return;
+    }
+    let expected_conflicts: Vec<_> = expected
+        .conflict_fields
+        .iter()
+        .map(|field| fixture_conflict_field(field))
+        .collect();
+    assert_eq!(
+        actual_conflicts, expected_conflicts,
+        "production material conflict fields drifted in {} / {}",
+        scenario.scenario_id, fixture.observation_id
+    );
+}
+
+fn expected_classification_matches(
+    expected: &str,
+    actual: PumpObservationClassificationV1,
+) -> bool {
+    match expected {
+        "canonical_primary_applied" => {
+            actual == PumpObservationClassificationV1::PrimaryCanonicalApplied
+        }
+        "evidence_capacity_exceeded" => {
+            actual == PumpObservationClassificationV1::EvidenceCapacityExceeded
+        }
+        "exact_duplicate" => actual == PumpObservationClassificationV1::ExactDuplicate,
+        "pending_witness_recorded" => matches!(
+            actual,
+            PumpObservationClassificationV1::ParsedWitnessPending
+                | PumpObservationClassificationV1::SecondaryWitnessOnly
+        ),
+        "primary_raw_coverage_incomplete" => {
+            actual == PumpObservationClassificationV1::PrimaryRawCoverageIncomplete
+        }
+        "secondary_raw_witness_correlated" => {
+            actual == PumpObservationClassificationV1::SameMutationAgreement
+        }
+        "source_reconciliation_conflict" => {
+            actual == PumpObservationClassificationV1::SourceReconciliationConflict
+        }
+        "witness_correlated" => actual == PumpObservationClassificationV1::ExactStructuralMatch,
+        other => panic!("unknown expected classification {other}"),
+    }
+}
+
+fn expected_correlation_observed(
+    expected: &str,
+    fixture: &CorpusObservation,
+    decisions: &[&PumpObservationLedgerDecisionV1],
+    pending_witness_count: usize,
+) -> bool {
+    match expected {
+        "not_observed" => decisions
+            .iter()
+            .all(|decision| decision.correlation.is_none()),
+        "pending" => pending_witness_count > 0,
+        "exact_replay_duplicate" => decisions.iter().any(|decision| {
+            decision.classification == PumpObservationClassificationV1::ExactDuplicate
+        }),
+        "exact_structural_match" => {
+            decisions.iter().any(|decision| {
+                decision.correlation
+                    == Some(ParsedWitnessCorrelationOutcomeV1::ExactStructuralMatch)
+            }) || (fixture.source_family == "raw_yellowstone"
+                && fixture.provider_role == "secondary_witness"
+                && decisions.iter().any(|decision| {
+                    matches!(
+                        decision.classification,
+                        PumpObservationClassificationV1::SameMutationAgreement
+                            | PumpObservationClassificationV1::SourceReconciliationConflict
+                    )
+                }))
+        }
+        "unique_signature_singleton_match" => decisions.iter().any(|decision| {
+            decision.correlation
+                == Some(ParsedWitnessCorrelationOutcomeV1::UniqueSignatureSingletonMatch)
+        }),
+        "ambiguous" => decisions.iter().any(|decision| {
+            decision.correlation == Some(ParsedWitnessCorrelationOutcomeV1::Ambiguous)
+        }),
+        "unmatchable" => decisions.iter().any(|decision| {
+            decision.correlation == Some(ParsedWitnessCorrelationOutcomeV1::Unmatchable)
+        }),
+        other => panic!("unknown expected correlation {other}"),
+    }
+}
+
+fn expected_agreement_observed(
+    expected: &str,
+    decisions: &[&PumpObservationLedgerDecisionV1],
+    pending_witness_count: usize,
+) -> bool {
+    match expected {
+        "not_observed" => decisions
+            .iter()
+            .all(|decision| decision.provider_agreement == PumpProviderAgreementV1::NotObserved),
+        "witness_only" => {
+            pending_witness_count > 0
+                || decisions.iter().any(|decision| {
+                    decision.provider_agreement == PumpProviderAgreementV1::WitnessOnly
+                })
+        }
+        "primary_secondary_agreement" | "no_conflict_with_unknown" => {
+            decisions.iter().any(|decision| {
+                decision.provider_agreement == PumpProviderAgreementV1::PrimarySecondaryAgreement
+            })
+        }
+        "primary_secondary_conflict" => decisions.iter().any(|decision| {
+            decision.provider_agreement == PumpProviderAgreementV1::PrimarySecondaryConflict
+        }),
+        other => panic!("unknown expected provider agreement {other}"),
+    }
+}
+
+fn assert_expected_finalize(
+    scenario: &CorpusScenario,
+    expected: &ExpectedFinalize,
+    decision: &PumpObservationLedgerDecisionV1,
+) {
+    assert_eq!(expected.classification, "correlation_finalized");
+    assert!(expected_correlation_observed(
+        &expected.correlation_outcome,
+        &CorpusObservation {
+            observation_id: "finalize".to_owned(),
+            source_family: "parsed_nln".to_owned(),
+            provider_role: "secondary_witness".to_owned(),
+            mutation_family: "trade".to_owned(),
+            signature: "finalize".to_owned(),
+            locator: None,
+            canonical_order: None,
+            raw_transaction_pump_mutation_count: None,
+            claims: FixtureClaims::default(),
+            provenance: None,
+        },
+        &[decision],
+        0,
+    ));
+    assert!(
+        expected_agreement_observed(&expected.provider_agreement, &[decision], 0),
+        "production finalize agreement drifted: {}",
+        scenario.scenario_id
+    );
+    let actual_conflicts: Vec<_> = decision.conflict_fields.clone();
+    let expected_conflicts: Vec<_> = expected
+        .conflict_fields
+        .iter()
+        .map(|field| fixture_conflict_field(field))
+        .collect();
+    assert_eq!(actual_conflicts, expected_conflicts);
+}
+
+fn update_replay_outcomes(
+    decisions: &[&PumpObservationLedgerDecisionV1],
+    last_correlation: &mut &'static str,
+    integrity: &mut CandidateIntegrityOutcomeV1,
+) {
+    for decision in decisions {
+        match decision.classification {
+            PumpObservationClassificationV1::SourceReconciliationConflict => {
+                *integrity = CandidateIntegrityOutcomeV1::SourceReconciliationConflict;
+            }
+            PumpObservationClassificationV1::PrimaryRawCoverageIncomplete => {
+                *integrity = CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete;
+            }
+            _ => {}
+        }
+        if let Some(correlation) = decision.correlation {
+            *last_correlation = match correlation {
+                ParsedWitnessCorrelationOutcomeV1::ExactStructuralMatch => "exact_structural_match",
+                ParsedWitnessCorrelationOutcomeV1::UniqueSignatureSingletonMatch => {
+                    "unique_signature_singleton_match"
+                }
+                ParsedWitnessCorrelationOutcomeV1::Unmatchable => "unmatchable",
+                ParsedWitnessCorrelationOutcomeV1::Ambiguous => "ambiguous",
+            };
+        } else if decision.classification == PumpObservationClassificationV1::ExactDuplicate {
+            *last_correlation = "exact_replay_duplicate";
+        } else if matches!(
+            decision.classification,
+            PumpObservationClassificationV1::SameMutationAgreement
+                | PumpObservationClassificationV1::SourceReconciliationConflict
+        ) && decision.provider_agreement != PumpProviderAgreementV1::NotObserved
+        {
+            *last_correlation = "exact_structural_match";
+        }
+        if let Some(signal) = &decision.candidate_integrity_signal {
+            *integrity = signal.outcome;
+        }
+    }
+}
+
+fn candidate_integrity_label(outcome: CandidateIntegrityOutcomeV1) -> &'static str {
+    match outcome {
+        CandidateIntegrityOutcomeV1::Ready => "ready",
+        CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete => {
+            "primary_raw_coverage_incomplete"
+        }
+        CandidateIntegrityOutcomeV1::AccountProviderConflict => "account_provider_conflict",
+        CandidateIntegrityOutcomeV1::SourceReconciliationConflict => {
+            "source_reconciliation_conflict"
+        }
+        CandidateIntegrityOutcomeV1::AnchorMissing => "anchor_missing",
+        CandidateIntegrityOutcomeV1::EconomicsNonEvaluable => "economics_non_evaluable",
+    }
+}
+
+fn fixture_conflict_field(field: &str) -> PumpMutationConflictFieldV1 {
+    match field {
+        "curve" => PumpMutationConflictFieldV1::Curve,
+        "mint" => PumpMutationConflictFieldV1::Mint,
+        "route_variant" => PumpMutationConflictFieldV1::RouteVariant,
+        "side" => PumpMutationConflictFieldV1::Side,
+        "success" => PumpMutationConflictFieldV1::Success,
+        "error_code" => PumpMutationConflictFieldV1::ErrorCode,
+        "token_amount_units" => PumpMutationConflictFieldV1::TokenAmountUnits,
+        "instruction_limit" => PumpMutationConflictFieldV1::InstructionLimit,
+        "reported_curve_quote_lamports" => PumpMutationConflictFieldV1::ReportedCurveQuoteLamports,
+        "reported_wallet_delta_lamports" => {
+            PumpMutationConflictFieldV1::ReportedWalletDeltaLamports
+        }
+        "reported_fee_breakdown" => PumpMutationConflictFieldV1::ReportedFeeBreakdown,
+        "reported_post_state_hash_blake3" => {
+            PumpMutationConflictFieldV1::ReportedPostStateHashBlake3
+        }
+        other => panic!("unknown expected material conflict field {other}"),
+    }
 }
 
 fn validate_inventory(scenarios: &[CorpusScenario]) {

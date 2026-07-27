@@ -82,6 +82,7 @@ pub enum PumpObservationEvidenceLaneV1 {
     PendingWitness,
     CorrelatedWitness,
     Conflict,
+    ExpiredWitnessAudit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -153,6 +154,10 @@ pub struct PumpObservationLedgerDecisionV1 {
     pub canonical_mutation: Option<StructuralCanonicalPumpMutationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_integrity_signal: Option<CandidateIntegritySignalV1>,
+    /// Immutable identity/provenance of a secondary witness removed by the
+    /// deterministic expiry boundary. It is audit evidence only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired_witness_observation: Option<ObservedPumpMutationV1>,
     pub evidence_complete: bool,
 }
 
@@ -186,6 +191,10 @@ pub struct PumpObservationLedgerSnapshotV1 {
     /// Finalized ambiguous/unmatchable witnesses retained for exact replay
     /// detection without consuming primary canonical capacity.
     pub finalized_unassigned_witness_count: usize,
+    #[serde(default)]
+    pub retained_expired_witness_count: usize,
+    #[serde(default)]
+    pub expired_witness_audit_overflow_count: u64,
     /// Total typed evidence overflows across all bounded witness/conflict
     /// lanes. The immutable first-overflow record remains a separate audit
     /// anchor.
@@ -194,6 +203,8 @@ pub struct PumpObservationLedgerSnapshotV1 {
     pub witness_evidence_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_evidence_overflow: Option<PumpObservationEvidenceOverflowV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_rejected_expired_witness: Option<ObservedPumpMutationV1>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -270,6 +281,9 @@ pub struct PumpObservationLedgerV1 {
     primary_transaction_inventories: HashMap<Signature, PrimaryTransactionInventory>,
     pending_witnesses: Vec<PendingWitness>,
     finalized_unassigned_witnesses: Vec<FinalizedUnassignedWitness>,
+    expired_witness_audit: Vec<ObservedPumpMutationV1>,
+    expired_witness_audit_overflow_count: u64,
+    first_rejected_expired_witness: Option<ObservedPumpMutationV1>,
     retained_conflicts: Vec<PumpSourceConflictEvidenceV1>,
     first_evidence_overflow: Option<PumpObservationEvidenceOverflowV1>,
     overflow_counts: HashMap<PumpObservationEvidenceLaneV1, u64>,
@@ -302,6 +316,9 @@ impl PumpObservationLedgerV1 {
             primary_transaction_inventories: HashMap::new(),
             pending_witnesses: Vec::new(),
             finalized_unassigned_witnesses: Vec::new(),
+            expired_witness_audit: Vec::new(),
+            expired_witness_audit_overflow_count: 0,
+            first_rejected_expired_witness: None,
             retained_conflicts: Vec::new(),
             first_evidence_overflow: None,
             overflow_counts: HashMap::new(),
@@ -372,6 +389,7 @@ impl PumpObservationLedgerV1 {
                     Vec::new(),
                 )
             }),
+            expired_witness_observation: None,
             evidence_complete: false,
         })
     }
@@ -387,7 +405,7 @@ impl PumpObservationLedgerV1 {
         let mut expired_by_signature: HashMap<Signature, Vec<PendingWitness>> = HashMap::new();
         let mut retained = Vec::with_capacity(self.pending_witnesses.len());
 
-        for pending in self.pending_witnesses.drain(..) {
+        for pending in std::mem::take(&mut self.pending_witnesses) {
             let age = now_monotonic_ns.saturating_sub(pending.first_seen_monotonic_ns);
             if age >= self.config.correlation_window_ns
                 && pending.observation.provenance.source_family
@@ -395,6 +413,9 @@ impl PumpObservationLedgerV1 {
                 && pending.observation.raw_provider_role
                     == Some(RawProviderRoleV1::SecondaryWitness)
             {
+                let expired_observation = pending.observation;
+                let retained_expiry_evidence =
+                    self.retain_expired_witness_audit(&expired_observation);
                 decisions.push(PumpObservationLedgerDecisionV1 {
                     classification: PumpObservationClassificationV1::SecondaryWitnessExpired,
                     correlation: None,
@@ -402,7 +423,8 @@ impl PumpObservationLedgerV1 {
                     conflict_fields: Vec::new(),
                     canonical_mutation: None,
                     candidate_integrity_signal: None,
-                    evidence_complete: self.witness_evidence_complete,
+                    expired_witness_observation: Some(expired_observation),
+                    evidence_complete: retained_expiry_evidence && self.witness_evidence_complete,
                 });
             } else if pending.observation.provenance.source_family
                 == ObservationSourceFamilyV1::ParsedNln
@@ -481,6 +503,7 @@ impl PumpObservationLedgerV1 {
                     conflict_fields: Vec::new(),
                     canonical_mutation: None,
                     candidate_integrity_signal: None,
+                    expired_witness_observation: None,
                     evidence_complete: retained && self.witness_evidence_complete,
                 });
             }
@@ -521,6 +544,7 @@ impl PumpObservationLedgerV1 {
                     conflict_fields: Vec::new(),
                     canonical_mutation: None,
                     candidate_integrity_signal: None,
+                    expired_witness_observation: None,
                     evidence_complete: retained && self.witness_evidence_complete,
                 });
             }
@@ -566,6 +590,8 @@ impl PumpObservationLedgerV1 {
             pending_witness_count: self.pending_witnesses.len(),
             retained_conflict_count: self.retained_conflicts.len(),
             finalized_unassigned_witness_count: self.finalized_unassigned_witnesses.len(),
+            retained_expired_witness_count: self.expired_witness_audit.len(),
+            expired_witness_audit_overflow_count: self.expired_witness_audit_overflow_count,
             evidence_overflow_count: self
                 .overflow_counts
                 .values()
@@ -574,12 +600,18 @@ impl PumpObservationLedgerV1 {
             primary_evidence_complete: self.primary_evidence_complete,
             witness_evidence_complete: self.witness_evidence_complete,
             first_evidence_overflow: self.first_evidence_overflow.clone(),
+            first_rejected_expired_witness: self.first_rejected_expired_witness.clone(),
         }
     }
 
     #[must_use]
     pub fn retained_conflicts(&self) -> &[PumpSourceConflictEvidenceV1] {
         &self.retained_conflicts
+    }
+
+    #[must_use]
+    pub fn retained_expired_witnesses(&self) -> &[ObservedPumpMutationV1] {
+        &self.expired_witness_audit
     }
 
     fn observe_primary_raw(
@@ -605,6 +637,7 @@ impl PumpObservationLedgerV1 {
                 conflict_fields: Vec::new(),
                 canonical_mutation: None,
                 candidate_integrity_signal: signal,
+                expired_witness_observation: None,
                 evidence_complete: false,
             });
         }
@@ -629,6 +662,7 @@ impl PumpObservationLedgerV1 {
                         Vec::new(),
                     )
                 }),
+                expired_witness_observation: None,
                 evidence_complete: false,
             });
         }
@@ -658,6 +692,7 @@ impl PumpObservationLedgerV1 {
                         Vec::new(),
                     )
                 }),
+                expired_witness_observation: None,
                 evidence_complete: false,
             });
         }
@@ -745,6 +780,7 @@ impl PumpObservationLedgerV1 {
                     })
                 })
                 .flatten(),
+            expired_witness_observation: None,
             evidence_complete: self.primary_evidence_complete
                 && observation.raw_transaction_mutation_count.is_some(),
         };
@@ -818,6 +854,7 @@ impl PumpObservationLedgerV1 {
                             conflict_fields: Vec::new(),
                             canonical_mutation: None,
                             candidate_integrity_signal: Some(signal),
+                            expired_witness_observation: None,
                             evidence_complete: self.primary_evidence_complete,
                         });
                     }
@@ -913,6 +950,7 @@ impl PumpObservationLedgerV1 {
                             &record.primary_observation,
                             Vec::new(),
                         )),
+                        expired_witness_observation: None,
                         evidence_complete: false,
                     });
                 }
@@ -975,6 +1013,7 @@ impl PumpObservationLedgerV1 {
                 conflict_fields: Vec::new(),
                 canonical_mutation: None,
                 candidate_integrity_signal: None,
+                expired_witness_observation: None,
                 evidence_complete: false,
             });
         }
@@ -992,11 +1031,14 @@ impl PumpObservationLedgerV1 {
         }
 
         let identity = ProviderObservationIdentity::from(&observation);
-        if let Some(finalized_outcome) = self
-            .finalized_unassigned_witnesses
-            .iter()
-            .find(|finalized| finalized.identity == identity)
-            .map(|finalized| finalized.outcome)
+        if let Some(finalized_outcome) =
+            self.finalized_unassigned_witnesses
+                .iter()
+                .find_map(|finalized| {
+                    (finalized.identity == identity
+                        && same_normalized_observation(&finalized.observation, &observation))
+                    .then_some(finalized.outcome)
+                })
         {
             self.exact_duplicate_count = self.exact_duplicate_count.saturating_add(1);
             return single_result(PumpObservationLedgerDecisionV1 {
@@ -1006,14 +1048,15 @@ impl PumpObservationLedgerV1 {
                 conflict_fields: Vec::new(),
                 canonical_mutation: None,
                 candidate_integrity_signal: None,
+                expired_witness_observation: None,
                 evidence_complete: self.witness_evidence_complete,
             });
         }
-        if self
-            .pending_witnesses
-            .iter()
-            .any(|pending| pending.identity == identity)
-        {
+        let pending_exact_normalized_observation = self.pending_witnesses.iter().any(|pending| {
+            pending.identity == identity
+                && same_normalized_observation(&pending.observation, &observation)
+        });
+        if pending_exact_normalized_observation {
             self.exact_duplicate_count = self.exact_duplicate_count.saturating_add(1);
             return single_result(PumpObservationLedgerDecisionV1 {
                 classification: PumpObservationClassificationV1::ExactDuplicate,
@@ -1022,6 +1065,7 @@ impl PumpObservationLedgerV1 {
                 conflict_fields: Vec::new(),
                 canonical_mutation: None,
                 candidate_integrity_signal: None,
+                expired_witness_observation: None,
                 evidence_complete: self.witness_evidence_complete,
             });
         }
@@ -1044,6 +1088,7 @@ impl PumpObservationLedgerV1 {
                 conflict_fields: Vec::new(),
                 canonical_mutation: None,
                 candidate_integrity_signal: None,
+                expired_witness_observation: None,
                 evidence_complete: false,
             });
         }
@@ -1064,6 +1109,7 @@ impl PumpObservationLedgerV1 {
             conflict_fields: Vec::new(),
             canonical_mutation: None,
             candidate_integrity_signal: None,
+            expired_witness_observation: None,
             evidence_complete: self.witness_evidence_complete,
         })
     }
@@ -1146,6 +1192,7 @@ impl PumpObservationLedgerV1 {
                 conflict_fields,
                 canonical_mutation: None,
                 candidate_integrity_signal: None,
+                expired_witness_observation: None,
                 evidence_complete: self.witness_evidence_complete,
             };
         }
@@ -1190,6 +1237,7 @@ impl PumpObservationLedgerV1 {
             conflict_fields: Vec::new(),
             canonical_mutation: None,
             candidate_integrity_signal: None,
+            expired_witness_observation: None,
             evidence_complete: retained_observation && self.witness_evidence_complete,
         }
     }
@@ -1266,6 +1314,7 @@ impl PumpObservationLedgerV1 {
                     conflict_fields,
                 )
             }),
+            expired_witness_observation: None,
             evidence_complete: retained_observation && self.witness_evidence_complete,
         }
     }
@@ -1300,8 +1349,29 @@ impl PumpObservationLedgerV1 {
                     Vec::new(),
                 )
             }),
+            expired_witness_observation: None,
             evidence_complete: false,
         })
+    }
+
+    fn retain_expired_witness_audit(&mut self, observation: &ObservedPumpMutationV1) -> bool {
+        if self.expired_witness_audit.len() < self.config.max_pending_witnesses {
+            self.expired_witness_audit.push(observation.clone());
+            return true;
+        }
+
+        self.witness_evidence_complete = false;
+        self.expired_witness_audit_overflow_count =
+            self.expired_witness_audit_overflow_count.saturating_add(1);
+        if self.first_rejected_expired_witness.is_none() {
+            self.first_rejected_expired_witness = Some(observation.clone());
+        }
+        self.note_overflow(
+            PumpObservationEvidenceLaneV1::ExpiredWitnessAudit,
+            observation,
+            self.expired_witness_audit.len(),
+        );
+        false
     }
 
     fn note_overflow(

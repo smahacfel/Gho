@@ -1,12 +1,12 @@
 # Pump Observation Ledger differential corpus v1
 
-Status: `FROZEN PRE-IMPLEMENTATION HARD GATE`
+Status: `FROZEN EXECUTABLE HARD GATE`
 
 This directory freezes the PR1D raw Yellowstone / parsed NLN differential
-contract before the production `PumpObservationLedgerV1` implementation
-exists. The corpus is transport-neutral and does not invoke a runtime parser,
-ledger, `CandidateIntegrityRegistry`, MFS, Gatekeeper, quote math, or
-execution code.
+contract. The immutable JSONL is transport-neutral. Its executable adapter
+constructs public `ObservedPumpMutationV1` values and runs every scenario
+through the production `PumpObservationLedgerV1`; it does not invoke MFS,
+Gatekeeper, quote math, or execution code.
 
 The fixture contains 33 scenarios. Every JSONL row contains:
 
@@ -117,9 +117,11 @@ Cross-layer inventory metadata:
 32. `account_provider_conflict_handoff`
 33. `lifecycle_conflict_matrix`
 
-The material-claim matrix covers every field of the frozen
+The material-claim matrix covers every field of the frozen V1
 `PumpMutationClaimsV1` contract. Reported quote, wallet-delta, and fee claims
-remain provider observations and gain no quote-math authority.
+remain provider observations and gain no quote-math authority. The additive
+V2 corpus covers later `error_code`, post-state hash, and secondary-expiry
+audit fields without changing these V1 bytes.
 
 The account handoff metadata freezes:
 
@@ -152,7 +154,7 @@ Run:
 cargo test -p ghost-core --test pump_observation_ledger_corpus_tests -- --nocapture
 ```
 
-The pre-implementation test validates only:
+The gate has two phases. The first validates:
 
 - exact fixture digest and JSONL framing;
 - strict serde schema with unknown fields rejected;
@@ -172,5 +174,8 @@ The pre-implementation test validates only:
 - account-conflict handoff metadata;
 - complete lifecycle inventory.
 
-Executable replay through the production ledger is added after the ledger
-implementation without changing this fixture or its digest.
+The second phase adapts every one of the 33 frozen records to production
+observations, calls `PumpObservationLedgerV1::observe()` and
+`finalize_expired()`, and compares the real classification, canonical count,
+correlation, conflict fields, CandidateIntegrity outcome, and evidence
+completeness with the frozen expectations.

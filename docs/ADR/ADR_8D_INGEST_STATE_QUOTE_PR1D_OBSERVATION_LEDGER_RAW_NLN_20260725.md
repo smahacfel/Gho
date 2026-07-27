@@ -1,6 +1,6 @@
 # ADR-8D: Ingest State Quote PR1D — Observation Ledger i raw/NLN reconciliation
 
-Status: `IMPLEMENTED / DRAFT PR #85 REVIEW REMEDIATION VALIDATED / READY FOR RE-REVIEW / OWNER-APPROVED PERFORMANCE WAIVER`
+Status: `IMPLEMENTED / DRAFT PR #85 SECOND REVIEW REMEDIATION VALIDATED / READY FOR RE-REVIEW / OWNER-APPROVED PERFORMANCE WAIVER`
 
 Typ: ADR-8D / PR1D / aktywna granica integralności ingestu
 
@@ -537,11 +537,12 @@ był zielony.
 
 ## D13. Rollback
 
-Rollbackiem jest revert pojedynczego finalnego commita PR1D. Typy i serde są
-addytywne. Nie ma migracji danych, production authority cutover ani quote
-schema cutover. Po rewercie wraca poprzednia ścieżka, dlatego merge wymaga
-pełnego dowodu, że NLN canonical bypass został usunięty i raw-only parity
-zachowane.
+Rollbackiem jest revert merge commita Draft PR #85 albo całego udokumentowanego
+zakresu commitów PR1D; nie należy zakładać pojedynczego commita na branchu
+review. Typy i serde są addytywne. Nie ma migracji danych, production
+authority cutover ani quote schema cutover. Po rewercie wraca poprzednia
+ścieżka, dlatego merge wymaga pełnego dowodu, że NLN canonical bypass został
+usunięty i raw-only parity zachowane.
 
 ## D14. Remediacja wyników końcowego audytu konfrontacyjnego
 
@@ -676,3 +677,51 @@ mechanicznie przeniesione na jawny `PrimaryAuthority`; pełne nazwy modułowe
 każdego testu przechodzą, a ponowiona bramka Seera zawiera już wyłącznie
 parentowe failure signatures. Produkcja nie została przy tej korekcie
 zmieniona.
+
+## D18. Remediacja drugiego niezależnego review Draft PR #85
+
+Drugie review zamknęło wcześniejsze findings active cutover, typed session
+apply i secondary expiry capacity, ale wykazało sześć dalszych luk. Wąska
+korekta zachowuje Observe i nie zmienia MFS, Gatekeepera, Triggera, quote math
+ani strategii:
+
+1. terminalny `AccountObservationArbiter` jest własnością tego samego
+   ograniczonego FIFO co `TerminalPoolIdentityTombstones`; eviction zachowuje
+   licznik oraz immutable pierwszy tombstone, a pod tym samym write lockiem
+   usuwa odpowiadający per-mint arbiter;
+2. evidence-only AccountUpdate nie może utworzyć arbitra po eviction; brak
+   retained ownera jest typed `ArbiterStateUnavailable`;
+3. wszystkie 33 niezmienne rekordy V1 są wykonywane przez produkcyjne
+   `PumpObservationLedgerV1::observe()` i `finalize_expired()`, a digest V1
+   pozostaje `833de2bd384c964712f2e7127f9bc1db57745644633c1c66facef540cdf4c2a4`;
+4. oddzielny corpus V2 zamraża `error_code`,
+   `reported_post_state_hash_blake3` oraz audytowalne
+   `SecondaryWitnessExpired`; jego digest wynosi
+   `c81d7b4f0cc3792c2bb2c4e71bfd0634fcfdd69723758d741ee2405770603415`;
+5. same-identity witness replay jest `ExactDuplicate` wyłącznie przy
+   identycznej pełnej normalizacji; sprzeczna witness-first normalizacja jest
+   retained w bounded lane i po primary daje ten sam conflict snapshot co
+   raw-first;
+6. wrapper IPC i raw observation muszą zgadzać się co do provider role oraz
+   provider ID. Sprzeczność zapisuje `PrimaryRawCoverageIncomplete` w shadow,
+   lecz poprawna parentowa emisja wrappera primary pozostaje niezmieniona;
+7. `SecondaryWitnessExpired` niesie immutable observation identity, jest
+   przechowywane w bounded audit lane opartym o istniejący witness cap, ma
+   overflow count i pierwszy odrzucony rekord oraz strukturalny log Seera.
+
+Performance waiver nie obejmuje bounded memory. Powyższa korekta domyka tę
+granicę bez zmiany zmierzonych progów i bez ponawiania performance protocol.
+
+Walidacja drugiej remediacji:
+
+- `cargo fmt --all --check`: PASS;
+- `git diff --check`: PASS;
+- ledger unit, pełny adversarial corpus i executable V1/V2 differential
+  corpus: PASS;
+- bounded terminal arbiter, late evidence no-recreate, mixed provider-role
+  boundary oraz istniejący terminal AccountUpdate audit: PASS;
+- `cargo check -p seer --tests`: PASS;
+- `cargo test -p ghost-core --no-fail-fast`: wyłącznie zamrożony baseline
+  `foundational_types_serialize_and_deserialize_roundtrip` z
+  `InvalidTagEncoding(104)`; wszystkie nowe testy PASS;
+- `cargo build --release --workspace`: PASS.

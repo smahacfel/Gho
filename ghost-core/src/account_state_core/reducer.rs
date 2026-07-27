@@ -139,11 +139,30 @@ impl AccountStateReducer {
         &self,
         update: AccountStateUpdate,
     ) -> AccountObservationDecisionV1 {
-        let arbiter = self
+        let Some(arbiter) = self
             .account_observation_arbiters
-            .entry(update.base_mint)
-            .or_insert_with(|| Arc::new(Mutex::new(AccountObservationArbiter::default())))
-            .clone();
+            .get(&update.base_mint)
+            .map(|entry| entry.clone())
+        else {
+            // Terminal evidence retention is owned by the bounded launcher
+            // tombstone lane. A late observation must not recreate an
+            // evicted per-mint arbiter and turn bounded terminal retention
+            // back into process-lifetime growth.
+            let decision = AccountObservationDecisionV1 {
+                classification: AccountObservationClassificationV1::ArbiterStateUnavailable,
+                outcome: AccountObservationOutcomeV1::RejectedInvalidObservation,
+                canonical_apply: false,
+                provider_agreement: AccountProviderAgreementV1::NotObserved,
+                mutation_version: Some(AccountMutationVersionV1 {
+                    pubkey: update.source_account_pubkey.unwrap_or(update.bonding_curve),
+                    slot: update.slot,
+                    write_version: update.write_version,
+                }),
+                data_hash_blake3: None,
+            };
+            self.record_account_observation_decision_metric(&decision);
+            return decision;
+        };
         let mut arbiter = match arbiter.lock() {
             Ok(guard) => guard,
             Err(_) => {
@@ -514,9 +533,24 @@ impl AccountStateReducer {
     pub fn remove_pool(&self, mint: &Pubkey) {
         self.states.remove(mint);
         self.bootstrap_states.remove(mint);
-        // Preserve the bounded in-process arbiter after terminal cleanup.
-        // Late provider agreement/conflict must remain auditable even though
-        // canonical runtime state and the observation session are gone.
+        self.account_observation_arbiters.remove(mint);
+    }
+
+    /// Remove canonical runtime state while retaining one evidence-only
+    /// account arbiter. The caller must pair this with a bounded terminal
+    /// identity owner and call [`Self::remove_terminal_account_observation_arbiter`]
+    /// when that identity is evicted.
+    pub fn remove_pool_retaining_account_observation_arbiter(&self, mint: &Pubkey) {
+        self.states.remove(mint);
+        self.bootstrap_states.remove(mint);
+        self.account_observation_arbiters
+            .entry(*mint)
+            .or_insert_with(|| Arc::new(Mutex::new(AccountObservationArbiter::default())));
+    }
+
+    /// Release evidence retained for an evicted terminal identity.
+    pub fn remove_terminal_account_observation_arbiter(&self, mint: &Pubkey) {
+        self.account_observation_arbiters.remove(mint);
     }
 
     #[must_use]
@@ -715,6 +749,31 @@ mod tests {
             AccountUpdateResult::Applied
         );
         assert_eq!(reducer.latest_observed_slot(), Some(105));
+    }
+
+    #[test]
+    fn late_evidence_cannot_recreate_an_evicted_terminal_arbiter() {
+        let reducer = AccountStateReducer::new();
+        let update = sample_update(106, 1);
+        assert_eq!(
+            reducer.apply_account_update(update.clone()),
+            AccountUpdateResult::Applied
+        );
+        reducer.remove_pool(&update.base_mint);
+        assert!(reducer
+            .account_observation_arbiter_snapshot(&update.base_mint)
+            .is_none());
+
+        let decision = reducer.observe_account_evidence_only(update.clone());
+        assert_eq!(
+            decision.classification,
+            AccountObservationClassificationV1::ArbiterStateUnavailable
+        );
+        assert!(!decision.canonical_apply);
+        assert!(reducer
+            .account_observation_arbiter_snapshot(&update.base_mint)
+            .is_none());
+        assert!(reducer.get_canonical_state(&update.base_mint).is_none());
     }
 
     #[test]

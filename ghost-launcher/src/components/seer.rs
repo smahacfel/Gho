@@ -2136,9 +2136,16 @@ fn pool_candidate_matches_primary_observation(
     candidate: &seer::types::CandidatePool,
     observation: &ObservedPumpMutationV1,
 ) -> bool {
-    if observation.provenance.source_family != ObservationSourceFamilyV1::RawYellowstone
-        || observation.raw_provider_role != Some(RawProviderRoleV1::PrimaryAuthority)
+    if observation.provenance.source_family != ObservationSourceFamilyV1::RawYellowstone {
+        return true;
+    }
+    if observation.raw_provider_role != candidate.provider_role
+        || observation.provenance.provider_id
+            != candidate.provider_id.as_deref().unwrap_or_default()
     {
+        return false;
+    }
+    if observation.raw_provider_role != Some(RawProviderRoleV1::PrimaryAuthority) {
         return true;
     }
     let Ok(signature) = solana_sdk::signature::Signature::from_str(&candidate.signature) else {
@@ -2167,9 +2174,6 @@ fn pool_candidate_matches_primary_observation(
         && observation.claims.curve == Some(candidate.bonding_curve)
         && observation.claims.mint == Some(candidate.base_mint)
         && observation.claims.success == Some(true)
-        && observation.provenance.provider_id
-            == candidate.provider_id.as_deref().unwrap_or_default()
-        && candidate.provider_role == Some(RawProviderRoleV1::PrimaryAuthority)
         && candidate.slot == Some(order.slot)
         && candidate.tx_index == Some(order.tx_index)
         && locator.outer_instruction_index == order.outer_instruction_index
@@ -2224,9 +2228,15 @@ fn trade_matches_primary_observation(
     trade: &seer::types::TradeEvent,
     observation: &ObservedPumpMutationV1,
 ) -> bool {
-    if observation.provenance.source_family != ObservationSourceFamilyV1::RawYellowstone
-        || observation.raw_provider_role != Some(RawProviderRoleV1::PrimaryAuthority)
+    if observation.provenance.source_family != ObservationSourceFamilyV1::RawYellowstone {
+        return true;
+    }
+    if observation.raw_provider_role != trade.provider_role
+        || observation.provenance.provider_id != trade.provider_id.as_deref().unwrap_or_default()
     {
+        return false;
+    }
+    if observation.raw_provider_role != Some(RawProviderRoleV1::PrimaryAuthority) {
         return true;
     }
     let Some(locator) = observation.locator_hint.as_ref() else {
@@ -2283,8 +2293,6 @@ fn trade_matches_primary_observation(
         && observation.claims.error_code == trade.error_code
         && observation.claims.token_amount_units == Some(trade.amount)
         && observation.claims.instruction_limit == launcher_trade_instruction_limit(trade, route)
-        && observation.provenance.provider_id == trade.provider_id.as_deref().unwrap_or_default()
-        && trade.provider_role == Some(RawProviderRoleV1::PrimaryAuthority)
         && observation
             .raw_transaction_mutation_count
             .is_some_and(|count| count > 0)
@@ -3925,6 +3933,18 @@ fn emit_pump_observation_decision(
     if decision.did_canonical_apply() {
         ::metrics::counter!("pump_observation_ledger_canonical_mutations_total", 1u64);
     }
+    if let Some(expired) = decision.expired_witness_observation.as_ref() {
+        warn!(
+            signature = %expired.signature,
+            locator = ?expired.locator_hint,
+            provider_id = %expired.provenance.provider_id,
+            provider_role = ?expired.raw_provider_role,
+            payload_hash_blake3 = %blake3::Hash::from_bytes(
+                expired.provenance.payload_hash_blake3
+            ).to_hex(),
+            "Seer: secondary raw witness expired from correlation capacity; immutable identity remains in the bounded ledger audit lane"
+        );
+    }
     let Some(signal) = decision.candidate_integrity_signal.clone() else {
         return;
     };
@@ -4066,13 +4086,13 @@ fn ingest_pump_observation(
         );
         return None;
     };
+    let observation_is_declared_primary = observation.provenance.source_family
+        == ObservationSourceFamilyV1::RawYellowstone
+        && observation.raw_provider_role == Some(RawProviderRoleV1::PrimaryAuthority);
+    let wrapper_primary_observation_mismatch =
+        !boundary_payload_aligned && missing_primary_signal.is_some();
     let result: PumpObservationLedgerResultV1 = match ledger.lock() {
-        Ok(mut ledger)
-            if !boundary_payload_aligned
-                && observation.provenance.source_family
-                    == ObservationSourceFamilyV1::RawYellowstone
-                && observation.raw_provider_role == Some(RawProviderRoleV1::PrimaryAuthority) =>
-        {
+        Ok(mut ledger) if !boundary_payload_aligned && observation_is_declared_primary => {
             ledger.observe_primary_boundary_mismatch(observation)
         }
         Ok(mut ledger) => ledger.observe(observation, now_monotonic_ns),
@@ -4090,6 +4110,13 @@ fn ingest_pump_observation(
             return None;
         }
     };
+    if wrapper_primary_observation_mismatch && !observation_is_declared_primary {
+        record_shadow_integrity_signal(
+            candidate_integrity_registry,
+            missing_primary_signal,
+            "wrapper_observation_provider_authority_mismatch",
+        );
+    }
 
     let decisions = std::iter::once(&result.observation_decision)
         .chain(result.derived_decisions.iter())
@@ -5966,10 +5993,11 @@ mod tests {
         emit_execution_account_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
         ingest_pump_observation, is_primary_raw_runtime_authority,
         missing_primary_observation_signal, nln_normalization_error_row,
-        nln_route_manifest_evidence_candidate_row, process_pool_detected_event_for_session_gate,
-        process_trade_event_for_session_gate, pumpswap_program_id,
-        select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
-        trade_has_forwardable_identity, NlnArtifactDeliveryState, NlnArtifactOverflowReasonV1,
+        nln_route_manifest_evidence_candidate_row, pool_candidate_matches_primary_observation,
+        process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
+        pumpswap_program_id, select_nln_program_stream_subscriptions,
+        trade_event_to_pool_transaction, trade_has_forwardable_identity,
+        trade_matches_primary_observation, NlnArtifactDeliveryState, NlnArtifactOverflowReasonV1,
         NlnArtifactRecord, NlnArtifactWriter, NlnProgramStreamCaptureTopic,
         NlnTradePoolIdentityResolver, NlnTradeResolveDecision, SessionAccountUpdateBridge,
         SessionAccountUpdateDecision, SessionBcv2Context, SessionExecutionAccountEvidenceDecision,
@@ -6242,6 +6270,81 @@ mod tests {
                 other.event_type()
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn pr1d_mixed_wrapper_and_observation_provider_roles_fail_shadow_closed_only() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut trade = make_trade(pool, mint);
+        trade.provider_id = Some("raw-primary".to_string());
+        trade.provider_role = Some(RawProviderRoleV1::PrimaryAuthority);
+        let mut candidate = make_candidate(pool, mint);
+        candidate.provider_id = Some("raw-primary".to_string());
+        candidate.provider_role = Some(RawProviderRoleV1::PrimaryAuthority);
+
+        let mut observation = primary_trade_observation(trade.signature, pool, mint, 8);
+        observation.provenance.provider_id = "raw-secondary".to_string();
+        observation.raw_provider_role = Some(RawProviderRoleV1::SecondaryWitness);
+        assert!(!trade_matches_primary_observation(&trade, &observation));
+        assert!(!pool_candidate_matches_primary_observation(
+            &candidate,
+            &observation
+        ));
+
+        let candidate_identity = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint,
+        };
+        let signal = missing_primary_observation_signal(candidate_identity, Some(trade.signature));
+        assert!(ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(observation),
+            1,
+            false,
+            Some(signal),
+        )
+        .is_none());
+        let ledger_snapshot = ledger.lock().expect("ledger snapshot").snapshot();
+        assert_eq!(ledger_snapshot.canonical_mutation_count, 0);
+        assert_eq!(ledger_snapshot.pending_witness_count, 1);
+        assert_eq!(
+            registry
+                .snapshot(candidate_identity)
+                .expect("typed wrapper/observation authority mismatch")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+
+        let (tx, mut rx) = create_event_bus();
+        let mut bridge = SessionPoolTradeBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let _ = bridge.register_detected_pool(pool, Instant::now());
+        assert_eq!(
+            process_trade_event_for_session_gate(
+                &tx,
+                &mut bridge,
+                &trade,
+                None,
+                Instant::now(),
+                None,
+                Some(&registry),
+            )
+            .decision,
+            SessionTradeDecision::ForwardNow
+        );
+        assert!(matches!(
+            recv_only_event(&mut rx).await,
+            GhostEvent::PoolTransaction(_)
+        ));
     }
 
     #[tokio::test]
