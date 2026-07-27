@@ -2063,6 +2063,189 @@ fn contradictory_same_identity_witness_replay_is_order_independent_conflict_evid
 }
 
 #[test]
+fn same_identity_unknown_to_concrete_agreement_is_retained_in_both_arrival_orders() {
+    let sig = signature(206);
+    let loc = locator(sig, 0);
+    let primary_claims = complete_claims(key(85), key(86));
+    let primary = primary_raw(loc.clone(), primary_claims.clone(), 207, Some(1));
+    let mut witness_unknown = secondary_raw(
+        loc,
+        primary_claims,
+        "raw-secondary-normalization-refinement",
+        208,
+    );
+    witness_unknown.claims.token_amount_units = None;
+    let mut witness_concrete = witness_unknown.clone();
+    witness_concrete.claims.token_amount_units = Some(42);
+
+    let mut raw_first = PumpObservationLedgerV1::default();
+    assert!(raw_first
+        .observe(primary.clone(), 1)
+        .observation_decision
+        .did_canonical_apply());
+    for (now, witness) in [(2, witness_unknown.clone()), (3, witness_concrete.clone())] {
+        let decision = raw_first.observe(witness, now).observation_decision;
+        assert_eq!(
+            decision.classification,
+            PumpObservationClassificationV1::SameMutationAgreement
+        );
+        assert_eq!(
+            decision.provider_agreement,
+            PumpProviderAgreementV1::PrimarySecondaryAgreement
+        );
+        assert!(decision.conflict_fields.is_empty());
+    }
+    let raw_first_before_replays = raw_first.snapshot();
+    assert_eq!(raw_first_before_replays.canonical_mutation_count, 1);
+    assert_eq!(raw_first_before_replays.exact_duplicate_count, 0);
+    assert_eq!(raw_first_before_replays.conflict_count, 0);
+
+    let mut witness_first = PumpObservationLedgerV1::default();
+    for (now, witness) in [(1, witness_unknown.clone()), (2, witness_concrete.clone())] {
+        assert_eq!(
+            witness_first
+                .observe(witness, now)
+                .observation_decision
+                .classification,
+            PumpObservationClassificationV1::SecondaryWitnessOnly
+        );
+    }
+    let resolved = witness_first.observe(primary, 3);
+    assert!(resolved.observation_decision.did_canonical_apply());
+    assert_eq!(resolved.derived_decisions.len(), 2);
+    assert!(resolved.derived_decisions.iter().all(|decision| {
+        decision.classification == PumpObservationClassificationV1::SameMutationAgreement
+            && decision.provider_agreement == PumpProviderAgreementV1::PrimarySecondaryAgreement
+            && decision.conflict_fields.is_empty()
+    }));
+    assert_eq!(witness_first.snapshot(), raw_first_before_replays);
+
+    for ledger in [&mut raw_first, &mut witness_first] {
+        for (now, witness) in [(4, witness_unknown.clone()), (5, witness_concrete.clone())] {
+            assert_eq!(
+                ledger
+                    .observe(witness, now)
+                    .observation_decision
+                    .classification,
+                PumpObservationClassificationV1::ExactDuplicate,
+                "each retained full normalization must be independently replayable"
+            );
+        }
+        assert_eq!(ledger.snapshot().canonical_mutation_count, 1);
+        assert_eq!(ledger.snapshot().exact_duplicate_count, 2);
+        assert_eq!(ledger.snapshot().conflict_count, 0);
+    }
+    assert_eq!(witness_first.snapshot(), raw_first.snapshot());
+}
+
+#[test]
+fn same_identity_inventory_divergence_is_typed_and_retained_in_both_arrival_orders() {
+    let sig = signature(209);
+    let loc = locator(sig, 0);
+    let claims = complete_claims(key(87), key(88));
+    let primary = primary_raw(loc.clone(), claims.clone(), 210, Some(1));
+    let witness_count_one = secondary_raw(loc, claims, "raw-secondary-inventory-divergence", 211);
+    let mut witness_count_two = witness_count_one.clone();
+    witness_count_two.raw_transaction_mutation_count = Some(2);
+
+    let assert_inventory_conflict = |decision: &ghost_core::PumpObservationLedgerDecisionV1| {
+        assert_eq!(
+            decision.classification,
+            PumpObservationClassificationV1::SourceReconciliationConflict
+        );
+        assert_eq!(
+            decision.provider_agreement,
+            PumpProviderAgreementV1::PrimarySecondaryConflict
+        );
+        assert_eq!(
+            decision.conflict_fields,
+            vec![PumpMutationConflictFieldV1::RawTransactionMutationCount]
+        );
+        assert_eq!(
+            decision
+                .candidate_integrity_signal
+                .as_ref()
+                .map(|signal| signal.outcome),
+            Some(CandidateIntegrityOutcomeV1::SourceReconciliationConflict)
+        );
+    };
+
+    let mut raw_first = PumpObservationLedgerV1::default();
+    assert!(raw_first
+        .observe(primary.clone(), 1)
+        .observation_decision
+        .did_canonical_apply());
+    assert_eq!(
+        raw_first
+            .observe(witness_count_one.clone(), 2)
+            .observation_decision
+            .classification,
+        PumpObservationClassificationV1::SameMutationAgreement
+    );
+    let raw_first_conflict = raw_first
+        .observe(witness_count_two.clone(), 3)
+        .observation_decision;
+    assert_inventory_conflict(&raw_first_conflict);
+    let raw_first_before_replays = raw_first.snapshot();
+    assert_eq!(raw_first_before_replays.canonical_mutation_count, 1);
+    assert_eq!(raw_first_before_replays.exact_duplicate_count, 0);
+    assert_eq!(raw_first_before_replays.conflict_count, 1);
+
+    let mut witness_first = PumpObservationLedgerV1::default();
+    for (now, witness) in [
+        (1, witness_count_one.clone()),
+        (2, witness_count_two.clone()),
+    ] {
+        assert_eq!(
+            witness_first
+                .observe(witness, now)
+                .observation_decision
+                .classification,
+            PumpObservationClassificationV1::SecondaryWitnessOnly
+        );
+    }
+    let resolved = witness_first.observe(primary, 3);
+    assert!(resolved.observation_decision.did_canonical_apply());
+    assert_eq!(resolved.derived_decisions.len(), 2);
+    assert!(resolved.derived_decisions.iter().any(|decision| {
+        decision.classification == PumpObservationClassificationV1::SameMutationAgreement
+    }));
+    let witness_first_conflict = resolved
+        .derived_decisions
+        .iter()
+        .find(|decision| {
+            decision.classification == PumpObservationClassificationV1::SourceReconciliationConflict
+        })
+        .expect("inventory divergence must remain typed in witness-first order");
+    assert_inventory_conflict(witness_first_conflict);
+    assert_eq!(witness_first.snapshot(), raw_first_before_replays);
+    assert_eq!(
+        witness_first.retained_conflicts(),
+        raw_first.retained_conflicts()
+    );
+
+    for ledger in [&mut raw_first, &mut witness_first] {
+        for (now, witness) in [
+            (4, witness_count_one.clone()),
+            (5, witness_count_two.clone()),
+        ] {
+            assert_eq!(
+                ledger
+                    .observe(witness, now)
+                    .observation_decision
+                    .classification,
+                PumpObservationClassificationV1::ExactDuplicate,
+                "each retained inventory normalization must be independently replayable"
+            );
+        }
+        assert_eq!(ledger.snapshot().canonical_mutation_count, 1);
+        assert_eq!(ledger.snapshot().exact_duplicate_count, 2);
+        assert_eq!(ledger.snapshot().conflict_count, 1);
+    }
+    assert_eq!(witness_first.snapshot(), raw_first.snapshot());
+}
+
+#[test]
 fn secondary_witness_expiry_retains_bounded_identity_and_first_overflow_evidence() {
     let sig = signature(204);
     let loc = locator(sig, 0);

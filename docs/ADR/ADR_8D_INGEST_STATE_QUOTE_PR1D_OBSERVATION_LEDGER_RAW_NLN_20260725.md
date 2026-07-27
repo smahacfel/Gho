@@ -104,9 +104,13 @@ Kontrakty wspólne należą do `ghost-core::ingest_integrity`.
 - provider role;
 - immutable provenance z captured-payload BLAKE3.
 
-Observation identity nie zawiera claims ani czasu odbioru. Exact replay
-oznacza tę samą immutable provider observation identity. Dwie obserwacje o tej
-samej signature, ale innym locatorze, pozostają odrębne.
+Observation identity nie zawiera claims ani czasu odbioru i sama nie dowodzi
+exact normalized replay. `ExactDuplicate` wymaga łącznie tej samej immutable
+provider observation identity oraz identycznej pełnej normalized observation.
+Ta sama identity z inną normalizacją pozostaje odrębnym bounded evidence:
+zgodne Unknown/concrete jest agreement, a sprzeczne concrete albo
+transaction-local inventory jest typed divergence. Dwie obserwacje o tej samej
+signature, ale innym locatorze, pozostają odrębne.
 
 ### D2.2. Structural canonical mutation
 
@@ -724,4 +728,35 @@ Walidacja drugiej remediacji:
 - `cargo test -p ghost-core --no-fail-fast`: wyłącznie zamrożony baseline
   `foundational_types_serialize_and_deserialize_roundtrip` z
   `InvalidTagEncoding(104)`; wszystkie nowe testy PASS;
+- `cargo build --release --workspace`: PASS.
+
+## D19. Finalne domknięcie exact normalized replay
+
+Finalne review wykazało, że branch canonical correlation nadal używał samej
+provider observation identity jako wystarczającego warunku duplicate, gdy
+pełna normalizacja różniła się bez concrete-vs-concrete material conflict.
+Kontrakt został domknięty bez zmiany authority:
+
+- `ExactDuplicate` wymaga jednocześnie tej samej immutable identity oraz
+  identycznej pełnej normalized observation;
+- Unknown przechodzące w zgodną wartość concrete pozostaje odrębnym,
+  ograniczonym agreement evidence;
+- różny `raw_transaction_mutation_count` jest typed
+  `RawTransactionMutationCount` divergence i nie jest agreement ani duplicate;
+- raw-first i witness-first dają ten sam snapshot, jedną canonical mutation i
+  zachowują oba warianty pełnej normalizacji w istniejącym bounded lane;
+- replay każdego zachowanego wariantu jest później idempotentnym
+  `ExactDuplicate`.
+
+Walidacja finalnego domknięcia:
+
+- dwa nowe adversarial testy obu arrival orders: PASS;
+- pełne ledger unit, adversarial oraz executable V1/V2 corpus: PASS;
+- parser snapshot V1
+  `549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202`
+  i V2
+  `507b13704d5b90c3f724a395acbf0d0cc55fdc37a83fcb95cf67cceb6247569f`:
+  PASS;
+- `cargo test -p ghost-core --no-fail-fast`: tylko niezmieniony baseline
+  `InvalidTagEncoding(104)`;
 - `cargo build --release --workspace`: PASS.

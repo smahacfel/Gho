@@ -1130,49 +1130,38 @@ impl PumpObservationLedgerV1 {
             canonical,
             candidate,
             primary_provenance,
+            primary_raw_transaction_mutation_count,
             correlated_witness_count,
         ) = {
             let record = self
                 .canonical_by_locator
                 .get(locator)
                 .expect("caller checked canonical locator");
+            let primary_identity = ProviderObservationIdentity::from(&record.primary_observation);
             (
                 record.observation_identities.contains(&identity),
-                record.correlated_witnesses.iter().any(|retained| {
-                    ProviderObservationIdentity::from(retained) == identity
-                        && same_normalized_observation(retained, &observation)
-                }),
+                (primary_identity == identity
+                    && same_normalized_observation(&record.primary_observation, &observation))
+                    || record.correlated_witnesses.iter().any(|retained| {
+                        ProviderObservationIdentity::from(retained) == identity
+                            && same_normalized_observation(retained, &observation)
+                    }),
                 record.canonical.clone(),
                 record.candidate,
                 record.canonical.primary_raw_provenance.clone(),
+                record.raw_transaction_mutation_count,
                 record.correlated_witnesses.len(),
             )
         };
-        let conflict_fields = material_conflict_fields(&canonical, &observation);
+        let mut conflict_fields = material_conflict_fields(&canonical, &observation);
+        push_concrete_conflict(
+            &mut conflict_fields,
+            observation.raw_transaction_mutation_count.as_ref(),
+            primary_raw_transaction_mutation_count.as_ref(),
+            PumpMutationConflictFieldV1::RawTransactionMutationCount,
+        );
 
-        if exact_identity {
-            // A captured provider payload cannot legitimately normalize into
-            // two different structural facts. The first such contradiction is
-            // retained as a typed source conflict; only an exact replay of that
-            // already-retained contradictory normalization is a duplicate.
-            if !conflict_fields.is_empty() && !exact_normalized_observation {
-                let retained_observation = self.retain_correlated_observation(
-                    locator,
-                    identity,
-                    &observation,
-                    correlated_witness_count,
-                );
-                return self.source_conflict_decision(
-                    locator,
-                    primary_provenance,
-                    candidate,
-                    observation,
-                    correlation,
-                    conflict_fields,
-                    incoming_is_primary,
-                    retained_observation,
-                );
-            }
+        if exact_identity && exact_normalized_observation {
             self.exact_duplicate_count = self.exact_duplicate_count.saturating_add(1);
             let provider_agreement = if !conflict_fields.is_empty() {
                 if incoming_is_primary {
@@ -1609,6 +1598,9 @@ fn conflict_field_tag(field: PumpMutationConflictFieldV1) -> &'static [u8] {
     match field {
         PumpMutationConflictFieldV1::MutationFamily => b"mutation_family",
         PumpMutationConflictFieldV1::CanonicalOrder => b"canonical_order",
+        PumpMutationConflictFieldV1::RawTransactionMutationCount => {
+            b"raw_transaction_mutation_count"
+        }
         PumpMutationConflictFieldV1::Curve => b"curve",
         PumpMutationConflictFieldV1::Mint => b"mint",
         PumpMutationConflictFieldV1::RouteVariant => b"route_variant",

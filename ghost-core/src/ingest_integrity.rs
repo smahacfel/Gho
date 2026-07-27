@@ -319,6 +319,7 @@ pub enum ParsedWitnessCorrelationOutcomeV1 {
 pub enum PumpMutationConflictFieldV1 {
     MutationFamily,
     CanonicalOrder,
+    RawTransactionMutationCount,
     Curve,
     Mint,
     RouteVariant,
