@@ -103,6 +103,10 @@ pub enum PumpObservationClassificationV1 {
     ExactDuplicate,
     SameMutationAgreement,
     SecondaryWitnessOnly,
+    /// A secondary raw witness exhausted the bounded correlation window
+    /// without an exact primary locator. It is audited and removed from the
+    /// pending lane; it never enables singleton correlation or canonical apply.
+    SecondaryWitnessExpired,
     ParsedWitnessPending,
     ExactStructuralMatch,
     UniqueSignatureSingletonMatch,
@@ -385,7 +389,23 @@ impl PumpObservationLedgerV1 {
 
         for pending in self.pending_witnesses.drain(..) {
             let age = now_monotonic_ns.saturating_sub(pending.first_seen_monotonic_ns);
-            if pending.observation.provenance.source_family == ObservationSourceFamilyV1::ParsedNln
+            if age >= self.config.correlation_window_ns
+                && pending.observation.provenance.source_family
+                    == ObservationSourceFamilyV1::RawYellowstone
+                && pending.observation.raw_provider_role
+                    == Some(RawProviderRoleV1::SecondaryWitness)
+            {
+                decisions.push(PumpObservationLedgerDecisionV1 {
+                    classification: PumpObservationClassificationV1::SecondaryWitnessExpired,
+                    correlation: None,
+                    provider_agreement: PumpProviderAgreementV1::WitnessOnly,
+                    conflict_fields: Vec::new(),
+                    canonical_mutation: None,
+                    candidate_integrity_signal: None,
+                    evidence_complete: self.witness_evidence_complete,
+                });
+            } else if pending.observation.provenance.source_family
+                == ObservationSourceFamilyV1::ParsedNln
                 && age >= self.config.correlation_window_ns
             {
                 expired_by_signature
@@ -1905,6 +1925,70 @@ mod tests {
         assert_eq!(snapshot.canonical_mutation_count, 1);
         assert!(!snapshot.witness_evidence_complete);
         assert!(snapshot.first_evidence_overflow.is_some());
+    }
+
+    #[test]
+    fn expired_secondary_reclaims_pending_capacity_without_singleton_or_canonical_authority() {
+        let config = PumpObservationLedgerConfigV1 {
+            correlation_window_ns: 10,
+            max_pending_witnesses: 1,
+            ..PumpObservationLedgerConfigV1::default()
+        };
+        let mut ledger = PumpObservationLedgerV1::try_new(config).expect("valid test config");
+        let signature = Signature::new_unique();
+        let locator = locator(signature, 0);
+        let curve = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let secondary = raw(
+            locator.clone(),
+            RawProviderRoleV1::SecondaryWitness,
+            "secondary",
+            1,
+            curve,
+            mint,
+            10,
+            1,
+        );
+
+        let first = ledger.observe(secondary.clone(), 1).observation_decision;
+        assert_eq!(
+            first.classification,
+            PumpObservationClassificationV1::SecondaryWitnessOnly
+        );
+        assert_eq!(ledger.snapshot().pending_witness_count, 1);
+
+        let expired = ledger.finalize_expired(11);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(
+            expired[0].classification,
+            PumpObservationClassificationV1::SecondaryWitnessExpired
+        );
+        assert_eq!(expired[0].correlation, None);
+        assert!(expired[0].canonical_mutation.is_none());
+        assert!(expired[0].candidate_integrity_signal.is_none());
+        assert_eq!(ledger.snapshot().pending_witness_count, 0);
+        assert_eq!(ledger.snapshot().canonical_mutation_count, 0);
+
+        let replay = ledger.observe(secondary, 12).observation_decision;
+        assert_eq!(
+            replay.classification,
+            PumpObservationClassificationV1::SecondaryWitnessOnly
+        );
+        let primary = ledger.observe(
+            raw(
+                locator,
+                RawProviderRoleV1::PrimaryAuthority,
+                "primary",
+                2,
+                curve,
+                mint,
+                10,
+                1,
+            ),
+            13,
+        );
+        assert!(primary.observation_decision.did_canonical_apply());
+        assert_eq!(ledger.snapshot().canonical_mutation_count, 1);
     }
 
     #[test]

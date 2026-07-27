@@ -22,7 +22,6 @@ use super::shadow_run::{
     RpcShadowSimulator, ShadowPreparationError, ShadowSimulator, TriggerBuyOutcome,
 };
 use super::tip_guard::{calculate_safe_tip, TipGuardConfig};
-use crate::candidate_integrity::{CandidateIntegritySubmitGuardV1, CandidateSubmitTransitionV1};
 use crate::components::live_tx_sender::{
     select_sender_tip_account, BuyTipResolution, LiveTxSender, LiveTxSenderError,
     PriorityFeeCacheKey, PriorityFeeEstimate, TipFloorResolutionTelemetry,
@@ -365,10 +364,6 @@ impl PreparedBuyRequestBuildMetadata {
 
 #[derive(Debug, Clone)]
 pub struct PreparedBuyRequest {
-    /// Technical integrity CAS used immediately before the first live sender
-    /// call. Compatibility/test builders may leave it absent; the active
-    /// OracleRuntime BUY path always attaches it.
-    pub candidate_integrity_submit_guard: Option<CandidateIntegritySubmitGuardV1>,
     pub join_metadata: ExecutionJoinMetadata,
     pub shadow_v2_entry_boundary: Option<ShadowV2EntryBoundaryPayload>,
     pub state_readiness_latch_diagnostics:
@@ -407,14 +402,6 @@ pub struct PreparedBuyRequest {
 }
 
 impl PreparedBuyRequest {
-    pub fn with_candidate_integrity_submit_guard(
-        mut self,
-        submit_guard: CandidateIntegritySubmitGuardV1,
-    ) -> Self {
-        self.candidate_integrity_submit_guard = Some(submit_guard);
-        self
-    }
-
     pub fn with_join_metadata(mut self, join_metadata: ExecutionJoinMetadata) -> Self {
         self.join_metadata = join_metadata;
         self
@@ -3069,7 +3056,6 @@ impl TriggerComponent {
     ) -> PreparedBuyRequest {
         let shadow_v2_entry_boundary = self.capture_shadow_v2_entry_boundary(build_profile);
         PreparedBuyRequest {
-            candidate_integrity_submit_guard: None,
             join_metadata: ExecutionJoinMetadata::default(),
             shadow_v2_entry_boundary,
             state_readiness_latch_diagnostics: None,
@@ -3219,7 +3205,6 @@ impl TriggerComponent {
             buy_tx,
         );
         rebuilt.preparation_telemetry = request.preparation_telemetry.clone();
-        rebuilt.candidate_integrity_submit_guard = request.candidate_integrity_submit_guard.clone();
         rebuilt.preparation_telemetry.payer_load_ms = payer_load_ms;
         rebuilt.preparation_telemetry.rebuild_ms = rebuild_ms;
         metrics::histogram!(
@@ -3542,14 +3527,6 @@ impl TriggerComponent {
                 "live BUY dispatch requires initialized Helius Sender transport"
             ))
         })?;
-        let submit_guard = request
-            .candidate_integrity_submit_guard
-            .clone()
-            .ok_or_else(|| {
-                SubmitPreparedViaSenderError::Failed(anyhow::anyhow!(
-                    "live BUY dispatch requires CandidateIntegrity submit guard"
-                ))
-            })?;
         let client_setup_latency_ms = saturating_elapsed_ms(client_setup_started_at);
         let mint = request.mint;
         let amount_lamports = request.amount_lamports;
@@ -3702,29 +3679,15 @@ impl TriggerComponent {
                 blockhash_observed_block_height = current_request.blockhash_observed_block_height,
                 "Trigger: live BUY pre-submit timing checkpoint"
             );
-            if attempt_index == 0 {
-                match submit_guard.try_begin_submit().map_err(|error| {
-                    metrics::counter!("trigger_candidate_integrity_submit_cancel_total", 1u64);
-                    SubmitPreparedViaSenderError::Failed(anyhow::anyhow!(
-                        "candidate integrity cancelled BUY before first sender call: {}",
-                        error
-                    ))
-                })? {
-                    CandidateSubmitTransitionV1::StartedNow => {}
-                    CandidateSubmitTransitionV1::AlreadyStarted => {
-                        metrics::counter!("trigger_candidate_integrity_submit_cancel_total", 1u64);
-                        return Err(SubmitPreparedViaSenderError::UncertainLanding(
-                            anyhow::anyhow!(
-                                "duplicate BUY submit attempt blocked: CandidateIntegrity guard was already started"
-                            ),
-                        ));
-                    }
-                }
-            }
             let submission = match client.send_transaction(&current_request.buy_tx).await {
                 Ok(submission) => submission,
                 Err(err) => {
                     let error = anyhow::anyhow!("Helius Sender BUY submission failed: {}", err);
+                    let next_action = if attempt_index == 0 {
+                        "stop"
+                    } else {
+                        "retain_slot"
+                    };
                     Self::log_live_buy_attempt_summary(
                         &mint,
                         &current_request,
@@ -3732,14 +3695,14 @@ impl TriggerComponent {
                         attempt_number,
                         "submit_failed",
                         None,
-                        "retain_slot",
+                        next_action,
                         Some(&error.to_string()),
                     );
-                    // Once the sender call was invoked, request/timeout/body
-                    // errors cannot prove that the endpoint did not accept the
-                    // signed transaction. Treat every attempt as unknown and
-                    // retain capacity for reconciliation.
-                    return Err(SubmitPreparedViaSenderError::UncertainLanding(error));
+                    return Err(if attempt_index == 0 {
+                        SubmitPreparedViaSenderError::Failed(error)
+                    } else {
+                        SubmitPreparedViaSenderError::UncertainLanding(error)
+                    });
                 }
             };
             if submission.signature != expected_signature {
@@ -3830,22 +3793,6 @@ impl TriggerComponent {
                         "stop",
                         None,
                     );
-                    if let Some(submit_guard) =
-                        confirmed_request.candidate_integrity_submit_guard.as_ref()
-                    {
-                        if let Err(error) = submit_guard.mark_confirmed() {
-                            metrics::counter!(
-                                "trigger_candidate_integrity_confirmation_marker_failure_total",
-                                1u64
-                            );
-                            warn!(
-                                mint = %mint,
-                                signature = %confirmed_transaction.signature,
-                                error = %error,
-                                "live BUY was confirmed but CandidateIntegrity confirmation marker failed"
-                            );
-                        }
-                    }
                     return Ok(confirmed_transaction);
                 }
                 SenderBuyAttemptConfirmation::Failed { source, detail } => {
@@ -5401,11 +5348,7 @@ impl TriggerComponent {
                 })
             }
             Err(error) => {
-                retain_position_slot_on_error = error.should_retain_position_slot()
-                    || request_for_error
-                        .candidate_integrity_submit_guard
-                        .as_ref()
-                        .is_some_and(CandidateIntegritySubmitGuardV1::requires_reconciliation);
+                retain_position_slot_on_error = error.should_retain_position_slot();
                 warn!(
                     mint = %mint,
                     amount_lamports,

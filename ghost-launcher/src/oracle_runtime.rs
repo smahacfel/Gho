@@ -17,9 +17,8 @@
 
 use crate::candidate_integrity::{
     CandidateIntegrityConflictActionV1, CandidateIntegrityErrorV1,
-    CandidateIntegrityEvaluationGuardV1, CandidateIntegrityReadyReleaseV1,
-    CandidateIntegrityRegistry, CandidateIntegritySubmitGuardV1, CandidateLifecyclePhaseV1,
-    CandidateTerminalTransitionV1, CanonicalMutationApplyReceiptV1,
+    CandidateIntegrityEvaluationGuardV1, CandidateIntegrityRegistry, CandidateTerminalTransitionV1,
+    CanonicalMutationApplyReceiptV1,
 };
 use crate::components::post_buy_runtime::{
     DirectPostBuyHandoff, DirectPostBuyHandoffAck, DirectPostBuySender,
@@ -2972,7 +2971,7 @@ impl OracleRuntime {
                     pool = %candidate.pool_amm_id,
                     base_mint = %candidate.mint,
                     error = %error,
-                    "CandidateIntegrity registry failed closed"
+                    "CandidateIntegrity shadow registry unavailable; active runtime behavior remains unchanged"
                 );
             }
         }
@@ -3855,7 +3854,7 @@ impl OracleRuntime {
             .pool_identities
             .get_by_pool(&update.pool_amm_id)
             .is_some();
-        let lifecycle_allows_canonical_apply = self
+        let candidate_integrity_would_allow = self
             .candidate_integrity_registry
             .account_state_apply_allowed(PumpCandidateIdentityV1 {
                 pool_amm_id: update.pool_amm_id,
@@ -3867,21 +3866,23 @@ impl OracleRuntime {
                         pool = %update.pool_amm_id,
                         mint = %update.base_mint,
                         error = %error,
-                        "CandidateIntegrity authority recheck unavailable; AccountUpdate fails closed"
+                        "CandidateIntegrity AccountUpdate shadow check unavailable; canonical authority remains unchanged"
                     );
                     false
                 },
                 |status| status.unwrap_or(true),
             );
-        let effective_canonical_state_apply = allow_canonical_state_apply
-            && active_identity_present
-            && lifecycle_allows_canonical_apply;
+        if !candidate_integrity_would_allow {
+            ::metrics::counter!("candidate_integrity_would_block_account_update_total", 1u64);
+        }
+        let effective_canonical_state_apply =
+            allow_canonical_state_apply && active_identity_present;
         if allow_canonical_state_apply && !effective_canonical_state_apply {
             ::metrics::counter!(
                 "account_update_authority_downgraded_total",
                 1u64,
                 "active_identity" => if active_identity_present { "present" } else { "terminal_tombstone" },
-                "candidate_integrity" => if lifecycle_allows_canonical_apply { "allowed" } else { "closed" }
+                "candidate_integrity" => if candidate_integrity_would_allow { "would_allow" } else { "would_block_observe_only" }
             );
         }
         let apply_result = if effective_canonical_state_apply {
@@ -4521,8 +4522,10 @@ impl OracleRuntime {
             .commit_coordinator
             .add_approved_tx(&base_mint, buffered_tx)
         {
+            // Buffering/enqueueing is not proof that a downstream canonical
+            // state owner applied this structural mutation.
             CommitIngressOutcome::BufferedHistory | CommitIngressOutcome::PendingLive => {
-                CanonicalMutationApplyOutcomeV1::AppliedNewMutation
+                CanonicalMutationApplyOutcomeV1::Ignored
             }
             CommitIngressOutcome::Duplicate => CanonicalMutationApplyOutcomeV1::Duplicate,
             CommitIngressOutcome::RouteToLive { bootstrap_snapshot } => {
@@ -17709,8 +17712,6 @@ enum PoolObservationMsg {
         Option<CanonicalMutationApplyReceiptV1>,
         CanonicalMutationApplyOutcomeV1,
     ),
-    /// Re-run a feature trigger that was held behind CandidateIntegrity.
-    CandidateIntegrityReady,
 }
 
 /// Result sent back from a per-pool task on terminal verdict.
@@ -17730,22 +17731,28 @@ struct PoolObservationResult {
     /// True when the pool must remain active after task completion even
     /// without a confirmed live BUY, e.g. an accepted shadow Guardian handoff.
     retain_runtime_pool: bool,
-    integrity_ready_rechecks: Vec<CandidateIntegrityReadyReleaseV1>,
 }
 
 fn complete_canonical_apply(
     ctx: &PoolObservationContext,
     receipt: Option<&CanonicalMutationApplyReceiptV1>,
-) -> Vec<CandidateIntegrityReadyReleaseV1> {
+) {
     let Some(receipt) = receipt else {
-        return Vec::new();
+        return;
     };
     match ctx
         .oracle_runtime
         .candidate_integrity_registry
         .mark_canonical_apply_succeeded(receipt)
     {
-        Ok(released) => released,
+        Ok(released) => {
+            if !released.is_empty() {
+                ::metrics::counter!(
+                    "candidate_integrity_shadow_ready_total",
+                    released.len() as u64
+                );
+            }
+        }
         Err(error) => {
             warn!(
                 signature = %receipt.signature,
@@ -17753,9 +17760,8 @@ fn complete_canonical_apply(
                 candidate_pool = %receipt.candidate.pool_amm_id,
                 candidate_mint = %receipt.candidate.mint,
                 error = %error,
-                "canonical mutation applied downstream, but CandidateIntegrity apply fence failed closed"
+                "canonical mutation applied downstream, but CandidateIntegrity shadow proof could not be completed"
             );
-            Vec::new()
         }
     }
 }
@@ -17764,12 +17770,13 @@ fn resolve_canonical_apply(
     ctx: &PoolObservationContext,
     receipt: Option<&CanonicalMutationApplyReceiptV1>,
     outcome: CanonicalMutationApplyOutcomeV1,
-) -> Vec<CandidateIntegrityReadyReleaseV1> {
+) {
     let Some(receipt) = receipt else {
-        return Vec::new();
+        return;
     };
     if outcome == CanonicalMutationApplyOutcomeV1::AppliedNewMutation {
-        return complete_canonical_apply(ctx, Some(receipt));
+        complete_canonical_apply(ctx, Some(receipt));
+        return;
     }
     if let Err(error) = ctx
         .oracle_runtime
@@ -17781,39 +17788,9 @@ fn resolve_canonical_apply(
             locator = ?receipt.locator,
             outcome = ?outcome,
             error = %error,
-            "canonical mutation was not newly applied; CandidateIntegrity failed closed"
+            "canonical mutation was not newly applied; CandidateIntegrity shadow proof invalidated"
         );
     }
-    Vec::new()
-}
-
-fn schedule_integrity_ready_rechecks(
-    ctx: &PoolObservationContext,
-    current_candidate: Option<PumpCandidateIdentityV1>,
-    releases: &[CandidateIntegrityReadyReleaseV1],
-) -> bool {
-    if releases.is_empty() {
-        return true;
-    }
-    let integrity_ready_rechecks = releases
-        .iter()
-        .filter(|release| Some(release.candidate) != current_candidate)
-        .cloned()
-        .collect::<Vec<_>>();
-    if integrity_ready_rechecks.is_empty() {
-        return true;
-    }
-    let result = PoolObservationResult {
-        pool_id: current_candidate
-            .map(|candidate| candidate.pool_amm_id)
-            .unwrap_or_default(),
-        base_mint: current_candidate.map(|candidate| candidate.mint),
-        disposition: PoolObservationDispositionV1::BoughtOrRetainedRuntime,
-        bought: false,
-        retain_runtime_pool: true,
-        integrity_ready_rechecks,
-    };
-    send_pool_observation_result(ctx, result)
 }
 
 fn send_pool_observation_result(
@@ -17823,13 +17800,7 @@ fn send_pool_observation_result(
     let pool_id = result.pool_id;
     match ctx.result_tx.send(result) {
         Ok(()) => true,
-        Err(error) => {
-            for release in error.0.integrity_ready_rechecks {
-                let _ = ctx
-                    .oracle_runtime
-                    .candidate_integrity_registry
-                    .fail_ready_release(&release);
-            }
+        Err(_error) => {
             warn!(
                 pool = %pool_id,
                 "per-pool result delivery failed because the Oracle result receiver is closed"
@@ -17837,16 +17808,6 @@ fn send_pool_observation_result(
             false
         }
     }
-}
-
-fn candidate_integrity_is_ready(
-    registry: &CandidateIntegrityRegistry,
-    candidate: PumpCandidateIdentityV1,
-) -> bool {
-    registry.snapshot(candidate).is_ok_and(|record| {
-        record.outcome == CandidateIntegrityOutcomeV1::Ready
-            && record.lifecycle_phase == CandidateLifecyclePhaseV1::PreMfs
-    })
 }
 
 fn detected_pool_apply_receipt(
@@ -17998,14 +17959,6 @@ fn try_materialize_terminal_features(
     Ok(features)
 }
 
-#[derive(Debug, Error)]
-enum TerminalEvaluationErrorV1 {
-    #[error(transparent)]
-    MetricContract(#[from] crate::session::observation::MetricContractMaterializationErrorV1),
-    #[error(transparent)]
-    CandidateIntegrity(#[from] CandidateIntegrityErrorV1),
-}
-
 #[derive(Clone, Copy)]
 struct CandidateIntegrityEvaluationInputV1<'a> {
     registry: &'a Arc<CandidateIntegrityRegistry>,
@@ -18015,47 +17968,94 @@ struct CandidateIntegrityEvaluationInputV1<'a> {
 
 fn open_candidate_integrity_evaluation_guard(
     input: Option<CandidateIntegrityEvaluationInputV1<'_>>,
-) -> Result<Option<CandidateIntegrityEvaluationGuardV1>, CandidateIntegrityErrorV1> {
+) -> Option<CandidateIntegrityEvaluationGuardV1> {
     let Some(input) = input else {
-        return Ok(None);
+        return None;
     };
-    let mint = input
-        .base_mint
-        .ok_or(CandidateIntegrityErrorV1::CandidateMissing)?;
-    input
-        .registry
-        .evaluation_guard(PumpCandidateIdentityV1 {
-            pool_amm_id: input.pool_amm_id,
-            mint,
-        })
-        .map(Some)
+    let Some(mint) = input.base_mint else {
+        ::metrics::counter!(
+            "candidate_integrity_would_block_before_mfs_total",
+            1u64,
+            "error" => "candidate_missing"
+        );
+        return None;
+    };
+    match input.registry.evaluation_guard(PumpCandidateIdentityV1 {
+        pool_amm_id: input.pool_amm_id,
+        mint,
+    }) {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            ::metrics::counter!(
+                "candidate_integrity_would_block_before_mfs_total",
+                1u64,
+                "error" => candidate_integrity_error_label(&error)
+            );
+            debug!(
+                pool = %input.pool_amm_id,
+                mint = %mint,
+                error = %error,
+                "CandidateIntegrity would block before MFS; observe-only runtime continues"
+            );
+            None
+        }
+    }
+}
+
+fn observe_candidate_integrity_evaluation_started(
+    guard: Option<&CandidateIntegrityEvaluationGuardV1>,
+) {
+    let Some(guard) = guard else {
+        return;
+    };
+    if let Err(error) = guard.mark_mfs_materialized() {
+        ::metrics::counter!(
+            "candidate_integrity_would_abort_evaluation_total",
+            1u64,
+            "stage" => "mfs_materialized",
+            "error" => candidate_integrity_error_label(&error)
+        );
+        return;
+    }
+    if let Err(error) = guard.mark_evaluation_running() {
+        ::metrics::counter!(
+            "candidate_integrity_would_abort_evaluation_total",
+            1u64,
+            "stage" => "evaluation_running",
+            "error" => candidate_integrity_error_label(&error)
+        );
+    }
 }
 
 fn finalize_candidate_integrity_evaluation(
     guard: Option<&CandidateIntegrityEvaluationGuardV1>,
     verdict: &GatekeeperVerdict,
-) -> Result<(), CandidateIntegrityErrorV1> {
+) {
     let Some(guard) = guard else {
-        return Ok(());
+        return;
     };
-    guard.check_ready()?;
-    match verdict {
-        GatekeeperVerdict::Reject { .. } => {
-            guard.publish_terminal(CandidateTerminalTransitionV1::Reject)?;
-        }
-        GatekeeperVerdict::Timeout { .. } => {
-            guard.publish_terminal(CandidateTerminalTransitionV1::Timeout)?;
-        }
-        GatekeeperVerdict::Buy { .. } => {
-            guard.publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)?;
-        }
+    let result = match verdict {
+        GatekeeperVerdict::Reject { .. } => guard
+            .publish_terminal(CandidateTerminalTransitionV1::Reject)
+            .map(|_| ()),
+        GatekeeperVerdict::Timeout { .. } => guard
+            .publish_terminal(CandidateTerminalTransitionV1::Timeout)
+            .map(|_| ()),
+        GatekeeperVerdict::Buy { .. } => guard
+            .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
+            .map(|_| ()),
         GatekeeperVerdict::Wait
         | GatekeeperVerdict::PendingCurve
-        | GatekeeperVerdict::ApprovedTx { .. } => {
-            guard.reset_pre_mfs()?;
-        }
+        | GatekeeperVerdict::ApprovedTx { .. } => guard.reset_pre_mfs(),
+    };
+    if let Err(error) = result {
+        ::metrics::counter!(
+            "candidate_integrity_would_abort_evaluation_total",
+            1u64,
+            "stage" => "verdict_publish",
+            "error" => candidate_integrity_error_label(&error)
+        );
     }
-    Ok(())
 }
 
 fn try_evaluate_feature_driven_terminal_verdict(
@@ -18063,8 +18063,8 @@ fn try_evaluate_feature_driven_terminal_verdict(
     gatekeeper_config: &GatekeeperV2Config,
     force_deadline: bool,
     integrity_input: Option<CandidateIntegrityEvaluationInputV1<'_>>,
-) -> Result<GatekeeperVerdict, TerminalEvaluationErrorV1> {
-    let integrity_guard = open_candidate_integrity_evaluation_guard(integrity_input)?;
+) -> Result<GatekeeperVerdict, crate::session::observation::MetricContractMaterializationErrorV1> {
+    let integrity_guard = open_candidate_integrity_evaluation_guard(integrity_input);
     session.begin_evaluation();
 
     #[cfg(test)]
@@ -18074,10 +18074,7 @@ fn try_evaluate_feature_driven_terminal_verdict(
         ::metrics::counter!("legacy_terminal_verdict_total", 1u64);
         let features =
             try_materialize_terminal_features(session, gatekeeper_config, force_deadline)?;
-        if let Some(guard) = integrity_guard.as_ref() {
-            guard.mark_mfs_materialized()?;
-            guard.mark_evaluation_running()?;
-        }
+        observe_candidate_integrity_evaluation_started(integrity_guard.as_ref());
         let verdict = {
             let buffer = session.gatekeeper_buffer_mut();
             buffer.prepare_feature_evaluation();
@@ -18091,15 +18088,12 @@ fn try_evaluate_feature_driven_terminal_verdict(
             session.resume_accumulation();
         }
 
-        finalize_candidate_integrity_evaluation(integrity_guard.as_ref(), &verdict)?;
+        finalize_candidate_integrity_evaluation(integrity_guard.as_ref(), &verdict);
         return Ok(verdict);
     }
 
     let features = try_materialize_terminal_features(session, gatekeeper_config, force_deadline)?;
-    if let Some(guard) = integrity_guard.as_ref() {
-        guard.mark_mfs_materialized()?;
-        guard.mark_evaluation_running()?;
-    }
+    observe_candidate_integrity_evaluation_started(integrity_guard.as_ref());
     if force_deadline {
         let phase1_passed = features.tx_intel_features.tx_count
             >= gatekeeper_config.min_tx_count as u64
@@ -18139,7 +18133,7 @@ fn try_evaluate_feature_driven_terminal_verdict(
                     Some("feature-driven deadline phase1 timeout".to_string()),
                 );
             let verdict = GatekeeperVerdict::Timeout { assessment };
-            finalize_candidate_integrity_evaluation(integrity_guard.as_ref(), &verdict)?;
+            finalize_candidate_integrity_evaluation(integrity_guard.as_ref(), &verdict);
             return Ok(verdict);
         }
     }
@@ -18157,7 +18151,7 @@ fn try_evaluate_feature_driven_terminal_verdict(
         session.resume_accumulation();
     }
 
-    finalize_candidate_integrity_evaluation(integrity_guard.as_ref(), &verdict)?;
+    finalize_candidate_integrity_evaluation(integrity_guard.as_ref(), &verdict);
     Ok(verdict)
 }
 
@@ -18201,7 +18195,7 @@ fn try_resolve_feature_trigger_outcome(
     ingress: GatekeeperIngressOutcome,
     gatekeeper_config: &GatekeeperV2Config,
     integrity_input: Option<CandidateIntegrityEvaluationInputV1<'_>>,
-) -> Result<GatekeeperVerdict, TerminalEvaluationErrorV1> {
+) -> Result<GatekeeperVerdict, crate::session::observation::MetricContractMaterializationErrorV1> {
     match ingress {
         GatekeeperIngressOutcome::Wait => Ok(GatekeeperVerdict::Wait),
         GatekeeperIngressOutcome::ApprovedTx { tx, metrics } => {
@@ -18302,16 +18296,6 @@ enum PoolObservationEnqueueOutcomeV1 {
     Failed,
 }
 
-impl PoolObservationMsg {
-    fn requires_confirmed_delivery(&self) -> bool {
-        match self {
-            Self::Transaction(_, receipt) => receipt.is_some(),
-            Self::NewPool(_, receipt, _) => receipt.is_some(),
-            Self::CandidateIntegrityReady => true,
-        }
-    }
-}
-
 fn enqueue_pool_observation_msg(
     sender: &tokio::sync::mpsc::Sender<PoolObservationMsg>,
     pool_id: Pubkey,
@@ -18335,17 +18319,9 @@ fn enqueue_pool_observation_msg(
         )
     };
 
-    let requires_confirmed_delivery = msg.requires_confirmed_delivery();
     match sender.try_send(msg) {
         Ok(()) => PoolObservationEnqueueOutcomeV1::Delivered,
         Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-            if requires_confirmed_delivery {
-                warn!(
-                    "POOL_TASK_BACKPRESSURE pool={} msg={} action=fail_closed_integrity_delivery",
-                    pool_id, msg_kind
-                );
-                return PoolObservationEnqueueOutcomeV1::Failed;
-            }
             warn!(
                 "POOL_TASK_BACKPRESSURE pool={} msg={} is_hot={} action=retry_send wait_ms={} attempts={}",
                 pool_id,
@@ -19127,7 +19103,6 @@ async fn hydrate_buy_path_metadata(
                         }
                         continue;
                     }
-                    Some(PoolObservationMsg::CandidateIntegrityReady) => continue,
                     None => return BuyPathMetadataSource::Missing,
                 }
             }
@@ -19221,7 +19196,6 @@ fn apply_trigger_readiness_message(
                     .fail_canonical_apply(receipt);
             }
         }
-        PoolObservationMsg::CandidateIntegrityReady => {}
     }
 }
 
@@ -19506,7 +19480,6 @@ fn apply_active_buy_route_evidence_message(
             }
             None
         }
-        PoolObservationMsg::CandidateIntegrityReady => None,
     }
 }
 
@@ -19969,100 +19942,70 @@ async fn execute_gatekeeper_buy_path(
                                         ),
                                 }
                             });
-                        let candidate = PumpCandidateIdentityV1 {
-                            pool_amm_id,
-                            mint: buy_mint,
-                        };
-                        match ctx
-                            .oracle_runtime
-                            .candidate_integrity_registry()
-                            .submit_guard(candidate)
-                        {
-                            Ok(submit_guard) => {
-                                let receipt = execute_gatekeeper_buy_via_trigger_with_fsc_gate(
-                                    trigger_component,
-                                    fsc_gate_status,
-                                    buy_mint,
-                                    &account_overrides,
-                                    tip_lamports,
-                                    Some(resolved_tip.telemetry.clone()),
-                                    Some(join_metadata),
-                                    Some(submit_guard),
-                                    working_builder_parity_mode,
-                                    working_builder_execution_evidence_context,
-                                    &ctx.oracle_runtime
-                                        .config
-                                        .selector
-                                        .simcov
-                                        .state_readiness_latch,
-                                )
-                                .await;
-                                if ctx.canonical_shadow_mode() && ctx.shutdown_requested() {
-                                    record_shadow_post_buy_handoff_skipped_for_shutdown(
-                                        pool_amm_id,
-                                        buy_mint,
-                                        "after_trigger_dispatch_before_post_buy",
+                        let receipt = execute_gatekeeper_buy_via_trigger_with_fsc_gate(
+                            trigger_component,
+                            fsc_gate_status,
+                            buy_mint,
+                            &account_overrides,
+                            tip_lamports,
+                            Some(resolved_tip.telemetry.clone()),
+                            Some(join_metadata),
+                            working_builder_parity_mode,
+                            working_builder_execution_evidence_context,
+                            &ctx.oracle_runtime
+                                .config
+                                .selector
+                                .simcov
+                                .state_readiness_latch,
+                        )
+                        .await;
+                        if ctx.canonical_shadow_mode() && ctx.shutdown_requested() {
+                            record_shadow_post_buy_handoff_skipped_for_shutdown(
+                                pool_amm_id,
+                                buy_mint,
+                                "after_trigger_dispatch_before_post_buy",
+                            );
+                            shadow_execution_outcome = "shadow_skipped_shutdown".to_string();
+                        } else {
+                            match apply_trigger_dispatch_receipt_with_builder_mode(
+                                &ctx.event_tx,
+                                ctx.post_buy_tx.as_ref(),
+                                trigger_component,
+                                &ctx.post_buy_epoch,
+                                ctx.execution_mode,
+                                &ctx.shadow_entry_log_path,
+                                ctx.shadow_lifecycle_log_path.as_deref(),
+                                &ctx.gatekeeper_rollout_profile,
+                                pool_amm_id,
+                                pd,
+                                trade_value_sol,
+                                tip_lamports,
+                                post_buy_lane,
+                                receipt,
+                                p37_working_builder_parity_enabled(
+                                    &ctx.oracle_runtime.config.p37_shadow_probe,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(applied) => {
+                                    bought = applied.bought;
+                                    retain_runtime_pool = applied.retain_runtime_pool;
+                                    buy_close_reason = applied.close_reason;
+                                    shadow_execution_outcome = applied.shadow_execution_outcome;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        pool = %pool_amm_id,
+                                        "GATEKEEPER BUY PATH FAILED: {}",
+                                        e
                                     );
                                     shadow_execution_outcome =
-                                        "shadow_skipped_shutdown".to_string();
-                                } else {
-                                    match apply_trigger_dispatch_receipt_with_builder_mode(
-                                        &ctx.event_tx,
-                                        ctx.post_buy_tx.as_ref(),
-                                        trigger_component,
-                                        &ctx.post_buy_epoch,
-                                        ctx.execution_mode,
-                                        &ctx.shadow_entry_log_path,
-                                        ctx.shadow_lifecycle_log_path.as_deref(),
-                                        &ctx.gatekeeper_rollout_profile,
-                                        pool_amm_id,
-                                        pd,
-                                        trade_value_sol,
-                                        tip_lamports,
-                                        post_buy_lane,
-                                        receipt,
-                                        p37_working_builder_parity_enabled(
-                                            &ctx.oracle_runtime.config.p37_shadow_probe,
-                                        ),
-                                    )
-                                    .await
-                                    {
-                                        Ok(applied) => {
-                                            bought = applied.bought;
-                                            retain_runtime_pool = applied.retain_runtime_pool;
-                                            buy_close_reason = applied.close_reason;
-                                            shadow_execution_outcome =
-                                                applied.shadow_execution_outcome;
-                                        }
-                                        Err(e) => {
-                                            error!(
-                                                pool = %pool_amm_id,
-                                                "GATEKEEPER BUY PATH FAILED: {}",
-                                                e
-                                            );
-                                            shadow_execution_outcome =
-                                                shadow_execution_outcome_from_dispatch_error(
-                                                    trigger_component,
-                                                    &e,
-                                                );
-                                        }
-                                    }
+                                        shadow_execution_outcome_from_dispatch_error(
+                                            trigger_component,
+                                            &e,
+                                        );
                                 }
-                            }
-                            Err(error) => {
-                                ::metrics::counter!(
-                                    "candidate_integrity_pre_submit_cancel_total",
-                                    1u64,
-                                    "error" => candidate_integrity_error_label(&error)
-                                );
-                                warn!(
-                                    pool = %pool_amm_id,
-                                    mint = %buy_mint,
-                                    error = %error,
-                                    "candidate integrity cancelled BUY before trigger dispatch"
-                                );
-                                shadow_execution_outcome =
-                                    "candidate_integrity_cancelled_before_dispatch".to_string();
                             }
                         }
                     } else {
@@ -20110,7 +20053,6 @@ async fn execute_gatekeeper_buy_via_trigger(
         account_overrides,
         tip_lamports,
         tip_floor_telemetry,
-        None,
         None,
         false,
         None,
@@ -20798,9 +20740,6 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
     tip_lamports: u64,
     tip_floor_telemetry: Option<crate::components::live_tx_sender::TipFloorResolutionTelemetry>,
     join_metadata: Option<ExecutionJoinMetadata>,
-    candidate_integrity_submit_guard: Option<
-        crate::candidate_integrity::CandidateIntegritySubmitGuardV1,
-    >,
     working_builder_parity_mode: bool,
     working_builder_execution_evidence_context: Option<P37WorkingBuilderExecutionEvidenceContext>,
     state_latch_config: &SelectorStateReadinessLatchConfig,
@@ -20840,12 +20779,6 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         } else {
                             prepared_buy
                         };
-                        let prepared_buy =
-                            if let Some(submit_guard) = candidate_integrity_submit_guard.clone() {
-                                prepared_buy.with_candidate_integrity_submit_guard(submit_guard)
-                            } else {
-                                prepared_buy
-                            };
                         let prepared_buy = if working_builder_parity_mode {
                             prepared_buy
                         } else {
@@ -20971,12 +20904,6 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                 } else {
                     prepared_buy
                 };
-                let prepared_buy =
-                    if let Some(submit_guard) = candidate_integrity_submit_guard.clone() {
-                        prepared_buy.with_candidate_integrity_submit_guard(submit_guard)
-                    } else {
-                        prepared_buy
-                    };
                 let prepared_buy = if working_builder_parity_mode {
                     prepared_buy
                 } else {
@@ -25272,7 +25199,6 @@ async fn pool_observation_task(
                 disposition: PoolObservationDispositionV1::TechnicalIntegrityFailure,
                 bought: false,
                 retain_runtime_pool: false,
-                integrity_ready_rechecks: Vec::new(),
             },
         );
         return;
@@ -25378,17 +25304,9 @@ async fn pool_observation_task(
     // ── Emit InitPoolEvent if reserves available ────────────────────────
     maybe_emit_init_pool_event(&ctx, pool_id, pool_data.as_deref());
 
-    let current_candidate = base_mint_pubkey.map(|mint| PumpCandidateIdentityV1 {
-        pool_amm_id: pool_id,
-        mint,
-    });
-    let initial_releases =
-        resolve_canonical_apply(&ctx, initial_apply_receipt.as_ref(), initial_apply_outcome);
-    let _ = schedule_integrity_ready_rechecks(&ctx, current_candidate, &initial_releases);
+    resolve_canonical_apply(&ctx, initial_apply_receipt.as_ref(), initial_apply_outcome);
 
     let post_buy_lane: &str = ctx.post_buy_lane();
-    let mut pending_integrity_trigger = false;
-    let mut pending_integrity_deadline = false;
 
     // ── Deadline: independent per-pool timer ────────────────────────────
     // +1ms grace to avoid races with event-time based deadline in buffer
@@ -25491,71 +25409,25 @@ async fn pool_observation_task(
                             }
                             result
                         };
-                        let candidate = base_mint_pubkey.map(|mint| {
-                            PumpCandidateIdentityV1 {
-                                pool_amm_id: pool_id,
-                                mint,
-                            }
-                        });
-                        let releases = resolve_canonical_apply(
+                        resolve_canonical_apply(
                             &ctx,
                             apply_receipt.as_ref(),
                             ingest_result.apply,
                         );
-                        let _ =
-                            schedule_integrity_ready_rechecks(&ctx, candidate, &releases);
                         #[cfg(test)]
                         ctx.oracle_runtime
                             .notify_downstream_apply_test_completed(&tx.signature);
-                        let released_current = candidate.is_some_and(|current| {
-                            releases
-                                .iter()
-                                .any(|release| release.candidate == current)
-                        });
-                        let ingress = if released_current && pending_integrity_trigger {
-                            let ingress = if pending_integrity_deadline {
-                                GatekeeperIngressOutcome::DeadlineElapsed
-                            } else {
-                                GatekeeperIngressOutcome::TriggerEvaluation
-                            };
-                            pending_integrity_trigger = false;
-                            pending_integrity_deadline = false;
-                            ingress
-                        } else {
-                            ingest_result.ingress
-                        };
-                        let requires_integrity = matches!(
-                            ingress,
-                            GatekeeperIngressOutcome::TriggerEvaluation
-                                | GatekeeperIngressOutcome::DeadlineElapsed
-                        );
-                        if requires_integrity
-                            && !candidate.is_some_and(|candidate| {
-                                candidate_integrity_is_ready(
-                                    &ctx.oracle_runtime.candidate_integrity_registry,
-                                    candidate,
-                                )
-                            })
-                        {
-                            pending_integrity_trigger = true;
-                            pending_integrity_deadline |=
-                                matches!(ingress, GatekeeperIngressOutcome::DeadlineElapsed);
-                            Ok(GatekeeperVerdict::Wait)
-                        } else {
-                            let mut session = session.write();
-                            try_resolve_feature_trigger_outcome(
-                                &mut session,
-                                ingress,
-                                &ctx.gatekeeper_config,
-                                Some(CandidateIntegrityEvaluationInputV1 {
-                                    registry: &ctx
-                                        .oracle_runtime
-                                        .candidate_integrity_registry,
-                                    pool_amm_id: pool_id,
-                                    base_mint: base_mint_pubkey,
-                                }),
-                            )
-                        }
+                        let mut session = session.write();
+                        try_resolve_feature_trigger_outcome(
+                            &mut session,
+                            ingest_result.ingress,
+                            &ctx.gatekeeper_config,
+                            Some(CandidateIntegrityEvaluationInputV1 {
+                                registry: &ctx.oracle_runtime.candidate_integrity_registry,
+                                pool_amm_id: pool_id,
+                                base_mint: base_mint_pubkey,
+                            }),
+                        )
                     }
                     Some(PoolObservationMsg::NewPool(
                         pd,
@@ -25627,89 +25499,12 @@ async fn pool_observation_task(
                             maybe_emit_init_pool_event(&ctx, pool_id, Some(&pd));
                             pool_data = Some(pd);
                         }
-                        let candidate = base_mint_pubkey.map(|mint| {
-                            PumpCandidateIdentityV1 {
-                                pool_amm_id: pool_id,
-                                mint,
-                            }
-                        });
-                        let releases = resolve_canonical_apply(
+                        resolve_canonical_apply(
                             &ctx,
                             apply_receipt.as_ref(),
                             apply_outcome,
                         );
-                        let _ =
-                            schedule_integrity_ready_rechecks(&ctx, candidate, &releases);
-                        if pending_integrity_trigger
-                            && candidate.is_some_and(|candidate| {
-                                candidate_integrity_is_ready(
-                                    &ctx.oracle_runtime.candidate_integrity_registry,
-                                    candidate,
-                                )
-                            })
-                        {
-                            let ingress = if pending_integrity_deadline {
-                                GatekeeperIngressOutcome::DeadlineElapsed
-                            } else {
-                                GatekeeperIngressOutcome::TriggerEvaluation
-                            };
-                            pending_integrity_trigger = false;
-                            pending_integrity_deadline = false;
-                            let mut session = session.write();
-                            try_resolve_feature_trigger_outcome(
-                                &mut session,
-                                ingress,
-                                &ctx.gatekeeper_config,
-                                Some(CandidateIntegrityEvaluationInputV1 {
-                                    registry: &ctx
-                                        .oracle_runtime
-                                        .candidate_integrity_registry,
-                                    pool_amm_id: pool_id,
-                                    base_mint: base_mint_pubkey,
-                                }),
-                            )
-                        } else {
-                            Ok(GatekeeperVerdict::Wait)
-                        }
-                    }
-                    Some(PoolObservationMsg::CandidateIntegrityReady) => {
-                        let candidate = base_mint_pubkey.map(|mint| {
-                            PumpCandidateIdentityV1 {
-                                pool_amm_id: pool_id,
-                                mint,
-                            }
-                        });
-                        if pending_integrity_trigger
-                            && candidate.is_some_and(|candidate| {
-                                candidate_integrity_is_ready(
-                                    &ctx.oracle_runtime.candidate_integrity_registry,
-                                    candidate,
-                                )
-                            })
-                        {
-                            let ingress = if pending_integrity_deadline {
-                                GatekeeperIngressOutcome::DeadlineElapsed
-                            } else {
-                                GatekeeperIngressOutcome::TriggerEvaluation
-                            };
-                            pending_integrity_trigger = false;
-                            pending_integrity_deadline = false;
-                            let mut session = session.write();
-                            try_resolve_feature_trigger_outcome(
-                                &mut session,
-                                ingress,
-                                &ctx.gatekeeper_config,
-                                Some(CandidateIntegrityEvaluationInputV1 {
-                                    registry: &ctx
-                                        .oracle_runtime
-                                        .candidate_integrity_registry,
-                                    pool_amm_id: pool_id,
-                                    base_mint: base_mint_pubkey,
-                                }),
-                            )
-                        } else {
-                            Ok(GatekeeperVerdict::Wait)
-                        }
+                        Ok(GatekeeperVerdict::Wait)
                     }
                     None => {
                         // Channel closed — force terminal evaluation on the collected snapshot.
@@ -25756,60 +25551,28 @@ async fn pool_observation_task(
                 }
                 let mut session = session.write();
                 session.gatekeeper_buffer_mut().advance_event_clock(now_ms);
-                let candidate = base_mint_pubkey.map(|mint| PumpCandidateIdentityV1 {
-                    pool_amm_id: pool_id,
-                    mint,
-                });
-                if candidate.is_some_and(|candidate| {
-                    candidate_integrity_is_ready(
-                        &ctx.oracle_runtime.candidate_integrity_registry,
-                        candidate,
-                    )
-                }) {
-                    try_evaluate_feature_driven_terminal_verdict(
-                        &mut session,
-                        &ctx.gatekeeper_config,
-                        true,
-                        Some(CandidateIntegrityEvaluationInputV1 {
-                            registry: &ctx.oracle_runtime.candidate_integrity_registry,
-                            pool_amm_id: pool_id,
-                            base_mint: base_mint_pubkey,
-                        }),
-                    )
-                } else {
-                    pending_integrity_trigger = true;
-                    pending_integrity_deadline = true;
-                    Ok(GatekeeperVerdict::Wait)
-                }
+                try_evaluate_feature_driven_terminal_verdict(
+                    &mut session,
+                    &ctx.gatekeeper_config,
+                    true,
+                    Some(CandidateIntegrityEvaluationInputV1 {
+                        registry: &ctx.oracle_runtime.candidate_integrity_registry,
+                        pool_amm_id: pool_id,
+                        base_mint: base_mint_pubkey,
+                    }),
+                )
             }
         };
 
         let verdict = match verdict {
             Ok(verdict) => verdict,
             Err(error) => {
-                match &error {
-                    TerminalEvaluationErrorV1::MetricContract(_) => {
-                        ::metrics::counter!("metric_contract_materialization_failures_total", 1u64);
-                        error!(
-                            pool = %pool_id,
-                            error = %error,
-                            "terminal metric-contract materialization failed closed"
-                        );
-                    }
-                    TerminalEvaluationErrorV1::CandidateIntegrity(integrity_error) => {
-                        ::metrics::counter!(
-                            "candidate_integrity_evaluation_block_total",
-                            1u64,
-                            "error" => candidate_integrity_error_label(integrity_error)
-                        );
-                        warn!(
-                            pool = %pool_id,
-                            base_mint = ?base_mint_pubkey,
-                            error = %integrity_error,
-                            "candidate evaluation stopped at technical integrity fence"
-                        );
-                    }
-                }
+                ::metrics::counter!("metric_contract_materialization_failures_total", 1u64);
+                error!(
+                    pool = %pool_id,
+                    error = %error,
+                    "terminal metric-contract materialization failed closed"
+                );
                 ctx.session_manager.remove_session(&pool_id);
                 let _ = send_pool_observation_result(
                     ctx.as_ref(),
@@ -25819,7 +25582,6 @@ async fn pool_observation_task(
                         disposition: PoolObservationDispositionV1::TechnicalIntegrityFailure,
                         bought: false,
                         retain_runtime_pool: false,
-                        integrity_ready_rechecks: Vec::new(),
                     },
                 );
                 return;
@@ -26010,7 +25772,6 @@ async fn pool_observation_task(
                         disposition: PoolObservationDispositionV1::StrategicTerminal,
                         bought: false,
                         retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
-                        integrity_ready_rechecks: Vec::new(),
                     },
                 );
                 return;
@@ -26139,7 +25900,6 @@ async fn pool_observation_task(
                         disposition: PoolObservationDispositionV1::StrategicTerminal,
                         bought: false,
                         retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
-                        integrity_ready_rechecks: Vec::new(),
                     },
                 );
                 return;
@@ -26355,7 +26115,6 @@ async fn pool_observation_task(
                                 disposition: PoolObservationDispositionV1::StrategicTerminal,
                                 bought: false,
                                 retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
-                                integrity_ready_rechecks: Vec::new(),
                             },
                         );
                         return;
@@ -26573,7 +26332,6 @@ async fn pool_observation_task(
                         bought,
                         retain_runtime_pool: retain_runtime_pool
                             || retain_runtime_pool_for_probe_lifecycle,
-                        integrity_ready_rechecks: Vec::new(),
                     },
                 );
                 return;
@@ -27419,7 +27177,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         {
                             warn!(
                                 error = %error,
-                                "CandidateIntegrity apply fence failed closed after Event Bus lag"
+                                "CandidateIntegrity shadow apply fence invalidation failed after Event Bus lag"
                             );
                         }
                         ctx.session_manager.mark_metric_contract_stream_gap();
@@ -27456,7 +27214,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                     pool = %pool_data.pool_amm_id,
                                     mint = %pool_data.base_mint,
                                     error = %error,
-                                    "NewPoolDetected apply receipt lookup failed closed"
+                                    "NewPoolDetected shadow apply receipt lookup failed; active routing continues"
                                 );
                                 None
                             }
@@ -27620,7 +27378,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                     signature = %tx.signature,
                                     event_ordinal = ?tx.event_ordinal,
                                     error = %error,
-                                    "PoolTransaction apply receipt lookup failed closed"
+                                    "PoolTransaction shadow apply receipt lookup failed; active routing continues"
                                 );
                                 None
                             }
@@ -27996,15 +27754,10 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                                     event_ts_ms,
                                                 );
                                             if let Some(receipt) = apply_receipt.as_ref() {
-                                                let releases = resolve_canonical_apply(
+                                                resolve_canonical_apply(
                                                     ctx.as_ref(),
                                                     Some(receipt),
                                                     apply_outcome,
-                                                );
-                                                let _ = schedule_integrity_ready_rechecks(
-                                                    ctx.as_ref(),
-                                                    None,
-                                                    &releases,
                                                 );
                                             }
                                             if runtime_state.is_committed() {
@@ -28170,37 +27923,6 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
             }
 
             Some(result) = result_rx.recv() => {
-                if !result.integrity_ready_rechecks.is_empty() {
-                    for release in result.integrity_ready_rechecks {
-                        let candidate = release.candidate;
-                        if let Some(handle) =
-                            pool_task_handles.get_mut(&candidate.pool_amm_id)
-                        {
-                            let delivery = enqueue_pool_observation_msg(
-                                &handle.tx,
-                                candidate.pool_amm_id,
-                                PoolObservationMsg::CandidateIntegrityReady,
-                                "candidate_integrity_ready",
-                                handle.is_hot(),
-                            );
-                            if delivery != PoolObservationEnqueueOutcomeV1::Delivered {
-                                let _ = oracle_runtime
-                                    .candidate_integrity_registry
-                                    .fail_ready_release(&release);
-                            }
-                        } else {
-                            let _ = oracle_runtime
-                                .candidate_integrity_registry
-                                .fail_ready_release(&release);
-                            warn!(
-                                pool = %candidate.pool_amm_id,
-                                mint = %candidate.mint,
-                                "CandidateIntegrity Ready has no active pool task to recheck"
-                            );
-                        }
-                    }
-                    continue;
-                }
                 if let Some(handle) = pool_task_handles.remove(&result.pool_id) {
                     if let Err(error) = handle.join_handle.await {
                         warn!(
@@ -35058,7 +34780,6 @@ mod tests {
 
         crate::components::trigger::PendingShadowSimulation {
             request: crate::components::trigger::PreparedBuyRequest {
-                candidate_integrity_submit_guard: None,
                 join_metadata: ExecutionJoinMetadata::default(),
                 shadow_v2_entry_boundary: None,
                 state_readiness_latch_diagnostics: None,
@@ -35125,7 +34846,6 @@ mod tests {
         .expect("test request versioned tx");
 
         crate::components::trigger::PreparedBuyRequest {
-            candidate_integrity_submit_guard: None,
             join_metadata: ExecutionJoinMetadata::default(),
             shadow_v2_entry_boundary: None,
             state_readiness_latch_diagnostics: None,
@@ -35266,7 +34986,6 @@ mod tests {
         };
 
         crate::components::trigger::PreparedBuyRequest {
-            candidate_integrity_submit_guard: None,
             join_metadata: ExecutionJoinMetadata::default(),
             shadow_v2_entry_boundary: None,
             state_readiness_latch_diagnostics: None,
@@ -35406,7 +35125,6 @@ mod tests {
         };
 
         crate::components::trigger::PreparedBuyRequest {
-            candidate_integrity_submit_guard: None,
             join_metadata: ExecutionJoinMetadata::default(),
             shadow_v2_entry_boundary: None,
             state_readiness_latch_diagnostics: None,
@@ -37525,6 +37243,23 @@ mod tests {
 
     #[test]
     fn typed_session_and_fast_path_apply_results_never_ack_non_mutations() {
+        let owner_snapshot = |session: &PoolObservationSession| {
+            (
+                session.tx_intelligence.state().clone(),
+                session.tx_intel_features.clone(),
+                session.gatekeeper_buffer.total_tx_count(),
+                session
+                    .tx_buffer
+                    .iter()
+                    .map(|tx| tx.signature.clone())
+                    .collect::<Vec<_>>(),
+                session.tx_keys_seen.clone(),
+                session.highest_seen_ts_ms,
+                session.diagnostics.clone(),
+                format!("{:?}", session.status),
+                session.active_risk_flags.clone(),
+            )
+        };
         let pool_id = Pubkey::new_unique();
         let pool = test_detected_pool(pool_id);
         let mint = Pubkey::from_str(&pool.base_mint).expect("mint");
@@ -37550,28 +37285,69 @@ mod tests {
         accepted.pool_amm_id = pool_id.to_string();
         accepted.token_mint = Some(mint.to_string());
         let accepted = Arc::new(accepted);
+        let accepted_before = owner_snapshot(&session);
         assert_eq!(
             session
                 .ingest_transaction_with_apply_result(Arc::clone(&accepted))
                 .apply,
             CanonicalMutationApplyOutcomeV1::AppliedNewMutation
         );
+        assert_ne!(owner_snapshot(&session), accepted_before);
+        let duplicate_before = owner_snapshot(&session);
         assert_eq!(
             session.ingest_transaction_with_apply_result(accepted).apply,
             CanonicalMutationApplyOutcomeV1::Duplicate
         );
+        assert_eq!(owner_snapshot(&session), duplicate_before);
 
         let mut dust = (*test_pool_observation_tx(&Signature::new_unique().to_string())).clone();
         dust.pool_amm_id = pool_id.to_string();
         dust.token_mint = Some(mint.to_string());
         dust.volume_sol = 0.0;
+        let dust_before = owner_snapshot(&session);
+        let dust_tx_intelligence = session.tx_intelligence.state().clone();
+        let dust_gatekeeper_count = session.gatekeeper_buffer.total_tx_count();
         assert_eq!(
             session
                 .ingest_transaction_with_apply_result(Arc::new(dust))
                 .apply,
-            CanonicalMutationApplyOutcomeV1::Ignored
+            CanonicalMutationApplyOutcomeV1::AppliedNewMutation
         );
+        assert_eq!(
+            session.tx_intelligence.state().dust_tx_count,
+            dust_tx_intelligence.dust_tx_count.saturating_add(1)
+        );
+        assert_eq!(
+            session.gatekeeper_buffer.total_tx_count(),
+            dust_gatekeeper_count,
+            "Gatekeeper ignored dust, but TxIntelligence still changed"
+        );
+        assert_ne!(owner_snapshot(&session), dust_before);
+
+        let mut unkeyable =
+            (*test_pool_observation_tx(&Signature::new_unique().to_string())).clone();
+        unkeyable.pool_amm_id = pool_id.to_string();
+        unkeyable.token_mint = Some(mint.to_string());
+        unkeyable.timestamp_ms = 0;
+        unkeyable.arrival_ts_ms = 0;
+        unkeyable.event_time.chain_event_ts_ms = Some(0);
+        unkeyable.event_time.ingress_wall_ts_ms = None;
+        let unkeyable_owner_before = owner_snapshot(&session);
+        let unkeyable_total_before = session.tx_intelligence.state().total_tx;
+        assert_eq!(
+            session
+                .ingest_transaction_with_apply_result(Arc::new(unkeyable))
+                .apply,
+            CanonicalMutationApplyOutcomeV1::AppliedNewMutation
+        );
+        assert_eq!(
+            session.tx_intelligence.state().total_tx,
+            unkeyable_total_before.saturating_add(1)
+        );
+        assert_ne!(owner_snapshot(&session), unkeyable_owner_before);
+
         session.status = SessionStatus::Closed;
+        let terminal_before = owner_snapshot(&session);
         assert_eq!(
             session
                 .ingest_transaction_with_apply_result(test_pool_observation_tx(
@@ -37580,6 +37356,7 @@ mod tests {
                 .apply,
             CanonicalMutationApplyOutcomeV1::Terminal
         );
+        assert_eq!(owner_snapshot(&session), terminal_before);
 
         let runtime = OracleRuntime::new(
             Arc::new(HyperPredictionOracle::default()),
@@ -37598,7 +37375,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_initialize_and_failed_ready_recheck_are_fail_closed() {
+    fn duplicate_initialize_is_not_acknowledged_as_new_apply() {
         let runtime = Arc::new(OracleRuntime::new(
             Arc::new(HyperPredictionOracle::default()),
             PUMPFUN_PROGRAM_ID.to_string(),
@@ -37626,40 +37403,6 @@ mod tests {
                 Pubkey::from_str(&pool.creator).ok(),
             ),
             CanonicalMutationApplyOutcomeV1::Duplicate
-        );
-
-        let snapshot_engine = Arc::new(SnapshotEngine::new(4, 0));
-        let (event_tx, _) = crate::events::create_event_bus();
-        let ctx =
-            test_pool_observation_context(Arc::clone(&runtime), snapshot_engine, event_tx, None);
-        let release_candidate = PumpCandidateIdentityV1 {
-            pool_amm_id: Pubkey::new_unique(),
-            mint: Pubkey::new_unique(),
-        };
-        let release = CandidateIntegrityReadyReleaseV1 {
-            candidate: release_candidate,
-            signature: Signature::new_unique(),
-            locator: RawPumpMutationLocatorV1 {
-                program_id: Pubkey::new_unique(),
-                signature: Signature::new_unique(),
-                outer_instruction_index: 0,
-                inner_instruction_path: Vec::new(),
-                semantic_event_ordinal: 0,
-            },
-            evidence_hash_blake3: [8; 32],
-        };
-        assert!(!schedule_integrity_ready_rechecks(
-            ctx.as_ref(),
-            None,
-            std::slice::from_ref(&release),
-        ));
-        assert_eq!(
-            runtime
-                .candidate_integrity_registry
-                .snapshot(release_candidate)
-                .expect("typed failed delivery")
-                .outcome,
-            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
         );
     }
 
@@ -40397,7 +40140,6 @@ mod tests {
             1_000_000,
             None,
             None,
-            None,
             false,
             None,
             &SelectorStateReadinessLatchConfig::default(),
@@ -40455,7 +40197,6 @@ mod tests {
             Pubkey::new_unique(),
             &crate::components::trigger::BuyAccountOverrides::default(),
             1_000_000,
-            None,
             None,
             None,
             false,
@@ -44291,7 +44032,6 @@ mod tests {
             disposition: PoolObservationDispositionV1::BoughtOrRetainedRuntime,
             bought: false,
             retain_runtime_pool: true,
-            integrity_ready_rechecks: Vec::new(),
         };
         let rejected_shadow = PoolObservationResult {
             pool_id: Pubkey::new_unique(),
@@ -44299,7 +44039,6 @@ mod tests {
             disposition: PoolObservationDispositionV1::StrategicTerminal,
             bought: false,
             retain_runtime_pool: false,
-            integrity_ready_rechecks: Vec::new(),
         };
         let live_buy = PoolObservationResult {
             pool_id: Pubkey::new_unique(),
@@ -44307,7 +44046,6 @@ mod tests {
             disposition: PoolObservationDispositionV1::BoughtOrRetainedRuntime,
             bought: true,
             retain_runtime_pool: false,
-            integrity_ready_rechecks: Vec::new(),
         };
 
         assert!(!should_cleanup_pool_after_observation(&retained_shadow));
@@ -44550,11 +44288,14 @@ mod tests {
             curve_data_known: true,
         };
 
-        runtime.forward_approved_tx_to_commit_or_live_pipeline(
-            pool_id,
-            base_mint,
-            &tx,
-            tx_event_ts_ms(&tx),
+        assert_eq!(
+            runtime.forward_approved_tx_to_commit_or_live_pipeline(
+                pool_id,
+                base_mint,
+                &tx,
+                tx_event_ts_ms(&tx),
+            ),
+            CanonicalMutationApplyOutcomeV1::AppliedNewMutation
         );
 
         assert!(live_pipeline.is_initialized(&base_mint));
@@ -44692,11 +44433,15 @@ mod tests {
             curve_data_known: true,
         };
 
-        runtime.forward_approved_tx_to_commit_or_live_pipeline(
-            pool_id,
-            base_mint,
-            &tx,
-            tx_event_ts_ms(&tx),
+        assert_eq!(
+            runtime.forward_approved_tx_to_commit_or_live_pipeline(
+                pool_id,
+                base_mint,
+                &tx,
+                tx_event_ts_ms(&tx),
+            ),
+            CanonicalMutationApplyOutcomeV1::Ignored,
+            "BufferedHistory/PendingLive is enqueue-only, not downstream apply"
         );
 
         assert_eq!(
@@ -46711,6 +46456,214 @@ mod tests {
     }
 
     #[test]
+    fn pr1d_observe_only_integrity_failure_does_not_block_primary_account_state() {
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+        let pool_id = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        assert!(runtime.register_new_pool(
+            pool_id,
+            base_mint,
+            EnhancedCandidate {
+                pool_amm_id: pool_id,
+                base_mint,
+                bonding_curve,
+                initial_liquidity_sol: 8.0,
+                token_total_supply: Some(900_000_000_000_000),
+                ..Default::default()
+            },
+            None,
+        ));
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool_id,
+            mint: base_mint,
+        };
+        runtime
+            .candidate_integrity_registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate,
+                outcome: CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [9; 32],
+            })
+            .expect("shadow failure evidence");
+        assert_eq!(
+            runtime
+                .candidate_integrity_registry
+                .account_state_apply_allowed(candidate)
+                .expect("shadow status"),
+            Some(false)
+        );
+
+        let update = build_test_raw_primary_account_state_update(
+            &runtime,
+            &base_mint,
+            32_000_000_000,
+            899_000_000_000_000,
+            0,
+            22,
+            Some(1),
+            CurveFinality::Finalized,
+        );
+        let apply_result = runtime.apply_account_state_update(&update);
+        assert!(
+            matches!(
+                apply_result,
+                ghost_core::account_state_core::types::AccountUpdateResult::Applied
+                    | ghost_core::account_state_core::types::AccountUpdateResult::PromotedFromBootstrap
+            ),
+            "primary apply result: {apply_result:?}"
+        );
+        let state = runtime
+            .account_state_core()
+            .get_canonical_state(&base_mint)
+            .expect("parent primary authority remains active");
+        assert_eq!(state.virtual_sol_reserves, 32_000_000_000);
+        assert_eq!(state.update_count, 1);
+    }
+
+    #[test]
+    fn pr1d_observe_only_integrity_failure_does_not_gate_evaluation_boundary() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+        };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate,
+                outcome: CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [8; 32],
+            })
+            .expect("shadow failure evidence");
+        assert!(matches!(
+            registry.evaluation_guard(candidate),
+            Err(CandidateIntegrityErrorV1::NotReady(
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+            ))
+        ));
+        assert!(open_candidate_integrity_evaluation_guard(Some(
+            CandidateIntegrityEvaluationInputV1 {
+                registry: &registry,
+                pool_amm_id: candidate.pool_amm_id,
+                base_mint: Some(candidate.mint),
+            }
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn pr1d_observe_only_integrity_failure_preserves_gatekeeper_verdict_and_reason_chain() {
+        let pool_id = Pubkey::new_unique();
+        let detected_pool = test_detected_pool(pool_id);
+        let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+        let bonding_curve = Pubkey::from_str(&detected_pool.bonding_curve).expect("curve");
+        let candidate_snapshot = enhanced_candidate_from_detected_pool(&detected_pool);
+        let gatekeeper_config = GatekeeperV2Config::default();
+        let make_session = |session_id| {
+            PoolObservationSession::new(
+                ghost_core::session::types::SessionId(session_id),
+                pool_id,
+                base_mint,
+                bonding_curve,
+                Pubkey::from_str(&detected_pool.creator).ok(),
+                candidate_snapshot.clone(),
+                1_000,
+                6_000,
+                &gatekeeper_config,
+                crate::tx_intelligence::TxIntelligenceConfig::from_gatekeeper_config(
+                    &gatekeeper_config,
+                    EarlyFingerprintConfig::default(),
+                ),
+            )
+        };
+        let mut baseline_session = make_session(91);
+        let mut shadow_session = make_session(92);
+        shadow_session.created_at_instant = baseline_session.created_at_instant;
+
+        let baseline = try_evaluate_feature_driven_terminal_verdict(
+            &mut baseline_session,
+            &gatekeeper_config,
+            true,
+            None,
+        )
+        .expect("parent evaluation");
+
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool_id,
+            mint: base_mint,
+        };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate,
+                outcome: CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [6; 32],
+            })
+            .expect("shadow failure evidence");
+        let observed = try_evaluate_feature_driven_terminal_verdict(
+            &mut shadow_session,
+            &gatekeeper_config,
+            true,
+            Some(CandidateIntegrityEvaluationInputV1 {
+                registry: &registry,
+                pool_amm_id: pool_id,
+                base_mint: Some(base_mint),
+            }),
+        )
+        .expect("observe-only evaluation");
+
+        let assessment_fingerprint =
+            |assessment: &crate::components::gatekeeper::GatekeeperAssessment| {
+                (
+                    assessment
+                        .decision
+                        .as_ref()
+                        .map(|decision| decision.verdict_type),
+                    assessment
+                        .decision
+                        .as_ref()
+                        .map(|decision| decision.reason_chain.clone()),
+                    assessment
+                        .decision
+                        .as_ref()
+                        .and_then(|decision| decision.reason_code),
+                    assessment.terminal_reason_code,
+                )
+            };
+        let fingerprint = |verdict: GatekeeperVerdict| match verdict {
+            GatekeeperVerdict::Wait => "wait".to_string(),
+            GatekeeperVerdict::PendingCurve => "pending_curve".to_string(),
+            GatekeeperVerdict::Buy { assessment, .. } => {
+                format!("buy:{:?}", assessment_fingerprint(&assessment))
+            }
+            GatekeeperVerdict::Reject { assessment, reason } => {
+                format!("reject:{reason}:{:?}", assessment_fingerprint(&assessment))
+            }
+            GatekeeperVerdict::Timeout { assessment } => {
+                format!("timeout:{:?}", assessment_fingerprint(&assessment))
+            }
+            GatekeeperVerdict::ApprovedTx { tx, .. } => {
+                format!("approved:{}", tx.signature)
+            }
+        };
+        assert_eq!(fingerprint(observed), fingerprint(baseline));
+    }
+
+    #[test]
     fn pr1d_ordering_event_bus_ready_cannot_bypass_apply_fence() {
         let runtime = OracleRuntime::new(
             Arc::new(HyperPredictionOracle::default()),
@@ -48680,7 +48633,7 @@ mod tests {
         let first = rx.recv().await.expect("first tx");
         match first {
             PoolObservationMsg::Transaction(tx, _) => assert_eq!(tx.signature, "first"),
-            PoolObservationMsg::NewPool(_, _, _) | PoolObservationMsg::CandidateIntegrityReady => {
+            PoolObservationMsg::NewPool(_, _, _) => {
                 panic!("expected transaction")
             }
         }
@@ -48697,7 +48650,7 @@ mod tests {
 
         match second {
             PoolObservationMsg::Transaction(tx, _) => assert_eq!(tx.signature, "second"),
-            PoolObservationMsg::NewPool(_, _, _) | PoolObservationMsg::CandidateIntegrityReady => {
+            PoolObservationMsg::NewPool(_, _, _) => {
                 panic!("expected transaction")
             }
         }
@@ -48992,8 +48945,7 @@ mod tests {
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 PoolObservationMsg::Transaction(_, _) => received += 1,
-                PoolObservationMsg::NewPool(_, _, _)
-                | PoolObservationMsg::CandidateIntegrityReady => {}
+                PoolObservationMsg::NewPool(_, _, _) => {}
             }
         }
         assert_eq!(
@@ -49093,7 +49045,7 @@ mod tests {
                     "hot pool must deliver correct message"
                 )
             }
-            PoolObservationMsg::NewPool(_, _, _) | PoolObservationMsg::CandidateIntegrityReady => {
+            PoolObservationMsg::NewPool(_, _, _) => {
                 panic!("expected transaction")
             }
         }
@@ -49132,7 +49084,7 @@ mod tests {
                     "cold pool must deliver correct message"
                 )
             }
-            PoolObservationMsg::NewPool(_, _, _) | PoolObservationMsg::CandidateIntegrityReady => {
+            PoolObservationMsg::NewPool(_, _, _) => {
                 panic!("expected transaction")
             }
         }

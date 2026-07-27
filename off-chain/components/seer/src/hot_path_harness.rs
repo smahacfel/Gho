@@ -658,6 +658,48 @@ fn canonical_parity_snapshot_detects_economic_and_state_drift() {
     );
 }
 
+#[test]
+fn pr1d_v1_v2_parser_digests_remain_frozen() {
+    let parser = BinaryParser::new(false);
+    let fixtures = [
+        ("ordinary_pump_buy", FixtureKind::PumpBuy, 1_u8),
+        ("ordinary_pump_sell", FixtureKind::PumpSell, 2_u8),
+        (
+            "create_and_initial_buy",
+            FixtureKind::CreateAndInitialBuy,
+            3_u8,
+        ),
+        (
+            "multiple_pump_mutations",
+            FixtureKind::MultiplePumpMutations,
+            4_u8,
+        ),
+        (
+            "pumpswap_trade_with_inner_instructions",
+            FixtureKind::PumpSwapInnerTrade,
+            5_u8,
+        ),
+    ];
+    let mut legacy_v1 = Vec::with_capacity(fixtures.len());
+    let mut full_pr1d_v2 = Vec::with_capacity(fixtures.len());
+    for (name, kind, seed) in fixtures {
+        let bundle = parser
+            .parse_transaction_bundle(&normalize_transaction(seed, kind))
+            .expect("frozen parser fixture");
+        legacy_v1.push(legacy_canonical_parser_projection_v1(name, &bundle));
+        full_pr1d_v2.push(full_pr1d_parser_snapshot_v2(name, &bundle));
+    }
+
+    assert_eq!(
+        canonical_parity_digest(&legacy_v1),
+        BASELINE_LEGACY_CANONICAL_PARITY_DIGEST_V1
+    );
+    assert_eq!(
+        canonical_parity_digest(&full_pr1d_v2),
+        BASELINE_FULL_PR1D_PARSER_SNAPSHOT_DIGEST_V2
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pr1b_slow_sinks_never_block_ingest_workers() {
     hot_path_metrics::reset();

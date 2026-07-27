@@ -1,6 +1,6 @@
 # ADR-8D: Ingest State Quote PR1D — Observation Ledger i raw/NLN reconciliation
 
-Status: `IMPLEMENTED / VALIDATED / OWNER-APPROVED PERFORMANCE WAIVER / READY FOR DRAFT PR`
+Status: `IMPLEMENTED / DRAFT PR #85 REVIEW REMEDIATION VALIDATED / READY FOR RE-REVIEW / OWNER-APPROVED PERFORMANCE WAIVER`
 
 Typ: ADR-8D / PR1D / aktywna granica integralności ingestu
 
@@ -20,14 +20,20 @@ reconciliation, `CandidateIntegrity` oraz pełna macierz konfliktów lifecycle.
 
 ## D0. Cel i granice niepodlegające reinterpretacji
 
-PR1D zamyka jedną aktywną ścieżkę:
+PR1D dodaje jedną izolowaną ścieżkę obserwacyjną równolegle do zachowanej
+aktywnej ścieżki parenta:
 
 ```text
 primary raw Yellowstone Pump observation
   -> Observation Ledger
-  -> dokładnie jedna structural canonical mutation
-  -> CandidateIntegrity
-  -> tylko Ready może wejść do MFS i Gatekeepera
+  -> dokładnie jedna shadow structural canonical mutation
+  -> CandidateIntegrity shadow evidence
+  -> would_block / would_abort / would_cancel / would_reconcile /
+     would_quarantine metrics
+
+primary raw Yellowstone Pump event
+  -> istniejąca ścieżka parenta
+  -> MFS / Gatekeeper / submit bez PR1D CandidateIntegrity enforcement
 
 secondary raw / parsed NLN
   -> Observation Ledger
@@ -62,6 +68,10 @@ Następujące reguły są zamrożone:
     źródła prawdy. Ledger i account arbiter zapisują sygnały synchronicznie do
     tej samej współdzielonej instancji registry; broadcast może pozostać
     wyłącznie nieautorytatywnym kanałem kompatybilnościowym/audytowym.
+13. Wynik ledgera, registry, receiptu albo apply fence nie tłumi eventu primary
+    raw, który parent `a7a7bf1` wyemitowałby po swoich istniejących filtrach.
+14. `CandidateIntegrity` w PR1D nie blokuje MFS, ewaluacji, submitu, capacity
+    ani lifecycle pozycji. Macierz lifecycle wylicza wyłącznie shadow actions.
 
 ## D1. Jeden właściciel architektury
 
@@ -116,9 +126,10 @@ Początkowy status ekonomiczny pozostaje `PendingAnchor`. PR1D nie certyfikuje
 economics i nie używa NLN do quote math.
 
 Brak locatora, order, provider ID/role albo captured-payload provenance w
-obserwacji deklarującej primary jest typed `PrimaryRawCoverageIncomplete` i
-fail-close. Nie wolno syntetyzować brakujących pól z receive order, timestampu,
-claims ani historycznego resolvera.
+obserwacji deklarującej primary jest typed `PrimaryRawCoverageIncomplete` dla
+shadow proof. Nie wolno syntetyzować brakujących pól z receive order,
+timestampu, claims ani historycznego resolvera. Niekompletność shadow proof
+nie tłumi jednak istniejącej emisji primary raw na aktywnej ścieżce parenta.
 
 ### D2.3. Bounded stores bez witness veto
 
@@ -254,15 +265,16 @@ NLN replay -> to_trade_event -> emit_pool_transaction_to_event_bus
 
 zostają usunięte z aktywnego runtime.
 
-Raw primary decision z `canonical_apply=true` przechodzi do istniejącego
-adaptera. Secondary, exact duplicate, NLN, ambiguous i unmatchable nie
-wywołują adaptera canonical.
+Poprawny raw primary przechodzi do istniejącego adaptera zgodnie z filtrami
+parenta niezależnie od wyniku shadow ledgera. Secondary, NLN i providerless
+observation nie wywołują adaptera canonical. Exact duplicate, ambiguous i
+unmatchable pozostają klasyfikacjami ledgera; nie otrzymują nowej authority.
 
 Launcher porównuje zaakceptowaną structural canonical mutation z towarzyszącym
 IPC payloadem przed zapisaniem mutacji w ledgerze. Niezgodność signature,
 locator/order, provider provenance, curve/mint, side, success albo amount jest
-typed `PrimaryRawCoverageIncomplete`, daje zero canonical emission i nie może
-pozostawić w ledgerze fałszywej canonical mutation.
+typed `PrimaryRawCoverageIncomplete`, nie może pozostawić w ledgerze fałszywej
+shadow canonical mutation, ale nie zmienia emisji, którą wykonałby parent.
 
 ## D6. CandidateIntegrity i lifecycle registry
 
@@ -292,36 +304,34 @@ Jeden bounded `CandidateIntegrityRegistry` należy do `OracleRuntime`, nie do
 
 Ta sama instancja registry jest przekazywana do launcherowego wrappera Seera.
 Zapis sygnału następuje synchronicznie przed `NewPoolDetected` albo
-`PoolTransaction`. Niepowodzenie registry blokuje canonical runtime emission.
-Oracle broadcast lag nie jest więc w stanie zgubić authority signal.
+`PoolTransaction`, gdy registry ma capacity. Niepowodzenie registry zapisuje
+metrykę/evidence niekompletności, lecz nie blokuje canonical runtime emission
+primary raw. Oracle broadcast lag nie może zostać zinterpretowany jako active
+authority gate.
 
 Pool i mint są aliasami tego samego rekordu po udowodnionej canonical pool
 identity. Claims NLN nie mogą samodzielnie utworzyć aliasu authority.
 
 ## D7. Pełna macierz konfliktów i punkty linearizacji
 
-| Faza | Punkt linearizacji | Reakcja |
+| Faza shadow modelu | Punkt obserwacji | Wyliczona akcja (bez enforcementu) |
 |---|---|---|
-| `PRE_MFS` | przed `session.begin_evaluation()` | techniczny abort, zero MFS, zero Gatekeeper |
-| `MFS_MATERIALIZED` | generation fence bezpośrednio po materializacji | interrupt, brak policy publication |
-| `EVALUATION_RUNNING` | generation fence po policy call, przed terminal publication | technical abort, brak recomputation |
-| `TERMINAL_REJECT` | atomowy terminal transition przed WAL/log await | immutable verdict + audit marker |
-| `TERMINAL_TIMEOUT` | atomowy terminal transition przed WAL/log await | immutable verdict + audit marker |
-| `TERMINAL_BUY_NOT_SUBMITTED` | atomowy terminal BUY transition | cancel intent, zero sender call, zwolnienie lease |
-| `SUBMIT_STARTED` | CAS bezpośrednio przed pierwszym `client.send_transaction()` | reconciliation required/unknown, bez fake cancel/success |
-| `CONFIRMED_OPEN_POSITION` | po potwierdzeniu sendera, przed post-buy handoff | raw authority, NLN quarantine, protective exit działa |
+| `PRE_MFS` | przed `session.begin_evaluation()` | `would_block_pre_mfs` |
+| `MFS_MATERIALIZED` | po materializacji | `would_abort_evaluation` |
+| `EVALUATION_RUNNING` | po policy call | `would_abort_evaluation` |
+| `TERMINAL_REJECT` | po historycznym terminalu | immutable verdict + audit marker |
+| `TERMINAL_TIMEOUT` | po historycznym terminalu | immutable verdict + audit marker |
+| `TERMINAL_BUY_NOT_SUBMITTED` | po historycznym BUY | `would_cancel_pre_submit` |
+| `SUBMIT_STARTED` | po zarejestrowanym shadow transition | `would_require_reconciliation` |
+| `CONFIRMED_OPEN_POSITION` | po zarejestrowanym shadow confirmation | `would_quarantine_position` |
 
 ### D7.1. Pre-MFS i evaluation fence
 
-Active runtime pobiera `CandidateIntegrityGuard` przed MFS. Status musi być
-`Ready`:
-
-1. przed `begin_evaluation`;
-2. po materializacji;
-3. po policy evaluation, przed publikacją terminalnego wyniku.
-
-Conflict wygrywający generation fence kończy kandydaturę technicznie.
-GatekeeperBuffer nie jest wznawiany i policy nie jest recomputowana.
+Active runtime może odczytać shadow `CandidateIntegrityGuard` przed MFS, aby
+policzyć `would_block`/`would_abort`, ale brak `Ready`, conflict albo zmiana
+generation nie zatrzymują `begin_evaluation`, materializacji, policy call ani
+publikacji terminalnego wyniku. GatekeeperBuffer, verdict i reason chain
+pozostają sterowane wyłącznie kontraktem parenta.
 
 ### D7.2. Terminal verdict
 
@@ -329,52 +339,22 @@ Terminal transition jest wykonywany przed pierwszym asynchronicznym
 DecisionLogger/WAL side effect. Późny konflikt po `REJECT`/`TIMEOUT` nie zmienia
 verdictu ani reason chain.
 
-`PoolObservationResult` otrzymuje typed disposition odróżniające:
-
-- strategic terminal;
-- technical integrity failure;
-- bought/retained runtime.
-
 Technical failure nie jest zapisywany jako strategiczny rejected pool ani
-Gatekeeper verdict. Może zostać oddzielnie zablokowany przed ponowną
-kandydaturą przez integrity registry.
+Gatekeeper verdict. Jest wyłącznie shadow/audit markerem i nie blokuje
+ponownej kandydatury w aktywnym runtime PR1D.
 
 ### D7.3. Pre-submit, submit i confirmation
 
-`PreparedBuyRequest` niesie opcjonalny, jawny integrity submit guard.
+`PreparedBuyRequest` nie niesie w PR1D integrity submit guarda. Active sender
+zachowuje dokładnie parentowe preconditions, retry, klasyfikację błędów,
+retention slotu i confirmation lifecycle. Registry może lokalnie zasymulować
+`try_begin_submit`/`mark_confirmed` w testach shadow macierzy, ale
+`TriggerComponent` ani `LiveTxSender` nie wywołują tych przejść i brak guarda
+nie blokuje sender call.
 
-Bezpośrednio przed pierwszym `send_transaction()` wykonywany jest atomic CAS:
-
-```text
-Ready + TerminalBuyNotSubmitted -> SubmitStarted
-```
-
-Jeżeli conflict wygra wyścig:
-
-- Sender call count = 0;
-- intent jest typed cancelled-before-submit;
-- RAII lease zostaje zwolniony;
-- historyczny Gatekeeper BUY pozostaje niezmieniony.
-
-Jeżeli submit wygra:
-
-- późny conflict daje reconciliation/unknown;
-- retry nie cofa phase do pre-submit;
-- capacity nie jest zwalniane jako rzekome cancel;
-- confirmation może nadal ustanowić `ConfirmedOpenPosition`.
-
-`AlreadyStarted` na zewnętrznym first-attempt callsite jest no-send. Retry
-wewnątrz jednego rozpoczętego submitu nie wykonuje ponownego CAS. Każdy błąd
-transportu po rzeczywistym wywołaniu sendera jest `UncertainLanding`; konflikt
-zapisany po CAS wymusza retention/reconciliation również wtedy, gdy niższa
-warstwa zwróciła inny błąd.
-
-Live-capable sender path bez `CandidateIntegritySubmitGuardV1` fail-closuje
-przed pierwszym sender call. `None` pozostaje dozwolone tylko dla
-shadow/dry-run i konstruktorów testowych, które nie wywołują live sendera.
-
-Po confirmation conflict nie usuwa AccountStateCore, position slot ani
-PostBuyRuntime i nie wywołuje automatycznego SELL.
+Późny conflict po confirmation nie usuwa AccountStateCore, position slot ani
+PostBuyRuntime, nie przerywa protective exit i nie wywołuje automatycznego
+SELL. Powstaje wyłącznie shadow `would_quarantine_position`.
 
 ## D8. Account provider conflict
 
@@ -383,8 +363,9 @@ CandidateIntegrity. `SameVersionDifferentHashConflict`, identity conflict oraz
 typed evidence incompleteness są zachowywane przed konwersją do legacy
 `AccountUpdateResult`.
 
-`AccountProviderConflict` aktualizuje ten sam lifecycle registry według
-rzeczywistej fazy. Canonical apply PR1C pozostaje bez zmian.
+`AccountProviderConflict` aktualizuje ten sam shadow lifecycle registry według
+zaobserwowanej fazy. Canonical apply PR1C pozostaje bez zmian i nie jest
+blokowany przez wynik CandidateIntegrity.
 
 Po strategicznym terminalu AccountUpdate nadal przechodzi przez zachowany
 bounded account arbiter w trybie evidence-only. Taka obserwacja może utworzyć
@@ -528,11 +509,11 @@ Wymagane testy:
 6. secondary/NLN saturation bez authority veto;
 7. no direct NLN canonical callsite;
 8. no-wait artifact sink;
-9. CandidateIntegrity pre-MFS/evaluation fences;
+9. CandidateIntegrity pre-MFS/evaluation shadow `would_*` matrix;
 10. terminal Reject/Timeout immutability;
-11. pre-submit conflict kontra submit CAS;
-12. submit-started unknown/reconciliation;
-13. confirmed position quarantine z działającym protective exit;
+11. pre-submit conflict kontra submit CAS w lokalnym shadow modelu;
+12. submit-started shadow reconciliation evidence;
+13. confirmed-position shadow quarantine marker bez wpływu na protective exit;
 14. account provider conflict handoff;
 15. raw-only parity i brak quote-math diff.
 
@@ -573,16 +554,19 @@ Przed finalnymi bramkami obowiązuje następująca zamrożona mapa korekt:
 3. dopuścić mapping/watch/bootstrap/replay wyłącznie z kompletnego primary raw;
    secondary i EntryAnchor CPI scan pozostają parser/evidence-only;
 4. sprawdzać IPC semantic payload przeciw observation przed `ledger.observe`;
-5. zapisywać `CandidateIntegrity` bezpośrednio do shared registry przed
-   canonical event-bus emission;
+5. próbować zapisać `CandidateIntegrity` bezpośrednio do shared registry przed
+   canonical event-bus emission, ale nigdy nie tłumić parentowej emisji primary
+   przez błąd ledgera, registry, receipt staging albo inventory sealing;
 6. alias conflict atomowo fail-closuje rekordy wskazane przez oba aliasy;
 7. bounded lifecycle audit zachowuje licznik i pierwszy odrzucony immutable
    marker;
 8. stale/terminal AccountUpdate przechodzi evidence-only arbitraż bez state
    apply;
-9. `AlreadyStarted` i brak live submit guarda wykonują zero sender calls;
-10. błąd po sender call jest unknown/retained, a conflict po CAS zawsze
-    wymusza reconciliation;
+9. usunąć CandidateIntegrity submit guard z aktywnego TriggerComponent i
+   zachować parentowe dispatch preconditions oraz klasyfikację sender errors;
+10. zapisywać pre-submit/submit/confirmed conflict wyłącznie jako shadow
+    `would_cancel`/`would_reconcile`/`would_quarantine`, bez sterowania senderem,
+    capacity ani protective exits;
 11. sibling Pump mutations są enqueueowane w canonical order.
 
 Te korekty nie rozszerzają PR1D o NLN authority, quote math, Gatekeeper policy,
@@ -621,3 +605,74 @@ Waiver obejmuje wyłącznie dwa względne progi performance. Nie obejmuje:
 PR1D pozostaje shadow/observe-only. Waiver nie autoryzuje live promotion,
 production authority cutover, zmian quote math, strategii ani Gatekeeper
 policy.
+
+## D16. Remediacja niezależnego review Draft PR #85
+
+Review wykazało, że pierwotny Draft przedwcześnie podłączył lokalny model
+`CandidateIntegrity` do aktywnego runtime. Korekta przywraca kontrakt planu:
+
+1. błędy observation metadata, boundary validation, ledger/registry capacity,
+   receipt staging i inventory sealing zapisują shadow evidence oraz metryki,
+   ale nie suppressują parentowej emisji poprawnego primary raw;
+   w Seerze aktywne mapowanie/emisja jest dlatego oparte na roli
+   `PrimaryAuthority`, a nie na kompletności shadow locatora/inventory;
+2. secondary raw, parsed NLN i providerless observation pozostają witness-only
+   i tworzą zero canonical `NewPoolDetected`/`PoolTransaction`;
+3. MFS, Gatekeeper verdict/reason chain, capacity, TriggerComponent,
+   LiveTxSender, confirmation i protective exits nie są sterowane przez
+   CandidateIntegrity;
+4. jeden prywatny bounded apply fence nadal wylicza shadow downstream-apply
+   proof, lecz jego failure nie steruje aktywnym flow;
+5. typed apply outcome opisuje rzeczywistą mutację właściciela stanu:
+   `Accepted`, `Unkeyable` i dust/not-counted są `AppliedNewMutation`, ponieważ
+   parentowy `TxIntelligence` przyjmuje nową obserwację; exact replay jest
+   `Duplicate`, terminal session jest `Terminal`, a samo
+   `BufferedHistory`/`PendingLive` jest `Ignored`;
+6. istniejąca rejestracja InitializePool jest `Duplicate`; brak bootstrapu
+   albo błąd instalacji jest `Failed`;
+7. nierozwiązany `SecondaryRaw` po istniejącym `correlation_window_ns` dostaje
+   typed `SecondaryWitnessExpired`, nie tworzy canonical mutation ani `Ready`,
+   zwalnia pending capacity i nie uzyskuje recovery authority. Późniejszy
+   primary nadal jest jedynym structural authority.
+
+Testy macierzy lifecycle opisują od tej korekty wyłącznie wyliczone shadow
+actions. Nazwy `BlockBeforeMfs`, `InterruptEvaluation`,
+`CancelExecutionBeforeSubmit`, `ReconciliationRequired` i
+`ConfirmedPositionQuarantined` pozostają lokalną taksonomią registry; nie są
+aktywnymi akcjami runtime w PR1D.
+
+## D17. Receipt remediacji Draft PR #85
+
+Walidacja zamrożonego diffu po korekcie potwierdziła:
+
+- wszystkie testy celowane PR1D ledgera, korelacji, CandidateIntegrity,
+  observe-only parity, typed apply, downstream-apply ordering oraz expiry
+  `SecondaryRaw` przechodzą;
+- zamrożone digests pozostają bez zmian:
+  - V1:
+    `549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202`;
+  - V2:
+    `507b13704d5b90c3f724a395acbf0d0cc55fdc37a83fcb95cf67cceb6247569f`;
+- obowiązkowy isolated global-counter contract przechodzi;
+- `cargo fmt --all --check` i `git diff --check` przechodzą;
+- `cargo build --release --workspace` przechodzi bez waivera.
+
+Pełne package/workspace suites pozostają czerwone wyłącznie w zweryfikowanych,
+odziedziczonych klasach:
+
+- `ghost-core`: `InvalidTagEncoding(104)` w
+  `foundational_types_serialize_and_deserialize_roundtrip`;
+- Seer: identyczne względem czystego parenta `a7a7bf1` historyczne failures
+  PumpPortal/synthetic-WAL/mapping oraz `source_router`;
+- Trigger: dwa braki `status_uuid` oraz
+  `presigned.size_bytes < 700`;
+- Ghost Launcher/workspace: testowe `PoolTransaction` `E0063` z identycznym
+  zestawem brakujących pól; zweryfikowane literały istniały już na
+  `88aa1b7`, a PR1D ich nie modyfikuje.
+
+Pełna bramka Seera ujawniła pięć testów, które nadal modelowały aktywną
+primary mapping/emission przez providerless fixture. Fixture'y zostały
+mechanicznie przeniesione na jawny `PrimaryAuthority`; pełne nazwy modułowe
+każdego testu przechodzą, a ponowiona bramka Seera zawiera już wyłącznie
+parentowe failure signatures. Produkcja nie została przy tej korekcie
+zmieniona.

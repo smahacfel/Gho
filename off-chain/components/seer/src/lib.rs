@@ -4539,14 +4539,6 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             && a.signer == b.signer
     }
 
-    fn is_complete_primary_raw_observation(observation: Option<&ObservedPumpMutationV1>) -> bool {
-        Self::is_complete_raw_observation(observation)
-            && observation.is_some_and(|observation| {
-                observation.raw_provider_role
-                    == Some(ghost_core::RawProviderRoleV1::PrimaryAuthority)
-            })
-    }
-
     fn is_complete_raw_observation(observation: Option<&ObservedPumpMutationV1>) -> bool {
         observation.is_some_and(|observation| {
             observation.provenance.source_family
@@ -4651,7 +4643,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             let can_forward_with_trade_mint = *mint != Pubkey::default()
                 && *mint != *wsol_mint_pubkey()
                 && pool_id != mint
-                && Self::is_complete_primary_raw_observation(observation);
+                && trade.provider_role == Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
 
             if can_forward_with_trade_mint {
                 // Optimistic self-registration: the trade itself is the fastest possible
@@ -4918,7 +4910,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             is_coverage_source,
         ) {
             TradeForwardDecision::Forward => {
-                if Self::is_complete_primary_raw_observation(observation.as_ref()) {
+                if trade.provider_role == Some(ghost_core::RawProviderRoleV1::PrimaryAuthority) {
                     if let Some(grpc_connection) = &self.grpc_connection {
                         grpc_connection.add_watched_mint(trade.mint);
                     }
@@ -5364,13 +5356,16 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     .with_label_values(&[amm_program.name()])
                     .inc();
 
-                let primary_structural_observation =
-                    Self::is_complete_primary_raw_observation(binary_pool_observation.as_ref());
+                // PR1D observation completeness is shadow evidence. Active
+                // parent-compatible mapping/emission remains keyed only by
+                // the already validated provider authority role.
+                let primary_runtime_authority = pool_event.provider_role
+                    == Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
 
                 // Session-start policy may suppress legacy candidate emission,
                 // but it must not drop the raw observation before PR1D.
                 let mut session_slot_suppressed = false;
-                if primary_structural_observation {
+                if primary_runtime_authority {
                     if let Some(slot) = pool_slot {
                         let current_start = self
                             .session_start_slot
@@ -5440,7 +5435,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     }
                     _ => None,
                 };
-                let observe_candidate = primary_structural_observation
+                let observe_candidate = primary_runtime_authority
                     && runtime_disposition == PoolDetectionRuntimeDispositionV1::Observe;
 
                 if matches!(candidate_mode, PoolInitCandidateMode::Suppressed) {
@@ -5507,7 +5502,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                             .map_err(|e| SeerError::ChannelSendError(e.to_string()))?;
                     }
                 } else if runtime_disposition == PoolDetectionRuntimeDispositionV1::Observe
-                    && primary_structural_observation
+                    && primary_runtime_authority
                 {
                     if let Some(candidate_sender) = &self.candidate_sender {
                         // Legacy non-IPC compatibility path has no PR1D
@@ -5525,7 +5520,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     }
                 }
 
-                if primary_structural_observation {
+                if primary_runtime_authority {
                     match runtime_disposition {
                         PoolDetectionRuntimeDispositionV1::Observe => {
                             self.register_curve_mapping(
@@ -6562,13 +6557,24 @@ mod tests {
     ) -> types::GeyserEvent {
         let pump_program = Pubkey::from_str(crate::grpc_connection::PUMP_FUN_PROGRAM_ID)
             .expect("valid pumpfun id");
+        let observation_provenance = ghost_core::ObservationProvenanceV1 {
+            source_family: ghost_core::ObservationSourceFamilyV1::RawYellowstone,
+            source_id: source_label.to_string(),
+            provider_id: "raw-primary".to_string(),
+            schema_id: "test.decoded_transaction.v1".to_string(),
+            payload_hash_blake3:
+                ghost_core::ObservationProvenanceV1::payload_hash_for_captured_provider_payload(
+                    signature.as_ref(),
+                ),
+            received_at_monotonic_ns: 1,
+        };
 
         types::GeyserEvent::Transaction {
-            provider_id: None,
-            provider_role: None,
-            observation_provenance: None,
+            provider_id: Some("raw-primary".to_string()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+            observation_provenance: Some(observation_provenance),
             slot: Some(42),
-            tx_index: None,
+            tx_index: Some(0),
             event_ts_ms: Some(1_777_777_777_000),
             arrival_ts_ms: Some(1_777_777_777_123),
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -7018,6 +7024,19 @@ mod tests {
             creator,
             GRPC_GLOBAL_STREAM_SOURCE_LABEL,
         );
+        let incomplete_shadow_bundle = BinaryParser::new(false)
+            .parse_transaction_bundle(&event)
+            .expect("test fixture must parse before runtime delivery");
+        assert!(incomplete_shadow_bundle
+            .initialize_pool_observation
+            .as_ref()
+            .is_some_and(|observation| observation.locator_hint.is_none()));
+        assert!(incomplete_shadow_bundle
+            .trade_observations
+            .iter()
+            .all(|observation| observation
+                .as_ref()
+                .is_some_and(|observation| observation.locator_hint.is_none())));
         seer.process_event(event)
             .await
             .expect("create+trade tx must process");
@@ -8428,8 +8447,8 @@ mod tests {
             .expect("valid pumpswap program");
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
-            provider_id: None,
-            provider_role: None,
+            provider_id: Some("raw-primary".to_string()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             slot: 55,
             txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -8501,8 +8520,8 @@ mod tests {
             .expect("valid pumpswap program");
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
-            provider_id: None,
-            provider_role: None,
+            provider_id: Some("raw-primary".to_string()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             slot: 55,
             txn_signature: None,
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -9133,7 +9152,9 @@ mod tests {
 
         seer.set_curve_mapping(good_pool, mint, "create", true);
         let good_trade = test_trade(good_pool, mint);
-        let wrong_trade = test_trade(wrong_pool, mint);
+        let mut wrong_trade = test_trade(wrong_pool, mint);
+        wrong_trade.provider_id = Some("raw-primary".to_string());
+        wrong_trade.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
 
         assert!(
             matches!(
@@ -9192,7 +9213,9 @@ mod tests {
         // Scenario A: no prior mapping — trade registers optimistic mapping and forwards.
         let pool_a = Pubkey::new_unique();
         let mint_a = Pubkey::new_unique();
-        let trade_a = test_trade(pool_a, mint_a);
+        let mut trade_a = test_trade(pool_a, mint_a);
+        trade_a.provider_id = Some("raw-primary".to_string());
+        trade_a.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
 
         assert!(
             matches!(
@@ -9215,7 +9238,9 @@ mod tests {
         let stale_mint = Pubkey::new_unique();
         let trade_mint = Pubkey::new_unique();
         seer.set_curve_mapping(pool_b, stale_mint, "create", true);
-        let conflicting_trade = test_trade(pool_b, trade_mint);
+        let mut conflicting_trade = test_trade(pool_b, trade_mint);
+        conflicting_trade.provider_id = Some("raw-primary".to_string());
+        conflicting_trade.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
 
         assert!(
             matches!(
@@ -9931,13 +9956,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_curve_mapping_does_not_duplicate_live_and_replayed_trade() {
-        // With optimistic self-registration, a live trade (pool+mint both known)
-        // registers the mapping and triggers replay of any buffered trades.
-        //
-        // When the buffered and live trade share the same (signature, event_ordinal)
-        // the live copy is a duplicate — suppressed so exactly ONE event reaches IPC.
-        // The replayed copy (with pool_amm_id filled in) is the canonical emission.
+    async fn test_register_curve_mapping_replays_legacy_buffer_once() {
+        // Providerless compatibility observations never self-register an
+        // authoritative mapping in PR1D. A later primary CREATE mapping still
+        // replays the legacy buffered copy exactly once.
         let mut ipc_config = IpcChannelConfig::default();
         ipc_config.buffer_size = 8;
         let (ipc_sender, mut ipc_receiver, _metrics) = create_ipc_channel(ipc_config);
@@ -9956,18 +9978,9 @@ mod tests {
             "pool=default trade must be buffered, not forwarded"
         );
 
-        // Step 2: live trade with full pool+mint triggers optimistic self-registration + replay.
-        //         Same signature and event_ordinal=0 → live is a duplicate of buffered → suppressed.
-        let mut live_trade = buffered_trade.clone();
-        live_trade.pool_amm_id = curve;
-
-        let live_forwarded = seer
-            .handle_trade_event(live_trade, "grpc_global_stream", true)
+        // Step 2: authoritative CREATE mapping replays the buffered copy.
+        seer.register_curve_mapping(curve, mint, "create", true)
             .await;
-        assert!(
-            !live_forwarded,
-            "live trade is a dup of buffered (same sig + ordinal) — replay already emitted it, live must be suppressed"
-        );
 
         // Step 3: exactly one event must arrive — the replayed copy with pool filled in.
         let replayed = ipc_receiver
@@ -9983,10 +9996,10 @@ mod tests {
             other => panic!("expected a replayed trade event, got {:?}", other),
         }
 
-        // Step 4: no second copy (live was suppressed by dedup).
+        // Step 4: no second copy.
         assert!(
             ipc_receiver.try_recv().is_err(),
-            "trade must be delivered exactly once; replay suppresses the duplicate live copy"
+            "legacy buffered trade must be delivered exactly once"
         );
 
         // Step 5: pending_trades must drain after optimistic mapping + replay.
@@ -9995,7 +10008,7 @@ mod tests {
                 .pending_trades
                 .read()
                 .contains_key(&PendingTradeKey::ByMint(mint.to_bytes())),
-            "replayed bucket should drain after optimistic mapping registration"
+            "replayed bucket should drain after authoritative mapping registration"
         );
     }
 
@@ -10009,8 +10022,17 @@ mod tests {
         let curve = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
 
+        let mut trade = test_trade(curve, mint);
+        trade.provider_id = Some("raw-primary".to_string());
+        trade.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
+        let observation = test_raw_trade_observation(trade.signature);
         let forwarded = seer
-            .handle_trade_event(test_trade(curve, mint), "grpc_global_stream", true)
+            .handle_trade_event_with_observation(
+                trade,
+                Some(observation),
+                "grpc_global_stream",
+                true,
+            )
             .await;
         assert!(
             forwarded,
@@ -10050,17 +10072,30 @@ mod tests {
 
         // Trade arrives with a different mint than the registered stale_mint.
         // Optimistic self-registration: forward immediately without buffering.
+        let mut trade = test_trade(curve, actual_mint);
+        trade.provider_id = Some("raw-primary".to_string());
+        trade.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
+        let observation = test_raw_trade_observation(trade.signature);
         let forwarded = seer
-            .handle_trade_event(test_trade(curve, actual_mint), "grpc_global_stream", true)
+            .handle_trade_event_with_observation(
+                trade,
+                Some(observation),
+                "grpc_global_stream",
+                true,
+            )
             .await;
         assert!(
             forwarded,
             "conflicting trade must be forwarded immediately via optimistic self-registration"
         );
 
-        let emitted = ipc_receiver
-            .try_recv()
-            .expect("trade must reach IPC without delay");
+        let emitted = tokio::time::timeout(
+            std::time::Duration::from_millis(TRADE_FORWARD_TIMEOUT_MS),
+            ipc_receiver.recv(),
+        )
+        .await
+        .expect("trade must reach IPC within the bounded delivery window")
+        .expect("IPC channel must remain open");
         match emitted {
             SeerEvent::Trade(trade_event) => {
                 assert_eq!(trade_event.trade.pool_amm_id, curve);
@@ -10254,20 +10289,55 @@ mod tests {
         let mint = Pubkey::new_unique();
         let signer = Pubkey::new_unique();
         let signature = Signature::new_unique();
+        let raw_observation = |ordinal: u32| {
+            let mut observation = test_raw_trade_observation(signature);
+            observation.locator_hint = Some(ghost_core::RawPumpMutationLocatorV1 {
+                program_id: Pubkey::from_str(crate::grpc_connection::PUMP_FUN_PROGRAM_ID)
+                    .expect("pump program"),
+                signature,
+                outer_instruction_index: ordinal as u16,
+                inner_instruction_path: Vec::new(),
+                semantic_event_ordinal: ordinal,
+            });
+            observation.canonical_order = Some(ghost_core::CanonicalPumpOrderKeyV1 {
+                slot: 1,
+                tx_index: 0,
+                outer_instruction_index: ordinal as u16,
+                inner_instruction_path: Vec::new(),
+                semantic_event_ordinal: ordinal,
+            });
+            observation.raw_transaction_mutation_count = Some(2);
+            observation
+        };
 
         let mut buffered_trade = test_trade(pool, Pubkey::default());
         buffered_trade.signature = signature;
         buffered_trade.signer = signer;
         buffered_trade.event_ordinal = Some(0);
-        seer.buffer_pending_trade(buffered_trade, "test", false);
+        buffered_trade.provider_id = Some("raw-primary".to_string());
+        buffered_trade.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
+        seer.buffer_pending_trade_with_observation(
+            buffered_trade,
+            Some(raw_observation(0)),
+            "test",
+            false,
+        );
 
         let mut live_trade = test_trade(pool, mint);
         live_trade.signature = signature;
         live_trade.signer = signer;
         live_trade.event_ordinal = Some(1);
+        live_trade.provider_id = Some("raw-primary".to_string());
+        live_trade.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
 
         assert!(
-            seer.handle_trade_event(live_trade, "test", false).await,
+            seer.handle_trade_event_with_observation(
+                live_trade,
+                Some(raw_observation(1)),
+                "test",
+                false,
+            )
+            .await,
             "resolved sibling trade should still forward live"
         );
 
@@ -10399,7 +10469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ultrafast_mode_keeps_forwarding_trades() {
+    async fn test_ultrafast_mode_does_not_promote_providerless_synthetic_trade() {
         let mut config = SeerConfig::default();
         config.source_mode = Some(SeerSourceMode::PumpPortalWs);
 
@@ -10453,16 +10523,12 @@ mod tests {
 
         seer.process_event(event).await.unwrap();
 
-        let maybe_trade = ipc_receiver
-            .recv()
-            .await
-            .expect("trade should still forward");
-        match maybe_trade {
-            SeerEvent::Trade(trade_event) => {
-                assert_eq!(trade_event.trade.signature, trade.signature);
-            }
-            other => panic!("expected trade event, got {:?}", other),
-        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), ipc_receiver.recv())
+                .await
+                .is_err(),
+            "ultrafast mode must not grant canonical authority to a providerless synthetic trade"
+        );
     }
 
     #[tokio::test]
@@ -10474,70 +10540,17 @@ mod tests {
         // Force session_start_slot to 100
         seer.session_start_slot.store(100, Relaxed);
 
-        let pumpfun_program_id =
-            Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
-        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-
-        let pool = types::InitializePoolEvent {
-            provider_id: None,
-            provider_role: None,
-            slot: Some(99), // Old slot
-            event_ordinal: None,
-            tx_index: None,
-            provenance: None,
-            event_ts_ms: Some(1_000),
-            event_time: ghost_core::EventTimeMetadata::default(),
-            signature: Signature::new_unique(),
-            amm_program_id: pumpfun_program_id,
-            pool_amm_id: Pubkey::new_unique(),
-            base_mint: Pubkey::new_unique(),
-            quote_mint: sol_mint,
-            bonding_curve: Pubkey::new_unique(),
-            creator: Pubkey::new_unique(),
-            initial_virtual_token_reserves: None,
-            initial_virtual_sol_reserves: None,
-            initial_real_token_reserves: None,
-            initial_real_sol_reserves: None,
-            token_total_supply: None,
-            block_time: Some(1),
-            raw_data: vec![],
-        };
-
-        let payload = bincode::serialize(&types::SyntheticPayload::InitializePool(pool)).unwrap();
-        let event = types::GeyserEvent::Transaction {
-            provider_id: None,
-            provider_role: None,
-            observation_provenance: None,
-            slot: Some(99),
-            tx_index: None,
-            event_ts_ms: Some(1_000),
-            arrival_ts_ms: Some(types::arrival_time_ms()),
-            event_time: ghost_core::EventTimeMetadata::default(),
-            signature: Signature::new_unique(),
-            accounts: vec![],
-            instructions: vec![types::RawInstruction {
-                program_id: Pubkey::default(),
-                account_indices: vec![],
-                data: payload,
-            }],
-            logs: vec![],
-            block_time: Some(1),
-            account_data: HashMap::new(),
-            pre_balances: vec![],
-            post_balances: vec![],
-            success: true,
-            error_code: None,
-            compute_units_consumed: None,
-            synthetic: true,
-            source: "pumpportal".to_string(), // Uses synthetic payload parsing
-            mpcf_payload_bytes: None,
-            mpcf_payload_missing_reason: types::RawBytesMissingReason::Unknown,
-            inner_instructions: vec![],
-            pre_token_balances: vec![],
-            post_token_balances: vec![],
-        };
-
-        seer.process_event(event).await.unwrap();
+        let mut old_event = create_tx_with_cpi_create_and_trade(
+            Signature::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            GRPC_GLOBAL_STREAM_SOURCE_LABEL,
+        );
+        if let types::GeyserEvent::Transaction { slot, .. } = &mut old_event {
+            *slot = Some(99);
+        }
+        seer.process_event(old_event).await.unwrap();
 
         // Should be rejected since slot 99 < 100
         assert!(
@@ -10545,67 +10558,17 @@ mod tests {
             "Older pool should have been rejected"
         );
 
-        let pool_new = types::InitializePoolEvent {
-            provider_id: None,
-            provider_role: None,
-            slot: Some(101), // New slot
-            event_ordinal: None,
-            tx_index: None,
-            provenance: None,
-            event_ts_ms: Some(1_000),
-            event_time: ghost_core::EventTimeMetadata::default(),
-            signature: Signature::new_unique(),
-            amm_program_id: pumpfun_program_id,
-            pool_amm_id: Pubkey::new_unique(),
-            base_mint: Pubkey::new_unique(),
-            quote_mint: sol_mint,
-            bonding_curve: Pubkey::new_unique(),
-            creator: Pubkey::new_unique(),
-            initial_virtual_token_reserves: None,
-            initial_virtual_sol_reserves: None,
-            initial_real_token_reserves: None,
-            initial_real_sol_reserves: None,
-            token_total_supply: None,
-            block_time: Some(1),
-            raw_data: vec![],
-        };
-
-        let payload_new =
-            bincode::serialize(&types::SyntheticPayload::InitializePool(pool_new)).unwrap();
-        let event_new = types::GeyserEvent::Transaction {
-            provider_id: None,
-            provider_role: None,
-            observation_provenance: None,
-            slot: Some(101),
-            tx_index: None,
-            event_ts_ms: Some(1_000),
-            arrival_ts_ms: Some(types::arrival_time_ms()),
-            event_time: ghost_core::EventTimeMetadata::default(),
-            signature: Signature::new_unique(),
-            accounts: vec![],
-            instructions: vec![types::RawInstruction {
-                program_id: Pubkey::default(),
-                account_indices: vec![],
-                data: payload_new,
-            }],
-            logs: vec![],
-            block_time: Some(1),
-            account_data: HashMap::new(),
-            pre_balances: vec![],
-            post_balances: vec![],
-            success: true,
-            error_code: None,
-            compute_units_consumed: None,
-            synthetic: true,
-            source: "pumpportal".to_string(),
-            mpcf_payload_bytes: None,
-            mpcf_payload_missing_reason: types::RawBytesMissingReason::Unknown,
-            inner_instructions: vec![],
-            pre_token_balances: vec![],
-            post_token_balances: vec![],
-        };
-
-        seer.process_event(event_new).await.unwrap();
+        let mut new_event = create_tx_with_cpi_create_and_trade(
+            Signature::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            GRPC_GLOBAL_STREAM_SOURCE_LABEL,
+        );
+        if let types::GeyserEvent::Transaction { slot, .. } = &mut new_event {
+            *slot = Some(101);
+        }
+        seer.process_event(new_event).await.unwrap();
         // Should be accepted since slot 101 >= 100
         assert!(rx.try_recv().is_ok(), "Newer pool should be accepted");
     }
@@ -11114,6 +11077,8 @@ mod tests {
         buffered_trade.signature = shared_sig;
         buffered_trade.signer = signer;
         buffered_trade.event_ordinal = Some(0);
+        buffered_trade.provider_id = Some("raw-primary".to_string());
+        buffered_trade.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
         seer.handle_trade_event(buffered_trade.clone(), "test", false)
             .await;
         assert!(
@@ -11130,6 +11095,8 @@ mod tests {
         live_trade.signature = shared_sig;
         live_trade.signer = signer;
         live_trade.event_ordinal = Some(0);
+        live_trade.provider_id = Some("raw-primary".to_string());
+        live_trade.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
         // register_curve_mapping is called inside handle_trade_event when mint is known.
         // This drains the buffer and replays; the live forward must be suppressed.
         seer.handle_trade_event(live_trade, "test", false).await;

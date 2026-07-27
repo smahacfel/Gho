@@ -1319,7 +1319,6 @@ mod tests {
             1,
         );
         PreparedBuyRequest {
-            candidate_integrity_submit_guard: None,
             join_metadata: ExecutionJoinMetadata::default(),
             shadow_v2_entry_boundary: None,
             state_readiness_latch_diagnostics: None,
@@ -1735,7 +1734,6 @@ mod tests {
             1,
         );
         let request = PreparedBuyRequest {
-            candidate_integrity_submit_guard: None,
             join_metadata: ExecutionJoinMetadata::default(),
             shadow_v2_entry_boundary: None,
             state_readiness_latch_diagnostics: None,

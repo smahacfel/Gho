@@ -1,7 +1,8 @@
 //! Candidate-integrity lifecycle registry for PR1D.
 //!
-//! The registry is a technical fence around MFS/evaluation/submit.  It never
-//! computes strategy features or changes a terminal Gatekeeper verdict.
+//! The registry computes the PR1D technical-integrity lifecycle in shadow.
+//! Active MFS/evaluation/submit paths may observe its would-block actions, but
+//! PR1D does not let this registry gate production behavior.
 
 use ghost_core::{
     CandidateIntegrityOutcomeV1, CandidateIntegritySignalV1, PumpCandidateIdentityV1,
@@ -938,15 +939,14 @@ impl CandidateIntegrityRegistry {
         Ok(lookup_record(&state, candidate)?.clone())
     }
 
-    /// Return the current CandidateIntegrity authority status for canonical
+    /// Return the current CandidateIntegrity shadow status for a canonical
     /// AccountStateCore mutation.
     ///
     /// `None` means that no PR1D record exists for this legacy candidate and
-    /// preserves pre-PR1D compatibility. `Some(false)` is authoritative: a
-    /// technical integrity failure or terminal reject/timeout has already
-    /// closed canonical account mutation, so later observations are
-    /// evidence-only. Registry unavailability is returned as an error and
-    /// callers must fail closed.
+    /// preserves pre-PR1D compatibility. `Some(false)` means the shadow model
+    /// would block this mutation. During PR1D Observe it is diagnostic only:
+    /// callers must preserve the parent authority path even if the registry is
+    /// unavailable.
     pub fn account_state_apply_allowed(
         &self,
         candidate: PumpCandidateIdentityV1,

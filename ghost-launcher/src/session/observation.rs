@@ -418,9 +418,8 @@ impl PoolObservationSession {
         &mut self,
         tx: Arc<PoolTransaction>,
     ) -> PoolTransactionIngestResultV1 {
-        let unkeyable = match self.admit_transaction(tx.as_ref()) {
-            SessionTransactionAdmission::Accepted => false,
-            SessionTransactionAdmission::Unkeyable => true,
+        match self.admit_transaction(tx.as_ref()) {
+            SessionTransactionAdmission::Accepted | SessionTransactionAdmission::Unkeyable => {}
             SessionTransactionAdmission::Duplicate { event_ts_ms } => {
                 return PoolTransactionIngestResultV1 {
                     ingress: self.duplicate_ingress_outcome(event_ts_ms),
@@ -433,7 +432,7 @@ impl PoolObservationSession {
                     apply: CanonicalMutationApplyOutcomeV1::Terminal,
                 };
             }
-        };
+        }
 
         self.tx_intelligence.on_transaction(tx.as_ref());
         self.refresh_tx_intelligence_snapshot();
@@ -464,11 +463,12 @@ impl PoolObservationSession {
 
         PoolTransactionIngestResultV1 {
             ingress: outcome,
-            apply: if accepted_unique && !unkeyable {
-                CanonicalMutationApplyOutcomeV1::AppliedNewMutation
-            } else {
-                CanonicalMutationApplyOutcomeV1::Ignored
-            },
+            // Admission above excludes both session duplicates and terminal
+            // sessions. Even when Gatekeeper does not count the event
+            // (unkeyable or dust), TxIntelligence owns and records a new
+            // runtime mutation. `Ignored` is therefore reserved for paths
+            // where no state owner changed.
+            apply: CanonicalMutationApplyOutcomeV1::AppliedNewMutation,
         }
     }
 

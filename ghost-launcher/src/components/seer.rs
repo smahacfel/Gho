@@ -15,8 +15,9 @@ use ghost_brain::oracle::{InitPoolEvent, SnapshotEngine};
 use ghost_core::health::RuntimeHealth;
 use ghost_core::shadow_ledger::ShadowLedger;
 use ghost_core::{
-    ExecutionAccountRole, ObservationProvenanceV1, ObservationSourceFamilyV1,
-    ObservedPumpMutationV1, PumpMutationClaimsV1, PumpMutationFamilyV1,
+    CandidateIntegrityOutcomeV1, CandidateIntegritySignalV1, ExecutionAccountRole,
+    ObservationProvenanceV1, ObservationSourceFamilyV1, ObservedPumpMutationV1,
+    PumpCandidateIdentityV1, PumpMutationClaimsV1, PumpMutationFamilyV1,
     PumpObservationClassificationV1, PumpObservationLedgerDecisionV1,
     PumpObservationLedgerResultV1, PumpObservationLedgerV1, PumpRouteVariant, PumpTradeSideV1,
     RawProviderRoleV1, TimestampQuality, Wal,
@@ -1880,6 +1881,7 @@ async fn run_nln_program_streams_topic_capture(
                         .as_nanos()
                         .min(u128::from(u64::MAX)) as u64,
                     true,
+                    None,
                 );
                 if let Some(writer) = artifact_writer.as_ref() {
                     writer.try_send_bounded(
@@ -1908,6 +1910,7 @@ async fn run_nln_program_streams_topic_capture(
                         .as_nanos()
                         .min(u128::from(u64::MAX)) as u64,
                     true,
+                    None,
                 );
                 ::metrics::counter!("nln_trade_rows", 1);
                 increment_counter!("nln_trade_rows_total");
@@ -2123,6 +2126,10 @@ fn sanitize_detected_creator(creator: Pubkey) -> String {
 
 fn trade_has_forwardable_identity(trade: &seer::types::TradeEvent) -> bool {
     trade.pool_amm_id != Pubkey::default() && trade.mint != Pubkey::default()
+}
+
+fn is_primary_raw_runtime_authority(provider_role: Option<RawProviderRoleV1>) -> bool {
+    provider_role == Some(RawProviderRoleV1::PrimaryAuthority)
 }
 
 fn pool_candidate_matches_primary_observation(
@@ -3888,6 +3895,7 @@ fn pump_observation_classification_label(
         PumpObservationClassificationV1::ExactDuplicate => "exact_duplicate",
         PumpObservationClassificationV1::SameMutationAgreement => "same_mutation_agreement",
         PumpObservationClassificationV1::SecondaryWitnessOnly => "secondary_witness_only",
+        PumpObservationClassificationV1::SecondaryWitnessExpired => "secondary_witness_expired",
         PumpObservationClassificationV1::ParsedWitnessPending => "parsed_witness_pending",
         PumpObservationClassificationV1::ExactStructuralMatch => "exact_structural_match",
         PumpObservationClassificationV1::UniqueSignatureSingletonMatch => {
@@ -3908,7 +3916,7 @@ fn pump_observation_classification_label(
 fn emit_pump_observation_decision(
     candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
     decision: &PumpObservationLedgerDecisionV1,
-) -> bool {
+) {
     ::metrics::counter!(
         "pump_observation_ledger_decisions_total",
         1u64,
@@ -3918,11 +3926,11 @@ fn emit_pump_observation_decision(
         ::metrics::counter!("pump_observation_ledger_canonical_mutations_total", 1u64);
     }
     let Some(signal) = decision.candidate_integrity_signal.clone() else {
-        return true;
+        return;
     };
     if signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready {
         ::metrics::counter!("candidate_integrity_ready_deferred_until_apply_total", 1u64);
-        return true;
+        return;
     }
     match candidate_integrity_registry.record_signal(signal.clone()) {
         Ok(result) => {
@@ -3932,7 +3940,6 @@ fn emit_pump_observation_decision(
                 "outcome" => format!("{:?}", signal.outcome),
                 "action" => format!("{:?}", result.action)
             );
-            true
         }
         Err(error) => {
             ::metrics::counter!(
@@ -3945,10 +3952,94 @@ fn emit_pump_observation_decision(
                 candidate_mint = %signal.candidate.mint,
                 outcome = ?signal.outcome,
                 error = %error,
-                "Seer: direct CandidateIntegrity registry update failed; canonical emission fails closed"
+                "Seer: direct CandidateIntegrity shadow update failed; parent runtime emission remains unchanged"
             );
-            false
         }
+    }
+}
+
+fn missing_primary_observation_signal(
+    candidate: PumpCandidateIdentityV1,
+    signature: Option<solana_sdk::signature::Signature>,
+) -> CandidateIntegritySignalV1 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ghost.pr1d.missing_primary_transport_observation.v1");
+    hasher.update(candidate.pool_amm_id.as_ref());
+    hasher.update(candidate.mint.as_ref());
+    if let Some(signature) = signature {
+        hasher.update(signature.as_ref());
+    }
+    CandidateIntegritySignalV1 {
+        candidate,
+        outcome: CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+        signature,
+        locator: None,
+        conflict_fields: Vec::new(),
+        evidence_hash_blake3: *hasher.finalize().as_bytes(),
+    }
+}
+
+fn canonical_coverage_incomplete_signal(
+    canonical: &ghost_core::StructuralCanonicalPumpMutationV1,
+) -> Option<CandidateIntegritySignalV1> {
+    Some(CandidateIntegritySignalV1 {
+        candidate: PumpCandidateIdentityV1 {
+            pool_amm_id: canonical.claims.curve?,
+            mint: canonical.claims.mint?,
+        },
+        outcome: CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+        signature: Some(canonical.locator.signature),
+        locator: Some(canonical.locator.clone()),
+        conflict_fields: Vec::new(),
+        evidence_hash_blake3: canonical.primary_raw_provenance.payload_hash_blake3,
+    })
+}
+
+fn record_shadow_integrity_signal(
+    candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
+    signal: Option<CandidateIntegritySignalV1>,
+    reason: &'static str,
+) {
+    let Some(signal) = signal else {
+        return;
+    };
+    match candidate_integrity_registry.record_signal(signal.clone()) {
+        Ok(result) => {
+            ::metrics::counter!(
+                "candidate_integrity_direct_signal_total",
+                1u64,
+                "outcome" => format!("{:?}", signal.outcome),
+                "action" => format!("{:?}", result.action)
+            );
+            ::metrics::counter!(
+                "candidate_integrity_would_block_primary_emission_total",
+                1u64,
+                "reason" => reason
+            );
+        }
+        Err(error) => {
+            ::metrics::counter!(
+                "candidate_integrity_direct_signal_failure_total",
+                1u64,
+                "error" => error.to_string()
+            );
+            error!(
+                candidate_pool = %signal.candidate.pool_amm_id,
+                candidate_mint = %signal.candidate.mint,
+                reason,
+                error = %error,
+                "Seer: CandidateIntegrity shadow evidence unavailable; primary runtime parity remains authoritative"
+            );
+        }
+    }
+}
+
+fn fail_shadow_canonical_apply(
+    candidate_integrity_registry: &CandidateIntegrityRegistry,
+    receipt: Option<&CanonicalMutationApplyReceiptV1>,
+) {
+    if let Some(receipt) = receipt {
+        let _ = candidate_integrity_registry.fail_canonical_apply(receipt);
     }
 }
 
@@ -3958,13 +4049,21 @@ fn ingest_pump_observation(
     observation: Option<ObservedPumpMutationV1>,
     now_monotonic_ns: u64,
     boundary_payload_aligned: bool,
+    missing_primary_signal: Option<CandidateIntegritySignalV1>,
 ) -> Option<CanonicalMutationApplyReceiptV1> {
     let Some(observation) = observation else {
         ::metrics::counter!(
             "pump_observation_ledger_missing_transport_observation_total",
             1u64
         );
-        warn!("Seer: Pump IPC event missing raw observation; canonical emission fails closed");
+        record_shadow_integrity_signal(
+            candidate_integrity_registry,
+            missing_primary_signal,
+            "missing_transport_observation",
+        );
+        warn!(
+            "Seer: primary Pump IPC event missing raw observation; shadow integrity is incomplete, parent runtime emission continues"
+        );
         return None;
     };
     let result: PumpObservationLedgerResultV1 = match ledger.lock() {
@@ -3981,7 +4080,12 @@ fn ingest_pump_observation(
             ::metrics::counter!("pump_observation_ledger_unavailable_total", 1u64);
             error!(
                 error = %error,
-                "Seer: Pump Observation Ledger mutex poisoned; canonical emission fails closed"
+                "Seer: Pump Observation Ledger mutex poisoned; shadow evidence unavailable, parent runtime emission continues"
+            );
+            record_shadow_integrity_signal(
+                candidate_integrity_registry,
+                missing_primary_signal,
+                "ledger_unavailable",
             );
             return None;
         }
@@ -3990,15 +4094,13 @@ fn ingest_pump_observation(
     let decisions = std::iter::once(&result.observation_decision)
         .chain(result.derived_decisions.iter())
         .collect::<Vec<_>>();
-    let mut integrity_recorded = true;
     for decision in decisions.iter().copied().filter(|decision| {
         decision
             .candidate_integrity_signal
             .as_ref()
             .is_none_or(|signal| signal.outcome != ghost_core::CandidateIntegrityOutcomeV1::Ready)
     }) {
-        integrity_recorded &=
-            emit_pump_observation_decision(candidate_integrity_registry, decision);
+        emit_pump_observation_decision(candidate_integrity_registry, decision);
     }
     for decision in decisions.iter().copied().filter(|decision| {
         decision
@@ -4006,19 +4108,9 @@ fn ingest_pump_observation(
             .as_ref()
             .is_some_and(|signal| signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready)
     }) {
-        integrity_recorded &=
-            emit_pump_observation_decision(candidate_integrity_registry, decision);
+        emit_pump_observation_decision(candidate_integrity_registry, decision);
     }
-    let runtime_eligible = boundary_payload_aligned
-        && !matches!(
-            result.observation_decision.classification,
-            PumpObservationClassificationV1::PrimaryRawCoverageIncomplete
-                | PumpObservationClassificationV1::EvidenceCapacityExceeded
-                | PumpObservationClassificationV1::SourceReconciliationConflict
-        );
-    let canonical = (integrity_recorded && runtime_eligible)
-        .then(|| result.observation_decision.canonical_mutation.as_ref())
-        .flatten()?;
+    let canonical = result.observation_decision.canonical_mutation.as_ref()?;
     let receipt = match candidate_integrity_registry.stage_canonical_mutation(canonical) {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -4026,7 +4118,12 @@ fn ingest_pump_observation(
                 signature = %canonical.locator.signature,
                 locator = ?canonical.locator,
                 error = %error,
-                "Seer: canonical apply receipt staging failed; runtime emission fails closed"
+                "Seer: canonical apply receipt staging failed in shadow; parent runtime emission continues"
+            );
+            record_shadow_integrity_signal(
+                candidate_integrity_registry,
+                canonical_coverage_incomplete_signal(canonical),
+                "receipt_stage_failed",
             );
             return None;
         }
@@ -4046,9 +4143,13 @@ fn ingest_pump_observation(
         error!(
             signature = %receipt.signature,
             locator = ?receipt.locator,
-            "Seer: complete transaction inventory could not seal apply fence; runtime emission fails closed"
+            "Seer: complete transaction inventory could not seal shadow apply fence; parent runtime emission continues"
         );
-        return None;
+        record_shadow_integrity_signal(
+            candidate_integrity_registry,
+            canonical_coverage_incomplete_signal(canonical),
+            "inventory_seal_failed",
+        );
     }
     Some(receipt)
 }
@@ -4070,7 +4171,7 @@ fn finalize_pump_observation_ledger(
         }
     };
     for decision in &decisions {
-        let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
+        emit_pump_observation_decision(candidate_integrity_registry, decision);
     }
 }
 
@@ -5062,11 +5163,12 @@ pub async fn run(
             match seer_event {
                 seer::ipc::SeerEvent::PoolDetected(event) => {
                     let candidate = &event.candidate;
+                    let primary_raw = is_primary_raw_runtime_authority(candidate.provider_role);
                     let boundary_payload_aligned =
                         event.observation.as_ref().is_some_and(|observation| {
                             pool_candidate_matches_primary_observation(candidate, observation)
                         });
-                    let Some(canonical_mutation) = ingest_pump_observation(
+                    let canonical_mutation = ingest_pump_observation(
                         &pump_observation_ledger_ipc,
                         &candidate_integrity_registry_ipc,
                         event.observation.clone(),
@@ -5075,15 +5177,27 @@ pub async fn run(
                             .as_nanos()
                             .min(u128::from(u64::MAX)) as u64,
                         boundary_payload_aligned,
-                    ) else {
+                        primary_raw.then(|| {
+                            missing_primary_observation_signal(
+                                PumpCandidateIdentityV1 {
+                                    pool_amm_id: candidate.pool_amm_id,
+                                    mint: candidate.base_mint,
+                                },
+                                solana_sdk::signature::Signature::from_str(&candidate.signature)
+                                    .ok(),
+                            )
+                        }),
+                    );
+                    if !primary_raw {
                         debug!(
                             pool = %candidate.pool_amm_id,
                             mint = %candidate.base_mint,
                             signature = %candidate.signature,
-                            "Seer: PoolDetected observation is witness/duplicate/incomplete; canonical runtime emission suppressed"
+                            provider_role = ?candidate.provider_role,
+                            "Seer: non-primary PoolDetected remains witness-only; zero canonical runtime emission"
                         );
                         continue;
-                    };
+                    }
                     match event.runtime_disposition {
                         PoolDetectionRuntimeDispositionV1::Observe => {}
                         PoolDetectionRuntimeDispositionV1::ContinuityOnly => {
@@ -5098,8 +5212,10 @@ pub async fn run(
                                 continuity_observation_pool = ?event.continuity_observation_pool,
                                 "Seer: canonical raw observation retained, but continuity-only pool is not admitted to runtime"
                             );
-                            let _ = candidate_integrity_registry_ipc
-                                .fail_canonical_apply(&canonical_mutation);
+                            fail_shadow_canonical_apply(
+                                &candidate_integrity_registry_ipc,
+                                canonical_mutation.as_ref(),
+                            );
                             continue;
                         }
                         PoolDetectionRuntimeDispositionV1::Suppressed => {
@@ -5113,8 +5229,10 @@ pub async fn run(
                                 mint = %candidate.base_mint,
                                 "Seer: canonical raw observation retained, but suppressed pool is not admitted to runtime"
                             );
-                            let _ = candidate_integrity_registry_ipc
-                                .fail_canonical_apply(&canonical_mutation);
+                            fail_shadow_canonical_apply(
+                                &candidate_integrity_registry_ipc,
+                                canonical_mutation.as_ref(),
+                            );
                             continue;
                         }
                     }
@@ -5175,8 +5293,10 @@ pub async fn run(
                             bonding_curve_str,
                             amm_program_str
                         );
-                        let _ = candidate_integrity_registry_ipc
-                            .fail_canonical_apply(&canonical_mutation);
+                        fail_shadow_canonical_apply(
+                            &candidate_integrity_registry_ipc,
+                            canonical_mutation.as_ref(),
+                        );
                         continue; // Skip this pool - do not emit, do not bootstrap
                     }
 
@@ -5192,8 +5312,10 @@ pub async fn run(
                             bonding_curve_str,
                             amm_program_str
                         );
-                        let _ = candidate_integrity_registry_ipc
-                            .fail_canonical_apply(&canonical_mutation);
+                        fail_shadow_canonical_apply(
+                            &candidate_integrity_registry_ipc,
+                            canonical_mutation.as_ref(),
+                        );
                         continue;
                     }
 
@@ -5209,8 +5331,10 @@ pub async fn run(
                             bonding_curve_str,
                             amm_program_str
                         );
-                        let _ = candidate_integrity_registry_ipc
-                            .fail_canonical_apply(&canonical_mutation);
+                        fail_shadow_canonical_apply(
+                            &candidate_integrity_registry_ipc,
+                            canonical_mutation.as_ref(),
+                        );
                         continue;
                     }
 
@@ -5226,8 +5350,10 @@ pub async fn run(
                             bonding_curve_str,
                             amm_program_str
                         );
-                        let _ = candidate_integrity_registry_ipc
-                            .fail_canonical_apply(&canonical_mutation);
+                        fail_shadow_canonical_apply(
+                            &candidate_integrity_registry_ipc,
+                            canonical_mutation.as_ref(),
+                        );
                         continue;
                     }
 
@@ -5243,8 +5369,10 @@ pub async fn run(
                             bonding_curve_str,
                             amm_program_str
                         );
-                        let _ = candidate_integrity_registry_ipc
-                            .fail_canonical_apply(&canonical_mutation);
+                        fail_shadow_canonical_apply(
+                            &candidate_integrity_registry_ipc,
+                            canonical_mutation.as_ref(),
+                        );
                         continue;
                     }
 
@@ -5293,7 +5421,7 @@ pub async fn run(
                             health_ipc.as_ref(),
                             now,
                             detected_ms,
-                            Some(&canonical_mutation),
+                            canonical_mutation.as_ref(),
                             Some(&candidate_integrity_registry_ipc),
                         );
                         let nln_replay_ready = match nln_trade_pool_resolver_ipc.lock() {
@@ -5363,8 +5491,10 @@ pub async fn run(
                             );
                         }
                     } else {
-                        let _ = candidate_integrity_registry_ipc
-                            .fail_canonical_apply(&canonical_mutation);
+                        fail_shadow_canonical_apply(
+                            &candidate_integrity_registry_ipc,
+                            canonical_mutation.as_ref(),
+                        );
                         let flush_result = session_trade_bridge
                             .register_detected_pool(candidate.pool_amm_id, Instant::now());
                         if let Ok(mut resolver) = nln_trade_pool_resolver_ipc.lock() {
@@ -5394,11 +5524,12 @@ pub async fn run(
 
                 seer::ipc::SeerEvent::Trade(trade_event) => {
                     let trade = &trade_event.trade;
+                    let primary_raw = is_primary_raw_runtime_authority(trade.provider_role);
                     let boundary_payload_aligned =
                         trade_event.observation.as_ref().is_some_and(|observation| {
                             trade_matches_primary_observation(trade, observation)
                         });
-                    let Some(canonical_mutation) = ingest_pump_observation(
+                    let canonical_mutation = ingest_pump_observation(
                         &pump_observation_ledger_ipc,
                         &candidate_integrity_registry_ipc,
                         trade_event.observation.clone(),
@@ -5407,16 +5538,27 @@ pub async fn run(
                             .as_nanos()
                             .min(u128::from(u64::MAX)) as u64,
                         boundary_payload_aligned,
-                    ) else {
+                        primary_raw.then(|| {
+                            missing_primary_observation_signal(
+                                PumpCandidateIdentityV1 {
+                                    pool_amm_id: trade.pool_amm_id,
+                                    mint: trade.mint,
+                                },
+                                Some(trade.signature),
+                            )
+                        }),
+                    );
+                    if !primary_raw {
                         debug!(
                             pool = %trade.pool_amm_id,
                             mint = %trade.mint,
                             signature = %trade.signature,
                             event_ordinal = ?trade.event_ordinal,
-                            "Seer: Trade observation is witness/duplicate/incomplete; canonical runtime emission suppressed"
+                            provider_role = ?trade.provider_role,
+                            "Seer: non-primary Trade remains witness-only; zero canonical runtime emission"
                         );
                         continue;
-                    };
+                    }
 
                     if !trade_has_forwardable_identity(trade) {
                         warn!(
@@ -5426,8 +5568,10 @@ pub async fn run(
                             trade.mint,
                             trade.event_ordinal
                         );
-                        let _ = candidate_integrity_registry_ipc
-                            .fail_canonical_apply(&canonical_mutation);
+                        fail_shadow_canonical_apply(
+                            &candidate_integrity_registry_ipc,
+                            canonical_mutation.as_ref(),
+                        );
                         continue;
                     }
 
@@ -5450,7 +5594,7 @@ pub async fn run(
                             trade,
                             health_ipc.as_ref(),
                             now,
-                            Some(&canonical_mutation),
+                            canonical_mutation.as_ref(),
                             Some(&candidate_integrity_registry_ipc),
                         );
                         if gate.decision == SessionTradeDecision::ForwardNow {
@@ -5483,8 +5627,10 @@ pub async fn run(
                             );
                         }
                     } else {
-                        let _ = candidate_integrity_registry_ipc
-                            .fail_canonical_apply(&canonical_mutation);
+                        fail_shadow_canonical_apply(
+                            &candidate_integrity_registry_ipc,
+                            canonical_mutation.as_ref(),
+                        );
                     }
                 }
 
@@ -5818,7 +5964,8 @@ mod tests {
     use super::{
         detected_pool_from_candidate, detection_clock_summary, emit_account_update_to_event_bus,
         emit_execution_account_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
-        ingest_pump_observation, nln_normalization_error_row,
+        ingest_pump_observation, is_primary_raw_runtime_authority,
+        missing_primary_observation_signal, nln_normalization_error_row,
         nln_route_manifest_evidence_candidate_row, process_pool_detected_event_for_session_gate,
         process_trade_event_for_session_gate, pumpswap_program_id,
         select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
@@ -5828,14 +5975,17 @@ mod tests {
         SessionAccountUpdateDecision, SessionBcv2Context, SessionExecutionAccountEvidenceDecision,
         SessionPoolTradeBridge, SessionTradeDecision, TOKEN_PROGRAM_ID,
     };
-    use crate::candidate_integrity::CandidateIntegrityRegistry;
+    use crate::candidate_integrity::{
+        CandidateIntegrityRegistry, CandidateIntegrityRegistryLimitsV1,
+    };
     use crate::events::{create_event_bus, GhostEvent};
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use ghost_core::{
         CandidateIntegrityOutcomeV1, CanonicalPumpOrderKeyV1, CurveFinality,
         ObservationProvenanceV1, ObservationSourceFamilyV1, ObservedPumpMutationV1,
         PumpCandidateIdentityV1, PumpMutationClaimsV1, PumpMutationFamilyV1,
-        PumpObservationLedgerV1, PumpTradeSideV1, RawProviderRoleV1, RawPumpMutationLocatorV1,
+        PumpObservationLedgerConfigV1, PumpObservationLedgerV1, PumpTradeSideV1, RawProviderRoleV1,
+        RawPumpMutationLocatorV1,
     };
     use seer::config::{ProgramStreamsConfig, ProgramStreamsQuotaPolicy};
     use seer::ipc::{
@@ -5907,6 +6057,7 @@ mod tests {
             }),
             1,
             true,
+            None,
         )
         .expect("primary canonical receipt");
         let candidate = PumpCandidateIdentityV1 {
@@ -5929,6 +6080,364 @@ mod tests {
                 .outcome,
             CandidateIntegrityOutcomeV1::Ready
         );
+    }
+
+    fn primary_trade_observation(
+        signature: Signature,
+        pool: Pubkey,
+        mint: Pubkey,
+        semantic_event_ordinal: u32,
+    ) -> ObservedPumpMutationV1 {
+        let program_id = Pubkey::new_unique();
+        ObservedPumpMutationV1 {
+            mutation_family: PumpMutationFamilyV1::Trade,
+            signature,
+            locator_hint: Some(RawPumpMutationLocatorV1 {
+                program_id,
+                signature,
+                outer_instruction_index: semantic_event_ordinal as u16,
+                inner_instruction_path: vec![semantic_event_ordinal as u16],
+                semantic_event_ordinal,
+            }),
+            canonical_order: Some(CanonicalPumpOrderKeyV1 {
+                slot: 10,
+                tx_index: 0,
+                outer_instruction_index: semantic_event_ordinal as u16,
+                inner_instruction_path: vec![semantic_event_ordinal as u16],
+                semantic_event_ordinal,
+            }),
+            raw_transaction_mutation_count: None,
+            claims: PumpMutationClaimsV1 {
+                curve: Some(pool),
+                mint: Some(mint),
+                side: Some(PumpTradeSideV1::Buy),
+                success: Some(true),
+                token_amount_units: Some(1),
+                ..PumpMutationClaimsV1::default()
+            },
+            raw_provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
+            provenance: ObservationProvenanceV1 {
+                source_family: ObservationSourceFamilyV1::RawYellowstone,
+                source_id: "yellowstone".to_string(),
+                provider_id: "primary".to_string(),
+                schema_id: "test".to_string(),
+                payload_hash_blake3: [semantic_event_ordinal.saturating_add(1) as u8; 32],
+                received_at_monotonic_ns: u64::from(semantic_event_ordinal),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn pr1d_observe_only_missing_primary_observation_preserves_parent_pool_emission() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut candidate = make_candidate(pool, mint);
+        candidate.provider_id = Some("primary".to_string());
+        candidate.provider_role = Some(RawProviderRoleV1::PrimaryAuthority);
+        let candidate_identity = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint,
+        };
+        let signal = missing_primary_observation_signal(
+            candidate_identity,
+            Signature::from_str(&candidate.signature).ok(),
+        );
+
+        assert!(
+            ingest_pump_observation(&ledger, &registry, None, 1, false, Some(signal),).is_none()
+        );
+        assert_eq!(
+            registry
+                .snapshot(candidate_identity)
+                .expect("typed incomplete shadow evidence")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+
+        let (tx, mut rx) = create_event_bus();
+        let mut bridge = SessionPoolTradeBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        process_pool_detected_event_for_session_gate(
+            &tx,
+            &mut bridge,
+            &candidate,
+            None,
+            Instant::now(),
+            11_000,
+            None,
+            Some(&registry),
+        );
+        match recv_only_event(&mut rx).await {
+            GhostEvent::NewPoolDetected(event) => {
+                assert_eq!(event.pool_amm_id, pool.to_string());
+                assert_eq!(event.base_mint, mint.to_string());
+                assert_eq!(event.signature, candidate.signature);
+            }
+            other => panic!(
+                "expected parent NewPoolDetected, got {}",
+                other.event_type()
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn pr1d_observe_only_boundary_mismatch_preserves_parent_trade_emission() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut trade = make_trade(pool, mint);
+        trade.provider_id = Some("primary".to_string());
+        trade.provider_role = Some(RawProviderRoleV1::PrimaryAuthority);
+        let observation = primary_trade_observation(trade.signature, pool, mint, 7);
+
+        assert!(
+            ingest_pump_observation(&ledger, &registry, Some(observation), 1, false, None,)
+                .is_none()
+        );
+        assert_eq!(
+            registry
+                .snapshot(PumpCandidateIdentityV1 {
+                    pool_amm_id: pool,
+                    mint,
+                })
+                .expect("boundary mismatch evidence")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+
+        let (tx, mut rx) = create_event_bus();
+        let mut bridge = SessionPoolTradeBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let _ = bridge.register_detected_pool(pool, Instant::now());
+        let ingress = process_trade_event_for_session_gate(
+            &tx,
+            &mut bridge,
+            &trade,
+            None,
+            Instant::now(),
+            None,
+            Some(&registry),
+        );
+        assert_eq!(ingress.decision, SessionTradeDecision::ForwardNow);
+        match recv_only_event(&mut rx).await {
+            GhostEvent::PoolTransaction(event) => {
+                assert_eq!(event.pool_amm_id, pool.to_string());
+                assert_eq!(event.signature, trade.signature.to_string());
+            }
+            other => panic!(
+                "expected parent PoolTransaction, got {}",
+                other.event_type()
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn pr1d_observe_only_ledger_capacity_preserves_parent_trade_emission() {
+        let ledger = Arc::new(Mutex::new(
+            PumpObservationLedgerV1::try_new(PumpObservationLedgerConfigV1 {
+                max_primary_canonical_mutations: 1,
+                ..PumpObservationLedgerConfigV1::default()
+            })
+            .expect("bounded ledger config"),
+        ));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        assert!(ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(
+                Signature::new_unique(),
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                0,
+            )),
+            1,
+            true,
+            None,
+        )
+        .is_some());
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut trade = make_trade(pool, mint);
+        trade.provider_id = Some("primary".to_string());
+        trade.provider_role = Some(RawProviderRoleV1::PrimaryAuthority);
+        assert!(ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(trade.signature, pool, mint, 1)),
+            2,
+            true,
+            None,
+        )
+        .is_none());
+        assert_eq!(
+            registry
+                .snapshot(PumpCandidateIdentityV1 {
+                    pool_amm_id: pool,
+                    mint,
+                })
+                .expect("capacity evidence")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+
+        let (tx, mut rx) = create_event_bus();
+        let mut bridge = SessionPoolTradeBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let _ = bridge.register_detected_pool(pool, Instant::now());
+        assert_eq!(
+            process_trade_event_for_session_gate(
+                &tx,
+                &mut bridge,
+                &trade,
+                None,
+                Instant::now(),
+                None,
+                Some(&registry),
+            )
+            .decision,
+            SessionTradeDecision::ForwardNow
+        );
+        assert!(matches!(
+            recv_only_event(&mut rx).await,
+            GhostEvent::PoolTransaction(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pr1d_observe_only_registry_capacity_preserves_parent_trade_emission() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::new(
+            CandidateIntegrityRegistryLimitsV1 {
+                max_candidates: 1,
+                max_audit_markers_per_candidate: 4,
+            },
+        ));
+        assert!(ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(
+                Signature::new_unique(),
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                0,
+            )),
+            1,
+            true,
+            None,
+        )
+        .is_some());
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut trade = make_trade(pool, mint);
+        trade.provider_id = Some("primary".to_string());
+        trade.provider_role = Some(RawProviderRoleV1::PrimaryAuthority);
+        assert!(ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(trade.signature, pool, mint, 1)),
+            2,
+            true,
+            None,
+        )
+        .is_none());
+        assert_eq!(
+            registry
+                .snapshot(PumpCandidateIdentityV1 {
+                    pool_amm_id: pool,
+                    mint,
+                })
+                .expect("receipt capacity evidence")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+
+        let (tx, mut rx) = create_event_bus();
+        let mut bridge = SessionPoolTradeBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let _ = bridge.register_detected_pool(pool, Instant::now());
+        assert_eq!(
+            process_trade_event_for_session_gate(
+                &tx,
+                &mut bridge,
+                &trade,
+                None,
+                Instant::now(),
+                None,
+                Some(&registry),
+            )
+            .decision,
+            SessionTradeDecision::ForwardNow
+        );
+        assert!(matches!(
+            recv_only_event(&mut rx).await,
+            GhostEvent::PoolTransaction(_)
+        ));
+    }
+
+    #[test]
+    fn pr1d_nonprimary_sources_remain_witness_only_at_runtime_authority_boundary() {
+        assert!(!is_primary_raw_runtime_authority(Some(
+            RawProviderRoleV1::SecondaryWitness
+        )));
+        assert!(!is_primary_raw_runtime_authority(None));
+
+        let mut ledger = PumpObservationLedgerV1::default();
+        let mut secondary = primary_trade_observation(
+            Signature::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            0,
+        );
+        secondary.raw_provider_role = Some(RawProviderRoleV1::SecondaryWitness);
+        secondary.provenance.provider_id = "secondary".to_string();
+        let secondary_result = ledger.observe(secondary, 1);
+        assert!(secondary_result
+            .observation_decision
+            .canonical_mutation
+            .is_none());
+
+        let mut nln = primary_trade_observation(
+            Signature::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            1,
+        );
+        nln.locator_hint = None;
+        nln.canonical_order = None;
+        nln.raw_provider_role = None;
+        nln.provenance.source_family = ObservationSourceFamilyV1::ParsedNln;
+        nln.provenance.provider_id = "nln".to_string();
+        let nln_result = ledger.observe(nln, 2);
+        assert!(nln_result.observation_decision.canonical_mutation.is_none());
+
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.canonical_mutation_count, 0);
+        assert_eq!(snapshot.pending_witness_count, 2);
     }
 
     #[test]

@@ -1,3 +1,9 @@
+//! Shadow-only PR1D lifecycle matrix.
+//!
+//! These tests validate the actions that CandidateIntegrity records as
+//! `would_*` evidence. They do not describe active MFS, Gatekeeper, submit,
+//! confirmation, capacity, or post-buy enforcement in PR1D.
+
 use ghost_core::{
     CandidateIntegrityOutcomeV1, CandidateIntegritySignalV1, PumpCandidateIdentityV1,
     PumpMutationConflictFieldV1, RawPumpMutationLocatorV1,
@@ -107,7 +113,7 @@ fn confirmed_position(
 }
 
 #[test]
-fn pre_mfs_integrity_failure_is_a_typed_technical_block() {
+fn shadow_pre_mfs_integrity_failure_computes_would_block() {
     let candidate = candidate();
     let registry = ready_registry(candidate);
 
@@ -152,7 +158,7 @@ fn pre_mfs_integrity_failure_is_a_typed_technical_block() {
 }
 
 #[test]
-fn mfs_and_evaluation_are_generation_fenced_against_late_conflicts() {
+fn shadow_mfs_and_evaluation_compute_would_abort_for_late_conflicts() {
     for expected_phase in [
         CandidateLifecyclePhaseV1::MfsMaterialized,
         CandidateLifecyclePhaseV1::EvaluationRunning,
@@ -232,7 +238,7 @@ fn terminal_reject_and_timeout_are_immutable_audit_boundaries() {
 }
 
 #[test]
-fn conflict_before_submit_revokes_the_only_submit_permit() {
+fn shadow_conflict_before_submit_computes_would_cancel() {
     let candidate = candidate();
     let registry = ready_registry(candidate);
     let submit_guard = buy_not_submitted(&registry, candidate);
@@ -269,7 +275,7 @@ fn conflict_before_submit_revokes_the_only_submit_permit() {
 }
 
 #[test]
-fn conflict_after_submit_requires_reconciliation_but_not_fake_confirmation() {
+fn shadow_conflict_after_submit_computes_would_reconcile() {
     let candidate = candidate();
     let registry = ready_registry(candidate);
     let submit_guard = buy_not_submitted(&registry, candidate);
@@ -309,7 +315,7 @@ fn conflict_after_submit_requires_reconciliation_but_not_fake_confirmation() {
 }
 
 #[test]
-fn conflict_after_confirmation_quarantines_witness_without_rewriting_position() {
+fn shadow_conflict_after_confirmation_computes_would_quarantine() {
     let candidate = candidate();
     let registry = ready_registry(candidate);
     let _submit_guard = confirmed_position(&registry, candidate);
@@ -335,7 +341,7 @@ fn conflict_after_confirmation_quarantines_witness_without_rewriting_position() 
 }
 
 #[test]
-fn conflict_vs_submit_race_has_only_the_two_fail_closed_outcomes() {
+fn shadow_conflict_vs_submit_race_has_only_the_two_recorded_outcomes() {
     const RACE_ATTEMPTS: u8 = 128;
 
     for attempt in 0..RACE_ATTEMPTS {
@@ -404,7 +410,7 @@ fn conflict_vs_submit_race_has_only_the_two_fail_closed_outcomes() {
 }
 
 #[test]
-fn bounded_audit_overflow_never_rewrites_confirmed_authority() {
+fn shadow_bounded_audit_overflow_never_rewrites_confirmed_history() {
     let candidate = candidate();
     let registry = ready_registry_with_limits(
         candidate,
