@@ -1,14 +1,14 @@
 # BASELINE RECEIPT PR1E — `103212b` — 2026-07-27
 
-Status: `FROZEN CHANGE SET 0 / PR1E COMPARISON AUTHORITY`  
-Repozytorium: `smahacfel/Gho`  
-Branch roboczy: `agent/ingest-state-quote-boundary-pr1e-20260727`  
+Status: `FROZEN CHANGE SET 0 / PR1E COMPARISON AUTHORITY`
+Repozytorium: `smahacfel/Gho`
+Branch roboczy: `agent/ingest-state-quote-boundary-pr1e-20260727`
 Baseline:
-`103212b16bfc059db367e1ceb3c7d00fd307d6c5`  
+`103212b16bfc059db367e1ceb3c7d00fd307d6c5`
 Rodzice merge:
 `a7a7bf194033331a2a59cad89f6ce255b82c7635`
 oraz
-`a982157f499313eb8f9b42326e67d495ace6224d`  
+`a982157f499313eb8f9b42326e67d495ace6224d`
 Opis: `Merge pull request #85 from
 smahacfel/agent/ingest-observation-ledger-pr1d-20260725`
 
@@ -178,4 +178,3 @@ Finalny PR1E:
 - nie może naprawiać powyższych historycznych fixture’ów w ramach PR1E;
 - musi zachować exact baseline output dla wszystkich untouched primary
   records.
-

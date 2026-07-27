@@ -10,7 +10,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Run the WEST (Wallet Energy & State Tracker) Listener component
 ///
@@ -51,7 +51,7 @@ pub async fn run(
                 match event {
                     Ok(ghost_event) => {
                         match ghost_event {
-                            GhostEvent::PoolTransaction(pool_tx) => {
+                            GhostEvent::PoolTransaction(pool_tx, Some(_permit)) => {
                                 // Parse pubkeys
                                 match (
                                     Pubkey::from_str(&pool_tx.pool_amm_id),
@@ -143,6 +143,16 @@ pub async fn run(
                                         );
                                     }
                                 }
+                            }
+                            GhostEvent::PoolTransaction(_, None)
+                            | GhostEvent::NewPoolDetected(_, None) => {
+                                ::metrics::counter!(
+                                    "pr1_runtime_bypass_attempt_total",
+                                    1u64
+                                );
+                                warn!(
+                                    "WestListener: rejected structural event without canonical PR1 permit"
+                                );
                             }
                             _ => {
                                 // Ignore other event types

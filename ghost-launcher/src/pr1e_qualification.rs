@@ -8,8 +8,8 @@
 use crate::{
     candidate_integrity::CandidateIntegrityRegistry,
     components::seer::{
-        ingest_pump_observation, process_trade_event_for_session_gate, SessionPoolTradeBridge,
-        SessionTradeDecision,
+        ingest_pump_observation, process_trade_event_for_session_gate, CanonicalRuntimeAdmissionV1,
+        SessionPoolTradeBridge, SessionTradeDecision,
     },
     events::{create_event_bus, GhostEvent},
 };
@@ -284,9 +284,13 @@ async fn pr1e_runner_uses_production_ledger_registry_and_event_adapter() {
     let signature = Signature::from([3; 64]);
     let observation = primary_trade_observation(signature, pool, mint, 0, Some(1));
 
-    let receipt =
-        ingest_pump_observation(&ledger, &registry, Some(observation.clone()), 1, true, None)
-            .expect("unique primary produces one canonical receipt");
+    let permit =
+        match ingest_pump_observation(&ledger, &registry, Some(observation.clone()), 1, true, None)
+        {
+            CanonicalRuntimeAdmissionV1::Apply(permit) => permit,
+            other => panic!("unique primary must produce one canonical permit: {other:?}"),
+        };
+    let receipt = permit.apply_receipt.clone();
 
     let (event_tx, mut event_rx) = create_event_bus();
     let mut bridge =
@@ -299,8 +303,8 @@ async fn pr1e_runner_uses_production_ledger_registry_and_event_adapter() {
         &trade,
         None,
         Instant::now(),
-        Some(&receipt),
-        Some(&registry),
+        permit,
+        &registry,
     );
     assert_eq!(ingress.decision, SessionTradeDecision::ForwardNow);
     assert!(matches!(
@@ -308,7 +312,7 @@ async fn pr1e_runner_uses_production_ledger_registry_and_event_adapter() {
             .recv()
             .await
             .expect("production Event Bus emission"),
-        GhostEvent::PoolTransaction(_)
+        GhostEvent::PoolTransaction(_, _)
     ));
 
     let candidate = PumpCandidateIdentityV1 {
@@ -335,16 +339,19 @@ async fn pr1e_runner_uses_production_ledger_registry_and_event_adapter() {
         .expect("candidate released after apply");
     assert!(registry.evaluation_guard(candidate).is_ok());
 
-    assert!(
-        ingest_pump_observation(&ledger, &registry, Some(observation.clone()), 2, true, None,)
-            .is_none()
-    );
+    assert!(matches!(
+        ingest_pump_observation(&ledger, &registry, Some(observation.clone()), 2, true, None,),
+        CanonicalRuntimeAdmissionV1::NoApply(_)
+    ));
 
     let mut secondary = observation.clone();
     secondary.raw_provider_role = Some(RawProviderRoleV1::SecondaryWitness);
     secondary.provenance.provider_id = "secondary".to_string();
     secondary.provenance.payload_hash_blake3 = [9; 32];
-    assert!(ingest_pump_observation(&ledger, &registry, Some(secondary), 3, true, None,).is_none());
+    assert!(matches!(
+        ingest_pump_observation(&ledger, &registry, Some(secondary), 3, true, None),
+        CanonicalRuntimeAdmissionV1::NoApply(_)
+    ));
 
     let mut nln = observation;
     nln.locator_hint = None;
@@ -353,8 +360,171 @@ async fn pr1e_runner_uses_production_ledger_registry_and_event_adapter() {
     nln.provenance.source_family = ObservationSourceFamilyV1::ParsedNln;
     nln.provenance.provider_id = "nln".to_string();
     nln.provenance.payload_hash_blake3 = [10; 32];
-    assert!(ingest_pump_observation(&ledger, &registry, Some(nln), 4, true, None,).is_none());
+    assert!(matches!(
+        ingest_pump_observation(&ledger, &registry, Some(nln), 4, true, None),
+        CanonicalRuntimeAdmissionV1::NoApply(_)
+    ));
 
     let snapshot = ledger.lock().expect("ledger").snapshot();
     assert_eq!(snapshot.canonical_mutation_count, 1);
+}
+
+#[tokio::test]
+async fn pr1e_runner_preserves_multi_locator_inventory_and_witness_arrival_order() {
+    let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+    let registry = Arc::new(CandidateIntegrityRegistry::default());
+    let pool = Pubkey::new_from_array([11; 32]);
+    let mint = Pubkey::new_from_array([12; 32]);
+    let signature = Signature::from([13; 64]);
+    let first = primary_trade_observation(signature, pool, mint, 0, Some(2));
+    let second = primary_trade_observation(signature, pool, mint, 1, Some(2));
+
+    let first_permit = match ingest_pump_observation(&ledger, &registry, Some(first), 1, true, None)
+    {
+        CanonicalRuntimeAdmissionV1::Apply(permit) => permit,
+        other => panic!("first locator must retain its own permit: {other:?}"),
+    };
+    let second_permit =
+        match ingest_pump_observation(&ledger, &registry, Some(second), 2, true, None) {
+            CanonicalRuntimeAdmissionV1::Apply(permit) => permit,
+            other => panic!("second locator must retain its own permit: {other:?}"),
+        };
+
+    let candidate = PumpCandidateIdentityV1 {
+        pool_amm_id: pool,
+        mint,
+    };
+    let (event_tx, mut event_rx) = create_event_bus();
+    let mut bridge =
+        SessionPoolTradeBridge::new(Duration::from_secs(1), 4, 16, Duration::from_secs(60), 32);
+    let _ = bridge.register_detected_pool(pool, Instant::now());
+    for (ordinal, permit) in [(0, first_permit.clone()), (1, second_permit.clone())] {
+        let ingress = process_trade_event_for_session_gate(
+            &event_tx,
+            &mut bridge,
+            &trade_carrier(signature, pool, mint, ordinal),
+            None,
+            Instant::now(),
+            permit,
+            &registry,
+        );
+        assert_eq!(ingress.decision, SessionTradeDecision::ForwardNow);
+        assert!(matches!(
+            event_rx.recv().await.expect("canonical Event Bus emission"),
+            GhostEvent::PoolTransaction(_, Some(_))
+        ));
+    }
+
+    registry
+        .mark_canonical_apply_succeeded(&first_permit.apply_receipt)
+        .expect("first exact locator applies");
+    assert!(
+        registry.evaluation_guard(candidate).is_err(),
+        "one applied locator must not satisfy a two-locator candidate"
+    );
+    registry
+        .mark_canonical_apply_succeeded(&second_permit.apply_receipt)
+        .expect("final exact locator applies");
+    assert!(registry.evaluation_guard(candidate).is_ok());
+    assert_eq!(
+        ledger
+            .lock()
+            .expect("multi-locator ledger snapshot")
+            .snapshot()
+            .canonical_mutation_count,
+        2
+    );
+
+    let witness_ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+    let witness_registry = Arc::new(CandidateIntegrityRegistry::default());
+    let witness_pool = Pubkey::new_from_array([21; 32]);
+    let witness_mint = Pubkey::new_from_array([22; 32]);
+    let witness_signature = Signature::from([23; 64]);
+    let raw = primary_trade_observation(witness_signature, witness_pool, witness_mint, 0, Some(1));
+    let mut nln = raw.clone();
+    nln.canonical_order = None;
+    nln.raw_provider_role = None;
+    nln.provenance.source_family = ObservationSourceFamilyV1::ParsedNln;
+    nln.provenance.source_id = "nln".to_string();
+    nln.provenance.provider_id = "nln".to_string();
+    nln.provenance.schema_id = "nln_pump_trade_v1".to_string();
+    nln.provenance.payload_hash_blake3 = [24; 32];
+
+    assert!(matches!(
+        ingest_pump_observation(
+            &witness_ledger,
+            &witness_registry,
+            Some(nln.clone()),
+            1,
+            true,
+            None,
+        ),
+        CanonicalRuntimeAdmissionV1::NoApply(_)
+    ));
+    let raw_permit =
+        match ingest_pump_observation(&witness_ledger, &witness_registry, Some(raw), 2, true, None)
+        {
+            CanonicalRuntimeAdmissionV1::Apply(permit) => permit,
+            other => panic!("NLN-first must not veto later raw primary: {other:?}"),
+        };
+    witness_registry
+        .mark_canonical_apply_succeeded(&raw_permit.apply_receipt)
+        .expect("raw primary applies after witness");
+    assert!(witness_registry
+        .evaluation_guard(PumpCandidateIdentityV1 {
+            pool_amm_id: witness_pool,
+            mint: witness_mint,
+        })
+        .is_ok());
+
+    let conflict_ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+    let conflict_registry = Arc::new(CandidateIntegrityRegistry::default());
+    nln.claims.token_amount_units = Some(999);
+    nln.provenance.payload_hash_blake3 = [25; 32];
+    assert!(matches!(
+        ingest_pump_observation(
+            &conflict_ledger,
+            &conflict_registry,
+            Some(nln),
+            1,
+            true,
+            None,
+        ),
+        CanonicalRuntimeAdmissionV1::NoApply(_)
+    ));
+    let conflict_raw =
+        primary_trade_observation(witness_signature, witness_pool, witness_mint, 0, Some(1));
+    let conflict_permit = match ingest_pump_observation(
+        &conflict_ledger,
+        &conflict_registry,
+        Some(conflict_raw),
+        2,
+        true,
+        None,
+    ) {
+        CanonicalRuntimeAdmissionV1::Apply(permit) => permit,
+        other => panic!("conflicted raw primary still owns structural apply: {other:?}"),
+    };
+    conflict_registry
+        .mark_canonical_apply_succeeded(&conflict_permit.apply_receipt)
+        .expect("conflicted primary structural mutation applies once");
+    assert!(matches!(
+        conflict_registry.evaluation_guard(PumpCandidateIdentityV1 {
+            pool_amm_id: witness_pool,
+            mint: witness_mint,
+        }),
+        Err(
+            crate::candidate_integrity::CandidateIntegrityErrorV1::NotReady(
+                CandidateIntegrityOutcomeV1::SourceReconciliationConflict
+            )
+        )
+    ));
+    assert_eq!(
+        conflict_ledger
+            .lock()
+            .expect("conflict ledger snapshot")
+            .snapshot()
+            .canonical_mutation_count,
+        1
+    );
 }

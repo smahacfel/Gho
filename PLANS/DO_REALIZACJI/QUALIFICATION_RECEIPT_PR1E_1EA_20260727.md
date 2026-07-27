@@ -1,7 +1,7 @@
 # PR1E 1E-A — executable qualification receipt
 
-Status: `1E-A QUALIFIED / EXPECTED BASELINE FAILURES RECORDED`  
-Base: `103212b16bfc059db367e1ceb3c7d00fd307d6c5`  
+Status: `1E-A QUALIFIED / EXPECTED BASELINE FAILURES RECORDED`
+Base: `103212b16bfc059db367e1ceb3c7d00fd307d6c5`
 Authority cutover: `NOT STARTED`
 
 ## Zamrożone artefakty

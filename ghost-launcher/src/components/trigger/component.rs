@@ -5724,7 +5724,7 @@ pub async fn run_with_oracle(
                     match event {
                         Ok(ghost_event) => {
                             match ghost_event {
-                                GhostEvent::NewPoolDetected(pool) => {
+                                GhostEvent::NewPoolDetected(pool, Some(_permit)) => {
                                     // 🟢 CHANGED: The "Lobotomy" - Don't score immediately. Cache and wait.
                                     info!(
                                         "Trigger: 🎯 Received NewPoolDetected - pool={}, mint={} (Caching & Waiting for OracleRuntime)",
@@ -5734,6 +5734,15 @@ pub async fn run_with_oracle(
                                     // SAVE TO WAITING AREA. DON'T SCORE INDEPENDENTLY.
                                     // Wait until OracleRuntime collects data (real/synthetic) and sends PoolScored.
                                     pending_pools.insert(pool.pool_amm_id.clone(), pool);
+                                }
+                                GhostEvent::NewPoolDetected(_, None) => {
+                                    ::metrics::counter!(
+                                        "pr1_runtime_bypass_attempt_total",
+                                        1u64
+                                    );
+                                    warn!(
+                                        "Trigger: rejected NewPoolDetected without canonical PR1 permit"
+                                    );
                                 }
                                 GhostEvent::GatekeeperCommitted { .. } => {
                                     // Ignored by trigger; scoring/approval handled by OracleRuntime
@@ -5753,9 +5762,15 @@ pub async fn run_with_oracle(
 
                                     let _ = handle_legacy_pool_scored_event(&mut pending_pools, &scored);
                                 }
-                                GhostEvent::PoolTransaction(_tx) => {
+                                GhostEvent::PoolTransaction(_tx, Some(_permit)) => {
                                     // PoolTransaction events are handled by SnapshotListener
                                     // Trigger doesn't need to process them
+                                }
+                                GhostEvent::PoolTransaction(_, None) => {
+                                    ::metrics::counter!(
+                                        "pr1_runtime_bypass_attempt_total",
+                                        1u64
+                                    );
                                 }
                                 GhostEvent::FundingTransferObserved(_) => {
                                     // Funding-transfer observations feed FSC rolling-state in
@@ -10003,7 +10018,9 @@ mod tests {
             signature: "test_sig".to_string(),
         };
 
-        event_tx.send(GhostEvent::new_pool_detected(pool)).unwrap();
+        event_tx
+            .send(GhostEvent::fixture_canonical_new_pool_detected(pool))
+            .unwrap();
 
         // Give time to process
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -10058,7 +10075,9 @@ mod tests {
             signature: "test_sig".to_string(),
         };
 
-        event_tx.send(GhostEvent::new_pool_detected(pool)).unwrap();
+        event_tx
+            .send(GhostEvent::fixture_canonical_new_pool_detected(pool))
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 

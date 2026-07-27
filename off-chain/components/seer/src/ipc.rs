@@ -52,17 +52,16 @@ pub enum SeerEvent {
     ExecutionAccountEvidence(DetectedExecutionAccountEvidenceEvent),
 }
 
-/// Existing runtime disposition attached to a raw pool-initialization
-/// observation after parser classification.
+/// Runtime disposition attached to a raw pool-initialization observation.
 ///
-/// Every raw observation still crosses the PR1D ledger. This field only
-/// preserves whether the legacy adapter may emit a new candidate after a
-/// primary canonical decision; it never grants authority by itself.
+/// `CandidateAdmission` only selects the new-candidate plane. It never grants
+/// authority by itself: PR1E additionally requires a canonical Ledger permit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PoolDetectionRuntimeDispositionV1 {
     #[default]
-    Observe,
+    #[serde(alias = "observe")]
+    CandidateAdmission,
     ContinuityOnly,
     Suppressed,
 }
@@ -1019,7 +1018,7 @@ impl IpcSender {
         self.send_with_observation_and_disposition(
             candidate,
             observation,
-            PoolDetectionRuntimeDispositionV1::Observe,
+            PoolDetectionRuntimeDispositionV1::CandidateAdmission,
             None,
             priority,
         )
@@ -1823,7 +1822,7 @@ mod tests {
                     SeerEvent::PoolDetected(DetectedPoolEvent {
                         candidate: create_test_candidate(),
                         observation: None,
-                        runtime_disposition: PoolDetectionRuntimeDispositionV1::Observe,
+                        runtime_disposition: PoolDetectionRuntimeDispositionV1::CandidateAdmission,
                         continuity_observation_pool: None,
                         detected_at: std::time::SystemTime::now(),
                         sequence_number: u64::MAX,
@@ -2391,7 +2390,7 @@ mod tests {
         let pool_event = DetectedPoolEvent {
             candidate: candidate.clone(),
             observation: None,
-            runtime_disposition: PoolDetectionRuntimeDispositionV1::Observe,
+            runtime_disposition: PoolDetectionRuntimeDispositionV1::CandidateAdmission,
             continuity_observation_pool: None,
             detected_at: SystemTime::now(),
             sequence_number: 42,
@@ -2426,7 +2425,7 @@ mod tests {
         let mut pool_json = serde_json::to_value(SeerEvent::PoolDetected(DetectedPoolEvent {
             candidate: create_test_candidate(),
             observation: None,
-            runtime_disposition: PoolDetectionRuntimeDispositionV1::Observe,
+            runtime_disposition: PoolDetectionRuntimeDispositionV1::CandidateAdmission,
             continuity_observation_pool: None,
             detected_at: SystemTime::now(),
             sequence_number: 1,
@@ -2445,7 +2444,7 @@ mod tests {
                 assert_eq!(event.observation, None);
                 assert_eq!(
                     event.runtime_disposition,
-                    PoolDetectionRuntimeDispositionV1::Observe
+                    PoolDetectionRuntimeDispositionV1::CandidateAdmission
                 );
                 assert_eq!(event.continuity_observation_pool, None);
             }

@@ -1875,7 +1875,7 @@ async fn run_launcher() -> Result<()> {
                 }
                 event = shadow_bus_rx.recv() => {
                     match event {
-                        Ok(GhostEvent::NewPoolDetected(pool)) => {
+                        Ok(GhostEvent::NewPoolDetected(pool, Some(_permit))) => {
                             let bonding_curve_result = pool.bonding_curve.parse::<solana_sdk::pubkey::Pubkey>();
                             let base_mint_result = pool.base_mint.parse::<solana_sdk::pubkey::Pubkey>();
 
@@ -1891,7 +1891,7 @@ async fn run_launcher() -> Result<()> {
                                 }
                             }
                         }
-                        Ok(GhostEvent::PoolTransaction(tx)) => {
+                        Ok(GhostEvent::PoolTransaction(tx, Some(_permit))) => {
                             // EPIC 2: Removed destructive set_snapshots with trim to 5.
                             //
                             // Previously this task would:
@@ -1919,6 +1919,12 @@ async fn run_launcher() -> Result<()> {
                         }
                         Ok(GhostEvent::GeyserTransaction { .. }) => {
                             // Skip cache updates without canonical base_mint context
+                        }
+                        Ok(
+                            GhostEvent::NewPoolDetected(_, None)
+                            | GhostEvent::PoolTransaction(_, None),
+                        ) => {
+                            ::metrics::counter!("pr1_runtime_bypass_attempt_total", 1u64);
                         }
                         _ => {}
                     }
@@ -2273,6 +2279,34 @@ async fn run_launcher() -> Result<()> {
         .map(|_| RugScalpValidationTapeBusV1::new());
     let mut oracle_runtime_config =
         oracle_runtime::OracleRuntimeConfig::from_shadow_ledger_config(&config.shadow_ledger);
+    let pr1_binary_path =
+        std::env::current_exe().context("resolve launcher binary for PR1 authority epoch")?;
+    let pr1_binary_hash = *blake3::hash(&std::fs::read(&pr1_binary_path).with_context(|| {
+        format!(
+            "read launcher binary for PR1 authority epoch: {}",
+            pr1_binary_path.display()
+        )
+    })?)
+    .as_bytes();
+    let pr1_config_hash = *blake3::hash(&std::fs::read(&config_path).with_context(|| {
+        format!(
+            "read launcher config for PR1 authority epoch: {}",
+            config_path.display()
+        )
+    })?)
+    .as_bytes();
+    let pr1_authority_epoch = ghost_launcher::candidate_integrity::Pr1AuthorityEpochV1::new(
+        pr1_binary_hash,
+        pr1_config_hash,
+    );
+    info!(
+        authority_epoch_id = pr1_authority_epoch.epoch_id,
+        binary_hash = %blake3::Hash::from_bytes(pr1_authority_epoch.binary_hash).to_hex(),
+        config_hash = %blake3::Hash::from_bytes(pr1_authority_epoch.config_hash).to_hex(),
+        started_at_unix_ms = pr1_authority_epoch.started_at_unix_ms,
+        "PR1 authority epoch initialized"
+    );
+    oracle_runtime_config.pr1_authority_epoch = Some(pr1_authority_epoch);
     oracle_runtime_config.session = config.session.clone();
     oracle_runtime_config.tx_intelligence = config.tx_intelligence.clone();
     let fsc_v2_runtime_config = ghost_brain_config.as_ref().and_then(|brain| {
@@ -2800,6 +2834,12 @@ async fn run_launcher() -> Result<()> {
         let seer_health = Arc::clone(&health);
         let seer_authoritative_funding_stream_tx = authoritative_funding_stream_tx.clone();
         let seer_candidate_integrity_registry = oracle_runtime.candidate_integrity_registry();
+        ghost_launcher::components::seer::validate_pr1e_startup_contract(
+            &seer_config,
+            Some(&seer_event_tx),
+            seer_candidate_integrity_registry.as_ref(),
+        )
+        .context("PR1E Seer startup contract failed")?;
 
         let handle = tokio::spawn(async move {
             if let Err(e) = ghost_launcher::components::seer::run(

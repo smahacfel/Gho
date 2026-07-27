@@ -679,7 +679,7 @@ impl PumpObservationLedgerV1 {
                 self.canonical_by_locator.len(),
             );
             return single_result(PumpObservationLedgerDecisionV1 {
-                classification: PumpObservationClassificationV1::PrimaryRawCoverageIncomplete,
+                classification: PumpObservationClassificationV1::EvidenceCapacityExceeded,
                 correlation: None,
                 provider_agreement: PumpProviderAgreementV1::NotObserved,
                 conflict_fields: Vec::new(),
@@ -2030,6 +2030,64 @@ mod tests {
         assert_eq!(snapshot.canonical_mutation_count, 1);
         assert!(!snapshot.witness_evidence_complete);
         assert!(snapshot.first_evidence_overflow.is_some());
+    }
+
+    #[test]
+    fn primary_canonical_capacity_has_typed_capacity_classification() {
+        let config = PumpObservationLedgerConfigV1 {
+            max_primary_canonical_mutations: 1,
+            ..PumpObservationLedgerConfigV1::default()
+        };
+        let mut ledger = PumpObservationLedgerV1::try_new(config).expect("valid test config");
+        let curve = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let first = Signature::new_unique();
+        let second = Signature::new_unique();
+
+        assert!(ledger
+            .observe(
+                raw(
+                    locator(first, 0),
+                    RawProviderRoleV1::PrimaryAuthority,
+                    "primary",
+                    1,
+                    curve,
+                    mint,
+                    1,
+                    1,
+                ),
+                1,
+            )
+            .observation_decision
+            .did_canonical_apply());
+        let overflow = ledger
+            .observe(
+                raw(
+                    locator(second, 0),
+                    RawProviderRoleV1::PrimaryAuthority,
+                    "primary",
+                    2,
+                    curve,
+                    mint,
+                    2,
+                    1,
+                ),
+                2,
+            )
+            .observation_decision;
+
+        assert_eq!(
+            overflow.classification,
+            PumpObservationClassificationV1::EvidenceCapacityExceeded
+        );
+        assert_eq!(
+            overflow
+                .candidate_integrity_signal
+                .expect("capacity failure must fail the candidate closed")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+        assert_eq!(ledger.snapshot().canonical_mutation_count, 1);
     }
 
     #[test]

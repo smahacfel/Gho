@@ -418,8 +418,9 @@ impl PoolObservationSession {
         &mut self,
         tx: Arc<PoolTransaction>,
     ) -> PoolTransactionIngestResultV1 {
-        match self.admit_transaction(tx.as_ref()) {
-            SessionTransactionAdmission::Accepted | SessionTransactionAdmission::Unkeyable => {}
+        let unkeyable = match self.admit_transaction(tx.as_ref()) {
+            SessionTransactionAdmission::Accepted => false,
+            SessionTransactionAdmission::Unkeyable => true,
             SessionTransactionAdmission::Duplicate { event_ts_ms } => {
                 return PoolTransactionIngestResultV1 {
                     ingress: self.duplicate_ingress_outcome(event_ts_ms),
@@ -432,7 +433,7 @@ impl PoolObservationSession {
                     apply: CanonicalMutationApplyOutcomeV1::Terminal,
                 };
             }
-        }
+        };
 
         self.tx_intelligence.on_transaction(tx.as_ref());
         self.refresh_tx_intelligence_snapshot();
@@ -463,12 +464,17 @@ impl PoolObservationSession {
 
         PoolTransactionIngestResultV1 {
             ingress: outcome,
-            // Admission above excludes both session duplicates and terminal
-            // sessions. Even when Gatekeeper does not count the event
-            // (unkeyable or dust), TxIntelligence owns and records a new
-            // runtime mutation. `Ignored` is therefore reserved for paths
-            // where no state owner changed.
-            apply: CanonicalMutationApplyOutcomeV1::AppliedNewMutation,
+            // A keyable transaction can acknowledge canonical apply even when
+            // Gatekeeper does not count it (for example dust), because
+            // TxIntelligence owns a real mutation. An unkeyable transaction
+            // cannot prove that the mutation belongs to this candidate, so
+            // PR1E deliberately fails its canonical apply receipt and blocks
+            // Ready despite retaining diagnostic TxIntelligence evidence.
+            apply: if unkeyable {
+                CanonicalMutationApplyOutcomeV1::Ignored
+            } else {
+                CanonicalMutationApplyOutcomeV1::AppliedNewMutation
+            },
         }
     }
 

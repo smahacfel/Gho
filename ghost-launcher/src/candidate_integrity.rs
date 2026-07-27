@@ -1,8 +1,8 @@
-//! Candidate-integrity lifecycle registry for PR1D.
+//! Candidate-integrity lifecycle registry for PR1D/PR1E.
 //!
-//! The registry computes the PR1D technical-integrity lifecycle in shadow.
-//! Active MFS/evaluation/submit paths may observe its would-block actions, but
-//! PR1D does not let this registry gate production behavior.
+//! PR1E activates this bounded registry as the technical admission boundary
+//! for new candidates. It remains independent from strategy verdicts and from
+//! protective handling of already confirmed positions.
 
 use ghost_core::{
     CandidateIntegrityOutcomeV1, CandidateIntegritySignalV1, PumpCandidateIdentityV1,
@@ -15,7 +15,59 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pr1AuthorityEpochV1 {
+    pub epoch_id: u64,
+    pub binary_hash: [u8; 32],
+    pub config_hash: [u8; 32],
+    pub started_at_unix_ms: u64,
+}
+
+impl Pr1AuthorityEpochV1 {
+    #[must_use]
+    pub fn new(binary_hash: [u8; 32], config_hash: [u8; 32]) -> Self {
+        let started_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let started_at_unix_ms = started_at.as_millis().min(u128::from(u64::MAX)) as u64;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ghost.pr1.authority_epoch.v1");
+        hasher.update(&binary_hash);
+        hasher.update(&config_hash);
+        hasher.update(&started_at.as_nanos().to_le_bytes());
+        hasher.update(&std::process::id().to_le_bytes());
+        let digest = hasher.finalize();
+        let mut epoch_bytes = [0u8; 8];
+        epoch_bytes.copy_from_slice(&digest.as_bytes()[..8]);
+        let epoch_id = u64::from_le_bytes(epoch_bytes).max(1);
+        Self {
+            epoch_id,
+            binary_hash,
+            config_hash,
+            started_at_unix_ms,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn test_epoch(epoch_id: u64) -> Self {
+        Self {
+            epoch_id,
+            binary_hash: [0; 32],
+            config_hash: [0; 32],
+            started_at_unix_ms: 0,
+        }
+    }
+}
+
+impl Default for Pr1AuthorityEpochV1 {
+    fn default() -> Self {
+        Self::new([0; 32], [0; 32])
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CandidateIntegrityRegistryLimitsV1 {
@@ -120,15 +172,41 @@ struct RuntimeMutationApplyKeyV1 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CanonicalMutationApplyReceiptV1 {
     runtime_key: RuntimeMutationApplyKeyV1,
+    pub(crate) authority_epoch_id: u64,
     pub(crate) signature: Signature,
     pub(crate) locator: RawPumpMutationLocatorV1,
     pub(crate) candidate: PumpCandidateIdentityV1,
-    evidence_hash_blake3: [u8; 32],
+    pub(crate) evidence_hash_blake3: [u8; 32],
+}
+
+#[cfg(test)]
+impl CanonicalMutationApplyReceiptV1 {
+    pub(crate) fn fixture(
+        mutation_family: PumpMutationFamilyV1,
+        signature: Signature,
+        candidate: PumpCandidateIdentityV1,
+        locator: RawPumpMutationLocatorV1,
+    ) -> Self {
+        Self {
+            runtime_key: RuntimeMutationApplyKeyV1 {
+                mutation_family,
+                signature,
+                candidate,
+                semantic_event_ordinal: locator.semantic_event_ordinal,
+            },
+            authority_epoch_id: 1,
+            signature,
+            locator,
+            candidate,
+            evidence_hash_blake3: [0xA5; 32],
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct CanonicalApplyReceiptStateV1 {
     receipt: CanonicalMutationApplyReceiptV1,
+    staged_at: Instant,
     applied: bool,
     failed: bool,
 }
@@ -166,8 +244,10 @@ pub(crate) struct CandidateIntegrityReadyReleaseV1 {
 #[derive(Debug)]
 pub struct CandidateIntegrityRegistry {
     limits: CandidateIntegrityRegistryLimitsV1,
+    authority_epoch: Pr1AuthorityEpochV1,
     state: Mutex<CandidateIntegrityRegistryStateV1>,
     available: AtomicBool,
+    candidate_admission_open: AtomicBool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,6 +278,36 @@ pub enum CandidateIntegrityErrorV1 {
 }
 
 impl CandidateIntegrityRegistry {
+    fn record_pending_permit_metrics(&self, state: &CandidateIntegrityRegistryStateV1) {
+        let now = Instant::now();
+        let mut pending = 0usize;
+        let mut oldest_age_ms = 0u64;
+        for entry in state
+            .canonical_apply_fence
+            .receipts_by_runtime_key
+            .values()
+            .filter(|entry| !entry.applied && !entry.failed)
+        {
+            pending = pending.saturating_add(1);
+            oldest_age_ms = oldest_age_ms.max(
+                now.saturating_duration_since(entry.staged_at)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+        }
+        let epoch = self.authority_epoch.epoch_id.to_string();
+        ::metrics::gauge!(
+            "pr1_runtime_pending_permits",
+            pending as f64,
+            "authority_epoch_id" => epoch.clone()
+        );
+        ::metrics::gauge!(
+            "pr1_runtime_oldest_pending_permit_age_ms",
+            oldest_age_ms as f64,
+            "authority_epoch_id" => epoch
+        );
+    }
+
     fn failure_record_capacity(&self) -> usize {
         self.limits.max_candidates.saturating_mul(2)
     }
@@ -248,10 +358,19 @@ impl CandidateIntegrityRegistry {
 
     #[must_use]
     pub fn new(limits: CandidateIntegrityRegistryLimitsV1) -> Self {
+        Self::new_with_epoch(limits, Pr1AuthorityEpochV1::default())
+    }
+
+    pub fn new_with_epoch(
+        limits: CandidateIntegrityRegistryLimitsV1,
+        authority_epoch: Pr1AuthorityEpochV1,
+    ) -> Self {
         Self {
             limits: limits.normalized(),
+            authority_epoch,
             state: Mutex::new(CandidateIntegrityRegistryStateV1::default()),
             available: AtomicBool::new(true),
+            candidate_admission_open: AtomicBool::new(true),
         }
     }
 
@@ -259,6 +378,7 @@ impl CandidateIntegrityRegistry {
         &self,
         canonical: &StructuralCanonicalPumpMutationV1,
     ) -> Result<CanonicalMutationApplyReceiptV1, CandidateIntegrityErrorV1> {
+        self.require_candidate_admission_open()?;
         self.require_available()?;
         let candidate = PumpCandidateIdentityV1 {
             pool_amm_id: canonical
@@ -278,6 +398,7 @@ impl CandidateIntegrityRegistry {
         };
         let receipt = CanonicalMutationApplyReceiptV1 {
             runtime_key: runtime_key.clone(),
+            authority_epoch_id: self.authority_epoch.epoch_id,
             signature: canonical.locator.signature,
             locator: canonical.locator.clone(),
             candidate,
@@ -292,22 +413,25 @@ impl CandidateIntegrityRegistry {
             if existing.receipt == receipt {
                 return Ok(existing.receipt.clone());
             }
-            self.available.store(false, Ordering::Release);
+            self.mark_unavailable("canonical_receipt_identity_contradiction");
             return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
         }
         if state.canonical_apply_fence.receipts_by_runtime_key.len() >= self.limits.max_candidates {
             drop(state);
             let _ = self.record_signal(Self::coverage_incomplete_signal(&receipt))?;
+            self.close_candidate_admission("canonical_receipt_capacity_exhausted");
             return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
         }
         state.canonical_apply_fence.receipts_by_runtime_key.insert(
             runtime_key,
             CanonicalApplyReceiptStateV1 {
                 receipt: receipt.clone(),
+                staged_at: Instant::now(),
                 applied: false,
                 failed: false,
             },
         );
+        self.record_pending_permit_metrics(&state);
         Ok(receipt)
     }
 
@@ -316,6 +440,7 @@ impl CandidateIntegrityRegistry {
         signature: Signature,
         ready_signals: &[CandidateIntegritySignalV1],
     ) -> Result<(), CandidateIntegrityErrorV1> {
+        self.require_candidate_admission_open()?;
         self.require_available()?;
         let mut state = self.lock_state()?;
         let mut pending_proofs = Vec::new();
@@ -337,7 +462,7 @@ impl CandidateIntegrityRegistry {
                 .map(|entry| entry.receipt.locator.clone())
                 .collect::<HashSet<_>>();
             if expected_locators.is_empty() {
-                self.available.store(false, Ordering::Release);
+                self.mark_unavailable("inventory_without_staged_locator");
                 return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
             }
             let invalidated = state
@@ -368,7 +493,7 @@ impl CandidateIntegrityRegistry {
                 if existing.expected_locators != expected_locators
                     || existing.ready_signal != *signal
                 {
-                    self.available.store(false, Ordering::Release);
+                    self.mark_unavailable("inventory_proof_identity_contradiction");
                     return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
                 }
                 continue;
@@ -493,6 +618,8 @@ impl CandidateIntegrityRegistry {
             });
         let first = matches.next().map(|entry| entry.receipt.clone());
         if matches.next().is_some() {
+            drop(state);
+            self.mark_unavailable("ambiguous_canonical_apply_receipt");
             return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
         }
         Ok(first)
@@ -511,7 +638,7 @@ impl CandidateIntegrityRegistry {
                 .get_mut(&receipt.runtime_key)
                 .ok_or(CandidateIntegrityErrorV1::CandidateMissing)?;
             if entry.receipt != *receipt {
-                self.available.store(false, Ordering::Release);
+                self.mark_unavailable("failed_receipt_identity_contradiction");
                 return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
             }
             if entry.applied || entry.failed {
@@ -525,6 +652,7 @@ impl CandidateIntegrityRegistry {
             {
                 proof.invalidated = true;
             }
+            self.record_pending_permit_metrics(&state);
         }
         let _ = self.record_signal(Self::coverage_incomplete_signal(receipt))?;
         Ok(())
@@ -575,6 +703,7 @@ impl CandidateIntegrityRegistry {
             {
                 proof.invalidated = true;
             }
+            self.record_pending_permit_metrics(&state);
             pending
         };
         let mut seen = HashSet::new();
@@ -598,7 +727,7 @@ impl CandidateIntegrityRegistry {
             .get_mut(&receipt.runtime_key)
             .ok_or(CandidateIntegrityErrorV1::CandidateMissing)?;
         if entry.receipt != *receipt {
-            self.available.store(false, Ordering::Release);
+            self.mark_unavailable("applied_receipt_identity_contradiction");
             return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
         }
         if entry.failed || entry.applied {
@@ -713,6 +842,7 @@ impl CandidateIntegrityRegistry {
             for signal in failure_signals {
                 let _ = self.record_signal(signal)?;
             }
+            self.close_candidate_admission("canonical_inventory_proof_capacity_exhausted");
             return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
         }
         let Some(entry) = state
@@ -720,7 +850,7 @@ impl CandidateIntegrityRegistry {
             .receipts_by_runtime_key
             .get_mut(&receipt.runtime_key)
         else {
-            self.available.store(false, Ordering::Release);
+            self.mark_unavailable("applied_receipt_disappeared");
             return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
         };
         entry.applied = true;
@@ -763,6 +893,7 @@ impl CandidateIntegrityRegistry {
         }) {
             Self::cleanup_canonical_apply_fence_for_candidate(&mut state, receipt.candidate);
         }
+        self.record_pending_permit_metrics(&state);
         Ok(released)
     }
 
@@ -774,7 +905,7 @@ impl CandidateIntegrityRegistry {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => {
-                self.available.store(false, Ordering::Release);
+                self.mark_unavailable("registry_mutex_poisoned");
                 return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
             }
         };
@@ -813,7 +944,7 @@ impl CandidateIntegrityRegistry {
                     self.limits.max_candidates
                 };
             if state.records.len() >= capacity {
-                self.available.store(false, Ordering::Release);
+                self.mark_unavailable("candidate_registry_capacity_exhausted");
                 return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
             }
             state
@@ -891,6 +1022,7 @@ impl CandidateIntegrityRegistry {
         self: &Arc<Self>,
         candidate: PumpCandidateIdentityV1,
     ) -> Result<CandidateIntegrityEvaluationGuardV1, CandidateIntegrityErrorV1> {
+        self.require_candidate_admission_open()?;
         self.require_available()?;
         let state = self.lock_state()?;
         let record = lookup_record(&state, candidate)?;
@@ -912,6 +1044,7 @@ impl CandidateIntegrityRegistry {
         self: &Arc<Self>,
         candidate: PumpCandidateIdentityV1,
     ) -> Result<CandidateIntegritySubmitGuardV1, CandidateIntegrityErrorV1> {
+        self.require_candidate_admission_open()?;
         self.require_available()?;
         let state = self.lock_state()?;
         let record = lookup_record(&state, candidate)?;
@@ -939,14 +1072,13 @@ impl CandidateIntegrityRegistry {
         Ok(lookup_record(&state, candidate)?.clone())
     }
 
-    /// Return the current CandidateIntegrity shadow status for a canonical
-    /// AccountStateCore mutation.
+    /// Return the current CandidateIntegrity status associated with a
+    /// canonical AccountStateCore mutation.
     ///
-    /// `None` means that no PR1D record exists for this legacy candidate and
-    /// preserves pre-PR1D compatibility. `Some(false)` means the shadow model
-    /// would block this mutation. During PR1D Observe it is diagnostic only:
-    /// callers must preserve the parent authority path even if the registry is
-    /// unavailable.
+    /// AccountStateCore authority remains owned independently by the PR1C
+    /// AccountObservationArbiter: this query must never suppress raw-primary
+    /// updates needed by an already confirmed position. CandidateIntegrity
+    /// gates only new-candidate MFS/evaluation/submit admission.
     pub fn account_state_apply_allowed(
         &self,
         candidate: PumpCandidateIdentityV1,
@@ -972,6 +1104,40 @@ impl CandidateIntegrityRegistry {
         self.available.load(Ordering::Acquire)
     }
 
+    #[must_use]
+    pub const fn authority_epoch(&self) -> Pr1AuthorityEpochV1 {
+        self.authority_epoch
+    }
+
+    #[must_use]
+    pub fn candidate_admission_open(&self) -> bool {
+        self.candidate_admission_open.load(Ordering::Acquire)
+    }
+
+    pub fn close_candidate_admission(&self, reason: &'static str) {
+        if self.candidate_admission_open.swap(false, Ordering::AcqRel) {
+            ::metrics::gauge!(
+                "pr1_runtime_candidate_admission_closed",
+                1.0,
+                "authority_epoch_id" => self.authority_epoch.epoch_id.to_string(),
+                "reason" => reason
+            );
+        }
+    }
+
+    fn mark_unavailable(&self, reason: &'static str) {
+        self.available.store(false, Ordering::Release);
+        self.close_candidate_admission(reason);
+    }
+
+    fn require_candidate_admission_open(&self) -> Result<(), CandidateIntegrityErrorV1> {
+        if self.candidate_admission_open() {
+            Ok(())
+        } else {
+            Err(CandidateIntegrityErrorV1::RegistryUnavailable)
+        }
+    }
+
     fn require_available(&self) -> Result<(), CandidateIntegrityErrorV1> {
         if self.is_available() {
             Ok(())
@@ -989,7 +1155,7 @@ impl CandidateIntegrityRegistry {
         match self.state.lock() {
             Ok(state) => Ok(state),
             Err(_) => {
-                self.available.store(false, Ordering::Release);
+                self.mark_unavailable("registry_mutex_poisoned");
                 Err(CandidateIntegrityErrorV1::RegistryUnavailable)
             }
         }
@@ -2114,5 +2280,62 @@ mod tests {
             CandidateLifecyclePhaseV1::ConfirmedOpenPosition
         );
         assert!(snapshot.reconciliation_required);
+    }
+
+    #[test]
+    fn conflict_after_confirmation_quarantines_witness_without_rewriting_position() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = candidate();
+        registry
+            .record_signal(signal(candidate, CandidateIntegrityOutcomeV1::Ready, 1))
+            .expect("register ready");
+        let evaluation = registry.evaluation_guard(candidate).expect("guard");
+        evaluation.mark_mfs_materialized().expect("MFS");
+        evaluation.mark_evaluation_running().expect("evaluation");
+        let submit_guard = evaluation
+            .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
+            .expect("publish BUY")
+            .expect("BUY creates submit guard");
+        assert_eq!(
+            submit_guard.try_begin_submit().expect("begin submit"),
+            CandidateSubmitTransitionV1::StartedNow
+        );
+        submit_guard.mark_confirmed().expect("confirm position");
+
+        let late_conflict = registry
+            .record_signal(signal(
+                candidate,
+                CandidateIntegrityOutcomeV1::SourceReconciliationConflict,
+                2,
+            ))
+            .expect("record confirmed-position conflict");
+        assert_eq!(
+            late_conflict.action,
+            CandidateIntegrityConflictActionV1::ConfirmedPositionQuarantined
+        );
+        assert_eq!(
+            late_conflict.snapshot.lifecycle_phase,
+            CandidateLifecyclePhaseV1::ConfirmedOpenPosition
+        );
+        assert!(late_conflict.snapshot.witness_quarantined);
+    }
+
+    #[test]
+    fn poisoned_registry_cannot_issue_evaluation_or_submit_authority() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let poison_target = Arc::clone(&registry);
+        assert!(std::thread::spawn(move || {
+            let _guard = poison_target.state.lock().expect("lock before poison");
+            panic!("intentional PR1E registry poison");
+        })
+        .join()
+        .is_err());
+
+        assert!(matches!(
+            registry.evaluation_guard(candidate()),
+            Err(CandidateIntegrityErrorV1::RegistryUnavailable)
+        ));
+        assert!(!registry.is_available());
+        assert!(!registry.candidate_admission_open());
     }
 }

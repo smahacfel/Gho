@@ -1634,7 +1634,7 @@ fn primary_capacity_saturation_fails_closed_and_retains_rejected_primary() {
 
     assert_eq!(
         decision.classification,
-        PumpObservationClassificationV1::PrimaryRawCoverageIncomplete
+        PumpObservationClassificationV1::EvidenceCapacityExceeded
     );
     assert!(!decision.did_canonical_apply());
     assert_eq!(
