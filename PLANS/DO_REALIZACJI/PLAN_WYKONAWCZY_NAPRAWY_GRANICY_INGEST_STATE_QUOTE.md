@@ -1,11 +1,11 @@
 PLAN WYKONAWCZY NAPRAWY GRANICY INGEST–STATE–QUOTE
 
-Status: "READY FOR IMPLEMENTATION / SHADOW-FIRST / NO LIVE PROMOTION"
-Data: "2026-07-24"
+Status: "PR1E READY FOR IMPLEMENTATION / RUNTIME AUTHORITY CUTOVER / LIVE EXECUTION DISABLED"
+Data: "2026-07-24 / rozszerzenie PR1E 2026-07-27"
 Repozytorium: "smahacfel/Gho"
 Baseline: "88aa1b775d51f4a1b3e512b1aaf05663e7af6db1"
 Zakres: siedem błędów integralności ingestu, stanu i ekonomiki
-Struktura realizacji: baseline receipt + maksymalnie dwa średnie PR-y
+Struktura realizacji: baseline receipt + PR1A–PR1E; PR2 pozostaje odłożony
 
 Aktualny baseline planu został formalnie przesunięty z
 `a12ef9cfb7199d44841cde27be2ecd8af13e2f3f` na
@@ -1145,7 +1145,10 @@ CI guard zabrania legacy math w katalogach authority.
 
 16. Struktura realizacji
 
-Realizacja obejmuje baseline receipt oraz dwa średnie, stacked PR-y.
+Pierwotna realizacja obejmowała baseline receipt oraz dwa średnie, stacked
+PR-y. Po scaleniu PR1A–PR1D plan zostaje rozszerzony o wykonawczy PR1E, który
+kwalifikuje cały PR1 end-to-end i przełącza runtime authority bez rozpoczynania
+PR2 ani zmiany ekonomiki.
 
 Change Set 0 — baseline receipt
 
@@ -1213,7 +1216,10 @@ PR 1 — INGEST AND STATE INTEGRITY
 
 Cel: exactly-once structural mutation, idempotent AccountStateCore, deterministic provider roles i nieblokujący transport.
 
-PR 1 nie przełącza jeszcze produkcyjnej authority. Nowa ścieżka działa w izolowanym "Observe".
+PR1A–PR1D nie przełączają jeszcze produkcyjnej authority. Nowa ścieżka działa
+w izolowanym "Observe". PR1E zamyka tę granicę i przełącza authority nowych
+kandydatów na Observation Ledger oraz CandidateIntegrity, przy nadal
+wyłączonym live execution.
 
 Commit 1A — additive contracts i provider roles
 
@@ -1383,6 +1389,923 @@ raw/NLN material conflict classified
 no source waits in hot path
 Gatekeeper not invoked for integrity-failed candidate
 
+Commit 1E — aktywacja integralności ingest–state w runtime i kwalifikacja
+end-to-end całego PR1
+
+Status: READY FOR IMPLEMENTATION
+Charakter: poboczny PR rozszerzający PR1A–PR1D
+Repozytorium: `smahacfel/Gho`
+Base: `103212b16bfc059db367e1ceb3c7d00fd307d6c5`
+PR bazowy: #85 — PR1D
+Head PR1D przed merge: `a982157f499313eb8f9b42326e67d495ace6224d`
+Struktura: jeden niewielki/średni PR, maksymalnie dwa logiczne commity
+Finalny stan: runtime authority aktywne, brak produkcyjnego `Observe` i brak
+per-event legacy fallbacku.
+
+PR #85 został zmergowany, ale jego jawna granica pozostawia
+`PumpObservationLedgerV1`, canonical apply proof i `CandidateIntegrity` w
+trybie dowodowym. Parent primary wrapper nadal steruje aktywną emisją, a
+CandidateIntegrity nie blokuje MFS, Gatekeepera ani submitu.
+
+PR1E zamyka dokładnie tę granicę. Jest wykonawczym rozszerzeniem pierwotnego
+planu naprawy ingest–state–quote, bez rozpoczynania PR2 i bez zmian ekonomiki.
+
+### 1E.1. Cel nadrzędny
+
+PR1E ma odpowiedzieć wykonawczo na dwa pytania:
+
+1. Czy komplet PR1A–PR1D działa wspólnie w realnej ścieżce:
+
+   `provider → Seer parser → IPC → Observation Ledger → Event Bus → session
+   → AccountStateCore → MFS → Gatekeeper → execution handoff`?
+
+2. Czy można bezpiecznie odebrać authority starej emisji i przekazać je
+   istniejącym mechanizmom PR1?
+
+Po merge PR1E aktywny przepływ ma wyglądać tak:
+
+```text
+PRIMARY RAW YELLOWSTONE WRAPPER
+        +
+ALIGNED ObservedPumpMutationV1
+                │
+                ▼
+       PumpObservationLedgerV1
+                │
+        ┌───────┴────────┐
+        │                │
+        ▼                ▼
+canonical mutation   duplicate / witness-only
+        │                │
+        │                └── zero runtime emission
+        ▼
+canonical runtime permit
+        │
+        ▼
+existing rich wrapper as data carrier
+        │
+        ▼
+NewPoolDetected / PoolTransaction
+        │
+        ▼
+actual downstream apply receipt
+        │
+        ▼
+CandidateIntegrity::Ready
+        │
+        ▼
+MFS → Gatekeeper → guarded submit
+```
+
+Najważniejsza zasada:
+
+> Oryginalny primary wrapper pozostaje nośnikiem kompletnego payloadu, ale
+> przestaje być źródłem authority. Prawo emisji uzyskuje wyłącznie przez
+> canonical decision Observation Ledgera.
+
+### 1E.2. Namacalny efekt po merge
+
+PR1E ma sprawić, że w działającym Ghostcie:
+
+- identyczna mutacja raw odebrana ponownie nie trafi drugi raz do runtime;
+- raw + NLN nie utworzą dwóch `PoolTransaction`;
+- NLN-only nie utworzy kandydata ani transakcji;
+- secondary raw nie zmutuje runtime state;
+- primary wrapper bez prawidłowej obserwacji nie ominie Ledgera;
+- wrapper niezgodny z obserwacją zostanie zatrzymany;
+- niepełne transaction inventory nie odblokuje MFS;
+- konflikt providera przed MFS zablokuje ocenę;
+- konflikt podczas evaluation przerwie ocenę bez strategicznego `REJECT`;
+- konflikt po BUY, ale przed submit, anuluje execution intent;
+- konflikt po rozpoczęciu submitu nie zostanie fałszywie uznany za anulowanie;
+- potwierdzona pozycja zachowa protective exits pomimo późnego konfliktu
+  witnessa;
+- duplicate AccountUpdate nie zmieni rezerw, velocity ani liczników;
+- awaria Ledgera albo CandidateIntegrity zamknie dopływ nowych kandydatów,
+  ale nie wyłączy ochrony istniejących pozycji.
+
+### 1E.3. Twarde granice zakresu
+
+PR1E zmienia:
+
+- authority emisji `NewPoolDetected`;
+- authority emisji `PoolTransaction`;
+- obsługę wyniku `PumpObservationLedgerV1`;
+- przepływ canonical apply receipt;
+- obsługę buforowanych i replayowanych trade’ów;
+- obowiązkowe sprawdzenie CandidateIntegrity przed MFS;
+- obowiązkowe sprawdzenie CandidateIntegrity podczas evaluation;
+- obowiązkowy submit guard;
+- zachowanie przy niedostępności Ledgera albo registry;
+- produkcyjny startup contract;
+- end-to-end qualification harness;
+- differential proof i fault injection;
+- telemetry cutoveru.
+
+PR1E nie zmienia:
+
+- `PumpQuoteV1`;
+- `sol_amount_lamports`;
+- quote math;
+- fee schedules;
+- entry sizing;
+- TP/SL;
+- executable valuation;
+- PnL;
+- transaction costs;
+- strategy scoring;
+- progów Gatekeepera;
+- kolejności Gatekeeper policy;
+- schematu `MaterializedFeatureSet`;
+- Position Manager policy;
+- shadow/live mode;
+- route authorization;
+- PR2 transaction-local anchors.
+
+Każda zmiana w powyższych elementach oznacza scope violation.
+
+### 1E.4. Nienaruszalne inwarianty
+
+1. Exactly-once dotyczy jednego runtime epoch i retained bounded ledgeru.
+2. PR1E nie deklaruje durable cross-restart deduplication.
+3. Primary raw Yellowstone pozostaje jedynym structural authority.
+4. Wrapper `provider_role=PrimaryAuthority` sam w sobie nie daje prawa emisji.
+5. Każdy nowy primary pool/trade musi posiadać aligned
+   `ObservedPumpMutationV1`.
+6. Każda aktywna emisja wymaga canonical mutation z Ledgera.
+7. Exact duplicate nie może uzyskać drugiego runtime permitu.
+8. Secondary raw i parsed NLN mają zawsze zero canonical runtime emissions.
+9. Jedna signature z kilkoma locatorami zachowuje kilka odrębnych mutacji.
+10. Canonical raw mutation może zostać zastosowana do strukturalnego state,
+    nawet gdy witness zgłosi konflikt, ale kandydat nie może wtedy przejść do
+    MFS.
+11. `CandidateIntegrity::Ready` jest wymagane przed MFS i pozostaje ważne
+    wyłącznie dla tej samej generation.
+12. Żaden technical integrity failure nie staje się Gatekeeper `REJECT`,
+    `TIMEOUT` ani policy reason.
+13. Bus enqueue nie jest dowodem downstream apply.
+14. Tylko `AppliedNewMutation` potwierdza canonical apply.
+15. `Duplicate`, `Ignored`, `Terminal`, `Failed` nie potwierdzają apply.
+16. Brak registry, poisoned lock, capacity exhaustion lub brak permitu blokuje
+    nowego kandydata.
+17. Awaria integralności nowych kandydatów nie zatrzymuje protective exitów
+    potwierdzonych pozycji.
+18. Nie istnieje produkcyjny per-event fallback do parent emission.
+19. Nie istnieje produkcyjny tryb `Legacy`.
+20. Rollback oznacza cały poprzedni binary i config.
+
+### 1E.5. Minimalny kontrakt aktywnego admission
+
+W `ghost-launcher/src/components/seer.rs` należy zastąpić obecne:
+
+```text
+ingest ledger
+→ ewentualnie zapisz shadow evidence
+→ primary wrapper i tak kontynuuje
+```
+
+kontraktem:
+
+```rust
+enum CanonicalRuntimeAdmissionV1 {
+    Apply(CanonicalRuntimePermitV1),
+    NoApply(CanonicalRuntimeNoApplyReasonV1),
+    Blocked(CandidateIntegrityOutcomeV1),
+}
+```
+
+Przykładowe `NoApply`:
+
+```rust
+enum CanonicalRuntimeNoApplyReasonV1 {
+    ExactDuplicate,
+    SecondaryWitnessOnly,
+    ParsedWitnessOnly,
+    AmbiguousWitness,
+    UnmatchableWitness,
+    ContinuityOnly,
+    Suppressed,
+}
+```
+
+`CanonicalRuntimePermitV1` ma być typem prywatnym dla launchera i zawierać co
+najmniej:
+
+```rust
+struct CanonicalRuntimePermitV1 {
+    apply_receipt: CanonicalMutationApplyReceiptV1,
+    authority_epoch_id: u64,
+    locator: RawPumpMutationLocatorV1,
+    primary_payload_hash_blake3: [u8; 32],
+}
+```
+
+Permit nie tworzy nowego modelu eventu. Upoważnia istniejący `CandidatePool`
+albo `TradeEvent` do przejścia przez dotychczasowy adapter.
+
+### 1E.6. Zmiana semantyki `ingest_pump_observation`
+
+Obecnie kod jawnie kontynuuje parent emission przy:
+
+- braku transportowej obserwacji;
+- poisoned ledger mutex;
+- nieudanym stagingu receiptu;
+- błędzie sealowania inventory.
+
+PR1E usuwa tę semantykę.
+
+Primary event bez observation:
+
+```text
+brak observation
+→ PrimaryRawCoverageIncomplete
+→ zero NewPoolDetected/PoolTransaction
+→ zamknięcie admission dla tego kandydata
+```
+
+Nie wolno emitować parent wrappera.
+
+Wrapper/observation mismatch obejmujący provider role, provider ID, candidate
+identity, signature albo locator/order daje:
+
+```text
+PrimaryRawCoverageIncomplete
+→ zero runtime emission tego wrappera
+```
+
+Ledger unavailable nie może kontynuować parent emission:
+
+```text
+new_candidate_admission_open = false
+runtime health = degraded/fail-closed
+existing confirmed positions continue
+protective exits continue
+```
+
+Nie należy zabijać całego procesu, jeśli istnieją pozycje wymagające ochrony.
+
+Tylko obecna canonical mutation tworzy permit. Jeżeli canonical mutation nie
+istnieje, nie ma emisji niezależnie od roli zapisanej w wrapperze.
+
+### 1E.7. Rich wrapper jako carrier, nie authority
+
+`StructuralCanonicalPumpMutationV1` nie musi powielać wszystkich pól
+istniejącego `TradeEvent` albo `CandidatePool`.
+
+Dlatego PR1E nie rekonstruuje pełnego eventu z claims. Zamiast tego:
+
+1. Ledger potwierdza identity, source role, order i canonical uniqueness.
+2. Boundary consistency sprawdza zgodność canonical mutation z wrapperem.
+3. Permit upoważnia oryginalny wrapper do dalszego przejścia.
+4. Existing adapter nadal mapuje wrapper do `DetectedPool` lub
+   `PoolTransaction`.
+
+Pozwala to uniknąć duplikowania parsera, utraty istniejących pól, nowego event
+schema, szerokiego rewrite’u oraz różnic w untouched primary events.
+
+### 1E.8. Buforowane trade’y
+
+Żaden trade z canonical permitem nie może zostać zbuforowany jako sam
+`TradeEvent`, ponieważ późniejszy replay mógłby ominąć canonical apply proof.
+
+Bufor musi przechowywać:
+
+```rust
+struct BufferedCanonicalTradeV1 {
+    trade: TradeEvent,
+    permit: CanonicalRuntimePermitV1,
+    buffered_at: Instant,
+}
+```
+
+Zasady:
+
+- replay używa dokładnie pierwotnego permitu;
+- replay nie tworzy nowego permitu;
+- expiry bufora wywołuje `fail_canonical_apply`;
+- eviction wywołuje `fail_canonical_apply`;
+- duplicate replay nie potwierdza apply;
+- replay bez permitu jest runtime bypass attempt i zostaje odrzucony;
+- `replay_ready` zachowuje canonical order.
+
+Analogicznie należy sprawdzić każdy inny lokalny bufor lub retry lane
+przenoszący `PoolDetected` albo `Trade`.
+
+### 1E.9. Downstream apply receipt
+
+PR1D wprowadził już oddzielny wynik faktycznego session apply:
+
+```rust
+enum CanonicalMutationApplyOutcomeV1 {
+    AppliedNewMutation,
+    Duplicate,
+    Ignored,
+    Terminal,
+    Failed,
+}
+```
+
+oraz `ingest_transaction_with_apply_result()`. PR1E czyni ten wynik
+autorytatywnym.
+
+| Downstream outcome | Działanie |
+| --- | --- |
+| `AppliedNewMutation` | `mark_canonical_apply_succeeded` |
+| `Duplicate` | fail receipt; typed divergence |
+| `Ignored` | fail receipt |
+| `Terminal` | fail receipt; terminal history bez zmian |
+| `Failed` | fail receipt |
+| brak receiptu | runtime bypass, event odrzucony |
+| kilka pasujących receiptów | registry unavailable, fail-closed |
+
+Samo `event_bus_tx.send(...)` nie może potwierdzać apply.
+
+Otwarcie/rejestracja sesji dla `NewPoolDetected` musi zwrócić analogiczny typed
+apply result. Za poprawny apply uznajemy wyłącznie sytuację, gdy candidate
+identity została jednoznacznie przyjęta, sesja została utworzona albo
+prawidłowo skorelowana z istniejącą tą samą sesją, nie wystąpił alias conflict,
+a event nie był terminalnym albo compatibility no-op.
+
+Canonical primary transaction, której downstream nie potrafi jednoznacznie
+zkeyować, nie może uzyskać `Ready`:
+
+```text
+Unkeyable under canonical permit
+→ PrimaryRawCoverageIncomplete
+→ zero MFS
+```
+
+Replay/diagnostic compatibility może nadal odczytać historyczny event, ale nie
+może odblokować produkcyjnej oceny.
+
+### 1E.10. CandidateIntegrity jako aktywny gate
+
+Registry ma już generation, CAS, evaluation guard, submit guard, phase
+transitions i conflict matrix. PR1E nie tworzy drugiego lifecycle’u. Włącza
+istniejący.
+
+Przed MFS:
+
+```text
+CandidateIntegrity != Ready
+→ brak MaterializedFeatureSet
+→ brak Gatekeeper invocation
+→ brak strategicznego verdictu
+```
+
+Guard należy pobrać bezpośrednio przed rozpoczęciem materializacji.
+
+Materializacja MFS:
+
+```text
+evaluation_guard()
+→ check_ready()
+→ build immutable MFS
+→ check_ready()
+→ mark_mfs_materialized()
+```
+
+Drugie `check_ready()` chroni przed konfliktem, który nadszedł podczas
+budowania MFS. Jeżeli generation się zmieniła:
+
+- MFS nie jest publikowany downstream;
+- lokalnie utworzony snapshot zostaje orphaned;
+- nie wolno go mutować ani ponownie wykorzystać;
+- wykonywany jest technical cleanup.
+
+Evaluation:
+
+```text
+check_ready()
+→ mark_evaluation_running()
+→ evaluate policy
+→ check_ready()
+→ publish terminal
+```
+
+Konflikt podczas evaluation oznacza technical abort, brak
+`BUY/REJECT/TIMEOUT`, brak policy reason oraz cleanup pre-buy resources.
+
+Jeżeli repo nie posiada odpowiedniego prywatnego cleanup receiptu, należy dodać
+wyłącznie wewnętrzny:
+
+```rust
+enum TechnicalEvaluationTerminationV1 {
+    CandidateIntegrityInvalidated,
+}
+```
+
+Nie jest to Gatekeeper verdict, strategy outcome ani terminal trading result.
+Ma jedynie zatrzymać evaluation, zwolnić pre-buy resources, zachować evidence
+i nie zanieczyszczać statystyk strategii.
+
+Późny konflikt po opublikowanym `REJECT/TIMEOUT` nie zmienia terminalu, nie
+uruchamia ponownej oceny i zapisuje audit marker.
+
+BUY musi zwrócić jeden `CandidateIntegritySubmitGuardV1`. Bez guardu execution
+handoff jest niemożliwy.
+
+Konflikt przed `try_begin_submit()` anuluje execution intent, zwalnia capacity
+dokładnie raz i daje sender call count = 0.
+
+Po `try_begin_submit()` konflikt nie oznacza anulowania ani sukcesu, capacity
+nie jest zwalniane, ustawiane jest `reconciliation_required`, a potwierdzenie
+transakcji zachowuje authority.
+
+Późny konflikt dla confirmed position powoduje quarantine witnessa, nie
+uruchamia automatycznego close, nie zatrzymuje raw AccountUpdate, a protective
+exits i monitoring działają dalej.
+
+### 1E.11. AccountStateCore
+
+PR1C pozostaje jedyną granicą AccountUpdate. Tylko
+`AccountObservationOutcomeV1::AppliedNewMutation` może zmienić
+AccountStateCore.
+
+Stanu nie mogą zmieniać duplicate, stale, provider conflict, secondary
+witness, unorderable without write version ani observation-only `RpcRefresh`.
+
+CandidateIntegrity nie może zatrzymywać raw-primary AccountUpdate dla już
+potwierdzonej pozycji.
+
+Rozdzielenie odpowiedzialności:
+
+```text
+AccountObservationArbiter
+→ decyduje, czy stan on-chain może się zmienić
+
+CandidateIntegrity
+→ decyduje, czy nowy kandydat może dojść do MFS/evaluation/submit
+```
+
+### 1E.12. Startup i continuity boundary
+
+Produkcyjny startup wymaga:
+
+- dokładnie jednego primary raw providera;
+- stabilnego `provider_id`;
+- dostępnego Pump Observation Ledgera;
+- dostępnego CandidateIntegrity registry;
+- niezerowych bounded capacities;
+- tego samego registry instance w Seer i OracleRuntime;
+- aktywnego downstream apply acknowledgement;
+- aktywnego AccountObservationArbiter;
+- wyłączonej direct NLN canonical emission;
+- wyłączonej secondary raw canonical emission.
+
+Brak któregokolwiek warunku jest startup error dla nowych candidate
+admissions.
+
+Obecna nazwa `Observe` nie może opisywać finalnej aktywnej ścieżki. Docelowo:
+
+```rust
+enum PoolDetectionRuntimeDispositionV1 {
+    CandidateAdmission,
+    ContinuityOnly,
+    Suppressed,
+}
+```
+
+Historyczna deserializacja może zachować:
+
+```rust
+#[serde(alias = "observe")]
+CandidateAdmission
+```
+
+ale produkcyjny kod nie posiada trybu `Observe`.
+
+`ContinuityOnly` służy wyłącznie pozycjom odtworzonym sprzed authority epoch,
+istniejącym monitoringom, protective state hydration i terminal
+reconciliation. Nie może tworzyć nowej sesji wejściowej, MFS, Gatekeepera ani
+nowego BUY.
+
+### 1E.13. Authority epoch
+
+Każdy start runtime tworzy:
+
+```rust
+struct Pr1AuthorityEpochV1 {
+    epoch_id: u64,
+    binary_hash: [u8; 32],
+    config_hash: [u8; 32],
+    started_at_unix_ms: u64,
+}
+```
+
+Cel:
+
+- jawnie ograniczyć exactly-once do runtime epoch;
+- odróżnić nowe candidate admissions od continuity state;
+- uniemożliwić fałszywe twierdzenie o durable cross-restart dedupe;
+- powiązać metrics i receipts z konkretnym binary/configiem.
+
+PR1E nie tworzy durable globalnego Observation Ledgera.
+
+### 1E.14. Zachowanie przy awarii integralności
+
+Globalna awaria obejmująca ledger unavailable, registry unavailable, capacity
+exhausted, impossible receipt ambiguity albo internal identity contradiction
+powoduje:
+
+```text
+new_candidate_admission_open = false
+new Gatekeeper evaluations = 0
+new submits = 0
+runtime health = critical/degraded
+existing confirmed positions continue
+protective exits continue
+```
+
+Nie wolno kontynuować parent emission, automatycznie przełączyć się na legacy,
+wyłączyć protective exits ani udawać poprawnego działania.
+
+### 1E.15. Struktura PR1E
+
+#### Commit 1E-A — executable PR1 end-to-end qualification
+
+Bez zmiany aktywnej authority.
+
+Zakres:
+
+- utworzyć baseline receipt dla `103212b16bfc059db367e1ceb3c7d00fd307d6c5`;
+- zbudować jeden runner przechodzący przez production adapters;
+- połączyć istniejące frozen corpora PR1B, PR1C i PR1D przez manifest;
+- nie kopiować istniejących fixture’ów;
+- dodać tylko brakujące cross-layer scenarios;
+- zamrozić manifest hash;
+- zamrozić runner hash;
+- uruchamiać ten sam input na merged PR1D parent behavior i planowanej ścieżce
+  Enforce.
+
+Manifest ma odwoływać się między innymi do:
+
+- PR1B canonical parity digest;
+- PR1C AccountObservationArbiter corpus;
+- PR1D V1 corpus digest;
+- PR1D V2 corpus digest.
+
+Pełne właściwe wartości digestów należy pobrać z zamrożonych receiptów, a nie
+przepisywać ręcznie z opisu PR.
+
+Dodatkowe cross-layer scenarios:
+
+1. primary create → session open → apply ack → Ready;
+2. create + initial buy w jednej signature;
+3. dwie trade mutations w jednej signature;
+4. duplicate raw po pierwszym apply;
+5. raw + NLN agreement;
+6. NLN-first, raw-second;
+7. NLN-only;
+8. raw/NLN conflict przed MFS;
+9. konflikt podczas MFS;
+10. konflikt podczas evaluation;
+11. konflikt BUY-before-submit;
+12. konflikt race z submit;
+13. konflikt po submit;
+14. konflikt po confirmation;
+15. missing transport observation;
+16. wrapper/observation provider mismatch;
+17. buffered canonical trade replay;
+18. buffered trade expiry;
+19. AccountUpdate duplicate;
+20. same version/different hash;
+21. continuity-only restored position;
+22. writer stall;
+23. queue saturation.
+
+PASS 1E-A:
+
+```text
+all existing corpus digests unchanged
+production adapters used
+test-only fake ledger = 0
+test-only fake CandidateIntegrity = 0
+unclassified differences = 0
+duplicate canonical applies = 0
+witness canonical emissions = 0
+false Ready = 0
+```
+
+#### Commit 1E-B — production authority cutover
+
+Zakres:
+
+- zmienić `ingest_pump_observation` na typed admission;
+- usunąć fail-open parent emission;
+- wprowadzić private canonical runtime permit;
+- wymagać permitu w pool/trade emitters;
+- zachowywać permit w buforach;
+- wymagać downstream apply receipt;
+- aktywować MFS/evaluation guard;
+- aktywować submit guard;
+- dodać technical abort cleanup;
+- zamknąć candidate admission przy niedostępności integrity subsystemu;
+- zachować confirmed-position continuity;
+- zmienić produkcyjny disposition z `Observe` na `CandidateAdmission`;
+- dodać startup preflight;
+- dodać runtime health i metrics;
+- nie dodawać produkcyjnego mode switcha.
+
+PASS 1E-B:
+
+```text
+primary wrapper without canonical permit emits 0 events
+exact duplicate emits 0 additional events
+secondary raw emits 0 events
+parsed NLN emits 0 events
+canonical unique primary emits exactly 1 event
+canonical apply requires actual downstream mutation
+Ready requires complete inventory and all applies
+non-Ready reaches MFS = 0
+integrity-failed candidate reaches Gatekeeper = 0
+pre-submit invalidated BUY reaches sender = 0
+confirmed position protective tick continues
+legacy parent bypass calls = 0
+```
+
+### 1E.16. Differential contract
+
+Dla poprawnych, unikalnych primary raw events następujące elementy pozostają
+identyczne:
+
+```text
+NewPoolDetected payload
+PoolTransaction payload
+session state hash
+MFS hash
+Gatekeeper verdict
+reason chain
+PM handoff
+terminal outcome
+```
+
+Każda dozwolona różnica musi mieć jedną klasyfikację:
+
+```text
+DUPLICATE_PRIMARY_SUPPRESSED
+SECONDARY_WITNESS_SUPPRESSED
+PARSED_WITNESS_SUPPRESSED
+PRIMARY_BOUNDARY_INCOMPLETE
+SOURCE_RECONCILIATION_BLOCK
+ACCOUNT_DUPLICATE_SUPPRESSED
+ACCOUNT_PROVIDER_CONFLICT
+EVALUATION_TECHNICALLY_ABORTED
+EXECUTION_CANCELLED_BEFORE_SUBMIT
+POST_SUBMIT_RECONCILIATION_REQUIRED
+CONFIRMED_POSITION_WITNESS_QUARANTINED
+BUFFERED_CANONICAL_APPLY_EXPIRED
+```
+
+Twarde bramki:
+
+```text
+unclassified_differences = 0
+unexpected_verdict_differences = 0
+unexpected_reason_chain_differences = 0
+unexpected_position_lifecycle_differences = 0
+unexpected_account_state_differences = 0
+```
+
+### 1E.17. Fault injection
+
+Code review nie jest wystarczającym dowodem PR1E. Obowiązkowo należy celowo
+zepsuć po jednym elemencie i wykazać fail-closed:
+
+| Wstrzyknięty błąd | Wymagany wynik |
+| --- | --- |
+| usunięta observation z primary wrappera | zero emission |
+| zmieniony provider ID | zero emission |
+| drugi identyczny raw | jedna łączna mutacja |
+| różny payload tego samego locatora | conflict |
+| brak jednego locatora inventory | brak Ready |
+| bus send bez downstream apply | brak Ready |
+| duplicate downstream apply | brak Ready |
+| poisoned registry | candidate admission closed |
+| pełna receipt capacity | candidate admission closed |
+| konflikt po MFS | evaluation abort |
+| konflikt przed submit | sender nieuruchomiony |
+| konflikt po submit | reconciliation required |
+| konflikt confirmed position | protective exits działają |
+| zatrzymany writer | receiver działa |
+| duplicate AccountUpdate | state hash bez zmiany |
+
+Test musi wykazać również, że usunięcie samego guard checku powoduje czerwony
+test. To zabezpiecza przed testem przechodzącym niezależnie od implementacji.
+
+### 1E.18. CI i performance
+
+Każdy commit:
+
+```text
+cargo fmt --all --check
+git diff --check
+cargo test -p ghost-core
+cargo test -p seer
+cargo test -p ghost-launcher
+cargo test --workspace
+cargo build --release --workspace
+```
+
+Dodatkowo:
+
+- dedicated PR1E end-to-end corpus;
+- active authority bypass guard;
+- CandidateIntegrity lifecycle tests już jako active semantics, nie `would_*`;
+- fault injection;
+- startup contract tests;
+- buffered permit tests;
+- continuity tests.
+
+Performance protocol:
+
+- 5 warm-up runs;
+- 20 measurement runs;
+- ten sam host;
+- ten sam release profile;
+- identyczny input;
+- base: merged PR1D `103212b16bfc059db367e1ceb3c7d00fd307d6c5`;
+- branch: finalny PR1E.
+
+Bramki:
+
+```text
+missing events = 0
+receiver blocked on writer = 0
+receiver blocked on overflow = 0
+silent drops = 0
+throughput lower one-sided 95% CI >= 0.98
+receive-to-normalize p99 upper one-sided 95% CI <= 1.05
+pending canonical permits at clean shutdown = 0
+unacknowledged canonical applies at clean shutdown = 0
+```
+
+Performance waiver PR1D nie przechodzi automatycznie na PR1E.
+
+### 1E.19. Zamknięty runtime qualification run
+
+Przed merge finalnego PR1E:
+
+```text
+minimum 30 minut
+minimum 10 000 successful primary raw Pump mutations
+final release binary
+final production-like config
+live execution disabled
+```
+
+Nowa ścieżka ma sterować rzeczywistym izolowanym runtime aż do Gatekeepera.
+Nie wystarczy policzyć równoległych metrics.
+
+Wymagania:
+
+```text
+primary unique canonical apply ratio = 100%
+duplicate second apply = 0
+secondary/NLN canonical emissions = 0
+false Ready = 0
+unclassified integrity outcomes = 0
+integrity-failed Gatekeeper invocations = 0
+unexpected unaffected verdict differences = 0
+pending permit leak = 0
+registry unavailable = 0
+ledger unavailable = 0
+receiver blocked = 0
+```
+
+Po pozytywnym runie finalny binary zostaje zmergowany i uruchomiony z aktywnym
+PR1 authority. Nie ma długotrwałego produkcyjnego `Observe`.
+
+### 1E.20. Telemetry
+
+Obowiązkowe liczniki:
+
+```text
+pr1_runtime_canonical_permit_issued_total
+pr1_runtime_canonical_apply_succeeded_total
+pr1_runtime_canonical_apply_failed_total
+pr1_runtime_duplicate_suppressed_total
+pr1_runtime_witness_suppressed_total
+pr1_runtime_bypass_attempt_total
+pr1_runtime_missing_observation_total
+pr1_runtime_wrapper_mismatch_total
+pr1_runtime_inventory_incomplete_total
+pr1_runtime_integrity_block_before_mfs_total
+pr1_runtime_evaluation_abort_total
+pr1_runtime_execution_cancel_before_submit_total
+pr1_runtime_post_submit_reconciliation_total
+pr1_runtime_confirmed_witness_quarantine_total
+pr1_runtime_candidate_admission_closed
+pr1_runtime_pending_permits
+pr1_runtime_oldest_pending_permit_age_ms
+```
+
+Każdy counter musi zawierać `authority_epoch_id` w receiptach lub w powiązanym
+manifest identity.
+
+### 1E.21. Rollback
+
+Przed wdrożeniem zamrozić:
+
+- poprzedni binary hash;
+- poprzedni config hash;
+- finalny PR1E binary hash;
+- finalny PR1E config hash;
+- authority epoch receipt.
+
+Rollback:
+
+```text
+previous frozen binary
++
+previous frozen config
+```
+
+Niedozwolone:
+
+- runtime toggle do `Legacy`;
+- per-event fallback;
+- fallback przy missing observation;
+- fallback przy unavailable registry;
+- fallback z conflict do parent wrapper;
+- równoległe dwóch aktywnych authority.
+
+### 1E.22. Definition of Done
+
+PR1E jest zakończony wyłącznie wtedy, gdy:
+
+```text
+active primary wrapper bypass = 0
+active direct NLN canonical emission = 0
+active secondary raw canonical emission = 0
+canonical event without permit = 0
+duplicate canonical runtime mutation = 0
+duplicate AccountUpdate state mutation = 0
+false CandidateIntegrity Ready = 0
+non-Ready MFS materialization = 0
+integrity-failed Gatekeeper invocation = 0
+pre-submit invalidated sender call = 0
+post-submit false cancellation = 0
+confirmed-position protective-exit interruption = 0
+unclassified differential differences = 0
+unexpected unaffected verdict changes = 0
+pending permit leaks = 0
+receiver blocking = 0
+```
+
+Dodatkowo:
+
+- wszystkie korpusy PR1A–PR1D są wykonywalne;
+- jeden end-to-end runner używa production code paths;
+- new candidate admission jest fail-closed;
+- existing confirmed positions zachowują continuity;
+- runtime działa bez produkcyjnego `Observe`;
+- PR2 pozostaje nietknięty.
+
+### 1E.23. Pierwsza kolejność prac
+
+1. Utworzyć clean worktree z `103212b16bfc059db367e1ceb3c7d00fd307d6c5`.
+2. Zapisać baseline receipt.
+3. Zmapować wszystkie emitery `NewPoolDetected` i `PoolTransaction`.
+4. Zmapować wszystkie session/replay buffery.
+5. Udowodnić, że nie istnieje drugi production emitter.
+6. Zbudować 1E-A end-to-end runner.
+7. Zamrozić corpus manifest.
+8. Dopiero wtedy zmienić emission authority.
+9. Wprowadzić permit do buforów.
+10. Włączyć downstream apply acknowledgement.
+11. Włączyć MFS/evaluation/submit guards.
+12. Uruchomić fault injection.
+13. Uruchomić differential i performance protocol.
+14. Uruchomić zamknięty qualification run.
+15. Po pełnym PASS zmergować i wdrożyć cały binary.
+
+### 1E.24. Ostateczna decyzja architektoniczna
+
+PR1E nie ma dodawać kolejnego „obserwatora”. Ma wykonać jeden konkretny
+cutover:
+
+```text
+BYŁO:
+primary wrapper → runtime
+ledger → evidence
+
+MA BYĆ:
+primary wrapper + observation
+→ ledger
+→ canonical permit
+→ runtime
+```
+
+Po PR1E Observation Ledger, AccountObservationArbiter i CandidateIntegrity nie
+są aparaturą diagnostyczną. Są aktywną granicą integralności nowych
+kandydatów.
+
+PR2 może zostać odłożony. Ghost nadal będzie używał dotychczasowej ekonomiki,
+ale będzie już działał na jednej canonical structural mutation, jednym
+primary raw authority, idempotentnym AccountStateCore, witness-only NLN,
+aktywnym technical integrity gate i dokładnie raz zastosowanym event flow.
+
 PR 1 merge gate
 
 unclassified structural differences = 0
@@ -1392,7 +2315,9 @@ silent primary gaps = 0
 receiver blocked time = 0
 unexpected Gatekeeper differences = 0
 
-PR 1 pozostaje shadow/observe-only.
+Po PR1D PR1 pozostaje shadow/observe-only. Po PR1E authority integralności
+nowych kandydatów jest aktywne w runtime, podczas gdy live execution pozostaje
+wyłączone i nie jest autoryzowane przez ten plan.
 
 ---
 

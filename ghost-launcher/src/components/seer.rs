@@ -4063,7 +4063,7 @@ fn fail_shadow_canonical_apply(
     }
 }
 
-fn ingest_pump_observation(
+pub(crate) fn ingest_pump_observation(
     ledger: &Arc<Mutex<PumpObservationLedgerV1>>,
     candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
     observation: Option<ObservedPumpMutationV1>,
@@ -4323,7 +4323,7 @@ fn detection_clock_summary(
     }
 }
 
-fn process_trade_event_for_session_gate(
+pub(crate) fn process_trade_event_for_session_gate(
     tx: &EventBusSender,
     session_trade_bridge: &mut SessionPoolTradeBridge,
     trade: &seer::types::TradeEvent,
@@ -4358,7 +4358,7 @@ fn process_trade_event_for_session_gate(
     gating_result
 }
 
-fn process_pool_detected_event_for_session_gate(
+pub(crate) fn process_pool_detected_event_for_session_gate(
     tx: &EventBusSender,
     session_trade_bridge: &mut SessionPoolTradeBridge,
     candidate: &seer::types::CandidatePool,

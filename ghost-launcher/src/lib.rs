@@ -50,6 +50,9 @@ pub mod session;
 pub mod tx_intelligence;
 pub mod wal_recovery;
 
+#[cfg(test)]
+mod pr1e_qualification;
+
 // Re-export commonly used types
 pub use events::{
     create_event_bus, create_event_bus_with_capacity, DetectedPool, EventBusReceiver,
