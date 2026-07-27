@@ -741,8 +741,11 @@ Kontrakt został domknięty bez zmiany authority:
   identycznej pełnej normalized observation;
 - Unknown przechodzące w zgodną wartość concrete pozostaje odrębnym,
   ograniczonym agreement evidence;
-- różny `raw_transaction_mutation_count` jest typed
-  `RawTransactionMutationCount` divergence i nie jest agreement ani duplicate;
+- incoming observation jest porównywana tą samą macierzą material fields z
+  primary oraz każdym retained witness o tej samej identity;
+- różne concrete claims albo `raw_transaction_mutation_count` pomiędzy
+  same-identity retained observations są typed divergence i nie są agreement
+  ani duplicate;
 - raw-first i witness-first dają ten sam snapshot, jedną canonical mutation i
   zachowują oba warianty pełnej normalizacji w istniejącym bounded lane;
 - replay każdego zachowanego wariantu jest później idempotentnym
@@ -750,7 +753,8 @@ Kontrakt został domknięty bez zmiany authority:
 
 Walidacja finalnego domknięcia:
 
-- dwa nowe adversarial testy obu arrival orders: PASS;
+- tabelaryczny test wszystkich opcjonalnych material claims oraz osobny test
+  inventory divergence w obu arrival orders: PASS;
 - pełne ledger unit, adversarial oraz executable V1/V2 corpus: PASS;
 - parser snapshot V1
   `549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202`

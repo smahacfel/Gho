@@ -2246,6 +2246,127 @@ fn same_identity_inventory_divergence_is_typed_and_retained_in_both_arrival_orde
 }
 
 #[test]
+fn same_identity_retained_concrete_claim_divergence_is_typed_in_both_arrival_orders() {
+    for (index, (case, expected_field)) in CLAIM_CASES.iter().enumerate() {
+        let sig = signature(220 + index as u8);
+        let loc = locator(sig, 0);
+        let mut primary_claims = complete_claims(key(89), key(90));
+        clear_claim(*case, &mut primary_claims);
+        let witness_a_claims = complete_claims(key(89), key(90));
+        let mut witness_b_claims = witness_a_claims.clone();
+        make_concrete_difference(*case, &mut witness_b_claims);
+        let primary = primary_raw(loc.clone(), primary_claims, 220 + index as u8, Some(1));
+        let witness_a = secondary_raw(
+            loc,
+            witness_a_claims,
+            "raw-secondary-retained-claim-divergence",
+            240 + index as u8,
+        );
+        let mut witness_b = witness_a.clone();
+        witness_b.claims = witness_b_claims;
+
+        let assert_typed_conflict = |decision: &ghost_core::PumpObservationLedgerDecisionV1| {
+            assert_eq!(
+                decision.classification,
+                PumpObservationClassificationV1::SourceReconciliationConflict,
+                "case={case:?}"
+            );
+            assert_eq!(
+                decision.provider_agreement,
+                PumpProviderAgreementV1::PrimarySecondaryConflict,
+                "case={case:?}"
+            );
+            assert_eq!(
+                decision.conflict_fields,
+                vec![*expected_field],
+                "case={case:?}"
+            );
+            if !matches!(case, ClaimCase::Curve | ClaimCase::Mint) {
+                assert_eq!(
+                    decision
+                        .candidate_integrity_signal
+                        .as_ref()
+                        .map(|signal| signal.outcome),
+                    Some(CandidateIntegrityOutcomeV1::SourceReconciliationConflict),
+                    "case={case:?}"
+                );
+            }
+        };
+
+        let mut raw_first = PumpObservationLedgerV1::default();
+        assert!(raw_first
+            .observe(primary.clone(), 1)
+            .observation_decision
+            .did_canonical_apply());
+        assert_eq!(
+            raw_first
+                .observe(witness_a.clone(), 2)
+                .observation_decision
+                .classification,
+            PumpObservationClassificationV1::SameMutationAgreement,
+            "case={case:?}"
+        );
+        let raw_first_conflict = raw_first.observe(witness_b.clone(), 3).observation_decision;
+        assert_typed_conflict(&raw_first_conflict);
+        let raw_first_before_replays = raw_first.snapshot();
+        assert_eq!(raw_first_before_replays.canonical_mutation_count, 1);
+        assert_eq!(raw_first_before_replays.exact_duplicate_count, 0);
+        assert_eq!(raw_first_before_replays.conflict_count, 1);
+
+        let mut witness_first = PumpObservationLedgerV1::default();
+        for (now, witness) in [(1, witness_a.clone()), (2, witness_b.clone())] {
+            assert_eq!(
+                witness_first
+                    .observe(witness, now)
+                    .observation_decision
+                    .classification,
+                PumpObservationClassificationV1::SecondaryWitnessOnly,
+                "case={case:?}"
+            );
+        }
+        let resolved = witness_first.observe(primary, 3);
+        assert!(resolved.observation_decision.did_canonical_apply());
+        assert_eq!(resolved.derived_decisions.len(), 2);
+        let witness_first_conflict = resolved
+            .derived_decisions
+            .iter()
+            .find(|decision| {
+                decision.classification
+                    == PumpObservationClassificationV1::SourceReconciliationConflict
+            })
+            .expect("retained concrete divergence must remain typed");
+        assert_typed_conflict(witness_first_conflict);
+        assert_eq!(witness_first.snapshot(), raw_first_before_replays);
+        assert_eq!(
+            witness_first.retained_conflicts(),
+            raw_first.retained_conflicts(),
+            "case={case:?}"
+        );
+
+        for ledger in [&mut raw_first, &mut witness_first] {
+            for (now, witness) in [(4, witness_a.clone()), (5, witness_b.clone())] {
+                assert_eq!(
+                    ledger
+                        .observe(witness, now)
+                        .observation_decision
+                        .classification,
+                    PumpObservationClassificationV1::ExactDuplicate,
+                    "retained variant replay case={case:?}"
+                );
+            }
+            assert_eq!(ledger.snapshot().canonical_mutation_count, 1);
+            assert_eq!(ledger.snapshot().exact_duplicate_count, 2);
+            assert_eq!(ledger.snapshot().conflict_count, 1);
+        }
+        assert_eq!(
+            witness_first.snapshot(),
+            raw_first.snapshot(),
+            "case={case:?}"
+        );
+    }
+}
+
+#[test]
 fn secondary_witness_expiry_retains_bounded_identity_and_first_overflow_evidence() {
     let sig = signature(204);
     let loc = locator(sig, 0);

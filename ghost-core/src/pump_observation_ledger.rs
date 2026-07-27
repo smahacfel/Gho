@@ -1127,11 +1127,9 @@ impl PumpObservationLedgerV1 {
         let (
             exact_identity,
             exact_normalized_observation,
-            same_identity_inventory_divergence,
-            canonical,
+            conflict_fields,
             candidate,
             primary_provenance,
-            primary_raw_transaction_mutation_count,
             correlated_witness_count,
         ) = {
             let record = self
@@ -1139,6 +1137,20 @@ impl PumpObservationLedgerV1 {
                 .get(locator)
                 .expect("caller checked canonical locator");
             let primary_identity = ProviderObservationIdentity::from(&record.primary_observation);
+            let mut conflict_fields = Vec::new();
+            extend_material_conflict_fields(
+                &mut conflict_fields,
+                &record.primary_observation,
+                &observation,
+            );
+            for retained in record
+                .correlated_witnesses
+                .iter()
+                .filter(|retained| ProviderObservationIdentity::from(*retained) == identity)
+            {
+                extend_material_conflict_fields(&mut conflict_fields, retained, &observation);
+            }
+            conflict_fields.sort_unstable_by_key(|field| conflict_field_rank(*field));
             (
                 record.observation_identities.contains(&identity),
                 (primary_identity == identity
@@ -1147,35 +1159,12 @@ impl PumpObservationLedgerV1 {
                         ProviderObservationIdentity::from(retained) == identity
                             && same_normalized_observation(retained, &observation)
                     }),
-                record
-                    .correlated_witnesses
-                    .iter()
-                    .filter(|retained| ProviderObservationIdentity::from(*retained) == identity)
-                    .any(|retained| {
-                        concrete_values_conflict(
-                            retained.raw_transaction_mutation_count.as_ref(),
-                            observation.raw_transaction_mutation_count.as_ref(),
-                        )
-                    }),
-                record.canonical.clone(),
+                conflict_fields,
                 record.candidate,
                 record.canonical.primary_raw_provenance.clone(),
-                record.raw_transaction_mutation_count,
                 record.correlated_witnesses.len(),
             )
         };
-        let mut conflict_fields = material_conflict_fields(&canonical, &observation);
-        push_concrete_conflict(
-            &mut conflict_fields,
-            observation.raw_transaction_mutation_count.as_ref(),
-            primary_raw_transaction_mutation_count.as_ref(),
-            PumpMutationConflictFieldV1::RawTransactionMutationCount,
-        );
-        if same_identity_inventory_divergence
-            && !conflict_fields.contains(&PumpMutationConflictFieldV1::RawTransactionMutationCount)
-        {
-            conflict_fields.push(PumpMutationConflictFieldV1::RawTransactionMutationCount);
-        }
 
         if exact_identity && exact_normalized_observation {
             self.exact_duplicate_count = self.exact_duplicate_count.saturating_add(1);
@@ -1460,93 +1449,98 @@ fn same_normalized_observation(
         && left.raw_provider_role == right.raw_provider_role
 }
 
-fn material_conflict_fields(
-    canonical: &StructuralCanonicalPumpMutationV1,
-    witness: &ObservedPumpMutationV1,
-) -> Vec<PumpMutationConflictFieldV1> {
-    let mut fields = Vec::new();
-    if canonical.mutation_family != witness.mutation_family {
-        fields.push(PumpMutationConflictFieldV1::MutationFamily);
+fn extend_material_conflict_fields(
+    fields: &mut Vec<PumpMutationConflictFieldV1>,
+    reference: &ObservedPumpMutationV1,
+    observation: &ObservedPumpMutationV1,
+) {
+    if reference.mutation_family != observation.mutation_family {
+        push_unique_conflict(fields, PumpMutationConflictFieldV1::MutationFamily);
     }
     push_concrete_conflict(
-        &mut fields,
-        witness.canonical_order.as_ref(),
-        Some(&canonical.order),
+        fields,
+        observation.canonical_order.as_ref(),
+        reference.canonical_order.as_ref(),
         PumpMutationConflictFieldV1::CanonicalOrder,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.curve.as_ref(),
-        canonical.claims.curve.as_ref(),
+        fields,
+        observation.raw_transaction_mutation_count.as_ref(),
+        reference.raw_transaction_mutation_count.as_ref(),
+        PumpMutationConflictFieldV1::RawTransactionMutationCount,
+    );
+    push_concrete_conflict(
+        fields,
+        observation.claims.curve.as_ref(),
+        reference.claims.curve.as_ref(),
         PumpMutationConflictFieldV1::Curve,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.mint.as_ref(),
-        canonical.claims.mint.as_ref(),
+        fields,
+        observation.claims.mint.as_ref(),
+        reference.claims.mint.as_ref(),
         PumpMutationConflictFieldV1::Mint,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.route_variant.as_ref(),
-        canonical.claims.route_variant.as_ref(),
+        fields,
+        observation.claims.route_variant.as_ref(),
+        reference.claims.route_variant.as_ref(),
         PumpMutationConflictFieldV1::RouteVariant,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.side.as_ref(),
-        canonical.claims.side.as_ref(),
+        fields,
+        observation.claims.side.as_ref(),
+        reference.claims.side.as_ref(),
         PumpMutationConflictFieldV1::Side,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.success.as_ref(),
-        canonical.claims.success.as_ref(),
+        fields,
+        observation.claims.success.as_ref(),
+        reference.claims.success.as_ref(),
         PumpMutationConflictFieldV1::Success,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.error_code.as_ref(),
-        canonical.claims.error_code.as_ref(),
+        fields,
+        observation.claims.error_code.as_ref(),
+        reference.claims.error_code.as_ref(),
         PumpMutationConflictFieldV1::ErrorCode,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.token_amount_units.as_ref(),
-        canonical.claims.token_amount_units.as_ref(),
+        fields,
+        observation.claims.token_amount_units.as_ref(),
+        reference.claims.token_amount_units.as_ref(),
         PumpMutationConflictFieldV1::TokenAmountUnits,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.instruction_limit.as_ref(),
-        canonical.claims.instruction_limit.as_ref(),
+        fields,
+        observation.claims.instruction_limit.as_ref(),
+        reference.claims.instruction_limit.as_ref(),
         PumpMutationConflictFieldV1::InstructionLimit,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.reported_curve_quote_lamports.as_ref(),
-        canonical.claims.reported_curve_quote_lamports.as_ref(),
+        fields,
+        observation.claims.reported_curve_quote_lamports.as_ref(),
+        reference.claims.reported_curve_quote_lamports.as_ref(),
         PumpMutationConflictFieldV1::ReportedCurveQuoteLamports,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.reported_wallet_delta_lamports.as_ref(),
-        canonical.claims.reported_wallet_delta_lamports.as_ref(),
+        fields,
+        observation.claims.reported_wallet_delta_lamports.as_ref(),
+        reference.claims.reported_wallet_delta_lamports.as_ref(),
         PumpMutationConflictFieldV1::ReportedWalletDeltaLamports,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.reported_fee_breakdown.as_ref(),
-        canonical.claims.reported_fee_breakdown.as_ref(),
+        fields,
+        observation.claims.reported_fee_breakdown.as_ref(),
+        reference.claims.reported_fee_breakdown.as_ref(),
         PumpMutationConflictFieldV1::ReportedFeeBreakdown,
     );
     push_concrete_conflict(
-        &mut fields,
-        witness.claims.reported_post_state_hash_blake3.as_ref(),
-        canonical.claims.reported_post_state_hash_blake3.as_ref(),
+        fields,
+        observation.claims.reported_post_state_hash_blake3.as_ref(),
+        reference.claims.reported_post_state_hash_blake3.as_ref(),
         PumpMutationConflictFieldV1::ReportedPostStateHashBlake3,
     );
-    fields
 }
 
 fn push_concrete_conflict<T: PartialEq>(
@@ -1556,12 +1550,41 @@ fn push_concrete_conflict<T: PartialEq>(
     field: PumpMutationConflictFieldV1,
 ) {
     if concrete_values_conflict(witness, primary) {
-        fields.push(field);
+        push_unique_conflict(fields, field);
     }
 }
 
 fn concrete_values_conflict<T: PartialEq>(left: Option<&T>, right: Option<&T>) -> bool {
     matches!((left, right), (Some(left), Some(right)) if left != right)
+}
+
+fn push_unique_conflict(
+    fields: &mut Vec<PumpMutationConflictFieldV1>,
+    field: PumpMutationConflictFieldV1,
+) {
+    if !fields.contains(&field) {
+        fields.push(field);
+    }
+}
+
+const fn conflict_field_rank(field: PumpMutationConflictFieldV1) -> u8 {
+    match field {
+        PumpMutationConflictFieldV1::MutationFamily => 0,
+        PumpMutationConflictFieldV1::CanonicalOrder => 1,
+        PumpMutationConflictFieldV1::RawTransactionMutationCount => 2,
+        PumpMutationConflictFieldV1::Curve => 3,
+        PumpMutationConflictFieldV1::Mint => 4,
+        PumpMutationConflictFieldV1::RouteVariant => 5,
+        PumpMutationConflictFieldV1::Side => 6,
+        PumpMutationConflictFieldV1::Success => 7,
+        PumpMutationConflictFieldV1::ErrorCode => 8,
+        PumpMutationConflictFieldV1::TokenAmountUnits => 9,
+        PumpMutationConflictFieldV1::InstructionLimit => 10,
+        PumpMutationConflictFieldV1::ReportedCurveQuoteLamports => 11,
+        PumpMutationConflictFieldV1::ReportedWalletDeltaLamports => 12,
+        PumpMutationConflictFieldV1::ReportedFeeBreakdown => 13,
+        PumpMutationConflictFieldV1::ReportedPostStateHashBlake3 => 14,
+    }
 }
 
 fn integrity_signal(
