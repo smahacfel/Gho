@@ -1127,6 +1127,7 @@ impl PumpObservationLedgerV1 {
         let (
             exact_identity,
             exact_normalized_observation,
+            same_identity_inventory_divergence,
             canonical,
             candidate,
             primary_provenance,
@@ -1146,6 +1147,16 @@ impl PumpObservationLedgerV1 {
                         ProviderObservationIdentity::from(retained) == identity
                             && same_normalized_observation(retained, &observation)
                     }),
+                record
+                    .correlated_witnesses
+                    .iter()
+                    .filter(|retained| ProviderObservationIdentity::from(*retained) == identity)
+                    .any(|retained| {
+                        concrete_values_conflict(
+                            retained.raw_transaction_mutation_count.as_ref(),
+                            observation.raw_transaction_mutation_count.as_ref(),
+                        )
+                    }),
                 record.canonical.clone(),
                 record.candidate,
                 record.canonical.primary_raw_provenance.clone(),
@@ -1160,6 +1171,11 @@ impl PumpObservationLedgerV1 {
             primary_raw_transaction_mutation_count.as_ref(),
             PumpMutationConflictFieldV1::RawTransactionMutationCount,
         );
+        if same_identity_inventory_divergence
+            && !conflict_fields.contains(&PumpMutationConflictFieldV1::RawTransactionMutationCount)
+        {
+            conflict_fields.push(PumpMutationConflictFieldV1::RawTransactionMutationCount);
+        }
 
         if exact_identity && exact_normalized_observation {
             self.exact_duplicate_count = self.exact_duplicate_count.saturating_add(1);
@@ -1539,9 +1555,13 @@ fn push_concrete_conflict<T: PartialEq>(
     primary: Option<&T>,
     field: PumpMutationConflictFieldV1,
 ) {
-    if matches!((witness, primary), (Some(left), Some(right)) if left != right) {
+    if concrete_values_conflict(witness, primary) {
         fields.push(field);
     }
+}
+
+fn concrete_values_conflict<T: PartialEq>(left: Option<&T>, right: Option<&T>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left != right)
 }
 
 fn integrity_signal(

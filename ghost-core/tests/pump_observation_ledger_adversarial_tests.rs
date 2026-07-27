@@ -2143,7 +2143,7 @@ fn same_identity_inventory_divergence_is_typed_and_retained_in_both_arrival_orde
     let sig = signature(209);
     let loc = locator(sig, 0);
     let claims = complete_claims(key(87), key(88));
-    let primary = primary_raw(loc.clone(), claims.clone(), 210, Some(1));
+    let primary = primary_raw(loc.clone(), claims.clone(), 210, None);
     let witness_count_one = secondary_raw(loc, claims, "raw-secondary-inventory-divergence", 211);
     let mut witness_count_two = witness_count_one.clone();
     witness_count_two.raw_transaction_mutation_count = Some(2);
