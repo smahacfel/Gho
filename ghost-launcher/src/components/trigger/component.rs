@@ -5738,6 +5738,11 @@ pub async fn run_with_oracle(
                                 GhostEvent::GatekeeperCommitted { .. } => {
                                     // Ignored by trigger; scoring/approval handled by OracleRuntime
                                 }
+                                GhostEvent::CandidateIntegrity(_) => {
+                                    // Technical candidate-integrity signals are consumed by
+                                    // OracleRuntime. They never enter Trigger's strategic
+                                    // scoring or execution policy path directly.
+                                }
                                 GhostEvent::PoolScored(scored) => {
                                     info!(
                                         runtime_plane = RuntimePlane::LegacyObservation.as_str(),

@@ -33,6 +33,7 @@ pub mod market_state;
 pub mod metric_contracts;
 pub mod pipeline_coverage;
 pub mod pool_identity;
+pub mod pump_observation_ledger;
 pub mod pump_quote;
 pub mod session;
 pub mod shadow_ledger;
@@ -74,9 +75,13 @@ pub use execution_account_evidence::{
     UpsertExecutionAccountEvidenceOutcome, UpsertExecutionAccountEvidenceResult,
 };
 pub use ingest_integrity::{
-    CanonicalPumpOrderKeyV1, LocalCoverageBoundaryV1, LocalCoverageGapReasonV1, LocalCoverageGapV1,
-    ObservationProvenanceV1, ObservationSourceFamilyV1, PumpInstructionLimitV1,
-    PumpMutationClaimsV1, PumpTradeSideV1, RawProviderRoleV1, RawPumpMutationLocatorV1,
+    CandidateIntegrityOutcomeV1, CandidateIntegritySignalV1, CanonicalPumpOrderKeyV1,
+    LocalCoverageBoundaryV1, LocalCoverageGapReasonV1, LocalCoverageGapV1, ObservationProvenanceV1,
+    ObservationSourceFamilyV1, ObservedPumpMutationV1, ParsedWitnessCorrelationOutcomeV1,
+    PumpCandidateIdentityV1, PumpEconomicCertificationStatusV1, PumpInstructionLimitV1,
+    PumpMutationClaimsV1, PumpMutationConflictFieldV1, PumpMutationFamilyV1,
+    PumpProviderAgreementV1, PumpTradeSideV1, RawProviderRoleV1, RawPumpMutationLocatorV1,
+    StructuralCanonicalPumpMutationV1,
 };
 pub use init_pool_parser::{
     compute_initialize_pool_discriminator,
@@ -109,6 +114,12 @@ pub use pipeline_coverage::{
     pipeline_coverage, PipelineCoverage, PipelineCoverageSnapshot, PipelineCoverageStage,
 };
 pub use pool_identity::{BaseMint, BondingCurveKey, PoolId, PoolIdentity, PoolIdentityRegistry};
+pub use pump_observation_ledger::{
+    PumpObservationClassificationV1, PumpObservationEvidenceLaneV1,
+    PumpObservationEvidenceOverflowV1, PumpObservationLedgerConfigErrorV1,
+    PumpObservationLedgerConfigV1, PumpObservationLedgerDecisionV1, PumpObservationLedgerResultV1,
+    PumpObservationLedgerSnapshotV1, PumpObservationLedgerV1, PumpSourceConflictEvidenceV1,
+};
 pub use pump_quote::{
     quote_exact_base_in_sell, quote_exact_base_out, quote_exact_quote_in, FeeRounding,
     InstructionLimitCheck, ProgramFeeCharge, ProgramFeeRule, ProgramFeeSchedule,

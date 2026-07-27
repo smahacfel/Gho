@@ -76,6 +76,7 @@ fn create_synthetic_event() -> GeyserEvent {
     GeyserEvent::Transaction {
         provider_id: None,
         provider_role: None,
+        observation_provenance: None,
         slot: None,
         tx_index: None,
         event_ts_ms: None,
@@ -120,6 +121,7 @@ fn create_raw_event() -> GeyserEvent {
     GeyserEvent::Transaction {
         provider_id: None,
         provider_role: None,
+        observation_provenance: None,
         slot: Some(12345),
         tx_index: None,
         event_ts_ms: None,

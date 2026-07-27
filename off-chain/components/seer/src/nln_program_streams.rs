@@ -36,6 +36,7 @@ const LIST_TOPICS_PATH: &str = "/nln.stream.v1.StreamService/ListTopics";
 const SUBSCRIBE_PATH: &str = "/nln.stream.v1.StreamService/Subscribe";
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
+pub const NLN_PROGRAM_STREAM_PAYLOAD_SCHEMA_ID: &str = "nln_program_stream_payload_json.v1";
 
 /// Empty request for `nln.stream.v1.StreamService/ListTopics`.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -114,6 +115,14 @@ pub struct NlnProgramStreamMessage {
     #[serde(default)]
     pub recv_ts_ns: u64,
     pub decode_ts_ms: u64,
+    /// Schema of the exact captured `SubscribeResponse.payload`
+    /// representation hashed below.
+    #[serde(default)]
+    pub payload_schema_id: String,
+    /// BLAKE3 of the exact bytes in `SubscribeResponse.payload`, before JSON
+    /// decoding or optional base64 unwrapping.
+    #[serde(default)]
+    pub payload_hash_blake3: [u8; 32],
     pub payload_json: Value,
 }
 
@@ -143,6 +152,10 @@ pub struct NlnIngestMeta {
     pub signature: Option<String>,
     pub tx_index: Option<u32>,
     pub instruction_index: Option<u32>,
+    #[serde(default)]
+    pub payload_schema_id: String,
+    #[serde(default)]
+    pub payload_hash_blake3: [u8; 32],
 }
 
 impl NlnIngestMeta {
@@ -167,6 +180,8 @@ impl NlnIngestMeta {
             signature,
             tx_index,
             instruction_index,
+            payload_schema_id: message.payload_schema_id.clone(),
+            payload_hash_blake3: message.payload_hash_blake3,
         }
     }
 }
@@ -821,6 +836,7 @@ pub fn decode_subscribe_response(
     let provider_ts_ms = (response.timestamp_ms > 0).then_some(response.timestamp_ms);
     stats.record_message(&response.topic, recv_ts_ms, provider_ts_ms);
 
+    let payload_hash_blake3 = *blake3::hash(&response.payload).as_bytes();
     let payload_json = match decode_json_payload(&response.payload) {
         Ok(payload) => payload,
         Err(err) => {
@@ -844,6 +860,8 @@ pub fn decode_subscribe_response(
         recv_ts_ms,
         recv_ts_ns,
         decode_ts_ms: now_ms(),
+        payload_schema_id: NLN_PROGRAM_STREAM_PAYLOAD_SCHEMA_ID.to_string(),
+        payload_hash_blake3,
         payload_json,
     })
 }
@@ -1323,6 +1341,8 @@ mod tests {
     }
 
     fn decoded_message(topic: String, payload_json: Value) -> NlnProgramStreamMessage {
+        let captured_payload =
+            serde_json::to_vec(&payload_json).expect("test payload must serialize");
         NlnProgramStreamMessage {
             topic,
             partition: 0,
@@ -1332,6 +1352,8 @@ mod tests {
             recv_ts_ms: 1_700_000_000_010,
             recv_ts_ns: 1_700_000_000_010_000_000,
             decode_ts_ms: 1_700_000_000_011,
+            payload_schema_id: NLN_PROGRAM_STREAM_PAYLOAD_SCHEMA_ID.to_string(),
+            payload_hash_blake3: *blake3::hash(&captured_payload).as_bytes(),
             payload_json,
         }
     }
@@ -1424,6 +1446,59 @@ mod tests {
         assert_eq!(decoded.partition, 3);
         assert_eq!(decoded.payload_json["from_wallet"], "a");
         assert_eq!(stats.snapshot().messages_received, 1);
+    }
+
+    #[test]
+    fn nln_payload_hash_covers_exact_subscribe_payload_bytes_and_reaches_meta() {
+        let stats = NlnProgramStreamsStats::default();
+        let decoded_json = br#"{"slot":42,"signature":"sig-a"}"#;
+        let captured_payload = general_purpose::STANDARD.encode(decoded_json).into_bytes();
+        let expected_hash = *blake3::hash(&captured_payload).as_bytes();
+        let response = SubscribeResponse {
+            topic: "custom.audit.topic".to_string(),
+            partition: 7,
+            offset: 91,
+            timestamp_ms: 1_700_000_000_000,
+            payload: captured_payload,
+        };
+
+        let message = decode_subscribe_response(&response, &stats).expect("decode NLN response");
+        assert_eq!(
+            message.payload_json,
+            json!({"slot": 42, "signature": "sig-a"})
+        );
+        assert_eq!(
+            message.payload_schema_id,
+            NLN_PROGRAM_STREAM_PAYLOAD_SCHEMA_ID
+        );
+        assert_eq!(message.payload_hash_blake3, expected_hash);
+
+        match normalize_nln_event(&message, &ProgramStreamsConfig::default())
+            .expect("unknown topic remains an observation")
+        {
+            NlnEvent::Unknown { meta, .. } => {
+                assert_eq!(meta.payload_schema_id, NLN_PROGRAM_STREAM_PAYLOAD_SCHEMA_ID);
+                assert_eq!(meta.payload_hash_blake3, expected_hash);
+            }
+            other => panic!("expected unknown NLN observation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_nln_message_json_defaults_payload_provenance_fields() {
+        let mut value = serde_json::to_value(decoded_message(
+            "legacy.topic".to_string(),
+            json!({"slot": 1}),
+        ))
+        .expect("serialize message");
+        let object = value.as_object_mut().expect("message object");
+        object.remove("payload_schema_id");
+        object.remove("payload_hash_blake3");
+
+        let decoded: NlnProgramStreamMessage =
+            serde_json::from_value(value).expect("legacy message JSON");
+        assert!(decoded.payload_schema_id.is_empty());
+        assert_eq!(decoded.payload_hash_blake3, [0; 32]);
     }
 
     #[test]

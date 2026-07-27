@@ -1479,8 +1479,51 @@ fn top_level_provenance(
         outer_program_id: None,
         invoked_program_id: invoked_program_id.to_string(),
         stack_height: None,
+        inner_instruction_path: Some(Vec::new()),
         from_cpi: false,
     }
+}
+
+/// Advance one source-neutral structural CPI path while walking Solana's
+/// chain-defined inner-instruction sequence.
+///
+/// Each component is the sibling ordinal under its parent. A missing/invalid
+/// height makes only that path unknown; a later direct child of the outer
+/// instruction can establish a new valid root.
+fn next_inner_instruction_path(
+    stack_height: Option<u32>,
+    current_path: &mut SmallVec<[u16; 8]>,
+    next_sibling_by_depth: &mut SmallVec<[u32; 8]>,
+) -> Option<Vec<u16>> {
+    let Some(depth) = stack_height
+        .and_then(|height| height.checked_sub(2))
+        .and_then(|depth| usize::try_from(depth).ok())
+    else {
+        current_path.clear();
+        return None;
+    };
+
+    // A child may descend by one level from the immediately preceding valid
+    // node. Larger jumps cannot be reconstructed safely.
+    if depth > current_path.len() {
+        current_path.clear();
+        return None;
+    }
+
+    if next_sibling_by_depth.len() <= depth {
+        next_sibling_by_depth.resize(depth + 1, 0);
+    }
+    let Ok(sibling) = u16::try_from(next_sibling_by_depth[depth]) else {
+        current_path.clear();
+        return None;
+    };
+    next_sibling_by_depth[depth] = next_sibling_by_depth[depth].saturating_add(1);
+
+    current_path.truncate(depth);
+    current_path.push(sibling);
+    next_sibling_by_depth.truncate(depth + 1);
+    next_sibling_by_depth.push(0);
+    Some(current_path.to_vec())
 }
 
 #[inline(always)]
@@ -1489,6 +1532,7 @@ fn inner_instruction_provenance(
     outer_program_id: Option<&str>,
     invoked_program_id: &str,
     stack_height: Option<u32>,
+    inner_instruction_path: Option<Vec<u16>>,
 ) -> InstructionProvenance {
     InstructionProvenance {
         outer_instruction_index: Some(outer_instruction_index),
@@ -1496,6 +1540,7 @@ fn inner_instruction_provenance(
         outer_program_id: outer_program_id.map(ToOwned::to_owned),
         invoked_program_id: invoked_program_id.to_string(),
         stack_height,
+        inner_instruction_path,
         from_cpi: true,
     }
 }
@@ -2049,7 +2094,14 @@ impl PumpParser {
                     );
                 }
                 let insts = &inner_set.instructions;
+                let mut current_inner_path = SmallVec::<[u16; 8]>::new();
+                let mut next_inner_sibling_by_depth = SmallVec::<[u32; 8]>::from_slice(&[0]);
                 for (i, inner_ix) in insts.iter().enumerate() {
+                    let inner_instruction_path = next_inner_instruction_path(
+                        inner_ix.stack_height,
+                        &mut current_inner_path,
+                        &mut next_inner_sibling_by_depth,
+                    );
                     let curr_sh = inner_ix.stack_height;
                     let next_sh = insts.get(i + 1).and_then(|ix| ix.stack_height);
                     let has_deeper_next = matches!((curr_sh, next_sh), (Some(c), Some(n)) if n > c);
@@ -2138,6 +2190,7 @@ impl PumpParser {
                         outer_program.as_deref(),
                         &prog,
                         inner_ix.stack_height,
+                        inner_instruction_path,
                     );
                     stamp_new_events(&mut out, before, instruction_ordinal, &provenance);
                     if !has_deeper_next {
@@ -2232,7 +2285,14 @@ impl PumpParser {
                 );
             }
             let insts = &inner_set.instructions;
+            let mut current_inner_path = SmallVec::<[u16; 8]>::new();
+            let mut next_inner_sibling_by_depth = SmallVec::<[u32; 8]>::from_slice(&[0]);
             for (i, inner_ix) in insts.iter().enumerate() {
+                let inner_instruction_path = next_inner_instruction_path(
+                    inner_ix.stack_height,
+                    &mut current_inner_path,
+                    &mut next_inner_sibling_by_depth,
+                );
                 let curr_sh = inner_ix.stack_height;
                 let next_sh = insts.get(i + 1).and_then(|ix| ix.stack_height);
                 let has_deeper_next = matches!((curr_sh, next_sh), (Some(c), Some(n)) if n > c);
@@ -2312,6 +2372,7 @@ impl PumpParser {
                     outer_program.as_deref(),
                     &prog,
                     inner_ix.stack_height,
+                    inner_instruction_path,
                 );
                 stamp_new_events(&mut out, before, instruction_ordinal, &provenance);
                 if !has_deeper_next {
@@ -3457,7 +3518,7 @@ fn make_ev(
 // and is copied at this public-output boundary, so it cannot affect parser
 // classification, canonical state, or policy authority.
 
-use crate::errors::SeerResult;
+use crate::errors::{SeerError, SeerResult};
 use crate::types::{
     GeyserEvent, InitializePoolEvent, ObservedAccountMetaProvenance, RawBytesMissingReason,
     TokenDelta, ToolchainFingerprintInput, TradeEvent,
@@ -3469,8 +3530,10 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use ghost_core::{
-    ExecutionAccountEvidence, ExecutionAccountEvidenceSource, ExecutionAccountEvidenceStatus,
-    ExecutionAccountRole, RawProviderRoleV1,
+    CanonicalPumpOrderKeyV1, ExecutionAccountEvidence, ExecutionAccountEvidenceSource,
+    ExecutionAccountEvidenceStatus, ExecutionAccountRole, ObservationProvenanceV1,
+    ObservedPumpMutationV1, PumpInstructionLimitV1, PumpMutationClaimsV1, PumpMutationFamilyV1,
+    PumpRouteVariant, PumpTradeSideV1, RawProviderRoleV1, RawPumpMutationLocatorV1,
 };
 
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
@@ -3520,6 +3583,198 @@ fn transaction_provider_metadata(
         } => (provider_id.clone(), *provider_role),
         _ => (None, None),
     }
+}
+
+fn transaction_observation_provenance(event: &GeyserEvent) -> Option<&ObservationProvenanceV1> {
+    match event {
+        GeyserEvent::Transaction {
+            observation_provenance,
+            ..
+        } => observation_provenance.as_ref(),
+        _ => None,
+    }
+}
+
+fn transaction_outcome(event: &GeyserEvent) -> (Option<bool>, Option<String>) {
+    match event {
+        GeyserEvent::Transaction {
+            success,
+            error_code,
+            ..
+        } => (Some(*success), error_code.clone()),
+        _ => (None, None),
+    }
+}
+
+fn non_default_observation_pubkey(pubkey: Pubkey) -> Option<Pubkey> {
+    (pubkey != Pubkey::default()).then_some(pubkey)
+}
+
+fn observed_structural_location(
+    signature: solana_sdk::signature::Signature,
+    slot: Option<u64>,
+    tx_index: Option<u32>,
+    event_ordinal: Option<u32>,
+    instruction_provenance: Option<&InstructionProvenance>,
+) -> (
+    Option<RawPumpMutationLocatorV1>,
+    Option<CanonicalPumpOrderKeyV1>,
+) {
+    let Some(instruction_provenance) = instruction_provenance else {
+        return (None, None);
+    };
+    if !is_pump_program(&instruction_provenance.invoked_program_id) {
+        // Balance-inferred generic-router trades are useful compatibility
+        // events, but they are not a structurally located Pump mutation.
+        return (None, None);
+    }
+    let Ok(program_id) = Pubkey::from_str(&instruction_provenance.invoked_program_id) else {
+        return (None, None);
+    };
+    let Some(outer_instruction_index) = instruction_provenance
+        .outer_instruction_index
+        .and_then(|index| u16::try_from(index).ok())
+    else {
+        return (None, None);
+    };
+    let Some(inner_instruction_path) = instruction_provenance.inner_instruction_path.clone() else {
+        return (None, None);
+    };
+    let Some(semantic_event_ordinal) = event_ordinal else {
+        return (None, None);
+    };
+
+    let locator = RawPumpMutationLocatorV1 {
+        program_id,
+        signature,
+        outer_instruction_index,
+        inner_instruction_path: inner_instruction_path.clone(),
+        semantic_event_ordinal,
+    };
+    let canonical_order = slot
+        .zip(tx_index)
+        .map(|(slot, tx_index)| CanonicalPumpOrderKeyV1 {
+            slot,
+            tx_index,
+            outer_instruction_index,
+            inner_instruction_path,
+            semantic_event_ordinal,
+        });
+    (Some(locator), canonical_order)
+}
+
+fn observed_initialize_pool_mutation(
+    event: &GeyserEvent,
+    pool: &InitializePoolEvent,
+    raw_transaction_mutation_count: u32,
+) -> Option<ObservedPumpMutationV1> {
+    let provenance = transaction_observation_provenance(event)?.clone();
+    let (locator_hint, canonical_order) = observed_structural_location(
+        pool.signature,
+        pool.slot,
+        pool.tx_index,
+        pool.event_ordinal,
+        pool.provenance.as_ref(),
+    );
+    let (success, error_code) = transaction_outcome(event);
+
+    Some(ObservedPumpMutationV1 {
+        mutation_family: PumpMutationFamilyV1::InitializePool,
+        signature: pool.signature,
+        locator_hint,
+        canonical_order,
+        raw_transaction_mutation_count: Some(raw_transaction_mutation_count),
+        claims: PumpMutationClaimsV1 {
+            curve: non_default_observation_pubkey(pool.bonding_curve),
+            mint: non_default_observation_pubkey(pool.base_mint),
+            success,
+            error_code,
+            ..PumpMutationClaimsV1::default()
+        },
+        raw_provider_role: pool.provider_role,
+        provenance,
+    })
+}
+
+fn trade_route_variant(trade: &TradeEvent) -> Option<PumpRouteVariant> {
+    if trade.is_pumpswap {
+        return None;
+    }
+    match trade.buy_variant.as_deref() {
+        Some("legacy_buy") => Some(PumpRouteVariant::LegacyBuy),
+        Some("buy_v2") => Some(PumpRouteVariant::BuyV2),
+        Some("routed_exact_sol_in") | Some("buy_exact_quote_in_v2") => {
+            Some(PumpRouteVariant::BuyExactQuoteInV2)
+        }
+        Some("legacy_sell") => Some(PumpRouteVariant::LegacySell),
+        Some("sell_v2") => Some(PumpRouteVariant::SellV2),
+        _ => None,
+    }
+}
+
+fn trade_instruction_limit(
+    trade: &TradeEvent,
+    route_variant: Option<PumpRouteVariant>,
+) -> Option<PumpInstructionLimitV1> {
+    match route_variant {
+        Some(PumpRouteVariant::LegacyBuy | PumpRouteVariant::BuyV2) if trade.max_sol_cost > 0 => {
+            Some(PumpInstructionLimitV1::MaxWalletDebitLamports(
+                trade.max_sol_cost,
+            ))
+        }
+        Some(PumpRouteVariant::BuyExactQuoteInV2) if trade.max_sol_cost > 0 => Some(
+            PumpInstructionLimitV1::ExactQuoteInputLamports(trade.max_sol_cost),
+        ),
+        Some(PumpRouteVariant::LegacySell | PumpRouteVariant::SellV2)
+            if trade.min_sol_output > 0 =>
+        {
+            Some(PumpInstructionLimitV1::MinWalletCreditLamports(
+                trade.min_sol_output,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn observed_trade_mutation(
+    event: &GeyserEvent,
+    trade: &TradeEvent,
+    raw_transaction_mutation_count: u32,
+) -> Option<ObservedPumpMutationV1> {
+    let provenance = transaction_observation_provenance(event)?.clone();
+    let (locator_hint, canonical_order) = observed_structural_location(
+        trade.signature,
+        trade.slot,
+        trade.tx_index,
+        trade.event_ordinal,
+        trade.provenance.as_ref(),
+    );
+    let route_variant = trade_route_variant(trade);
+
+    Some(ObservedPumpMutationV1 {
+        mutation_family: PumpMutationFamilyV1::Trade,
+        signature: trade.signature,
+        locator_hint,
+        canonical_order,
+        raw_transaction_mutation_count: Some(raw_transaction_mutation_count),
+        claims: PumpMutationClaimsV1 {
+            curve: non_default_observation_pubkey(trade.pool_amm_id),
+            mint: non_default_observation_pubkey(trade.mint),
+            route_variant,
+            side: Some(if trade.is_buy {
+                PumpTradeSideV1::Buy
+            } else {
+                PumpTradeSideV1::Sell
+            }),
+            success: Some(trade.success),
+            error_code: trade.error_code.clone(),
+            token_amount_units: Some(trade.amount),
+            instruction_limit: trade_instruction_limit(trade, route_variant),
+            ..PumpMutationClaimsV1::default()
+        },
+        raw_provider_role: trade.provider_role,
+        provenance,
+    })
 }
 
 const BCV2_RPC_HYDRATION_QUEUE_CAP: usize = 1024;
@@ -4074,7 +4329,15 @@ pub struct BinaryParser {
 #[derive(Debug, Clone)]
 pub struct ParsedTransactionBundle {
     pub initialize_pool: Option<InitializePoolEvent>,
+    /// Raw observation aligned with `initialize_pool`. It is absent only for
+    /// compatibility/non-Yellowstone inputs that do not carry captured payload
+    /// provenance.
+    pub initialize_pool_observation: Option<ObservedPumpMutationV1>,
     pub trades: Vec<TradeEvent>,
+    /// Index-aligned raw observations for `trades`. A `None` element preserves
+    /// alignment for a compatibility or inference-only trade that cannot claim
+    /// complete captured-provider provenance.
+    pub trade_observations: Vec<Option<ObservedPumpMutationV1>>,
 }
 
 impl BinaryParser {
@@ -4133,6 +4396,10 @@ impl BinaryParser {
         let event_time = crate::types::transaction_event_time(event);
         let event_ts_ms = event.compat_event_ts_ms();
         let (provider_id, provider_role) = transaction_provider_metadata(event);
+        let tx_index = match event {
+            GeyserEvent::Transaction { tx_index, .. } => *tx_index,
+            _ => None,
+        };
         // Priority: CpiCreate (Borsh event log, ec.user is always correct) >
         //           Create (direct instruction, account index may shift across Pump.fun versions) >
         //           SwapPoolCreated.
@@ -4160,6 +4427,8 @@ impl BinaryParser {
         }
         let chosen = cpi_create.or(direct_create).or(swap_pool_created);
         if let Some(p) = chosen {
+            let event_ordinal = p.event_ordinal;
+            let provenance = p.provenance.clone();
             match p.kind {
                 ParsedEventKind::Create {
                     params: _params,
@@ -4177,6 +4446,9 @@ impl BinaryParser {
                         provider_id: provider_id.clone(),
                         provider_role,
                         slot: Some(p.slot),
+                        event_ordinal,
+                        tx_index,
+                        provenance: provenance.clone(),
                         event_ts_ms,
                         event_time,
                         signature: sig,
@@ -4210,6 +4482,9 @@ impl BinaryParser {
                         provider_id: provider_id.clone(),
                         provider_role,
                         slot: Some(p.slot),
+                        event_ordinal,
+                        tx_index,
+                        provenance: provenance.clone(),
                         event_ts_ms,
                         event_time,
                         signature: sig,
@@ -4259,6 +4534,9 @@ impl BinaryParser {
                         provider_id: provider_id.clone(),
                         provider_role,
                         slot: Some(p.slot),
+                        event_ordinal,
+                        tx_index,
+                        provenance: provenance.clone(),
                         event_ts_ms,
                         event_time,
                         signature: sig,
@@ -4296,9 +4574,33 @@ impl BinaryParser {
         event: &GeyserEvent,
     ) -> SeerResult<ParsedTransactionBundle> {
         let parsed = self.parse_pump_events(event);
+        let initialize_pool = self.initialize_pool_from_parsed(event, parsed.clone())?;
+        let trades = self.trades_from_parsed(event, parsed)?;
+        let raw_transaction_mutation_count = u32::try_from(
+            (if initialize_pool.is_some() {
+                1usize
+            } else {
+                0usize
+            })
+            .saturating_add(trades.len()),
+        )
+        .map_err(|_| {
+            SeerError::ParseError(
+                "Pump mutation count exceeds u32 in one Yellowstone transaction".to_string(),
+            )
+        })?;
+        let initialize_pool_observation = initialize_pool.as_ref().and_then(|pool| {
+            observed_initialize_pool_mutation(event, pool, raw_transaction_mutation_count)
+        });
+        let trade_observations = trades
+            .iter()
+            .map(|trade| observed_trade_mutation(event, trade, raw_transaction_mutation_count))
+            .collect();
         Ok(ParsedTransactionBundle {
-            initialize_pool: self.initialize_pool_from_parsed(event, parsed.clone())?,
-            trades: self.trades_from_parsed(event, parsed)?,
+            initialize_pool,
+            initialize_pool_observation,
+            trades,
+            trade_observations,
         })
     }
 
@@ -5072,6 +5374,7 @@ impl BinaryParser {
                     outer_program_id: None,
                     invoked_program_id: hint.router_program.to_string(),
                     stack_height: None,
+                    inner_instruction_path: Some(Vec::new()),
                     from_cpi: false,
                 }),
                 timestamp_ms: effective_runtime_ts_ms,
@@ -5215,7 +5518,14 @@ impl BinaryParser {
                 );
             }
             let insts = &group.instructions;
+            let mut current_inner_path = SmallVec::<[u16; 8]>::new();
+            let mut next_inner_sibling_by_depth = SmallVec::<[u32; 8]>::from_slice(&[0]);
             for (i, inner_ix) in insts.iter().enumerate() {
+                let inner_instruction_path = next_inner_instruction_path(
+                    inner_ix.stack_height,
+                    &mut current_inner_path,
+                    &mut next_inner_sibling_by_depth,
+                );
                 let curr_sh = inner_ix.stack_height;
                 let next_sh = insts.get(i + 1).and_then(|ix| ix.stack_height);
                 let has_deeper_next = matches!((curr_sh, next_sh), (Some(c), Some(n)) if n > c);
@@ -5296,6 +5606,7 @@ impl BinaryParser {
                     outer_program.as_deref(),
                     &prog,
                     inner_ix.stack_height,
+                    inner_instruction_path,
                 );
                 stamp_new_events(&mut out, before, instruction_ordinal, &provenance);
                 if !has_deeper_next {
@@ -7228,6 +7539,7 @@ mod tests {
         GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -7251,6 +7563,20 @@ mod tests {
             inner_instructions,
             pre_token_balances: vec![],
             post_token_balances: vec![],
+        }
+    }
+
+    fn raw_test_observation_provenance() -> ObservationProvenanceV1 {
+        ObservationProvenanceV1 {
+            source_family: ghost_core::ObservationSourceFamilyV1::RawYellowstone,
+            source_id: "grpc_global_stream".to_string(),
+            provider_id: "raw-primary".to_string(),
+            schema_id: "yellowstone_subscribe_update_transaction.prost.v1".to_string(),
+            payload_hash_blake3:
+                ObservationProvenanceV1::payload_hash_for_captured_provider_payload(
+                    b"raw-test-payload",
+                ),
+            received_at_monotonic_ns: 17,
         }
     }
 
@@ -7413,6 +7739,7 @@ mod tests {
         GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -8092,29 +8419,53 @@ mod tests {
         if let GeyserEvent::Transaction {
             provider_id: event_provider_id,
             provider_role: event_provider_role,
+            observation_provenance,
+            tx_index,
             ..
         } = &mut event
         {
             *event_provider_id = Some(provider_id.clone());
             *event_provider_role = Some(provider_role);
+            *observation_provenance = Some(raw_test_observation_provenance());
+            *tx_index = Some(0);
         } else {
             panic!("fixture must be a normalized transaction");
         }
 
-        let pool = parser
-            .parse_initialize_pool(&event)
-            .expect("decoded create should parse")
+        let bundle = parser
+            .parse_transaction_bundle(&event)
+            .expect("decoded create bundle");
+        let pool = bundle
+            .initialize_pool
             .expect("decoded create should emit pool");
+        let observation = bundle
+            .initialize_pool_observation
+            .expect("aligned initialize observation");
         assert_eq!(pool.provider_id.as_deref(), Some(provider_id.as_str()));
         assert_eq!(pool.provider_role, Some(provider_role));
+        assert_eq!(pool.tx_index, Some(0));
+        assert_eq!(observation.raw_transaction_mutation_count, Some(1));
+        assert_eq!(observation.raw_provider_role, Some(provider_role));
+        let locator = observation
+            .locator_hint
+            .as_ref()
+            .expect("initialize structural locator");
+        assert!(locator.inner_instruction_path.is_empty());
+        let order = observation
+            .canonical_order
+            .as_ref()
+            .expect("initialize canonical order");
+        assert_eq!((order.slot, order.tx_index), (42, 0));
+        assert!(order.inner_instruction_path.is_empty());
 
         let candidate: crate::types::CandidatePool = pool.into();
         assert_eq!(candidate.provider_id.as_deref(), Some(provider_id.as_str()));
         assert_eq!(candidate.provider_role, Some(provider_role));
+        assert_eq!(candidate.tx_index, Some(0));
 
         let (sender, mut receiver, _) = create_ipc_channel(IpcChannelConfig::default());
         sender
-            .send(candidate, EventPriority::Normal)
+            .send_with_observation(candidate, Some(observation.clone()), EventPriority::Normal)
             .await
             .expect("pool provenance must cross the Seer IPC boundary");
         match receiver.recv().await.expect("IPC pool event") {
@@ -8124,6 +8475,7 @@ mod tests {
                     Some(provider_id.as_str())
                 );
                 assert_eq!(observed.candidate.provider_role, Some(provider_role));
+                assert_eq!(observed.observation, Some(observation));
             }
             other => panic!("expected IPC pool candidate, got {other:?}"),
         }
@@ -8366,6 +8718,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
@@ -8417,6 +8770,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_000),
@@ -8470,6 +8824,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_100),
@@ -8574,6 +8929,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_200),
@@ -8671,6 +9027,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_300),
@@ -8776,6 +9133,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_400),
@@ -8847,6 +9205,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: Some(1_777_777_777_500),
@@ -8993,6 +9352,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -9139,6 +9499,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -9305,6 +9666,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -9449,6 +9811,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -10217,6 +10580,42 @@ mod tests {
     }
 
     #[test]
+    fn inner_instruction_paths_are_structural_and_fail_closed_when_height_is_unknown() {
+        let mut current_path = SmallVec::<[u16; 8]>::new();
+        let mut next_sibling_by_depth = SmallVec::<[u32; 8]>::from_slice(&[0]);
+        let actual = [
+            Some(2),
+            Some(3),
+            Some(3),
+            Some(2),
+            None,
+            Some(3),
+            Some(2),
+            Some(4),
+            Some(2),
+        ]
+        .into_iter()
+        .map(|stack_height| {
+            next_inner_instruction_path(stack_height, &mut current_path, &mut next_sibling_by_depth)
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                Some(vec![0]),
+                Some(vec![0, 0]),
+                Some(vec![0, 1]),
+                Some(vec![1]),
+                None,
+                None,
+                Some(vec![2]),
+                None,
+                Some(vec![3]),
+            ]
+        );
+    }
+
+    #[test]
     fn trade_event_preserves_provenance_from_cpi_source() {
         let parser = BinaryParser::new(false);
         let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap();
@@ -10284,11 +10683,24 @@ mod tests {
                 },
             ],
         }];
-        let event = make_decoded_tx_event_with_inner(
+        let mut event = make_decoded_tx_event_with_inner(
             accounts.clone(),
             instructions.clone(),
             inner_instructions.clone(),
         );
+        if let GeyserEvent::Transaction {
+            provider_id,
+            provider_role,
+            observation_provenance,
+            tx_index,
+            ..
+        } = &mut event
+        {
+            *provider_id = Some("raw-primary".to_string());
+            *provider_role = Some(RawProviderRoleV1::PrimaryAuthority);
+            *observation_provenance = Some(raw_test_observation_provenance());
+            *tx_index = Some(0);
+        }
 
         let live = parser.parse_pump_events(&event);
         let decoded = PumpParser::parse_geyser_transaction(
@@ -10319,6 +10731,72 @@ mod tests {
         assert_eq!(live_ordinals, decoded_ordinals);
         assert_eq!(live_provenance, decoded_provenance);
         assert_eq!(live_ordinals, vec![Some(1), Some(2)]);
+        assert_eq!(
+            live_provenance
+                .iter()
+                .map(|provenance| {
+                    provenance
+                        .as_ref()
+                        .and_then(|provenance| provenance.inner_instruction_path.clone())
+                })
+                .collect::<Vec<_>>(),
+            vec![Some(vec![0]), Some(vec![1])]
+        );
+
+        let signature = match &event {
+            GeyserEvent::Transaction { signature, .. } => *signature,
+            _ => unreachable!("test event is a transaction"),
+        };
+        let bundle = parser
+            .parse_transaction_bundle(&event)
+            .expect("two sibling Pump mutations parse in one pass");
+        assert_eq!(bundle.trades.len(), 2);
+        assert_eq!(bundle.trade_observations.len(), 2);
+        let observations = bundle
+            .trade_observations
+            .iter()
+            .map(|observation| observation.as_ref().expect("aligned raw observation"))
+            .collect::<Vec<_>>();
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.signature == signature),
+            "one signature is a correlation scope, never a dedup key"
+        );
+        assert!(observations
+            .iter()
+            .all(|observation| observation.raw_transaction_mutation_count == Some(2)));
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| {
+                    observation
+                        .locator_hint
+                        .as_ref()
+                        .expect("structural locator")
+                        .inner_instruction_path
+                        .clone()
+                })
+                .collect::<Vec<_>>(),
+            vec![vec![0], vec![1]]
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| {
+                    let order = observation
+                        .canonical_order
+                        .as_ref()
+                        .expect("canonical order");
+                    (order.slot, order.tx_index)
+                })
+                .collect::<Vec<_>>(),
+            vec![(42, 0), (42, 0)]
+        );
+        assert_ne!(
+            observations[0].locator_hint, observations[1].locator_hint,
+            "sibling mutations in one signature remain distinct"
+        );
     }
 
     #[test]
@@ -10363,6 +10841,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(42),
             tx_index: None,
             event_ts_ms: None,
@@ -10881,6 +11360,7 @@ mod tests {
             outer_program_id: Some(SYSTEM_PROGRAM_ID.to_string()),
             invoked_program_id: PUMP_FUN_PROGRAM_ID.to_string(),
             stack_height: Some(2),
+            inner_instruction_path: Some(vec![0]),
             from_cpi: true,
         });
 
@@ -10922,6 +11402,7 @@ mod tests {
             outer_program_id: Some(PUMP_FUN_PROGRAM_ID.to_string()),
             invoked_program_id: PUMP_FUN_PROGRAM_ID.to_string(),
             stack_height: Some(3),
+            inner_instruction_path: Some(vec![0, 0]),
             from_cpi: true,
         });
 
@@ -12602,6 +13083,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: None,
@@ -12699,6 +13181,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(1),
             tx_index: None,
             event_ts_ms: None,
@@ -12796,6 +13279,7 @@ mod tests {
         let event = GeyserEvent::Transaction {
             provider_id: None,
             provider_role: None,
+            observation_provenance: None,
             slot: Some(2),
             tx_index: None,
             event_ts_ms: None,

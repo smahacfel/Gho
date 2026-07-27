@@ -15,6 +15,11 @@
 //!       - canonical/bootstrap reserve truth
 //! ```
 
+use crate::candidate_integrity::{
+    CandidateIntegrityConflictActionV1, CandidateIntegrityErrorV1,
+    CandidateIntegrityEvaluationGuardV1, CandidateIntegrityRegistry, CandidateTerminalTransitionV1,
+    CanonicalMutationApplyReceiptV1,
+};
 use crate::components::post_buy_runtime::{
     DirectPostBuyHandoff, DirectPostBuyHandoffAck, DirectPostBuySender,
 };
@@ -37,6 +42,7 @@ use crate::rug_scalp_validation_tape::{
     RugScalpCanonicalOrderKeyV1, RugScalpValidationRunContextV1, RugScalpValidationTapeBusV1,
     RugScalpValidationTapeRecordV1, RugScalpValidationTapeV1,
 };
+use crate::session::observation::CanonicalMutationApplyOutcomeV1;
 use crate::session::{
     OpenSessionRequest, PoolObservationSession, SessionConfig, SessionManager, SharedSession,
 };
@@ -66,15 +72,16 @@ use ghost_core::market_state::{
 use ghost_core::session::types::{SessionStatus, VerdictOutcome};
 use ghost_core::shadow_ledger::types::{PriceReason, PriceState};
 use ghost_core::shadow_ledger::{
-    BufferedTx as GatekeeperBufferedHistoryTx, CurveWriteMetadata, LiveTxEvent, MarketSnapshot,
-    ShadowLedger, ShadowLedgerWriteResult, TradeSide, TxKey, HOT_POOL_TX_THRESHOLD,
+    BufferedTx as GatekeeperBufferedHistoryTx, CurveWriteMetadata, LivePipelineError, LiveTxEvent,
+    MarketSnapshot, ShadowLedger, ShadowLedgerWriteResult, TradeSide, TxKey, HOT_POOL_TX_THRESHOLD,
 };
 use ghost_core::{
-    coverage_audit, BaseMint, BondingCurveKey, CoverageAuditClosedWindow, CoverageAuditRecord,
+    coverage_audit, BaseMint, BondingCurveKey, CandidateIntegrityOutcomeV1,
+    CandidateIntegritySignalV1, CoverageAuditClosedWindow, CoverageAuditRecord,
     CoverageAuditTruthSignatureState, CurveFinality, ExecutionAccountEvidence,
     ExecutionAccountEvidenceRecord, ExecutionAccountEvidenceStatus, ExecutionAccountEvidenceStore,
     ExecutionAccountRole, GatekeeperDecision as WalGatekeeperDecision, PoolId,
-    PoolIdentity as DomainPoolIdentity, PoolIdentityRegistry,
+    PoolIdentity as DomainPoolIdentity, PoolIdentityRegistry, PumpCandidateIdentityV1,
     UpsertExecutionAccountEvidenceOutcome, UpsertExecutionAccountEvidenceResult, Wal, WalRecord,
 };
 
@@ -98,9 +105,10 @@ use chrono::{SecondsFormat, TimeZone, Utc};
 use dashmap::DashMap;
 use ghost_brain::config::{GatekeeperMode, GatekeeperV2Config, GatekeeperV3Config};
 use ghost_brain::oracle::window_spec::{ensure_epoch_ms, WindowCloseReason, WindowState};
+use ghost_core::account_state_core::observation_arbiter::AccountObservationClassificationV1;
 use ghost_core::account_state_core::reducer::AccountStateReducer;
 use ghost_core::account_state_core::types::{
-    AccountStateUpdate, BootstrapHints, CanonicalPoolState, UpdateSource,
+    AccountStateUpdate, AccountUpdateResult, BootstrapHints, CanonicalPoolState, UpdateSource,
 };
 use ghost_core::checkpoint::MaterializedFeatureSet;
 use ghost_core::features::coordination::{
@@ -161,6 +169,9 @@ const GENESIS_SOL_LAMPORTS: u64 = 30_000_000_000;
 const GENESIS_TOKEN_RESERVES: u64 = 1_073_000_000_000_000;
 const MIN_POOL_RESERVE_LAMPORTS: u128 = 1; // Smallest non-zero value to avoid division-by-zero in reserve math
 const DEFAULT_SHADOW_LEDGER_ENRICHMENT_FRESHNESS_MS: u64 = 200;
+/// Bounded identity tombstones retained after terminal runtime cleanup so
+/// late AccountUpdate observations can still be classified as evidence-only.
+const TERMINAL_POOL_IDENTITY_CAP: usize = 50_000;
 const POOL_TASK_CHANNEL_CAPACITY: usize = 65_536;
 const POOL_TASK_BACKPRESSURE_WAIT_MS: u64 = 50;
 const POOL_TASK_BACKPRESSURE_RETRY_ATTEMPTS: usize = 5;
@@ -1751,6 +1762,29 @@ fn pool_tx_to_buffered_history_tx(
     }
 }
 
+fn classify_live_pipeline_apply(
+    pool_id: Pubkey,
+    base_mint: Pubkey,
+    context: &'static str,
+    result: Result<(), LivePipelineError>,
+) -> CanonicalMutationApplyOutcomeV1 {
+    match result {
+        Ok(()) => CanonicalMutationApplyOutcomeV1::AppliedNewMutation,
+        Err(LivePipelineError::DuplicateTxKey(_)) => CanonicalMutationApplyOutcomeV1::Duplicate,
+        Err(LivePipelineError::StaleTx { .. }) => CanonicalMutationApplyOutcomeV1::Ignored,
+        Err(error) => {
+            warn!(
+                pool = %pool_id,
+                base_mint = %base_mint,
+                context,
+                error = %error,
+                "LivePipeline canonical apply failed"
+            );
+            CanonicalMutationApplyOutcomeV1::Failed
+        }
+    }
+}
+
 fn pool_tx_to_gatekeeper_history(
     buffered: &crate::components::gatekeeper::GatekeeperBufferedTx,
 ) -> Option<GatekeeperBufferedHistoryTx> {
@@ -2095,6 +2129,123 @@ impl Default for OracleRuntimeConfig {
 // Oracle Runtime
 // =============================================================================
 
+/// Bounded identity evidence retained after runtime/session cleanup.
+///
+/// This is not an authority registry: active lookups always consult
+/// `PoolIdentityRegistry` first. Tombstones exist solely to build a typed
+/// evidence-only `AccountStateUpdate` for late primary/secondary observations
+/// after a terminal lifecycle transition.
+#[derive(Debug)]
+struct TerminalPoolIdentityTombstones {
+    by_pool: HashMap<Pubkey, DomainPoolIdentity>,
+    pool_by_base_mint: HashMap<Pubkey, Pubkey>,
+    pool_by_bonding_curve: HashMap<Pubkey, Pubkey>,
+    fifo: VecDeque<Pubkey>,
+    cap: usize,
+    eviction_count: u64,
+    first_evicted_identity: Option<DomainPoolIdentity>,
+}
+
+impl TerminalPoolIdentityTombstones {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_pool: HashMap::with_capacity(cap.min(4096)),
+            pool_by_base_mint: HashMap::with_capacity(cap.min(4096)),
+            pool_by_bonding_curve: HashMap::with_capacity(cap.min(4096)),
+            fifo: VecDeque::with_capacity(cap.min(4096)),
+            cap: cap.max(1),
+            eviction_count: 0,
+            first_evicted_identity: None,
+        }
+    }
+
+    fn insert(&mut self, identity: DomainPoolIdentity) -> Option<DomainPoolIdentity> {
+        let pool_id: Pubkey = identity.pool_id.into();
+        let base_mint: Pubkey = identity.base_mint.into();
+        let bonding_curve: Pubkey = identity.bonding_curve.into();
+
+        if self.by_pool.contains_key(&pool_id) {
+            self.by_pool.insert(pool_id, identity);
+            self.pool_by_base_mint.insert(base_mint, pool_id);
+            self.pool_by_bonding_curve.insert(bonding_curve, pool_id);
+            return None;
+        }
+
+        let mut evicted_identity = None;
+        while self.by_pool.len() >= self.cap {
+            let Some(evicted_pool) = self.fifo.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.by_pool.remove(&evicted_pool) {
+                let evicted_base_mint: Pubkey = evicted.base_mint.into();
+                let evicted_bonding_curve: Pubkey = evicted.bonding_curve.into();
+                if self.pool_by_base_mint.get(&evicted_base_mint) == Some(&evicted_pool) {
+                    self.pool_by_base_mint.remove(&evicted_base_mint);
+                }
+                if self.pool_by_bonding_curve.get(&evicted_bonding_curve) == Some(&evicted_pool) {
+                    self.pool_by_bonding_curve.remove(&evicted_bonding_curve);
+                }
+                self.eviction_count = self.eviction_count.saturating_add(1);
+                if self.first_evicted_identity.is_none() {
+                    self.first_evicted_identity = Some(evicted);
+                }
+                ::metrics::counter!("terminal_pool_identity_tombstone_evicted_total", 1u64);
+                evicted_identity = Some(evicted);
+                break;
+            }
+        }
+
+        self.by_pool.insert(pool_id, identity);
+        self.pool_by_base_mint.insert(base_mint, pool_id);
+        self.pool_by_bonding_curve.insert(bonding_curve, pool_id);
+        self.fifo.push_back(pool_id);
+        evicted_identity
+    }
+
+    fn get(
+        &self,
+        base_mint: &Pubkey,
+        bonding_curve: Option<&Pubkey>,
+    ) -> Option<DomainPoolIdentity> {
+        self.pool_by_base_mint
+            .get(base_mint)
+            .and_then(|pool_id| self.by_pool.get(pool_id))
+            .copied()
+            .or_else(|| {
+                bonding_curve.and_then(|bonding_curve| {
+                    self.pool_by_bonding_curve
+                        .get(bonding_curve)
+                        .and_then(|pool_id| self.by_pool.get(pool_id))
+                        .copied()
+                })
+            })
+    }
+
+    #[cfg(test)]
+    fn retained_count(&self) -> usize {
+        self.by_pool.len()
+    }
+}
+
+fn retain_terminal_account_evidence(
+    terminal_pool_identities: &RwLock<TerminalPoolIdentityTombstones>,
+    account_state_core: &AccountStateReducer,
+    identity: DomainPoolIdentity,
+) {
+    let base_mint: Pubkey = identity.base_mint.into();
+    account_state_core.remove_pool_retaining_account_observation_arbiter(&base_mint);
+
+    // The tombstone and its evidence-only account arbiter share one bounded
+    // retention owner. Holding the tombstone write lock until the evicted
+    // arbiter is removed prevents a late observation from resolving an
+    // identity whose corresponding evidence lane has already been released.
+    let mut tombstones = terminal_pool_identities.write();
+    if let Some(evicted) = tombstones.insert(identity) {
+        let evicted_base_mint: Pubkey = evicted.base_mint.into();
+        account_state_core.remove_terminal_account_observation_arbiter(&evicted_base_mint);
+    }
+}
+
 pub struct OracleRuntime {
     config: OracleRuntimeConfig,
     hyper_oracle: Arc<HyperPredictionOracle>,
@@ -2112,7 +2263,9 @@ pub struct OracleRuntime {
     detected_pools: RwLock<HashMap<Pubkey, Arc<DetectedPool>>>,
     registered_mints: RwLock<HashMap<Pubkey, Pubkey>>,
     pool_identities: Arc<PoolIdentityRegistry>,
+    terminal_pool_identities: RwLock<TerminalPoolIdentityTombstones>,
     account_state_core: Arc<AccountStateReducer>,
+    candidate_integrity_registry: Arc<CandidateIntegrityRegistry>,
     execution_account_evidence_store: Arc<ExecutionAccountEvidenceStore>,
     active_buy_route_manifest_cache:
         RwLock<HashMap<ActiveBuyRouteManifestKey, ActiveBuyRouteManifestEntry>>,
@@ -2153,6 +2306,118 @@ pub struct OracleRuntime {
     /// Rollback reeval seeds recovered during WAL replay at startup.
     recovered_rollback_seeds: Mutex<Vec<ghost_core::wal::RollbackReevalSeedRecord>>,
     p37_shadow_probe_state: Arc<P37ShadowProbeRuntimeState>,
+    #[cfg(test)]
+    downstream_apply_test_barrier: Mutex<Option<DownstreamApplyTestBarrierV1>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct DownstreamApplyTestBarrierV1 {
+    signature: String,
+    reached: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
+    completed: Arc<tokio::sync::Notify>,
+}
+
+const fn candidate_integrity_outcome_label(outcome: CandidateIntegrityOutcomeV1) -> &'static str {
+    match outcome {
+        CandidateIntegrityOutcomeV1::Ready => "ready",
+        CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete => {
+            "primary_raw_coverage_incomplete"
+        }
+        CandidateIntegrityOutcomeV1::AccountProviderConflict => "account_provider_conflict",
+        CandidateIntegrityOutcomeV1::SourceReconciliationConflict => {
+            "source_reconciliation_conflict"
+        }
+        CandidateIntegrityOutcomeV1::AnchorMissing => "anchor_missing",
+        CandidateIntegrityOutcomeV1::EconomicsNonEvaluable => "economics_non_evaluable",
+    }
+}
+
+const fn candidate_integrity_action_label(
+    action: CandidateIntegrityConflictActionV1,
+) -> &'static str {
+    match action {
+        CandidateIntegrityConflictActionV1::ReadyRegistered => "ready_registered",
+        CandidateIntegrityConflictActionV1::DuplicateReady => "duplicate_ready",
+        CandidateIntegrityConflictActionV1::ExistingFailurePreserved => {
+            "existing_failure_preserved"
+        }
+        CandidateIntegrityConflictActionV1::BlockBeforeMfs => "block_before_mfs",
+        CandidateIntegrityConflictActionV1::InterruptEvaluation => "interrupt_evaluation",
+        CandidateIntegrityConflictActionV1::TerminalVerdictImmutableAudit => {
+            "terminal_verdict_immutable_audit"
+        }
+        CandidateIntegrityConflictActionV1::CancelExecutionBeforeSubmit => {
+            "cancel_execution_before_submit"
+        }
+        CandidateIntegrityConflictActionV1::ReconciliationRequired => "reconciliation_required",
+        CandidateIntegrityConflictActionV1::ConfirmedPositionQuarantined => {
+            "confirmed_position_quarantined"
+        }
+    }
+}
+
+const fn candidate_integrity_error_label(error: &CandidateIntegrityErrorV1) -> &'static str {
+    match error {
+        CandidateIntegrityErrorV1::RegistryUnavailable => "registry_unavailable",
+        CandidateIntegrityErrorV1::RegistryCapacityExceeded => "registry_capacity_exceeded",
+        CandidateIntegrityErrorV1::CandidateMissing => "candidate_missing",
+        CandidateIntegrityErrorV1::CandidateAliasConflict => "candidate_alias_conflict",
+        CandidateIntegrityErrorV1::NotReady(_) => "not_ready",
+        CandidateIntegrityErrorV1::GenerationChanged { .. } => "generation_changed",
+        CandidateIntegrityErrorV1::PhaseMismatch { .. } => "phase_mismatch",
+    }
+}
+
+fn account_decision_integrity_signal(
+    update: &AccountStateUpdate,
+    decision: &ghost_core::account_state_core::observation_arbiter::AccountObservationDecisionV1,
+) -> Option<CandidateIntegritySignalV1> {
+    let outcome = match decision.classification {
+        AccountObservationClassificationV1::SameVersionDifferentHashConflict
+        | AccountObservationClassificationV1::AccountIdentityConflict => {
+            CandidateIntegrityOutcomeV1::AccountProviderConflict
+        }
+        AccountObservationClassificationV1::EvidenceCapacityExceeded
+        | AccountObservationClassificationV1::MissingProviderProvenance
+        | AccountObservationClassificationV1::InvalidDataHash
+        | AccountObservationClassificationV1::UnsupportedUpdateSource
+        | AccountObservationClassificationV1::ArbiterStateUnavailable => {
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        }
+        AccountObservationClassificationV1::ExactDuplicate
+        | AccountObservationClassificationV1::NewerMutation
+        | AccountObservationClassificationV1::OlderObservation
+        | AccountObservationClassificationV1::SameVersionSameHash
+        | AccountObservationClassificationV1::WriteVersionUnknown => return None,
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ghost.account_candidate_integrity.v1");
+    hasher.update(update.pool_amm_id.as_ref());
+    hasher.update(update.base_mint.as_ref());
+    hasher.update(&update.slot.to_le_bytes());
+    if let Some(write_version) = update.write_version {
+        hasher.update(&write_version.to_le_bytes());
+    }
+    if let Some(data_hash) = decision.data_hash_blake3 {
+        hasher.update(&data_hash);
+    }
+    if let Some(signature) = update.txn_signature {
+        hasher.update(signature.as_ref());
+    }
+
+    Some(CandidateIntegritySignalV1 {
+        candidate: PumpCandidateIdentityV1 {
+            pool_amm_id: update.pool_amm_id,
+            mint: update.base_mint,
+        },
+        outcome,
+        signature: update.txn_signature,
+        locator: None,
+        conflict_fields: Vec::new(),
+        evidence_hash_blake3: *hasher.finalize().as_bytes(),
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2576,6 +2841,7 @@ impl OracleRuntime {
         );
 
         let account_state_core = Arc::new(AccountStateReducer::new());
+        let candidate_integrity_registry = Arc::new(CandidateIntegrityRegistry::default());
         let execution_account_evidence_store = Arc::new(ExecutionAccountEvidenceStore::new());
         let session_manager = Arc::new(SessionManager::new_with_metric_contract_context(
             config.session_manager_config(),
@@ -2603,7 +2869,11 @@ impl OracleRuntime {
             detected_pools: RwLock::new(HashMap::new()),
             registered_mints: RwLock::new(HashMap::new()),
             pool_identities: Arc::new(PoolIdentityRegistry::new()),
+            terminal_pool_identities: RwLock::new(TerminalPoolIdentityTombstones::new(
+                TERMINAL_POOL_IDENTITY_CAP,
+            )),
             account_state_core,
+            candidate_integrity_registry,
             execution_account_evidence_store,
             active_buy_route_manifest_cache: RwLock::new(HashMap::new()),
             canonical_readiness_notifier: CanonicalReadinessNotifier::default(),
@@ -2625,9 +2895,55 @@ impl OracleRuntime {
             wal_disabled_due_to_enospc: AtomicBool::new(false),
             recovered_rollback_seeds: Mutex::new(Vec::new()),
             p37_shadow_probe_state,
+            #[cfg(test)]
+            downstream_apply_test_barrier: Mutex::new(None),
         };
 
         runtime
+    }
+
+    #[cfg(test)]
+    fn install_downstream_apply_test_barrier(
+        &self,
+        signature: String,
+    ) -> DownstreamApplyTestBarrierV1 {
+        let barrier = DownstreamApplyTestBarrierV1 {
+            signature,
+            reached: Arc::new(tokio::sync::Barrier::new(2)),
+            release: Arc::new(tokio::sync::Barrier::new(2)),
+            completed: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.downstream_apply_test_barrier.lock() = Some(barrier.clone());
+        barrier
+    }
+
+    #[cfg(test)]
+    async fn wait_at_downstream_apply_test_barrier(&self, signature: &str) {
+        let barrier = self
+            .downstream_apply_test_barrier
+            .lock()
+            .as_ref()
+            .filter(|barrier| barrier.signature == signature)
+            .cloned();
+        let Some(barrier) = barrier else {
+            return;
+        };
+        barrier.reached.wait().await;
+        barrier.release.wait().await;
+    }
+
+    #[cfg(test)]
+    fn notify_downstream_apply_test_completed(&self, signature: &str) {
+        let mut slot = self.downstream_apply_test_barrier.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|current| current.signature == signature)
+        {
+            if let Some(barrier) = slot.as_ref() {
+                barrier.completed.notify_one();
+            }
+            *slot = None;
+        }
     }
 
     /// Attach a shared WAL handle for runtime decision durability.
@@ -2642,6 +2958,58 @@ impl OracleRuntime {
 
     pub fn execution_account_evidence_store(&self) -> Arc<ExecutionAccountEvidenceStore> {
         Arc::clone(&self.execution_account_evidence_store)
+    }
+
+    pub fn candidate_integrity_registry(&self) -> Arc<CandidateIntegrityRegistry> {
+        Arc::clone(&self.candidate_integrity_registry)
+    }
+
+    fn record_candidate_integrity_signal(&self, signal: CandidateIntegritySignalV1) {
+        let outcome = signal.outcome;
+        let candidate = signal.candidate;
+        if outcome == CandidateIntegrityOutcomeV1::Ready {
+            ::metrics::counter!("candidate_integrity_bus_ready_rejected_total", 1u64);
+            warn!(
+                pool = %candidate.pool_amm_id,
+                base_mint = %candidate.mint,
+                "CandidateIntegrity Ready rejected at Event Bus boundary; downstream apply fence is the sole publisher"
+            );
+            return;
+        }
+        match self.candidate_integrity_registry.record_signal(signal) {
+            Ok(result) => {
+                ::metrics::counter!(
+                    "candidate_integrity_signal_total",
+                    1u64,
+                    "outcome" => candidate_integrity_outcome_label(outcome),
+                    "action" => candidate_integrity_action_label(result.action)
+                );
+                if outcome != CandidateIntegrityOutcomeV1::Ready {
+                    warn!(
+                        pool = %candidate.pool_amm_id,
+                        base_mint = %candidate.mint,
+                        outcome = candidate_integrity_outcome_label(outcome),
+                        action = candidate_integrity_action_label(result.action),
+                        phase = ?result.snapshot.lifecycle_phase,
+                        generation = result.snapshot.generation,
+                        "CANDIDATE_INTEGRITY_TECHNICAL_FAILURE"
+                    );
+                }
+            }
+            Err(error) => {
+                ::metrics::counter!(
+                    "candidate_integrity_registry_failure_total",
+                    1u64,
+                    "error" => candidate_integrity_error_label(&error)
+                );
+                error!(
+                    pool = %candidate.pool_amm_id,
+                    base_mint = %candidate.mint,
+                    error = %error,
+                    "CandidateIntegrity shadow registry unavailable; active runtime behavior remains unchanged"
+                );
+            }
+        }
     }
 
     fn active_buy_route_manifest_cache_enabled(&self) -> bool {
@@ -3040,20 +3408,34 @@ impl OracleRuntime {
                 })
             }) {
             Some(identity) => identity,
-            None => {
-                ::metrics::counter!(
-                    "account_update_build_none_total",
-                    1u64,
-                    "reason" => "identity_missing"
-                );
-                warn!(
-                    base_mint = %base_mint,
-                    slot,
-                    source = ?source,
-                    "DIAG_ACCOUNT_UPDATE_IDENTITY_MISS"
-                );
-                return None;
-            }
+            None => match self
+                .terminal_pool_identities
+                .read()
+                .get(base_mint, bonding_curve_hint)
+            {
+                Some(identity) => {
+                    ::metrics::counter!(
+                        "account_update_identity_resolution_total",
+                        1u64,
+                        "source" => "terminal_tombstone"
+                    );
+                    identity
+                }
+                None => {
+                    ::metrics::counter!(
+                        "account_update_build_none_total",
+                        1u64,
+                        "reason" => "identity_missing"
+                    );
+                    warn!(
+                        base_mint = %base_mint,
+                        slot,
+                        source = ?source,
+                        "DIAG_ACCOUNT_UPDATE_IDENTITY_MISS"
+                    );
+                    return None;
+                }
+            },
         };
         Some(AccountStateUpdate {
             provider_id,
@@ -3087,6 +3469,11 @@ impl OracleRuntime {
             .apply_account_observation(update.clone());
         let canonical_applied = observation_result.did_apply();
         let decision = observation_result.decision.clone();
+        if let Some(signal) = account_decision_integrity_signal(update, &decision) {
+            // Preserve the typed account-arbiter decision at the technical
+            // integrity boundary before the legacy result is flattened.
+            self.record_candidate_integrity_signal(signal);
+        }
         ::metrics::counter!(
             "account_update_observation_decision_total",
             1u64,
@@ -3401,6 +3788,34 @@ impl OracleRuntime {
         event: Option<&AccountUpdateEvent>,
         enqueue_on_identity_miss: bool,
     ) -> Option<ghost_core::shadow_ledger::reconciliation::ReconciliationOutcome> {
+        self.process_account_update_with_explicit_source_mode(
+            base_mint,
+            on_chain_sol,
+            on_chain_tok,
+            on_chain_complete,
+            slot,
+            curve_finality,
+            source,
+            event,
+            enqueue_on_identity_miss,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_account_update_with_explicit_source_mode(
+        &self,
+        base_mint: &Pubkey,
+        on_chain_sol: u64,
+        on_chain_tok: u64,
+        on_chain_complete: u8,
+        slot: u64,
+        curve_finality: CurveFinality,
+        source: UpdateSource,
+        event: Option<&AccountUpdateEvent>,
+        enqueue_on_identity_miss: bool,
+        allow_canonical_state_apply: bool,
+    ) -> Option<ghost_core::shadow_ledger::reconciliation::ReconciliationOutcome> {
         ::metrics::counter!(
             "account_update_ingress_total",
             1u64,
@@ -3442,10 +3857,20 @@ impl OracleRuntime {
             Some(update) => update,
             None => {
                 ::metrics::counter!("account_update_before_identity_total", 1u64);
-                if enqueue_on_identity_miss {
+                if enqueue_on_identity_miss && allow_canonical_state_apply {
                     if let Some(event) = event {
                         self.enqueue_pre_identity_account_update(event);
                     }
+                } else if !allow_canonical_state_apply {
+                    ::metrics::counter!(
+                        "account_update_terminal_evidence_identity_missing_total",
+                        1u64
+                    );
+                    warn!(
+                        base_mint = %base_mint,
+                        slot,
+                        "Terminal AccountUpdate evidence identity unavailable; observation fails closed and is never promoted into canonical replay"
+                    );
                 }
                 return None;
             }
@@ -3460,7 +3885,67 @@ impl OracleRuntime {
                 &update.pool_amm_id.to_string(),
             );
         }
-        let apply_result = self.apply_account_state_update(&update);
+        let active_identity_present = self
+            .pool_identities
+            .get_by_pool(&update.pool_amm_id)
+            .is_some();
+        let candidate_integrity_would_allow = self
+            .candidate_integrity_registry
+            .account_state_apply_allowed(PumpCandidateIdentityV1 {
+                pool_amm_id: update.pool_amm_id,
+                mint: update.base_mint,
+            })
+            .map_or_else(
+                |error| {
+                    warn!(
+                        pool = %update.pool_amm_id,
+                        mint = %update.base_mint,
+                        error = %error,
+                        "CandidateIntegrity AccountUpdate shadow check unavailable; canonical authority remains unchanged"
+                    );
+                    false
+                },
+                |status| status.unwrap_or(true),
+            );
+        if !candidate_integrity_would_allow {
+            ::metrics::counter!("candidate_integrity_would_block_account_update_total", 1u64);
+        }
+        let effective_canonical_state_apply =
+            allow_canonical_state_apply && active_identity_present;
+        if allow_canonical_state_apply && !effective_canonical_state_apply {
+            ::metrics::counter!(
+                "account_update_authority_downgraded_total",
+                1u64,
+                "active_identity" => if active_identity_present { "present" } else { "terminal_tombstone" },
+                "candidate_integrity" => if candidate_integrity_would_allow { "would_allow" } else { "would_block_observe_only" }
+            );
+        }
+        let apply_result = if effective_canonical_state_apply {
+            self.apply_account_state_update(&update)
+        } else {
+            let decision = self
+                .account_state_core
+                .observe_account_evidence_only(update.clone());
+            if let Some(signal) = account_decision_integrity_signal(&update, &decision) {
+                self.record_candidate_integrity_signal(signal);
+            }
+            ::metrics::counter!(
+                "account_update_observation_decision_total",
+                1u64,
+                "classification" => decision.classification.as_str(),
+                "outcome" => decision.outcome.as_str(),
+                "provider_agreement" => decision.provider_agreement.as_str(),
+                "state_apply" => "terminal_evidence_only"
+            );
+            ::metrics::counter!(
+                "account_update_terminal_evidence_only_total",
+                1u64,
+                "classification" => decision.classification.as_str()
+            );
+            ghost_core::account_state_core::types::AccountUpdateResult::Rejected(
+                ghost_core::account_state_core::types::AccountUpdateRejectReason::StaleObservation,
+            )
+        };
         let update_accepted = matches!(
             apply_result,
             ghost_core::account_state_core::types::AccountUpdateResult::Applied
@@ -4019,9 +4504,9 @@ impl OracleRuntime {
         base_mint: Pubkey,
         tx: &PoolTransaction,
         event_ts_ms: u64,
-    ) {
+    ) -> CanonicalMutationApplyOutcomeV1 {
         let Some(tx_key) = pool_tx_to_tx_key(tx, event_ts_ms) else {
-            return;
+            return CanonicalMutationApplyOutcomeV1::Ignored;
         };
 
         let runtime_state = self
@@ -4038,23 +4523,20 @@ impl OracleRuntime {
                         base_mint = %base_mint,
                         "Runtime marked pool committed but launcher bootstrap snapshot is missing"
                     );
-                    return;
+                    return CanonicalMutationApplyOutcomeV1::Failed;
                 }
             }
 
             let Some(event) = pool_tx_to_live_event(base_mint, tx, tx_key) else {
-                return;
+                return CanonicalMutationApplyOutcomeV1::Ignored;
             };
 
-            if let Err(err) = self.live_pipeline.process_event(event) {
-                warn!(
-                    pool = %pool_id,
-                    base_mint = %base_mint,
-                    error = %err,
-                    "Failed to forward committed tx into LivePipeline"
-                );
-            }
-            return;
+            return classify_live_pipeline_apply(
+                pool_id,
+                base_mint,
+                "committed_runtime",
+                self.live_pipeline.process_event(event),
+            );
         }
 
         if !runtime_state.is_approved() {
@@ -4064,31 +4546,35 @@ impl OracleRuntime {
                 state = ?runtime_state,
                 "Runtime rejected pre/post-commit routing for pool without approval"
             );
-            return;
+            return CanonicalMutationApplyOutcomeV1::Terminal;
         }
 
         let Some(buffered_tx) = pool_tx_to_buffered_history_tx(tx, tx_key.clone()) else {
-            return;
+            return CanonicalMutationApplyOutcomeV1::Ignored;
         };
 
         match self
             .commit_coordinator
             .add_approved_tx(&base_mint, buffered_tx)
         {
-            CommitIngressOutcome::BufferedHistory | CommitIngressOutcome::PendingLive => {}
-            CommitIngressOutcome::Duplicate => {}
+            // Buffering/enqueueing is not proof that a downstream canonical
+            // state owner applied this structural mutation.
+            CommitIngressOutcome::BufferedHistory | CommitIngressOutcome::PendingLive => {
+                CanonicalMutationApplyOutcomeV1::Ignored
+            }
+            CommitIngressOutcome::Duplicate => CanonicalMutationApplyOutcomeV1::Duplicate,
             CommitIngressOutcome::RouteToLive { bootstrap_snapshot } => {
                 self.ensure_live_pipeline_initialized_from_snapshot(base_mint, &bootstrap_snapshot);
                 self.mark_pool_committed(pool_id);
                 if let Some(event) = pool_tx_to_live_event(base_mint, tx, tx_key) {
-                    if let Err(err) = self.live_pipeline.process_event(event) {
-                        warn!(
-                            pool = %pool_id,
-                            base_mint = %base_mint,
-                            error = %err,
-                            "LivePipeline rejected tx after launcher commit persistence"
-                        );
-                    }
+                    classify_live_pipeline_apply(
+                        pool_id,
+                        base_mint,
+                        "commit_persistence",
+                        self.live_pipeline.process_event(event),
+                    )
+                } else {
+                    CanonicalMutationApplyOutcomeV1::Ignored
                 }
             }
             CommitIngressOutcome::Missing => {
@@ -4096,14 +4582,14 @@ impl OracleRuntime {
                     self.ensure_live_pipeline_initialized_from_snapshot(base_mint, &snapshot);
                     self.mark_pool_committed(pool_id);
                     if let Some(event) = pool_tx_to_live_event(base_mint, tx, tx_key) {
-                        if let Err(err) = self.live_pipeline.process_event(event) {
-                            warn!(
-                                pool = %pool_id,
-                                base_mint = %base_mint,
-                                error = %err,
-                                "LivePipeline rejected tx after recovering finalized launcher commit"
-                            );
-                        }
+                        classify_live_pipeline_apply(
+                            pool_id,
+                            base_mint,
+                            "recovered_commit",
+                            self.live_pipeline.process_event(event),
+                        )
+                    } else {
+                        CanonicalMutationApplyOutcomeV1::Ignored
                     }
                 } else {
                     warn!(
@@ -4111,6 +4597,7 @@ impl OracleRuntime {
                         base_mint = %base_mint,
                         "Failed to route approved tx: launcher commit window missing"
                     );
+                    CanonicalMutationApplyOutcomeV1::Failed
                 }
             }
         }
@@ -4346,6 +4833,28 @@ impl OracleRuntime {
         true
     }
 
+    fn register_new_pool_with_apply_outcome(
+        &self,
+        pool_amm_id: Pubkey,
+        base_mint: Pubkey,
+        candidate: EnhancedCandidate,
+        dev_wallet: Option<Pubkey>,
+    ) -> CanonicalMutationApplyOutcomeV1 {
+        if self.register_new_pool(pool_amm_id, base_mint, candidate.clone(), dev_wallet) {
+            return CanonicalMutationApplyOutcomeV1::AppliedNewMutation;
+        }
+        if self
+            .lookup_pool_identity(&pool_amm_id)
+            .is_some_and(|identity| {
+                identity.base_mint == base_mint && identity.bonding_curve == candidate.bonding_curve
+            })
+        {
+            CanonicalMutationApplyOutcomeV1::Duplicate
+        } else {
+            CanonicalMutationApplyOutcomeV1::Failed
+        }
+    }
+
     /// Remove a pool completely from runtime state
     ///
     /// This is the ONLY correct way to delete a pool. It ensures all
@@ -4388,7 +4897,9 @@ impl OracleRuntime {
         if let Some(base_mint) = base_mint_key {
             self.shadow_ledger.cleanup_snapshots(&base_mint);
             self.shadow_ledger.remove_curve_alias(&base_mint);
-            self.account_state_core.remove_pool(&base_mint);
+            if identity.is_none() {
+                self.account_state_core.remove_pool(&base_mint);
+            }
             self.pending_account_updates.write().remove(&base_mint);
             if self.live_pipeline.remove_mint(&base_mint) {
                 info!(pool = %pool_amm_id, base_mint = %base_mint, reason, "🗑️  USUNIETO BASE MINT Z PIPELINE");
@@ -4408,6 +4919,13 @@ impl OracleRuntime {
             self.reconciliation_runtime
                 .lock()
                 .unregister_pool(&base_mint);
+        }
+        if let Some(identity) = identity {
+            retain_terminal_account_evidence(
+                &self.terminal_pool_identities,
+                &self.account_state_core,
+                identity,
+            );
         }
         self.pool_identities.remove_by_pool(&pool_amm_id);
         self.runtime_pool_states.write().remove(&pool_amm_id);
@@ -17225,15 +17743,30 @@ const REJECTED_POOLS_CAP: usize = 50_000;
 /// Message sent from the router to a per-pool observation task.
 enum PoolObservationMsg {
     /// A new transaction for this pool.
-    Transaction(Arc<PoolTransaction>),
+    Transaction(
+        Arc<PoolTransaction>,
+        Option<CanonicalMutationApplyReceiptV1>,
+    ),
     /// Late-arriving pool metadata (when TX arrived before NewPoolDetected).
-    NewPool(Arc<DetectedPool>),
+    NewPool(
+        Arc<DetectedPool>,
+        Option<CanonicalMutationApplyReceiptV1>,
+        CanonicalMutationApplyOutcomeV1,
+    ),
 }
 
 /// Result sent back from a per-pool task on terminal verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoolObservationDispositionV1 {
+    StrategicTerminal,
+    TechnicalIntegrityFailure,
+    BoughtOrRetainedRuntime,
+}
+
 struct PoolObservationResult {
     pool_id: Pubkey,
     base_mint: Option<Pubkey>,
+    disposition: PoolObservationDispositionV1,
     /// True if a BUY was executed (not vetoed by IWIM).
     bought: bool,
     /// True when the pool must remain active after task completion even
@@ -17241,8 +17774,132 @@ struct PoolObservationResult {
     retain_runtime_pool: bool,
 }
 
+fn complete_canonical_apply(
+    ctx: &PoolObservationContext,
+    receipt: Option<&CanonicalMutationApplyReceiptV1>,
+) {
+    let Some(receipt) = receipt else {
+        return;
+    };
+    match ctx
+        .oracle_runtime
+        .candidate_integrity_registry
+        .mark_canonical_apply_succeeded(receipt)
+    {
+        Ok(released) => {
+            if !released.is_empty() {
+                ::metrics::counter!(
+                    "candidate_integrity_shadow_ready_total",
+                    released.len() as u64
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                signature = %receipt.signature,
+                locator = ?receipt.locator,
+                candidate_pool = %receipt.candidate.pool_amm_id,
+                candidate_mint = %receipt.candidate.mint,
+                error = %error,
+                "canonical mutation applied downstream, but CandidateIntegrity shadow proof could not be completed"
+            );
+        }
+    }
+}
+
+fn resolve_canonical_apply(
+    ctx: &PoolObservationContext,
+    receipt: Option<&CanonicalMutationApplyReceiptV1>,
+    outcome: CanonicalMutationApplyOutcomeV1,
+) {
+    let Some(receipt) = receipt else {
+        return;
+    };
+    if outcome == CanonicalMutationApplyOutcomeV1::AppliedNewMutation {
+        complete_canonical_apply(ctx, Some(receipt));
+        return;
+    }
+    if let Err(error) = ctx
+        .oracle_runtime
+        .candidate_integrity_registry
+        .fail_canonical_apply(receipt)
+    {
+        warn!(
+            signature = %receipt.signature,
+            locator = ?receipt.locator,
+            outcome = ?outcome,
+            error = %error,
+            "canonical mutation was not newly applied; CandidateIntegrity shadow proof invalidated"
+        );
+    }
+}
+
+fn send_pool_observation_result(
+    ctx: &PoolObservationContext,
+    result: PoolObservationResult,
+) -> bool {
+    let pool_id = result.pool_id;
+    match ctx.result_tx.send(result) {
+        Ok(()) => true,
+        Err(_error) => {
+            warn!(
+                pool = %pool_id,
+                "per-pool result delivery failed because the Oracle result receiver is closed"
+            );
+            false
+        }
+    }
+}
+
+fn detected_pool_apply_receipt(
+    registry: &CandidateIntegrityRegistry,
+    pool: &DetectedPool,
+) -> Result<Option<CanonicalMutationApplyReceiptV1>, CandidateIntegrityErrorV1> {
+    let Ok(signature) = Signature::from_str(&pool.signature) else {
+        return Ok(None);
+    };
+    let Ok(pool_amm_id) = Pubkey::from_str(&pool.pool_amm_id) else {
+        return Ok(None);
+    };
+    let Ok(mint) = Pubkey::from_str(&pool.base_mint) else {
+        return Ok(None);
+    };
+    registry.initialize_pool_apply_receipt(signature, PumpCandidateIdentityV1 { pool_amm_id, mint })
+}
+
+fn pool_transaction_apply_receipt(
+    registry: &CandidateIntegrityRegistry,
+    tx: &PoolTransaction,
+) -> Result<Option<CanonicalMutationApplyReceiptV1>, CandidateIntegrityErrorV1> {
+    let Ok(signature) = Signature::from_str(&tx.signature) else {
+        return Ok(None);
+    };
+    let Ok(pool_amm_id) = Pubkey::from_str(&tx.pool_amm_id) else {
+        return Ok(None);
+    };
+    let Some(mint) = tx
+        .token_mint
+        .as_deref()
+        .and_then(|mint| Pubkey::from_str(mint).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(semantic_event_ordinal) = tx.event_ordinal else {
+        return Ok(None);
+    };
+    registry.trade_apply_receipt(
+        signature,
+        PumpCandidateIdentityV1 { pool_amm_id, mint },
+        semantic_event_ordinal,
+    )
+}
+
 fn should_cleanup_pool_after_observation(result: &PoolObservationResult) -> bool {
     !result.bought && !result.retain_runtime_pool
+}
+
+fn should_mark_pool_as_strategically_rejected(result: &PoolObservationResult) -> bool {
+    result.disposition == PoolObservationDispositionV1::StrategicTerminal
 }
 
 fn ensure_pool_observation_session(
@@ -17343,11 +18000,112 @@ fn try_materialize_terminal_features(
     Ok(features)
 }
 
+#[derive(Clone, Copy)]
+struct CandidateIntegrityEvaluationInputV1<'a> {
+    registry: &'a Arc<CandidateIntegrityRegistry>,
+    pool_amm_id: Pubkey,
+    base_mint: Option<Pubkey>,
+}
+
+fn open_candidate_integrity_evaluation_guard(
+    input: Option<CandidateIntegrityEvaluationInputV1<'_>>,
+) -> Option<CandidateIntegrityEvaluationGuardV1> {
+    let Some(input) = input else {
+        return None;
+    };
+    let Some(mint) = input.base_mint else {
+        ::metrics::counter!(
+            "candidate_integrity_would_block_before_mfs_total",
+            1u64,
+            "error" => "candidate_missing"
+        );
+        return None;
+    };
+    match input.registry.evaluation_guard(PumpCandidateIdentityV1 {
+        pool_amm_id: input.pool_amm_id,
+        mint,
+    }) {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            ::metrics::counter!(
+                "candidate_integrity_would_block_before_mfs_total",
+                1u64,
+                "error" => candidate_integrity_error_label(&error)
+            );
+            debug!(
+                pool = %input.pool_amm_id,
+                mint = %mint,
+                error = %error,
+                "CandidateIntegrity would block before MFS; observe-only runtime continues"
+            );
+            None
+        }
+    }
+}
+
+fn observe_candidate_integrity_evaluation_started(
+    guard: Option<&CandidateIntegrityEvaluationGuardV1>,
+) {
+    let Some(guard) = guard else {
+        return;
+    };
+    if let Err(error) = guard.mark_mfs_materialized() {
+        ::metrics::counter!(
+            "candidate_integrity_would_abort_evaluation_total",
+            1u64,
+            "stage" => "mfs_materialized",
+            "error" => candidate_integrity_error_label(&error)
+        );
+        return;
+    }
+    if let Err(error) = guard.mark_evaluation_running() {
+        ::metrics::counter!(
+            "candidate_integrity_would_abort_evaluation_total",
+            1u64,
+            "stage" => "evaluation_running",
+            "error" => candidate_integrity_error_label(&error)
+        );
+    }
+}
+
+fn finalize_candidate_integrity_evaluation(
+    guard: Option<&CandidateIntegrityEvaluationGuardV1>,
+    verdict: &GatekeeperVerdict,
+) {
+    let Some(guard) = guard else {
+        return;
+    };
+    let result = match verdict {
+        GatekeeperVerdict::Reject { .. } => guard
+            .publish_terminal(CandidateTerminalTransitionV1::Reject)
+            .map(|_| ()),
+        GatekeeperVerdict::Timeout { .. } => guard
+            .publish_terminal(CandidateTerminalTransitionV1::Timeout)
+            .map(|_| ()),
+        GatekeeperVerdict::Buy { .. } => guard
+            .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
+            .map(|_| ()),
+        GatekeeperVerdict::Wait
+        | GatekeeperVerdict::PendingCurve
+        | GatekeeperVerdict::ApprovedTx { .. } => guard.reset_pre_mfs(),
+    };
+    if let Err(error) = result {
+        ::metrics::counter!(
+            "candidate_integrity_would_abort_evaluation_total",
+            1u64,
+            "stage" => "verdict_publish",
+            "error" => candidate_integrity_error_label(&error)
+        );
+    }
+}
+
 fn try_evaluate_feature_driven_terminal_verdict(
     session: &mut PoolObservationSession,
     gatekeeper_config: &GatekeeperV2Config,
     force_deadline: bool,
+    integrity_input: Option<CandidateIntegrityEvaluationInputV1<'_>>,
 ) -> Result<GatekeeperVerdict, crate::session::observation::MetricContractMaterializationErrorV1> {
+    let integrity_guard = open_candidate_integrity_evaluation_guard(integrity_input);
     session.begin_evaluation();
 
     #[cfg(test)]
@@ -17357,6 +18115,7 @@ fn try_evaluate_feature_driven_terminal_verdict(
         ::metrics::counter!("legacy_terminal_verdict_total", 1u64);
         let features =
             try_materialize_terminal_features(session, gatekeeper_config, force_deadline)?;
+        observe_candidate_integrity_evaluation_started(integrity_guard.as_ref());
         let verdict = {
             let buffer = session.gatekeeper_buffer_mut();
             buffer.prepare_feature_evaluation();
@@ -17370,10 +18129,12 @@ fn try_evaluate_feature_driven_terminal_verdict(
             session.resume_accumulation();
         }
 
+        finalize_candidate_integrity_evaluation(integrity_guard.as_ref(), &verdict);
         return Ok(verdict);
     }
 
     let features = try_materialize_terminal_features(session, gatekeeper_config, force_deadline)?;
+    observe_candidate_integrity_evaluation_started(integrity_guard.as_ref());
     if force_deadline {
         let phase1_passed = features.tx_intel_features.tx_count
             >= gatekeeper_config.min_tx_count as u64
@@ -17412,7 +18173,9 @@ fn try_evaluate_feature_driven_terminal_verdict(
                     ),
                     Some("feature-driven deadline phase1 timeout".to_string()),
                 );
-            return Ok(GatekeeperVerdict::Timeout { assessment });
+            let verdict = GatekeeperVerdict::Timeout { assessment };
+            finalize_candidate_integrity_evaluation(integrity_guard.as_ref(), &verdict);
+            return Ok(verdict);
         }
     }
 
@@ -17429,6 +18192,7 @@ fn try_evaluate_feature_driven_terminal_verdict(
         session.resume_accumulation();
     }
 
+    finalize_candidate_integrity_evaluation(integrity_guard.as_ref(), &verdict);
     Ok(verdict)
 }
 
@@ -17437,7 +18201,12 @@ fn evaluate_feature_driven_terminal_verdict(
     gatekeeper_config: &GatekeeperV2Config,
     force_deadline: bool,
 ) -> GatekeeperVerdict {
-    match try_evaluate_feature_driven_terminal_verdict(session, gatekeeper_config, force_deadline) {
+    match try_evaluate_feature_driven_terminal_verdict(
+        session,
+        gatekeeper_config,
+        force_deadline,
+        None,
+    ) {
         Ok(verdict) => verdict,
         Err(error) => panic!("metric-contract materialization failed closed: {error}"),
     }
@@ -17466,6 +18235,7 @@ fn try_resolve_feature_trigger_outcome(
     session: &mut PoolObservationSession,
     ingress: GatekeeperIngressOutcome,
     gatekeeper_config: &GatekeeperV2Config,
+    integrity_input: Option<CandidateIntegrityEvaluationInputV1<'_>>,
 ) -> Result<GatekeeperVerdict, crate::session::observation::MetricContractMaterializationErrorV1> {
     match ingress {
         GatekeeperIngressOutcome::Wait => Ok(GatekeeperVerdict::Wait),
@@ -17473,11 +18243,19 @@ fn try_resolve_feature_trigger_outcome(
             Ok(GatekeeperVerdict::ApprovedTx { tx, metrics })
         }
         GatekeeperIngressOutcome::TriggerEvaluation => {
-            try_evaluate_feature_driven_terminal_verdict(session, gatekeeper_config, false)
+            try_evaluate_feature_driven_terminal_verdict(
+                session,
+                gatekeeper_config,
+                false,
+                integrity_input,
+            )
         }
-        GatekeeperIngressOutcome::DeadlineElapsed => {
-            try_evaluate_feature_driven_terminal_verdict(session, gatekeeper_config, true)
-        }
+        GatekeeperIngressOutcome::DeadlineElapsed => try_evaluate_feature_driven_terminal_verdict(
+            session,
+            gatekeeper_config,
+            true,
+            integrity_input,
+        ),
     }
 }
 
@@ -17552,13 +18330,20 @@ impl PoolTaskHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolObservationEnqueueOutcomeV1 {
+    Delivered,
+    Deferred,
+    Failed,
+}
+
 fn enqueue_pool_observation_msg(
     sender: &tokio::sync::mpsc::Sender<PoolObservationMsg>,
     pool_id: Pubkey,
     msg: PoolObservationMsg,
     msg_kind: &'static str,
     is_hot: bool,
-) {
+) -> PoolObservationEnqueueOutcomeV1 {
     // Hot pools receive more aggressive retry behaviour: more attempts with a
     // shorter per-attempt wait window.  Cold pools use the standard constants.
     // Both paths are deterministic and bounded — no infinite loops, no
@@ -17576,7 +18361,7 @@ fn enqueue_pool_observation_msg(
     };
 
     match sender.try_send(msg) {
-        Ok(()) => {}
+        Ok(()) => PoolObservationEnqueueOutcomeV1::Delivered,
         Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
             warn!(
                 "POOL_TASK_BACKPRESSURE pool={} msg={} is_hot={} action=retry_send wait_ms={} attempts={}",
@@ -17627,9 +18412,11 @@ fn enqueue_pool_observation_msg(
                     }
                 }
             });
+            PoolObservationEnqueueOutcomeV1::Deferred
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
             warn!("POOL_TASK_CHANNEL_CLOSED pool={} msg={}", pool_id, msg_kind);
+            PoolObservationEnqueueOutcomeV1::Failed
         }
     }
 }
@@ -18326,7 +19113,13 @@ async fn hydrate_buy_path_metadata(
         tokio::select! {
             maybe_msg = rx.recv() => {
                 match maybe_msg {
-                    Some(PoolObservationMsg::NewPool(pd)) => {
+                    Some(PoolObservationMsg::NewPool(pd, receipt, _)) => {
+                        if let Some(receipt) = receipt.as_ref() {
+                            let _ = ctx
+                                .oracle_runtime
+                                .candidate_integrity_registry
+                                .fail_canonical_apply(receipt);
+                        }
                         info!(
                             "POOL_TASK_BUY_METADATA_HYDRATED pool={} source=late_new_pool mint={}",
                             pool_id, pd.base_mint
@@ -18342,7 +19135,15 @@ async fn hydrate_buy_path_metadata(
                         );
                         return BuyPathMetadataSource::WaitFallback;
                     }
-                    Some(PoolObservationMsg::Transaction(_)) => continue,
+                    Some(PoolObservationMsg::Transaction(_, receipt)) => {
+                        if let Some(receipt) = receipt.as_ref() {
+                            let _ = ctx
+                                .oracle_runtime
+                                .candidate_integrity_registry
+                                .fail_canonical_apply(receipt);
+                        }
+                        continue;
+                    }
                     None => return BuyPathMetadataSource::Missing,
                 }
             }
@@ -18395,7 +19196,7 @@ fn apply_trigger_readiness_message(
     pool_data: &mut Option<Arc<DetectedPool>>,
 ) {
     match msg {
-        PoolObservationMsg::Transaction(tx) => {
+        PoolObservationMsg::Transaction(tx, receipt) => {
             maybe_promote_observation_identity_from_tx(
                 pool_id,
                 tx.as_ref(),
@@ -18412,8 +19213,14 @@ fn apply_trigger_readiness_message(
                     *base_mint_pubkey,
                     tx.as_ref(),
                 );
+            if let Some(receipt) = receipt.as_ref() {
+                let _ = ctx
+                    .oracle_runtime
+                    .candidate_integrity_registry
+                    .fail_canonical_apply(receipt);
+            }
         }
-        PoolObservationMsg::NewPool(pd) => {
+        PoolObservationMsg::NewPool(pd, receipt, _) => {
             install_buy_path_metadata(
                 pool_id,
                 registered_wall_ts_ms,
@@ -18423,6 +19230,12 @@ fn apply_trigger_readiness_message(
                 base_mint_pubkey,
                 pool_data,
             );
+            if let Some(receipt) = receipt.as_ref() {
+                let _ = ctx
+                    .oracle_runtime
+                    .candidate_integrity_registry
+                    .fail_canonical_apply(receipt);
+            }
         }
     }
 }
@@ -18647,7 +19460,7 @@ fn apply_active_buy_route_evidence_message(
     pool_data: &mut Option<Arc<DetectedPool>>,
 ) -> Option<Arc<PoolTransaction>> {
     match msg {
-        PoolObservationMsg::Transaction(tx) => {
+        PoolObservationMsg::Transaction(tx, receipt) => {
             if tx.pool_amm_id != pool_id.to_string() {
                 return None;
             }
@@ -18682,9 +19495,15 @@ fn apply_active_buy_route_evidence_message(
                     *base_mint_pubkey,
                     enriched.as_ref(),
                 );
+            if let Some(receipt) = receipt.as_ref() {
+                let _ = ctx
+                    .oracle_runtime
+                    .candidate_integrity_registry
+                    .fail_canonical_apply(receipt);
+            }
             Some(enriched)
         }
-        PoolObservationMsg::NewPool(pd) => {
+        PoolObservationMsg::NewPool(pd, receipt, _) => {
             install_buy_path_metadata(
                 pool_id,
                 registered_wall_ts_ms,
@@ -18694,6 +19513,12 @@ fn apply_active_buy_route_evidence_message(
                 base_mint_pubkey,
                 pool_data,
             );
+            if let Some(receipt) = receipt.as_ref() {
+                let _ = ctx
+                    .oracle_runtime
+                    .candidate_integrity_registry
+                    .fail_canonical_apply(receipt);
+            }
             None
         }
     }
@@ -24026,6 +24851,7 @@ fn build_seer_geyser_event_from_confirmed_tx(
     Some(SeerGeyserEvent::Transaction {
         provider_id: None,
         provider_role: None,
+        observation_provenance: None,
         slot: seer::types::normalize_slot(Some(tx.slot)),
         tx_index: None,
         event_ts_ms: seer::types::event_ts_from_block_time(tx.block_time),
@@ -24384,6 +25210,8 @@ fn spawn_coverage_audit_for_closed_window(
 async fn pool_observation_task(
     pool_id: Pubkey,
     initial_pool_data: Option<Arc<DetectedPool>>,
+    initial_apply_receipt: Option<CanonicalMutationApplyReceiptV1>,
+    initial_apply_outcome: CanonicalMutationApplyOutcomeV1,
     registered_wall_ts_ms: u64,
     mut rx: tokio::sync::mpsc::Receiver<PoolObservationMsg>,
     ctx: Arc<PoolObservationContext>,
@@ -24398,12 +25226,22 @@ async fn pool_observation_task(
         pool_data.as_deref(),
     ) else {
         warn!(pool = %pool_id, "ZADANIE OBSERWACJI PULI ZOSTAŁO PRZERWANE PRZED OTWARCIEM SESJI");
-        let _ = ctx.result_tx.send(PoolObservationResult {
-            pool_id,
-            base_mint: None,
-            bought: false,
-            retain_runtime_pool: false,
-        });
+        if let Some(receipt) = initial_apply_receipt.as_ref() {
+            let _ = ctx
+                .oracle_runtime
+                .candidate_integrity_registry
+                .fail_canonical_apply(receipt);
+        }
+        let _ = send_pool_observation_result(
+            ctx.as_ref(),
+            PoolObservationResult {
+                pool_id,
+                base_mint: None,
+                disposition: PoolObservationDispositionV1::TechnicalIntegrityFailure,
+                bought: false,
+                retain_runtime_pool: false,
+            },
+        );
         return;
     };
 
@@ -24507,6 +25345,8 @@ async fn pool_observation_task(
     // ── Emit InitPoolEvent if reserves available ────────────────────────
     maybe_emit_init_pool_event(&ctx, pool_id, pool_data.as_deref());
 
+    resolve_canonical_apply(&ctx, initial_apply_receipt.as_ref(), initial_apply_outcome);
+
     let post_buy_lane: &str = ctx.post_buy_lane();
 
     // ── Deadline: independent per-pool timer ────────────────────────────
@@ -24530,7 +25370,7 @@ async fn pool_observation_task(
         let verdict = tokio::select! {
             msg = rx.recv() => {
                 match msg {
-                    Some(PoolObservationMsg::Transaction(tx)) => {
+                    Some(PoolObservationMsg::Transaction(tx, apply_receipt)) => {
                         // Normalize timestamp (per-pool monotonic)
                         let (normalized_ts, has_chain_time) =
                             normalize_gatekeeper_event_time_ms(&tx, last_event_ts);
@@ -24596,18 +25436,45 @@ async fn pool_observation_task(
                         increment_counter!("gatekeeper_window_tx_seen");
 
                         increment_counter!("grpc_events_parsed_ok");
-                        let verdict = {
+                        #[cfg(test)]
+                        ctx.oracle_runtime
+                            .wait_at_downstream_apply_test_barrier(&tx.signature)
+                            .await;
+                        let ingest_result = {
                             let mut session = session.write();
                             let accepted_tx_before = session.diagnostics.total_tx_seen;
-                            let ingress = session.ingest_transaction(tx.clone());
+                            let result =
+                                session.ingest_transaction_with_apply_result(tx.clone());
                             if session.diagnostics.total_tx_seen > accepted_tx_before {
                                 session.try_checkpoint(normalized_ts);
                             }
-                            try_resolve_feature_trigger_outcome(&mut session, ingress, &ctx.gatekeeper_config)
+                            result
                         };
-                        verdict
+                        resolve_canonical_apply(
+                            &ctx,
+                            apply_receipt.as_ref(),
+                            ingest_result.apply,
+                        );
+                        #[cfg(test)]
+                        ctx.oracle_runtime
+                            .notify_downstream_apply_test_completed(&tx.signature);
+                        let mut session = session.write();
+                        try_resolve_feature_trigger_outcome(
+                            &mut session,
+                            ingest_result.ingress,
+                            &ctx.gatekeeper_config,
+                            Some(CandidateIntegrityEvaluationInputV1 {
+                                registry: &ctx.oracle_runtime.candidate_integrity_registry,
+                                pool_amm_id: pool_id,
+                                base_mint: base_mint_pubkey,
+                            }),
+                        )
                     }
-                    Some(PoolObservationMsg::NewPool(pd)) => {
+                    Some(PoolObservationMsg::NewPool(
+                        pd,
+                        apply_receipt,
+                        apply_outcome,
+                    )) => {
                         // Late-arriving pool metadata — upgrade identity & state.
                         // Also handle the case where pool_data already exists but
                         // has an incomplete identity (base_mint or creator unknown)
@@ -24673,6 +25540,11 @@ async fn pool_observation_task(
                             maybe_emit_init_pool_event(&ctx, pool_id, Some(&pd));
                             pool_data = Some(pd);
                         }
+                        resolve_canonical_apply(
+                            &ctx,
+                            apply_receipt.as_ref(),
+                            apply_outcome,
+                        );
                         Ok(GatekeeperVerdict::Wait)
                     }
                     None => {
@@ -24685,6 +25557,11 @@ async fn pool_observation_task(
                             &mut session,
                             &ctx.gatekeeper_config,
                             true,
+                            Some(CandidateIntegrityEvaluationInputV1 {
+                                registry: &ctx.oracle_runtime.candidate_integrity_registry,
+                                pool_amm_id: pool_id,
+                                base_mint: base_mint_pubkey,
+                            }),
                         )
                     }
                 }
@@ -24719,6 +25596,11 @@ async fn pool_observation_task(
                     &mut session,
                     &ctx.gatekeeper_config,
                     true,
+                    Some(CandidateIntegrityEvaluationInputV1 {
+                        registry: &ctx.oracle_runtime.candidate_integrity_registry,
+                        pool_amm_id: pool_id,
+                        base_mint: base_mint_pubkey,
+                    }),
                 )
             }
         };
@@ -24733,12 +25615,16 @@ async fn pool_observation_task(
                     "terminal metric-contract materialization failed closed"
                 );
                 ctx.session_manager.remove_session(&pool_id);
-                let _ = ctx.result_tx.send(PoolObservationResult {
-                    pool_id,
-                    base_mint: base_mint_pubkey,
-                    bought: false,
-                    retain_runtime_pool: false,
-                });
+                let _ = send_pool_observation_result(
+                    ctx.as_ref(),
+                    PoolObservationResult {
+                        pool_id,
+                        base_mint: base_mint_pubkey,
+                        disposition: PoolObservationDispositionV1::TechnicalIntegrityFailure,
+                        bought: false,
+                        retain_runtime_pool: false,
+                    },
+                );
                 return;
             }
         };
@@ -24919,12 +25805,16 @@ async fn pool_observation_task(
                         reason: reason.clone(),
                     },
                 );
-                let _ = ctx.result_tx.send(PoolObservationResult {
-                    pool_id,
-                    base_mint: base_mint_pubkey,
-                    bought: false,
-                    retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
-                });
+                let _ = send_pool_observation_result(
+                    ctx.as_ref(),
+                    PoolObservationResult {
+                        pool_id,
+                        base_mint: base_mint_pubkey,
+                        disposition: PoolObservationDispositionV1::StrategicTerminal,
+                        bought: false,
+                        retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
+                    },
+                );
                 return;
             }
 
@@ -25043,12 +25933,16 @@ async fn pool_observation_task(
                         reason: "gatekeeper_timeout".to_string(),
                     },
                 );
-                let _ = ctx.result_tx.send(PoolObservationResult {
-                    pool_id,
-                    base_mint: base_mint_pubkey,
-                    bought: false,
-                    retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
-                });
+                let _ = send_pool_observation_result(
+                    ctx.as_ref(),
+                    PoolObservationResult {
+                        pool_id,
+                        base_mint: base_mint_pubkey,
+                        disposition: PoolObservationDispositionV1::StrategicTerminal,
+                        bought: false,
+                        retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
+                    },
+                );
                 return;
             }
 
@@ -25254,12 +26148,16 @@ async fn pool_observation_task(
                                 reason: reason.clone(),
                             },
                         );
-                        let _ = ctx.result_tx.send(PoolObservationResult {
-                            pool_id,
-                            base_mint: base_mint_pubkey,
-                            bought: false,
-                            retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
-                        });
+                        let _ = send_pool_observation_result(
+                            ctx.as_ref(),
+                            PoolObservationResult {
+                                pool_id,
+                                base_mint: base_mint_pubkey,
+                                disposition: PoolObservationDispositionV1::StrategicTerminal,
+                                bought: false,
+                                retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
+                            },
+                        );
                         return;
                     }
 
@@ -25466,13 +26364,17 @@ async fn pool_observation_task(
                     },
                 );
 
-                let _ = ctx.result_tx.send(PoolObservationResult {
-                    pool_id,
-                    base_mint: base_mint_pubkey,
-                    bought,
-                    retain_runtime_pool: retain_runtime_pool
-                        || retain_runtime_pool_for_probe_lifecycle,
-                });
+                let _ = send_pool_observation_result(
+                    ctx.as_ref(),
+                    PoolObservationResult {
+                        pool_id,
+                        base_mint: base_mint_pubkey,
+                        disposition: PoolObservationDispositionV1::BoughtOrRetainedRuntime,
+                        bought,
+                        retain_runtime_pool: retain_runtime_pool
+                            || retain_runtime_pool_for_probe_lifecycle,
+                    },
+                );
                 return;
             }
         }
@@ -25482,8 +26384,9 @@ async fn pool_observation_task(
 fn process_runtime_account_update_event(
     oracle_runtime: &OracleRuntime,
     event: &AccountUpdateEvent,
+    allow_canonical_state_apply: bool,
 ) {
-    let outcome = oracle_runtime.process_account_update_with_explicit_source(
+    let outcome = oracle_runtime.process_account_update_with_explicit_source_mode(
         &event.base_mint,
         event.sol_reserves,
         event.token_reserves,
@@ -25493,25 +26396,38 @@ fn process_runtime_account_update_event(
         UpdateSource::GeyserAccountUpdate,
         Some(event),
         true,
+        allow_canonical_state_apply,
     );
     if outcome.is_some() {
         increment_counter!("oracle_runtime_account_update_reconciliation_total");
     }
 }
 
+#[derive(Debug)]
+struct AccountUpdateWorkItemV1 {
+    event: AccountUpdateEvent,
+    allow_canonical_state_apply: bool,
+}
+
 fn spawn_account_update_worker(
     oracle_runtime: Arc<OracleRuntime>,
-    mut work_rx: tokio::sync::mpsc::UnboundedReceiver<AccountUpdateEvent>,
+    mut work_rx: tokio::sync::mpsc::UnboundedReceiver<AccountUpdateWorkItemV1>,
     queue_depth: Arc<AtomicUsize>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(event) = work_rx.recv().await {
+        while let Some(work_item) = work_rx.recv().await {
+            let event = work_item.event;
             let base_mint = event.base_mint;
             let slot = event.slot;
             let write_version = event.write_version;
+            let allow_canonical_state_apply = work_item.allow_canonical_state_apply;
             let runtime = Arc::clone(&oracle_runtime);
             let join_result = tokio::task::spawn_blocking(move || {
-                process_runtime_account_update_event(runtime.as_ref(), &event);
+                process_runtime_account_update_event(
+                    runtime.as_ref(),
+                    &event,
+                    allow_canonical_state_apply,
+                );
             })
             .await;
             let (remaining, underflow_prevented) =
@@ -25571,9 +26487,10 @@ fn decrement_account_update_queue_depth(queue_depth: &AtomicUsize) -> (usize, bo
 }
 
 fn dispatch_account_update_to_worker(
-    worker_tx: &tokio::sync::mpsc::UnboundedSender<AccountUpdateEvent>,
+    worker_tx: &tokio::sync::mpsc::UnboundedSender<AccountUpdateWorkItemV1>,
     queue_depth: &Arc<AtomicUsize>,
     event: AccountUpdateEvent,
+    allow_canonical_state_apply: bool,
 ) {
     let base_mint = event.base_mint;
     let slot = event.slot;
@@ -25592,7 +26509,10 @@ fn dispatch_account_update_to_worker(
         return;
     };
 
-    match worker_tx.send(event) {
+    match worker_tx.send(AccountUpdateWorkItemV1 {
+        event,
+        allow_canonical_state_apply,
+    }) {
         Ok(()) => {
             ::metrics::gauge!("oracle_runtime_account_update_queue_depth", depth as f64);
             increment_counter!(
@@ -26065,7 +26985,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         }
     }
     let (account_update_work_tx, account_update_work_rx) =
-        tokio::sync::mpsc::unbounded_channel::<AccountUpdateEvent>();
+        tokio::sync::mpsc::unbounded_channel::<AccountUpdateWorkItemV1>();
     let account_update_queue_depth = Arc::new(AtomicUsize::new(0));
     let _account_update_worker = spawn_account_update_worker(
         Arc::clone(&oracle_runtime),
@@ -26292,6 +27212,15 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                     Ok(e) => e,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!("LAG ORACLE by {} messages", n);
+                        if let Err(error) = oracle_runtime
+                            .candidate_integrity_registry
+                            .invalidate_pending_canonical_applies()
+                        {
+                            warn!(
+                                error = %error,
+                                "CandidateIntegrity shadow apply fence invalidation failed after Event Bus lag"
+                            );
+                        }
                         ctx.session_manager.mark_metric_contract_stream_gap();
                         if let Some(tape) = rug_scalp_validation_tape.as_mut() {
                             let records = tape.mark_stream_gap("oracle_broadcast_lag");
@@ -26311,7 +27240,27 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                 };
 
                 match event {
+                    GhostEvent::CandidateIntegrity(signal) => {
+                        oracle_runtime.record_candidate_integrity_signal((*signal).clone());
+                    }
+
                     GhostEvent::NewPoolDetected(pool_data) => {
+                        let apply_receipt = match detected_pool_apply_receipt(
+                            &oracle_runtime.candidate_integrity_registry,
+                            pool_data.as_ref(),
+                        ) {
+                            Ok(receipt) => receipt,
+                            Err(error) => {
+                                warn!(
+                                    pool = %pool_data.pool_amm_id,
+                                    mint = %pool_data.base_mint,
+                                    error = %error,
+                                    "NewPoolDetected shadow apply receipt lookup failed; active routing continues"
+                                );
+                                None
+                            }
+                        };
+                        let mut canonical_apply_admitted = apply_receipt.is_none();
                         info!(
                             "🔮 OBSLUGUJE EVENT NewPoolDetected: pool={}",
                             pool_data.pool_amm_id
@@ -26345,6 +27294,11 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                     if rejected_pools.contains(&pool_id)
                                         || rejected_pools.contains(&base_mint)
                                     {
+                                        if let Some(receipt) = apply_receipt.as_ref() {
+                                            let _ = oracle_runtime
+                                                .candidate_integrity_registry
+                                                .fail_canonical_apply(receipt);
+                                        }
                                         warn!(
                                             "TX_IGNORED_ZOMBIE pool={} mint={} reason=REJECTED_POOL_REGISTRATION",
                                             pool_id, base_mint
@@ -26354,14 +27308,15 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
 
                                     // Already tracking this pool — forward metadata
                                     if let Some(handle) = pool_task_handles.get(&pool_id) {
-                                        // Register pool with OracleRuntime if not yet done
-                                        let registered = oracle_runtime.register_new_pool(
-                                            pool_id,
-                                            base_mint,
-                                            candidate.clone(),
-                                            detected_creator,
-                                        );
-                                        if registered
+                                        let apply_outcome = oracle_runtime
+                                            .register_new_pool_with_apply_outcome(
+                                                pool_id,
+                                                base_mint,
+                                                candidate.clone(),
+                                                detected_creator,
+                                            );
+                                        if apply_outcome
+                                            == CanonicalMutationApplyOutcomeV1::AppliedNewMutation
                                             || oracle_runtime
                                                 .lookup_base_mint_for_pool(&pool_id)
                                                 .is_some()
@@ -26370,13 +27325,26 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                                 .remember_detected_pool(pool_id, pool_data.clone());
                                         }
                                         // Forward pool data to existing task
-                                        enqueue_pool_observation_msg(
+                                        let delivery = enqueue_pool_observation_msg(
                                             &handle.tx,
                                             pool_id,
-                                            PoolObservationMsg::NewPool(pool_data.clone()),
+                                            PoolObservationMsg::NewPool(
+                                                pool_data.clone(),
+                                                apply_receipt.clone(),
+                                                apply_outcome,
+                                            ),
                                             "new_pool",
                                             handle.is_hot(),
                                         );
+                                        canonical_apply_admitted = delivery
+                                            == PoolObservationEnqueueOutcomeV1::Delivered;
+                                        if !canonical_apply_admitted {
+                                            let _ = resolve_canonical_apply(
+                                                ctx.as_ref(),
+                                                apply_receipt.as_ref(),
+                                                CanonicalMutationApplyOutcomeV1::Failed,
+                                            );
+                                        }
                                         debug!(
                                             "POOL_TASK_LATE_METADATA_SENT pool={} mint={}",
                                             pool_id, base_mint
@@ -26384,12 +27352,16 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                         continue;
                                     }
 
-                                    if oracle_runtime.register_new_pool(
-                                        pool_id,
-                                        base_mint,
-                                        candidate.clone(),
-                                        detected_creator,
-                                    ) {
+                                    let apply_outcome = oracle_runtime
+                                        .register_new_pool_with_apply_outcome(
+                                            pool_id,
+                                            base_mint,
+                                            candidate.clone(),
+                                            detected_creator,
+                                        );
+                                    if apply_outcome
+                                        == CanonicalMutationApplyOutcomeV1::AppliedNewMutation
+                                    {
                                         // Spawn per-pool observation task
                                         let (task_tx, task_rx) = tokio::sync::mpsc::channel(
                                             POOL_TASK_CHANNEL_CAPACITY,
@@ -26400,10 +27372,13 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                             tokio::spawn(pool_observation_task(
                                                 pool_id,
                                                 Some(pool_data_clone),
+                                                apply_receipt.clone(),
+                                                apply_outcome,
                                                 registered_wall_ts_ms,
                                                 task_rx,
                                                 ctx_clone,
                                             ));
+                                        canonical_apply_admitted = true;
                                         pool_task_handles.insert(
                                             pool_id,
                                             PoolTaskHandle {
@@ -26423,9 +27398,33 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                 }
                             }
                         }
+                        if !canonical_apply_admitted {
+                            if let Some(receipt) = apply_receipt.as_ref() {
+                                let _ = oracle_runtime
+                                    .candidate_integrity_registry
+                                    .fail_canonical_apply(receipt);
+                            }
+                        }
                     }
 
                     GhostEvent::PoolTransaction(tx) => {
+                        let apply_receipt = match pool_transaction_apply_receipt(
+                            &oracle_runtime.candidate_integrity_registry,
+                            tx.as_ref(),
+                        ) {
+                            Ok(receipt) => receipt,
+                            Err(error) => {
+                                warn!(
+                                    pool = %tx.pool_amm_id,
+                                    signature = %tx.signature,
+                                    event_ordinal = ?tx.event_ordinal,
+                                    error = %error,
+                                    "PoolTransaction shadow apply receipt lookup failed; active routing continues"
+                                );
+                                None
+                            }
+                        };
+                        let mut canonical_apply_admitted = apply_receipt.is_none();
                         increment_counter!("grpc_events_received");
                         if let Ok(mut pool_id) =
                             Pubkey::try_from(tx.pool_amm_id.as_str())
@@ -26759,6 +27758,11 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                     .as_ref()
                                     .is_some_and(|m| rejected_pools.contains(m))
                             {
+                                if let Some(receipt) = apply_receipt.as_ref() {
+                                    let _ = oracle_runtime
+                                        .candidate_integrity_registry
+                                        .fail_canonical_apply(receipt);
+                                }
                                 continue;
                             }
 
@@ -26783,13 +27787,20 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                                     &ctx.cross_pool_velocity_config,
                                                 );
                                             let event_ts_ms = tx_event_ts_ms(&tx);
-                                            oracle_runtime
+                                            let apply_outcome = oracle_runtime
                                                 .forward_approved_tx_to_commit_or_live_pipeline(
                                                     pool_id,
                                                     mint,
                                                     &tx,
                                                     event_ts_ms,
                                                 );
+                                            if let Some(receipt) = apply_receipt.as_ref() {
+                                                resolve_canonical_apply(
+                                                    ctx.as_ref(),
+                                                    Some(receipt),
+                                                    apply_outcome,
+                                                );
+                                            }
                                             if runtime_state.is_committed() {
                                                 increment_counter!(
                                                     "shadow_ledger_live_tx_committed_pool_total"
@@ -26799,6 +27810,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                                     "shadow_ledger_live_tx_approved_pool_total"
                                                 );
                                             }
+                                            canonical_apply_admitted = true;
                                             continue;
                                         }
                                     }
@@ -26809,13 +27821,25 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                             if let Some(handle) = pool_task_handles.get_mut(&pool_id) {
                                 let is_hot = handle.is_hot();
                                 handle.tx_enqueued += 1;
-                                enqueue_pool_observation_msg(
+                                let delivery = enqueue_pool_observation_msg(
                                     &handle.tx,
                                     pool_id,
-                                    PoolObservationMsg::Transaction(tx),
+                                    PoolObservationMsg::Transaction(
+                                        tx,
+                                        apply_receipt.clone(),
+                                    ),
                                     "tx",
                                     is_hot,
                                 );
+                                canonical_apply_admitted = delivery
+                                    == PoolObservationEnqueueOutcomeV1::Delivered;
+                                if !canonical_apply_admitted {
+                                    let _ = resolve_canonical_apply(
+                                        ctx.as_ref(),
+                                        apply_receipt.as_ref(),
+                                        CanonicalMutationApplyOutcomeV1::Failed,
+                                    );
+                                }
                             } else {
                                 let event_ts_ms = tx_event_ts_ms(&tx);
                                 oracle_runtime.register_pool_tx(
@@ -26835,6 +27859,13 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                     signature = %tx.signature,
                                     "Buffering tx-first event for non-canonical pool until NewPoolDetected"
                                 );
+                            }
+                        }
+                        if !canonical_apply_admitted {
+                            if let Some(receipt) = apply_receipt.as_ref() {
+                                let _ = oracle_runtime
+                                    .candidate_integrity_registry
+                                    .fail_canonical_apply(receipt);
                             }
                         }
                     }
@@ -26896,28 +27927,28 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                             }
                         }
                         if canonical_account_update_relay_enabled {
-                            if rejected_pools.contains(&event.base_mint)
+                            let terminal_evidence_only = rejected_pools.contains(&event.base_mint)
                                 || rejected_pools.contains(&event.bonding_curve)
                                 || oracle_runtime
                                     .lookup_registered_pool(&event.base_mint)
-                                    .is_some_and(|pool_id| rejected_pools.contains(&pool_id))
-                            {
+                                    .is_some_and(|pool_id| rejected_pools.contains(&pool_id));
+                            if terminal_evidence_only {
                                 increment_counter!(
                                     "oracle_runtime_account_update_ignored_total",
-                                    "reason" => "rejected_pool"
+                                    "reason" => "terminal_evidence_only"
                                 );
                                 debug!(
                                     base_mint = %event.base_mint,
                                     bonding_curve = %event.bonding_curve,
                                     slot = event.slot,
-                                    "ACCOUNT_UPDATE_IGNORED_ZOMBIE reason=REJECTED_POOL"
+                                    "ACCOUNT_UPDATE_TERMINAL_EVIDENCE_ONLY reason=REJECTED_POOL"
                                 );
-                                continue;
                             }
                             dispatch_account_update_to_worker(
                                 &account_update_work_tx,
                                 &account_update_queue_depth,
                                 event,
+                                !terminal_evidence_only,
                             );
                         }
                         // degraded/test fallback: intentional no-op — increment ignored_total
@@ -26943,9 +27974,16 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                     }
                 }
                 if should_cleanup_pool_after_observation(&result) {
-                    rejected_pools.insert(result.pool_id);
-                    if let Some(mint) = result.base_mint {
-                        rejected_pools.insert(mint);
+                    if should_mark_pool_as_strategically_rejected(&result) {
+                        rejected_pools.insert(result.pool_id);
+                        if let Some(mint) = result.base_mint {
+                            rejected_pools.insert(mint);
+                        }
+                    } else {
+                        ::metrics::counter!(
+                            "candidate_integrity_technical_cleanup_total",
+                            1u64
+                        );
                     }
                     snapshot_engine.remove_pool(result.pool_id);
                     let _ = oracle_runtime
@@ -26961,8 +27999,9 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                     );
                 }
                 debug!(
-                    "POOL_TASK_DONE pool={} bought={} retain_runtime_pool={} active_tasks={}",
+                    "POOL_TASK_DONE pool={} disposition={:?} bought={} retain_runtime_pool={} active_tasks={}",
                     result.pool_id,
+                    result.disposition,
                     result.bought,
                     result.retain_runtime_pool,
                     pool_task_handles.len()
@@ -27166,8 +28205,11 @@ mod tests {
     use ghost_core::features::coordination::CoordinationRiskEvidenceUnit;
     use ghost_core::shadow_ledger::LivePipelineConfig;
     use ghost_core::{
-        ExecutionAccountEvidenceSource, ExecutionAccountEvidenceStatus,
-        GatekeeperDecision as WalGatekeeperDecision, Wal, WalRecord,
+        CanonicalPumpOrderKeyV1, ExecutionAccountEvidenceSource, ExecutionAccountEvidenceStatus,
+        GatekeeperDecision as WalGatekeeperDecision, ObservationProvenanceV1,
+        ObservationSourceFamilyV1, ObservedPumpMutationV1, PumpMutationClaimsV1,
+        PumpMutationFamilyV1, PumpObservationLedgerV1, PumpTradeSideV1, RawProviderRoleV1,
+        RawPumpMutationLocatorV1, Wal, WalRecord,
     };
     use solana_sdk::signature::Keypair;
     use solana_sdk::signer::Signer;
@@ -36241,6 +37283,171 @@ mod tests {
     }
 
     #[test]
+    fn typed_session_and_fast_path_apply_results_never_ack_non_mutations() {
+        let owner_snapshot = |session: &PoolObservationSession| {
+            (
+                session.tx_intelligence.state().clone(),
+                session.tx_intel_features.clone(),
+                session.gatekeeper_buffer.total_tx_count(),
+                session
+                    .tx_buffer
+                    .iter()
+                    .map(|tx| tx.signature.clone())
+                    .collect::<Vec<_>>(),
+                session.tx_keys_seen.clone(),
+                session.highest_seen_ts_ms,
+                session.diagnostics.clone(),
+                format!("{:?}", session.status),
+                session.active_risk_flags.clone(),
+            )
+        };
+        let pool_id = Pubkey::new_unique();
+        let pool = test_detected_pool(pool_id);
+        let mint = Pubkey::from_str(&pool.base_mint).expect("mint");
+        let curve = Pubkey::from_str(&pool.bonding_curve).expect("curve");
+        let gatekeeper_config = GatekeeperV2Config::default();
+        let mut session = PoolObservationSession::new(
+            ghost_core::session::types::SessionId(77),
+            pool_id,
+            mint,
+            curve,
+            Pubkey::from_str(&pool.creator).ok(),
+            enhanced_candidate_from_detected_pool(&pool),
+            1_000,
+            31_000,
+            &gatekeeper_config,
+            crate::tx_intelligence::TxIntelligenceConfig::from_gatekeeper_config(
+                &gatekeeper_config,
+                EarlyFingerprintConfig::default(),
+            ),
+        );
+        let mut accepted =
+            (*test_pool_observation_tx(&Signature::new_unique().to_string())).clone();
+        accepted.pool_amm_id = pool_id.to_string();
+        accepted.token_mint = Some(mint.to_string());
+        let accepted = Arc::new(accepted);
+        let accepted_before = owner_snapshot(&session);
+        assert_eq!(
+            session
+                .ingest_transaction_with_apply_result(Arc::clone(&accepted))
+                .apply,
+            CanonicalMutationApplyOutcomeV1::AppliedNewMutation
+        );
+        assert_ne!(owner_snapshot(&session), accepted_before);
+        let duplicate_before = owner_snapshot(&session);
+        assert_eq!(
+            session.ingest_transaction_with_apply_result(accepted).apply,
+            CanonicalMutationApplyOutcomeV1::Duplicate
+        );
+        assert_eq!(owner_snapshot(&session), duplicate_before);
+
+        let mut dust = (*test_pool_observation_tx(&Signature::new_unique().to_string())).clone();
+        dust.pool_amm_id = pool_id.to_string();
+        dust.token_mint = Some(mint.to_string());
+        dust.volume_sol = 0.0;
+        let dust_before = owner_snapshot(&session);
+        let dust_tx_intelligence = session.tx_intelligence.state().clone();
+        let dust_gatekeeper_count = session.gatekeeper_buffer.total_tx_count();
+        assert_eq!(
+            session
+                .ingest_transaction_with_apply_result(Arc::new(dust))
+                .apply,
+            CanonicalMutationApplyOutcomeV1::AppliedNewMutation
+        );
+        assert_eq!(
+            session.tx_intelligence.state().dust_tx_count,
+            dust_tx_intelligence.dust_tx_count.saturating_add(1)
+        );
+        assert_eq!(
+            session.gatekeeper_buffer.total_tx_count(),
+            dust_gatekeeper_count,
+            "Gatekeeper ignored dust, but TxIntelligence still changed"
+        );
+        assert_ne!(owner_snapshot(&session), dust_before);
+
+        let mut unkeyable =
+            (*test_pool_observation_tx(&Signature::new_unique().to_string())).clone();
+        unkeyable.pool_amm_id = pool_id.to_string();
+        unkeyable.token_mint = Some(mint.to_string());
+        unkeyable.timestamp_ms = 0;
+        unkeyable.arrival_ts_ms = 0;
+        unkeyable.event_time.chain_event_ts_ms = Some(0);
+        unkeyable.event_time.ingress_wall_ts_ms = None;
+        let unkeyable_owner_before = owner_snapshot(&session);
+        let unkeyable_total_before = session.tx_intelligence.state().total_tx;
+        assert_eq!(
+            session
+                .ingest_transaction_with_apply_result(Arc::new(unkeyable))
+                .apply,
+            CanonicalMutationApplyOutcomeV1::AppliedNewMutation
+        );
+        assert_eq!(
+            session.tx_intelligence.state().total_tx,
+            unkeyable_total_before.saturating_add(1)
+        );
+        assert_ne!(owner_snapshot(&session), unkeyable_owner_before);
+
+        session.status = SessionStatus::Closed;
+        let terminal_before = owner_snapshot(&session);
+        assert_eq!(
+            session
+                .ingest_transaction_with_apply_result(test_pool_observation_tx(
+                    &Signature::new_unique().to_string(),
+                ))
+                .apply,
+            CanonicalMutationApplyOutcomeV1::Terminal
+        );
+        assert_eq!(owner_snapshot(&session), terminal_before);
+
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+        runtime.mark_pool_approved(pool_id);
+        let failed = runtime.forward_approved_tx_to_commit_or_live_pipeline(
+            pool_id,
+            mint,
+            test_pool_observation_tx(&Signature::new_unique().to_string()).as_ref(),
+            1_000,
+        );
+        assert_eq!(failed, CanonicalMutationApplyOutcomeV1::Failed);
+    }
+
+    #[test]
+    fn duplicate_initialize_is_not_acknowledged_as_new_apply() {
+        let runtime = Arc::new(OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            PUMPFUN_PROGRAM_ID.to_string(),
+            Pubkey::new_unique().to_string(),
+            Arc::new(ShadowLedger::new()),
+        ));
+        let pool_id = Pubkey::new_unique();
+        let pool = test_detected_pool(pool_id);
+        let mint = Pubkey::from_str(&pool.base_mint).expect("mint");
+        let candidate = enhanced_candidate_from_detected_pool(&pool);
+        assert_eq!(
+            runtime.register_new_pool_with_apply_outcome(
+                pool_id,
+                mint,
+                candidate.clone(),
+                Pubkey::from_str(&pool.creator).ok(),
+            ),
+            CanonicalMutationApplyOutcomeV1::AppliedNewMutation
+        );
+        assert_eq!(
+            runtime.register_new_pool_with_apply_outcome(
+                pool_id,
+                mint,
+                candidate,
+                Pubkey::from_str(&pool.creator).ok(),
+            ),
+            CanonicalMutationApplyOutcomeV1::Duplicate
+        );
+    }
+
+    #[test]
     fn oracle_runtime_wal_records_decision() {
         let wal_dir = tempdir().expect("wal tempdir");
         let wal = Arc::new(Wal::new(wal_dir.path(), 60_000, 60_000).expect("wal init"));
@@ -36421,9 +37628,13 @@ mod tests {
         let late_pool = detected_pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            tx.send(PoolObservationMsg::NewPool(late_pool))
-                .await
-                .expect("late pool metadata send");
+            tx.send(PoolObservationMsg::NewPool(
+                late_pool,
+                None,
+                CanonicalMutationApplyOutcomeV1::Ignored,
+            ))
+            .await
+            .expect("late pool metadata send");
         });
 
         tokio::time::sleep(Duration::from_millis(75)).await;
@@ -36490,7 +37701,7 @@ mod tests {
             .iter()
             .map(|value| Pubkey::from_str(value).expect("remaining pubkey"))
             .collect();
-        tx.send(PoolObservationMsg::Transaction(late_tx))
+        tx.send(PoolObservationMsg::Transaction(late_tx, None))
             .await
             .expect("late route evidence send");
 
@@ -36570,9 +37781,12 @@ mod tests {
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        tx.send(PoolObservationMsg::Transaction(Arc::new(telemetry_tx)))
-            .await
-            .expect("telemetry send");
+        tx.send(PoolObservationMsg::Transaction(
+            Arc::new(telemetry_tx),
+            None,
+        ))
+        .await
+        .expect("telemetry send");
 
         let (overrides, _waited_ms, wait_result) = wait_for_active_buy_route_evidence(
             pool_id,
@@ -36640,7 +37854,7 @@ mod tests {
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        tx.send(PoolObservationMsg::Transaction(wrong_pool_tx))
+        tx.send(PoolObservationMsg::Transaction(wrong_pool_tx, None))
             .await
             .expect("wrong pool route evidence send");
 
@@ -36965,7 +38179,7 @@ mod tests {
             observed_tx.curve_finality = CurveFinality::Speculative;
             observed_tx.v_sol_in_bonding_curve = Some(31.0);
             observed_tx.v_tokens_in_bonding_curve = Some(900_000_000.0);
-            tx.send(PoolObservationMsg::Transaction(Arc::new(observed_tx)))
+            tx.send(PoolObservationMsg::Transaction(Arc::new(observed_tx), None))
                 .await
                 .expect("transaction observation send");
         });
@@ -37594,6 +38808,8 @@ mod tests {
         let join = tokio::spawn(pool_observation_task(
             pool_id,
             Some(detected_pool.clone()),
+            None,
+            CanonicalMutationApplyOutcomeV1::Ignored,
             1_000,
             rx,
             ctx.clone(),
@@ -37617,7 +38833,7 @@ mod tests {
 
         let mut observed_tx = (*test_pool_observation_tx("sig-session-lifecycle")).clone();
         observed_tx.pool_amm_id = pool_id.to_string();
-        tx.send(PoolObservationMsg::Transaction(Arc::new(observed_tx)))
+        tx.send(PoolObservationMsg::Transaction(Arc::new(observed_tx), None))
             .await
             .expect("tx send must succeed");
         drop(tx);
@@ -37710,6 +38926,8 @@ mod tests {
         let join = tokio::spawn(pool_observation_task(
             pool_id,
             Some(detected_pool),
+            None,
+            CanonicalMutationApplyOutcomeV1::Ignored,
             1_000,
             rx,
             ctx.clone(),
@@ -37734,7 +38952,7 @@ mod tests {
 
         let mut observed_tx = (*test_pool_observation_tx("sig-pr5-runtime")).clone();
         observed_tx.pool_amm_id = pool_id.to_string();
-        tx.send(PoolObservationMsg::Transaction(Arc::new(observed_tx)))
+        tx.send(PoolObservationMsg::Transaction(Arc::new(observed_tx), None))
             .await
             .expect("tx send must succeed");
         drop(tx);
@@ -42852,18 +44070,21 @@ mod tests {
         let retained_shadow = PoolObservationResult {
             pool_id: Pubkey::new_unique(),
             base_mint: Some(Pubkey::new_unique()),
+            disposition: PoolObservationDispositionV1::BoughtOrRetainedRuntime,
             bought: false,
             retain_runtime_pool: true,
         };
         let rejected_shadow = PoolObservationResult {
             pool_id: Pubkey::new_unique(),
             base_mint: Some(Pubkey::new_unique()),
+            disposition: PoolObservationDispositionV1::StrategicTerminal,
             bought: false,
             retain_runtime_pool: false,
         };
         let live_buy = PoolObservationResult {
             pool_id: Pubkey::new_unique(),
             base_mint: Some(Pubkey::new_unique()),
+            disposition: PoolObservationDispositionV1::BoughtOrRetainedRuntime,
             bought: true,
             retain_runtime_pool: false,
         };
@@ -43108,11 +44329,14 @@ mod tests {
             curve_data_known: true,
         };
 
-        runtime.forward_approved_tx_to_commit_or_live_pipeline(
-            pool_id,
-            base_mint,
-            &tx,
-            tx_event_ts_ms(&tx),
+        assert_eq!(
+            runtime.forward_approved_tx_to_commit_or_live_pipeline(
+                pool_id,
+                base_mint,
+                &tx,
+                tx_event_ts_ms(&tx),
+            ),
+            CanonicalMutationApplyOutcomeV1::AppliedNewMutation
         );
 
         assert!(live_pipeline.is_initialized(&base_mint));
@@ -43250,11 +44474,15 @@ mod tests {
             curve_data_known: true,
         };
 
-        runtime.forward_approved_tx_to_commit_or_live_pipeline(
-            pool_id,
-            base_mint,
-            &tx,
-            tx_event_ts_ms(&tx),
+        assert_eq!(
+            runtime.forward_approved_tx_to_commit_or_live_pipeline(
+                pool_id,
+                base_mint,
+                &tx,
+                tx_event_ts_ms(&tx),
+            ),
+            CanonicalMutationApplyOutcomeV1::Ignored,
+            "BufferedHistory/PendingLive is enqueue-only, not downstream apply"
         );
 
         assert_eq!(
@@ -45269,6 +46497,433 @@ mod tests {
     }
 
     #[test]
+    fn pr1d_observe_only_integrity_failure_does_not_block_primary_account_state() {
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+        let pool_id = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        assert!(runtime.register_new_pool(
+            pool_id,
+            base_mint,
+            EnhancedCandidate {
+                pool_amm_id: pool_id,
+                base_mint,
+                bonding_curve,
+                initial_liquidity_sol: 8.0,
+                token_total_supply: Some(900_000_000_000_000),
+                ..Default::default()
+            },
+            None,
+        ));
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool_id,
+            mint: base_mint,
+        };
+        runtime
+            .candidate_integrity_registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate,
+                outcome: CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [9; 32],
+            })
+            .expect("shadow failure evidence");
+        assert_eq!(
+            runtime
+                .candidate_integrity_registry
+                .account_state_apply_allowed(candidate)
+                .expect("shadow status"),
+            Some(false)
+        );
+
+        let update = build_test_raw_primary_account_state_update(
+            &runtime,
+            &base_mint,
+            32_000_000_000,
+            899_000_000_000_000,
+            0,
+            22,
+            Some(1),
+            CurveFinality::Finalized,
+        );
+        let apply_result = runtime.apply_account_state_update(&update);
+        assert!(
+            matches!(
+                apply_result,
+                ghost_core::account_state_core::types::AccountUpdateResult::Applied
+                    | ghost_core::account_state_core::types::AccountUpdateResult::PromotedFromBootstrap
+            ),
+            "primary apply result: {apply_result:?}"
+        );
+        let state = runtime
+            .account_state_core()
+            .get_canonical_state(&base_mint)
+            .expect("parent primary authority remains active");
+        assert_eq!(state.virtual_sol_reserves, 32_000_000_000);
+        assert_eq!(state.update_count, 1);
+    }
+
+    #[test]
+    fn pr1d_observe_only_integrity_failure_does_not_gate_evaluation_boundary() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+        };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate,
+                outcome: CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [8; 32],
+            })
+            .expect("shadow failure evidence");
+        assert!(matches!(
+            registry.evaluation_guard(candidate),
+            Err(CandidateIntegrityErrorV1::NotReady(
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+            ))
+        ));
+        assert!(open_candidate_integrity_evaluation_guard(Some(
+            CandidateIntegrityEvaluationInputV1 {
+                registry: &registry,
+                pool_amm_id: candidate.pool_amm_id,
+                base_mint: Some(candidate.mint),
+            }
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn pr1d_observe_only_integrity_failure_preserves_gatekeeper_verdict_and_reason_chain() {
+        let pool_id = Pubkey::new_unique();
+        let detected_pool = test_detected_pool(pool_id);
+        let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+        let bonding_curve = Pubkey::from_str(&detected_pool.bonding_curve).expect("curve");
+        let candidate_snapshot = enhanced_candidate_from_detected_pool(&detected_pool);
+        let gatekeeper_config = GatekeeperV2Config::default();
+        let make_session = |session_id| {
+            PoolObservationSession::new(
+                ghost_core::session::types::SessionId(session_id),
+                pool_id,
+                base_mint,
+                bonding_curve,
+                Pubkey::from_str(&detected_pool.creator).ok(),
+                candidate_snapshot.clone(),
+                1_000,
+                6_000,
+                &gatekeeper_config,
+                crate::tx_intelligence::TxIntelligenceConfig::from_gatekeeper_config(
+                    &gatekeeper_config,
+                    EarlyFingerprintConfig::default(),
+                ),
+            )
+        };
+        let mut baseline_session = make_session(91);
+        let mut shadow_session = make_session(92);
+        shadow_session.created_at_instant = baseline_session.created_at_instant;
+
+        let baseline = try_evaluate_feature_driven_terminal_verdict(
+            &mut baseline_session,
+            &gatekeeper_config,
+            true,
+            None,
+        )
+        .expect("parent evaluation");
+
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool_id,
+            mint: base_mint,
+        };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate,
+                outcome: CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [6; 32],
+            })
+            .expect("shadow failure evidence");
+        let observed = try_evaluate_feature_driven_terminal_verdict(
+            &mut shadow_session,
+            &gatekeeper_config,
+            true,
+            Some(CandidateIntegrityEvaluationInputV1 {
+                registry: &registry,
+                pool_amm_id: pool_id,
+                base_mint: Some(base_mint),
+            }),
+        )
+        .expect("observe-only evaluation");
+
+        let assessment_fingerprint =
+            |assessment: &crate::components::gatekeeper::GatekeeperAssessment| {
+                (
+                    assessment
+                        .decision
+                        .as_ref()
+                        .map(|decision| decision.verdict_type),
+                    assessment
+                        .decision
+                        .as_ref()
+                        .map(|decision| decision.reason_chain.clone()),
+                    assessment
+                        .decision
+                        .as_ref()
+                        .and_then(|decision| decision.reason_code),
+                    assessment.terminal_reason_code,
+                )
+            };
+        let fingerprint = |verdict: GatekeeperVerdict| match verdict {
+            GatekeeperVerdict::Wait => "wait".to_string(),
+            GatekeeperVerdict::PendingCurve => "pending_curve".to_string(),
+            GatekeeperVerdict::Buy { assessment, .. } => {
+                format!("buy:{:?}", assessment_fingerprint(&assessment))
+            }
+            GatekeeperVerdict::Reject { assessment, reason } => {
+                format!("reject:{reason}:{:?}", assessment_fingerprint(&assessment))
+            }
+            GatekeeperVerdict::Timeout { assessment } => {
+                format!("timeout:{:?}", assessment_fingerprint(&assessment))
+            }
+            GatekeeperVerdict::ApprovedTx { tx, .. } => {
+                format!("approved:{}", tx.signature)
+            }
+        };
+        assert_eq!(fingerprint(observed), fingerprint(baseline));
+    }
+
+    #[test]
+    fn pr1d_ordering_event_bus_ready_cannot_bypass_apply_fence() {
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+        };
+        runtime.record_candidate_integrity_signal(CandidateIntegritySignalV1 {
+            candidate,
+            outcome: CandidateIntegrityOutcomeV1::Ready,
+            signature: Some(Signature::new_unique()),
+            locator: None,
+            conflict_fields: Vec::new(),
+            evidence_hash_blake3: [7; 32],
+        });
+        assert!(matches!(
+            runtime.candidate_integrity_registry.snapshot(candidate),
+            Err(CandidateIntegrityErrorV1::CandidateMissing)
+        ));
+    }
+
+    #[test]
+    fn late_account_update_after_terminal_cleanup_is_classified_evidence_only() {
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+        let pool_id = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool_id,
+            mint: base_mint,
+        };
+        assert!(runtime.register_new_pool(
+            pool_id,
+            base_mint,
+            EnhancedCandidate {
+                pool_amm_id: pool_id,
+                base_mint,
+                bonding_curve,
+                initial_liquidity_sol: 8.0,
+                token_total_supply: Some(900_000_000_000_000),
+                virtual_sol_reserves: Some(8_000_000_000),
+                ..Default::default()
+            },
+            None,
+        ));
+        runtime
+            .candidate_integrity_registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate,
+                outcome: CandidateIntegrityOutcomeV1::Ready,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [1; 32],
+            })
+            .expect("register Ready candidate");
+        assert!(process_test_raw_primary_account_update(
+            &runtime,
+            &base_mint,
+            9_000_000_000,
+            888_000_000_000_000,
+            0,
+            10,
+            Some(7),
+            CurveFinality::Finalized,
+        )
+        .is_some());
+
+        let guard = Arc::clone(&runtime.candidate_integrity_registry)
+            .evaluation_guard(candidate)
+            .expect("Ready candidate must enter evaluation");
+        guard
+            .mark_mfs_materialized()
+            .expect("mark MFS materialized");
+        guard
+            .mark_evaluation_running()
+            .expect("mark evaluation running");
+        guard
+            .publish_terminal(CandidateTerminalTransitionV1::Reject)
+            .expect("publish terminal reject");
+        assert!(runtime.remove_pool_with_reason(pool_id, "test_terminal_cleanup"));
+
+        let mut secondary = test_raw_primary_account_update_event(
+            base_mint,
+            bonding_curve,
+            9_100_000_000,
+            887_000_000_000_000,
+            0,
+            10,
+            Some(7),
+            CurveFinality::Finalized,
+        );
+        secondary.provider_id = Some("test-raw-secondary".to_owned());
+        secondary.provider_role = Some(ghost_core::RawProviderRoleV1::SecondaryWitness);
+        let outcome = runtime.process_account_update_with_explicit_source_mode(
+            &base_mint,
+            secondary.sol_reserves,
+            secondary.token_reserves,
+            secondary.complete,
+            secondary.slot,
+            secondary.curve_finality,
+            UpdateSource::GeyserAccountUpdate,
+            Some(&secondary),
+            true,
+            true,
+        );
+
+        assert!(outcome.is_none());
+        assert!(
+            runtime
+                .account_state_core()
+                .get_canonical_state(&base_mint)
+                .is_none(),
+            "terminal evidence must never recreate canonical state"
+        );
+        assert_eq!(
+            runtime.get_pre_identity_account_update_stats(),
+            (0, 0),
+            "terminal tombstone resolution must not enter pre-identity replay"
+        );
+        let arbiter = runtime
+            .account_state_core()
+            .account_observation_arbiter_snapshot(&base_mint)
+            .expect("retained arbiter evidence");
+        assert_eq!(arbiter.counters.canonical_mutation_count, 1);
+        assert_eq!(arbiter.counters.provider_conflict_count, 1);
+        assert_eq!(arbiter.conflicts.len(), 1);
+
+        let integrity = runtime
+            .candidate_integrity_registry
+            .snapshot(candidate)
+            .expect("retained candidate integrity");
+        assert_eq!(
+            integrity.lifecycle_phase,
+            crate::candidate_integrity::CandidateLifecyclePhaseV1::TerminalReject
+        );
+        assert_eq!(
+            integrity.audit_markers.last().map(|marker| marker.action),
+            Some(CandidateIntegrityConflictActionV1::TerminalVerdictImmutableAudit)
+        );
+    }
+
+    #[test]
+    fn terminal_account_arbiters_are_evicted_with_their_bounded_identity_tombstones() {
+        let reducer = AccountStateReducer::new();
+        let tombstones = RwLock::new(TerminalPoolIdentityTombstones::new(2));
+        let mut identities = Vec::new();
+
+        for slot in 1..=3_u64 {
+            let pool_id = Pubkey::new_unique();
+            let base_mint = Pubkey::new_unique();
+            let bonding_curve = Pubkey::new_unique();
+            let identity = DomainPoolIdentity {
+                pool_id: PoolId::from(pool_id),
+                base_mint: BaseMint::from(base_mint),
+                bonding_curve: BondingCurveKey::from(bonding_curve),
+            };
+            let result = reducer.apply_account_update(AccountStateUpdate {
+                provider_id: Some("test-primary".to_owned()),
+                provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+                pool_amm_id: pool_id,
+                base_mint,
+                bonding_curve,
+                sol_reserves: 1_000_000_000 + slot,
+                token_reserves: 500_000_000_000 + slot,
+                is_complete: 0,
+                slot,
+                write_version: Some(slot),
+                txn_signature: None,
+                source_account_pubkey: Some(bonding_curve),
+                source_account_owner_or_program: Some(bonding_curve),
+                account_data_len: Some(56),
+                account_data_hash: Some(format!("{slot:064x}")),
+                receive_ts_ms: slot.saturating_mul(1_000),
+                receive_seq: slot,
+                curve_finality: CurveFinality::Provisional,
+                source: UpdateSource::GeyserAccountUpdate,
+            });
+            assert!(matches!(
+                result,
+                AccountUpdateResult::Applied | AccountUpdateResult::PromotedFromBootstrap
+            ));
+            retain_terminal_account_evidence(&tombstones, &reducer, identity);
+            identities.push(identity);
+        }
+
+        let retained = tombstones.read();
+        assert_eq!(retained.retained_count(), 2);
+        assert_eq!(retained.eviction_count, 1);
+        assert_eq!(retained.first_evicted_identity, Some(identities[0]));
+        drop(retained);
+
+        let first_mint: Pubkey = identities[0].base_mint.into();
+        let second_mint: Pubkey = identities[1].base_mint.into();
+        let third_mint: Pubkey = identities[2].base_mint.into();
+        assert!(
+            reducer
+                .account_observation_arbiter_snapshot(&first_mint)
+                .is_none(),
+            "evicted tombstone must release the paired terminal arbiter"
+        );
+        assert!(reducer
+            .account_observation_arbiter_snapshot(&second_mint)
+            .is_some());
+        assert!(reducer
+            .account_observation_arbiter_snapshot(&third_mint)
+            .is_some());
+    }
+
+    #[test]
     fn test_resolve_price_context_prefers_bootstrap_state_before_canonical_update() {
         let hyper_oracle = Arc::new(HyperPredictionOracle::default());
         let shadow_ledger = Arc::new(ShadowLedger::new());
@@ -47068,24 +48723,27 @@ mod tests {
         let pool_id = Pubkey::new_unique();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-        tx.send(PoolObservationMsg::Transaction(test_pool_observation_tx(
-            "first",
-        )))
+        tx.send(PoolObservationMsg::Transaction(
+            test_pool_observation_tx("first"),
+            None,
+        ))
         .await
         .expect("prime channel");
 
         enqueue_pool_observation_msg(
             &tx,
             pool_id,
-            PoolObservationMsg::Transaction(test_pool_observation_tx("second")),
+            PoolObservationMsg::Transaction(test_pool_observation_tx("second"), None),
             "transaction",
             false,
         );
 
         let first = rx.recv().await.expect("first tx");
         match first {
-            PoolObservationMsg::Transaction(tx) => assert_eq!(tx.signature, "first"),
-            PoolObservationMsg::NewPool(_) => panic!("expected transaction"),
+            PoolObservationMsg::Transaction(tx, _) => assert_eq!(tx.signature, "first"),
+            PoolObservationMsg::NewPool(_, _, _) => {
+                panic!("expected transaction")
+            }
         }
 
         let second = tokio::time::timeout(
@@ -47099,8 +48757,10 @@ mod tests {
         .expect("second tx missing");
 
         match second {
-            PoolObservationMsg::Transaction(tx) => assert_eq!(tx.signature, "second"),
-            PoolObservationMsg::NewPool(_) => panic!("expected transaction"),
+            PoolObservationMsg::Transaction(tx, _) => assert_eq!(tx.signature, "second"),
+            PoolObservationMsg::NewPool(_, _, _) => {
+                panic!("expected transaction")
+            }
         }
     }
 
@@ -47382,7 +49042,7 @@ mod tests {
             enqueue_pool_observation_msg(
                 &handle.tx,
                 pool_id,
-                PoolObservationMsg::Transaction(test_pool_observation_tx(&sig)),
+                PoolObservationMsg::Transaction(test_pool_observation_tx(&sig), None),
                 "burst_tx",
                 is_hot,
             );
@@ -47392,8 +49052,8 @@ mod tests {
         let mut received = 0usize;
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                PoolObservationMsg::Transaction(_) => received += 1,
-                PoolObservationMsg::NewPool(_) => {}
+                PoolObservationMsg::Transaction(_, _) => received += 1,
+                PoolObservationMsg::NewPool(_, _, _) => {}
             }
         }
         assert_eq!(
@@ -47459,16 +49119,17 @@ mod tests {
         let (hot_tx, mut hot_rx) = tokio::sync::mpsc::channel(1);
         // Fill channel so the second send hits backpressure.
         hot_tx
-            .send(PoolObservationMsg::Transaction(test_pool_observation_tx(
-                "blocker",
-            )))
+            .send(PoolObservationMsg::Transaction(
+                test_pool_observation_tx("blocker"),
+                None,
+            ))
             .await
             .unwrap();
         // Enqueue "hot" message — will retry until channel drains.
         enqueue_pool_observation_msg(
             &hot_tx,
             pool_id,
-            PoolObservationMsg::Transaction(test_pool_observation_tx("hot_msg")),
+            PoolObservationMsg::Transaction(test_pool_observation_tx("hot_msg"), None),
             "tx",
             true, // is_hot
         );
@@ -47486,27 +49147,30 @@ mod tests {
         .expect("hot pool message must be delivered within retry budget")
         .expect("hot pool message must not be None");
         match hot_result {
-            PoolObservationMsg::Transaction(tx) => {
+            PoolObservationMsg::Transaction(tx, _) => {
                 assert_eq!(
                     tx.signature, "hot_msg",
                     "hot pool must deliver correct message"
                 )
             }
-            PoolObservationMsg::NewPool(_) => panic!("expected transaction"),
+            PoolObservationMsg::NewPool(_, _, _) => {
+                panic!("expected transaction")
+            }
         }
 
         // --- Cold pool path (baseline) ---
         let (cold_tx, mut cold_rx) = tokio::sync::mpsc::channel(1);
         cold_tx
-            .send(PoolObservationMsg::Transaction(test_pool_observation_tx(
-                "blocker2",
-            )))
+            .send(PoolObservationMsg::Transaction(
+                test_pool_observation_tx("blocker2"),
+                None,
+            ))
             .await
             .unwrap();
         enqueue_pool_observation_msg(
             &cold_tx,
             pool_id,
-            PoolObservationMsg::Transaction(test_pool_observation_tx("cold_msg")),
+            PoolObservationMsg::Transaction(test_pool_observation_tx("cold_msg"), None),
             "tx",
             false, // is_hot = false
         );
@@ -47522,13 +49186,15 @@ mod tests {
         .expect("cold pool message must be delivered within retry budget")
         .expect("cold pool message must not be None");
         match cold_result {
-            PoolObservationMsg::Transaction(tx) => {
+            PoolObservationMsg::Transaction(tx, _) => {
                 assert_eq!(
                     tx.signature, "cold_msg",
                     "cold pool must deliver correct message"
                 )
             }
-            PoolObservationMsg::NewPool(_) => panic!("expected transaction"),
+            PoolObservationMsg::NewPool(_, _, _) => {
+                panic!("expected transaction")
+            }
         }
     }
 
@@ -49639,6 +51305,209 @@ mod tests {
             .expect("OracleRuntime should stop after shutdown signal")
             .expect("OracleRuntime task should not panic")
             .expect("OracleRuntime should finalize DecisionLogger cleanly");
+    }
+
+    #[test]
+    fn pr1d_primary_ready_is_published_only_after_real_downstream_apply() {
+        std::thread::Builder::new()
+            .name("pr1d-production-path".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_stack_size(32 * 1024 * 1024)
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(async {
+                        use ghost_brain::config::IwimVetoGateConfig;
+
+                        let temp = tempfile::tempdir().expect("tempdir");
+                        let runtime = Arc::new(OracleRuntime::new(
+                            Arc::new(HyperPredictionOracle::default()),
+                            "pump_program".to_string(),
+                            "bonk_program".to_string(),
+                            Arc::new(ShadowLedger::new()),
+                        ));
+                        let snapshot_engine = Arc::new(SnapshotEngine::new(16, 0));
+                        let (event_tx, event_rx) = crate::events::create_event_bus();
+                        let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+                        let runtime_task = tokio::spawn(Box::pin(
+                            start_oracle_runtime_task_with_funding_availability(
+                                event_rx,
+                                Arc::clone(&runtime),
+                                snapshot_engine,
+                                event_tx.clone(),
+                                None,
+                                30_000,
+                                GatekeeperV2Config::default(),
+                                GatekeeperV3Config::default(),
+                                IwimVetoGateConfig::default(),
+                                ExecutionMode::Shadow,
+                                true,
+                                temp.path().join("decisions").display().to_string(),
+                                temp.path().join("entries.jsonl").display().to_string(),
+                                Some(temp.path().join("lifecycle.jsonl").display().to_string()),
+                                None,
+                                temp.path().join("events").display().to_string(),
+                                None,
+                                false,
+                                false,
+                                false,
+                                None,
+                                Some(shutdown_rx),
+                            ),
+                        ));
+
+                        let pool_id = Pubkey::new_unique();
+                        let mut pool = (*test_detected_pool(pool_id)).clone();
+                        pool.amm_program = PUMPFUN_PROGRAM_ID.to_string();
+                        let mint = Pubkey::from_str(&pool.base_mint).expect("mint");
+                        event_tx
+                            .send(GhostEvent::new_pool_detected(pool))
+                            .expect("broadcast pool");
+                        tokio::time::timeout(Duration::from_secs(2), async {
+                            while runtime.session_manager().get_session(&pool_id).is_none() {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("real per-pool task should open a session");
+
+                        let signature = Signature::new_unique();
+                        let locator = RawPumpMutationLocatorV1 {
+                            program_id: Pubkey::new_unique(),
+                            signature,
+                            outer_instruction_index: 1,
+                            inner_instruction_path: vec![0],
+                            semantic_event_ordinal: 0,
+                        };
+                        let mut ledger = PumpObservationLedgerV1::default();
+                        let ledger_result = ledger.observe(
+                            ObservedPumpMutationV1 {
+                                mutation_family: PumpMutationFamilyV1::Trade,
+                                signature,
+                                locator_hint: Some(locator.clone()),
+                                canonical_order: Some(CanonicalPumpOrderKeyV1 {
+                                    slot: 10,
+                                    tx_index: 0,
+                                    outer_instruction_index: 1,
+                                    inner_instruction_path: vec![0],
+                                    semantic_event_ordinal: 0,
+                                }),
+                                raw_transaction_mutation_count: Some(1),
+                                claims: PumpMutationClaimsV1 {
+                                    curve: Some(pool_id),
+                                    mint: Some(mint),
+                                    side: Some(PumpTradeSideV1::Buy),
+                                    success: Some(true),
+                                    token_amount_units: Some(1_000_000),
+                                    ..PumpMutationClaimsV1::default()
+                                },
+                                raw_provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
+                                provenance: ObservationProvenanceV1 {
+                                    source_family: ObservationSourceFamilyV1::RawYellowstone,
+                                    source_id: "yellowstone".to_string(),
+                                    provider_id: "primary".to_string(),
+                                    schema_id: "test".to_string(),
+                                    payload_hash_blake3: [7; 32],
+                                    received_at_monotonic_ns: 1,
+                                },
+                            },
+                            1,
+                        );
+                        let canonical = ledger_result
+                            .observation_decision
+                            .canonical_mutation
+                            .as_ref()
+                            .expect("primary canonical mutation");
+                        let receipt = runtime
+                            .candidate_integrity_registry
+                            .stage_canonical_mutation(canonical)
+                            .expect("stage exact apply receipt");
+                        let ready_signals = std::iter::once(&ledger_result.observation_decision)
+                            .chain(ledger_result.derived_decisions.iter())
+                            .filter_map(|decision| decision.candidate_integrity_signal.clone())
+                            .filter(|signal| signal.outcome == CandidateIntegrityOutcomeV1::Ready)
+                            .collect::<Vec<_>>();
+                        runtime
+                            .candidate_integrity_registry
+                            .seal_complete_transaction_inventory(signature, &ready_signals)
+                            .expect("seal Some(1) inventory");
+
+                        let candidate = PumpCandidateIdentityV1 {
+                            pool_amm_id: pool_id,
+                            mint,
+                        };
+                        let mut tx = (*test_pool_observation_tx(&signature.to_string())).clone();
+                        tx.pool_amm_id = pool_id.to_string();
+                        tx.token_mint = Some(mint.to_string());
+                        tx.slot = Some(10);
+                        tx.tx_index = Some(0);
+                        tx.event_ordinal = Some(0);
+                        tx.curve_data_known = true;
+
+                        let first_barrier =
+                            runtime.install_downstream_apply_test_barrier(signature.to_string());
+                        event_tx
+                            .send(GhostEvent::pool_transaction(tx.clone()))
+                            .expect("broadcast primary transaction");
+                        tokio::time::timeout(Duration::from_secs(2), first_barrier.reached.wait())
+                            .await
+                            .expect("transaction should reach downstream apply barrier");
+                        assert!(runtime
+                            .candidate_integrity_registry
+                            .evaluation_guard(candidate)
+                            .is_err());
+                        first_barrier.release.wait().await;
+                        tokio::time::timeout(
+                            Duration::from_secs(2),
+                            first_barrier.completed.notified(),
+                        )
+                        .await
+                        .expect("downstream apply should complete");
+                        let ready = runtime
+                            .candidate_integrity_registry
+                            .snapshot(candidate)
+                            .expect("Ready after explicit apply");
+                        assert_eq!(ready.outcome, CandidateIntegrityOutcomeV1::Ready);
+                        let ready_generation = ready.generation;
+                        let ready_markers = ready.audit_markers.len();
+
+                        let replay_barrier =
+                            runtime.install_downstream_apply_test_barrier(signature.to_string());
+                        event_tx
+                            .send(GhostEvent::pool_transaction(tx))
+                            .expect("broadcast replay");
+                        tokio::time::timeout(Duration::from_secs(2), replay_barrier.reached.wait())
+                            .await
+                            .expect("replay should traverse the same per-pool path");
+                        replay_barrier.release.wait().await;
+                        tokio::time::timeout(
+                            Duration::from_secs(2),
+                            replay_barrier.completed.notified(),
+                        )
+                        .await
+                        .expect("duplicate classification should complete");
+                        let after_replay = runtime
+                            .candidate_integrity_registry
+                            .snapshot(candidate)
+                            .expect("terminal Ready history");
+                        assert_eq!(after_replay.outcome, CandidateIntegrityOutcomeV1::Ready);
+                        assert_eq!(after_replay.generation, ready_generation);
+                        assert_eq!(after_replay.audit_markers.len(), ready_markers);
+
+                        shutdown_tx.send(()).expect("shutdown runtime");
+                        tokio::time::timeout(Duration::from_secs(3), runtime_task)
+                            .await
+                            .expect("runtime shutdown timeout")
+                            .expect("runtime task panic")
+                            .expect("runtime shutdown");
+                    });
+            })
+            .expect("spawn production-path test thread")
+            .join()
+            .expect("production-path test thread");
     }
 
     #[tokio::test]

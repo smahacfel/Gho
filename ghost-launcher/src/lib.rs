@@ -35,6 +35,7 @@
 //! tx.send(GhostEvent::new_pool_detected(pool)).unwrap();
 //! ```
 
+pub mod candidate_integrity;
 pub mod components;
 pub mod config;
 pub mod events;

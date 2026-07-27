@@ -119,7 +119,23 @@ struct DecisionSeriesAccountPriceObservation {
 enum SessionTransactionAdmission {
     Accepted,
     Duplicate { event_ts_ms: u64 },
+    Unkeyable,
     Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalMutationApplyOutcomeV1 {
+    AppliedNewMutation,
+    Duplicate,
+    Ignored,
+    Terminal,
+    Failed,
+}
+
+#[derive(Debug)]
+pub(crate) struct PoolTransactionIngestResultV1 {
+    pub(crate) ingress: GatekeeperIngressOutcome,
+    pub(crate) apply: CanonicalMutationApplyOutcomeV1,
 }
 
 pub struct PoolObservationSession {
@@ -318,7 +334,7 @@ impl PoolObservationSession {
         let Some(tx_key) = GatekeeperBuffer::tx_key_for(tx) else {
             // Preserve the existing fallback behavior for an event that cannot be keyed. The
             // downstream reducers retain their own defensive validation for this degraded case.
-            return SessionTransactionAdmission::Accepted;
+            return SessionTransactionAdmission::Unkeyable;
         };
 
         if self.tx_keys_seen.insert(tx_key.clone()) {
@@ -391,12 +407,31 @@ impl PoolObservationSession {
 
     /// Production ingest path for PR6 trigger cutover.
     pub fn ingest_transaction(&mut self, tx: Arc<PoolTransaction>) -> GatekeeperIngressOutcome {
+        self.ingest_transaction_with_apply_result(tx).ingress
+    }
+
+    /// Narrow runtime receipt for the PR1D downstream-apply fence.
+    ///
+    /// `ingress` remains the decision-window result. `apply` is independent
+    /// proof that this exact transaction became a new session mutation.
+    pub(crate) fn ingest_transaction_with_apply_result(
+        &mut self,
+        tx: Arc<PoolTransaction>,
+    ) -> PoolTransactionIngestResultV1 {
         match self.admit_transaction(tx.as_ref()) {
-            SessionTransactionAdmission::Accepted => {}
+            SessionTransactionAdmission::Accepted | SessionTransactionAdmission::Unkeyable => {}
             SessionTransactionAdmission::Duplicate { event_ts_ms } => {
-                return self.duplicate_ingress_outcome(event_ts_ms);
+                return PoolTransactionIngestResultV1 {
+                    ingress: self.duplicate_ingress_outcome(event_ts_ms),
+                    apply: CanonicalMutationApplyOutcomeV1::Duplicate,
+                };
             }
-            SessionTransactionAdmission::Terminal => return GatekeeperIngressOutcome::Wait,
+            SessionTransactionAdmission::Terminal => {
+                return PoolTransactionIngestResultV1 {
+                    ingress: GatekeeperIngressOutcome::Wait,
+                    apply: CanonicalMutationApplyOutcomeV1::Terminal,
+                };
+            }
         }
 
         self.tx_intelligence.on_transaction(tx.as_ref());
@@ -426,7 +461,15 @@ impl PoolObservationSession {
 
         self.refresh_from_gatekeeper();
 
-        outcome
+        PoolTransactionIngestResultV1 {
+            ingress: outcome,
+            // Admission above excludes both session duplicates and terminal
+            // sessions. Even when Gatekeeper does not count the event
+            // (unkeyable or dust), TxIntelligence owns and records a new
+            // runtime mutation. `Ignored` is therefore reserved for paths
+            // where no state owner changed.
+            apply: CanonicalMutationApplyOutcomeV1::AppliedNewMutation,
+        }
     }
 
     pub fn on_account_update(&mut self, update: &AccountStateUpdate) {

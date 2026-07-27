@@ -12,6 +12,7 @@ fn make_tx_event(
     GeyserEvent::Transaction {
         provider_id: None,
         provider_role: None,
+        observation_provenance: None,
         slot: Some(42),
         tx_index: None,
         event_ts_ms,

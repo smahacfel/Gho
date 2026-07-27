@@ -6,7 +6,7 @@
 use crate::types::{CandidatePool, TradeEvent};
 use ghost_core::{
     CurveFinality, EventSemanticEnvelope, EventTimeMetadata, ExecutionAccountEvidence,
-    RawProviderRoleV1,
+    ObservedPumpMutationV1, RawProviderRoleV1,
 };
 use prometheus::{
     register_histogram, register_int_counter, register_int_gauge, Histogram, IntCounter, IntGauge,
@@ -52,11 +52,38 @@ pub enum SeerEvent {
     ExecutionAccountEvidence(DetectedExecutionAccountEvidenceEvent),
 }
 
+/// Existing runtime disposition attached to a raw pool-initialization
+/// observation after parser classification.
+///
+/// Every raw observation still crosses the PR1D ledger. This field only
+/// preserves whether the legacy adapter may emit a new candidate after a
+/// primary canonical decision; it never grants authority by itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolDetectionRuntimeDispositionV1 {
+    #[default]
+    Observe,
+    ContinuityOnly,
+    Suppressed,
+}
+
 /// Typed pool detection event payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedPoolEvent {
     /// The detected pool candidate
     pub candidate: CandidatePool,
+
+    /// Raw Yellowstone observation aligned with `candidate`. Parsed/NLN
+    /// witnesses use the same contract later but never gain canonical runtime
+    /// authority through this transport field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<ObservedPumpMutationV1>,
+
+    #[serde(default)]
+    pub runtime_disposition: PoolDetectionRuntimeDispositionV1,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_observation_pool: Option<Pubkey>,
 
     /// Timestamp when the event was created (for latency tracking)
     pub detected_at: std::time::SystemTime,
@@ -73,6 +100,10 @@ pub struct DetectedPoolEvent {
 pub struct DetectedTradeEvent {
     /// The detected trade
     pub trade: TradeEvent,
+
+    /// Raw Yellowstone observation aligned with `trade`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<ObservedPumpMutationV1>,
 
     /// Timestamp when the event was created (for latency tracking)
     pub detected_at: std::time::SystemTime,
@@ -975,8 +1006,39 @@ impl IpcSender {
         candidate: CandidatePool,
         priority: EventPriority,
     ) -> Result<(), IpcError> {
+        self.send_with_observation(candidate, None, priority).await
+    }
+
+    /// Send a pool detection together with its aligned raw observation.
+    pub async fn send_with_observation(
+        &self,
+        candidate: CandidatePool,
+        observation: Option<ObservedPumpMutationV1>,
+        priority: EventPriority,
+    ) -> Result<(), IpcError> {
+        self.send_with_observation_and_disposition(
+            candidate,
+            observation,
+            PoolDetectionRuntimeDispositionV1::Observe,
+            None,
+            priority,
+        )
+        .await
+    }
+
+    pub async fn send_with_observation_and_disposition(
+        &self,
+        candidate: CandidatePool,
+        observation: Option<ObservedPumpMutationV1>,
+        runtime_disposition: PoolDetectionRuntimeDispositionV1,
+        continuity_observation_pool: Option<Pubkey>,
+        priority: EventPriority,
+    ) -> Result<(), IpcError> {
         let event = SeerEvent::PoolDetected(DetectedPoolEvent {
             candidate,
+            observation,
+            runtime_disposition,
+            continuity_observation_pool,
             detected_at: std::time::SystemTime::now(),
             sequence_number: 0,
             priority,
@@ -991,8 +1053,20 @@ impl IpcSender {
         trade: TradeEvent,
         priority: EventPriority,
     ) -> Result<(), IpcError> {
+        self.send_trade_with_observation(trade, None, priority)
+            .await
+    }
+
+    /// Send a trade together with its index-aligned raw observation.
+    pub async fn send_trade_with_observation(
+        &self,
+        trade: TradeEvent,
+        observation: Option<ObservedPumpMutationV1>,
+        priority: EventPriority,
+    ) -> Result<(), IpcError> {
         let event = SeerEvent::Trade(DetectedTradeEvent {
             trade,
+            observation,
             detected_at: std::time::SystemTime::now(),
             sequence_number: 0,
             priority,
@@ -1748,6 +1822,9 @@ mod tests {
                 } else {
                     SeerEvent::PoolDetected(DetectedPoolEvent {
                         candidate: create_test_candidate(),
+                        observation: None,
+                        runtime_disposition: PoolDetectionRuntimeDispositionV1::Observe,
+                        continuity_observation_pool: None,
                         detected_at: std::time::SystemTime::now(),
                         sequence_number: u64::MAX,
                         priority: EventPriority::Normal,
@@ -2313,6 +2390,9 @@ mod tests {
         let candidate = create_test_candidate();
         let pool_event = DetectedPoolEvent {
             candidate: candidate.clone(),
+            observation: None,
+            runtime_disposition: PoolDetectionRuntimeDispositionV1::Observe,
+            continuity_observation_pool: None,
             detected_at: SystemTime::now(),
             sequence_number: 42,
             priority: EventPriority::High,
@@ -2340,6 +2420,58 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pool_and_trade_json_default_raw_observation_to_none() {
+        use std::time::SystemTime;
+
+        let mut pool_json = serde_json::to_value(SeerEvent::PoolDetected(DetectedPoolEvent {
+            candidate: create_test_candidate(),
+            observation: None,
+            runtime_disposition: PoolDetectionRuntimeDispositionV1::Observe,
+            continuity_observation_pool: None,
+            detected_at: SystemTime::now(),
+            sequence_number: 1,
+            priority: EventPriority::Normal,
+        }))
+        .expect("serialize pool event");
+        let legacy_pool = pool_json
+            .get_mut("PoolDetected")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("externally tagged pool event");
+        legacy_pool.remove("observation");
+        legacy_pool.remove("runtime_disposition");
+        legacy_pool.remove("continuity_observation_pool");
+        match serde_json::from_value::<SeerEvent>(pool_json).expect("legacy pool JSON") {
+            SeerEvent::PoolDetected(event) => {
+                assert_eq!(event.observation, None);
+                assert_eq!(
+                    event.runtime_disposition,
+                    PoolDetectionRuntimeDispositionV1::Observe
+                );
+                assert_eq!(event.continuity_observation_pool, None);
+            }
+            other => panic!("expected pool event, got {other:?}"),
+        }
+
+        let mut trade_json = serde_json::to_value(SeerEvent::Trade(DetectedTradeEvent {
+            trade: create_test_trade_event(true),
+            observation: None,
+            detected_at: SystemTime::now(),
+            sequence_number: 2,
+            priority: EventPriority::Normal,
+        }))
+        .expect("serialize trade event");
+        trade_json
+            .get_mut("Trade")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("externally tagged trade event")
+            .remove("observation");
+        match serde_json::from_value::<SeerEvent>(trade_json).expect("legacy trade JSON") {
+            SeerEvent::Trade(event) => assert_eq!(event.observation, None),
+            other => panic!("expected trade event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_seer_event_serialization_deserialization_trade() {
         use std::time::SystemTime;
 
@@ -2352,6 +2484,7 @@ mod tests {
 
         let trade_event = DetectedTradeEvent {
             trade: trade.clone(),
+            observation: None,
             detected_at: SystemTime::now(),
             sequence_number: 99,
             priority: EventPriority::Normal,
@@ -2394,6 +2527,7 @@ mod tests {
 
         let trade_event = DetectedTradeEvent {
             trade: trade.clone(),
+            observation: None,
             detected_at: SystemTime::now(),
             sequence_number: 123,
             priority: EventPriority::Low,
