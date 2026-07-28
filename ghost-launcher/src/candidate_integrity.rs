@@ -357,6 +357,17 @@ struct CanonicalApplyFenceV1 {
         HashMap<(Signature, PumpCandidateIdentityV1), CandidateApplyProofV1>,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct TransitionBeforeCommitHookV1(Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TransitionBeforeCommitHookV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TransitionBeforeCommitHookV1(..)")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CandidateIntegrityReadyReleaseV1 {
     pub(crate) candidate: PumpCandidateIdentityV1,
@@ -380,6 +391,10 @@ pub struct CandidateIntegrityRegistry {
     /// global ingest-integrity failure must invalidate every not-yet-started
     /// candidate action without rewriting terminal submit/confirmation state.
     authority_admission_generation: AtomicU64,
+    #[cfg(test)]
+    transition_before_commit_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
+    #[cfg(test)]
+    close_after_state_lock_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -494,6 +509,45 @@ impl CandidateIntegrityRegistry {
             .retain(|(_, proof_candidate), _| *proof_candidate != candidate);
     }
 
+    /// Move one fully resolved record out of active admission ownership.
+    ///
+    /// The caller proves that no unresolved receipt remains and that the
+    /// lifecycle is safe to retire.  Both ordinary Oracle cleanup and a
+    /// terminal pre-session technical failure use this one bounded path, so
+    /// neither can turn the active maps into an event-count shutdown budget.
+    fn retire_resolved_record(
+        &self,
+        state: &mut CandidateIntegrityRegistryStateV1,
+        candidate: PumpCandidateIdentityV1,
+    ) -> Result<Option<CandidateIntegrityRecordV1>, CandidateIntegrityErrorV1> {
+        if state.terminal_ledger_retirements.len() >= self.limits.max_terminal_tombstones {
+            return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
+        }
+        let Some(removed) = state.records.remove(&candidate) else {
+            return Ok(None);
+        };
+        if state.by_pool.get(&candidate.pool_amm_id) == Some(&candidate) {
+            state.by_pool.remove(&candidate.pool_amm_id);
+        }
+        if state.by_mint.get(&candidate.mint) == Some(&candidate) {
+            state.by_mint.remove(&candidate.mint);
+        }
+        Self::cleanup_canonical_apply_fence_for_candidate(state, candidate);
+        let evicted = state.terminal_tombstones.insert(removed.clone());
+        state
+            .terminal_ledger_retirements
+            .push_back(CandidateIntegrityTerminalRetirementV1 { candidate });
+        if evicted.is_some() {
+            ::metrics::counter!("candidate_integrity_terminal_tombstone_evicted_total", 1u64);
+        }
+        ::metrics::gauge!(
+            "candidate_integrity_terminal_tombstones",
+            state.terminal_tombstones.by_candidate.len() as f64,
+            "authority_epoch_id" => self.authority_epoch.epoch_id.to_string()
+        );
+        Ok(Some(removed))
+    }
+
     #[must_use]
     pub fn new(limits: CandidateIntegrityRegistryLimitsV1) -> Self {
         Self::new_with_epoch(limits, Pr1AuthorityEpochV1::default())
@@ -513,6 +567,10 @@ impl CandidateIntegrityRegistry {
             available: AtomicBool::new(true),
             candidate_admission_open: AtomicBool::new(true),
             authority_admission_generation: AtomicU64::new(1),
+            #[cfg(test)]
+            transition_before_commit_hook: Mutex::new(None),
+            #[cfg(test)]
+            close_after_state_lock_hook: Mutex::new(None),
         }
     }
 
@@ -555,6 +613,7 @@ impl CandidateIntegrityRegistry {
             if existing.receipt == receipt {
                 return Ok(existing.receipt.clone());
             }
+            drop(state);
             self.mark_unavailable("canonical_receipt_identity_contradiction");
             return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
         }
@@ -606,6 +665,7 @@ impl CandidateIntegrityRegistry {
                 .map(|entry| entry.receipt.locator.clone())
                 .collect::<HashSet<_>>();
             if expected_locators.is_empty() {
+                drop(state);
                 self.mark_unavailable("inventory_without_staged_locator");
                 return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
             }
@@ -637,6 +697,7 @@ impl CandidateIntegrityRegistry {
                 if existing.expected_locators != expected_locators
                     || existing.ready_signal != *signal
                 {
+                    drop(state);
                     self.mark_unavailable("inventory_proof_identity_contradiction");
                     return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
                 }
@@ -774,7 +835,7 @@ impl CandidateIntegrityRegistry {
         receipt: &CanonicalMutationApplyReceiptV1,
     ) -> Result<(), CandidateIntegrityErrorV1> {
         self.require_available()?;
-        {
+        let identity_contradiction = {
             let mut state = self.lock_state()?;
             let entry = state
                 .canonical_apply_fence
@@ -782,21 +843,25 @@ impl CandidateIntegrityRegistry {
                 .get_mut(&receipt.runtime_key)
                 .ok_or(CandidateIntegrityErrorV1::CandidateMissing)?;
             if entry.receipt != *receipt {
-                self.mark_unavailable("failed_receipt_identity_contradiction");
-                return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
-            }
-            if entry.applied || entry.failed {
+                true
+            } else if entry.applied || entry.failed {
                 return Ok(());
+            } else {
+                entry.failed = true;
+                if let Some(proof) = state
+                    .canonical_apply_fence
+                    .proofs_by_signature_candidate
+                    .get_mut(&(receipt.signature, receipt.candidate))
+                {
+                    proof.invalidated = true;
+                }
+                self.record_pending_permit_metrics(&state);
+                false
             }
-            entry.failed = true;
-            if let Some(proof) = state
-                .canonical_apply_fence
-                .proofs_by_signature_candidate
-                .get_mut(&(receipt.signature, receipt.candidate))
-            {
-                proof.invalidated = true;
-            }
-            self.record_pending_permit_metrics(&state);
+        };
+        if identity_contradiction {
+            self.mark_unavailable("failed_receipt_identity_contradiction");
+            return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
         }
         let _ = self.record_signal(Self::coverage_incomplete_signal(receipt))?;
         Ok(())
@@ -870,17 +935,24 @@ impl CandidateIntegrityRegistry {
         self.require_candidate_admission_open()?;
         self.require_available()?;
         let mut state = self.lock_state()?;
-        let entry = state
-            .canonical_apply_fence
-            .receipts_by_runtime_key
-            .get_mut(&receipt.runtime_key)
-            .ok_or(CandidateIntegrityErrorV1::CandidateMissing)?;
-        if entry.receipt != *receipt {
+        let receipt_identity_mismatch = {
+            let entry = state
+                .canonical_apply_fence
+                .receipts_by_runtime_key
+                .get_mut(&receipt.runtime_key)
+                .ok_or(CandidateIntegrityErrorV1::CandidateMissing)?;
+            if entry.receipt != *receipt {
+                true
+            } else if entry.failed || entry.applied {
+                return Ok(Vec::new());
+            } else {
+                false
+            }
+        };
+        if receipt_identity_mismatch {
+            drop(state);
             self.mark_unavailable("applied_receipt_identity_contradiction");
             return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
-        }
-        if entry.failed || entry.applied {
-            return Ok(Vec::new());
         }
 
         let proof_keys = state
@@ -1001,6 +1073,7 @@ impl CandidateIntegrityRegistry {
             .receipts_by_runtime_key
             .get_mut(&receipt.runtime_key)
         else {
+            drop(state);
             self.mark_unavailable("applied_receipt_disappeared");
             return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
         };
@@ -1116,6 +1189,7 @@ impl CandidateIntegrityRegistry {
                     self.limits.max_candidates
                 };
             if state.records.len() >= capacity {
+                drop(state);
                 self.mark_unavailable("candidate_registry_capacity_exhausted");
                 return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
             }
@@ -1186,6 +1260,44 @@ impl CandidateIntegrityRegistry {
         };
         if signal.outcome != CandidateIntegrityOutcomeV1::Ready {
             Self::cleanup_canonical_apply_fence_for_candidate(&mut state, signal.candidate);
+        }
+
+        // A first non-Ready signal with no unresolved canonical receipt has
+        // not opened an Oracle-owned candidate session. Keeping it in the
+        // active maps would make malformed/missing wrapper evidence a
+        // deterministic capacity-to-shutdown budget. Preserve its immutable
+        // technical failure in the same bounded tombstone lane used by
+        // ordinary terminal Oracle cleanup instead.
+        let pre_session_terminal_failure = inserted
+            && signal.outcome != CandidateIntegrityOutcomeV1::Ready
+            && !state
+                .canonical_apply_fence
+                .receipts_by_runtime_key
+                .values()
+                .any(|entry| {
+                    entry.receipt.candidate == signal.candidate && !entry.applied && !entry.failed
+                });
+        if pre_session_terminal_failure {
+            match self.retire_resolved_record(&mut state, signal.candidate) {
+                Ok(Some(_)) => {
+                    ::metrics::counter!(
+                        "candidate_integrity_pre_session_terminal_retired_total",
+                        1u64,
+                        "authority_epoch_id" => self.authority_epoch.epoch_id.to_string()
+                    );
+                }
+                Ok(None) => {
+                    self.available.store(false, Ordering::Release);
+                    drop(state);
+                    self.close_candidate_admission("pre_session_terminal_record_disappeared");
+                    return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
+                }
+                Err(error) => {
+                    drop(state);
+                    self.mark_unavailable("pre_session_terminal_retirement_capacity_exhausted");
+                    return Err(error);
+                }
+            }
         }
         Ok(result)
     }
@@ -1291,34 +1403,8 @@ impl CandidateIntegrityRegistry {
                 actual: record.lifecycle_phase,
             });
         }
-        if state.terminal_ledger_retirements.len() >= self.limits.max_terminal_tombstones {
-            return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
-        }
-
-        let removed = state
-            .records
-            .remove(&candidate)
-            .ok_or(CandidateIntegrityErrorV1::CandidateMissing)?;
-        if state.by_pool.get(&candidate.pool_amm_id) == Some(&candidate) {
-            state.by_pool.remove(&candidate.pool_amm_id);
-        }
-        if state.by_mint.get(&candidate.mint) == Some(&candidate) {
-            state.by_mint.remove(&candidate.mint);
-        }
-        Self::cleanup_canonical_apply_fence_for_candidate(&mut state, candidate);
-        let evicted = state.terminal_tombstones.insert(removed.clone());
-        state
-            .terminal_ledger_retirements
-            .push_back(CandidateIntegrityTerminalRetirementV1 { candidate });
-        if evicted.is_some() {
-            ::metrics::counter!("candidate_integrity_terminal_tombstone_evicted_total", 1u64);
-        }
-        ::metrics::gauge!(
-            "candidate_integrity_terminal_tombstones",
-            state.terminal_tombstones.by_candidate.len() as f64,
-            "authority_epoch_id" => self.authority_epoch.epoch_id.to_string()
-        );
-        Ok(true)
+        self.retire_resolved_record(&mut state, candidate)
+            .map(|removed| removed.is_some())
     }
 
     /// Drain the bounded terminal-retirement control handoff. The caller is
@@ -1379,6 +1465,43 @@ impl CandidateIntegrityRegistry {
     }
 
     pub fn close_candidate_admission(&self, reason: &'static str) {
+        // `state` is the common linearization lock for global closure and a
+        // guard phase transition.  A transition which owns this lock and has
+        // rechecked its admission generation commits before a concurrent
+        // closure; a closure which owns it first increments the generation
+        // before any new transition may commit.  This deliberately permits
+        // an already-started submit to retain reconciliation authority while
+        // making the close/submit race deterministic.
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                self.force_close_candidate_admission_without_state(reason);
+                return;
+            }
+        };
+        #[cfg(test)]
+        self.invoke_close_after_state_lock_hook();
+        self.close_candidate_admission_while_state_locked(reason);
+        drop(state);
+    }
+
+    fn close_candidate_admission_while_state_locked(&self, reason: &'static str) {
+        if self.candidate_admission_open.swap(false, Ordering::AcqRel) {
+            self.authority_admission_generation
+                .fetch_add(1, Ordering::AcqRel);
+            ::metrics::gauge!(
+                "pr1_runtime_candidate_admission_closed",
+                1.0,
+                "authority_epoch_id" => self.authority_epoch.epoch_id.to_string(),
+                "reason" => reason
+            );
+        }
+    }
+
+    /// Poison handling cannot acquire `state` again.  The unavailable bit is
+    /// itself fail-closed; this atomic fallback only records the matching
+    /// admission transition and is never a normal guard linearization path.
+    fn force_close_candidate_admission_without_state(&self, reason: &'static str) {
         if self.candidate_admission_open.swap(false, Ordering::AcqRel) {
             self.authority_admission_generation
                 .fetch_add(1, Ordering::AcqRel);
@@ -1507,7 +1630,8 @@ impl CandidateIntegrityRegistry {
         match self.state.lock() {
             Ok(state) => Ok(state),
             Err(_) => {
-                self.mark_unavailable("registry_mutex_poisoned");
+                self.available.store(false, Ordering::Release);
+                self.force_close_candidate_admission_without_state("registry_mutex_poisoned");
                 Err(CandidateIntegrityErrorV1::RegistryUnavailable)
             }
         }
@@ -1534,6 +1658,8 @@ impl CandidateIntegrityRegistry {
                 actual: record.lifecycle_phase,
             });
         }
+        #[cfg(test)]
+        self.invoke_transition_before_commit_hook();
         record.lifecycle_phase = next;
         if matches!(
             next,
@@ -1545,6 +1671,52 @@ impl CandidateIntegrityRegistry {
             Self::cleanup_canonical_apply_fence_for_candidate(&mut state, candidate);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_transition_before_commit_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .transition_before_commit_hook
+            .lock()
+            .expect("test transition hook mutex") = hook.map(TransitionBeforeCommitHookV1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_close_after_state_lock_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .close_after_state_lock_hook
+            .lock()
+            .expect("test close hook mutex") = hook.map(TransitionBeforeCommitHookV1);
+    }
+
+    #[cfg(test)]
+    fn invoke_transition_before_commit_hook(&self) {
+        let hook = self
+            .transition_before_commit_hook
+            .lock()
+            .expect("test transition hook mutex")
+            .clone();
+        if let Some(hook) = hook {
+            (hook.0)();
+        }
+    }
+
+    #[cfg(test)]
+    fn invoke_close_after_state_lock_hook(&self) {
+        let hook = self
+            .close_after_state_lock_hook
+            .lock()
+            .expect("test close hook mutex")
+            .clone();
+        if let Some(hook) = hook {
+            (hook.0)();
+        }
     }
 
     fn check_guard(
@@ -1976,6 +2148,7 @@ mod tests {
         PumpMutationConflictFieldV1, RawPumpMutationLocatorV1,
     };
     use solana_sdk::{pubkey::Pubkey, signature::Signature};
+    use std::sync::Barrier;
 
     fn candidate() -> PumpCandidateIdentityV1 {
         PumpCandidateIdentityV1 {
@@ -2861,6 +3034,136 @@ mod tests {
     }
 
     #[test]
+    fn submit_transition_and_global_close_are_linearized_by_the_registry_state_lock() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = candidate();
+        registry
+            .record_signal(signal(candidate, CandidateIntegrityOutcomeV1::Ready, 1))
+            .expect("register Ready");
+        let evaluation = registry
+            .evaluation_guard(candidate)
+            .expect("evaluation guard");
+        evaluation.mark_mfs_materialized().expect("MFS");
+        evaluation
+            .mark_evaluation_running()
+            .expect("evaluation running");
+        let submit_guard = evaluation
+            .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
+            .expect("BUY terminal")
+            .expect("submit guard");
+
+        let transition_entered = Arc::new(Barrier::new(2));
+        let allow_commit = Arc::new(Barrier::new(2));
+        let hook_entered = Arc::clone(&transition_entered);
+        let hook_release = Arc::clone(&allow_commit);
+        registry.set_transition_before_commit_hook(Some(Arc::new(move || {
+            hook_entered.wait();
+            hook_release.wait();
+        })));
+
+        let submit = submit_guard.clone();
+        let submit_thread = std::thread::spawn(move || submit.try_begin_submit());
+        transition_entered.wait();
+
+        let close_entered = Arc::new(Barrier::new(2));
+        let close_barrier = Arc::clone(&close_entered);
+        let closing_registry = Arc::clone(&registry);
+        let close_thread = std::thread::spawn(move || {
+            close_barrier.wait();
+            closing_registry.close_candidate_admission("deterministic_submit_close_race");
+        });
+        close_entered.wait();
+
+        // The submit transition already owns the shared state lock and has
+        // passed its generation check. Releasing it commits SubmitStarted;
+        // the overlapping close then linearizes afterwards and preserves
+        // reconciliation rather than inventing a false cancellation.
+        allow_commit.wait();
+        assert_eq!(
+            submit_thread
+                .join()
+                .expect("submit thread join")
+                .expect("submit wins"),
+            CandidateSubmitTransitionV1::StartedNow
+        );
+        close_thread.join().expect("close thread join");
+        registry.set_transition_before_commit_hook(None);
+
+        assert_eq!(
+            registry
+                .snapshot(candidate)
+                .expect("submit-started record")
+                .lifecycle_phase,
+            CandidateLifecyclePhaseV1::SubmitStarted
+        );
+        assert!(submit_guard.requires_reconciliation());
+        assert!(!registry.candidate_admission_open());
+    }
+
+    #[test]
+    fn global_close_that_owns_state_lock_first_rejects_a_concurrent_submit_transition() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = candidate();
+        registry
+            .record_signal(signal(candidate, CandidateIntegrityOutcomeV1::Ready, 1))
+            .expect("register Ready");
+        let evaluation = registry
+            .evaluation_guard(candidate)
+            .expect("evaluation guard");
+        evaluation.mark_mfs_materialized().expect("MFS");
+        evaluation
+            .mark_evaluation_running()
+            .expect("evaluation running");
+        let submit_guard = evaluation
+            .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
+            .expect("BUY terminal")
+            .expect("submit guard");
+
+        let close_holds_state = Arc::new(Barrier::new(2));
+        let release_close = Arc::new(Barrier::new(2));
+        let entered = Arc::clone(&close_holds_state);
+        let release = Arc::clone(&release_close);
+        registry.set_close_after_state_lock_hook(Some(Arc::new(move || {
+            entered.wait();
+            release.wait();
+        })));
+
+        let closing_registry = Arc::clone(&registry);
+        let close_thread = std::thread::spawn(move || {
+            closing_registry.close_candidate_admission("deterministic_close_wins_race");
+        });
+        close_holds_state.wait();
+
+        let submit_started = Arc::new(Barrier::new(2));
+        let submit_entered = Arc::clone(&submit_started);
+        let submit = submit_guard.clone();
+        let submit_thread = std::thread::spawn(move || {
+            submit_entered.wait();
+            submit.try_begin_submit()
+        });
+        submit_started.wait();
+
+        // The close already owns the common state lock.  It increments the
+        // admission generation before the waiting submit transition can make
+        // its second guarded check, so close deterministically wins.
+        release_close.wait();
+        close_thread.join().expect("close thread join");
+        assert!(matches!(
+            submit_thread.join().expect("submit thread join"),
+            Err(CandidateIntegrityErrorV1::AdmissionClosed { .. })
+        ));
+        registry.set_close_after_state_lock_hook(None);
+        assert!(!registry.candidate_admission_open());
+        assert_eq!(
+            registry
+                .snapshot(candidate)
+                .expect("closed candidate snapshot")
+                .lifecycle_phase,
+            CandidateLifecyclePhaseV1::TerminalBuyNotSubmitted
+        );
+    }
+
+    #[test]
     fn terminal_retirement_reclaims_active_capacity_without_resurrecting_ready() {
         let registry = Arc::new(CandidateIntegrityRegistry::new(
             CandidateIntegrityRegistryLimitsV1 {
@@ -2976,5 +3279,84 @@ mod tests {
         assert_eq!(state.terminal_tombstones.retained_count(), 2);
         assert_eq!(state.terminal_tombstones.eviction_count, 2);
         assert!(state.terminal_tombstones.first_evicted.is_some());
+    }
+
+    #[test]
+    fn pre_session_technical_failures_retire_into_bounded_terminal_history() {
+        let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
+            max_candidates: 1,
+            max_audit_markers_per_candidate: 2,
+            max_terminal_tombstones: 2,
+        });
+        let first = candidate();
+        let first_result = registry
+            .record_signal(signal(
+                first,
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                1,
+            ))
+            .expect("pre-session failure is retained as terminal evidence");
+        assert_eq!(
+            first_result.snapshot.outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+        {
+            let state = registry.lock_state().expect("registry state");
+            assert!(
+                state.records.is_empty(),
+                "pre-session failure is not active capacity"
+            );
+            assert_eq!(state.terminal_tombstones.retained_count(), 1);
+        }
+        assert_eq!(
+            registry
+                .drain_terminal_ledger_retirements()
+                .expect("bounded ledger handoff")
+                .len(),
+            1
+        );
+
+        let second = candidate();
+        registry
+            .record_signal(signal(
+                second,
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                2,
+            ))
+            .expect("next pre-session failure must not exhaust active capacity");
+        assert!(registry.candidate_admission_open());
+        assert_eq!(
+            registry
+                .snapshot(first)
+                .expect("first terminal audit")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+    }
+
+    #[test]
+    fn pre_session_failure_with_unresolved_receipt_remains_active_until_receipt_resolves() {
+        let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
+            max_candidates: 2,
+            max_audit_markers_per_candidate: 2,
+            max_terminal_tombstones: 2,
+        });
+        let candidate = candidate();
+        let receipt = registry
+            .stage_canonical_mutation(&canonical(Signature::new_unique(), 0, candidate))
+            .expect("stage unresolved receipt");
+        registry
+            .record_signal(signal(
+                candidate,
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                3,
+            ))
+            .expect("technical signal remains active while receipt is unresolved");
+        let state = registry.lock_state().expect("registry state");
+        assert!(state.records.contains_key(&candidate));
+        assert!(state
+            .canonical_apply_fence
+            .receipts_by_runtime_key
+            .contains_key(&receipt.runtime_key));
     }
 }

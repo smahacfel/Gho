@@ -1,7 +1,7 @@
 # ADR-8D: Ingest State Quote PR1E — aktywacja runtime authority i kwalifikacja PR1
 
 Status:
-`IMPLEMENTED / REVIEW REMEDIATION COMPLETE LOCALLY / CLOSED RUNTIME RUN PENDING / DRAFT PR`
+`IMPLEMENTED / REVIEW REMEDIATION COMPLETE LOCALLY / FINAL LOCAL MATRIX PENDING / DRAFT PR`
 
 Typ: ADR-8D / PR1E / aktywna granica integralności nowych kandydatów
 
@@ -178,6 +178,14 @@ Wyjątkiem jest submit, który rzeczywiście już osiągnął `SubmitStarted`:
 nie jest on fałszywie anulowany, lecz przechodzi istniejącą ścieżkę
 confirmation/reconciliation. Confirmed position zachowuje protective exits.
 
+Wspólnym linearization point dla `close_candidate_admission()` i każdego
+guard phase transition jest mutex `CandidateIntegrityRegistry::state`.
+Transition ponownie sprawdza admission generation po przejęciu tego locka i
+bezpośrednio przed commit phase; close pod tym samym lockiem zamyka admission
+i inkrementuje generation. Zatem submit może wygrać tylko, gdy jego transition
+już przeszedł drugi check i posiada lock; jeżeli close inkrementuje generation
+wcześniej, `try_begin_submit()` kończy się typed `AdmissionClosed`.
+
 ## D5. Startup, epoch i fail-closed health
 
 Startup nowych candidate admissions wymaga:
@@ -216,6 +224,11 @@ może ukryć wcześniejszego primary gap. Overflow samego bounded control plane
 jest osobnym fail-closed degradation, ponieważ runtime nie potrafi już
 dowieść, że nie utracił primary coverage; zwykły, zidentyfikowany gap
 secondary/NLN nadal jest audit-only.
+
+Candidate-admission `PoolDetected` wymusza `BackpressurePolicy::Block`
+niezależnie od ustawionego `DropNew`; nasycenie tej structural lane zawsze
+tworzy primary coverage-gap notice. `ContinuityOnly` i `Suppressed` zachowują
+skonfigurowaną politykę, ponieważ nie są nową admission structural mutation.
 
 ## D6. Continuity i AccountStateCore
 
@@ -268,6 +281,20 @@ typed admission/permit, Event Bus adapter i realny
 `PoolObservationSession::ingest_transaction_with_apply_result`; test porównuje
 faktyczne canonical emissions, downstream applies, Ready i klasyfikację
 różnicy z oczekiwaniem fixture. Nie jest to już test wyłącznie hasha/schematu.
+
+Każdy rekord fixture zawiera i asercjuje także `ready_publications`,
+`mfs_materializations`, `gatekeeper_invocations` oraz `sender_calls`.
+`primary_create_session_apply_ready` wykonuje `InitializePool` → canonical
+`NewPoolDetected` → `OracleRuntime::register_new_pool_with_apply_outcome` →
+realne `SessionManager::open_session`; `create_and_initial_buy_one_signature`
+łączy `InitializePool` i `Trade` pod jednym inventory. `writer_stall`
+zatrzymuje rzeczywisty bounded NLN artifact-writer worker przed odbiorem,
+nasyca jego kolejkę i potwierdza canonical apply przed zwolnieniem oraz
+fizycznym appendem. `queue_saturation` nasyca realne IPC i odbiera
+control-plane notice, zaś `conflict_race_with_submit` używa dwóch wątków i
+bariery wokół production submit transition. MFS count pochodzi z
+`try_materialize_features()`, a sender count z instrumentowanego adaptera
+wywołującego rzeczywisty `CandidateIntegritySubmitGuardV1`.
 
 Pełny parent-versus-Enforce run na tym samym production-like input pozostaje
 osobną, niezamkniętą bramką przed merge. Nie wolno opisywać committed
@@ -331,16 +358,19 @@ buffer, fault-injection i active-guard testy są uruchamiane ponownie po
 review remediation. Dopóki pełna macierz nie zostanie ponownie zapisana dla
 finalnego SHA, ten ADR nie deklaruje finalnego offline/differential PASS.
 
-Pełne package/workspace suites pozostają czerwone wyłącznie przez exact
-historyczne failure classes zamrożone na `103212b`. Release workspace build
-przeszedł. Formalny 5-warmup/20-pair performance protocol przeszedł bez
-waivera:
+Pełne package/workspace suites historycznego receipt'u pozostają czerwone
+wyłącznie przez exact historyczne failure classes zamrożone na `103212b`.
+Historyczny release workspace build przeszedł. Formalny 5-warmup/20-pair
+performance protocol dla wcześniejszego SHA przeszedł bez waivera:
 
 - throughput lower one-sided 95% CI: `1.018097198`;
 - receive-to-normalize p99 upper one-sided 95% CI: `0.958477979`;
 - missing events: `0`;
 - silent drops: `0`;
 - receiver saturation blocking: `0`.
+
+Wartości te nie są finalnym receipt'em aktualnego remediacyjnego diffu; po
+zacommitowaniu finalnego SHA wymagają ponownego uruchomienia zgodnie z planem.
 
 Parser V1/V2 digests muszą pozostać niezmienione. Szczegóły, log hashes,
 rollback identity oraz status niezamkniętych external gates znajdują się w
@@ -378,6 +408,12 @@ admission.
   primary record; first eviction oraz counters pozostają audytowalne;
 - unresolved canonical receipt nie może być wycofany: terminal cleanup
   fail-closes new admission zamiast go silently evictować.
+
+Pierwszy terminalny technical failure bez unresolved receipt i bez Oracle
+session przechodzi identyczną bounded retirement ścieżkę. Dzięki temu missing
+observation, boundary mismatch i pre-session conflict nie pozostają trwale w
+aktywnych indeksach `records`, `by_pool` i `by_mint`; ich późne evidence
+pozostaje wyłącznie w bounded immutable tombstone history.
 
 W ten sposób `max_candidates` i `max_primary_canonical_mutations` pozostają
 bounded protection przed aktywnym overloadem, a nie deterministycznym

@@ -6,18 +6,28 @@
 //! second runtime authority.
 
 use crate::{
-    candidate_integrity::{CandidateIntegrityRegistry, CandidateTerminalTransitionV1},
+    candidate_integrity::{
+        CandidateIntegrityRegistry, CandidateIntegritySubmitGuardV1, CandidateSubmitTransitionV1,
+        CandidateTerminalTransitionV1,
+    },
     components::seer::{
         authorize_pool_runtime_disposition, handle_local_coverage_gap_notice,
-        ingest_pump_observation, process_trade_event_for_session_gate,
-        replay_buffered_canonical_trades, CanonicalRuntimeAdmissionV1,
-        CanonicalRuntimeNoApplyReasonV1, SessionPoolTradeBridge, SessionTradeDecision,
+        ingest_pump_observation, process_pool_detected_event_for_session_gate,
+        process_trade_event_for_session_gate, replay_buffered_canonical_trades,
+        CanonicalRuntimeAdmissionV1, CanonicalRuntimeNoApplyReasonV1,
+        NlnArtifactWriterStallProbeV1, SessionPoolTradeBridge, SessionTradeDecision,
     },
     events::{create_event_bus, CanonicalRuntimePermitV1, GhostEvent},
-    session::{observation::CanonicalMutationApplyOutcomeV1, PoolObservationSession},
-    tx_intelligence::TxIntelligenceConfig,
+    oracle_runtime::OracleRuntime,
+    session::{
+        observation::CanonicalMutationApplyOutcomeV1, OpenSessionRequest, PoolObservationSession,
+        SharedSession,
+    },
+    tx_intelligence::{FundingSourceConfig, TxIntelligenceConfig},
 };
-use ghost_brain::{config::GatekeeperV2Config, fast_pipeline::EnhancedCandidate};
+use ghost_brain::{
+    config::GatekeeperV2Config, fast_pipeline::EnhancedCandidate, oracle::HyperPredictionOracle,
+};
 use ghost_core::{
     account_state_core::{
         reducer::AccountStateReducer,
@@ -31,22 +41,31 @@ use ghost_core::{
 };
 use seer::{
     early_fingerprint::EarlyFingerprintConfig,
-    ipc::{LocalCoverageGapNoticeV1, PoolDetectionRuntimeDispositionV1},
-    types::{InstructionProvenance, RawBytesMissingReason, ToolchainFingerprintInput, TradeEvent},
+    ipc::{
+        create_ipc_channel, BackpressurePolicy, EventPriority, IpcChannelConfig, IpcError,
+        PoolDetectionRuntimeDispositionV1,
+    },
+    types::{
+        CandidatePool, InstructionProvenance, RawBytesMissingReason, ToolchainFingerprintInput,
+        TradeEvent,
+    },
 };
 use serde::Deserialize;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use std::{
     collections::BTreeSet,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Barrier, Mutex,
+    },
     time::{Duration, Instant},
 };
 
 const MANIFEST_BYTES: &[u8] = include_bytes!("../tests/fixtures/pr1e/pr1e_corpus_manifest_v1.json");
-const MANIFEST_BLAKE3: &str = "cd28c798082999cf2377842199ffabb6601f7115417da244a3cf864e5ef27208";
+const MANIFEST_BLAKE3: &str = "d111283727259e44a80338e1a4d81fc4c40daff06e67640cd090501874aa42dd";
 const CROSS_LAYER_BYTES: &[u8] =
     include_bytes!("../tests/fixtures/pr1e/pr1e_cross_layer_scenarios_v1.jsonl");
-const CROSS_LAYER_BLAKE3: &str = "30fbf78344afd77958fe573af5c2414139023db4c770b03c0f710026b7cdd38c";
+const CROSS_LAYER_BLAKE3: &str = "db5812ac10d5fcdede623037ead4baf42c2da90d929969bdb35ad1b06a4a8bae";
 const PR1C_V2_BYTES: &[u8] = include_bytes!(
     "../../ghost-core/tests/fixtures/account_observation_arbiter_v1/account_observation_differential_corpus_v2.jsonl"
 );
@@ -79,6 +98,10 @@ struct CrossLayerScenarioV1 {
     phase: String,
     expected_canonical_emissions: u64,
     expected_canonical_applies: u64,
+    expected_ready_publications: u64,
+    expected_mfs_materializations: u64,
+    expected_gatekeeper_invocations: u64,
+    expected_sender_calls: u64,
     expected_false_ready: u64,
     difference_class: Option<String>,
 }
@@ -126,6 +149,74 @@ fn primary_trade_observation(
             payload_hash_blake3: [ordinal.saturating_add(1) as u8; 32],
             received_at_monotonic_ns: u64::from(ordinal) + 1,
         },
+    }
+}
+
+fn primary_initialize_pool_observation(
+    signature: Signature,
+    pool: Pubkey,
+    mint: Pubkey,
+    ordinal: u32,
+    inventory: Option<u32>,
+) -> ObservedPumpMutationV1 {
+    let locator = RawPumpMutationLocatorV1 {
+        program_id: Pubkey::new_from_array([4; 32]),
+        signature,
+        outer_instruction_index: ordinal as u16,
+        inner_instruction_path: vec![ordinal as u16],
+        semantic_event_ordinal: ordinal,
+    };
+    ObservedPumpMutationV1 {
+        mutation_family: PumpMutationFamilyV1::InitializePool,
+        signature,
+        locator_hint: Some(locator.clone()),
+        canonical_order: Some(CanonicalPumpOrderKeyV1 {
+            slot: 10,
+            tx_index: 0,
+            outer_instruction_index: locator.outer_instruction_index,
+            inner_instruction_path: locator.inner_instruction_path.clone(),
+            semantic_event_ordinal: ordinal,
+        }),
+        raw_transaction_mutation_count: inventory,
+        claims: PumpMutationClaimsV1 {
+            curve: Some(pool),
+            mint: Some(mint),
+            success: Some(true),
+            ..PumpMutationClaimsV1::default()
+        },
+        raw_provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
+        provenance: ObservationProvenanceV1 {
+            source_family: ObservationSourceFamilyV1::RawYellowstone,
+            source_id: "yellowstone".to_string(),
+            provider_id: "primary".to_string(),
+            schema_id: "prost_subscribe_update_transaction_v1".to_string(),
+            payload_hash_blake3: [ordinal.saturating_add(1) as u8; 32],
+            received_at_monotonic_ns: u64::from(ordinal) + 1,
+        },
+    }
+}
+
+fn candidate_carrier(signature: Signature, pool: Pubkey, mint: Pubkey) -> CandidatePool {
+    CandidatePool {
+        semantic: ghost_core::EventSemanticEnvelope::default(),
+        provider_id: Some("primary".to_string()),
+        provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
+        slot: Some(10),
+        tx_index: Some(0),
+        event_ts_ms: Some(1_000),
+        event_time: ghost_core::EventTimeMetadata::default(),
+        signature: signature.to_string(),
+        amm_program_id: Pubkey::new_from_array([4; 32]),
+        pool_amm_id: pool,
+        base_mint: mint,
+        quote_mint: Pubkey::new_unique(),
+        bonding_curve: pool,
+        creator: Pubkey::new_unique(),
+        timestamp: 1_000,
+        bonding_curve_progress: Some(0.0),
+        initial_liquidity_sol: Some(1.0),
+        token_total_supply: Some(1_000_000),
+        block_time: Some(1),
     }
 }
 
@@ -240,6 +331,168 @@ fn qualification_session(pool: Pubkey, mint: Pubkey) -> PoolObservationSession {
             EarlyFingerprintConfig::default(),
         ),
     )
+}
+
+fn qualification_oracle_runtime() -> OracleRuntime {
+    OracleRuntime::new(
+        Arc::new(HyperPredictionOracle::default()),
+        Pubkey::new_unique().to_string(),
+        Pubkey::new_unique().to_string(),
+        Arc::new(ghost_core::shadow_ledger::ShadowLedger::new()),
+    )
+}
+
+fn enhanced_candidate_from_carrier(candidate: &CandidatePool) -> EnhancedCandidate {
+    EnhancedCandidate {
+        pool_amm_id: candidate.pool_amm_id,
+        amm_program_id: candidate.amm_program_id,
+        base_mint: candidate.base_mint,
+        quote_mint: candidate.quote_mint,
+        bonding_curve: candidate.bonding_curve,
+        slot: candidate.slot,
+        timestamp: candidate.timestamp,
+        initial_liquidity_sol: candidate.initial_liquidity_sol.unwrap_or_default(),
+        signature: candidate.signature.clone(),
+        ..EnhancedCandidate::default()
+    }
+}
+
+fn open_qualification_oracle_session(
+    runtime: &OracleRuntime,
+    candidate: &CandidatePool,
+) -> Option<SharedSession> {
+    let gatekeeper_config = GatekeeperV2Config::default();
+    runtime
+        .session_manager()
+        .open_session(OpenSessionRequest {
+            pool_amm_id: candidate.pool_amm_id,
+            base_mint: candidate.base_mint,
+            bonding_curve: candidate.bonding_curve,
+            dev_wallet: Some(candidate.creator),
+            candidate_snapshot: enhanced_candidate_from_carrier(candidate),
+            created_at_wall_ms: candidate.timestamp,
+            deadline_wall_ms: Some(candidate.timestamp.saturating_add(60_000)),
+            gatekeeper_config: gatekeeper_config.clone(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config),
+            fingerprint_config: EarlyFingerprintConfig::default(),
+        })
+        .ok()?;
+    runtime
+        .session_manager()
+        .get_session(&candidate.pool_amm_id)
+}
+
+/// Exercise the production `NewPoolDetected` adapter and the real
+/// `OracleRuntime` structural-registration owner before completing an
+/// InitializePool receipt.  A bus enqueue alone is deliberately not an
+/// acknowledgement.
+fn forward_permitted_initialize_through_oracle(
+    runtime: &OracleRuntime,
+    registry: &Arc<CandidateIntegrityRegistry>,
+    bridge: &mut SessionPoolTradeBridge,
+    candidate: &CandidatePool,
+    permit: CanonicalRuntimePermitV1,
+    now: Instant,
+) -> (CrossLayerExecutionV1, SharedSession) {
+    let (event_tx, mut event_rx) = create_event_bus();
+    let _flush = process_pool_detected_event_for_session_gate(
+        &event_tx,
+        bridge,
+        candidate,
+        None,
+        now,
+        candidate.timestamp,
+        permit.clone(),
+        registry,
+    );
+    let (detected, receipt) = match event_rx
+        .try_recv()
+        .expect("canonical NewPool Event Bus delivery")
+    {
+        GhostEvent::NewPoolDetected(detected, Some(permit)) => (detected, permit.apply_receipt),
+        other => {
+            panic!("production adapter must emit one permitted NewPoolDetected, got {other:?}")
+        }
+    };
+    let pool = Pubkey::try_from(detected.pool_amm_id.as_str()).expect("detected pool pubkey");
+    let mint = Pubkey::try_from(detected.base_mint.as_str()).expect("detected mint pubkey");
+    let apply = runtime.register_new_pool_with_apply_outcome(
+        pool,
+        mint,
+        enhanced_candidate_from_carrier(candidate),
+        Pubkey::try_from(detected.creator.as_str()).ok(),
+    );
+    // Registration is only the first half of InitializePool downstream
+    // application.  The permit is acknowledged only after the actual
+    // SessionManager has accepted the same identity; a failed open fails the
+    // receipt instead of publishing Ready from registration alone.
+    let session = (apply == CanonicalMutationApplyOutcomeV1::AppliedNewMutation)
+        .then(|| open_qualification_oracle_session(runtime, candidate))
+        .flatten();
+    let completion_apply = if session.is_some() {
+        apply
+    } else {
+        CanonicalMutationApplyOutcomeV1::Failed
+    };
+    let completion = complete_receipt_after_session_apply(registry, &receipt, completion_apply);
+    let session = session.expect("canonical Oracle registration must open its matching session");
+    (
+        CrossLayerExecutionV1 {
+            canonical_emissions: 1,
+            downstream_applies: completion.downstream_applies,
+            ready_publications: completion.ready_publications,
+            ..CrossLayerExecutionV1::default()
+        },
+        session,
+    )
+}
+
+/// The production MFS builder is executed between the two existing integrity
+/// generation checks.  If a conflict arrives while the immutable snapshot is
+/// being built, the snapshot is deliberately not published and this helper
+/// returns `false`.
+fn materialize_mfs_under_integrity_guard(
+    session: &PoolObservationSession,
+    guard: &crate::candidate_integrity::CandidateIntegrityEvaluationGuardV1,
+    between_build_and_publish: impl FnOnce(),
+) -> bool {
+    guard
+        .check_ready()
+        .expect("Ready is required before MFS materialization");
+    let _materialized = session
+        .try_materialize_features()
+        .expect("qualification session must use the production MFS builder");
+    between_build_and_publish();
+    if guard.check_ready().is_err() {
+        return false;
+    }
+    guard.mark_mfs_materialized().is_ok()
+}
+
+/// Test-only instrumented sender adapter.  It owns no admission policy: a
+/// counter moves only after the production submit guard atomically reports
+/// `StartedNow`.
+#[derive(Clone, Default)]
+struct InstrumentedSenderAdapterV1 {
+    calls: Arc<AtomicU64>,
+}
+
+impl InstrumentedSenderAdapterV1 {
+    fn send(
+        &self,
+        guard: &CandidateIntegritySubmitGuardV1,
+    ) -> Result<CandidateSubmitTransitionV1, crate::candidate_integrity::CandidateIntegrityErrorV1>
+    {
+        let transition = guard.try_begin_submit()?;
+        if transition == CandidateSubmitTransitionV1::StartedNow {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(transition)
+    }
+
+    fn call_count(&self) -> u64 {
+        self.calls.load(Ordering::Acquire)
+    }
 }
 
 fn primary_permit(
@@ -480,9 +733,20 @@ fn assert_no_runtime_permit(admission: CanonicalRuntimeAdmissionV1) {
 /// The fixture has no embedded fake outcome: each `scenario_id` selects a
 /// concrete production action sequence and the returned counters are the
 /// actual result compared with its immutable JSONL expectation below.
-fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV1 {
+async fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV1 {
     let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
-    let registry = Arc::new(CandidateIntegrityRegistry::default());
+    // Only InitializePool scenarios construct an Oracle runtime; all other
+    // rows retain the same real ledger/registry/session adapters while
+    // avoiding unrelated runtime construction work.
+    let runtime = matches!(
+        scenario_id,
+        "primary_create_session_apply_ready" | "create_and_initial_buy_one_signature"
+    )
+    .then(qualification_oracle_runtime);
+    let registry = runtime
+        .as_ref()
+        .map(OracleRuntime::candidate_integrity_registry)
+        .unwrap_or_else(|| Arc::new(CandidateIntegrityRegistry::default()));
     let pool = Pubkey::new_unique();
     let mint = Pubkey::new_unique();
     let signature = Signature::new_unique();
@@ -495,7 +759,41 @@ fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV1 {
     let mut session = qualification_session(pool, mint);
 
     match scenario_id {
-        "primary_create_session_apply_ready" | "writer_stall" => {
+        "primary_create_session_apply_ready" => {
+            let runtime = runtime
+                .as_ref()
+                .expect("InitializePool qualification owns one Oracle runtime");
+            let carrier = candidate_carrier(signature, pool, mint);
+            let permit = primary_permit(
+                &ledger,
+                &registry,
+                primary_initialize_pool_observation(signature, pool, mint, 0, Some(1)),
+                1,
+            );
+            let (execution, session) = forward_permitted_initialize_through_oracle(
+                runtime,
+                &registry,
+                &mut bridge,
+                &carrier,
+                permit,
+                Instant::now(),
+            );
+            assert_eq!(execution.ready_publications, 1);
+            assert!(runtime.lookup_pool_identity(&pool).is_some());
+            assert_eq!(
+                runtime.session_manager().active_session_count(),
+                1,
+                "InitializePool opens the production Oracle session exactly once"
+            );
+            assert_eq!(session.read().pool_amm_id, pool);
+            execution
+        }
+        "writer_stall" => {
+            let writer_stall = NlnArtifactWriterStallProbeV1::start().await;
+            assert!(
+                writer_stall.fill_and_saturate(),
+                "the real bounded NLN artifact writer queue must report typed saturation"
+            );
             let (_, execution) = apply_unique_primary(
                 &ledger,
                 &registry,
@@ -509,9 +807,66 @@ fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV1 {
                 1,
             );
             assert_eq!(execution.ready_publications, 1);
+            assert!(
+                !writer_stall.completed(),
+                "canonical receiver/session apply must complete before the stalled writer append"
+            );
+            assert!(
+                writer_stall.release_and_join().await,
+                "the released production artifact writer must complete its physical append"
+            );
             execution
         }
-        "create_and_initial_buy_one_signature" | "two_trade_mutations_one_signature" => {
+        "create_and_initial_buy_one_signature" => {
+            let runtime = runtime
+                .as_ref()
+                .expect("InitializePool qualification owns one Oracle runtime");
+            let mut execution = CrossLayerExecutionV1::default();
+            let carrier = candidate_carrier(signature, pool, mint);
+            let initialize_permit = primary_permit(
+                &ledger,
+                &registry,
+                primary_initialize_pool_observation(signature, pool, mint, 0, Some(2)),
+                1,
+            );
+            let (first, opened_session) = forward_permitted_initialize_through_oracle(
+                runtime,
+                &registry,
+                &mut bridge,
+                &carrier,
+                initialize_permit,
+                Instant::now(),
+            );
+            assert_eq!(
+                first.downstream_applies, 1,
+                "InitializePool reached Oracle state owner"
+            );
+            assert_eq!(
+                first.ready_publications, 0,
+                "create locator alone is not Ready"
+            );
+            add_execution(&mut execution, first);
+            let mut opened_session = opened_session.write();
+            let (_, second) = apply_unique_primary(
+                &ledger,
+                &registry,
+                &mut bridge,
+                &mut opened_session,
+                signature,
+                pool,
+                mint,
+                1,
+                Some(2),
+                2,
+            );
+            assert_eq!(
+                second.ready_publications, 1,
+                "final exact locator releases once"
+            );
+            add_execution(&mut execution, second);
+            execution
+        }
+        "two_trade_mutations_one_signature" => {
             let mut execution = CrossLayerExecutionV1::default();
             let (_, first) = apply_unique_primary(
                 &ledger,
@@ -527,7 +882,7 @@ fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV1 {
             );
             assert_eq!(
                 first.ready_publications, 0,
-                "first locator is not Ready alone"
+                "first trade locator is not Ready alone"
             );
             add_execution(&mut execution, first);
             let (_, second) = apply_unique_primary(
@@ -544,7 +899,7 @@ fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV1 {
             );
             assert_eq!(
                 second.ready_publications, 1,
-                "final exact locator releases once"
+                "second trade locator releases once"
             );
             add_execution(&mut execution, second);
             execution
@@ -656,14 +1011,35 @@ fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV1 {
             let guard = registry
                 .evaluation_guard(candidate)
                 .expect("Ready before conflict");
-            guard.mark_mfs_materialized().expect("MFS phase");
-            execution.mfs_materializations = 1;
-            if scenario_id != "conflict_during_mfs" {
-                guard.mark_evaluation_running().expect("evaluation phase");
+            if scenario_id == "conflict_during_mfs" {
+                let materialized = materialize_mfs_under_integrity_guard(&session, &guard, || {
+                    registry
+                        .record_signal(lifecycle_conflict_signal(
+                            candidate,
+                            signature,
+                            permit.locator.clone(),
+                        ))
+                        .expect("typed conflict");
+                });
+                assert!(
+                    !materialized,
+                    "a conflict between real MFS build and publication must orphan the snapshot"
+                );
+                assert!(guard.check_ready().is_err());
+                execution.difference_class = Some("EVALUATION_TECHNICALLY_ABORTED");
+                return execution;
             }
 
+            assert!(
+                materialize_mfs_under_integrity_guard(&session, &guard, || {}),
+                "production MFS materialization must publish only while Ready"
+            );
+            execution.mfs_materializations = 1;
+            guard.mark_evaluation_running().expect("evaluation phase");
+            let sender = InstrumentedSenderAdapterV1::default();
+
             let difference_class = match scenario_id {
-                "conflict_during_mfs" | "conflict_during_evaluation" => {
+                "conflict_during_evaluation" => {
                     registry
                         .record_signal(lifecycle_conflict_signal(
                             candidate,
@@ -686,16 +1062,69 @@ fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV1 {
                             permit.locator.clone(),
                         ))
                         .expect("typed conflict");
-                    assert!(submit.try_begin_submit().is_err());
+                    assert!(sender.send(&submit).is_err());
+                    assert_eq!(sender.call_count(), 0);
                     "EXECUTION_CANCELLED_BEFORE_SUBMIT"
                 }
-                "conflict_race_with_submit" | "conflict_after_submit" => {
+                "conflict_race_with_submit" => {
                     let submit = guard
                         .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
                         .expect("BUY terminal")
                         .expect("submit guard");
-                    assert!(submit.try_begin_submit().is_ok());
-                    execution.sender_calls = 1;
+                    let transition_entered = Arc::new(Barrier::new(2));
+                    let allow_submit = Arc::new(Barrier::new(2));
+                    let entered = Arc::clone(&transition_entered);
+                    let release = Arc::clone(&allow_submit);
+                    registry.set_transition_before_commit_hook(Some(Arc::new(move || {
+                        entered.wait();
+                        release.wait();
+                    })));
+                    let submit_sender = sender.clone();
+                    let submit_guard = submit.clone();
+                    let submit_thread =
+                        std::thread::spawn(move || submit_sender.send(&submit_guard));
+                    transition_entered.wait();
+
+                    let conflict_ready = Arc::new(Barrier::new(2));
+                    let conflict_start = Arc::clone(&conflict_ready);
+                    let conflict_registry = Arc::clone(&registry);
+                    let conflict_locator = permit.locator.clone();
+                    let conflict_thread = std::thread::spawn(move || {
+                        conflict_start.wait();
+                        conflict_registry.record_signal(lifecycle_conflict_signal(
+                            candidate,
+                            signature,
+                            conflict_locator,
+                        ))
+                    });
+                    conflict_ready.wait();
+                    allow_submit.wait();
+                    assert_eq!(
+                        submit_thread
+                            .join()
+                            .expect("submit race thread join")
+                            .expect("submit wins the shared-state linearization"),
+                        CandidateSubmitTransitionV1::StartedNow
+                    );
+                    conflict_thread
+                        .join()
+                        .expect("conflict race thread join")
+                        .expect("typed conflict records after submit linearizes");
+                    registry.set_transition_before_commit_hook(None);
+                    execution.sender_calls = sender.call_count();
+                    assert_eq!(execution.sender_calls, 1);
+                    assert!(submit.requires_reconciliation());
+                    "POST_SUBMIT_RECONCILIATION_REQUIRED"
+                }
+                "conflict_after_submit" => {
+                    let submit = guard
+                        .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
+                        .expect("BUY terminal")
+                        .expect("submit guard");
+                    assert_eq!(
+                        sender.send(&submit).expect("instrumented sender starts"),
+                        CandidateSubmitTransitionV1::StartedNow
+                    );
                     registry
                         .record_signal(lifecycle_conflict_signal(
                             candidate,
@@ -703,6 +1132,8 @@ fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV1 {
                             permit.locator.clone(),
                         ))
                         .expect("typed conflict");
+                    execution.sender_calls = sender.call_count();
+                    assert_eq!(execution.sender_calls, 1);
                     assert!(submit.requires_reconciliation());
                     "POST_SUBMIT_RECONCILIATION_REQUIRED"
                 }
@@ -711,11 +1142,15 @@ fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV1 {
                         .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
                         .expect("BUY terminal")
                         .expect("submit guard");
-                    assert!(submit.try_begin_submit().is_ok());
+                    assert_eq!(
+                        sender.send(&submit).expect("instrumented sender starts"),
+                        CandidateSubmitTransitionV1::StartedNow
+                    );
                     submit
                         .mark_confirmed()
                         .expect("confirmation remains authoritative");
-                    execution.sender_calls = 1;
+                    execution.sender_calls = sender.call_count();
+                    assert_eq!(execution.sender_calls, 1);
                     registry
                         .record_signal(lifecycle_conflict_signal(
                             candidate,
@@ -882,14 +1317,63 @@ fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV1 {
             CrossLayerExecutionV1::default()
         }
         "queue_saturation" => {
+            let (sender, receiver, _metrics) = create_ipc_channel(IpcChannelConfig {
+                buffer_size: 1,
+                backpressure_policy: BackpressurePolicy::DropNew,
+                log_drops: false,
+                log_overflows: false,
+                warning_threshold_percent: 100.0,
+                account_update_queue_capacity: 1,
+            });
+            let mut local_gap_rx = receiver.local_coverage_gap_receiver();
+            let pool_carrier = candidate_carrier(signature, pool, mint);
+            let primary_observation =
+                primary_initialize_pool_observation(signature, pool, mint, 0, Some(1));
+            let mut saturation = None;
+            for _ in 0..128 {
+                match sender
+                    .send_with_observation(
+                        pool_carrier.clone(),
+                        Some(primary_observation.clone()),
+                        EventPriority::Normal,
+                    )
+                    .await
+                {
+                    Ok(()) => tokio::task::yield_now().await,
+                    Err(IpcError::LocalProcessingGap) => {
+                        saturation = Some(());
+                        break;
+                    }
+                    Err(other) => {
+                        panic!("candidate-admission IPC saturation must fail closed: {other}")
+                    }
+                }
+            }
+            assert!(
+                saturation.is_some(),
+                "a real full DropNew IPC queue must become a primary local coverage gap"
+            );
+            tokio::time::timeout(Duration::from_secs(1), local_gap_rx.changed())
+                .await
+                .expect("real IPC saturation must notify independent control plane")
+                .expect("local-gap control plane remains available");
+            let notice = local_gap_rx
+                .borrow_and_update()
+                .notices
+                .iter()
+                .find(|notice| notice.provider_id == "primary")
+                .cloned()
+                .expect("primary PoolDetected saturation notice");
             assert!(handle_local_coverage_gap_notice(
                 registry.as_ref(),
-                "primary",
-                &LocalCoverageGapNoticeV1 {
-                    provider_id: "primary".to_string(),
-                    reason: ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
-                },
+                &notice.provider_id,
+                &notice,
             ));
+            assert!(
+                !registry.candidate_admission_open(),
+                "primary IPC coverage gap closes candidate admission before MFS/Gatekeeper/submit"
+            );
+            assert!(registry.evaluation_guard(candidate).is_err());
             assert!(matches!(
                 ingest_pump_observation(
                     &ledger,
@@ -1002,8 +1486,8 @@ fn pr1e_manifest_is_frozen_and_references_all_existing_pr1_corpora() {
     assert_eq!(actual, required);
 }
 
-#[test]
-fn pr1e_frozen_cross_layer_corpus_executes_each_scenario_through_production_adapters() {
+#[tokio::test]
+async fn pr1e_frozen_cross_layer_corpus_executes_each_scenario_through_production_adapters() {
     let scenarios = std::str::from_utf8(CROSS_LAYER_BYTES)
         .expect("UTF-8 JSONL")
         .lines()
@@ -1016,7 +1500,7 @@ fn pr1e_frozen_cross_layer_corpus_executes_each_scenario_through_production_adap
     );
 
     for scenario in scenarios {
-        let actual = execute_cross_layer_scenario(&scenario.scenario_id);
+        let actual = execute_cross_layer_scenario(&scenario.scenario_id).await;
         assert_eq!(
             actual.canonical_emissions, scenario.expected_canonical_emissions,
             "{}: production canonical emission count",
@@ -1028,6 +1512,26 @@ fn pr1e_frozen_cross_layer_corpus_executes_each_scenario_through_production_adap
             scenario.scenario_id
         );
         assert_eq!(
+            actual.ready_publications, scenario.expected_ready_publications,
+            "{}: Ready publications released only after all exact downstream applies",
+            scenario.scenario_id
+        );
+        assert_eq!(
+            actual.mfs_materializations, scenario.expected_mfs_materializations,
+            "{}: actual production MFS materialization count",
+            scenario.scenario_id
+        );
+        assert_eq!(
+            actual.gatekeeper_invocations, scenario.expected_gatekeeper_invocations,
+            "{}: Gatekeeper invocation count",
+            scenario.scenario_id
+        );
+        assert_eq!(
+            actual.sender_calls, scenario.expected_sender_calls,
+            "{}: instrumented sender calls after production submit guard",
+            scenario.scenario_id
+        );
+        assert_eq!(
             actual.false_ready, scenario.expected_false_ready,
             "{}: Ready may not be visible before exact downstream apply",
             scenario.scenario_id
@@ -1036,11 +1540,6 @@ fn pr1e_frozen_cross_layer_corpus_executes_each_scenario_through_production_adap
             actual.difference_class.map(str::to_owned),
             scenario.difference_class,
             "{}: classified parent-to-enforce difference",
-            scenario.scenario_id
-        );
-        assert_eq!(
-            actual.gatekeeper_invocations, 0,
-            "{}: qualification never turns a technical integrity path into a policy evaluation",
             scenario.scenario_id
         );
     }
@@ -1272,12 +1771,18 @@ async fn pr1e_runner_preserves_multi_locator_inventory_and_witness_arrival_order
             pool_amm_id: witness_pool,
             mint: witness_mint,
         }),
-        Err(
-            crate::candidate_integrity::CandidateIntegrityErrorV1::NotReady(
-                CandidateIntegrityOutcomeV1::SourceReconciliationConflict
-            )
-        )
+        Err(crate::candidate_integrity::CandidateIntegrityErrorV1::CandidateMissing)
     ));
+    assert_eq!(
+        conflict_registry
+            .snapshot(PumpCandidateIdentityV1 {
+                pool_amm_id: witness_pool,
+                mint: witness_mint,
+            })
+            .expect("pre-session conflict remains in bounded terminal evidence")
+            .outcome,
+        CandidateIntegrityOutcomeV1::SourceReconciliationConflict
+    );
     assert_eq!(
         conflict_ledger
             .lock()

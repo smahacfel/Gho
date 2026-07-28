@@ -54,7 +54,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, oneshot, watch, Notify};
 use tracing::{debug, error, info, warn};
 
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
@@ -344,6 +344,111 @@ impl NlnArtifactWriter {
             message.offset_raw.clone(),
         ];
         nln_stable_hash_u64(&parts) % u64::from(rate) == 0
+    }
+}
+
+/// Test-only controlled execution of the production bounded NLN artifact
+/// writer.  The worker is deliberately held before its first receive so the
+/// qualification runner can prove two independent facts: the real writer
+/// queue becomes full with typed evidence, and a primary runtime mutation can
+/// still complete before the delayed physical artifact append is released.
+///
+/// This is not a second production writer.  It uses the same
+/// `NlnArtifactWriter::try_send_bounded`, `open_nln_artifact_file`,
+/// `write_nln_artifact_line`, and flush primitives as the production worker;
+/// only the deterministic pre-receive barrier is test-only.
+#[cfg(test)]
+pub(crate) struct NlnArtifactWriterStallProbeV1 {
+    writer: NlnArtifactWriter,
+    release_writer: Arc<Notify>,
+    completed: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+    output_path: PathBuf,
+    _temp_dir: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl NlnArtifactWriterStallProbeV1 {
+    pub(crate) async fn start() -> Self {
+        let temp_dir = tempfile::tempdir().expect("PR1E artifact writer tempdir");
+        let output_path = temp_dir.path().join("pumpfun_create_raw_v1.jsonl");
+        let (tx, mut rx) = mpsc::channel(1);
+        let writer = NlnArtifactWriter {
+            tx,
+            transfer_sample_rate: 1,
+            delivery_state: Arc::new(NlnArtifactDeliveryState::default()),
+        };
+        let release_writer = Arc::new(Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = oneshot::channel();
+        let worker_release = Arc::clone(&release_writer);
+        let worker_completed = Arc::clone(&completed);
+        let worker_output_path = output_path.clone();
+        let task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            worker_release.notified().await;
+            let Some(NlnArtifactRecord::PumpFunCreateRaw(row)) = rx.recv().await else {
+                return;
+            };
+            let mut artifact =
+                open_nln_artifact_file(worker_output_path, "pumpfun_create_raw_v1").await;
+            write_nln_artifact_line(&mut artifact, &row, "pumpfun_create_raw_v1").await;
+            flush_nln_artifact_writer(&mut artifact, "pumpfun_create_raw_v1").await;
+            worker_completed.store(true, Ordering::Release);
+        });
+        started_rx
+            .await
+            .expect("PR1E artifact writer worker must start before saturation");
+        Self {
+            writer,
+            release_writer,
+            completed,
+            task,
+            output_path,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    pub(crate) fn fill_and_saturate(&self) -> bool {
+        let accepted = self.writer.try_send_bounded(
+            NlnArtifactRecord::PumpFunCreateRaw(json!({"qualification": 1})),
+            "pumpfun_create_raw_v1",
+        );
+        let saturated = !self.writer.try_send_bounded(
+            NlnArtifactRecord::PumpFunTradeRaw(json!({"qualification": 2})),
+            "pumpfun_trade_raw_v1",
+        );
+        let snapshot = self.writer.delivery_snapshot();
+        accepted
+            && saturated
+            && !snapshot.artifact_segment_complete
+            && snapshot.overflow_count == 1
+            && snapshot
+                .first_overflow
+                .is_some_and(|overflow| overflow.reason == NlnArtifactOverflowReasonV1::QueueFull)
+    }
+
+    #[must_use]
+    pub(crate) fn completed(&self) -> bool {
+        self.completed.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn release_and_join(self) -> bool {
+        let Self {
+            release_writer,
+            completed,
+            task,
+            output_path,
+            _temp_dir,
+            ..
+        } = self;
+        release_writer.notify_one();
+        if task.await.is_err() || !completed.load(Ordering::Acquire) {
+            return false;
+        }
+        tokio::fs::read_to_string(&output_path)
+            .await
+            .is_ok_and(|content| content.contains("qualification"))
     }
 }
 

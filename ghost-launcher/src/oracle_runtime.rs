@@ -4828,7 +4828,7 @@ impl OracleRuntime {
         true
     }
 
-    fn register_new_pool_with_apply_outcome(
+    pub(crate) fn register_new_pool_with_apply_outcome(
         &self,
         pool_amm_id: Pubkey,
         base_mint: Pubkey,

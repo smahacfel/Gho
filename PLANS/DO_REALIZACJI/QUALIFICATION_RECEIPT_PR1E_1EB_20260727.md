@@ -1,7 +1,7 @@
 # PR1E 1E-B — production authority cutover qualification receipt
 
 Status:
-`IMPLEMENTED / REVIEW REMEDIATION COMPLETE LOCALLY / CLOSED RUNTIME RUN PENDING / DRAFT PR`
+`IMPLEMENTED / REVIEW REMEDIATION COMPLETE LOCALLY / FINAL LOCAL MATRIX PENDING / DRAFT PR`
 
 Base: `103212b16bfc059db367e1ceb3c7d00fd307d6c5`
 
@@ -45,17 +45,28 @@ Digesty istniejących corpusów pozostały niezmienione:
 | PR1D PumpObservationLedger v1 | `833de2bd384c964712f2e7127f9bc1db57745644633c1c66facef540cdf4c2a4` |
 | PR1D PumpObservationLedger v2 | `c81d7b4f0cc3792c2bb2c4e71bfd0634fcfdd69723758d741ee2405770603415` |
 | PR1D full parser snapshot v2 | `507b13704d5b90c3f724a395acbf0d0cc55fdc37a83fcb95cf67cceb6247569f` |
-| PR1E manifest | `cd28c798082999cf2377842199ffabb6601f7115417da244a3cf864e5ef27208` |
-| PR1E cross-layer corpus | `30fbf78344afd77958fe573af5c2414139023db4c770b03c0f710026b7cdd38c` |
+| PR1E manifest | `d111283727259e44a80338e1a4d81fc4c40daff06e67640cd090501874aa42dd` |
+| PR1E cross-layer corpus | `db5812ac10d5fcdede623037ead4baf42c2da90d929969bdb35ad1b06a4a8bae` |
 
-Wersja wykonywalnego runnera po lokalnej remediacji review:
+Historyczna wersja wykonywalnego runnera z wcześniejszej remediacji review:
 
 ```text
 ghost-launcher/src/pr1e_qualification.rs
 SHA-256 = d67137260eaa1904f2e40bdc1fe84d54199725138833e9de253fca879d8e114b
 ```
 
-Runner używa produkcyjnych:
+Zamrożony lokalny runner po tej remediacji (przed finalnym commitem):
+
+```text
+ghost-launcher/src/pr1e_qualification.rs
+SHA-256 = 117fa9d5783e487aca3075645b6b1ca7304c38117b8e9b0255324b2554038c1e
+```
+
+Ten hash identyfikuje wyłącznie runner/source obecnego local diffu. Finalny
+receipt ma go ponownie powiązać z utworzonym commitem, package/workspace
+matrix i parent-versus-Enforce differential; nie jest jeszcze merge receipt.
+
+Aktualny runner używa produkcyjnych:
 
 - `PumpObservationLedgerV1`;
 - `CandidateIntegrityRegistry`;
@@ -66,11 +77,31 @@ Runner używa produkcyjnych:
 
 Fake Ledger: `0`. Fake CandidateIntegrity: `0`.
 
-Po niezależnym review runner został rozszerzony tak, aby każdy z 23 rekordów
-JSONL był rzeczywiście dispatchowany przez produkcyjny Ledger, typed permit,
-Event Bus adapter i `PoolObservationSession` z typed apply result. Poprzedni
-SHA-256 runnera nie jest więc receipt'em finalnego remediacyjnego diffu i nie
-może być używany jako finalna bramka merge.
+Po kolejnym niezależnym review runner został rozszerzony tak, aby każdy z 23
+rekordów JSONL wykonywał własną produkcyjną sekwencję. W szczególności:
+
+- `primary_create_session_apply_ready` przechodzi przez
+  `InitializePool` → canonical `NewPoolDetected` → realny
+  `OracleRuntime::register_new_pool_with_apply_outcome` → realne otwarcie
+  `SessionManager`;
+- `create_and_initial_buy_one_signature` zawiera `InitializePool` i `Trade`
+  pod jedną signature/inventory;
+- `writer_stall` zatrzymuje rzeczywisty bounded NLN artifact-writer worker
+  przed odbiorem, nasyca jego kolejkę, dowodzi postępu canonical primary path
+  przed zwolnieniem writera, a następnie potwierdza fizyczny append po
+  zwolnieniu;
+- `queue_saturation` nasyca rzeczywisty IPC przy `DropNew`, odbiera
+  niezależny control-plane notice i zamyka registry;
+- `conflict_race_with_submit` używa dwóch wątków i bariery w rzeczywistym
+  submit transition;
+- MFS count pochodzi z `try_materialize_features()`, a sender count z
+  instrumentowanego adaptera wywołującego rzeczywisty submit guard.
+
+Fixture asercjuje dla każdego scenariusza canonical emissions, downstream
+applies, Ready publications, MFS materializations, Gatekeeper invocations,
+sender calls, false Ready oraz difference classification. Historyczny SHA-256
+runnera powyżej nie jest receipt'em finalnego remediacyjnego diffu i nie może
+być używany jako finalna bramka merge.
 
 ## 3. Targeted correctness i fault injection
 
@@ -108,8 +139,9 @@ Testy PR1E obejmują między innymi:
   retirement unresolved receipt.
 
 Powyższa tabela gate'ów jest historycznym receipt'em wcześniejszego SHA.
-Końcowa macierz musi być uruchomiona ponownie na finalnym remediacyjnym SHA;
-do tego momentu nie należy zapisywać `OFFLINE PASS` ani `DIFFERENTIAL PASS`.
+Aktualnie lokalnie potwierdzono wyłącznie bezpośrednie remediacyjne testy;
+końcowa macierz musi być uruchomiona ponownie na finalnym, zacommitowanym SHA.
+Do tego momentu nie należy zapisywać `OFFLINE PASS` ani `DIFFERENTIAL PASS`.
 
 ## 4. Package/workspace gate matrix
 
@@ -137,7 +169,7 @@ Zamrożone czerwone klasy pozostały bez zmian:
 
 Nie naprawiono żadnego odziedziczonego fixture w PR1E.
 
-## 5. Formalny parent-versus-PR1E performance protocol
+## 5. Historyczny parent-versus-PR1E performance protocol — nie finalny SHA
 
 Warunki:
 
@@ -180,7 +212,9 @@ Raw receipts:
 | `/tmp/pr1e_perf_protocol_20260727_v1/summary.json` | `8e18d9564154eadee2b2d6e977acbb9b62216d892fe7fe42b29ac8bb981e363b` |
 | `/tmp/pr1e_perf_protocol_20260727_v1/raw_receipts.sha256` | `e756c351e8d14ff6218f300cfbd8bddd2067abaef3ea68f29500b8b3b69d32b3` |
 
-Performance result: `PASS`. Waiver PR1D nie został użyty.
+Ten pomiar dotyczy wcześniejszego remediacyjnego SHA. Nie stanowi wyniku dla
+aktualnego local diffu i nie jest podstawą twierdzenia `PERFORMANCE PASS` dla
+finalnego PR1E. Waiver PR1D nie został użyty.
 
 ## 6. Rollback identity
 
@@ -211,6 +245,14 @@ MFS/evaluation/BUY/submit po globalnym close. `SubmitStarted` zachowuje
 wyłącznie confirmation/reconciliation, a confirmed position continuity nie
 jest przerywana.
 
+Linearization point jest wspólny mutex `CandidateIntegrityRegistry::state`:
+guard sprawdza admission generation drugi raz pod tym lockiem bezpośrednio
+przed zmianą fazy, a close zamyka admission i zwiększa generation pod tym
+samym lockiem. Zatem `SubmitStarted` wygrywa wyłącznie wtedy, gdy już przeszedł
+drugi check i trzyma lock; close wygrywa, gdy inkrementuje generation przed
+tym checkiem. Dwa deterministyczne testy z barierą pokrywają oba kierunki:
+submit-wins oraz close-wins.
+
 ### 7.2 Bounded terminal retirement
 
 Terminalny Oracle cleanup przekazuje candidate do bounded registry tombstone
@@ -218,6 +260,12 @@ FIFO oraz do bounded Seer-ledger tombstone FIFO. Oba tory odzyskują active
 capacity, zachowują późną duplicate/witness classification i rejestrują first
 eviction. Unresolved receipt oraz pełny retirement handoff fail-close new
 admission zamiast silently discard.
+
+Ten sam bounded terminal lane obejmuje pierwsze technical failures, które
+odpadają przed utworzeniem Oracle session (missing observation, wrapper
+mismatch albo pre-session conflict), o ile nie istnieje unresolved canonical
+receipt. Rekord zostaje zachowany jako immutable tombstone, a nie w active
+`records` / `by_pool` / `by_mint`; unresolved receipt nadal blokuje retirement.
 
 ### 7.3 Primary coverage gaps
 
@@ -232,6 +280,12 @@ control-plane retention jest fail-closed, bo provider scope dalszych gaps nie
 jest wtedy dowiedziony; zidentyfikowany, nieoverflowujący secondary/NLN gap
 pozostaje telemetry-only.
 
+`PoolDetected` z dyspozycją `CandidateAdmission` wymusza tę samą fail-closed
+politykę IPC co `Trade`, niezależnie od konfigurowalnego `DropNew`. Zatem
+pełna kolejka otwiera primary coverage gap i control-plane notice zamiast
+po cichu zgubić structural pool birth. `ContinuityOnly` i `Suppressed`
+zachowują skonfigurowaną politykę, ponieważ nie są nową candidate admission.
+
 ### 7.4 Focused remediation checks (local worktree; not a merge receipt)
 
 Po zamrożeniu remediacyjnego kodu lokalnie przeszły następujące bezpośrednie
@@ -239,16 +293,16 @@ bramki:
 
 | Polecenie / kontrakt | Wynik |
 |---|---|
-| `cargo check -p ghost-core -p seer -p ghost-launcher` | PASS |
-| `cargo test -p ghost-launcher --lib pr1e_ -- --nocapture` | PASS — 16/16 |
-| global admission generation: evaluation / BUY-not-submitted / SubmitStarted | PASS — 3/3 |
+| `cargo check -p ghost-launcher --lib` | PASS |
+| `cargo test -p ghost-launcher --lib pr1e_qualification:: -- --nocapture` | PASS — 4/4 on local remediation diff |
+| `cargo test -p ghost-launcher --lib candidate_integrity::tests:: -- --nocapture` | PASS — 27/27; sequential and deterministic dual-direction submit/close race |
 | poisoned Ledger → issued guard cannot begin MFS | PASS |
-| real IPC saturation → control-plane gap → launcher admission close | PASS |
+| `cargo test -p seer ipc::tests::candidate_admission_pool_detected_overrides_drop_new_with_a_coverage_gap -- --exact --nocapture` | PASS — 1/1 |
 | bounded gap-control retention preserves primary after witness and signals overflow | PASS — 2/2 |
 | registry terminal retirement / unresolved receipt / FIFO rollover | PASS — 3/3 |
 | ledger terminal retirement / late witness / FIFO rollover | PASS — 2/2 |
 | frozen PumpObservationLedger V1/V2 executable corpus | PASS — 3/3 |
-| production Oracle downstream-apply ordering barrier | PASS |
+| `InitializePool` Event Bus → Oracle registration → SessionManager open; mixed create+trade inventory | PASS |
 | `cargo fmt --all --check` + `git diff --check` | PASS |
 
 Te wyniki nie zastępują końcowej macierzy package/workspace/release dla

@@ -1100,7 +1100,17 @@ impl IpcSender {
             priority,
         });
 
-        self.send_event(event, priority).await
+        // A candidate-admission PoolDetected is structural primary evidence.
+        // It must never inherit a configurable DropNew/low-priority policy:
+        // saturation opens the independent local-coverage-gap control path so
+        // launcher admission can fail closed. Continuity/suppressed events
+        // remain non-admission traffic and retain the configured policy.
+        let policy = match runtime_disposition {
+            PoolDetectionRuntimeDispositionV1::CandidateAdmission => BackpressurePolicy::Block,
+            PoolDetectionRuntimeDispositionV1::ContinuityOnly
+            | PoolDetectionRuntimeDispositionV1::Suppressed => self.config.backpressure_policy,
+        };
+        self.send_event_with_policy(event, priority, policy).await
     }
 
     /// Send a trade event through the channel with backpressure handling
@@ -1244,12 +1254,6 @@ impl IpcSender {
     #[must_use]
     pub fn current_queue_length(&self) -> usize {
         self.egress.len()
-    }
-
-    /// Internal method to send any SeerEvent
-    async fn send_event(&self, event: SeerEvent, priority: EventPriority) -> Result<(), IpcError> {
-        self.send_event_with_policy(event, priority, self.config.backpressure_policy)
-            .await
     }
 
     async fn send_event_with_policy(
@@ -2017,7 +2021,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drop_new_policy() {
+    async fn candidate_admission_pool_detected_overrides_drop_new_with_a_coverage_gap() {
         let config = IpcChannelConfig {
             buffer_size: 2,
             backpressure_policy: BackpressurePolicy::DropNew,
@@ -2025,6 +2029,7 @@ mod tests {
             ..Default::default()
         };
         let (sender, receiver, metrics) = create_ipc_channel(config);
+        let mut local_gap_rx = receiver.local_coverage_gap_receiver();
 
         // Fill the existing downstream IPC channel, let the fixed dispatcher
         // hold one event, then fill the bounded egress queue deterministically.
@@ -2049,10 +2054,21 @@ mod tests {
             wait_for_dispatcher_len(&sender, expected).await;
         }
 
-        // This should be dropped
+        // CandidateAdmission is structural primary traffic: even with a
+        // DropNew config it must report a gap rather than silently disappear.
         let result = sender.send(candidate, EventPriority::Normal).await;
-        assert!(result.is_err());
-        assert_eq!(metrics.events_dropped.get(), 1);
+        assert!(matches!(result, Err(IpcError::LocalProcessingGap)));
+        assert_eq!(metrics.events_dropped.get(), 0);
+        tokio::time::timeout(Duration::from_secs(1), local_gap_rx.changed())
+            .await
+            .expect("structural pool saturation must reach coverage control plane")
+            .expect("coverage control sender remains alive");
+        let notices = local_gap_rx.borrow_and_update().clone();
+        assert!(notices
+            .notices
+            .iter()
+            .any(|notice| notice.reason
+                == ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated));
     }
 
     #[tokio::test]
@@ -2088,8 +2104,16 @@ mod tests {
             wait_for_dispatcher_len(&sender, expected).await;
         }
 
-        // Low priority should be dropped
-        let result = sender.send(candidate.clone(), EventPriority::Low).await;
+        // Only non-admission continuity traffic retains DropByPriority.
+        let result = sender
+            .send_with_observation_and_disposition(
+                candidate.clone(),
+                None,
+                PoolDetectionRuntimeDispositionV1::ContinuityOnly,
+                None,
+                EventPriority::Low,
+            )
+            .await;
         assert!(result.is_err());
         assert_eq!(metrics.drops_by_priority_low.get(), 1);
     }

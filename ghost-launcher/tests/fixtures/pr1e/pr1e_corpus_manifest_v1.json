@@ -29,7 +29,7 @@
     {
       "id": "pr1e_cross_layer_v1",
       "path": "ghost-launcher/tests/fixtures/pr1e/pr1e_cross_layer_scenarios_v1.jsonl",
-      "blake3_contract": "30fbf78344afd77958fe573af5c2414139023db4c770b03c0f710026b7cdd38c",
+      "blake3_contract": "db5812ac10d5fcdede623037ead4baf42c2da90d929969bdb35ad1b06a4a8bae",
       "contract_kind": "file_digest"
     }
   ]
