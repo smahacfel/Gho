@@ -509,6 +509,64 @@ impl CandidateIntegrityRegistry {
             .retain(|(_, proof_candidate), _| *proof_candidate != candidate);
     }
 
+    fn has_unresolved_canonical_receipt(
+        state: &CandidateIntegrityRegistryStateV1,
+        candidate: PumpCandidateIdentityV1,
+    ) -> bool {
+        state
+            .canonical_apply_fence
+            .receipts_by_runtime_key
+            .values()
+            .any(|entry| entry.receipt.candidate == candidate && !entry.applied && !entry.failed)
+    }
+
+    /// Resolve the fence ownership for candidates whose canonical receipt has
+    /// completed but whose technical integrity outcome is already non-Ready.
+    ///
+    /// This is deliberately narrower than ordinary Oracle lifecycle cleanup:
+    /// it only retires a `PreMfs` record after every receipt for that exact
+    /// candidate is resolved. A tombstoned candidate is also cleaned
+    /// defensively, so a historical ordering bug cannot leave an applied or
+    /// failed receipt consuming bounded fence capacity forever.
+    fn cleanup_resolved_non_ready_receipt(
+        &self,
+        candidate: PumpCandidateIdentityV1,
+    ) -> Result<(), CandidateIntegrityErrorV1> {
+        let mut state = self.lock_state()?;
+        let requires_cleanup = state.terminal_tombstones.get(candidate).is_some()
+            || state
+                .records
+                .get(&candidate)
+                .is_some_and(|record| record.outcome != CandidateIntegrityOutcomeV1::Ready);
+        if !requires_cleanup {
+            return Ok(());
+        }
+        Self::cleanup_canonical_apply_fence_for_candidate(&mut state, candidate);
+
+        let retire = !Self::has_unresolved_canonical_receipt(&state, candidate)
+            && state.records.get(&candidate).is_some_and(|record| {
+                record.outcome != CandidateIntegrityOutcomeV1::Ready
+                    && record.lifecycle_phase == CandidateLifecyclePhaseV1::PreMfs
+            });
+        if retire {
+            match self.retire_resolved_record(&mut state, candidate) {
+                Ok(Some(_)) => {
+                    ::metrics::counter!(
+                        "candidate_integrity_pre_session_terminal_retired_total",
+                        1u64,
+                        "authority_epoch_id" => self.authority_epoch.epoch_id.to_string()
+                    );
+                }
+                Ok(None) => {
+                    return Err(CandidateIntegrityErrorV1::CandidateMissing);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.record_pending_permit_metrics(&state);
+        Ok(())
+    }
+
     /// Move one fully resolved record out of active admission ownership.
     ///
     /// The caller proves that no unresolved receipt remains and that the
@@ -520,6 +578,9 @@ impl CandidateIntegrityRegistry {
         state: &mut CandidateIntegrityRegistryStateV1,
         candidate: PumpCandidateIdentityV1,
     ) -> Result<Option<CandidateIntegrityRecordV1>, CandidateIntegrityErrorV1> {
+        if Self::has_unresolved_canonical_receipt(state, candidate) {
+            return Err(CandidateIntegrityErrorV1::TerminalRetirementPending);
+        }
         if state.terminal_ledger_retirements.len() >= self.limits.max_terminal_tombstones {
             return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
         }
@@ -835,19 +896,26 @@ impl CandidateIntegrityRegistry {
         receipt: &CanonicalMutationApplyReceiptV1,
     ) -> Result<(), CandidateIntegrityErrorV1> {
         self.require_available()?;
+        let mut newly_failed = false;
         let identity_contradiction = {
             let mut state = self.lock_state()?;
-            let entry = state
-                .canonical_apply_fence
-                .receipts_by_runtime_key
-                .get_mut(&receipt.runtime_key)
-                .ok_or(CandidateIntegrityErrorV1::CandidateMissing)?;
-            if entry.receipt != *receipt {
-                true
-            } else if entry.applied || entry.failed {
-                return Ok(());
-            } else {
-                entry.failed = true;
+            let identity_contradiction = {
+                let entry = state
+                    .canonical_apply_fence
+                    .receipts_by_runtime_key
+                    .get_mut(&receipt.runtime_key)
+                    .ok_or(CandidateIntegrityErrorV1::CandidateMissing)?;
+                if entry.receipt != *receipt {
+                    true
+                } else if entry.applied {
+                    return Ok(());
+                } else {
+                    newly_failed = !entry.failed;
+                    entry.failed = true;
+                    false
+                }
+            };
+            if !identity_contradiction {
                 if let Some(proof) = state
                     .canonical_apply_fence
                     .proofs_by_signature_candidate
@@ -855,15 +923,22 @@ impl CandidateIntegrityRegistry {
                 {
                     proof.invalidated = true;
                 }
+                Self::cleanup_canonical_apply_fence_for_candidate(&mut state, receipt.candidate);
                 self.record_pending_permit_metrics(&state);
-                false
             }
+            identity_contradiction
         };
         if identity_contradiction {
             self.mark_unavailable("failed_receipt_identity_contradiction");
             return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
         }
-        let _ = self.record_signal(Self::coverage_incomplete_signal(receipt))?;
+        if newly_failed {
+            let _ = self.record_signal(Self::coverage_incomplete_signal(receipt))?;
+        }
+        if let Err(error) = self.cleanup_resolved_non_ready_receipt(receipt.candidate) {
+            self.mark_unavailable("failed_receipt_terminal_cleanup_failed");
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1105,19 +1180,29 @@ impl CandidateIntegrityRegistry {
                 });
             }
         }
-        if state.records.get(&receipt.candidate).is_some_and(|record| {
-            record.outcome != CandidateIntegrityOutcomeV1::Ready
-                || matches!(
-                    record.lifecycle_phase,
-                    CandidateLifecyclePhaseV1::TerminalReject
-                        | CandidateLifecyclePhaseV1::TerminalTimeout
-                        | CandidateLifecyclePhaseV1::TerminalBuyNotSubmitted
-                        | CandidateLifecyclePhaseV1::ConfirmedOpenPosition
-                )
-        }) {
+        let resolved_non_ready_or_tombstoned =
+            state.terminal_tombstones.get(receipt.candidate).is_some()
+                || state.records.get(&receipt.candidate).is_some_and(|record| {
+                    record.outcome != CandidateIntegrityOutcomeV1::Ready
+                        || matches!(
+                            record.lifecycle_phase,
+                            CandidateLifecyclePhaseV1::TerminalReject
+                                | CandidateLifecyclePhaseV1::TerminalTimeout
+                                | CandidateLifecyclePhaseV1::TerminalBuyNotSubmitted
+                                | CandidateLifecyclePhaseV1::ConfirmedOpenPosition
+                        )
+                });
+        if resolved_non_ready_or_tombstoned {
             Self::cleanup_canonical_apply_fence_for_candidate(&mut state, receipt.candidate);
         }
         self.record_pending_permit_metrics(&state);
+        drop(state);
+        if resolved_non_ready_or_tombstoned {
+            if let Err(error) = self.cleanup_resolved_non_ready_receipt(receipt.candidate) {
+                self.mark_unavailable("applied_receipt_terminal_cleanup_failed");
+                return Err(error);
+            }
+        }
         Ok(released)
     }
 
@@ -1379,11 +1464,7 @@ impl CandidateIntegrityRegistry {
     ) -> Result<bool, CandidateIntegrityErrorV1> {
         self.require_available()?;
         let mut state = self.lock_state()?;
-        let has_unresolved_receipt = state
-            .canonical_apply_fence
-            .receipts_by_runtime_key
-            .values()
-            .any(|entry| entry.receipt.candidate == candidate && !entry.applied && !entry.failed);
+        let has_unresolved_receipt = Self::has_unresolved_canonical_receipt(&state, candidate);
         let Some(record) = state.records.get(&candidate).cloned() else {
             // A receipt may have been staged before inventory completion
             // creates the CandidateIntegrity record. It is still an active
@@ -1409,17 +1490,54 @@ impl CandidateIntegrityRegistry {
 
     /// Drain the bounded terminal-retirement control handoff. The caller is
     /// the Seer component's synchronous ledger finalizer; the value carries
-    /// no runtime authority by itself.
+    /// no runtime authority by itself. A notice is released only while the
+    /// candidate has no unresolved canonical apply receipt. This defensive
+    /// revalidation prevents an old/stale handoff from retiring Ledger state
+    /// ahead of a receipt that is still in flight.
     pub(crate) fn drain_terminal_ledger_retirements(
         &self,
     ) -> Result<Vec<CandidateIntegrityTerminalRetirementV1>, CandidateIntegrityErrorV1> {
         let mut state = self.lock_state()?;
-        Ok(state.terminal_ledger_retirements.drain(..).collect())
+        let mut ready_for_ledger = Vec::new();
+        let mut deferred = VecDeque::with_capacity(state.terminal_ledger_retirements.len());
+        while let Some(retirement) = state.terminal_ledger_retirements.pop_front() {
+            if Self::has_unresolved_canonical_receipt(&state, retirement.candidate) {
+                deferred.push_back(retirement);
+                ::metrics::counter!(
+                    "candidate_integrity_terminal_retirement_deferred_unresolved_receipt_total",
+                    1u64,
+                    "authority_epoch_id" => self.authority_epoch.epoch_id.to_string()
+                );
+            } else {
+                ready_for_ledger.push(retirement);
+            }
+        }
+        state.terminal_ledger_retirements = deferred;
+        Ok(ready_for_ledger)
     }
 
     #[cfg(test)]
-    fn terminal_tombstone_count(&self) -> Result<usize, CandidateIntegrityErrorV1> {
+    pub(crate) fn terminal_tombstone_count(&self) -> Result<usize, CandidateIntegrityErrorV1> {
         Ok(self.lock_state()?.terminal_tombstones.retained_count())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_record_count(&self) -> Result<usize, CandidateIntegrityErrorV1> {
+        Ok(self.lock_state()?.records.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canonical_apply_fence_counts(
+        &self,
+    ) -> Result<(usize, usize), CandidateIntegrityErrorV1> {
+        let state = self.lock_state()?;
+        Ok((
+            state.canonical_apply_fence.receipts_by_runtime_key.len(),
+            state
+                .canonical_apply_fence
+                .proofs_by_signature_candidate
+                .len(),
+        ))
     }
 
     /// Return the current CandidateIntegrity status associated with a
@@ -3358,5 +3476,146 @@ mod tests {
             .canonical_apply_fence
             .receipts_by_runtime_key
             .contains_key(&receipt.runtime_key));
+    }
+
+    #[test]
+    fn resolved_non_ready_canonical_apply_retires_and_reclaims_the_entire_fence() {
+        let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
+            max_candidates: 2,
+            max_audit_markers_per_candidate: 2,
+            max_terminal_tombstones: 2,
+        });
+        let candidate = candidate();
+        let canonical = canonical(Signature::new_unique(), 0, candidate);
+        let receipt = registry
+            .stage_canonical_mutation(&canonical)
+            .expect("canonical receipt staged before non-Ready evidence");
+        registry
+            .record_signal(signal(
+                candidate,
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                1,
+            ))
+            .expect("non-Ready candidate remains active while receipt is unresolved");
+
+        assert_eq!(registry.active_record_count().expect("active count"), 1);
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("fence counts"),
+            (1, 0)
+        );
+
+        assert!(registry
+            .mark_canonical_apply_succeeded(&receipt)
+            .expect("downstream state mutation is acknowledged")
+            .is_empty());
+
+        assert_eq!(registry.active_record_count().expect("active count"), 0);
+        assert_eq!(
+            registry
+                .terminal_tombstone_count()
+                .expect("terminal evidence count"),
+            1
+        );
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("resolved fence is reclaimed"),
+            (0, 0)
+        );
+        assert!(registry.candidate_admission_open());
+        assert_eq!(
+            registry
+                .drain_terminal_ledger_retirements()
+                .expect("resolved terminal handoff"),
+            vec![CandidateIntegrityTerminalRetirementV1 { candidate }]
+        );
+    }
+
+    #[test]
+    fn failed_non_ready_canonical_apply_retires_and_reclaims_the_entire_fence() {
+        let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
+            max_candidates: 2,
+            max_audit_markers_per_candidate: 2,
+            max_terminal_tombstones: 2,
+        });
+        let candidate = candidate();
+        let receipt = registry
+            .stage_canonical_mutation(&canonical(Signature::new_unique(), 0, candidate))
+            .expect("canonical receipt staged");
+        registry
+            .record_signal(signal(
+                candidate,
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                1,
+            ))
+            .expect("non-Ready evidence recorded");
+
+        registry
+            .fail_canonical_apply(&receipt)
+            .expect("failed downstream apply resolves its receipt");
+
+        assert_eq!(registry.active_record_count().expect("active count"), 0);
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("failed fence is reclaimed"),
+            (0, 0)
+        );
+        assert_eq!(
+            registry
+                .terminal_tombstone_count()
+                .expect("terminal evidence count"),
+            1
+        );
+        assert!(registry.candidate_admission_open());
+    }
+
+    #[test]
+    fn terminal_ledger_handoff_waits_for_a_late_staged_receipt_to_resolve() {
+        let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
+            max_candidates: 2,
+            max_audit_markers_per_candidate: 2,
+            max_terminal_tombstones: 2,
+        });
+        let candidate = candidate();
+        registry
+            .record_signal(signal(
+                candidate,
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                1,
+            ))
+            .expect("simulate historical pre-receipt terminal evidence");
+        let receipt = registry
+            .stage_canonical_mutation(&canonical(Signature::new_unique(), 0, candidate))
+            .expect("late staged receipt");
+
+        assert!(registry
+            .drain_terminal_ledger_retirements()
+            .expect("unresolved handoff is retained")
+            .is_empty());
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("late receipt remains owned"),
+            (1, 0)
+        );
+
+        registry
+            .fail_canonical_apply(&receipt)
+            .expect("late receipt failure resolves ownership");
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("resolved late receipt is reclaimed"),
+            (0, 0)
+        );
+        assert_eq!(
+            registry
+                .drain_terminal_ledger_retirements()
+                .expect("handoff becomes eligible after resolution"),
+            vec![CandidateIntegrityTerminalRetirementV1 { candidate }]
+        );
     }
 }

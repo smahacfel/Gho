@@ -4447,23 +4447,10 @@ pub(crate) fn ingest_pump_observation(
     let decisions = std::iter::once(&result.observation_decision)
         .chain(result.derived_decisions.iter())
         .collect::<Vec<_>>();
-    for decision in decisions.iter().copied().filter(|decision| {
-        decision
-            .candidate_integrity_signal
-            .as_ref()
-            .is_none_or(|signal| signal.outcome != ghost_core::CandidateIntegrityOutcomeV1::Ready)
-    }) {
-        emit_pump_observation_decision(candidate_integrity_registry, decision);
-    }
-    for decision in decisions.iter().copied().filter(|decision| {
-        decision
-            .candidate_integrity_signal
-            .as_ref()
-            .is_some_and(|signal| signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready)
-    }) {
-        emit_pump_observation_decision(candidate_integrity_registry, decision);
-    }
     let Some(canonical) = result.observation_decision.canonical_mutation.as_ref() else {
+        for decision in decisions.iter().copied() {
+            emit_pump_observation_decision(candidate_integrity_registry, decision);
+        }
         if wrapper_primary_observation_mismatch {
             return CanonicalRuntimeAdmissionV1::Blocked(
                 CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
@@ -4536,6 +4523,27 @@ pub(crate) fn ingest_pump_observation(
             );
         }
     };
+
+    // A canonical receipt is the ownership fence for this runtime mutation.
+    // It must exist before a derived non-Ready signal can classify the
+    // candidate as terminal pre-session evidence; otherwise that signal could
+    // retire the identity before the downstream apply obligation is visible.
+    for decision in decisions.iter().copied().filter(|decision| {
+        decision
+            .candidate_integrity_signal
+            .as_ref()
+            .is_none_or(|signal| signal.outcome != ghost_core::CandidateIntegrityOutcomeV1::Ready)
+    }) {
+        emit_pump_observation_decision(candidate_integrity_registry, decision);
+    }
+    for decision in decisions.iter().copied().filter(|decision| {
+        decision
+            .candidate_integrity_signal
+            .as_ref()
+            .is_some_and(|signal| signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready)
+    }) {
+        emit_pump_observation_decision(candidate_integrity_registry, decision);
+    }
     let ready_signals = decisions
         .iter()
         .filter_map(|decision| decision.candidate_integrity_signal.as_ref())
@@ -6988,6 +6996,237 @@ mod tests {
             .drain_terminal_ledger_retirements()
             .expect("retirement handoff was drained")
             .is_empty());
+    }
+
+    #[test]
+    fn canonical_missing_inventory_receipt_outlives_non_ready_signal_then_retires_cleanly() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::new(
+            CandidateIntegrityRegistryLimitsV1 {
+                max_candidates: 2,
+                max_audit_markers_per_candidate: 4,
+                max_terminal_tombstones: 2,
+            },
+        ));
+        let signature = Signature::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let permit = expect_runtime_permit(ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(signature, pool, mint, 0)),
+            1,
+            true,
+            None,
+        ));
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint,
+        };
+
+        assert_eq!(
+            registry
+                .active_record_count()
+                .expect("active non-Ready record"),
+            1
+        );
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("staged receipt counts"),
+            (1, 0),
+            "the non-Ready signal must observe the unresolved receipt"
+        );
+        assert_eq!(
+            registry
+                .snapshot(candidate)
+                .expect("incomplete candidate")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+
+        // A terminal ledger retirement cannot happen while this canonical
+        // receipt is in flight.
+        finalize_pump_observation_ledger(&ledger, &registry, 2);
+        assert_eq!(
+            ledger
+                .lock()
+                .expect("ledger before apply")
+                .snapshot()
+                .retained_terminal_canonical_tombstone_count,
+            0
+        );
+
+        assert!(registry
+            .mark_canonical_apply_succeeded(&permit.apply_receipt)
+            .expect("actual downstream mutation resolves receipt")
+            .is_empty());
+        assert_eq!(registry.active_record_count().expect("active count"), 0);
+        assert_eq!(
+            registry.terminal_tombstone_count().expect("terminal count"),
+            1
+        );
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("resolved receipt/proof counts"),
+            (0, 0)
+        );
+        assert!(registry.candidate_admission_open());
+
+        finalize_pump_observation_ledger(&ledger, &registry, 3);
+        assert_eq!(
+            ledger
+                .lock()
+                .expect("ledger after apply")
+                .snapshot()
+                .retained_terminal_canonical_tombstone_count,
+            1,
+            "the ledger retires only after the receipt resolves"
+        );
+    }
+
+    #[test]
+    fn nln_first_conflict_keeps_canonical_receipt_until_apply_then_retires_it() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::new(
+            CandidateIntegrityRegistryLimitsV1 {
+                max_candidates: 2,
+                max_audit_markers_per_candidate: 4,
+                max_terminal_tombstones: 2,
+            },
+        ));
+        let signature = Signature::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut primary = primary_trade_observation(signature, pool, mint, 0);
+        primary.raw_transaction_mutation_count = Some(1);
+        let mut nln = primary.clone();
+        nln.raw_provider_role = None;
+        nln.canonical_order = None;
+        nln.provenance.source_family = ObservationSourceFamilyV1::ParsedNln;
+        nln.provenance.provider_id = "nln".to_string();
+        nln.provenance.payload_hash_blake3 = [0xB2; 32];
+        nln.claims.token_amount_units = Some(2);
+
+        assert!(matches!(
+            ingest_pump_observation(&ledger, &registry, Some(nln), 1, true, None),
+            CanonicalRuntimeAdmissionV1::NoApply(
+                CanonicalRuntimeNoApplyReasonV1::ParsedWitnessOnly
+            )
+        ));
+        let permit = expect_runtime_permit(ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary),
+            2,
+            true,
+            None,
+        ));
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint,
+        };
+
+        assert_eq!(
+            registry
+                .snapshot(candidate)
+                .expect("conflict evidence")
+                .outcome,
+            CandidateIntegrityOutcomeV1::SourceReconciliationConflict
+        );
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("conflict receipt/proof counts"),
+            (1, 1)
+        );
+        finalize_pump_observation_ledger(&ledger, &registry, 3);
+        assert_eq!(
+            ledger
+                .lock()
+                .expect("ledger before conflict apply")
+                .snapshot()
+                .retained_terminal_canonical_tombstone_count,
+            0
+        );
+
+        assert!(registry
+            .mark_canonical_apply_succeeded(&permit.apply_receipt)
+            .expect("canonical state apply remains valid despite witness conflict")
+            .is_empty());
+        assert_eq!(registry.active_record_count().expect("active count"), 0);
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("conflict receipt/proof cleanup"),
+            (0, 0)
+        );
+        assert!(matches!(
+            registry.evaluation_guard(candidate),
+            Err(crate::candidate_integrity::CandidateIntegrityErrorV1::CandidateMissing)
+        ));
+
+        finalize_pump_observation_ledger(&ledger, &registry, 4);
+        let snapshot = ledger
+            .lock()
+            .expect("ledger after conflict apply")
+            .snapshot();
+        assert_eq!(snapshot.canonical_mutation_count, 1);
+        assert_eq!(snapshot.retained_terminal_canonical_tombstone_count, 1);
+    }
+
+    #[test]
+    fn resolved_non_ready_receipts_do_not_exhaust_small_candidate_capacity() {
+        let ledger = Arc::new(Mutex::new(
+            PumpObservationLedgerV1::try_new(PumpObservationLedgerConfigV1 {
+                max_primary_canonical_mutations: 2,
+                max_terminal_canonical_tombstones: 2,
+                ..PumpObservationLedgerConfigV1::default()
+            })
+            .expect("small bounded ledger"),
+        ));
+        let registry = Arc::new(CandidateIntegrityRegistry::new(
+            CandidateIntegrityRegistryLimitsV1 {
+                max_candidates: 2,
+                max_audit_markers_per_candidate: 2,
+                max_terminal_tombstones: 2,
+            },
+        ));
+
+        for ordinal in 0..12_u32 {
+            let permit = expect_runtime_permit(ingest_pump_observation(
+                &ledger,
+                &registry,
+                Some(primary_trade_observation(
+                    Signature::new_unique(),
+                    Pubkey::new_unique(),
+                    Pubkey::new_unique(),
+                    ordinal,
+                )),
+                u64::from(ordinal).saturating_add(1),
+                true,
+                None,
+            ));
+            assert!(registry
+                .mark_canonical_apply_succeeded(&permit.apply_receipt)
+                .expect("resolved non-Ready apply")
+                .is_empty());
+            assert_eq!(
+                registry
+                    .canonical_apply_fence_counts()
+                    .expect("fence must not grow across terminal candidates"),
+                (0, 0)
+            );
+            finalize_pump_observation_ledger(
+                &ledger,
+                &registry,
+                u64::from(ordinal).saturating_add(100),
+            );
+            assert!(registry.candidate_admission_open());
+        }
+        assert_eq!(registry.active_record_count().expect("active count"), 0);
+        assert!(registry.candidate_admission_open());
     }
 
     fn primary_trade_observation(

@@ -1612,6 +1612,63 @@ async fn pr1e_runner_uses_production_ledger_registry_and_event_adapter() {
     assert_eq!(snapshot.canonical_mutation_count, 1);
 }
 
+#[test]
+fn missing_inventory_canonical_apply_uses_real_session_then_reclaims_terminal_fence() {
+    let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+    let registry = Arc::new(CandidateIntegrityRegistry::default());
+    let pool = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let signature = Signature::new_unique();
+    let permit = primary_permit(
+        &ledger,
+        &registry,
+        primary_trade_observation(signature, pool, mint, 0, None),
+        1,
+    );
+    let candidate = PumpCandidateIdentityV1 {
+        pool_amm_id: pool,
+        mint,
+    };
+    assert_eq!(
+        registry
+            .active_record_count()
+            .expect("active incomplete record"),
+        1
+    );
+
+    let mut bridge =
+        SessionPoolTradeBridge::new(Duration::from_secs(1), 4, 16, Duration::from_secs(60), 32);
+    let mut session = qualification_session(pool, mint);
+    let execution = forward_permitted_trade_through_session(
+        &registry,
+        &mut bridge,
+        &mut session,
+        &trade_carrier(signature, pool, mint, 0),
+        permit,
+        Instant::now(),
+    );
+
+    assert_eq!(execution.downstream_applies, 1);
+    assert_eq!(execution.ready_publications, 0);
+    assert_eq!(registry.active_record_count().expect("active count"), 0);
+    assert_eq!(
+        registry
+            .terminal_tombstone_count()
+            .expect("terminal evidence"),
+        1
+    );
+    assert_eq!(
+        registry
+            .canonical_apply_fence_counts()
+            .expect("all resolved fence state reclaimed"),
+        (0, 0)
+    );
+    assert!(matches!(
+        registry.evaluation_guard(candidate),
+        Err(crate::candidate_integrity::CandidateIntegrityErrorV1::CandidateMissing)
+    ));
+}
+
 #[tokio::test]
 async fn pr1e_runner_preserves_multi_locator_inventory_and_witness_arrival_order() {
     let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
