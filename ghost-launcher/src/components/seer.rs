@@ -1,6 +1,8 @@
 //! Seer component wrapper
 
-use crate::candidate_integrity::{CandidateIntegrityRegistry, CanonicalMutationApplyReceiptV1};
+use crate::candidate_integrity::{
+    CandidateIntegrityErrorV1, CandidateIntegrityRegistry, CanonicalMutationApplyReceiptV1,
+};
 use crate::config::{
     redact_endpoint_for_logs, ProgramStreamsQuotaPolicy as LauncherProgramStreamsQuotaPolicy,
     SeerCommitment, SeerComponentConfig,
@@ -4094,7 +4096,7 @@ fn pump_observation_classification_label(
 fn emit_pump_observation_decision(
     candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
     decision: &PumpObservationLedgerDecisionV1,
-) {
+) -> Result<(), CandidateIntegrityErrorV1> {
     ::metrics::counter!(
         "pump_observation_ledger_decisions_total",
         1u64,
@@ -4116,11 +4118,11 @@ fn emit_pump_observation_decision(
         );
     }
     let Some(signal) = decision.candidate_integrity_signal.clone() else {
-        return;
+        return Ok(());
     };
     if signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready {
         ::metrics::counter!("candidate_integrity_ready_deferred_until_apply_total", 1u64);
-        return;
+        return Ok(());
     }
     match candidate_integrity_registry.record_signal(signal.clone()) {
         Ok(result) => {
@@ -4183,6 +4185,7 @@ fn emit_pump_observation_decision(
                 }
                 _ => {}
             }
+            Ok(())
         }
         Err(error) => {
             ::metrics::counter!(
@@ -4200,6 +4203,7 @@ fn emit_pump_observation_decision(
             candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
                 "candidate_integrity_signal_failed",
             );
+            Err(error)
         }
     }
 }
@@ -4284,6 +4288,28 @@ fn fail_canonical_apply(
     if let Some(receipt) = receipt {
         let _ = candidate_integrity_registry.fail_canonical_apply(receipt);
     }
+}
+
+/// A staged canonical receipt is an ownership obligation even when the
+/// integrity evidence that should accompany it cannot be recorded.  Never
+/// issue a runtime permit after that failure: resolve the receipt if possible,
+/// then close admission.  The close is deliberately idempotent because the
+/// recording path may already have made the same fail-closed transition.
+fn fail_staged_canonical_runtime_admission(
+    candidate_integrity_registry: &CandidateIntegrityRegistry,
+    receipt: &CanonicalMutationApplyReceiptV1,
+    reason: &'static str,
+) {
+    if let Err(error) = candidate_integrity_registry.fail_canonical_apply(receipt) {
+        error!(
+            signature = %receipt.signature,
+            locator = ?receipt.locator,
+            error = %error,
+            reason,
+            "Seer: staged canonical receipt could not be resolved after integrity admission failure"
+        );
+    }
+    candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(reason);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4449,7 +4475,7 @@ pub(crate) fn ingest_pump_observation(
         .collect::<Vec<_>>();
     let Some(canonical) = result.observation_decision.canonical_mutation.as_ref() else {
         for decision in decisions.iter().copied() {
-            emit_pump_observation_decision(candidate_integrity_registry, decision);
+            let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
         }
         if wrapper_primary_observation_mismatch {
             return CanonicalRuntimeAdmissionV1::Blocked(
@@ -4534,7 +4560,23 @@ pub(crate) fn ingest_pump_observation(
             .as_ref()
             .is_none_or(|signal| signal.outcome != ghost_core::CandidateIntegrityOutcomeV1::Ready)
     }) {
-        emit_pump_observation_decision(candidate_integrity_registry, decision);
+        if let Err(error) = emit_pump_observation_decision(candidate_integrity_registry, decision) {
+            error!(
+                signature = %receipt.signature,
+                locator = ?receipt.locator,
+                classification = ?decision.classification,
+                error = %error,
+                "Seer: required non-Ready integrity evidence failed after receipt staging; canonical runtime emission blocked"
+            );
+            fail_staged_canonical_runtime_admission(
+                candidate_integrity_registry,
+                &receipt,
+                "candidate_integrity_signal_failed_after_receipt_stage",
+            );
+            return CanonicalRuntimeAdmissionV1::Blocked(
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+            );
+        }
     }
     for decision in decisions.iter().copied().filter(|decision| {
         decision
@@ -4542,7 +4584,7 @@ pub(crate) fn ingest_pump_observation(
             .as_ref()
             .is_some_and(|signal| signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready)
     }) {
-        emit_pump_observation_decision(candidate_integrity_registry, decision);
+        let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
     }
     let ready_signals = decisions
         .iter()
@@ -4577,6 +4619,25 @@ pub(crate) fn ingest_pump_observation(
         );
         candidate_integrity_registry
             .close_candidate_admission_with_integrity_invalidation("inventory_seal_failed");
+        return CanonicalRuntimeAdmissionV1::Blocked(
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+        );
+    }
+    if !candidate_integrity_registry.is_available()
+        || !candidate_integrity_registry.candidate_admission_open()
+    {
+        error!(
+            signature = %receipt.signature,
+            locator = ?receipt.locator,
+            registry_available = candidate_integrity_registry.is_available(),
+            candidate_admission_open = candidate_integrity_registry.candidate_admission_open(),
+            "Seer: CandidateIntegrity became unavailable or closed before canonical runtime permit issuance"
+        );
+        fail_staged_canonical_runtime_admission(
+            candidate_integrity_registry,
+            &receipt,
+            "candidate_integrity_unavailable_before_runtime_permit",
+        );
         return CanonicalRuntimeAdmissionV1::Blocked(
             CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
         );
@@ -4646,7 +4707,7 @@ fn finalize_pump_observation_ledger(
         }
     };
     for decision in &decisions {
-        emit_pump_observation_decision(candidate_integrity_registry, decision);
+        let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
     }
 }
 
@@ -6706,11 +6767,11 @@ mod tests {
     use crate::events::{create_event_bus, CanonicalRuntimePermitV1, GhostEvent};
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use ghost_core::{
-        CandidateIntegrityOutcomeV1, CanonicalPumpOrderKeyV1, CurveFinality,
-        LocalCoverageGapReasonV1, ObservationProvenanceV1, ObservationSourceFamilyV1,
-        ObservedPumpMutationV1, PumpCandidateIdentityV1, PumpMutationClaimsV1,
-        PumpMutationFamilyV1, PumpObservationLedgerConfigV1, PumpObservationLedgerV1,
-        PumpTradeSideV1, RawProviderRoleV1, RawPumpMutationLocatorV1,
+        CandidateIntegrityOutcomeV1, CandidateIntegritySignalV1, CanonicalPumpOrderKeyV1,
+        CurveFinality, LocalCoverageGapReasonV1, ObservationProvenanceV1,
+        ObservationSourceFamilyV1, ObservedPumpMutationV1, PumpCandidateIdentityV1,
+        PumpMutationClaimsV1, PumpMutationFamilyV1, PumpObservationLedgerConfigV1,
+        PumpObservationLedgerV1, PumpTradeSideV1, RawProviderRoleV1, RawPumpMutationLocatorV1,
     };
     use seer::config::{ProgramStreamsConfig, ProgramStreamsQuotaPolicy};
     use seer::ipc::{
@@ -7083,6 +7144,88 @@ mod tests {
                 .retained_terminal_canonical_tombstone_count,
             1,
             "the ledger retires only after the receipt resolves"
+        );
+    }
+
+    #[test]
+    fn integrity_signal_alias_conflict_after_receipt_stage_blocks_permit_and_reclaims_fence() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::new(
+            CandidateIntegrityRegistryLimitsV1 {
+                max_candidates: 4,
+                max_audit_markers_per_candidate: 4,
+                max_terminal_tombstones: 4,
+            },
+        ));
+        let pool = Pubkey::new_unique();
+        let existing = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint: Pubkey::new_unique(),
+        };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate: existing,
+                outcome: CandidateIntegrityOutcomeV1::Ready,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [0xA1; 32],
+            })
+            .expect("existing pool identity occupies the alias lane");
+
+        // `stage_canonical_mutation` intentionally establishes the receipt
+        // before CandidateIntegrity signal aliases are checked.  The missing
+        // inventory claim below therefore exercises the exact failure window:
+        // stage -> non-Ready signal alias conflict -> no runtime permit.
+        let admission = ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(
+                Signature::new_unique(),
+                pool,
+                Pubkey::new_unique(),
+                0,
+            )),
+            1,
+            true,
+            None,
+        );
+
+        let outcome = match &admission {
+            CanonicalRuntimeAdmissionV1::Blocked(outcome) => *outcome,
+            other => panic!("alias-conflicted non-Ready evidence must block, got {other:?}"),
+        };
+        assert_eq!(
+            outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+        assert!(
+            admission.into_permit().is_none(),
+            "the Event Bus bridge is reachable only from Apply; an integrity signal failure may issue zero permits"
+        );
+        assert!(!registry.candidate_admission_open());
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("failed staged receipt must be reclaimed"),
+            (0, 0),
+            "a failed integrity signal must not strand a receipt or proof"
+        );
+        assert_eq!(
+            registry
+                .snapshot(existing)
+                .expect("existing alias evidence remains auditable")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+        assert_eq!(
+            ledger
+                .lock()
+                .expect("canonical ledger fact")
+                .snapshot()
+                .canonical_mutation_count,
+            1,
+            "the primary structural fact remains ledger evidence, but it cannot enter runtime"
         );
     }
 
