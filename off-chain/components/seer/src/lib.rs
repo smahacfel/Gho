@@ -5116,6 +5116,13 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
     pub async fn process_event(&self, event: types::GeyserEvent) -> SeerResult<()> {
         if let types::GeyserEvent::LocalCoverageGap { gap } = &event {
             self.local_segment_unreliable.store(true, Release);
+            if let Some(ipc_sender) = self.ipc_sender.as_ref() {
+                // This is a control-plane signal, intentionally independent
+                // of the congested business-event FIFO. The launcher decides
+                // whether the provider is the configured primary and closes
+                // new-candidate authority only for that case.
+                ipc_sender.report_local_coverage_gap(gap.provider_id.clone(), gap.reason);
+            }
             if !self.local_gap_audit.emit(gap.clone()) {
                 error!(
                     gap_id = %bs58::encode(gap.gap_id_blake3).into_string(),

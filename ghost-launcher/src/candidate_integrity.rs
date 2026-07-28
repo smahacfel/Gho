@@ -10,9 +10,9 @@ use ghost_core::{
 };
 use serde::{Deserialize, Serialize};
 use solana_sdk::signature::Signature;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -73,6 +73,10 @@ impl Default for Pr1AuthorityEpochV1 {
 pub struct CandidateIntegrityRegistryLimitsV1 {
     pub max_candidates: usize,
     pub max_audit_markers_per_candidate: usize,
+    /// Bounded terminal history retained after an Oracle pool/session has
+    /// completed cleanup. The active registry can therefore recycle capacity
+    /// without pretending that in-process deduplication is durable forever.
+    pub max_terminal_tombstones: usize,
 }
 
 impl Default for CandidateIntegrityRegistryLimitsV1 {
@@ -80,6 +84,7 @@ impl Default for CandidateIntegrityRegistryLimitsV1 {
         Self {
             max_candidates: 100_000,
             max_audit_markers_per_candidate: 32,
+            max_terminal_tombstones: 50_000,
         }
     }
 }
@@ -89,6 +94,7 @@ impl CandidateIntegrityRegistryLimitsV1 {
         Self {
             max_candidates: self.max_candidates.max(1),
             max_audit_markers_per_candidate: self.max_audit_markers_per_candidate.max(1),
+            max_terminal_tombstones: self.max_terminal_tombstones.max(1),
         }
     }
 }
@@ -153,12 +159,130 @@ pub struct CandidateIntegrityRecordV1 {
     pub audit_markers: Vec<CandidateIntegrityAuditMarkerV1>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CandidateIntegrityTerminalRetirementV1 {
+    pub(crate) candidate: PumpCandidateIdentityV1,
+}
+
+/// Compact, bounded terminal ownership for a candidate record after its
+/// active runtime/session has been removed. A tombstone is never an admission
+/// authority: it preserves immutable late-evidence classification while the
+/// active maps recover capacity for new candidates.
+#[derive(Debug)]
+struct TerminalCandidateTombstonesV1 {
+    by_candidate: HashMap<PumpCandidateIdentityV1, CandidateIntegrityRecordV1>,
+    by_pool: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
+    by_mint: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
+    fifo: VecDeque<PumpCandidateIdentityV1>,
+    cap: usize,
+    eviction_count: u64,
+    first_evicted: Option<CandidateIntegrityRecordV1>,
+}
+
+impl TerminalCandidateTombstonesV1 {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_candidate: HashMap::with_capacity(cap.min(4096)),
+            by_pool: HashMap::with_capacity(cap.min(4096)),
+            by_mint: HashMap::with_capacity(cap.min(4096)),
+            fifo: VecDeque::with_capacity(cap.min(4096)),
+            cap: cap.max(1),
+            eviction_count: 0,
+            first_evicted: None,
+        }
+    }
+
+    fn insert(&mut self, record: CandidateIntegrityRecordV1) -> Option<CandidateIntegrityRecordV1> {
+        let candidate = record.candidate;
+        if self.by_candidate.contains_key(&candidate) {
+            self.by_candidate.insert(candidate, record);
+            return None;
+        }
+
+        let mut evicted = None;
+        while self.by_candidate.len() >= self.cap {
+            let Some(oldest) = self.fifo.pop_front() else {
+                break;
+            };
+            if let Some(old_record) = self.by_candidate.remove(&oldest) {
+                if self.by_pool.get(&old_record.candidate.pool_amm_id) == Some(&oldest) {
+                    self.by_pool.remove(&old_record.candidate.pool_amm_id);
+                }
+                if self.by_mint.get(&old_record.candidate.mint) == Some(&oldest) {
+                    self.by_mint.remove(&old_record.candidate.mint);
+                }
+                self.eviction_count = self.eviction_count.saturating_add(1);
+                if self.first_evicted.is_none() {
+                    self.first_evicted = Some(old_record.clone());
+                }
+                evicted = Some(old_record);
+                break;
+            }
+        }
+
+        self.by_pool.insert(candidate.pool_amm_id, candidate);
+        self.by_mint.insert(candidate.mint, candidate);
+        self.by_candidate.insert(candidate, record);
+        self.fifo.push_back(candidate);
+        evicted
+    }
+
+    fn get(&self, candidate: PumpCandidateIdentityV1) -> Option<&CandidateIntegrityRecordV1> {
+        self.by_candidate.get(&candidate)
+    }
+
+    fn get_mut(
+        &mut self,
+        candidate: PumpCandidateIdentityV1,
+    ) -> Option<&mut CandidateIntegrityRecordV1> {
+        self.by_candidate.get_mut(&candidate)
+    }
+
+    fn alias_conflicts(&self, candidate: PumpCandidateIdentityV1) -> Vec<PumpCandidateIdentityV1> {
+        let mut conflicts = HashSet::new();
+        if let Some(existing) = self.by_pool.get(&candidate.pool_amm_id) {
+            if *existing != candidate {
+                conflicts.insert(*existing);
+            }
+        }
+        if let Some(existing) = self.by_mint.get(&candidate.mint) {
+            if *existing != candidate {
+                conflicts.insert(*existing);
+            }
+        }
+        conflicts.into_iter().collect()
+    }
+
+    #[cfg(test)]
+    fn retained_count(&self) -> usize {
+        self.by_candidate.len()
+    }
+}
+
+#[derive(Debug)]
 struct CandidateIntegrityRegistryStateV1 {
     records: HashMap<PumpCandidateIdentityV1, CandidateIntegrityRecordV1>,
     by_pool: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
     by_mint: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
     canonical_apply_fence: CanonicalApplyFenceV1,
+    terminal_tombstones: TerminalCandidateTombstonesV1,
+    /// A bounded handoff to the Seer-owned PumpObservationLedger. Oracle
+    /// lifecycle cleanup creates it; Seer's periodic ledger finalizer drains
+    /// it synchronously. It is not a retry queue and cannot grant authority.
+    terminal_ledger_retirements: VecDeque<CandidateIntegrityTerminalRetirementV1>,
+}
+
+impl CandidateIntegrityRegistryStateV1 {
+    fn new(max_terminal_tombstones: usize) -> Self {
+        Self {
+            records: HashMap::new(),
+            by_pool: HashMap::new(),
+            by_mint: HashMap::new(),
+            canonical_apply_fence: CanonicalApplyFenceV1::default(),
+            terminal_tombstones: TerminalCandidateTombstonesV1::new(max_terminal_tombstones),
+            terminal_ledger_retirements: VecDeque::with_capacity(max_terminal_tombstones.min(4096)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -248,6 +372,14 @@ pub struct CandidateIntegrityRegistry {
     state: Mutex<CandidateIntegrityRegistryStateV1>,
     available: AtomicBool,
     candidate_admission_open: AtomicBool,
+    /// Monotonic global admission fence. A guard carries the value observed
+    /// when it was issued; closing admission increments this value so an
+    /// already-issued MFS/evaluation/submit guard cannot cross the closure.
+    ///
+    /// This is deliberately separate from a candidate record generation:
+    /// global ingest-integrity failure must invalidate every not-yet-started
+    /// candidate action without rewriting terminal submit/confirmation state.
+    authority_admission_generation: AtomicU64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,12 +396,18 @@ pub enum CandidateIntegrityErrorV1 {
     RegistryCapacityExceeded,
     #[error("candidate integrity record is missing")]
     CandidateMissing,
+    #[error("candidate terminal retirement has unresolved canonical apply receipts")]
+    TerminalRetirementPending,
     #[error("candidate identity aliases disagree")]
     CandidateAliasConflict,
     #[error("candidate integrity is not Ready: {0:?}")]
     NotReady(CandidateIntegrityOutcomeV1),
     #[error("candidate integrity generation changed: expected={expected} actual={actual}")]
     GenerationChanged { expected: u64, actual: u64 },
+    #[error(
+        "candidate admission closed or guard invalidated: expected admission generation={expected} actual={actual}"
+    )]
+    AdmissionClosed { expected: u64, actual: u64 },
     #[error("candidate lifecycle phase mismatch: expected={expected:?} actual={actual:?}")]
     PhaseMismatch {
         expected: CandidateLifecyclePhaseV1,
@@ -365,12 +503,16 @@ impl CandidateIntegrityRegistry {
         limits: CandidateIntegrityRegistryLimitsV1,
         authority_epoch: Pr1AuthorityEpochV1,
     ) -> Self {
+        let limits = limits.normalized();
         Self {
-            limits: limits.normalized(),
+            state: Mutex::new(CandidateIntegrityRegistryStateV1::new(
+                limits.max_terminal_tombstones,
+            )),
+            limits,
             authority_epoch,
-            state: Mutex::new(CandidateIntegrityRegistryStateV1::default()),
             available: AtomicBool::new(true),
             candidate_admission_open: AtomicBool::new(true),
+            authority_admission_generation: AtomicU64::new(1),
         }
     }
 
@@ -419,7 +561,9 @@ impl CandidateIntegrityRegistry {
         if state.canonical_apply_fence.receipts_by_runtime_key.len() >= self.limits.max_candidates {
             drop(state);
             let _ = self.record_signal(Self::coverage_incomplete_signal(&receipt))?;
-            self.close_candidate_admission("canonical_receipt_capacity_exhausted");
+            self.close_candidate_admission_with_integrity_invalidation(
+                "canonical_receipt_capacity_exhausted",
+            );
             return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
         }
         state.canonical_apply_fence.receipts_by_runtime_key.insert(
@@ -719,6 +863,11 @@ impl CandidateIntegrityRegistry {
         &self,
         receipt: &CanonicalMutationApplyReceiptV1,
     ) -> Result<Vec<CandidateIntegrityReadyReleaseV1>, CandidateIntegrityErrorV1> {
+        // A downstream mutation that races a global integrity closure remains
+        // an applied state fact, but it must never turn into a new Ready
+        // admission. The closure's generation fence also invalidates every
+        // previously issued evaluation/submit guard.
+        self.require_candidate_admission_open()?;
         self.require_available()?;
         let mut state = self.lock_state()?;
         let entry = state
@@ -842,7 +991,9 @@ impl CandidateIntegrityRegistry {
             for signal in failure_signals {
                 let _ = self.record_signal(signal)?;
             }
-            self.close_candidate_admission("canonical_inventory_proof_capacity_exhausted");
+            self.close_candidate_admission_with_integrity_invalidation(
+                "canonical_inventory_proof_capacity_exhausted",
+            );
             return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
         }
         let Some(entry) = state
@@ -909,6 +1060,27 @@ impl CandidateIntegrityRegistry {
                 return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
             }
         };
+        if let Some(record) = state.terminal_tombstones.get_mut(signal.candidate) {
+            // A retired identity remains immutable evidence, never a route
+            // back into active candidate admission. Preserve the late signal
+            // in the bounded terminal audit history instead of recreating an
+            // active record and consuming capacity again.
+            append_audit_marker(
+                record,
+                self.limits.max_audit_markers_per_candidate,
+                CandidateIntegrityAuditMarkerV1 {
+                    generation: record.generation,
+                    outcome: signal.outcome,
+                    phase_at_observation: record.lifecycle_phase,
+                    evidence_hash_blake3: signal.evidence_hash_blake3,
+                    action: CandidateIntegrityConflictActionV1::TerminalVerdictImmutableAudit,
+                },
+            );
+            return Ok(CandidateIntegritySignalResultV1 {
+                action: CandidateIntegrityConflictActionV1::TerminalVerdictImmutableAudit,
+                snapshot: record.clone(),
+            });
+        }
         let alias_conflicts = conflicting_alias_candidates(&state, signal.candidate);
         if !alias_conflicts.is_empty() {
             for existing_candidate in alias_conflicts.iter().copied() {
@@ -1022,9 +1194,10 @@ impl CandidateIntegrityRegistry {
         self: &Arc<Self>,
         candidate: PumpCandidateIdentityV1,
     ) -> Result<CandidateIntegrityEvaluationGuardV1, CandidateIntegrityErrorV1> {
-        self.require_candidate_admission_open()?;
+        let admission_generation = self.capture_admission_generation()?;
         self.require_available()?;
         let state = self.lock_state()?;
+        self.require_admission_generation(admission_generation)?;
         let record = lookup_record(&state, candidate)?;
         require_ready(record)?;
         if record.lifecycle_phase != CandidateLifecyclePhaseV1::PreMfs {
@@ -1037,6 +1210,7 @@ impl CandidateIntegrityRegistry {
             registry: Arc::clone(self),
             candidate: record.candidate,
             generation: record.generation,
+            admission_generation,
         })
     }
 
@@ -1044,9 +1218,10 @@ impl CandidateIntegrityRegistry {
         self: &Arc<Self>,
         candidate: PumpCandidateIdentityV1,
     ) -> Result<CandidateIntegritySubmitGuardV1, CandidateIntegrityErrorV1> {
-        self.require_candidate_admission_open()?;
+        let admission_generation = self.capture_admission_generation()?;
         self.require_available()?;
         let state = self.lock_state()?;
+        self.require_admission_generation(admission_generation)?;
         let record = lookup_record(&state, candidate)?;
         require_ready(record)?;
         if record.lifecycle_phase != CandidateLifecyclePhaseV1::TerminalBuyNotSubmitted {
@@ -1059,6 +1234,7 @@ impl CandidateIntegrityRegistry {
             registry: Arc::clone(self),
             candidate: record.candidate,
             generation: record.generation,
+            admission_generation,
             submit_started: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -1069,7 +1245,95 @@ impl CandidateIntegrityRegistry {
         candidate: PumpCandidateIdentityV1,
     ) -> Result<CandidateIntegrityRecordV1, CandidateIntegrityErrorV1> {
         let state = self.lock_state()?;
-        Ok(lookup_record(&state, candidate)?.clone())
+        if let Some(record) = state.records.get(&candidate) {
+            return Ok(record.clone());
+        }
+        state
+            .terminal_tombstones
+            .get(candidate)
+            .cloned()
+            .ok_or(CandidateIntegrityErrorV1::CandidateMissing)
+    }
+
+    /// Retire a completed runtime candidate from the active admission maps.
+    ///
+    /// This is called only after the Oracle has removed its session/pool. The
+    /// full record is replaced by one bounded terminal tombstone, and an
+    /// equally bounded handoff is queued for the Seer-owned observation
+    /// ledger. No unresolved canonical receipt is ever silently retired.
+    pub(crate) fn retire_terminal_candidate(
+        &self,
+        candidate: PumpCandidateIdentityV1,
+    ) -> Result<bool, CandidateIntegrityErrorV1> {
+        self.require_available()?;
+        let mut state = self.lock_state()?;
+        let has_unresolved_receipt = state
+            .canonical_apply_fence
+            .receipts_by_runtime_key
+            .values()
+            .any(|entry| entry.receipt.candidate == candidate && !entry.applied && !entry.failed);
+        let Some(record) = state.records.get(&candidate).cloned() else {
+            // A receipt may have been staged before inventory completion
+            // creates the CandidateIntegrity record. It is still an active
+            // proof obligation and must never disappear merely because its
+            // candidate has not reached Ready yet.
+            if has_unresolved_receipt {
+                return Err(CandidateIntegrityErrorV1::TerminalRetirementPending);
+            }
+            return Ok(false);
+        };
+        if has_unresolved_receipt {
+            return Err(CandidateIntegrityErrorV1::TerminalRetirementPending);
+        }
+        if record.lifecycle_phase == CandidateLifecyclePhaseV1::SubmitStarted {
+            return Err(CandidateIntegrityErrorV1::PhaseMismatch {
+                expected: CandidateLifecyclePhaseV1::ConfirmedOpenPosition,
+                actual: record.lifecycle_phase,
+            });
+        }
+        if state.terminal_ledger_retirements.len() >= self.limits.max_terminal_tombstones {
+            return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
+        }
+
+        let removed = state
+            .records
+            .remove(&candidate)
+            .ok_or(CandidateIntegrityErrorV1::CandidateMissing)?;
+        if state.by_pool.get(&candidate.pool_amm_id) == Some(&candidate) {
+            state.by_pool.remove(&candidate.pool_amm_id);
+        }
+        if state.by_mint.get(&candidate.mint) == Some(&candidate) {
+            state.by_mint.remove(&candidate.mint);
+        }
+        Self::cleanup_canonical_apply_fence_for_candidate(&mut state, candidate);
+        let evicted = state.terminal_tombstones.insert(removed.clone());
+        state
+            .terminal_ledger_retirements
+            .push_back(CandidateIntegrityTerminalRetirementV1 { candidate });
+        if evicted.is_some() {
+            ::metrics::counter!("candidate_integrity_terminal_tombstone_evicted_total", 1u64);
+        }
+        ::metrics::gauge!(
+            "candidate_integrity_terminal_tombstones",
+            state.terminal_tombstones.by_candidate.len() as f64,
+            "authority_epoch_id" => self.authority_epoch.epoch_id.to_string()
+        );
+        Ok(true)
+    }
+
+    /// Drain the bounded terminal-retirement control handoff. The caller is
+    /// the Seer component's synchronous ledger finalizer; the value carries
+    /// no runtime authority by itself.
+    pub(crate) fn drain_terminal_ledger_retirements(
+        &self,
+    ) -> Result<Vec<CandidateIntegrityTerminalRetirementV1>, CandidateIntegrityErrorV1> {
+        let mut state = self.lock_state()?;
+        Ok(state.terminal_ledger_retirements.drain(..).collect())
+    }
+
+    #[cfg(test)]
+    fn terminal_tombstone_count(&self) -> Result<usize, CandidateIntegrityErrorV1> {
+        Ok(self.lock_state()?.terminal_tombstones.retained_count())
     }
 
     /// Return the current CandidateIntegrity status associated with a
@@ -1116,6 +1380,8 @@ impl CandidateIntegrityRegistry {
 
     pub fn close_candidate_admission(&self, reason: &'static str) {
         if self.candidate_admission_open.swap(false, Ordering::AcqRel) {
+            self.authority_admission_generation
+                .fetch_add(1, Ordering::AcqRel);
             ::metrics::gauge!(
                 "pr1_runtime_candidate_admission_closed",
                 1.0,
@@ -1123,6 +1389,76 @@ impl CandidateIntegrityRegistry {
                 "reason" => reason
             );
         }
+    }
+
+    /// Close new-candidate admission and synchronously turn every mutable
+    /// candidate record into typed technical integrity evidence.
+    ///
+    /// This is used by cross-candidate failures such as a primary local
+    /// coverage gap. Already-started submit/confirmation flows are not
+    /// cancelled: they retain reconciliation authority, while confirmed
+    /// positions keep their protective lifecycle untouched.
+    pub fn close_candidate_admission_with_integrity_invalidation(&self, reason: &'static str) {
+        self.close_candidate_admission(reason);
+        let admission_generation = self.authority_admission_generation.load(Ordering::Acquire);
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                self.available.store(false, Ordering::Release);
+                return;
+            }
+        };
+
+        let mut cleanup_candidates = Vec::new();
+        for record in state.records.values_mut() {
+            let action = match record.lifecycle_phase {
+                CandidateLifecyclePhaseV1::PreMfs
+                | CandidateLifecyclePhaseV1::MfsMaterialized
+                | CandidateLifecyclePhaseV1::EvaluationRunning
+                | CandidateLifecyclePhaseV1::TerminalBuyNotSubmitted => {
+                    record.generation = record.generation.saturating_add(1);
+                    record.outcome = CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete;
+                    cleanup_candidates.push(record.candidate);
+                    Some(conflict_action_for_phase(record))
+                }
+                CandidateLifecyclePhaseV1::SubmitStarted => {
+                    // The sender has already begun. Preserve that real-world
+                    // lifecycle and require reconciliation instead of a false
+                    // cancellation.
+                    record.reconciliation_required = true;
+                    Some(CandidateIntegrityConflictActionV1::ReconciliationRequired)
+                }
+                CandidateLifecyclePhaseV1::TerminalReject
+                | CandidateLifecyclePhaseV1::TerminalTimeout => None,
+                CandidateLifecyclePhaseV1::ConfirmedOpenPosition => {
+                    // Confirmed position continuity/protective exits are not
+                    // candidate admission and must continue after a global
+                    // coverage failure.
+                    None
+                }
+            };
+            if let Some(action) = action {
+                append_audit_marker(
+                    record,
+                    self.limits.max_audit_markers_per_candidate,
+                    CandidateIntegrityAuditMarkerV1 {
+                        generation: record.generation,
+                        outcome: CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                        phase_at_observation: record.lifecycle_phase,
+                        evidence_hash_blake3: global_admission_evidence_hash(
+                            reason,
+                            record.candidate,
+                            admission_generation,
+                        ),
+                        action,
+                    },
+                );
+            }
+        }
+        for candidate in cleanup_candidates {
+            Self::cleanup_canonical_apply_fence_for_candidate(&mut state, candidate);
+        }
+        self.record_pending_permit_metrics(&state);
     }
 
     fn mark_unavailable(&self, reason: &'static str) {
@@ -1135,6 +1471,22 @@ impl CandidateIntegrityRegistry {
             Ok(())
         } else {
             Err(CandidateIntegrityErrorV1::RegistryUnavailable)
+        }
+    }
+
+    fn capture_admission_generation(&self) -> Result<u64, CandidateIntegrityErrorV1> {
+        self.require_candidate_admission_open()?;
+        let generation = self.authority_admission_generation.load(Ordering::Acquire);
+        self.require_admission_generation(generation)?;
+        Ok(generation)
+    }
+
+    fn require_admission_generation(&self, expected: u64) -> Result<(), CandidateIntegrityErrorV1> {
+        let actual = self.authority_admission_generation.load(Ordering::Acquire);
+        if self.candidate_admission_open() && actual == expected {
+            Ok(())
+        } else {
+            Err(CandidateIntegrityErrorV1::AdmissionClosed { expected, actual })
         }
     }
 
@@ -1165,11 +1517,14 @@ impl CandidateIntegrityRegistry {
         &self,
         candidate: PumpCandidateIdentityV1,
         generation: u64,
+        admission_generation: u64,
         expected: CandidateLifecyclePhaseV1,
         next: CandidateLifecyclePhaseV1,
     ) -> Result<(), CandidateIntegrityErrorV1> {
         self.require_available()?;
+        self.require_admission_generation(admission_generation)?;
         let mut state = self.lock_state()?;
+        self.require_admission_generation(admission_generation)?;
         let record = lookup_record_mut(&mut state, candidate)?;
         require_generation(record, generation)?;
         require_ready(record)?;
@@ -1196,9 +1551,12 @@ impl CandidateIntegrityRegistry {
         &self,
         candidate: PumpCandidateIdentityV1,
         generation: u64,
+        admission_generation: u64,
     ) -> Result<(), CandidateIntegrityErrorV1> {
         self.require_available()?;
+        self.require_admission_generation(admission_generation)?;
         let state = self.lock_state()?;
+        self.require_admission_generation(admission_generation)?;
         let record = lookup_record(&state, candidate)?;
         require_generation(record, generation)?;
         require_ready(record)
@@ -1216,6 +1574,7 @@ pub struct CandidateIntegrityEvaluationGuardV1 {
     registry: Arc<CandidateIntegrityRegistry>,
     candidate: PumpCandidateIdentityV1,
     generation: u64,
+    admission_generation: u64,
 }
 
 impl CandidateIntegrityEvaluationGuardV1 {
@@ -1230,13 +1589,15 @@ impl CandidateIntegrityEvaluationGuardV1 {
     }
 
     pub fn check_ready(&self) -> Result<(), CandidateIntegrityErrorV1> {
-        self.registry.check_guard(self.candidate, self.generation)
+        self.registry
+            .check_guard(self.candidate, self.generation, self.admission_generation)
     }
 
     pub fn mark_mfs_materialized(&self) -> Result<(), CandidateIntegrityErrorV1> {
         self.registry.transition_guard_phase(
             self.candidate,
             self.generation,
+            self.admission_generation,
             CandidateLifecyclePhaseV1::PreMfs,
             CandidateLifecyclePhaseV1::MfsMaterialized,
         )
@@ -1246,6 +1607,7 @@ impl CandidateIntegrityEvaluationGuardV1 {
         self.registry.transition_guard_phase(
             self.candidate,
             self.generation,
+            self.admission_generation,
             CandidateLifecyclePhaseV1::MfsMaterialized,
             CandidateLifecyclePhaseV1::EvaluationRunning,
         )
@@ -1253,7 +1615,11 @@ impl CandidateIntegrityEvaluationGuardV1 {
 
     pub fn reset_pre_mfs(&self) -> Result<(), CandidateIntegrityErrorV1> {
         self.registry.require_available()?;
+        self.registry
+            .require_admission_generation(self.admission_generation)?;
         let mut state = self.registry.lock_state()?;
+        self.registry
+            .require_admission_generation(self.admission_generation)?;
         let record = lookup_record_mut(&mut state, self.candidate)?;
         require_generation(record, self.generation)?;
         require_ready(record)?;
@@ -1285,6 +1651,7 @@ impl CandidateIntegrityEvaluationGuardV1 {
         self.registry.transition_guard_phase(
             self.candidate,
             self.generation,
+            self.admission_generation,
             CandidateLifecyclePhaseV1::EvaluationRunning,
             next,
         )?;
@@ -1294,6 +1661,7 @@ impl CandidateIntegrityEvaluationGuardV1 {
                     registry: Arc::clone(&self.registry),
                     candidate: self.candidate,
                     generation: self.generation,
+                    admission_generation: self.admission_generation,
                     submit_started: Arc::new(AtomicBool::new(false)),
                 }
             }),
@@ -1306,6 +1674,7 @@ pub struct CandidateIntegritySubmitGuardV1 {
     registry: Arc<CandidateIntegrityRegistry>,
     candidate: PumpCandidateIdentityV1,
     generation: u64,
+    admission_generation: u64,
     submit_started: Arc<AtomicBool>,
 }
 
@@ -1325,6 +1694,7 @@ impl CandidateIntegritySubmitGuardV1 {
         self.registry.transition_guard_phase(
             self.candidate,
             self.generation,
+            self.admission_generation,
             CandidateLifecyclePhaseV1::TerminalBuyNotSubmitted,
             CandidateLifecyclePhaseV1::SubmitStarted,
         )?;
@@ -1369,6 +1739,12 @@ impl CandidateIntegritySubmitGuardV1 {
         if !self.submit_started.load(Ordering::Acquire) {
             return false;
         }
+        if !self.registry.candidate_admission_open() {
+            // Global admission closure cannot cancel an already-started
+            // sender. It instead requires the existing confirmation path to
+            // reconcile the attempt conservatively.
+            return true;
+        }
         self.registry
             .snapshot(self.candidate)
             .map_or(true, |record| record.reconciliation_required)
@@ -1386,6 +1762,11 @@ fn publish_ready_with_cas(
     cas: CandidateIntegrityCasTokenV1,
     signal: &CandidateIntegritySignalV1,
 ) -> Result<bool, CandidateIntegrityErrorV1> {
+    if state.terminal_tombstones.get(signal.candidate).is_some() {
+        // A late downstream acknowledgement for a retired pool is an audit
+        // fact, never a way to resurrect a candidate or publish Ready again.
+        return Ok(false);
+    }
     validate_aliases(state, signal.candidate)?;
     match cas {
         CandidateIntegrityCasTokenV1::Absent => {
@@ -1452,6 +1833,16 @@ fn validate_aliases(
             .by_mint
             .get(&candidate.mint)
             .is_some_and(|existing| *existing != candidate)
+        || state
+            .terminal_tombstones
+            .by_pool
+            .get(&candidate.pool_amm_id)
+            .is_some_and(|existing| *existing != candidate)
+        || state
+            .terminal_tombstones
+            .by_mint
+            .get(&candidate.mint)
+            .is_some_and(|existing| *existing != candidate)
     {
         return Err(CandidateIntegrityErrorV1::CandidateAliasConflict);
     }
@@ -1473,6 +1864,7 @@ fn conflicting_alias_candidates(
             conflicts.insert(*existing);
         }
     }
+    conflicts.extend(state.terminal_tombstones.alias_conflicts(candidate));
     conflicts.into_iter().collect()
 }
 
@@ -1542,6 +1934,20 @@ fn require_generation(
         });
     }
     Ok(())
+}
+
+fn global_admission_evidence_hash(
+    reason: &'static str,
+    candidate: PumpCandidateIdentityV1,
+    admission_generation: u64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ghost.pr1e.global_candidate_admission_closure.v1");
+    hasher.update(reason.as_bytes());
+    hasher.update(candidate.pool_amm_id.as_ref());
+    hasher.update(candidate.mint.as_ref());
+    hasher.update(&admission_generation.to_le_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 fn append_audit_marker(
@@ -1942,6 +2348,7 @@ mod tests {
         let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
             max_candidates: 1,
             max_audit_markers_per_candidate: 2,
+            max_terminal_tombstones: 1,
         });
         let pending_candidate = candidate();
         let pending = canonical(Signature::new_unique(), 0, pending_candidate);
@@ -1974,6 +2381,7 @@ mod tests {
         let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
             max_candidates: 1,
             max_audit_markers_per_candidate: 2,
+            max_terminal_tombstones: 1,
         });
         registry
             .record_signal(signal(candidate(), CandidateIntegrityOutcomeV1::Ready, 1))
@@ -2014,6 +2422,7 @@ mod tests {
         let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
             max_candidates: 1,
             max_audit_markers_per_candidate: 2,
+            max_terminal_tombstones: 1,
         });
         let affected = candidate();
         let canonical = canonical(Signature::new_unique(), 0, affected);
@@ -2337,5 +2746,235 @@ mod tests {
         ));
         assert!(!registry.is_available());
         assert!(!registry.candidate_admission_open());
+    }
+
+    #[test]
+    fn global_admission_close_invalidates_an_issued_evaluation_guard_before_mfs() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = candidate();
+        registry
+            .record_signal(signal(candidate, CandidateIntegrityOutcomeV1::Ready, 1))
+            .expect("register Ready");
+        let guard = registry
+            .evaluation_guard(candidate)
+            .expect("issue evaluation guard while admission is open");
+
+        registry.close_candidate_admission("test_global_integrity_failure");
+
+        assert!(matches!(
+            guard.check_ready(),
+            Err(CandidateIntegrityErrorV1::AdmissionClosed { .. })
+        ));
+        assert!(matches!(
+            guard.mark_mfs_materialized(),
+            Err(CandidateIntegrityErrorV1::AdmissionClosed { .. })
+        ));
+        assert_eq!(
+            registry
+                .snapshot(candidate)
+                .expect("record remains auditable")
+                .lifecycle_phase,
+            CandidateLifecyclePhaseV1::PreMfs,
+            "an invalidated guard cannot begin MFS or invoke Gatekeeper"
+        );
+    }
+
+    #[test]
+    fn global_admission_close_prevents_buy_not_submitted_from_starting_sender() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = candidate();
+        registry
+            .record_signal(signal(candidate, CandidateIntegrityOutcomeV1::Ready, 1))
+            .expect("register Ready");
+        let evaluation = registry
+            .evaluation_guard(candidate)
+            .expect("evaluation guard");
+        evaluation.mark_mfs_materialized().expect("MFS");
+        evaluation
+            .mark_evaluation_running()
+            .expect("evaluation running");
+        let submit_guard = evaluation
+            .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
+            .expect("BUY terminal")
+            .expect("BUY creates submit guard");
+
+        registry.close_candidate_admission("test_global_integrity_failure");
+
+        assert!(matches!(
+            submit_guard.try_begin_submit(),
+            Err(CandidateIntegrityErrorV1::AdmissionClosed { .. })
+        ));
+        assert_eq!(
+            registry
+                .snapshot(candidate)
+                .expect("record remains auditable")
+                .lifecycle_phase,
+            CandidateLifecyclePhaseV1::TerminalBuyNotSubmitted,
+            "no sender start is authorized after global admission closure"
+        );
+    }
+
+    #[test]
+    fn global_admission_close_preserves_confirmation_after_submit_started() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = candidate();
+        registry
+            .record_signal(signal(candidate, CandidateIntegrityOutcomeV1::Ready, 1))
+            .expect("register Ready");
+        let evaluation = registry
+            .evaluation_guard(candidate)
+            .expect("evaluation guard");
+        evaluation.mark_mfs_materialized().expect("MFS");
+        evaluation
+            .mark_evaluation_running()
+            .expect("evaluation running");
+        let submit_guard = evaluation
+            .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
+            .expect("BUY terminal")
+            .expect("BUY creates submit guard");
+        assert_eq!(
+            submit_guard
+                .try_begin_submit()
+                .expect("submit starts before closure"),
+            CandidateSubmitTransitionV1::StartedNow
+        );
+
+        registry.close_candidate_admission("test_global_integrity_failure");
+
+        assert!(submit_guard.requires_reconciliation());
+        assert_eq!(
+            submit_guard
+                .try_begin_submit()
+                .expect("idempotent submit-start query remains available"),
+            CandidateSubmitTransitionV1::AlreadyStarted
+        );
+        submit_guard
+            .mark_confirmed()
+            .expect("real confirmation remains authoritative after sender start");
+        assert_eq!(
+            registry
+                .snapshot(candidate)
+                .expect("confirmed snapshot")
+                .lifecycle_phase,
+            CandidateLifecyclePhaseV1::ConfirmedOpenPosition
+        );
+    }
+
+    #[test]
+    fn terminal_retirement_reclaims_active_capacity_without_resurrecting_ready() {
+        let registry = Arc::new(CandidateIntegrityRegistry::new(
+            CandidateIntegrityRegistryLimitsV1 {
+                max_candidates: 1,
+                max_audit_markers_per_candidate: 2,
+                max_terminal_tombstones: 2,
+            },
+        ));
+        let retired = candidate();
+        registry
+            .record_signal(signal(retired, CandidateIntegrityOutcomeV1::Ready, 1))
+            .expect("active candidate");
+
+        assert!(registry
+            .retire_terminal_candidate(retired)
+            .expect("terminal pool has no unresolved receipt"));
+        assert_eq!(
+            registry
+                .terminal_tombstone_count()
+                .expect("bounded tombstone snapshot"),
+            1
+        );
+        assert!(matches!(
+            registry.evaluation_guard(retired),
+            Err(CandidateIntegrityErrorV1::CandidateMissing)
+        ));
+        let late = registry
+            .record_signal(signal(
+                retired,
+                CandidateIntegrityOutcomeV1::SourceReconciliationConflict,
+                2,
+            ))
+            .expect("late retired evidence remains auditable");
+        assert_eq!(
+            late.action,
+            CandidateIntegrityConflictActionV1::TerminalVerdictImmutableAudit
+        );
+
+        let next = candidate();
+        registry
+            .record_signal(signal(next, CandidateIntegrityOutcomeV1::Ready, 3))
+            .expect("reclaimed active capacity admits the next candidate");
+        assert!(registry.evaluation_guard(next).is_ok());
+        assert!(registry.candidate_admission_open());
+
+        let retirements = registry
+            .drain_terminal_ledger_retirements()
+            .expect("bounded handoff");
+        assert_eq!(retirements.len(), 1);
+        assert_eq!(retirements[0].candidate, retired);
+        assert!(registry
+            .drain_terminal_ledger_retirements()
+            .expect("handoff drain is idempotent")
+            .is_empty());
+    }
+
+    #[test]
+    fn terminal_retirement_never_discards_an_unresolved_apply_receipt() {
+        let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
+            max_candidates: 1,
+            max_audit_markers_per_candidate: 2,
+            max_terminal_tombstones: 1,
+        });
+        let candidate = candidate();
+        let canonical = canonical(Signature::new_unique(), 0, candidate);
+        let receipt = registry
+            .stage_canonical_mutation(&canonical)
+            .expect("stage unresolved apply");
+
+        assert_eq!(
+            registry.retire_terminal_candidate(candidate),
+            Err(CandidateIntegrityErrorV1::TerminalRetirementPending)
+        );
+        let state = registry.lock_state().expect("registry state");
+        assert!(state
+            .canonical_apply_fence
+            .receipts_by_runtime_key
+            .contains_key(&receipt.runtime_key));
+        assert_eq!(state.terminal_tombstones.retained_count(), 0);
+    }
+
+    #[test]
+    fn terminal_tombstone_fifo_reclaims_active_registry_capacity_past_retention_cap() {
+        let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
+            max_candidates: 1,
+            max_audit_markers_per_candidate: 2,
+            max_terminal_tombstones: 2,
+        });
+
+        for sequence in 0..4_u8 {
+            let terminal = candidate();
+            registry
+                .record_signal(signal(
+                    terminal,
+                    CandidateIntegrityOutcomeV1::Ready,
+                    sequence,
+                ))
+                .expect("active capacity is reclaimed before the next candidate arrives");
+            assert!(registry
+                .retire_terminal_candidate(terminal)
+                .expect("resolved candidate retires into bounded terminal lane"));
+            assert_eq!(
+                registry
+                    .drain_terminal_ledger_retirements()
+                    .expect("test drains the cross-owner handoff")
+                    .len(),
+                1
+            );
+        }
+
+        let state = registry.lock_state().expect("registry state");
+        assert_eq!(state.records.len(), 0);
+        assert_eq!(state.terminal_tombstones.retained_count(), 2);
+        assert_eq!(state.terminal_tombstones.eviction_count, 2);
+        assert!(state.terminal_tombstones.first_evicted.is_some());
     }
 }

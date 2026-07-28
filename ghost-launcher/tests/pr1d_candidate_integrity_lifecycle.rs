@@ -417,6 +417,7 @@ fn shadow_bounded_audit_overflow_never_rewrites_confirmed_history() {
         CandidateIntegrityRegistryLimitsV1 {
             max_candidates: 1,
             max_audit_markers_per_candidate: 2,
+            max_terminal_tombstones: 1,
         },
     );
     let _submit_guard = confirmed_position(&registry, candidate);

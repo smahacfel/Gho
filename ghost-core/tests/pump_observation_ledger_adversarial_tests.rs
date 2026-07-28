@@ -174,6 +174,7 @@ fn small_config(
         max_pending_witnesses: pending,
         max_correlated_witnesses_per_mutation: correlated,
         max_retained_conflicts: conflicts,
+        max_terminal_canonical_tombstones: 8,
     }
 }
 

@@ -14,7 +14,7 @@ use crate::ingest_integrity::{
 };
 use serde::{Deserialize, Serialize};
 use solana_sdk::signature::Signature;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
 /// Bounded capacities and deterministic correlation retention.
@@ -32,6 +32,11 @@ pub struct PumpObservationLedgerConfigV1 {
     /// Retained material conflicts. Classification continues after saturation,
     /// while evidence completeness is marked false.
     pub max_retained_conflicts: usize,
+    /// Compact terminal primary records retained after a candidate/session has
+    /// completed cleanup. This bounds in-process duplicate/witness history
+    /// without imposing a fixed lifetime cap on active admission.
+    #[serde(default = "default_max_terminal_canonical_tombstones")]
+    pub max_terminal_canonical_tombstones: usize,
 }
 
 impl Default for PumpObservationLedgerConfigV1 {
@@ -42,8 +47,13 @@ impl Default for PumpObservationLedgerConfigV1 {
             max_pending_witnesses: 16_384,
             max_correlated_witnesses_per_mutation: 32,
             max_retained_conflicts: 8_192,
+            max_terminal_canonical_tombstones: default_max_terminal_canonical_tombstones(),
         }
     }
+}
+
+const fn default_max_terminal_canonical_tombstones() -> usize {
+    50_000
 }
 
 impl PumpObservationLedgerConfigV1 {
@@ -71,6 +81,11 @@ impl PumpObservationLedgerConfigV1 {
                 PumpObservationEvidenceLaneV1::Conflict,
             ));
         }
+        if self.max_terminal_canonical_tombstones == 0 {
+            return Err(PumpObservationLedgerConfigErrorV1::ZeroCapacity(
+                PumpObservationEvidenceLaneV1::TerminalCanonicalTombstone,
+            ));
+        }
         Ok(self)
     }
 }
@@ -83,6 +98,7 @@ pub enum PumpObservationEvidenceLaneV1 {
     CorrelatedWitness,
     Conflict,
     ExpiredWitnessAudit,
+    TerminalCanonicalTombstone,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -188,6 +204,12 @@ pub struct PumpObservationLedgerSnapshotV1 {
     pub conflict_count: u64,
     pub pending_witness_count: usize,
     pub retained_conflict_count: usize,
+    #[serde(default)]
+    pub retained_terminal_canonical_tombstone_count: usize,
+    #[serde(default)]
+    pub terminal_canonical_tombstone_eviction_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_evicted_terminal_locator: Option<RawPumpMutationLocatorV1>,
     /// Finalized ambiguous/unmatchable witnesses retained for exact replay
     /// detection without consuming primary canonical capacity.
     pub finalized_unassigned_witness_count: usize,
@@ -268,6 +290,91 @@ struct PrimaryTransactionInventory {
     incomplete_signaled: bool,
 }
 
+/// Bounded compact retention of canonical records after the owning candidate
+/// has terminally left the Oracle runtime. The record keeps the exact
+/// structural locator, normalized primary payload and bounded correlated
+/// witnesses needed to classify late duplicates/witnesses, but it is no
+/// longer in the active canonical authority lane.
+#[derive(Debug)]
+struct TerminalCanonicalTombstonesV1 {
+    by_locator: HashMap<RawPumpMutationLocatorV1, CanonicalRecord>,
+    locators_by_signature: HashMap<Signature, Vec<RawPumpMutationLocatorV1>>,
+    fifo: VecDeque<RawPumpMutationLocatorV1>,
+    cap: usize,
+    eviction_count: u64,
+    first_evicted_locator: Option<RawPumpMutationLocatorV1>,
+}
+
+impl TerminalCanonicalTombstonesV1 {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_locator: HashMap::with_capacity(cap.min(4096)),
+            locators_by_signature: HashMap::with_capacity(cap.min(4096)),
+            fifo: VecDeque::with_capacity(cap.min(4096)),
+            cap: cap.max(1),
+            eviction_count: 0,
+            first_evicted_locator: None,
+        }
+    }
+
+    fn contains(&self, locator: &RawPumpMutationLocatorV1) -> bool {
+        self.by_locator.contains_key(locator)
+    }
+
+    fn get(&self, locator: &RawPumpMutationLocatorV1) -> Option<&CanonicalRecord> {
+        self.by_locator.get(locator)
+    }
+
+    fn get_mut(&mut self, locator: &RawPumpMutationLocatorV1) -> Option<&mut CanonicalRecord> {
+        self.by_locator.get_mut(locator)
+    }
+
+    fn locators_for_signature(&self, signature: &Signature) -> Vec<RawPumpMutationLocatorV1> {
+        self.locators_by_signature
+            .get(signature)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn insert(&mut self, locator: RawPumpMutationLocatorV1, record: CanonicalRecord) {
+        if self.by_locator.contains_key(&locator) {
+            self.by_locator.insert(locator, record);
+            return;
+        }
+        while self.by_locator.len() >= self.cap {
+            let Some(oldest) = self.fifo.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.by_locator.remove(&oldest) {
+                let remove_signature =
+                    if let Some(locators) = self.locators_by_signature.get_mut(&oldest.signature) {
+                        locators.retain(|locator| locator != &oldest);
+                        locators.is_empty()
+                    } else {
+                        false
+                    };
+                if remove_signature {
+                    self.locators_by_signature.remove(&oldest.signature);
+                }
+                self.eviction_count = self.eviction_count.saturating_add(1);
+                if self.first_evicted_locator.is_none() {
+                    self.first_evicted_locator = Some(oldest.clone());
+                }
+                // `evicted` is deliberately dropped: bounded exactly-once
+                // applies only while the terminal tombstone is retained.
+                drop(evicted);
+                break;
+            }
+        }
+        self.locators_by_signature
+            .entry(locator.signature)
+            .or_default()
+            .push(locator.clone());
+        self.by_locator.insert(locator.clone(), record);
+        self.fifo.push_back(locator);
+    }
+}
+
 /// Pure in-process Pump observation arbiter.
 ///
 /// Exactly-once here is bounded to the process and retained primary lane.
@@ -279,6 +386,7 @@ pub struct PumpObservationLedgerV1 {
     canonical_by_locator: HashMap<RawPumpMutationLocatorV1, CanonicalRecord>,
     canonical_locators_by_signature: HashMap<Signature, Vec<RawPumpMutationLocatorV1>>,
     primary_transaction_inventories: HashMap<Signature, PrimaryTransactionInventory>,
+    terminal_canonical_tombstones: TerminalCanonicalTombstonesV1,
     pending_witnesses: Vec<PendingWitness>,
     finalized_unassigned_witnesses: Vec<FinalizedUnassignedWitness>,
     expired_witness_audit: Vec<ObservedPumpMutationV1>,
@@ -314,6 +422,9 @@ impl PumpObservationLedgerV1 {
             canonical_by_locator: HashMap::new(),
             canonical_locators_by_signature: HashMap::new(),
             primary_transaction_inventories: HashMap::new(),
+            terminal_canonical_tombstones: TerminalCanonicalTombstonesV1::new(
+                config.max_terminal_canonical_tombstones,
+            ),
             pending_witnesses: Vec::new(),
             finalized_unassigned_witnesses: Vec::new(),
             expired_witness_audit: Vec::new(),
@@ -466,17 +577,9 @@ impl PumpObservationLedgerV1 {
                 self.pending_witnesses = still_pending;
             }
 
-            let raw_locators = self
-                .canonical_locators_by_signature
-                .get(&signature)
-                .cloned()
-                .unwrap_or_default();
+            let raw_locators = self.all_canonical_locators_for_signature(&signature);
             let declared_singleton = raw_locators.len() == 1
-                && self
-                    .canonical_by_locator
-                    .get(&raw_locators[0])
-                    .and_then(|record| record.raw_transaction_mutation_count)
-                    == Some(1);
+                && self.raw_transaction_mutation_count_for_locator(&raw_locators[0]) == Some(1);
 
             let mut locatorless = Vec::new();
             let mut nonmatching_complete = Vec::new();
@@ -512,11 +615,22 @@ impl PumpObservationLedgerV1 {
                 let pending = locatorless
                     .pop()
                     .expect("locatorless length was checked without concurrent mutation");
-                decisions.push(self.correlate_with_canonical(
-                    &raw_locators[0],
-                    pending.observation,
-                    Some(ParsedWitnessCorrelationOutcomeV1::UniqueSignatureSingletonMatch),
-                ));
+                let locator = &raw_locators[0];
+                let correlation =
+                    Some(ParsedWitnessCorrelationOutcomeV1::UniqueSignatureSingletonMatch);
+                if self.canonical_by_locator.contains_key(locator) {
+                    decisions.push(self.correlate_with_canonical(
+                        locator,
+                        pending.observation,
+                        correlation,
+                    ));
+                } else if self.terminal_canonical_tombstones.contains(locator) {
+                    decisions.push(self.correlate_with_terminal_tombstone(
+                        locator,
+                        pending.observation,
+                        correlation,
+                    ));
+                }
                 continue;
             }
 
@@ -589,6 +703,17 @@ impl PumpObservationLedgerV1 {
             conflict_count: self.conflict_count,
             pending_witness_count: self.pending_witnesses.len(),
             retained_conflict_count: self.retained_conflicts.len(),
+            retained_terminal_canonical_tombstone_count: self
+                .terminal_canonical_tombstones
+                .by_locator
+                .len(),
+            terminal_canonical_tombstone_eviction_count: self
+                .terminal_canonical_tombstones
+                .eviction_count,
+            first_evicted_terminal_locator: self
+                .terminal_canonical_tombstones
+                .first_evicted_locator
+                .clone(),
             finalized_unassigned_witness_count: self.finalized_unassigned_witnesses.len(),
             retained_expired_witness_count: self.expired_witness_audit.len(),
             expired_witness_audit_overflow_count: self.expired_witness_audit_overflow_count,
@@ -604,6 +729,33 @@ impl PumpObservationLedgerV1 {
         }
     }
 
+    /// Move every active canonical locator belonging to a terminally removed
+    /// candidate into the bounded terminal tombstone lane.
+    ///
+    /// The caller is responsible for proving that the downstream session has
+    /// completed and that CandidateIntegrity has no unresolved apply receipt.
+    /// This method never emits a new canonical mutation and never evicts an
+    /// active primary record merely to create room.
+    pub fn retire_terminal_candidate(&mut self, candidate: PumpCandidateIdentityV1) -> usize {
+        let locators = self
+            .canonical_by_locator
+            .iter()
+            .filter_map(|(locator, record)| {
+                (record.candidate == Some(candidate)).then_some(locator.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for locator in &locators {
+            let Some(record) = self.canonical_by_locator.remove(locator) else {
+                continue;
+            };
+            self.remove_active_locator_from_signature(locator);
+            self.terminal_canonical_tombstones
+                .insert(locator.clone(), record);
+        }
+        locators.len()
+    }
+
     #[must_use]
     pub fn retained_conflicts(&self) -> &[PumpSourceConflictEvidenceV1] {
         &self.retained_conflicts
@@ -612,6 +764,50 @@ impl PumpObservationLedgerV1 {
     #[must_use]
     pub fn retained_expired_witnesses(&self) -> &[ObservedPumpMutationV1] {
         &self.expired_witness_audit
+    }
+
+    fn remove_active_locator_from_signature(&mut self, locator: &RawPumpMutationLocatorV1) {
+        let remove_inventory = if let Some(locators) = self
+            .canonical_locators_by_signature
+            .get_mut(&locator.signature)
+        {
+            locators.retain(|existing| existing != locator);
+            locators.is_empty()
+        } else {
+            false
+        };
+        if remove_inventory {
+            self.canonical_locators_by_signature
+                .remove(&locator.signature);
+            self.primary_transaction_inventories
+                .remove(&locator.signature);
+        }
+    }
+
+    fn all_canonical_locators_for_signature(
+        &self,
+        signature: &Signature,
+    ) -> Vec<RawPumpMutationLocatorV1> {
+        let mut locators = self
+            .canonical_locators_by_signature
+            .get(signature)
+            .cloned()
+            .unwrap_or_default();
+        locators.extend(
+            self.terminal_canonical_tombstones
+                .locators_for_signature(signature),
+        );
+        locators
+    }
+
+    fn raw_transaction_mutation_count_for_locator(
+        &self,
+        locator: &RawPumpMutationLocatorV1,
+    ) -> Option<u32> {
+        self.canonical_by_locator
+            .get(locator)
+            .or_else(|| self.terminal_canonical_tombstones.get(locator))
+            .and_then(|record| record.raw_transaction_mutation_count)
     }
 
     fn observe_primary_raw(
@@ -668,6 +864,10 @@ impl PumpObservationLedgerV1 {
         }
         if self.canonical_by_locator.contains_key(&locator) {
             let decision = self.correlate_with_canonical(&locator, observation, None);
+            return single_result(decision);
+        }
+        if self.terminal_canonical_tombstones.contains(&locator) {
+            let decision = self.correlate_with_terminal_tombstone(&locator, observation, None);
             return single_result(decision);
         }
 
@@ -901,14 +1101,21 @@ impl PumpObservationLedgerV1 {
         &mut self,
         now_monotonic_ns: u64,
     ) -> Vec<PumpObservationLedgerDecisionV1> {
+        let observed_counts = self
+            .primary_transaction_inventories
+            .keys()
+            .map(|signature| {
+                (
+                    *signature,
+                    self.all_canonical_locators_for_signature(signature).len(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let expired: Vec<_> = self
             .primary_transaction_inventories
             .iter_mut()
             .filter_map(|(signature, inventory)| {
-                let observed_count = self
-                    .canonical_locators_by_signature
-                    .get(signature)
-                    .map_or(0, Vec::len);
+                let observed_count = observed_counts.get(signature).copied().unwrap_or_default();
                 let incomplete = u32::try_from(observed_count)
                     .map_or(true, |observed| observed < inventory.declared_count);
                 let expired = now_monotonic_ns.saturating_sub(inventory.first_seen_monotonic_ns)
@@ -974,17 +1181,13 @@ impl PumpObservationLedgerV1 {
         {
             return false;
         }
-        let Some(existing_locators) = self
-            .canonical_locators_by_signature
-            .get(&observation.signature)
-        else {
+        let existing_locators = self.all_canonical_locators_for_signature(&observation.signature);
+        if existing_locators.is_empty() {
             return true;
-        };
+        }
 
         if existing_locators.iter().any(|existing_locator| {
-            self.canonical_by_locator
-                .get(existing_locator)
-                .and_then(|record| record.raw_transaction_mutation_count)
+            self.raw_transaction_mutation_count_for_locator(existing_locator)
                 .is_some_and(|existing_count| existing_count != declared_count)
         }) {
             return false;
@@ -1023,6 +1226,15 @@ impl PumpObservationLedgerV1 {
                 let correlation =
                     parsed_nln.then_some(ParsedWitnessCorrelationOutcomeV1::ExactStructuralMatch);
                 return single_result(self.correlate_with_canonical(
+                    &locator,
+                    observation,
+                    correlation,
+                ));
+            }
+            if self.terminal_canonical_tombstones.contains(&locator) {
+                let correlation =
+                    parsed_nln.then_some(ParsedWitnessCorrelationOutcomeV1::ExactStructuralMatch);
+                return single_result(self.correlate_with_terminal_tombstone(
                     &locator,
                     observation,
                     correlation,
@@ -1236,6 +1448,134 @@ impl PumpObservationLedgerV1 {
         }
     }
 
+    /// Correlate a late observation with a bounded terminal primary record.
+    /// The result is evidence-only: a retained tombstone can classify a
+    /// duplicate, agreement or conflict, but it can never restore canonical
+    /// runtime authority after the owning candidate/session has been removed.
+    fn correlate_with_terminal_tombstone(
+        &mut self,
+        locator: &RawPumpMutationLocatorV1,
+        observation: ObservedPumpMutationV1,
+        correlation: Option<ParsedWitnessCorrelationOutcomeV1>,
+    ) -> PumpObservationLedgerDecisionV1 {
+        let identity = ProviderObservationIdentity::from(&observation);
+        let incoming_is_primary = observation.provenance.source_family
+            == ObservationSourceFamilyV1::RawYellowstone
+            && observation.raw_provider_role == Some(RawProviderRoleV1::PrimaryAuthority);
+        let (
+            exact_identity,
+            exact_normalized_observation,
+            conflict_fields,
+            candidate,
+            primary_provenance,
+            correlated_witness_count,
+        ) = {
+            let Some(record) = self.terminal_canonical_tombstones.get(locator) else {
+                self.primary_evidence_complete = false;
+                return PumpObservationLedgerDecisionV1 {
+                    classification: PumpObservationClassificationV1::PrimaryRawCoverageIncomplete,
+                    correlation,
+                    provider_agreement: PumpProviderAgreementV1::NotObserved,
+                    conflict_fields: Vec::new(),
+                    canonical_mutation: None,
+                    candidate_integrity_signal: None,
+                    expired_witness_observation: None,
+                    evidence_complete: false,
+                };
+            };
+            let primary_identity = ProviderObservationIdentity::from(&record.primary_observation);
+            let mut conflict_fields = Vec::new();
+            extend_material_conflict_fields(
+                &mut conflict_fields,
+                &record.primary_observation,
+                &observation,
+            );
+            for retained in record
+                .correlated_witnesses
+                .iter()
+                .filter(|retained| ProviderObservationIdentity::from(*retained) == identity)
+            {
+                extend_material_conflict_fields(&mut conflict_fields, retained, &observation);
+            }
+            conflict_fields.sort_unstable_by_key(|field| conflict_field_rank(*field));
+            (
+                record.observation_identities.contains(&identity),
+                (primary_identity == identity
+                    && same_normalized_observation(&record.primary_observation, &observation))
+                    || record.correlated_witnesses.iter().any(|retained| {
+                        ProviderObservationIdentity::from(retained) == identity
+                            && same_normalized_observation(retained, &observation)
+                    }),
+                conflict_fields,
+                record.candidate,
+                record.canonical.primary_raw_provenance.clone(),
+                record.correlated_witnesses.len(),
+            )
+        };
+
+        if exact_identity && exact_normalized_observation {
+            self.exact_duplicate_count = self.exact_duplicate_count.saturating_add(1);
+            return PumpObservationLedgerDecisionV1 {
+                classification: PumpObservationClassificationV1::ExactDuplicate,
+                correlation,
+                provider_agreement: if incoming_is_primary {
+                    PumpProviderAgreementV1::NotObserved
+                } else if conflict_fields.is_empty() {
+                    PumpProviderAgreementV1::PrimarySecondaryAgreement
+                } else {
+                    PumpProviderAgreementV1::PrimarySecondaryConflict
+                },
+                conflict_fields,
+                canonical_mutation: None,
+                candidate_integrity_signal: None,
+                expired_witness_observation: None,
+                evidence_complete: self.witness_evidence_complete,
+            };
+        }
+
+        let retained_observation = self.retain_terminal_correlated_observation(
+            locator,
+            identity,
+            &observation,
+            correlated_witness_count,
+        );
+        if !conflict_fields.is_empty() {
+            return self.source_conflict_decision(
+                locator,
+                primary_provenance,
+                candidate,
+                observation,
+                correlation,
+                conflict_fields,
+                incoming_is_primary,
+                retained_observation,
+            );
+        }
+
+        PumpObservationLedgerDecisionV1 {
+            classification: match correlation {
+                Some(ParsedWitnessCorrelationOutcomeV1::ExactStructuralMatch) => {
+                    PumpObservationClassificationV1::ExactStructuralMatch
+                }
+                Some(ParsedWitnessCorrelationOutcomeV1::UniqueSignatureSingletonMatch) => {
+                    PumpObservationClassificationV1::UniqueSignatureSingletonMatch
+                }
+                _ => PumpObservationClassificationV1::SameMutationAgreement,
+            },
+            correlation,
+            provider_agreement: if incoming_is_primary {
+                PumpProviderAgreementV1::NotObserved
+            } else {
+                PumpProviderAgreementV1::PrimarySecondaryAgreement
+            },
+            conflict_fields: Vec::new(),
+            canonical_mutation: None,
+            candidate_integrity_signal: None,
+            expired_witness_observation: None,
+            evidence_complete: retained_observation && self.witness_evidence_complete,
+        }
+    }
+
     fn retain_correlated_observation(
         &mut self,
         locator: &RawPumpMutationLocatorV1,
@@ -1245,6 +1585,30 @@ impl PumpObservationLedgerV1 {
     ) -> bool {
         if correlated_witness_count < self.config.max_correlated_witnesses_per_mutation {
             if let Some(record) = self.canonical_by_locator.get_mut(locator) {
+                record.observation_identities.insert(identity);
+                record.correlated_witnesses.push(observation.clone());
+                return true;
+            }
+        } else {
+            self.witness_evidence_complete = false;
+            self.note_overflow(
+                PumpObservationEvidenceLaneV1::CorrelatedWitness,
+                observation,
+                correlated_witness_count,
+            );
+        }
+        false
+    }
+
+    fn retain_terminal_correlated_observation(
+        &mut self,
+        locator: &RawPumpMutationLocatorV1,
+        identity: ProviderObservationIdentity,
+        observation: &ObservedPumpMutationV1,
+        correlated_witness_count: usize,
+    ) -> bool {
+        if correlated_witness_count < self.config.max_correlated_witnesses_per_mutation {
+            if let Some(record) = self.terminal_canonical_tombstones.get_mut(locator) {
                 record.observation_identities.insert(identity);
                 record.correlated_witnesses.push(observation.clone());
                 return true;
@@ -2088,6 +2452,134 @@ mod tests {
             CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
         );
         assert_eq!(ledger.snapshot().canonical_mutation_count, 1);
+    }
+
+    #[test]
+    fn terminal_retirement_reclaims_primary_capacity_and_retains_exact_duplicate_proof() {
+        let config = PumpObservationLedgerConfigV1 {
+            max_primary_canonical_mutations: 1,
+            max_terminal_canonical_tombstones: 2,
+            ..PumpObservationLedgerConfigV1::default()
+        };
+        let mut ledger = PumpObservationLedgerV1::try_new(config).expect("valid bounded config");
+        let retired_curve = Pubkey::new_unique();
+        let retired_mint = Pubkey::new_unique();
+        let retired_signature = Signature::new_unique();
+        let retired_locator = locator(retired_signature, 0);
+        let retired_primary = raw(
+            retired_locator.clone(),
+            RawProviderRoleV1::PrimaryAuthority,
+            "primary",
+            1,
+            retired_curve,
+            retired_mint,
+            1,
+            1,
+        );
+        assert!(ledger
+            .observe(retired_primary.clone(), 1)
+            .observation_decision
+            .did_canonical_apply());
+        assert_eq!(
+            ledger.retire_terminal_candidate(PumpCandidateIdentityV1 {
+                pool_amm_id: retired_curve,
+                mint: retired_mint,
+            }),
+            1
+        );
+        assert_eq!(
+            ledger
+                .snapshot()
+                .retained_terminal_canonical_tombstone_count,
+            1
+        );
+
+        let replay = ledger
+            .observe(retired_primary.clone(), 2)
+            .observation_decision;
+        assert_eq!(
+            replay.classification,
+            PumpObservationClassificationV1::ExactDuplicate
+        );
+        assert!(!replay.did_canonical_apply());
+
+        let mut late_witness = retired_primary;
+        late_witness.raw_provider_role = Some(RawProviderRoleV1::SecondaryWitness);
+        late_witness.provenance.provider_id = "secondary".to_string();
+        late_witness.provenance.payload_hash_blake3 = [0xB2; 32];
+        let witness = ledger.observe(late_witness, 3).observation_decision;
+        assert_eq!(
+            witness.classification,
+            PumpObservationClassificationV1::SameMutationAgreement
+        );
+        assert_eq!(
+            witness.provider_agreement,
+            PumpProviderAgreementV1::PrimarySecondaryAgreement
+        );
+        assert!(!witness.did_canonical_apply());
+
+        let next = ledger.observe(
+            raw(
+                locator(Signature::new_unique(), 0),
+                RawProviderRoleV1::PrimaryAuthority,
+                "primary",
+                2,
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                2,
+                1,
+            ),
+            4,
+        );
+        assert!(
+            next.observation_decision.did_canonical_apply(),
+            "terminal retention must free active primary capacity instead of closing authority after a fixed workload"
+        );
+    }
+
+    #[test]
+    fn terminal_tombstone_fifo_keeps_primary_authority_open_past_retention_cap() {
+        let config = PumpObservationLedgerConfigV1 {
+            max_primary_canonical_mutations: 1,
+            max_terminal_canonical_tombstones: 2,
+            ..PumpObservationLedgerConfigV1::default()
+        };
+        let mut ledger = PumpObservationLedgerV1::try_new(config).expect("valid bounded config");
+
+        for sequence in 0..4_u8 {
+            let curve = Pubkey::new_unique();
+            let mint = Pubkey::new_unique();
+            let primary = raw(
+                locator(Signature::new_unique(), 0),
+                RawProviderRoleV1::PrimaryAuthority,
+                "primary",
+                sequence + 1,
+                curve,
+                mint,
+                u64::from(sequence + 1),
+                1,
+            );
+            assert!(
+                ledger
+                    .observe(primary, u64::from(sequence + 1))
+                    .observation_decision
+                    .did_canonical_apply(),
+                "terminal rollover must not turn a bounded tombstone lane into a primary authority veto"
+            );
+            assert_eq!(
+                ledger.retire_terminal_candidate(PumpCandidateIdentityV1 {
+                    pool_amm_id: curve,
+                    mint,
+                }),
+                1
+            );
+        }
+
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.retained_terminal_canonical_tombstone_count, 2);
+        assert_eq!(snapshot.terminal_canonical_tombstone_eviction_count, 2);
+        assert_eq!(snapshot.canonical_mutation_count, 4);
+        assert!(snapshot.first_evicted_terminal_locator.is_some());
     }
 
     #[test]

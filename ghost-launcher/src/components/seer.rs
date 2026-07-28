@@ -19,9 +19,9 @@ use ghost_core::{
     CandidateIntegrityOutcomeV1, CandidateIntegritySignalV1, ExecutionAccountRole,
     ObservationProvenanceV1, ObservationSourceFamilyV1, ObservedPumpMutationV1,
     PumpCandidateIdentityV1, PumpMutationClaimsV1, PumpMutationFamilyV1,
-    PumpObservationClassificationV1, PumpObservationLedgerDecisionV1,
-    PumpObservationLedgerResultV1, PumpObservationLedgerV1, PumpRouteVariant, PumpTradeSideV1,
-    RawProviderRoleV1, TimestampQuality, Wal,
+    PumpObservationClassificationV1, PumpObservationLedgerConfigV1,
+    PumpObservationLedgerDecisionV1, PumpObservationLedgerResultV1, PumpObservationLedgerV1,
+    PumpRouteVariant, PumpTradeSideV1, RawProviderRoleV1, TimestampQuality, Wal,
 };
 use metrics::increment_counter;
 use seer::{
@@ -32,7 +32,7 @@ use seer::{
     },
     ipc::{
         create_ipc_channel, BackpressurePolicy, FundingLaneRuntimeHealth, IpcChannelConfig,
-        PoolDetectionRuntimeDispositionV1,
+        LocalCoverageGapNoticeV1, PoolDetectionRuntimeDispositionV1,
     },
     nln_program_streams::{
         normalize_nln_event, NlnEvent, NlnFundingTransferCoverage, NlnProgramStreamMessage,
@@ -4092,8 +4092,9 @@ fn emit_pump_observation_decision(
                 error = %error,
                 "Seer: CandidateIntegrity update failed; new-candidate admission closed"
             );
-            candidate_integrity_registry
-                .close_candidate_admission("candidate_integrity_signal_failed");
+            candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
+                "candidate_integrity_signal_failed",
+            );
         }
     }
 }
@@ -4165,7 +4166,8 @@ fn record_integrity_signal(
                 error = %error,
                 "Seer: CandidateIntegrity signal could not be recorded; candidate admission is fail-closed"
             );
-            candidate_integrity_registry.close_candidate_admission(reason);
+            candidate_integrity_registry
+                .close_candidate_admission_with_integrity_invalidation(reason);
         }
     }
 }
@@ -4207,7 +4209,7 @@ impl CanonicalRuntimeAdmissionV1 {
     }
 }
 
-fn authorize_pool_runtime_disposition(
+pub(crate) fn authorize_pool_runtime_disposition(
     disposition: PoolDetectionRuntimeDispositionV1,
     permit: &CanonicalRuntimePermitV1,
     candidate_integrity_registry: &CandidateIntegrityRegistry,
@@ -4312,7 +4314,8 @@ pub(crate) fn ingest_pump_observation(
                 missing_primary_signal,
                 "ledger_unavailable",
             );
-            candidate_integrity_registry.close_candidate_admission("ledger_unavailable");
+            candidate_integrity_registry
+                .close_candidate_admission_with_integrity_invalidation("ledger_unavailable");
             return CanonicalRuntimeAdmissionV1::Blocked(
                 CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
             );
@@ -4377,8 +4380,9 @@ pub(crate) fn ingest_pump_observation(
                 && result.observation_decision.classification
                     == PumpObservationClassificationV1::EvidenceCapacityExceeded
             {
-                candidate_integrity_registry
-                    .close_candidate_admission("ledger_primary_coverage_incomplete");
+                candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
+                    "ledger_primary_coverage_incomplete",
+                );
             }
             return CanonicalRuntimeAdmissionV1::Blocked(signal.outcome);
         }
@@ -4420,7 +4424,8 @@ pub(crate) fn ingest_pump_observation(
                     .to_string(),
                 "reason" => "receipt_stage_failed"
             );
-            candidate_integrity_registry.close_candidate_admission("receipt_stage_failed");
+            candidate_integrity_registry
+                .close_candidate_admission_with_integrity_invalidation("receipt_stage_failed");
             return CanonicalRuntimeAdmissionV1::Blocked(
                 CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
             );
@@ -4457,7 +4462,8 @@ pub(crate) fn ingest_pump_observation(
                 .to_string(),
             "reason" => "inventory_seal_failed"
         );
-        candidate_integrity_registry.close_candidate_admission("inventory_seal_failed");
+        candidate_integrity_registry
+            .close_candidate_admission_with_integrity_invalidation("inventory_seal_failed");
         return CanonicalRuntimeAdmissionV1::Blocked(
             CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
         );
@@ -4482,20 +4488,90 @@ fn finalize_pump_observation_ledger(
     now_monotonic_ns: u64,
 ) {
     let decisions = match ledger.lock() {
-        Ok(mut ledger) => ledger.finalize_expired(now_monotonic_ns),
+        Ok(mut ledger) => {
+            let retirements = match candidate_integrity_registry.drain_terminal_ledger_retirements()
+            {
+                Ok(retirements) => retirements,
+                Err(error) => {
+                    drop(ledger);
+                    error!(
+                        error = %error,
+                        "Seer: CandidateIntegrity terminal-retirement handoff unavailable"
+                    );
+                    candidate_integrity_registry
+                        .close_candidate_admission_with_integrity_invalidation(
+                            "terminal_retirement_handoff_unavailable",
+                        );
+                    return;
+                }
+            };
+            for retirement in retirements {
+                let retired = ledger.retire_terminal_candidate(retirement.candidate);
+                if retired > 0 {
+                    ::metrics::counter!(
+                        "pump_observation_ledger_terminal_retired_total",
+                        retired as u64,
+                        "authority_epoch_id" => candidate_integrity_registry
+                            .authority_epoch()
+                            .epoch_id
+                            .to_string()
+                    );
+                }
+            }
+            ledger.finalize_expired(now_monotonic_ns)
+        }
         Err(error) => {
             ::metrics::counter!("pump_observation_ledger_unavailable_total", 1u64);
             error!(
                 error = %error,
                 "Seer: Pump Observation Ledger mutex poisoned during correlation finalization"
             );
-            candidate_integrity_registry.close_candidate_admission("ledger_finalize_unavailable");
+            candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
+                "ledger_finalize_unavailable",
+            );
             return;
         }
     };
     for decision in &decisions {
         emit_pump_observation_decision(candidate_integrity_registry, decision);
     }
+}
+
+/// Apply the active PR1E consequence of an unrecovered local coverage gap.
+///
+/// A primary raw gap means a decision window may be missing structural input,
+/// so new candidate admission is closed globally and every mutable candidate
+/// gets typed `PrimaryRawCoverageIncomplete` evidence. A gap from any witness
+/// lane is still audited but never becomes a second authority decision.
+pub(crate) fn handle_local_coverage_gap_notice(
+    candidate_integrity_registry: &CandidateIntegrityRegistry,
+    configured_primary_provider_id: &str,
+    notice: &LocalCoverageGapNoticeV1,
+) -> bool {
+    if notice.provider_id != configured_primary_provider_id {
+        ::metrics::counter!(
+            "pr1_runtime_witness_coverage_gap_audit_total",
+            1u64,
+            "reason" => notice.reason.as_str(),
+            "provider_id" => notice.provider_id.clone()
+        );
+        return false;
+    }
+
+    ::metrics::counter!(
+        "pr1_runtime_primary_coverage_gap_total",
+        1u64,
+        "reason" => notice.reason.as_str(),
+        "authority_epoch_id" => candidate_integrity_registry.authority_epoch().epoch_id.to_string()
+    );
+    error!(
+        provider_id = %notice.provider_id,
+        reason = notice.reason.as_str(),
+        "Seer: unrecovered primary local coverage gap closes new candidate admission"
+    );
+    candidate_integrity_registry
+        .close_candidate_admission_with_integrity_invalidation("primary_local_coverage_gap");
+    true
 }
 
 fn nln_observation_provenance(
@@ -4711,7 +4787,7 @@ pub(crate) fn process_pool_detected_event_for_session_gate(
     flush_result
 }
 
-fn replay_buffered_canonical_trades(
+pub(crate) fn replay_buffered_canonical_trades(
     tx: &EventBusSender,
     pool_amm_id: Pubkey,
     flush_result: &SessionTradeFlushResult,
@@ -5193,6 +5269,7 @@ pub async fn run(
         event_bus_tx.as_ref(),
         candidate_integrity_registry.as_ref(),
     )?;
+    let primary_raw_provider_id = config.primary_raw_provider_id.clone();
 
     if snapshot_engine.is_some() {
         info!(
@@ -5371,7 +5448,15 @@ pub async fn run(
     let nln_trade_pool_resolver = Arc::new(Mutex::new(
         NlnTradePoolIdentityResolver::from_program_streams_config(&program_streams_capture_config),
     ));
-    let pump_observation_ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+    // Freeze the active bounded-retention contract at startup rather than
+    // silently inheriting an opaque `default()` inside the runtime path.
+    // `try_new` rejects zero capacities before candidate admission begins.
+    let pump_observation_ledger_config = PumpObservationLedgerConfigV1::default();
+    let pump_observation_ledger = Arc::new(Mutex::new(
+        PumpObservationLedgerV1::try_new(pump_observation_ledger_config).map_err(|error| {
+            anyhow::anyhow!("invalid PR1E PumpObservationLedger config: {error}")
+        })?,
+    ));
     let pump_observation_clock = Instant::now();
 
     info!("Seer: Configuration loaded");
@@ -5403,6 +5488,14 @@ pub async fn run(
     info!(
         "  ingress_queue_capacity: {}",
         seer_config.ingress_queue_capacity
+    );
+    info!(
+        max_primary_canonical_mutations =
+            pump_observation_ledger_config.max_primary_canonical_mutations,
+        max_terminal_canonical_tombstones =
+            pump_observation_ledger_config.max_terminal_canonical_tombstones,
+        max_pending_witnesses = pump_observation_ledger_config.max_pending_witnesses,
+        "Seer: PR1E bounded observation-ledger retention contract"
     );
     info!(
         "  ipc_buffer_size: {} account_update_queue_capacity: {}",
@@ -5453,6 +5546,7 @@ pub async fn run(
     // Create IPC channel for candidate forwarding
     let (ipc_sender, mut ipc_receiver, ipc_metrics) =
         create_ipc_channel(seer_config.ipc_config.clone());
+    let mut local_coverage_gap_rx = ipc_receiver.local_coverage_gap_receiver();
 
     // Create Seer instance (optionally with ShadowLedger for live curve updates)
     let mut seer_instance = match shadow_ledger {
@@ -5554,11 +5648,56 @@ pub async fn run(
             SESSION_POOL_TRADE_BUFFER_TTL,
             detected_pool_ttl,
         ));
+        // The IPC coverage control plane retains a bounded monotonic prefix
+        // of notices. Track the prefix already classified so secondary audit
+        // metrics are not replayed on every subsequent notice. An overflow is
+        // itself a fail-closed condition because a primary gap can no longer
+        // be disproven.
+        let mut handled_local_coverage_gap_notices = 0usize;
+        let mut local_coverage_gap_control_overflow_handled = false;
         info!("Seer: Starting IPC event processing");
         info!("Seer: IPC receiver task is now listening for pool detection events from Seer core");
 
         loop {
             let seer_event = tokio::select! {
+                gap_changed = local_coverage_gap_rx.changed() => {
+                    match gap_changed {
+                        Ok(()) => {
+                            let gap_state = local_coverage_gap_rx.borrow_and_update().clone();
+                            if gap_state.overflowed && !local_coverage_gap_control_overflow_handled {
+                                local_coverage_gap_control_overflow_handled = true;
+                                error!(
+                                    "Seer: bounded local coverage-gap control retention overflowed; closing new candidate admission"
+                                );
+                                candidate_integrity_registry_ipc
+                                    .close_candidate_admission_with_integrity_invalidation(
+                                        "local_coverage_gap_control_overflow",
+                                    );
+                            }
+                            for notice in gap_state
+                                .notices
+                                .iter()
+                                .skip(handled_local_coverage_gap_notices)
+                            {
+                                let _ = handle_local_coverage_gap_notice(
+                                    candidate_integrity_registry_ipc.as_ref(),
+                                    &primary_raw_provider_id,
+                                    notice,
+                                );
+                            }
+                            handled_local_coverage_gap_notices = gap_state.notices.len();
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!("Seer: local coverage-gap control channel closed");
+                            candidate_integrity_registry_ipc
+                                .close_candidate_admission_with_integrity_invalidation(
+                                    "local_coverage_gap_control_channel_closed",
+                                );
+                            break;
+                        }
+                    }
+                }
                 _ = prune_interval.tick() => {
                     let (expired_permits, expired_detected) =
                         session_trade_bridge.prune_expired(Instant::now());
@@ -6433,7 +6572,8 @@ mod tests {
     use super::{
         authorize_pool_runtime_disposition, detected_pool_from_candidate, detection_clock_summary,
         emit_account_update_to_event_bus, emit_execution_account_evidence_to_event_bus,
-        emit_funding_transfer_to_event_bus, ingest_pump_observation,
+        emit_funding_transfer_to_event_bus, finalize_pump_observation_ledger,
+        handle_local_coverage_gap_notice, ingest_pump_observation,
         is_primary_raw_runtime_authority, missing_primary_observation_signal,
         nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
         pool_candidate_matches_primary_observation, process_pool_detected_event_for_session_gate,
@@ -6454,16 +6594,17 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use ghost_core::{
         CandidateIntegrityOutcomeV1, CanonicalPumpOrderKeyV1, CurveFinality,
-        ObservationProvenanceV1, ObservationSourceFamilyV1, ObservedPumpMutationV1,
-        PumpCandidateIdentityV1, PumpMutationClaimsV1, PumpMutationFamilyV1,
-        PumpObservationLedgerConfigV1, PumpObservationLedgerV1, PumpTradeSideV1, RawProviderRoleV1,
-        RawPumpMutationLocatorV1,
+        LocalCoverageGapReasonV1, ObservationProvenanceV1, ObservationSourceFamilyV1,
+        ObservedPumpMutationV1, PumpCandidateIdentityV1, PumpMutationClaimsV1,
+        PumpMutationFamilyV1, PumpObservationLedgerConfigV1, PumpObservationLedgerV1,
+        PumpTradeSideV1, RawProviderRoleV1, RawPumpMutationLocatorV1,
     };
     use seer::config::{ProgramStreamsConfig, ProgramStreamsQuotaPolicy};
     use seer::ipc::{
-        AccountUpdateReplayOrigin, DetectedAccountUpdateEvent,
-        DetectedExecutionAccountEvidenceEvent, DetectedFundingTransferEvent, DetectedPoolEvent,
-        DetectedTradeEvent, EventPriority, FundingTransferEvent, SeerEvent,
+        create_ipc_channel, AccountUpdateReplayOrigin, BackpressurePolicy,
+        DetectedAccountUpdateEvent, DetectedExecutionAccountEvidenceEvent,
+        DetectedFundingTransferEvent, DetectedPoolEvent, DetectedTradeEvent, EventPriority,
+        FundingTransferEvent, IpcChannelConfig, IpcError, LocalCoverageGapNoticeV1, SeerEvent,
     };
     use seer::nln_program_streams::{
         NlnIngestMeta, NlnProgramStreamMessage, NlnPumpFunTradeEvent, PumpFunTradeSide,
@@ -6559,6 +6700,189 @@ mod tests {
                 .outcome,
             CandidateIntegrityOutcomeV1::Ready
         );
+    }
+
+    #[test]
+    fn primary_local_coverage_gap_invalidates_issued_guard_before_mfs() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let signature = Signature::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let permit = expect_runtime_permit(ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(signature, pool, mint, 0)),
+            1,
+            true,
+            None,
+        ));
+        registry
+            .mark_canonical_apply_succeeded(&permit.apply_receipt)
+            .expect("downstream canonical apply reaches Ready before the gap");
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint,
+        };
+        let guard = registry
+            .evaluation_guard(candidate)
+            .expect("Ready candidate receives an evaluation guard before the gap");
+
+        assert!(handle_local_coverage_gap_notice(
+            registry.as_ref(),
+            "primary",
+            &LocalCoverageGapNoticeV1 {
+                provider_id: "primary".to_string(),
+                reason: LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
+            },
+        ));
+
+        assert!(matches!(
+            guard.mark_mfs_materialized(),
+            Err(crate::candidate_integrity::CandidateIntegrityErrorV1::AdmissionClosed { .. })
+        ));
+        let snapshot = registry.snapshot(candidate).expect("retained evidence");
+        assert_eq!(
+            snapshot.outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+        assert!(!registry.candidate_admission_open());
+    }
+
+    #[test]
+    fn witness_local_coverage_gap_remains_audit_only() {
+        let registry = CandidateIntegrityRegistry::default();
+
+        assert!(!handle_local_coverage_gap_notice(
+            &registry,
+            "primary",
+            &LocalCoverageGapNoticeV1 {
+                provider_id: "secondary".to_string(),
+                reason: LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
+            },
+        ));
+        assert!(registry.candidate_admission_open());
+    }
+
+    #[tokio::test]
+    async fn primary_ipc_saturation_reaches_launcher_control_plane_and_invalidates_admission() {
+        // This deliberately crosses the real Seer IPC queue, its independent
+        // coverage-gap watch channel and the launcher-side control handler.
+        // No direct synthetic gap is injected into CandidateIntegrity.
+        let (sender, receiver, _metrics) = create_ipc_channel(IpcChannelConfig {
+            buffer_size: 1,
+            backpressure_policy: BackpressurePolicy::DropNew,
+            log_drops: false,
+            ..IpcChannelConfig::default()
+        });
+        let mut gap_rx = receiver.local_coverage_gap_receiver();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut saw_gap = false;
+        for _ in 0..64_u64 {
+            let mut trade = make_trade(pool, mint);
+            trade.provider_id = Some("primary".to_string());
+            trade.provider_role = Some(RawProviderRoleV1::PrimaryAuthority);
+            let observation = primary_trade_observation(trade.signature, pool, mint, 0);
+            let result = sender
+                .send_trade_with_observation(trade, Some(observation), EventPriority::Normal)
+                .await;
+            if matches!(result, Err(IpcError::LocalProcessingGap)) {
+                saw_gap = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            saw_gap,
+            "bounded IPC saturation must open a typed local gap"
+        );
+        tokio::time::timeout(Duration::from_secs(1), gap_rx.changed())
+            .await
+            .expect("IPC gap must reach the control plane")
+            .expect("coverage-gap sender remains alive");
+        let gap_state = gap_rx.borrow_and_update().clone();
+        let notice = gap_state.notices.first().expect("primary local gap notice");
+
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let signature = Signature::new_unique();
+        let mut ready_observation = primary_trade_observation(signature, pool, mint, 0);
+        ready_observation.raw_transaction_mutation_count = Some(1);
+        let permit = expect_runtime_permit(ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(ready_observation),
+            1,
+            true,
+            None,
+        ));
+        registry
+            .mark_canonical_apply_succeeded(&permit.apply_receipt)
+            .expect("test setup reaches Ready");
+        let guard = registry
+            .evaluation_guard(PumpCandidateIdentityV1 {
+                pool_amm_id: pool,
+                mint,
+            })
+            .expect("guard issued before saturation notice");
+
+        assert!(handle_local_coverage_gap_notice(
+            registry.as_ref(),
+            "primary",
+            notice,
+        ));
+        assert!(guard.mark_mfs_materialized().is_err());
+        assert!(!registry.candidate_admission_open());
+    }
+
+    #[test]
+    fn terminal_registry_retirement_is_drained_into_the_production_ledger_lane() {
+        let ledger = Arc::new(Mutex::new(
+            PumpObservationLedgerV1::try_new(PumpObservationLedgerConfigV1 {
+                max_primary_canonical_mutations: 1,
+                max_terminal_canonical_tombstones: 2,
+                ..PumpObservationLedgerConfigV1::default()
+            })
+            .expect("bounded test ledger"),
+        ));
+        let registry = Arc::new(CandidateIntegrityRegistry::new(
+            CandidateIntegrityRegistryLimitsV1 {
+                max_candidates: 1,
+                max_audit_markers_per_candidate: 4,
+                max_terminal_tombstones: 2,
+            },
+        ));
+        let signature = Signature::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let permit = expect_runtime_permit(ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(signature, pool, mint, 0)),
+            1,
+            true,
+            None,
+        ));
+        registry
+            .mark_canonical_apply_succeeded(&permit.apply_receipt)
+            .expect("real downstream acknowledgement in test setup");
+        assert!(registry
+            .retire_terminal_candidate(PumpCandidateIdentityV1 {
+                pool_amm_id: pool,
+                mint,
+            })
+            .expect("terminal candidate has no pending receipt"));
+
+        finalize_pump_observation_ledger(&ledger, &registry, 2);
+
+        let snapshot = ledger.lock().expect("ledger state").snapshot();
+        assert_eq!(snapshot.canonical_mutation_count, 1);
+        assert_eq!(snapshot.retained_terminal_canonical_tombstone_count, 1);
+        assert!(registry
+            .drain_terminal_ledger_retirements()
+            .expect("retirement handoff was drained")
+            .is_empty());
     }
 
     fn primary_trade_observation(
@@ -6926,6 +7250,7 @@ mod tests {
             CandidateIntegrityRegistryLimitsV1 {
                 max_candidates: 1,
                 max_audit_markers_per_candidate: 4,
+                max_terminal_tombstones: 1,
             },
         ));
         assert!(matches!(
@@ -6980,6 +7305,24 @@ mod tests {
     #[test]
     fn pr1e_poisoned_ledger_closes_candidate_admission_without_runtime_permit() {
         let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let existing_candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+        };
+        registry
+            .record_signal(ghost_core::CandidateIntegritySignalV1 {
+                candidate: existing_candidate,
+                outcome: CandidateIntegrityOutcomeV1::Ready,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [0xE1; 32],
+            })
+            .expect("issue a pre-existing evaluation guard before the ledger failure");
+        let issued_guard = registry
+            .evaluation_guard(existing_candidate)
+            .expect("Ready candidate obtains a guard before ledger poison");
         let poison_target = Arc::clone(&ledger);
         assert!(std::thread::spawn(move || {
             let _guard = poison_target.lock().expect("lock before poison");
@@ -6987,7 +7330,6 @@ mod tests {
         })
         .join()
         .is_err());
-        let registry = Arc::new(CandidateIntegrityRegistry::default());
         let observation = primary_trade_observation(
             Signature::new_unique(),
             Pubkey::new_unique(),
@@ -7001,6 +7343,7 @@ mod tests {
             )
         ));
         assert!(!registry.candidate_admission_open());
+        assert!(issued_guard.mark_mfs_materialized().is_err());
     }
 
     #[test]

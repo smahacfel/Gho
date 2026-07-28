@@ -2349,9 +2349,11 @@ const fn candidate_integrity_error_label(error: &CandidateIntegrityErrorV1) -> &
         CandidateIntegrityErrorV1::RegistryUnavailable => "registry_unavailable",
         CandidateIntegrityErrorV1::RegistryCapacityExceeded => "registry_capacity_exceeded",
         CandidateIntegrityErrorV1::CandidateMissing => "candidate_missing",
+        CandidateIntegrityErrorV1::TerminalRetirementPending => "terminal_retirement_pending",
         CandidateIntegrityErrorV1::CandidateAliasConflict => "candidate_alias_conflict",
         CandidateIntegrityErrorV1::NotReady(_) => "not_ready",
         CandidateIntegrityErrorV1::GenerationChanged { .. } => "generation_changed",
+        CandidateIntegrityErrorV1::AdmissionClosed { .. } => "admission_closed",
         CandidateIntegrityErrorV1::PhaseMismatch { .. } => "phase_mismatch",
     }
 }
@@ -2998,7 +3000,9 @@ impl OracleRuntime {
                     "CandidateIntegrity registry unavailable; new-candidate admission is fail-closed"
                 );
                 self.candidate_integrity_registry
-                    .close_candidate_admission("candidate_integrity_signal_failed");
+                    .close_candidate_admission_with_integrity_invalidation(
+                        "candidate_integrity_signal_failed",
+                    );
             }
         }
     }
@@ -4912,6 +4916,43 @@ impl OracleRuntime {
                 .unregister_pool(&base_mint);
         }
         if let Some(identity) = identity {
+            let candidate = PumpCandidateIdentityV1 {
+                pool_amm_id,
+                mint: *identity.base_mint,
+            };
+            match self
+                .candidate_integrity_registry
+                .retire_terminal_candidate(candidate)
+            {
+                Ok(true) => {
+                    ::metrics::counter!(
+                        "candidate_integrity_terminal_retired_total",
+                        1u64,
+                        "authority_epoch_id" => self
+                            .candidate_integrity_registry
+                            .authority_epoch()
+                            .epoch_id
+                            .to_string()
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // Runtime cleanup must never silently discard a candidate
+                    // whose bounded ledger/registry retention cannot be
+                    // proved. Existing position continuity continues, but
+                    // new admission fails closed.
+                    warn!(
+                        pool = %pool_amm_id,
+                        base_mint = %identity.base_mint,
+                        error = %error,
+                        "CandidateIntegrity terminal retirement unavailable; closing new candidate admission"
+                    );
+                    self.candidate_integrity_registry
+                        .close_candidate_admission_with_integrity_invalidation(
+                            "terminal_candidate_retirement_failed",
+                        );
+                }
+            }
             retain_terminal_account_evidence(
                 &self.terminal_pool_identities,
                 &self.account_state_core,
@@ -17773,7 +17814,9 @@ fn complete_canonical_apply(
         increment_counter!("pr1_runtime_bypass_attempt_total");
         ctx.oracle_runtime
             .candidate_integrity_registry
-            .close_candidate_admission("downstream_apply_receipt_missing");
+            .close_candidate_admission_with_integrity_invalidation(
+                "downstream_apply_receipt_missing",
+            );
         return;
     };
     match ctx
@@ -17802,7 +17845,7 @@ fn complete_canonical_apply(
             );
             ctx.oracle_runtime
                 .candidate_integrity_registry
-                .close_candidate_admission("ready_publication_failed");
+                .close_candidate_admission_with_integrity_invalidation("ready_publication_failed");
         }
     }
 }
@@ -17854,7 +17897,9 @@ fn send_pool_observation_result(
             );
             ctx.oracle_runtime
                 .candidate_integrity_registry
-                .close_candidate_admission("pool_result_delivery_failed");
+                .close_candidate_admission_with_integrity_invalidation(
+                    "pool_result_delivery_failed",
+                );
             false
         }
     }
@@ -27320,7 +27365,9 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         }
                         oracle_runtime
                             .candidate_integrity_registry
-                            .close_candidate_admission("event_bus_lagged");
+                            .close_candidate_admission_with_integrity_invalidation(
+                                "event_bus_lagged",
+                            );
                         ctx.session_manager.mark_metric_contract_stream_gap();
                         if let Some(tape) = rug_scalp_validation_tape.as_mut() {
                             let records = tape.mark_stream_gap("oracle_broadcast_lag");
@@ -46903,6 +46950,26 @@ mod tests {
             .publish_terminal(CandidateTerminalTransitionV1::Reject)
             .expect("publish terminal reject");
         assert!(runtime.remove_pool_with_reason(pool_id, "test_terminal_cleanup"));
+        assert!(matches!(
+            runtime
+                .candidate_integrity_registry
+                .evaluation_guard(candidate),
+            Err(CandidateIntegrityErrorV1::CandidateMissing)
+        ));
+        assert!(matches!(
+            runtime.candidate_integrity_registry.snapshot(candidate),
+            Ok(record)
+                if record.lifecycle_phase
+                    == crate::candidate_integrity::CandidateLifecyclePhaseV1::TerminalReject
+        ));
+        assert_eq!(
+            runtime
+                .candidate_integrity_registry
+                .drain_terminal_ledger_retirements()
+                .expect("Oracle terminal cleanup hands the candidate to the bounded ledger lane")
+                .len(),
+            1
+        );
 
         let mut secondary = test_raw_primary_account_update_event(
             base_mint,

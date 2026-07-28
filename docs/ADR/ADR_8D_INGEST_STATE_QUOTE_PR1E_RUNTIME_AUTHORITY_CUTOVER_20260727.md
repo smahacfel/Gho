@@ -1,7 +1,7 @@
 # ADR-8D: Ingest State Quote PR1E — aktywacja runtime authority i kwalifikacja PR1
 
 Status:
-`IMPLEMENTED / OFFLINE QUALIFICATION PASS / CLOSED RUNTIME RUN PENDING / DRAFT PR`
+`IMPLEMENTED / REVIEW REMEDIATION COMPLETE LOCALLY / CLOSED RUNTIME RUN PENDING / DRAFT PR`
 
 Typ: ADR-8D / PR1E / aktywna granica integralności nowych kandydatów
 
@@ -164,6 +164,20 @@ submitu ustawia reconciliation; nie udaje anulowania ani sukcesu. Potwierdzona
 pozycja zachowuje monitoring i protective exits, a późny witness jest
 quarantined.
 
+Globalne zamknięcie candidate admission jest osobną technical authority
+generation. Każdy evaluation oraz submit guard przechowuje generation wydaną
+w chwili utworzenia. `close_candidate_admission()` atomowo zamyka admission i
+zwiększa generation, więc żaden wcześniej wydany guard nie może już:
+
+- rozpocząć MFS;
+- rozpocząć evaluation;
+- opublikować nowego BUY;
+- rozpocząć submitu.
+
+Wyjątkiem jest submit, który rzeczywiście już osiągnął `SubmitStarted`:
+nie jest on fałszywie anulowany, lecz przechodzi istniejącą ścieżkę
+confirmation/reconciliation. Confirmed position zachowuje protective exits.
+
 ## D5. Startup, epoch i fail-closed health
 
 Startup nowych candidate admissions wymaga:
@@ -188,6 +202,20 @@ cross-restart deduplication.
 Poison, capacity exhaustion, ambiguity albo niedostępność registry zamyka
 globalne admission nowych kandydatów. Nie włącza fallbacku i nie zatrzymuje
 AccountUpdate/protective handling istniejących potwierdzonych pozycji.
+
+Primary local coverage gap z bounded Yellowstone ingress albo Seer IPC jest
+aktywną technical failure, nie tylko metryką. Niezależny control-plane notice
+dociera do launcherowego Seera poza business FIFO i wykonuje globalne
+zamknięcie admission z invalidacją mutable candidates. Gap secondary/NLN
+pozostaje audit-only. Test przechodzi rzeczywiście przez IPC saturation →
+watch notice → launcher handler → CandidateIntegrity guard denial.
+
+Control plane zachowuje bounded, monotoniczny zbiór distinct notices zamiast
+jednego nadpisywalnego `watch<Option<_>>`: późniejszy secondary notice nie
+może ukryć wcześniejszego primary gap. Overflow samego bounded control plane
+jest osobnym fail-closed degradation, ponieważ runtime nie potrafi już
+dowieść, że nie utracił primary coverage; zwykły, zidentyfikowany gap
+secondary/NLN nadal jest audit-only.
 
 ## D6. Continuity i AccountStateCore
 
@@ -233,6 +261,17 @@ Fault injection obejmuje missing observation, provider mismatch, duplicate,
 conflict, incomplete inventory, bus without apply, duplicate downstream
 apply, poison, capacity exhaustion, lifecycle conflicts, writer stall,
 queue saturation i AccountUpdate duplicate.
+
+Zamrożony JSONL pozostaje niezmiennym inventory scenariuszy. Każdy jego
+`scenario_id` jest wykonywany przez production `PumpObservationLedgerV1`,
+typed admission/permit, Event Bus adapter i realny
+`PoolObservationSession::ingest_transaction_with_apply_result`; test porównuje
+faktyczne canonical emissions, downstream applies, Ready i klasyfikację
+różnicy z oczekiwaniem fixture. Nie jest to już test wyłącznie hasha/schematu.
+
+Pełny parent-versus-Enforce run na tym samym production-like input pozostaje
+osobną, niezamkniętą bramką przed merge. Nie wolno opisywać committed
+execution corpus jako zastępstwa credentialed parent/current differential.
 
 ## D8. Telemetry
 
@@ -288,7 +327,9 @@ finalny authority epoch.
 ## D11. Stan walidacji
 
 Targeted ledger, CandidateIntegrity, downstream-apply ordering, startup,
-buffer, fault-injection i active-guard testy przeszły.
+buffer, fault-injection i active-guard testy są uruchamiane ponownie po
+review remediation. Dopóki pełna macierz nie zostanie ponownie zapisana dla
+finalnego SHA, ten ADR nie deklaruje finalnego offline/differential PASS.
 
 Pełne package/workspace suites pozostają czerwone wyłącznie przez exact
 historyczne failure classes zamrożone na `103212b`. Release workspace build
@@ -301,8 +342,8 @@ waivera:
 - silent drops: `0`;
 - receiver saturation blocking: `0`.
 
-Parser V1/V2 digests pozostały niezmienione. Szczegóły, log hashes i rollback
-identity znajdują się w
+Parser V1/V2 digests muszą pozostać niezmienione. Szczegóły, log hashes,
+rollback identity oraz status niezamkniętych external gates znajdują się w
 `PLANS/DO_REALIZACJI/QUALIFICATION_RECEIPT_PR1E_1EB_20260727.md`.
 
 Zamknięty 30-min/10k-mutation run pozostaje twardą bramką przed merge.
@@ -318,3 +359,26 @@ Launcherowy Ledger/admission zatrzymuje go przed Event Busem.
 
 Nowy, prawidłowy raw carrier używa `CandidateAdmission`, ale sama dyspozycja
 nie nadaje authority: nadal wymagany jest aligned canonical permit.
+
+## D13. Bounded terminal retirement
+
+PR1E aktywnie używa bounded state, dlatego terminal retention nie może być
+ani nieograniczona, ani automatycznym licznikiem do trwałego zamknięcia
+admission.
+
+- aktywny `PumpObservationLedgerV1` zachowuje wyłącznie bieżące canonical
+  records;
+- po bezpiecznym terminalnym cleanupie Oracle CandidateIntegrity przenosi
+  record do bounded FIFO tombstone i przekazuje bounded retirement handoff do
+  Seer-owned Ledgera;
+- Ledger przenosi canonical locator do własnego bounded FIFO terminal lane;
+- tombstone zachowuje exact duplicate/late witness classification, ale nigdy
+  nie przywraca canonical authority;
+- pełny tombstone FIFO evictuje wyłącznie terminal evidence i nigdy aktywnego
+  primary record; first eviction oraz counters pozostają audytowalne;
+- unresolved canonical receipt nie może być wycofany: terminal cleanup
+  fail-closes new admission zamiast go silently evictować.
+
+W ten sposób `max_candidates` i `max_primary_canonical_mutations` pozostają
+bounded protection przed aktywnym overloadem, a nie deterministycznym
+samozamknięciem runtime po liczbie historycznych, już zakończonych kandydatów.
