@@ -22,6 +22,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tracing::warn;
 
 /// Unified event type sent from Seer via IPC
@@ -52,17 +53,43 @@ pub enum SeerEvent {
     ExecutionAccountEvidence(DetectedExecutionAccountEvidenceEvent),
 }
 
-/// Existing runtime disposition attached to a raw pool-initialization
-/// observation after parser classification.
+/// Bounded control-plane notice that an unrecovered local coverage gap was
+/// observed before a normal IPC event could be delivered.  This is not a
+/// business event and never enters the canonical event FIFO: using that FIFO
+/// for the notice would fail precisely when saturation is the failure being
+/// reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalCoverageGapNoticeV1 {
+    pub provider_id: String,
+    pub reason: ghost_core::LocalCoverageGapReasonV1,
+}
+
+/// Bounded, monotonic control-plane retention for local coverage gaps.
 ///
-/// Every raw observation still crosses the PR1D ledger. This field only
-/// preserves whether the legacy adapter may emit a new candidate after a
-/// primary canonical decision; it never grants authority by itself.
+/// A single `watch<Option<_>>` can overwrite a primary gap with a later
+/// secondary notice before the launcher observes it. That is unsafe once the
+/// launcher uses primary gaps as an active admission gate. The state retains
+/// a bounded prefix of distinct notices instead. If the control plane itself
+/// overflows, the launcher must fail closed because it can no longer prove
+/// that no primary coverage gap was missed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LocalCoverageGapStateV1 {
+    pub notices: Vec<LocalCoverageGapNoticeV1>,
+    pub overflowed: bool,
+}
+
+const MAX_RETAINED_LOCAL_COVERAGE_GAP_NOTICES: usize = 64;
+
+/// Runtime disposition attached to a raw pool-initialization observation.
+///
+/// `CandidateAdmission` only selects the new-candidate plane. It never grants
+/// authority by itself: PR1E additionally requires a canonical Ledger permit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PoolDetectionRuntimeDispositionV1 {
     #[default]
-    Observe,
+    #[serde(alias = "observe")]
+    CandidateAdmission,
     ContinuityOnly,
     Suppressed,
 }
@@ -964,6 +991,7 @@ pub struct IpcSender {
 
     local_gap: Arc<crate::local_gap::LocalGapTracker>,
     local_gap_audit: Arc<crate::local_gap::LocalGapAuditRouter>,
+    local_coverage_gap_tx: watch::Sender<LocalCoverageGapStateV1>,
 }
 
 impl IpcSender {
@@ -974,6 +1002,7 @@ impl IpcSender {
         config: IpcChannelConfig,
         metrics: Arc<IpcMetrics>,
         local_gap_audit: Arc<crate::local_gap::LocalGapAuditRouter>,
+        local_coverage_gap_tx: watch::Sender<LocalCoverageGapStateV1>,
     ) -> Self {
         Self {
             egress,
@@ -984,6 +1013,7 @@ impl IpcSender {
                 ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
             )),
             local_gap_audit,
+            local_coverage_gap_tx,
         }
     }
 
@@ -993,6 +1023,32 @@ impl IpcSender {
 
     pub fn has_unrecovered_local_gap(&self) -> bool {
         self.local_gap.is_unreliable()
+    }
+
+    /// Notify the launcher control plane immediately about an unrecovered
+    /// local gap. Retention is bounded and monotonic: a primary gap cannot be
+    /// overwritten by a later witness notice before launcher admission sees
+    /// it. If the bounded control plane itself overflows, the launcher closes
+    /// admission rather than guessing which provider was affected.
+    pub fn report_local_coverage_gap(
+        &self,
+        provider_id: impl Into<String>,
+        reason: ghost_core::LocalCoverageGapReasonV1,
+    ) {
+        let notice = LocalCoverageGapNoticeV1 {
+            provider_id: provider_id.into(),
+            reason,
+        };
+        self.local_coverage_gap_tx.send_modify(|state| {
+            if state.notices.iter().any(|existing| existing == &notice) {
+                return;
+            }
+            if state.notices.len() >= MAX_RETAINED_LOCAL_COVERAGE_GAP_NOTICES {
+                state.overflowed = true;
+                return;
+            }
+            state.notices.push(notice);
+        });
     }
 
     #[cfg(test)]
@@ -1019,7 +1075,7 @@ impl IpcSender {
         self.send_with_observation_and_disposition(
             candidate,
             observation,
-            PoolDetectionRuntimeDispositionV1::Observe,
+            PoolDetectionRuntimeDispositionV1::CandidateAdmission,
             None,
             priority,
         )
@@ -1044,7 +1100,17 @@ impl IpcSender {
             priority,
         });
 
-        self.send_event(event, priority).await
+        // A candidate-admission PoolDetected is structural primary evidence.
+        // It must never inherit a configurable DropNew/low-priority policy:
+        // saturation opens the independent local-coverage-gap control path so
+        // launcher admission can fail closed. Continuity/suppressed events
+        // remain non-admission traffic and retain the configured policy.
+        let policy = match runtime_disposition {
+            PoolDetectionRuntimeDispositionV1::CandidateAdmission => BackpressurePolicy::Block,
+            PoolDetectionRuntimeDispositionV1::ContinuityOnly
+            | PoolDetectionRuntimeDispositionV1::Suppressed => self.config.backpressure_policy,
+        };
+        self.send_event_with_policy(event, priority, policy).await
     }
 
     /// Send a trade event through the channel with backpressure handling
@@ -1190,12 +1256,6 @@ impl IpcSender {
         self.egress.len()
     }
 
-    /// Internal method to send any SeerEvent
-    async fn send_event(&self, event: SeerEvent, priority: EventPriority) -> Result<(), IpcError> {
-        self.send_event_with_policy(event, priority, self.config.backpressure_policy)
-            .await
-    }
-
     async fn send_event_with_policy(
         &self,
         event: SeerEvent,
@@ -1236,7 +1296,7 @@ impl IpcSender {
                     Err(IpcError::EventDropped { policy, priority })
                 } else {
                     self.local_gap.observe_saturation(
-                        provider_id,
+                        provider_id.clone(),
                         0,
                         boundary,
                         current_queue_length.max(self.config.buffer_size),
@@ -1244,6 +1304,10 @@ impl IpcSender {
                     ::metrics::increment_counter!(
                         "seer_local_coverage_gap_opened_total",
                         "reason" => "ipc_egress_queue_saturated"
+                    );
+                    self.report_local_coverage_gap(
+                        provider_id,
+                        ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
                     );
                     Err(IpcError::LocalProcessingGap)
                 }
@@ -1339,6 +1403,7 @@ pub struct IpcReceiver {
 
     /// Metrics
     metrics: Arc<IpcMetrics>,
+    local_coverage_gap_rx: watch::Receiver<LocalCoverageGapStateV1>,
 }
 
 /// Extract the `detected_at` timestamp from any `SeerEvent` variant.
@@ -1392,8 +1457,24 @@ fn ipc_event_boundary(event: &SeerEvent) -> ghost_core::LocalCoverageBoundaryV1 
 
 impl IpcReceiver {
     /// Create a new IPC receiver
-    pub fn new(receiver: mpsc::Receiver<SeerEvent>, metrics: Arc<IpcMetrics>) -> Self {
-        Self { receiver, metrics }
+    pub fn new(
+        receiver: mpsc::Receiver<SeerEvent>,
+        metrics: Arc<IpcMetrics>,
+        local_coverage_gap_rx: watch::Receiver<LocalCoverageGapStateV1>,
+    ) -> Self {
+        Self {
+            receiver,
+            metrics,
+            local_coverage_gap_rx,
+        }
+    }
+
+    /// Clone the overwrite-only local-gap control signal. The launcher uses
+    /// it independently of the business FIFO so an IPC saturation cannot be
+    /// hidden by a subsequent lack of normal events.
+    #[must_use]
+    pub fn local_coverage_gap_receiver(&self) -> watch::Receiver<LocalCoverageGapStateV1> {
+        self.local_coverage_gap_rx.clone()
     }
 
     /// Record handling latency for the given event using the shared helper.
@@ -1431,6 +1512,8 @@ pub fn create_ipc_channel(config: IpcChannelConfig) -> (IpcSender, IpcReceiver, 
     let (downstream_tx, rx) = mpsc::channel(config.buffer_size);
     let metrics = IpcMetrics::new();
     let local_gap_audit = Arc::new(crate::local_gap::LocalGapAuditRouter::new());
+    let (local_coverage_gap_tx, local_coverage_gap_rx) =
+        watch::channel(LocalCoverageGapStateV1::default());
     let egress = Arc::new(IpcEgressQueue::new(
         config.buffer_size,
         config.account_update_queue_capacity,
@@ -1472,8 +1555,9 @@ pub fn create_ipc_channel(config: IpcChannelConfig) -> (IpcSender, IpcReceiver, 
         config.clone(),
         Arc::clone(&metrics),
         local_gap_audit,
+        local_coverage_gap_tx,
     );
-    let receiver = IpcReceiver::new(rx, Arc::clone(&metrics));
+    let receiver = IpcReceiver::new(rx, Arc::clone(&metrics), local_coverage_gap_rx);
 
     (sender, receiver, metrics)
 }
@@ -1823,7 +1907,7 @@ mod tests {
                     SeerEvent::PoolDetected(DetectedPoolEvent {
                         candidate: create_test_candidate(),
                         observation: None,
-                        runtime_disposition: PoolDetectionRuntimeDispositionV1::Observe,
+                        runtime_disposition: PoolDetectionRuntimeDispositionV1::CandidateAdmission,
                         continuity_observation_pool: None,
                         detected_at: std::time::SystemTime::now(),
                         sequence_number: u64::MAX,
@@ -1937,7 +2021,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drop_new_policy() {
+    async fn candidate_admission_pool_detected_overrides_drop_new_with_a_coverage_gap() {
         let config = IpcChannelConfig {
             buffer_size: 2,
             backpressure_policy: BackpressurePolicy::DropNew,
@@ -1945,6 +2029,7 @@ mod tests {
             ..Default::default()
         };
         let (sender, receiver, metrics) = create_ipc_channel(config);
+        let mut local_gap_rx = receiver.local_coverage_gap_receiver();
 
         // Fill the existing downstream IPC channel, let the fixed dispatcher
         // hold one event, then fill the bounded egress queue deterministically.
@@ -1969,10 +2054,21 @@ mod tests {
             wait_for_dispatcher_len(&sender, expected).await;
         }
 
-        // This should be dropped
+        // CandidateAdmission is structural primary traffic: even with a
+        // DropNew config it must report a gap rather than silently disappear.
         let result = sender.send(candidate, EventPriority::Normal).await;
-        assert!(result.is_err());
-        assert_eq!(metrics.events_dropped.get(), 1);
+        assert!(matches!(result, Err(IpcError::LocalProcessingGap)));
+        assert_eq!(metrics.events_dropped.get(), 0);
+        tokio::time::timeout(Duration::from_secs(1), local_gap_rx.changed())
+            .await
+            .expect("structural pool saturation must reach coverage control plane")
+            .expect("coverage control sender remains alive");
+        let notices = local_gap_rx.borrow_and_update().clone();
+        assert!(notices
+            .notices
+            .iter()
+            .any(|notice| notice.reason
+                == ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated));
     }
 
     #[tokio::test]
@@ -2008,8 +2104,16 @@ mod tests {
             wait_for_dispatcher_len(&sender, expected).await;
         }
 
-        // Low priority should be dropped
-        let result = sender.send(candidate.clone(), EventPriority::Low).await;
+        // Only non-admission continuity traffic retains DropByPriority.
+        let result = sender
+            .send_with_observation_and_disposition(
+                candidate.clone(),
+                None,
+                PoolDetectionRuntimeDispositionV1::ContinuityOnly,
+                None,
+                EventPriority::Low,
+            )
+            .await;
         assert!(result.is_err());
         assert_eq!(metrics.drops_by_priority_low.get(), 1);
     }
@@ -2391,7 +2495,7 @@ mod tests {
         let pool_event = DetectedPoolEvent {
             candidate: candidate.clone(),
             observation: None,
-            runtime_disposition: PoolDetectionRuntimeDispositionV1::Observe,
+            runtime_disposition: PoolDetectionRuntimeDispositionV1::CandidateAdmission,
             continuity_observation_pool: None,
             detected_at: SystemTime::now(),
             sequence_number: 42,
@@ -2426,7 +2530,7 @@ mod tests {
         let mut pool_json = serde_json::to_value(SeerEvent::PoolDetected(DetectedPoolEvent {
             candidate: create_test_candidate(),
             observation: None,
-            runtime_disposition: PoolDetectionRuntimeDispositionV1::Observe,
+            runtime_disposition: PoolDetectionRuntimeDispositionV1::CandidateAdmission,
             continuity_observation_pool: None,
             detected_at: SystemTime::now(),
             sequence_number: 1,
@@ -2445,7 +2549,7 @@ mod tests {
                 assert_eq!(event.observation, None);
                 assert_eq!(
                     event.runtime_disposition,
-                    PoolDetectionRuntimeDispositionV1::Observe
+                    PoolDetectionRuntimeDispositionV1::CandidateAdmission
                 );
                 assert_eq!(event.continuity_observation_pool, None);
             }
@@ -2723,6 +2827,7 @@ mod tests {
             ..Default::default()
         };
         let (sender, receiver, metrics) = create_ipc_channel(config);
+        let mut local_gap_rx = receiver.local_coverage_gap_receiver();
 
         // Critical trades override DropNew. They never wait for downstream
         // capacity: saturation opens a typed local-processing gap and fails
@@ -2753,5 +2858,76 @@ mod tests {
         assert!(matches!(send_res, Err(IpcError::LocalProcessingGap)));
         assert_eq!(metrics.events_dropped.get(), 0);
         assert!(sender.has_unrecovered_local_gap());
+        tokio::time::timeout(Duration::from_secs(1), local_gap_rx.changed())
+            .await
+            .expect("queue saturation must notify the independent control plane")
+            .expect("coverage-gap control sender remains alive");
+        let notices = local_gap_rx.borrow_and_update().clone();
+        let notice = notices.notices.first().expect("coverage-gap notice");
+        assert!(!notices.overflowed);
+        assert_eq!(notice.provider_id, "unknown");
+        assert_eq!(
+            notice.reason,
+            ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated
+        );
+    }
+
+    #[tokio::test]
+    async fn local_coverage_gap_control_retains_primary_after_a_witness_notice() {
+        let (sender, receiver, _metrics) = create_ipc_channel(IpcChannelConfig::default());
+        let mut gap_rx = receiver.local_coverage_gap_receiver();
+
+        sender.report_local_coverage_gap(
+            "secondary",
+            ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
+        );
+        sender.report_local_coverage_gap(
+            "primary",
+            ghost_core::LocalCoverageGapReasonV1::IngressQueueSaturated,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), gap_rx.changed())
+            .await
+            .expect("coverage control state changes")
+            .expect("coverage-gap sender remains alive");
+        let state = gap_rx.borrow_and_update().clone();
+        assert!(!state.overflowed);
+        assert_eq!(
+            state
+                .notices
+                .iter()
+                .map(|notice| notice.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["secondary", "primary"],
+            "a later witness/control notice must never overwrite a primary gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_coverage_gap_control_marks_overflow_without_unbounded_retention() {
+        let (sender, receiver, _metrics) = create_ipc_channel(IpcChannelConfig::default());
+        let mut gap_rx = receiver.local_coverage_gap_receiver();
+
+        for index in 0..=MAX_RETAINED_LOCAL_COVERAGE_GAP_NOTICES {
+            sender.report_local_coverage_gap(
+                format!("provider-{index}"),
+                ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
+            );
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), gap_rx.changed())
+            .await
+            .expect("coverage control state changes")
+            .expect("coverage-gap sender remains alive");
+        let state = gap_rx.borrow_and_update().clone();
+        assert_eq!(
+            state.notices.len(),
+            MAX_RETAINED_LOCAL_COVERAGE_GAP_NOTICES,
+            "control-plane retention remains bounded"
+        );
+        assert!(
+            state.overflowed,
+            "an unretained provider gap must be explicit so launcher can fail closed"
+        );
     }
 }

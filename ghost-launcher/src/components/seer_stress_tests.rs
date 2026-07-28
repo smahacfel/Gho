@@ -1,9 +1,80 @@
 #[cfg(test)]
 mod stress_tests {
-    use crate::components::seer::{SessionPoolTradeBridge, SessionTradeDecision};
+    use crate::{
+        candidate_integrity::CandidateIntegrityRegistry,
+        components::seer::{
+            ingest_pump_observation, CanonicalRuntimeAdmissionV1, SessionPoolTradeBridge,
+            SessionTradeDecision,
+        },
+        events::CanonicalRuntimePermitV1,
+    };
+    use ghost_core::{
+        CanonicalPumpOrderKeyV1, ObservationProvenanceV1, ObservationSourceFamilyV1,
+        ObservedPumpMutationV1, PumpMutationClaimsV1, PumpMutationFamilyV1,
+        PumpObservationLedgerV1, PumpTradeSideV1, RawProviderRoleV1, RawPumpMutationLocatorV1,
+    };
     use seer::types::{CandidatePool, RawBytesMissingReason, TradeEvent};
     use solana_sdk::{pubkey::Pubkey, signature::Signature};
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    fn canonical_trade_permit(
+        registry: &Arc<CandidateIntegrityRegistry>,
+        trade: &TradeEvent,
+    ) -> CanonicalRuntimePermitV1 {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let semantic_event_ordinal = trade.event_ordinal.unwrap_or_default();
+        let locator = RawPumpMutationLocatorV1 {
+            program_id: Pubkey::new_unique(),
+            signature: trade.signature,
+            outer_instruction_index: 0,
+            inner_instruction_path: Vec::new(),
+            semantic_event_ordinal,
+        };
+        let admission = ingest_pump_observation(
+            &ledger,
+            registry,
+            Some(ObservedPumpMutationV1 {
+                mutation_family: PumpMutationFamilyV1::Trade,
+                signature: trade.signature,
+                locator_hint: Some(locator.clone()),
+                canonical_order: Some(CanonicalPumpOrderKeyV1 {
+                    slot: trade.slot.unwrap_or_default(),
+                    tx_index: trade.tx_index.unwrap_or_default(),
+                    outer_instruction_index: 0,
+                    inner_instruction_path: Vec::new(),
+                    semantic_event_ordinal,
+                }),
+                raw_transaction_mutation_count: None,
+                claims: PumpMutationClaimsV1 {
+                    curve: Some(trade.pool_amm_id),
+                    mint: Some(trade.mint),
+                    side: Some(PumpTradeSideV1::Buy),
+                    success: Some(trade.success),
+                    token_amount_units: Some(trade.amount),
+                    ..PumpMutationClaimsV1::default()
+                },
+                raw_provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
+                provenance: ObservationProvenanceV1 {
+                    source_family: ObservationSourceFamilyV1::RawYellowstone,
+                    source_id: "stress-test".to_string(),
+                    provider_id: "primary".to_string(),
+                    schema_id: "stress-test".to_string(),
+                    payload_hash_blake3: [7; 32],
+                    received_at_monotonic_ns: 1,
+                },
+            }),
+            1,
+            true,
+            None,
+        );
+        match admission {
+            CanonicalRuntimeAdmissionV1::Apply(permit) => permit,
+            other => panic!("expected canonical permit: {other:?}"),
+        }
+    }
 
     fn make_heavy_candidate(pool: Pubkey, mint: Pubkey) -> CandidatePool {
         CandidatePool {
@@ -127,6 +198,7 @@ mod stress_tests {
         );
 
         let mut trade = make_atomic_dev_buy(pool, mint);
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
         trade.compute_units_consumed = Some(trade_cu);
 
         let atomic_arrival = Instant::now();
@@ -152,13 +224,14 @@ mod stress_tests {
             register_time.duration_since(atomic_arrival).as_millis()
         );
         assert!(
-            flush.replay_ready.is_empty(),
+            flush.replay_ready_is_empty(),
             "Nothing buffered before registration"
         );
 
         // Step 2: Trade arrives — pool is already registered.
         let (finished_trade, ingest_time) = ingest_handle.await.unwrap();
-        let ingress = bridge.ingest_trade(&finished_trade, ingest_time);
+        let permit = canonical_trade_permit(&registry, &finished_trade);
+        let ingress = bridge.ingest_trade(&finished_trade, permit, ingest_time);
         println!(
             "  [T+{}ms] Dev Buy processed → ForwardNow (pool was pre-registered)",
             ingest_time.duration_since(atomic_arrival).as_millis()
@@ -173,14 +246,7 @@ mod stress_tests {
     }
 
     #[tokio::test]
-    async fn test_pre_session_pool_trade_silently_dropped() {
-        // Pre-session pools (existing pools streaming via grpc_global_stream) never emit
-        // PoolDetected in this session. Their trades must be silently discarded — no
-        // buffering, no expiry overhead, no log spam.
-        //
-        // This test verifies that even under extreme timing (e.g. congested pipeline where
-        // trades arrive long before any registration attempt), the decision is SilentDrop
-        // and the system carries zero buffering overhead.
+    async fn test_pre_session_canonical_trade_is_bounded_and_expires_without_apply() {
         let ttl = Duration::from_millis(10);
         let mut bridge = SessionPoolTradeBridge::new(ttl, 100, 1000, Duration::from_secs(60), 1000);
         let pool = Pubkey::new_unique();
@@ -202,33 +268,32 @@ mod stress_tests {
         );
 
         let trade = make_atomic_dev_buy(pool, mint);
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
         let t_start = Instant::now();
 
         let t_ingest = t_start + trade_delay;
         let t_register = t_start + pool_delay;
 
-        // Trade for unregistered pool → SilentDrop (no buffering).
-        let ingress = bridge.ingest_trade(&trade, t_ingest);
+        let permit = canonical_trade_permit(&registry, &trade);
+        let ingress = bridge.ingest_trade(&trade, permit, t_ingest);
         assert_eq!(
             ingress.decision,
-            SessionTradeDecision::SilentDrop,
-            "Pre-session pool trade must be silently dropped — no buffering"
+            SessionTradeDecision::Buffered,
+            "Canonical trade must retain its exact permit while awaiting pool admission"
         );
 
-        // Even if register_detected_pool is called later (e.g. snapshot bootstrap),
-        // there is nothing to replay because nothing was buffered.
         let flush = bridge.register_detected_pool(pool, t_register);
         let gap = t_register.duration_since(t_ingest).as_millis();
-        println!("  Gap: {}ms — irrelevant, no buffer was created", gap);
+        println!("  Gap: {}ms — canonical permit expires fail-closed", gap);
         assert!(
-            flush.replay_ready.is_empty(),
-            "Nothing buffered → nothing to replay"
+            flush.replay_ready_is_empty(),
+            "Expired canonical permit must not replay"
         );
         assert_eq!(
-            flush.expired_count, 0,
-            "Nothing expired → nothing was buffered"
+            flush.expired_count, 1,
+            "Expired canonical permit must be reported for fail-closed resolution"
         );
-        println!("  Outcome: ✅ SUCCESS - Silent drop, zero buffering overhead");
+        println!("  Outcome: ✅ SUCCESS - bounded expiry, zero canonical apply");
         println!("-----------------------------------------\n");
     }
 }

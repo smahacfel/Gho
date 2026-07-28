@@ -174,6 +174,7 @@ fn small_config(
         max_pending_witnesses: pending,
         max_correlated_witnesses_per_mutation: correlated,
         max_retained_conflicts: conflicts,
+        max_terminal_canonical_tombstones: 8,
     }
 }
 
@@ -1634,7 +1635,7 @@ fn primary_capacity_saturation_fails_closed_and_retains_rejected_primary() {
 
     assert_eq!(
         decision.classification,
-        PumpObservationClassificationV1::PrimaryRawCoverageIncomplete
+        PumpObservationClassificationV1::EvidenceCapacityExceeded
     );
     assert!(!decision.did_canonical_apply());
     assert_eq!(

@@ -1514,7 +1514,7 @@ enum TradeForwardDecision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PoolInitCandidateMode {
-    Observe,
+    CandidateAdmission,
     ContinuityOnly { observation_pool: Pubkey },
     Suppressed,
 }
@@ -5116,6 +5116,13 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
     pub async fn process_event(&self, event: types::GeyserEvent) -> SeerResult<()> {
         if let types::GeyserEvent::LocalCoverageGap { gap } = &event {
             self.local_segment_unreliable.store(true, Release);
+            if let Some(ipc_sender) = self.ipc_sender.as_ref() {
+                // This is a control-plane signal, intentionally independent
+                // of the congested business-event FIFO. The launcher decides
+                // whether the provider is the configured primary and closes
+                // new-candidate authority only for that case.
+                ipc_sender.report_local_coverage_gap(gap.provider_id.clone(), gap.reason);
+            }
             if !self.local_gap_audit.emit(gap.clone()) {
                 error!(
                     gap_id = %bs58::encode(gap.gap_id_blake3).into_string(),
@@ -5356,9 +5363,9 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     .with_label_values(&[amm_program.name()])
                     .inc();
 
-                // PR1D observation completeness is shadow evidence. Active
-                // parent-compatible mapping/emission remains keyed only by
-                // the already validated provider authority role.
+                // Provider role selects only the carrier lane. PR1E grants
+                // runtime emission authority later, after this carrier and
+                // its observation pass through the launcher's Ledger boundary.
                 let primary_runtime_authority = pool_event.provider_role
                     == Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
 
@@ -5377,7 +5384,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                             info!("Session start slot initialized to {}", slot);
                         } else if slot < current_start {
                             warn!(
-                                "Suppressing legacy CandidatePool emission from old slot {} (session started at {}); raw observation still enters PR1D",
+                            "Suppressing candidate admission from old slot {} (session started at {}); raw observation still enters PR1",
                             slot, current_start
                         );
                             session_slot_suppressed = true;
@@ -5395,7 +5402,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     };
                 if is_backfill {
                     warn!(
-                        "Suppressing legacy CandidatePool from backfill queue (slot {:?}); raw observation still enters PR1D",
+                        "Suppressing CandidatePool admission from backfill queue (slot {:?}); raw observation still enters PR1",
                         pool_slot
                     );
                 }
@@ -5418,8 +5425,8 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                         PoolDetectionRuntimeDispositionV1::Suppressed
                     } else {
                         match candidate_mode {
-                            PoolInitCandidateMode::Observe => {
-                                PoolDetectionRuntimeDispositionV1::Observe
+                            PoolInitCandidateMode::CandidateAdmission => {
+                                PoolDetectionRuntimeDispositionV1::CandidateAdmission
                             }
                             PoolInitCandidateMode::ContinuityOnly { .. } => {
                                 PoolDetectionRuntimeDispositionV1::ContinuityOnly
@@ -5435,8 +5442,8 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     }
                     _ => None,
                 };
-                let observe_candidate = primary_runtime_authority
-                    && runtime_disposition == PoolDetectionRuntimeDispositionV1::Observe;
+                let admit_candidate = primary_runtime_authority
+                    && runtime_disposition == PoolDetectionRuntimeDispositionV1::CandidateAdmission;
 
                 if matches!(candidate_mode, PoolInitCandidateMode::Suppressed) {
                     self.metrics
@@ -5480,7 +5487,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 // causing the first dev-buy to be lost every time.
                 if let Some(ipc_sender) = &self.ipc_sender {
                     let should_emit_ipc = runtime_disposition
-                        == PoolDetectionRuntimeDispositionV1::Observe
+                        == PoolDetectionRuntimeDispositionV1::CandidateAdmission
                         || binary_pool_observation.is_some();
                     if !should_emit_ipc {
                         debug!(
@@ -5501,28 +5508,19 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                             .await
                             .map_err(|e| SeerError::ChannelSendError(e.to_string()))?;
                     }
-                } else if runtime_disposition == PoolDetectionRuntimeDispositionV1::Observe
+                } else if runtime_disposition
+                    == PoolDetectionRuntimeDispositionV1::CandidateAdmission
                     && primary_runtime_authority
                 {
-                    if let Some(candidate_sender) = &self.candidate_sender {
-                        // Legacy non-IPC compatibility path has no PR1D
-                        // ledger. Keep it primary-only and never use it for
-                        // continuity/suppressed observations.
-                        candidate_sender.send(candidate.clone()).await.map_err(
-                            |e: tokio::sync::mpsc::error::SendError<CandidatePool>| {
-                                SeerError::ChannelSendError(e.to_string())
-                            },
-                        )?;
-                    } else {
-                        return Err(SeerError::ChannelSendError(
-                            "No sender configured".to_string(),
-                        ));
-                    }
+                    return Err(SeerError::ChannelSendError(
+                        "PR1E candidate admission requires the IPC Observation Ledger boundary; direct CandidatePool emission is disabled"
+                            .to_string(),
+                    ));
                 }
 
                 if primary_runtime_authority {
                     match runtime_disposition {
-                        PoolDetectionRuntimeDispositionV1::Observe => {
+                        PoolDetectionRuntimeDispositionV1::CandidateAdmission => {
                             self.register_curve_mapping(
                                 candidate.bonding_curve,
                                 candidate.base_mint,
@@ -5549,7 +5547,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 }
 
                 // Try to build EnhancedCandidate in a background task so it doesn't block the hot path
-                if observe_candidate && !ultrafast_mode {
+                if admit_candidate && !ultrafast_mode {
                     let candidate_clone = candidate.clone();
                     // Just take what we need to avoid cloning the large event if possible,
                     // but we need event for analysis. GeyserEvent clone is moderately expensive but
@@ -5587,7 +5585,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     .inc();
 
                 // Track bonding_curve for ShadowLedger updates and bootstrap with genesis until first AccountUpdate
-                if observe_candidate {
+                if admit_candidate {
                     if let Some(ledger) = &self.shadow_ledger {
                         self.tracked_curves
                             .write()
@@ -5650,7 +5648,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
 
                 let parser_finished_at = std::time::SystemTime::now();
 
-                if observe_candidate {
+                if admit_candidate {
                     info!(
                         "Detected new pool: {} on {} (latency: {:.2}ms) [enhanced: false] | detection_ts={} parser_ts={} block_time={:?} slot={:?} source={}",
                         candidate.pool_amm_id,
@@ -6029,7 +6027,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         candidate: &CandidatePool,
     ) -> PoolInitCandidateMode {
         match amm_program {
-            AmmProgram::PumpFun => PoolInitCandidateMode::Observe,
+            AmmProgram::PumpFun => PoolInitCandidateMode::CandidateAdmission,
             AmmProgram::PumpSwap => match self.observation_alias_pool_for_mint(candidate.base_mint)
             {
                 Some(observation_pool) if observation_pool != candidate.pool_amm_id => {
@@ -10534,8 +10532,10 @@ mod tests {
     #[tokio::test]
     async fn test_session_start_slot_rejects_old_pools() {
         let config = SeerConfig::default();
-        let (tx, mut rx) = mpsc::channel(10);
-        let seer = Seer::new(config, tx);
+        let mut ipc_config = IpcChannelConfig::default();
+        ipc_config.buffer_size = 10;
+        let (ipc_sender, mut ipc_receiver, _metrics) = create_ipc_channel(ipc_config);
+        let seer = Seer::new_with_ipc(config, ipc_sender);
 
         // Force session_start_slot to 100
         seer.session_start_slot.store(100, Relaxed);
@@ -10552,11 +10552,20 @@ mod tests {
         }
         seer.process_event(old_event).await.unwrap();
 
-        // Should be rejected since slot 99 < 100
-        assert!(
-            rx.try_recv().is_err(),
-            "Older pool should have been rejected"
-        );
+        // The raw carrier must remain ledger-visible, but the old slot cannot
+        // obtain candidate-admission authority.
+        let old_carrier = tokio::time::timeout(Duration::from_millis(100), ipc_receiver.recv())
+            .await
+            .expect("old-slot carrier must reach the IPC integrity boundary")
+            .expect("IPC channel must remain open");
+        match old_carrier {
+            SeerEvent::PoolDetected(event) => assert_eq!(
+                event.runtime_disposition,
+                PoolDetectionRuntimeDispositionV1::Suppressed,
+                "old-slot carrier must not request candidate admission"
+            ),
+            other => panic!("expected old-slot PoolDetected carrier, got {other:?}"),
+        }
 
         let mut new_event = create_tx_with_cpi_create_and_trade(
             Signature::new_unique(),
@@ -10569,8 +10578,23 @@ mod tests {
             *slot = Some(101);
         }
         seer.process_event(new_event).await.unwrap();
-        // Should be accepted since slot 101 >= 100
-        assert!(rx.try_recv().is_ok(), "Newer pool should be accepted");
+        // The old create+trade transaction may still contribute its separate
+        // trade carrier. Skip non-pool carriers and assert the next pool's
+        // admission disposition.
+        loop {
+            let carrier = tokio::time::timeout(Duration::from_millis(100), ipc_receiver.recv())
+                .await
+                .expect("newer pool must reach the required IPC boundary")
+                .expect("IPC channel must remain open");
+            if let SeerEvent::PoolDetected(event) = carrier {
+                assert_eq!(
+                    event.runtime_disposition,
+                    PoolDetectionRuntimeDispositionV1::CandidateAdmission,
+                    "newer pool must request candidate admission"
+                );
+                break;
+            }
+        }
     }
 
     // ── resolve throughput: config + stress tests ─────────────────────────

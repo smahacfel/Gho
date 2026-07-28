@@ -543,7 +543,7 @@ pub async fn run(
                 match event {
                     Ok(ghost_event) => {
                         match ghost_event {
-                            GhostEvent::PoolTransaction(pool_tx) => {
+                            GhostEvent::PoolTransaction(pool_tx, Some(_permit)) => {
                                 increment_counter!("ghost_pipeline_stage_total", "stage" => "listener_received");
                                 pipeline_coverage().increment(PipelineCoverageStage::ListenerReceived, 1);
                                 let pool_pubkey = Pubkey::from_str(&pool_tx.pool_amm_id);
@@ -700,7 +700,7 @@ pub async fn run(
                                     }
                                 }
                             }
-                            GhostEvent::NewPoolDetected(detected_pool) => {
+                            GhostEvent::NewPoolDetected(detected_pool, Some(_permit)) => {
                                 if let Some(pool_pubkey) = maybe_cache_detected_pool_identity(
                                     detected_pool.as_ref(),
                                     &mut resolved_pool_base_mints,
@@ -722,6 +722,13 @@ pub async fn run(
                                         pool_pubkey,
                                     );
                                 }
+                            }
+                            GhostEvent::PoolTransaction(_, None)
+                            | GhostEvent::NewPoolDetected(_, None) => {
+                                increment_counter!("pr1_runtime_bypass_attempt_total");
+                                warn!(
+                                    "SnapshotListener: rejected structural event without canonical PR1 permit"
+                                );
                             }
                             GhostEvent::GatekeeperCommitted {
                                 pool_amm_id,
@@ -1056,7 +1063,7 @@ mod tests {
         // 4. Send PoolTransaction
         let ptx = make_pool_tx(pool_id, base_mint, signer, "sig_ack_test");
         let receivers = event_tx
-            .send(GhostEvent::pool_transaction(ptx))
+            .send(GhostEvent::fixture_canonical_pool_transaction(ptx))
             .expect("send must succeed");
         assert!(receivers >= 1, "at least 1 receiver");
 
@@ -1132,13 +1139,13 @@ mod tests {
         // Send TX for unapproved pool – should NOT be forwarded
         let ptx_unknown = make_pool_tx(unapproved_pool, base_mint, signer, "sig_unknown");
         event_tx
-            .send(GhostEvent::pool_transaction(ptx_unknown))
+            .send(GhostEvent::fixture_canonical_pool_transaction(ptx_unknown))
             .unwrap();
 
         // Send TX for approved pool – SHOULD be forwarded
         let ptx_approved = make_pool_tx(approved_pool, base_mint, signer, "sig_approved");
         event_tx
-            .send(GhostEvent::pool_transaction(ptx_approved))
+            .send(GhostEvent::fixture_canonical_pool_transaction(ptx_approved))
             .unwrap();
 
         // We should only get the ACK for the approved pool
@@ -1205,7 +1212,9 @@ mod tests {
 
         let mut ptx = make_pool_tx(pool_id, base_mint, signer, "sig_tracked_buffered");
         ptx.token_mint = None;
-        event_tx.send(GhostEvent::pool_transaction(ptx)).unwrap();
+        event_tx
+            .send(GhostEvent::fixture_canonical_pool_transaction(ptx))
+            .unwrap();
 
         let ack = tokio::time::timeout(Duration::from_secs(2), ack_rx.recv()).await;
         assert!(ack.is_ok(), "Expected ACK for tracked buffered pool");
@@ -1326,12 +1335,9 @@ mod tests {
         });
 
         event_tx
-            .send(GhostEvent::pool_transaction(make_pool_tx(
-                pool_id,
-                base_mint,
-                signer,
-                "sig_unknown_buffered",
-            )))
+            .send(GhostEvent::fixture_canonical_pool_transaction(
+                make_pool_tx(pool_id, base_mint, signer, "sig_unknown_buffered"),
+            ))
             .expect("tx send");
 
         let no_ack = tokio::time::timeout(Duration::from_millis(200), ack_rx.recv()).await;
@@ -1345,9 +1351,9 @@ mod tests {
         );
 
         event_tx
-            .send(GhostEvent::new_pool_detected(make_detected_pool(
-                pool_id, base_mint,
-            )))
+            .send(GhostEvent::fixture_canonical_new_pool_detected(
+                make_detected_pool(pool_id, base_mint),
+            ))
             .expect("detected pool send");
 
         let ack = tokio::time::timeout(Duration::from_secs(2), ack_rx.recv())
@@ -1418,20 +1424,17 @@ mod tests {
         });
 
         event_tx
-            .send(GhostEvent::pool_transaction(make_pool_tx(
-                pool_id,
-                base_mint,
-                signer,
-                "sig_expired_before_replay",
-            )))
+            .send(GhostEvent::fixture_canonical_pool_transaction(
+                make_pool_tx(pool_id, base_mint, signer, "sig_expired_before_replay"),
+            ))
             .expect("tx send");
 
         tokio::time::sleep(Duration::from_millis(80)).await;
 
         event_tx
-            .send(GhostEvent::new_pool_detected(make_detected_pool(
-                pool_id, base_mint,
-            )))
+            .send(GhostEvent::fixture_canonical_new_pool_detected(
+                make_detected_pool(pool_id, base_mint),
+            ))
             .expect("detected pool send");
 
         let no_ack = tokio::time::timeout(Duration::from_millis(200), ack_rx.recv()).await;
@@ -1490,26 +1493,20 @@ mod tests {
         });
 
         event_tx
-            .send(GhostEvent::pool_transaction(make_pool_tx(
-                pool_id,
-                base_mint,
-                signer,
-                "sig_cap_old",
-            )))
+            .send(GhostEvent::fixture_canonical_pool_transaction(
+                make_pool_tx(pool_id, base_mint, signer, "sig_cap_old"),
+            ))
             .expect("tx1 send");
         event_tx
-            .send(GhostEvent::pool_transaction(make_pool_tx(
-                pool_id,
-                base_mint,
-                signer,
-                "sig_cap_new",
-            )))
+            .send(GhostEvent::fixture_canonical_pool_transaction(
+                make_pool_tx(pool_id, base_mint, signer, "sig_cap_new"),
+            ))
             .expect("tx2 send");
 
         event_tx
-            .send(GhostEvent::new_pool_detected(make_detected_pool(
-                pool_id, base_mint,
-            )))
+            .send(GhostEvent::fixture_canonical_new_pool_detected(
+                make_detected_pool(pool_id, base_mint),
+            ))
             .expect("detected pool send");
 
         let ack = tokio::time::timeout(Duration::from_secs(2), ack_rx.recv())
@@ -1579,7 +1576,7 @@ mod tests {
         let mut tx = make_pool_tx(pool_id, base_mint, signer, "sig_default_mint");
         tx.token_mint = Some(Pubkey::default().to_string());
         event_tx
-            .send(GhostEvent::pool_transaction(tx))
+            .send(GhostEvent::fixture_canonical_pool_transaction(tx))
             .expect("tx send");
 
         let no_ack = tokio::time::timeout(Duration::from_millis(200), ack_rx.recv()).await;
@@ -1593,9 +1590,9 @@ mod tests {
         );
 
         event_tx
-            .send(GhostEvent::new_pool_detected(make_detected_pool(
-                pool_id, base_mint,
-            )))
+            .send(GhostEvent::fixture_canonical_new_pool_detected(
+                make_detected_pool(pool_id, base_mint),
+            ))
             .expect("detected pool send");
 
         let ack = tokio::time::timeout(Duration::from_secs(2), ack_rx.recv())
@@ -1665,7 +1662,7 @@ mod tests {
         let mut tx = make_pool_tx(pool_id, base_mint, signer, "sig_identity_pending");
         tx.token_mint = None;
         event_tx
-            .send(GhostEvent::pool_transaction(tx))
+            .send(GhostEvent::fixture_canonical_pool_transaction(tx))
             .expect("tx send");
 
         let no_ack = tokio::time::timeout(Duration::from_millis(200), ack_rx.recv()).await;
@@ -1679,9 +1676,9 @@ mod tests {
         );
 
         event_tx
-            .send(GhostEvent::new_pool_detected(make_detected_pool(
-                pool_id, base_mint,
-            )))
+            .send(GhostEvent::fixture_canonical_new_pool_detected(
+                make_detected_pool(pool_id, base_mint),
+            ))
             .expect("detected pool send");
 
         let ack = tokio::time::timeout(Duration::from_secs(2), ack_rx.recv())
@@ -1741,28 +1738,19 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
         event_tx
-            .send(GhostEvent::pool_transaction(make_pool_tx(
-                pool_id,
-                base_mint,
-                signer,
-                "sig_lagged_1",
-            )))
+            .send(GhostEvent::fixture_canonical_pool_transaction(
+                make_pool_tx(pool_id, base_mint, signer, "sig_lagged_1"),
+            ))
             .unwrap();
         event_tx
-            .send(GhostEvent::pool_transaction(make_pool_tx(
-                pool_id,
-                base_mint,
-                signer,
-                "sig_lagged_2",
-            )))
+            .send(GhostEvent::fixture_canonical_pool_transaction(
+                make_pool_tx(pool_id, base_mint, signer, "sig_lagged_2"),
+            ))
             .unwrap();
         event_tx
-            .send(GhostEvent::pool_transaction(make_pool_tx(
-                pool_id,
-                base_mint,
-                signer,
-                "sig_lagged_3",
-            )))
+            .send(GhostEvent::fixture_canonical_pool_transaction(
+                make_pool_tx(pool_id, base_mint, signer, "sig_lagged_3"),
+            ))
             .unwrap();
 
         let handle = tokio::spawn({
@@ -1893,7 +1881,7 @@ mod tests {
         pipeline_coverage().increment(PipelineCoverageStage::ParsedOk, 1);
         pipeline_coverage().increment(PipelineCoverageStage::SeerForwarded, 1);
         event_tx
-            .send(GhostEvent::pool_transaction(tx1.clone()))
+            .send(GhostEvent::fixture_canonical_pool_transaction(tx1.clone()))
             .expect("tx1 send");
 
         let ack = tokio::time::timeout(Duration::from_secs(2), ack_rx.recv())
@@ -1987,7 +1975,7 @@ mod tests {
         pipeline_coverage().increment(PipelineCoverageStage::ParsedOk, 1);
         pipeline_coverage().increment(PipelineCoverageStage::SeerForwarded, 1);
         event_tx
-            .send(GhostEvent::pool_transaction(tx2.clone()))
+            .send(GhostEvent::fixture_canonical_pool_transaction(tx2.clone()))
             .expect("tx2 send");
 
         let ack = tokio::time::timeout(Duration::from_secs(2), ack_rx.recv())

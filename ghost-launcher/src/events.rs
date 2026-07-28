@@ -27,7 +27,7 @@
 //! let (bus_tx, bus_rx) = create_event_bus();
 //!
 //! // Seer emits events
-//! bus_tx.send(GhostEvent::NewPoolDetected(pool_data))?;
+//! bus_tx.send(GhostEvent::canonical_new_pool_detected(pool_data, permit))?;
 //!
 //! // Trigger receives and acts
 //! let event = bus_rx.recv().await?;
@@ -38,6 +38,23 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use crate::candidate_integrity::CanonicalMutationApplyReceiptV1;
+use ghost_core::RawPumpMutationLocatorV1;
+
+/// Opaque launcher-local proof that an unchanged rich Seer payload received
+/// canonical runtime authority from the PR1 Observation Ledger.
+///
+/// It is deliberately not serializable and grants authority only inside the
+/// process/epoch that owns the matching CandidateIntegrity registry.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalRuntimePermitV1 {
+    pub(crate) apply_receipt: CanonicalMutationApplyReceiptV1,
+    pub(crate) authority_epoch_id: u64,
+    pub(crate) locator: RawPumpMutationLocatorV1,
+    pub(crate) primary_payload_hash_blake3: [u8; 32],
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SimulationAccountManifestEntry {
@@ -1042,7 +1059,8 @@ pub struct AccountUpdateEvent {
     /// Stable raw-provider identifier when supplied by Yellowstone ingest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
-    /// Configured provider role. Metadata-only in ingest integrity Observe.
+    /// Configured provider role used by the AccountObservationArbiter. It does
+    /// not by itself grant structural runtime emission authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_role: Option<ghost_core::RawProviderRoleV1>,
     /// Cross-source semantic envelope carried through canonical ingest.
@@ -1353,10 +1371,10 @@ pub enum GhostEvent {
 
     /// A new pool was detected by Seer
     /// Uses Arc for zero-copy sharing across subscribers
-    NewPoolDetected(Arc<DetectedPool>),
+    NewPoolDetected(Arc<DetectedPool>, Option<CanonicalRuntimePermitV1>),
 
     /// A pool transaction was observed (for SnapshotEngine)
-    PoolTransaction(Arc<PoolTransaction>),
+    PoolTransaction(Arc<PoolTransaction>, Option<CanonicalRuntimePermitV1>),
 
     /// A funding transfer observation was observed on the bus.
     FundingTransferObserved(Arc<FundingTransferObserved>),
@@ -1480,7 +1498,57 @@ pub enum GhostEvent {
 impl GhostEvent {
     /// Create a NewPoolDetected event from pool data
     pub fn new_pool_detected(pool: DetectedPool) -> Self {
-        GhostEvent::NewPoolDetected(Arc::new(pool))
+        GhostEvent::NewPoolDetected(Arc::new(pool), None)
+    }
+
+    pub(crate) fn canonical_new_pool_detected(
+        pool: DetectedPool,
+        permit: CanonicalRuntimePermitV1,
+    ) -> Self {
+        GhostEvent::NewPoolDetected(Arc::new(pool), Some(permit))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_canonical_new_pool_detected(pool: DetectedPool) -> Self {
+        let signature = pool
+            .signature
+            .parse()
+            .unwrap_or_else(|_| solana_sdk::signature::Signature::new_unique());
+        let candidate = ghost_core::PumpCandidateIdentityV1 {
+            pool_amm_id: pool
+                .pool_amm_id
+                .parse()
+                .unwrap_or_else(|_| solana_sdk::pubkey::Pubkey::new_unique()),
+            mint: pool
+                .base_mint
+                .parse()
+                .unwrap_or_else(|_| solana_sdk::pubkey::Pubkey::new_unique()),
+        };
+        let locator = RawPumpMutationLocatorV1 {
+            program_id: pool
+                .amm_program
+                .parse()
+                .unwrap_or_else(|_| solana_sdk::pubkey::Pubkey::new_unique()),
+            signature,
+            outer_instruction_index: 0,
+            inner_instruction_path: Vec::new(),
+            semantic_event_ordinal: 0,
+        };
+        let apply_receipt = CanonicalMutationApplyReceiptV1::fixture(
+            ghost_core::PumpMutationFamilyV1::InitializePool,
+            signature,
+            candidate,
+            locator.clone(),
+        );
+        Self::canonical_new_pool_detected(
+            pool,
+            CanonicalRuntimePermitV1 {
+                apply_receipt,
+                authority_epoch_id: 1,
+                locator,
+                primary_payload_hash_blake3: [0xA5; 32],
+            },
+        )
     }
 
     /// Create a technical candidate-integrity event.
@@ -1490,7 +1558,57 @@ impl GhostEvent {
 
     /// Create a PoolTransaction event
     pub fn pool_transaction(tx: PoolTransaction) -> Self {
-        GhostEvent::PoolTransaction(Arc::new(tx))
+        GhostEvent::PoolTransaction(Arc::new(tx), None)
+    }
+
+    pub(crate) fn canonical_pool_transaction(
+        tx: PoolTransaction,
+        permit: CanonicalRuntimePermitV1,
+    ) -> Self {
+        GhostEvent::PoolTransaction(Arc::new(tx), Some(permit))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_canonical_pool_transaction(tx: PoolTransaction) -> Self {
+        let signature = tx
+            .signature
+            .parse()
+            .unwrap_or_else(|_| solana_sdk::signature::Signature::new_unique());
+        let pool_amm_id = tx
+            .pool_amm_id
+            .parse()
+            .unwrap_or_else(|_| solana_sdk::pubkey::Pubkey::new_unique());
+        let candidate = ghost_core::PumpCandidateIdentityV1 {
+            pool_amm_id,
+            mint: tx
+                .token_mint
+                .as_deref()
+                .and_then(|mint| mint.parse().ok())
+                .unwrap_or(pool_amm_id),
+        };
+        let semantic_event_ordinal = tx.event_ordinal.unwrap_or_default();
+        let locator = RawPumpMutationLocatorV1 {
+            program_id: solana_sdk::pubkey::Pubkey::new_unique(),
+            signature,
+            outer_instruction_index: tx.outer_instruction_index.unwrap_or_default() as u16,
+            inner_instruction_path: Vec::new(),
+            semantic_event_ordinal,
+        };
+        let apply_receipt = CanonicalMutationApplyReceiptV1::fixture(
+            ghost_core::PumpMutationFamilyV1::Trade,
+            signature,
+            candidate,
+            locator.clone(),
+        );
+        Self::canonical_pool_transaction(
+            tx,
+            CanonicalRuntimePermitV1 {
+                apply_receipt,
+                authority_epoch_id: 1,
+                locator,
+                primary_payload_hash_blake3: [0xA5; 32],
+            },
+        )
     }
 
     /// Create a FundingTransferObserved event.
@@ -1666,8 +1784,8 @@ impl GhostEvent {
     pub fn event_type(&self) -> &'static str {
         match self {
             GhostEvent::CandidateIntegrity(_) => "candidate_integrity",
-            GhostEvent::NewPoolDetected(_) => "new_pool_detected",
-            GhostEvent::PoolTransaction(_) => "pool_transaction",
+            GhostEvent::NewPoolDetected(_, _) => "new_pool_detected",
+            GhostEvent::PoolTransaction(_, _) => "pool_transaction",
             GhostEvent::FundingTransferObserved(_) => "funding_transfer_observed",
             GhostEvent::ExecutionAccountEvidence(_) => "execution_account_evidence",
             GhostEvent::PoolScored(_) => "pool_scored",
@@ -1857,7 +1975,7 @@ mod tests {
         let event = rx.recv().await.unwrap();
         assert_eq!(event.event_type(), "new_pool_detected");
 
-        if let GhostEvent::NewPoolDetected(pool_arc) = event {
+        if let GhostEvent::NewPoolDetected(pool_arc, _) = event {
             assert_eq!(pool_arc.pool_amm_id, "pool123");
             assert_eq!(pool_arc.slot, Some(12345));
         } else {

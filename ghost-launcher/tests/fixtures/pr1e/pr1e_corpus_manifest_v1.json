@@ -1,0 +1,36 @@
+{
+  "schema": "pr1e_corpus_manifest_v1",
+  "base_sha": "103212b16bfc059db367e1ceb3c7d00fd307d6c5",
+  "corpora": [
+    {
+      "id": "pr1b_parser_legacy_projection_v1",
+      "path": "off-chain/components/seer/src/hot_path_harness.rs",
+      "blake3_contract": "549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202",
+      "contract_kind": "embedded_snapshot_digest"
+    },
+    {
+      "id": "pr1c_account_observation_arbiter_v2",
+      "path": "ghost-core/tests/fixtures/account_observation_arbiter_v1/account_observation_differential_corpus_v2.jsonl",
+      "blake3_contract": "63839d047310638fe0d8643ee6c71148ac292f4390fc9098a2e573ce0ac1e051",
+      "contract_kind": "file_digest"
+    },
+    {
+      "id": "pr1d_pump_observation_ledger_v1",
+      "path": "ghost-core/tests/fixtures/pump_observation_ledger_v1/pump_observation_differential_corpus_v1.jsonl",
+      "blake3_contract": "833de2bd384c964712f2e7127f9bc1db57745644633c1c66facef540cdf4c2a4",
+      "contract_kind": "file_digest"
+    },
+    {
+      "id": "pr1d_pump_observation_ledger_v2",
+      "path": "ghost-core/tests/fixtures/pump_observation_ledger_v2/pump_observation_differential_corpus_v2.jsonl",
+      "blake3_contract": "c81d7b4f0cc3792c2bb2c4e71bfd0634fcfdd69723758d741ee2405770603415",
+      "contract_kind": "file_digest"
+    },
+    {
+      "id": "pr1e_cross_layer_v1",
+      "path": "ghost-launcher/tests/fixtures/pr1e/pr1e_cross_layer_scenarios_v1.jsonl",
+      "blake3_contract": "db5812ac10d5fcdede623037ead4baf42c2da90d929969bdb35ad1b06a4a8bae",
+      "contract_kind": "file_digest"
+    }
+  ]
+}
