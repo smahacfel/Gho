@@ -81,8 +81,8 @@ manifest_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/run_manife
 # `implementation_sha` is the frozen corrective implementation commit, distinct
 # from baseline PR #86 and from the runtime-computed BLAKE3 binary hash.
 baseline_sha = "43057b296663129ca9b4f572e793474830a5452c"
-implementation_sha = "1439f2745cbc80d1a672bc6c24280321010b79fc"
-code_hash = "git:1439f2745cbc80d1a672bc6c24280321010b79fc"
+implementation_sha = "c8e003aec057c2dfe5c8c8292ded5cf36dbf04db"
+code_hash = "git:c8e003aec057c2dfe5c8c8292ded5cf36dbf04db"
 health_evidence_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/capture_health_v1.json"
 
 [rug_reality_capture.cost_profile]
