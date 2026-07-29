@@ -2708,6 +2708,10 @@ mod tests {
         assert!(!config.execution.events.enable_aem_ticks);
         assert!(config
             .rug_reality_capture
+            .validate_enabled_contract()
+            .is_ok());
+        assert!(config
+            .rug_reality_capture
             .validate_event_writer_contract(config.execution.events.enable_optional_events)
             .is_ok());
     }
