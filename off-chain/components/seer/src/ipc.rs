@@ -1518,6 +1518,37 @@ fn should_emit_downstream_full_marker(last_emitted: Option<Instant>, now: Instan
     last_emitted.is_none_or(|last| now.duration_since(last) >= IPC_DOWNSTREAM_FULL_LOG_INTERVAL)
 }
 
+/// Diagnostic-only state for one downstream-full episode.
+///
+/// A single successful `try_send` may free exactly one downstream slot while
+/// the dispatcher still has an egress backlog.  Treating that success as a
+/// new episode would turn a sustained pressure condition into a log per slot.
+/// The episode therefore ends only once the egress has drained.
+#[derive(Debug, Default)]
+struct DownstreamFullEpisode {
+    started_at: Option<Instant>,
+    last_logged_at: Option<Instant>,
+}
+
+impl DownstreamFullEpisode {
+    fn observe_full(&mut self, now: Instant) -> Option<Duration> {
+        let started_at = *self.started_at.get_or_insert(now);
+        if should_emit_downstream_full_marker(self.last_logged_at, now) {
+            self.last_logged_at = Some(now);
+            Some(now.duration_since(started_at))
+        } else {
+            None
+        }
+    }
+
+    fn observe_delivery(&mut self, egress_is_empty: bool) {
+        if egress_is_empty {
+            self.started_at = None;
+            self.last_logged_at = None;
+        }
+    }
+}
+
 fn ipc_event_boundary(event: &SeerEvent) -> ghost_core::LocalCoverageBoundaryV1 {
     match event {
         SeerEvent::PoolDetected(event) => ghost_core::LocalCoverageBoundaryV1 {
@@ -1556,6 +1587,15 @@ impl IpcReceiver {
     #[must_use]
     pub fn local_coverage_gap_receiver(&self) -> watch::Receiver<LocalCoverageGapStateV1> {
         self.local_coverage_gap_rx.clone()
+    }
+
+    /// Number of events currently waiting in the bounded downstream hand-off.
+    ///
+    /// This is diagnostic-only and does not participate in receive ordering,
+    /// backpressure, or admission policy.
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.receiver.len()
     }
 
     /// Record handling latency for the given event using the shared helper.
@@ -1606,8 +1646,7 @@ pub fn create_ipc_channel(config: IpcChannelConfig) -> (IpcSender, IpcReceiver, 
         .name("seer-ipc-egress".to_string())
         .spawn(move || {
             let mut pending = None;
-            let mut downstream_full_started_at = None;
-            let mut downstream_full_last_logged_at = None;
+            let mut downstream_full_episode = DownstreamFullEpisode::default();
             loop {
                 let event = match pending.take().or_else(|| worker_egress.next_event()) {
                     Some(event) => event,
@@ -1615,23 +1654,21 @@ pub fn create_ipc_channel(config: IpcChannelConfig) -> (IpcSender, IpcReceiver, 
                 };
                 match downstream_tx.try_send(event) {
                     Ok(()) => {
-                        downstream_full_started_at = None;
-                        downstream_full_last_logged_at = None;
+                        downstream_full_episode.observe_delivery(worker_egress.len() == 0);
                     }
                     Err(mpsc::error::TrySendError::Full(event)) => {
                         let now = Instant::now();
-                        let started_at = *downstream_full_started_at.get_or_insert(now);
-                        if should_emit_downstream_full_marker(downstream_full_last_logged_at, now) {
+                        if let Some(continuous_full_duration) =
+                            downstream_full_episode.observe_full(now)
+                        {
                             warn!(
                                 pending_event_kind = seer_event_kind(&event),
-                                continuous_full_duration_ms = now
-                                    .duration_since(started_at)
+                                continuous_full_duration_ms = continuous_full_duration
                                     .as_millis()
                                     .min(u128::from(u64::MAX))
                                     as u64,
                                 "IPC_DOWNSTREAM_FULL"
                             );
-                            downstream_full_last_logged_at = Some(now);
                         }
                         pending = Some(event);
                         if worker_egress.shutdown_deadline_expired() {
@@ -1726,6 +1763,33 @@ mod tests {
             Some(started),
             started + IPC_DOWNSTREAM_FULL_LOG_INTERVAL
         ));
+    }
+
+    #[test]
+    fn downstream_full_episode_survives_one_slot_delivery_with_egress_backlog() {
+        let started = Instant::now();
+        let mut episode = DownstreamFullEpisode::default();
+
+        assert_eq!(episode.observe_full(started), Some(Duration::ZERO));
+        episode.observe_delivery(false);
+        assert_eq!(
+            episode.observe_full(started + Duration::from_millis(999)),
+            None,
+            "one successful downstream delivery must not reset a full episode while egress remains backlogged"
+        );
+        assert_eq!(
+            episode.observe_full(started + IPC_DOWNSTREAM_FULL_LOG_INTERVAL),
+            Some(IPC_DOWNSTREAM_FULL_LOG_INTERVAL)
+        );
+
+        episode.observe_delivery(true);
+        assert_eq!(
+            episode.observe_full(
+                started + IPC_DOWNSTREAM_FULL_LOG_INTERVAL + Duration::from_millis(1)
+            ),
+            Some(Duration::ZERO),
+            "an empty egress queue begins a new downstream-full episode"
+        );
     }
 
     #[test]

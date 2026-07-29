@@ -26,6 +26,8 @@ use ghost_core::{
     PumpRouteVariant, PumpTradeSideV1, RawProviderRoleV1, TimestampQuality, Wal,
 };
 use metrics::increment_counter;
+use once_cell::sync::Lazy;
+use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts};
 use seer::{
     config::{
         ConnectionMode, FilterConfig, FundingLaneMode, ProgramStreamPayloadFormat,
@@ -34,7 +36,7 @@ use seer::{
     },
     ipc::{
         create_ipc_channel, BackpressurePolicy, FundingLaneRuntimeHealth, IpcChannelConfig,
-        LocalCoverageGapNoticeV1, PoolDetectionRuntimeDispositionV1,
+        IpcReceiver, LocalCoverageGapNoticeV1, PoolDetectionRuntimeDispositionV1,
     },
     nln_program_streams::{
         normalize_nln_event, NlnEvent, NlnFundingTransferCoverage, NlnProgramStreamMessage,
@@ -44,6 +46,7 @@ use seer::{
     Seer,
 };
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::hash::Hash;
@@ -76,6 +79,262 @@ const SESSION_POOL_REGISTRY_FALLBACK_CAP: usize = 16_384;
 const SEER_CORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_POOL_BRIDGE_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
 const NLN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+const ORACLE_RUNTIME_SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(5);
+const ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US: &[f64] = &[
+    10.0,
+    25.0,
+    50.0,
+    100.0,
+    250.0,
+    500.0,
+    1_000.0,
+    2_500.0,
+    5_000.0,
+    10_000.0,
+    25_000.0,
+    50_000.0,
+    100_000.0,
+    250_000.0,
+    500_000.0,
+    1_000_000.0,
+    2_500_000.0,
+    5_000_000.0,
+];
+
+/// Prometheus evidence for the bounded hand-off from `IpcReceiver` into the
+/// launcher-side bridge that forwards work to OracleRuntime.  These metrics
+/// observe only; they do not feed queue, admission, or execution control.
+struct OracleRuntimeIpcProfileMetrics {
+    processing_duration_us: HistogramVec,
+    handler_stage_duration_us: HistogramVec,
+    events_handled: IntCounterVec,
+    backlog_before: IntGaugeVec,
+    backlog_after: IntGaugeVec,
+}
+
+impl OracleRuntimeIpcProfileMetrics {
+    fn register() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            processing_duration_us: prometheus::register_histogram_vec!(
+                HistogramOpts::new(
+                    "oracle_runtime_ipc_event_processing_duration_us",
+                    "End-to-end launcher bridge processing time per IpcReceiver event in microseconds"
+                )
+                .buckets(ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US.to_vec()),
+                &["event_kind"]
+            )?,
+            handler_stage_duration_us: prometheus::register_histogram_vec!(
+                HistogramOpts::new(
+                    "oracle_runtime_ipc_handler_stage_duration_us",
+                    "Observed main-stage processing time per IpcReceiver event in microseconds"
+                )
+                .buckets(ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US.to_vec()),
+                &["event_kind", "handler_stage"]
+            )?,
+            events_handled: prometheus::register_int_counter_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_events_handled_total",
+                    "IpcReceiver events whose launcher bridge handler returned"
+                ),
+                &["event_kind", "handler_stage"]
+            )?,
+            backlog_before: prometheus::register_int_gauge_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_downstream_backlog_before",
+                    "Bounded IpcReceiver downstream backlog immediately before an event handler"
+                ),
+                &["event_kind"]
+            )?,
+            backlog_after: prometheus::register_int_gauge_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_downstream_backlog_after",
+                    "Bounded IpcReceiver downstream backlog immediately after an event handler"
+                ),
+                &["event_kind"]
+            )?,
+        })
+    }
+}
+
+static ORACLE_RUNTIME_IPC_PROFILE_METRICS: Lazy<Result<OracleRuntimeIpcProfileMetrics, String>> =
+    Lazy::new(|| OracleRuntimeIpcProfileMetrics::register().map_err(|error| error.to_string()));
+static ORACLE_RUNTIME_SLOW_EVENT_LAST_LOGGED_AT: Lazy<Mutex<Option<Instant>>> =
+    Lazy::new(|| Mutex::new(None));
+
+fn oracle_runtime_ipc_profile_metrics() -> Option<&'static OracleRuntimeIpcProfileMetrics> {
+    ORACLE_RUNTIME_IPC_PROFILE_METRICS.as_ref().ok()
+}
+
+fn oracle_runtime_ipc_event_kind(event: &seer::ipc::SeerEvent) -> &'static str {
+    match event {
+        seer::ipc::SeerEvent::PoolDetected(_) => "pool_detected",
+        seer::ipc::SeerEvent::Trade(_) => "trade",
+        seer::ipc::SeerEvent::FundingTransfer(_) => "funding_transfer",
+        seer::ipc::SeerEvent::AccountUpdate(_) => "account_update",
+        seer::ipc::SeerEvent::ExecutionAccountEvidence(_) => "execution_account_evidence",
+    }
+}
+
+fn should_emit_oracle_runtime_slow_event_marker(
+    last_logged_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    last_logged_at
+        .is_none_or(|last| now.duration_since(last) >= ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL)
+}
+
+fn claim_oracle_runtime_slow_event_log(now: Instant) -> bool {
+    let Ok(mut last_logged_at) = ORACLE_RUNTIME_SLOW_EVENT_LAST_LOGGED_AT.lock() else {
+        return false;
+    };
+    if should_emit_oracle_runtime_slow_event_marker(*last_logged_at, now) {
+        *last_logged_at = Some(now);
+        true
+    } else {
+        false
+    }
+}
+
+fn oracle_runtime_ipc_slow_identity(
+    event: &seer::ipc::SeerEvent,
+) -> (Option<String>, Option<String>) {
+    match event {
+        seer::ipc::SeerEvent::PoolDetected(event) => (
+            Some(event.candidate.pool_amm_id.to_string()),
+            Some(event.candidate.signature.clone()),
+        ),
+        seer::ipc::SeerEvent::Trade(event) => (
+            Some(event.trade.pool_amm_id.to_string()),
+            Some(event.trade.signature.to_string()),
+        ),
+        seer::ipc::SeerEvent::AccountUpdate(event) => (
+            Some(event.bonding_curve.to_string()),
+            event.txn_signature.map(|signature| signature.to_string()),
+        ),
+        seer::ipc::SeerEvent::FundingTransfer(_)
+        | seer::ipc::SeerEvent::ExecutionAccountEvidence(_) => (None, None),
+    }
+}
+
+/// Records one event boundary without changing its ordering, admission, or
+/// delivery.  `Drop` deliberately covers early `continue` paths as well as
+/// successful bridge completion.
+struct OracleRuntimeIpcEventProfile<'a> {
+    event: &'a seer::ipc::SeerEvent,
+    receiver: &'a IpcReceiver,
+    started_at: Instant,
+    stage_started_at: Cell<Instant>,
+    handler_stage: Cell<&'static str>,
+    backlog_before: usize,
+    metrics: Option<&'static OracleRuntimeIpcProfileMetrics>,
+}
+
+impl<'a> OracleRuntimeIpcEventProfile<'a> {
+    fn new(event: &'a seer::ipc::SeerEvent, receiver: &'a IpcReceiver) -> Self {
+        let started_at = Instant::now();
+        Self {
+            event,
+            receiver,
+            started_at,
+            stage_started_at: Cell::new(started_at),
+            handler_stage: Cell::new("ipc_received"),
+            backlog_before: receiver.pending_len(),
+            metrics: oracle_runtime_ipc_profile_metrics(),
+        }
+    }
+
+    fn transition_to(&self, next_stage: &'static str) {
+        self.record_current_stage();
+        self.handler_stage.set(next_stage);
+        self.stage_started_at.set(Instant::now());
+    }
+
+    fn record_current_stage(&self) {
+        let Some(metrics) = self.metrics else {
+            return;
+        };
+        let elapsed_us = self.stage_started_at.get().elapsed().as_micros() as f64;
+        metrics
+            .handler_stage_duration_us
+            .with_label_values(&[
+                oracle_runtime_ipc_event_kind(self.event),
+                self.handler_stage.get(),
+            ])
+            .observe(elapsed_us);
+    }
+}
+
+impl Drop for OracleRuntimeIpcEventProfile<'_> {
+    fn drop(&mut self) {
+        self.record_current_stage();
+
+        let event_kind = oracle_runtime_ipc_event_kind(self.event);
+        let handler_stage = self.handler_stage.get();
+        let duration = self.started_at.elapsed();
+        let duration_us = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+        let backlog_after = self.receiver.pending_len();
+
+        if let Some(metrics) = self.metrics {
+            metrics
+                .processing_duration_us
+                .with_label_values(&[event_kind])
+                .observe(duration_us as f64);
+            metrics
+                .events_handled
+                .with_label_values(&[event_kind, handler_stage])
+                .inc();
+            metrics
+                .backlog_before
+                .with_label_values(&[event_kind])
+                .set(self.backlog_before.min(i64::MAX as usize) as i64);
+            metrics
+                .backlog_after
+                .with_label_values(&[event_kind])
+                .set(backlog_after.min(i64::MAX as usize) as i64);
+        }
+
+        if duration >= ORACLE_RUNTIME_SLOW_EVENT_THRESHOLD
+            && claim_oracle_runtime_slow_event_log(Instant::now())
+        {
+            let (pool, signature) = oracle_runtime_ipc_slow_identity(self.event);
+            match (pool, signature) {
+                (Some(pool), Some(signature)) => warn!(
+                    event_kind,
+                    duration_us,
+                    handler_stage,
+                    pool = %pool,
+                    signature = %signature,
+                    current_backlog = backlog_after,
+                    "ORACLE_RUNTIME_SLOW_EVENT"
+                ),
+                (Some(pool), None) => warn!(
+                    event_kind,
+                    duration_us,
+                    handler_stage,
+                    pool = %pool,
+                    current_backlog = backlog_after,
+                    "ORACLE_RUNTIME_SLOW_EVENT"
+                ),
+                (None, Some(signature)) => warn!(
+                    event_kind,
+                    duration_us,
+                    handler_stage,
+                    signature = %signature,
+                    current_backlog = backlog_after,
+                    "ORACLE_RUNTIME_SLOW_EVENT"
+                ),
+                (None, None) => warn!(
+                    event_kind,
+                    duration_us,
+                    handler_stage,
+                    current_backlog = backlog_after,
+                    "ORACLE_RUNTIME_SLOW_EVENT"
+                ),
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct NlnArtifactCaptureConfig {
@@ -6027,8 +6286,14 @@ pub async fn run(
                 h.mark_ipc_event();
             }
 
-            match seer_event {
+            // This is the sole bounded IpcReceiver consumer before the Event
+            // Bus / OracleRuntime path. The guard covers every branch,
+            // including early fail-closed and witness-only returns.
+            let ipc_event_profile = OracleRuntimeIpcEventProfile::new(&seer_event, &ipc_receiver);
+
+            match &seer_event {
                 seer::ipc::SeerEvent::PoolDetected(event) => {
+                    ipc_event_profile.transition_to("pool_detected::canonical_admission");
                     let candidate = &event.candidate;
                     let primary_raw = is_primary_raw_runtime_authority(candidate.provider_role);
                     let boundary_payload_aligned =
@@ -6055,6 +6320,7 @@ pub async fn run(
                             )
                         }),
                     );
+                    ipc_event_profile.transition_to("pool_detected::canonical_permit");
                     if !primary_raw {
                         debug!(
                             pool = %candidate.pool_amm_id,
@@ -6086,6 +6352,7 @@ pub async fn run(
                             continue;
                         }
                     };
+                    ipc_event_profile.transition_to("pool_detected::last_gate_validation");
                     if let Err(reason) = authorize_pool_runtime_disposition(
                         event.runtime_disposition,
                         &permit,
@@ -6277,6 +6544,7 @@ pub async fn run(
                     }
 
                     // Emit to unified event bus if available
+                    ipc_event_profile.transition_to("pool_detected::event_bus_bridge");
                     if let Some(ref tx) = event_bus_tx {
                         let now = Instant::now();
                         process_pool_detected_event_for_session_gate(
@@ -6388,6 +6656,7 @@ pub async fn run(
                 }
 
                 seer::ipc::SeerEvent::Trade(trade_event) => {
+                    ipc_event_profile.transition_to("trade::canonical_admission");
                     let trade = &trade_event.trade;
                     let primary_raw = is_primary_raw_runtime_authority(trade.provider_role);
                     let boundary_payload_aligned =
@@ -6413,6 +6682,7 @@ pub async fn run(
                             )
                         }),
                     );
+                    ipc_event_profile.transition_to("trade::canonical_permit");
                     if !primary_raw {
                         debug!(
                             pool = %trade.pool_amm_id,
@@ -6448,6 +6718,7 @@ pub async fn run(
                         }
                     };
 
+                    ipc_event_profile.transition_to("trade::identity_validation");
                     if !trade_has_forwardable_identity(trade) {
                         warn!(
                             "Seer: dropping unresolved trade before Event Bus bridge sig={} pool={} mint={} event_ordinal={:?}",
@@ -6474,6 +6745,7 @@ pub async fn run(
                     // NOTE: Log only forwarded trades (ForwardNow). Pools born before session
                     // startup are SilentDrop — logging before the gate check would spam hundreds
                     // of thousands of INFO lines per minute for pools we will never observe.
+                    ipc_event_profile.transition_to("trade::event_bus_bridge");
                     if let Some(ref tx) = event_bus_tx {
                         let now = Instant::now();
                         let gate = process_trade_event_for_session_gate(
@@ -6523,15 +6795,17 @@ pub async fn run(
                 }
 
                 seer::ipc::SeerEvent::FundingTransfer(funding_event) => {
+                    ipc_event_profile.transition_to("funding_transfer::event_bus_bridge");
                     if let Some(ref tx) = event_bus_tx {
-                        emit_funding_transfer_to_event_bus(tx, &funding_event, health_ipc.as_ref());
+                        emit_funding_transfer_to_event_bus(tx, funding_event, health_ipc.as_ref());
                     }
                 }
 
                 seer::ipc::SeerEvent::ExecutionAccountEvidence(evidence_event) => {
+                    ipc_event_profile.transition_to("execution_account_evidence::session_bridge");
                     if let Some(ref tx) = event_bus_tx {
                         let ingress = session_account_update_bridge
-                            .ingest_execution_account_evidence(&evidence_event, Instant::now());
+                            .ingest_execution_account_evidence(evidence_event, Instant::now());
                         record_session_account_update_expired(ingress.expired_count);
                         record_session_account_update_detected_key_expired(
                             ingress.expired_detected_keys,
@@ -6540,7 +6814,7 @@ pub async fn run(
                             SessionExecutionAccountEvidenceDecision::ForwardNow => {
                                 emit_execution_account_evidence_to_event_bus(
                                     tx,
-                                    &evidence_event,
+                                    evidence_event,
                                     health_ipc.as_ref(),
                                 );
                             }
@@ -6565,9 +6839,10 @@ pub async fn run(
                 // suppressed end-to-end.
                 seer::ipc::SeerEvent::AccountUpdate(au) => {
                     if canonical_account_update_relay_enabled {
+                        ipc_event_profile.transition_to("account_update::session_bridge");
                         if let Some(ref tx) = event_bus_tx {
                             let ingress = session_account_update_bridge
-                                .ingest_account_update(&au, Instant::now());
+                                .ingest_account_update(au, Instant::now());
                             record_session_account_update_expired(ingress.expired_count);
                             record_session_account_update_detected_key_expired(
                                 ingress.expired_detected_keys,
@@ -6580,7 +6855,7 @@ pub async fn run(
                                 SessionAccountUpdateDecision::ForwardNow => {
                                     emit_account_update_to_event_bus(
                                         tx,
-                                        &au,
+                                        au,
                                         health_ipc.as_ref(),
                                         false,
                                     );
@@ -6598,6 +6873,8 @@ pub async fn run(
                                 }
                             }
                         }
+                    } else {
+                        ipc_event_profile.transition_to("account_update::relay_disabled");
                     }
                     // degraded/test compatibility: silently drop — no
                     // ShadowLedger writes happen in Seer, so there is no local
@@ -6865,16 +7142,18 @@ mod tests {
         handle_local_coverage_gap_notice, ingest_pump_observation,
         is_primary_raw_runtime_authority, missing_primary_observation_signal,
         nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
-        pool_candidate_matches_primary_observation, process_pool_detected_event_for_session_gate,
-        process_trade_event_for_session_gate, pumpswap_program_id,
-        select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
+        oracle_runtime_ipc_profile_metrics, pool_candidate_matches_primary_observation,
+        process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
+        pumpswap_program_id, select_nln_program_stream_subscriptions,
+        should_emit_oracle_runtime_slow_event_marker, trade_event_to_pool_transaction,
         trade_has_forwardable_identity, trade_matches_primary_observation,
         validate_pr1e_startup_contract, CanonicalRuntimeAdmissionV1,
         CanonicalRuntimeNoApplyReasonV1, NlnArtifactDeliveryState, NlnArtifactOverflowReasonV1,
         NlnArtifactRecord, NlnArtifactWriter, NlnProgramStreamCaptureTopic,
         NlnTradePoolIdentityResolver, NlnTradeResolveDecision, SessionAccountUpdateBridge,
         SessionAccountUpdateDecision, SessionBcv2Context, SessionExecutionAccountEvidenceDecision,
-        SessionPoolTradeBridge, SessionTradeDecision, TOKEN_PROGRAM_ID,
+        SessionPoolTradeBridge, SessionTradeDecision, ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL,
+        TOKEN_PROGRAM_ID,
     };
     use crate::candidate_integrity::{
         CandidateIntegrityRegistry, CandidateIntegrityRegistryLimitsV1,
@@ -6914,6 +7193,47 @@ mod tests {
             CanonicalRuntimeAdmissionV1::Apply(permit) => permit,
             other => panic!("expected canonical runtime permit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oracle_runtime_ipc_profile_registers_duration_and_backlog_metrics() {
+        let metrics = oracle_runtime_ipc_profile_metrics()
+            .expect("diagnostic metrics must register without affecting runtime control");
+
+        metrics
+            .processing_duration_us
+            .with_label_values(&["trade"])
+            .observe(250.0);
+        metrics
+            .handler_stage_duration_us
+            .with_label_values(&["trade", "trade::event_bus_bridge"])
+            .observe(125.0);
+        metrics
+            .events_handled
+            .with_label_values(&["trade", "trade::event_bus_bridge"])
+            .inc();
+        metrics.backlog_before.with_label_values(&["trade"]).set(10);
+        metrics.backlog_after.with_label_values(&["trade"]).set(8);
+
+        assert_eq!(
+            metrics.backlog_before.with_label_values(&["trade"]).get(),
+            10
+        );
+        assert_eq!(metrics.backlog_after.with_label_values(&["trade"]).get(), 8);
+    }
+
+    #[test]
+    fn oracle_runtime_slow_event_marker_is_rate_limited() {
+        let started = Instant::now();
+        assert!(should_emit_oracle_runtime_slow_event_marker(None, started));
+        assert!(!should_emit_oracle_runtime_slow_event_marker(
+            Some(started),
+            started + ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(should_emit_oracle_runtime_slow_event_marker(
+            Some(started),
+            started + ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL
+        ));
     }
 
     #[test]
