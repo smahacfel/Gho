@@ -4677,36 +4677,51 @@ pub(crate) fn ingest_pump_observation(
         .filter(|signal| signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready)
         .cloned()
         .collect::<Vec<_>>();
-    if !ready_signals.is_empty()
-        && candidate_integrity_registry
+    if !ready_signals.is_empty() {
+        if let Err(error) = candidate_integrity_registry
             .seal_complete_transaction_inventory(receipt.signature, &ready_signals)
-            .is_err()
-    {
-        let _ = candidate_integrity_registry.fail_canonical_apply(&receipt);
-        error!(
-            signature = %receipt.signature,
-            locator = ?receipt.locator,
-            "Seer: complete transaction inventory could not seal apply fence; canonical runtime emission blocked"
-        );
-        record_integrity_signal(
-            candidate_integrity_registry,
-            canonical_coverage_incomplete_signal(canonical),
-            "inventory_seal_failed",
-        );
-        ::metrics::counter!(
-            "pr1_runtime_inventory_incomplete_total",
-            1u64,
-            "authority_epoch_id" => candidate_integrity_registry
-                .authority_epoch()
-                .epoch_id
-                .to_string(),
-            "reason" => "inventory_seal_failed"
-        );
-        candidate_integrity_registry
-            .close_candidate_admission_with_integrity_invalidation("inventory_seal_failed");
-        return CanonicalRuntimeAdmissionV1::Blocked(
-            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
-        );
+        {
+            if matches!(error, CandidateIntegrityErrorV1::CandidateAliasConflict) {
+                warn!(
+                    signature = %receipt.signature,
+                    locator = ?receipt.locator,
+                    candidate_pool = %receipt.candidate.pool_amm_id,
+                    candidate_mint = %receipt.candidate.mint,
+                    error = %error,
+                    "Seer: complete transaction inventory found a candidate-local alias conflict; canonical mutation remains blocked, staged receipt is reclaimed, and global admission stays open"
+                );
+                reclaim_staged_candidate_alias_conflict(candidate_integrity_registry, &receipt);
+                return CanonicalRuntimeAdmissionV1::Blocked(
+                    CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                );
+            }
+            let _ = candidate_integrity_registry.fail_canonical_apply(&receipt);
+            error!(
+                signature = %receipt.signature,
+                locator = ?receipt.locator,
+                error = %error,
+                "Seer: complete transaction inventory could not seal apply fence; canonical runtime emission blocked"
+            );
+            record_integrity_signal(
+                candidate_integrity_registry,
+                canonical_coverage_incomplete_signal(canonical),
+                "inventory_seal_failed",
+            );
+            ::metrics::counter!(
+                "pr1_runtime_inventory_incomplete_total",
+                1u64,
+                "authority_epoch_id" => candidate_integrity_registry
+                    .authority_epoch()
+                    .epoch_id
+                    .to_string(),
+                "reason" => "inventory_seal_failed"
+            );
+            candidate_integrity_registry
+                .close_candidate_admission_with_integrity_invalidation("inventory_seal_failed");
+            return CanonicalRuntimeAdmissionV1::Blocked(
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+            );
+        }
     }
     if !candidate_integrity_registry.is_available()
         || !candidate_integrity_registry.candidate_admission_open()
@@ -7398,6 +7413,63 @@ mod tests {
                 .canonical_mutation_count,
             0,
             "the failed non-canonical observation must issue no runtime evidence"
+        );
+    }
+
+    #[test]
+    fn inventory_seal_alias_conflict_blocks_only_conflicting_candidate() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::new(
+            CandidateIntegrityRegistryLimitsV1 {
+                max_candidates: 4,
+                max_audit_markers_per_candidate: 4,
+                max_terminal_tombstones: 4,
+            },
+        ));
+        let pool = Pubkey::new_unique();
+        let existing = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint: Pubkey::new_unique(),
+        };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate: existing,
+                outcome: CandidateIntegrityOutcomeV1::Ready,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [0xA3; 32],
+            })
+            .expect("existing pool identity occupies the alias lane");
+
+        let mut observation =
+            primary_trade_observation(Signature::new_unique(), pool, Pubkey::new_unique(), 0);
+        observation.raw_transaction_mutation_count = Some(1);
+        let admission =
+            ingest_pump_observation(&ledger, &registry, Some(observation), 1, true, None);
+
+        assert!(matches!(
+            admission,
+            CanonicalRuntimeAdmissionV1::Blocked(
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+            )
+        ));
+        assert!(
+            registry.candidate_admission_open(),
+            "a ready-inventory alias conflict must not globally close admission"
+        );
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("conflicting receipt must be reclaimed"),
+            (0, 0)
+        );
+        assert_eq!(
+            registry
+                .snapshot(existing)
+                .expect("existing alias remains auditable")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
         );
     }
 
