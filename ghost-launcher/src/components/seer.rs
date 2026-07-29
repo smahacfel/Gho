@@ -27,7 +27,7 @@ use ghost_core::{
 };
 use metrics::increment_counter;
 use once_cell::sync::Lazy;
-use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts};
+use prometheus::{HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts};
 use seer::{
     config::{
         ConnectionMode, FilterConfig, FundingLaneMode, ProgramStreamPayloadFormat,
@@ -81,6 +81,9 @@ const SESSION_POOL_BRIDGE_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
 const NLN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 const ORACLE_RUNTIME_SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(5);
 const ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const ORACLE_RUNTIME_IPC_RECV_GAP_THRESHOLD: Duration = Duration::from_millis(5);
+const ORACLE_RUNTIME_IPC_RECV_GAP_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const ORACLE_RUNTIME_SCHEDULING_LAG_INTERVAL: Duration = Duration::from_millis(10);
 const ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US: &[f64] = &[
     10.0,
     25.0,
@@ -111,6 +114,15 @@ struct OracleRuntimeIpcProfileMetrics {
     events_handled: IntCounterVec,
     backlog_before: IntGaugeVec,
     backlog_after: IntGaugeVec,
+    select_branch_selected: IntCounterVec,
+    prune_invocations: IntCounter,
+    prune_stage_duration_us: HistogramVec,
+    prune_stage_total_duration_us: IntCounterVec,
+    prune_stage_max_duration_us: IntGaugeVec,
+    prune_items_total: IntCounterVec,
+    recv_gap_with_backlog_us: HistogramVec,
+    recv_gap_with_backlog_max_us: IntGaugeVec,
+    scheduling_lag_us: HistogramVec,
 }
 
 impl OracleRuntimeIpcProfileMetrics {
@@ -153,6 +165,70 @@ impl OracleRuntimeIpcProfileMetrics {
                 ),
                 &["event_kind"]
             )?,
+            select_branch_selected: prometheus::register_int_counter_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_select_branch_selected_total",
+                    "Selections of each branch in the OracleRuntime IPC consumer select loop"
+                ),
+                &["branch"]
+            )?,
+            prune_invocations: prometheus::register_int_counter!(
+                Opts::new(
+                    "oracle_runtime_ipc_prune_invocations_total",
+                    "Invocations of the OracleRuntime IPC prune_interval branch"
+                )
+            )?,
+            prune_stage_duration_us: prometheus::register_histogram_vec!(
+                HistogramOpts::new(
+                    "oracle_runtime_ipc_prune_stage_duration_us",
+                    "Duration of each stage in the OracleRuntime IPC prune_interval branch in microseconds"
+                )
+                .buckets(ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US.to_vec()),
+                &["stage"]
+            )?,
+            prune_stage_total_duration_us: prometheus::register_int_counter_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_prune_stage_total_duration_us",
+                    "Accumulated duration of each OracleRuntime IPC prune stage in microseconds"
+                ),
+                &["stage"]
+            )?,
+            prune_stage_max_duration_us: prometheus::register_int_gauge_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_prune_stage_max_duration_us",
+                    "Largest observed duration of each OracleRuntime IPC prune stage in microseconds"
+                ),
+                &["stage"]
+            )?,
+            prune_items_total: prometheus::register_int_counter_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_prune_items_total",
+                    "Items or decisions processed by each OracleRuntime IPC prune stage"
+                ),
+                &["stage"]
+            )?,
+            recv_gap_with_backlog_us: prometheus::register_histogram_vec!(
+                HistogramOpts::new(
+                    "oracle_runtime_ipc_recv_gap_with_backlog_us",
+                    "Time from a completed IPC event to the next recv when either IPC backlog is nonzero"
+                )
+                .buckets(ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US.to_vec()),
+                &["last_selected_branch"]
+            )?,
+            recv_gap_with_backlog_max_us: prometheus::register_int_gauge_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_recv_gap_with_backlog_max_us",
+                    "Largest IPC recv gap with nonzero IPC backlog in microseconds"
+                ),
+                &["last_selected_branch"]
+            )?,
+            scheduling_lag_us: prometheus::register_histogram!(
+                HistogramOpts::new(
+                    "oracle_runtime_scheduling_lag_us",
+                    "Scheduling delay of the diagnostic 10 ms OracleRuntime lag observer in microseconds"
+                )
+                .buckets(ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US.to_vec())
+            )?,
         })
     }
 }
@@ -160,6 +236,8 @@ impl OracleRuntimeIpcProfileMetrics {
 static ORACLE_RUNTIME_IPC_PROFILE_METRICS: Lazy<Result<OracleRuntimeIpcProfileMetrics, String>> =
     Lazy::new(|| OracleRuntimeIpcProfileMetrics::register().map_err(|error| error.to_string()));
 static ORACLE_RUNTIME_SLOW_EVENT_LAST_LOGGED_AT: Lazy<Mutex<Option<Instant>>> =
+    Lazy::new(|| Mutex::new(None));
+static ORACLE_RUNTIME_IPC_RECV_GAP_LAST_LOGGED_AT: Lazy<Mutex<Option<Instant>>> =
     Lazy::new(|| Mutex::new(None));
 
 fn oracle_runtime_ipc_profile_metrics() -> Option<&'static OracleRuntimeIpcProfileMetrics> {
@@ -196,6 +274,118 @@ fn claim_oracle_runtime_slow_event_log(now: Instant) -> bool {
     }
 }
 
+fn should_emit_oracle_runtime_ipc_recv_gap_marker(
+    last_logged_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    last_logged_at
+        .is_none_or(|last| now.duration_since(last) >= ORACLE_RUNTIME_IPC_RECV_GAP_LOG_INTERVAL)
+}
+
+fn claim_oracle_runtime_ipc_recv_gap_log(now: Instant) -> bool {
+    let Ok(mut last_logged_at) = ORACLE_RUNTIME_IPC_RECV_GAP_LAST_LOGGED_AT.lock() else {
+        return false;
+    };
+    if should_emit_oracle_runtime_ipc_recv_gap_marker(*last_logged_at, now) {
+        *last_logged_at = Some(now);
+        true
+    } else {
+        false
+    }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn record_oracle_runtime_ipc_prune_stage(stage: &'static str, duration: Duration, items: usize) {
+    let Some(metrics) = oracle_runtime_ipc_profile_metrics() else {
+        return;
+    };
+    let elapsed_us = duration_us(duration);
+    let max_duration = metrics
+        .prune_stage_max_duration_us
+        .with_label_values(&[stage]);
+    metrics
+        .prune_stage_duration_us
+        .with_label_values(&[stage])
+        .observe(elapsed_us as f64);
+    metrics
+        .prune_stage_total_duration_us
+        .with_label_values(&[stage])
+        .inc_by(elapsed_us);
+    metrics
+        .prune_items_total
+        .with_label_values(&[stage])
+        .inc_by(items.min(u64::MAX as usize) as u64);
+    if elapsed_us > max_duration.get().max(0) as u64 {
+        max_duration.set(elapsed_us.min(i64::MAX as u64) as i64);
+    }
+}
+
+fn record_oracle_runtime_ipc_select_branch(branch: &'static str) {
+    if let Some(metrics) = oracle_runtime_ipc_profile_metrics() {
+        metrics
+            .select_branch_selected
+            .with_label_values(&[branch])
+            .inc();
+    }
+}
+
+fn record_oracle_runtime_ipc_recv_gap(
+    gap: Duration,
+    downstream_backlog: usize,
+    egress_backlog: usize,
+    last_selected_branch: &'static str,
+) {
+    if downstream_backlog == 0 && egress_backlog == 0 {
+        return;
+    }
+
+    let gap_us = duration_us(gap);
+    if let Some(metrics) = oracle_runtime_ipc_profile_metrics() {
+        metrics
+            .recv_gap_with_backlog_us
+            .with_label_values(&[last_selected_branch])
+            .observe(gap_us as f64);
+        let max_gap = metrics
+            .recv_gap_with_backlog_max_us
+            .with_label_values(&[last_selected_branch]);
+        if gap_us > max_gap.get().max(0) as u64 {
+            max_gap.set(gap_us.min(i64::MAX as u64) as i64);
+        }
+    }
+
+    if gap >= ORACLE_RUNTIME_IPC_RECV_GAP_THRESHOLD
+        && claim_oracle_runtime_ipc_recv_gap_log(Instant::now())
+    {
+        warn!(
+            gap_us,
+            downstream_backlog, egress_backlog, last_selected_branch, "IPC_CONSUMER_RECV_GAP"
+        );
+    }
+}
+
+fn spawn_oracle_runtime_scheduling_lag_observer(
+    mut stop_rx: oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(metrics) = oracle_runtime_ipc_profile_metrics() else {
+            return;
+        };
+        let mut interval = tokio::time::interval(ORACLE_RUNTIME_SCHEDULING_LAG_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                scheduled_at = interval.tick() => {
+                    let lag_us = duration_us(tokio::time::Instant::now().duration_since(scheduled_at));
+                    metrics.scheduling_lag_us.observe(lag_us as f64);
+                }
+            }
+        }
+    })
+}
+
 fn oracle_runtime_ipc_slow_identity(
     event: &seer::ipc::SeerEvent,
 ) -> (Option<String>, Option<String>) {
@@ -223,6 +413,7 @@ fn oracle_runtime_ipc_slow_identity(
 struct OracleRuntimeIpcEventProfile<'a> {
     event: &'a seer::ipc::SeerEvent,
     receiver: &'a IpcReceiver,
+    completed_at: &'a Cell<Option<Instant>>,
     started_at: Instant,
     stage_started_at: Cell<Instant>,
     handler_stage: Cell<&'static str>,
@@ -231,11 +422,16 @@ struct OracleRuntimeIpcEventProfile<'a> {
 }
 
 impl<'a> OracleRuntimeIpcEventProfile<'a> {
-    fn new(event: &'a seer::ipc::SeerEvent, receiver: &'a IpcReceiver) -> Self {
+    fn new(
+        event: &'a seer::ipc::SeerEvent,
+        receiver: &'a IpcReceiver,
+        completed_at: &'a Cell<Option<Instant>>,
+    ) -> Self {
         let started_at = Instant::now();
         Self {
             event,
             receiver,
+            completed_at,
             started_at,
             stage_started_at: Cell::new(started_at),
             handler_stage: Cell::new("ipc_received"),
@@ -333,6 +529,8 @@ impl Drop for OracleRuntimeIpcEventProfile<'_> {
                 ),
             }
         }
+
+        self.completed_at.set(Some(Instant::now()));
     }
 }
 
@@ -5023,12 +5221,18 @@ pub(crate) fn ingest_pump_observation(
     })
 }
 
-fn finalize_pump_observation_ledger(
+#[derive(Default)]
+struct PumpObservationLedgerFinalizationV1 {
+    decisions: Vec<PumpObservationLedgerDecisionV1>,
+    retired_terminal_candidates: usize,
+}
+
+fn collect_pump_observation_ledger_finalization(
     ledger: &Arc<Mutex<PumpObservationLedgerV1>>,
     candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
     now_monotonic_ns: u64,
-) {
-    let decisions = match ledger.lock() {
+) -> PumpObservationLedgerFinalizationV1 {
+    let (decisions, retired_terminal_candidates) = match ledger.lock() {
         Ok(mut ledger) => {
             let retirements = match candidate_integrity_registry.drain_terminal_ledger_retirements()
             {
@@ -5043,9 +5247,10 @@ fn finalize_pump_observation_ledger(
                         .close_candidate_admission_with_integrity_invalidation(
                             "terminal_retirement_handoff_unavailable",
                         );
-                    return;
+                    return PumpObservationLedgerFinalizationV1::default();
                 }
             };
+            let retired_terminal_candidates = retirements.len();
             for retirement in retirements {
                 let retired = ledger.retire_terminal_candidate(retirement.candidate);
                 if retired > 0 {
@@ -5059,7 +5264,10 @@ fn finalize_pump_observation_ledger(
                     );
                 }
             }
-            ledger.finalize_expired(now_monotonic_ns)
+            (
+                ledger.finalize_expired(now_monotonic_ns),
+                retired_terminal_candidates,
+            )
         }
         Err(error) => {
             ::metrics::counter!("pump_observation_ledger_unavailable_total", 1u64);
@@ -5070,16 +5278,44 @@ fn finalize_pump_observation_ledger(
             candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
                 "ledger_finalize_unavailable",
             );
-            return;
+            return PumpObservationLedgerFinalizationV1::default();
         }
     };
-    for decision in &decisions {
+
+    PumpObservationLedgerFinalizationV1 {
+        decisions,
+        retired_terminal_candidates,
+    }
+}
+
+fn emit_finalized_pump_observation_decisions(
+    candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
+    decisions: &[PumpObservationLedgerDecisionV1],
+) -> usize {
+    for decision in decisions {
         let _ = emit_pump_observation_decision(
             candidate_integrity_registry,
             decision,
             IntegritySignalFailureScopeV1::CanonicalLifecycle,
         );
     }
+    decisions.len()
+}
+
+fn finalize_pump_observation_ledger(
+    ledger: &Arc<Mutex<PumpObservationLedgerV1>>,
+    candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
+    now_monotonic_ns: u64,
+) {
+    let finalization = collect_pump_observation_ledger_finalization(
+        ledger,
+        candidate_integrity_registry,
+        now_monotonic_ns,
+    );
+    let _ = emit_finalized_pump_observation_decisions(
+        candidate_integrity_registry,
+        &finalization.decisions,
+    );
 }
 
 /// Apply the active PR1E consequence of an unrecovered local coverage gap.
@@ -6182,6 +6418,9 @@ pub async fn run(
     let pump_observation_ledger_ipc = pump_observation_ledger.clone();
     let candidate_integrity_registry_ipc = candidate_integrity_registry;
     let pump_observation_clock_ipc = pump_observation_clock;
+    let (scheduling_lag_stop_tx, scheduling_lag_stop_rx) = oneshot::channel();
+    let mut scheduling_lag_handle =
+        spawn_oracle_runtime_scheduling_lag_observer(scheduling_lag_stop_rx);
     let mut ipc_handle = tokio::spawn(async move {
         let detected_pool_ttl = Duration::from_millis(seer_config.watched_pools_ttl_ms.max(1));
         let detected_pool_cap = seer_config.watched_pools_cap.max(1);
@@ -6203,12 +6442,16 @@ pub async fn run(
         // be disproven.
         let mut handled_local_coverage_gap_notices = 0usize;
         let mut local_coverage_gap_control_overflow_handled = false;
+        let last_ipc_event_completed_at = Cell::new(None);
+        let mut last_selected_branch = "startup";
         info!("Seer: Starting IPC event processing");
         info!("Seer: IPC receiver task is now listening for pool detection events from Seer core");
 
         loop {
             let seer_event = tokio::select! {
                 gap_changed = local_coverage_gap_rx.changed() => {
+                    record_oracle_runtime_ipc_select_branch("local_coverage_gap_control");
+                    last_selected_branch = "local_coverage_gap_control";
                     match gap_changed {
                         Ok(()) => {
                             let gap_state = local_coverage_gap_rx.borrow_and_update().clone();
@@ -6247,10 +6490,24 @@ pub async fn run(
                     }
                 }
                 _ = prune_interval.tick() => {
+                    record_oracle_runtime_ipc_select_branch("prune_interval");
+                    last_selected_branch = "prune_interval";
+                    if let Some(metrics) = oracle_runtime_ipc_profile_metrics() {
+                        metrics.prune_invocations.inc();
+                    }
+                    let prune_started_at = Instant::now();
+                    let trade_prune_started_at = Instant::now();
                     let (expired_permits, expired_detected) =
                         session_trade_bridge.prune_expired(Instant::now());
+                    record_oracle_runtime_ipc_prune_stage(
+                        "session_trade_bridge::prune_expired",
+                        trade_prune_started_at.elapsed(),
+                        expired_permits.len().saturating_add(expired_detected),
+                    );
                     record_session_buffer_expired(expired_permits.len());
                     record_session_detected_pool_expired(expired_detected);
+                    let emit_expired_decisions_started_at = Instant::now();
+                    let expired_permit_count = expired_permits.len();
                     for expired in expired_permits {
                         let _ = candidate_integrity_registry_ipc
                             .fail_canonical_apply(&expired.apply_receipt);
@@ -6261,11 +6518,25 @@ pub async fn run(
                             "reason" => "buffer_expired"
                         );
                     }
-                    let (expired_updates, expired_update_keys, _expired_evidence) =
+                    record_oracle_runtime_ipc_prune_stage(
+                        "emit_finalized_decisions",
+                        emit_expired_decisions_started_at.elapsed(),
+                        expired_permit_count,
+                    );
+                    let account_update_prune_started_at = Instant::now();
+                    let (expired_updates, expired_update_keys, expired_evidence) =
                         session_account_update_bridge.prune_expired(Instant::now());
+                    record_oracle_runtime_ipc_prune_stage(
+                        "session_account_update_bridge::prune_expired",
+                        account_update_prune_started_at.elapsed(),
+                        expired_updates
+                            .saturating_add(expired_update_keys)
+                            .saturating_add(expired_evidence),
+                    );
                     record_session_account_update_expired(expired_updates);
                     record_session_account_update_detected_key_expired(expired_update_keys);
-                    finalize_pump_observation_ledger(
+                    let ledger_finalization_started_at = Instant::now();
+                    let finalization = collect_pump_observation_ledger_finalization(
                         &pump_observation_ledger_ipc,
                         &candidate_integrity_registry_ipc,
                         pump_observation_clock_ipc
@@ -6273,11 +6544,56 @@ pub async fn run(
                             .as_nanos()
                             .min(u128::from(u64::MAX)) as u64,
                     );
+                    record_oracle_runtime_ipc_prune_stage(
+                        "finalize_pump_observation_ledger",
+                        ledger_finalization_started_at.elapsed(),
+                        finalization
+                            .retired_terminal_candidates
+                            .saturating_add(finalization.decisions.len()),
+                    );
+                    let emit_ledger_decisions_started_at = Instant::now();
+                    let emitted_ledger_decisions = emit_finalized_pump_observation_decisions(
+                        &candidate_integrity_registry_ipc,
+                        &finalization.decisions,
+                    );
+                    record_oracle_runtime_ipc_prune_stage(
+                        "emit_finalized_decisions",
+                        emit_ledger_decisions_started_at.elapsed(),
+                        emitted_ledger_decisions,
+                    );
+                    record_oracle_runtime_ipc_prune_stage(
+                        "total",
+                        prune_started_at.elapsed(),
+                        expired_permit_count
+                            .saturating_add(expired_detected)
+                            .saturating_add(expired_updates)
+                            .saturating_add(expired_update_keys)
+                            .saturating_add(expired_evidence)
+                            .saturating_add(finalization.retired_terminal_candidates)
+                            .saturating_add(emitted_ledger_decisions),
+                    );
                     continue;
                 }
-                maybe_event = ipc_receiver.recv() => match maybe_event {
-                    Some(event) => event,
-                    None => break,
+                maybe_event = ipc_receiver.recv() => {
+                    record_oracle_runtime_ipc_select_branch("ipc_recv");
+                    match maybe_event {
+                        Some(event) => {
+                            let received_at = Instant::now();
+                            let downstream_backlog = ipc_receiver.pending_len();
+                            let egress_backlog = ipc_receiver.egress_pending_len();
+                            if let Some(completed_at) = last_ipc_event_completed_at.get() {
+                                record_oracle_runtime_ipc_recv_gap(
+                                    received_at.saturating_duration_since(completed_at),
+                                    downstream_backlog,
+                                    egress_backlog,
+                                    last_selected_branch,
+                                );
+                            }
+                            last_selected_branch = "ipc_recv";
+                            event
+                        }
+                        None => break,
+                    }
                 }
             };
 
@@ -6289,7 +6605,11 @@ pub async fn run(
             // This is the sole bounded IpcReceiver consumer before the Event
             // Bus / OracleRuntime path. The guard covers every branch,
             // including early fail-closed and witness-only returns.
-            let ipc_event_profile = OracleRuntimeIpcEventProfile::new(&seer_event, &ipc_receiver);
+            let ipc_event_profile = OracleRuntimeIpcEventProfile::new(
+                &seer_event,
+                &ipc_receiver,
+                &last_ipc_event_completed_at,
+            );
 
             match &seer_event {
                 seer::ipc::SeerEvent::PoolDetected(event) => {
@@ -6975,6 +7295,18 @@ pub async fn run(
             ));
         }
     }
+    let _ = scheduling_lag_stop_tx.send(());
+    match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, &mut scheduling_lag_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join_err)) => {
+            warn!(error = %join_err, "Seer: diagnostic scheduling-lag observer join failed");
+        }
+        Err(_) => {
+            scheduling_lag_handle.abort();
+            let _ = scheduling_lag_handle.await;
+            warn!("Seer: diagnostic scheduling-lag observer did not stop within shutdown timeout");
+        }
+    }
     if let Some(handle) = nln_program_streams_handle {
         handle.abort();
     }
@@ -7144,7 +7476,9 @@ mod tests {
         nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
         oracle_runtime_ipc_profile_metrics, pool_candidate_matches_primary_observation,
         process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
-        pumpswap_program_id, select_nln_program_stream_subscriptions,
+        pumpswap_program_id, record_oracle_runtime_ipc_prune_stage,
+        record_oracle_runtime_ipc_recv_gap, record_oracle_runtime_ipc_select_branch,
+        select_nln_program_stream_subscriptions, should_emit_oracle_runtime_ipc_recv_gap_marker,
         should_emit_oracle_runtime_slow_event_marker, trade_event_to_pool_transaction,
         trade_has_forwardable_identity, trade_matches_primary_observation,
         validate_pr1e_startup_contract, CanonicalRuntimeAdmissionV1,
@@ -7152,8 +7486,8 @@ mod tests {
         NlnArtifactRecord, NlnArtifactWriter, NlnProgramStreamCaptureTopic,
         NlnTradePoolIdentityResolver, NlnTradeResolveDecision, SessionAccountUpdateBridge,
         SessionAccountUpdateDecision, SessionBcv2Context, SessionExecutionAccountEvidenceDecision,
-        SessionPoolTradeBridge, SessionTradeDecision, ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL,
-        TOKEN_PROGRAM_ID,
+        SessionPoolTradeBridge, SessionTradeDecision, ORACLE_RUNTIME_IPC_RECV_GAP_LOG_INTERVAL,
+        ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL, TOKEN_PROGRAM_ID,
     };
     use crate::candidate_integrity::{
         CandidateIntegrityRegistry, CandidateIntegrityRegistryLimitsV1,
@@ -7233,6 +7567,84 @@ mod tests {
         assert!(should_emit_oracle_runtime_slow_event_marker(
             Some(started),
             started + ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn oracle_runtime_ipc_select_prune_and_recv_gap_metrics_are_observe_only() {
+        let metrics = oracle_runtime_ipc_profile_metrics()
+            .expect("diagnostic metrics must register without affecting runtime control");
+        let select_before = metrics
+            .select_branch_selected
+            .with_label_values(&["prune_interval"])
+            .get();
+        let prune_total_before = metrics
+            .prune_stage_total_duration_us
+            .with_label_values(&["total"])
+            .get();
+        let prune_items_before = metrics
+            .prune_items_total
+            .with_label_values(&["total"])
+            .get();
+        let recv_gap_before = metrics
+            .recv_gap_with_backlog_us
+            .with_label_values(&["prune_interval"])
+            .get_sample_count();
+
+        record_oracle_runtime_ipc_select_branch("prune_interval");
+        record_oracle_runtime_ipc_prune_stage("total", Duration::from_micros(250), 3);
+        record_oracle_runtime_ipc_recv_gap(Duration::from_micros(6_000), 1, 2, "prune_interval");
+
+        assert_eq!(
+            metrics
+                .select_branch_selected
+                .with_label_values(&["prune_interval"])
+                .get(),
+            select_before + 1
+        );
+        assert_eq!(
+            metrics
+                .prune_stage_total_duration_us
+                .with_label_values(&["total"])
+                .get(),
+            prune_total_before + 250
+        );
+        assert_eq!(
+            metrics
+                .prune_items_total
+                .with_label_values(&["total"])
+                .get(),
+            prune_items_before + 3
+        );
+        assert_eq!(
+            metrics
+                .recv_gap_with_backlog_us
+                .with_label_values(&["prune_interval"])
+                .get_sample_count(),
+            recv_gap_before + 1
+        );
+        assert!(
+            metrics
+                .recv_gap_with_backlog_max_us
+                .with_label_values(&["prune_interval"])
+                .get()
+                >= 6_000
+        );
+    }
+
+    #[test]
+    fn oracle_runtime_ipc_recv_gap_marker_is_rate_limited() {
+        let started = Instant::now();
+        assert!(should_emit_oracle_runtime_ipc_recv_gap_marker(
+            None, started
+        ));
+        assert!(!should_emit_oracle_runtime_ipc_recv_gap_marker(
+            Some(started),
+            started + ORACLE_RUNTIME_IPC_RECV_GAP_LOG_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(should_emit_oracle_runtime_ipc_recv_gap_marker(
+            Some(started),
+            started + ORACLE_RUNTIME_IPC_RECV_GAP_LOG_INTERVAL
         ));
     }
 

@@ -1462,6 +1462,9 @@ pub struct IpcReceiver {
 
     /// Metrics
     metrics: Arc<IpcMetrics>,
+    /// Read-only view of the fixed egress FIFO for consumer-boundary
+    /// diagnostics. It is never used to dequeue, enqueue, or steer delivery.
+    egress_diagnostics: Option<Arc<IpcEgressQueue>>,
     local_coverage_gap_rx: watch::Receiver<LocalCoverageGapStateV1>,
 }
 
@@ -1577,6 +1580,21 @@ impl IpcReceiver {
         Self {
             receiver,
             metrics,
+            egress_diagnostics: None,
+            local_coverage_gap_rx,
+        }
+    }
+
+    fn with_egress_diagnostics(
+        receiver: mpsc::Receiver<SeerEvent>,
+        metrics: Arc<IpcMetrics>,
+        egress_diagnostics: Arc<IpcEgressQueue>,
+        local_coverage_gap_rx: watch::Receiver<LocalCoverageGapStateV1>,
+    ) -> Self {
+        Self {
+            receiver,
+            metrics,
+            egress_diagnostics: Some(egress_diagnostics),
             local_coverage_gap_rx,
         }
     }
@@ -1596,6 +1614,18 @@ impl IpcReceiver {
     #[must_use]
     pub fn pending_len(&self) -> usize {
         self.receiver.len()
+    }
+
+    /// Number of events still waiting before the fixed egress dispatcher.
+    ///
+    /// This is a diagnostic-only snapshot used to distinguish a delayed
+    /// receiver from an empty producer egress. It does not alter IPC
+    /// ordering, capacity, backpressure, or fail-closed handling.
+    #[must_use]
+    pub fn egress_pending_len(&self) -> usize {
+        self.egress_diagnostics
+            .as_ref()
+            .map_or(0, |egress| egress.len())
     }
 
     /// Record handling latency for the given event using the shared helper.
@@ -1688,7 +1718,7 @@ pub fn create_ipc_channel(config: IpcChannelConfig) -> (IpcSender, IpcReceiver, 
     let dispatcher = Arc::new(Mutex::new(Some(handle)));
 
     let sender = IpcSender::new(
-        egress,
+        Arc::clone(&egress),
         dispatcher,
         downstream_diagnostics,
         config.clone(),
@@ -1696,7 +1726,12 @@ pub fn create_ipc_channel(config: IpcChannelConfig) -> (IpcSender, IpcReceiver, 
         local_gap_audit,
         local_coverage_gap_tx,
     );
-    let receiver = IpcReceiver::new(rx, Arc::clone(&metrics), local_coverage_gap_rx);
+    let receiver = IpcReceiver::with_egress_diagnostics(
+        rx,
+        Arc::clone(&metrics),
+        egress,
+        local_coverage_gap_rx,
+    );
 
     (sender, receiver, metrics)
 }
