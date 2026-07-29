@@ -81,11 +81,36 @@ def event_files(root: Path) -> list[Path]:
     return sorted(path for path in root.rglob("exec_*.jsonl") if path.is_file())
 
 
+def has_ace_smoke_trade_shape(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("success") is not True or payload.get("is_synthetic") is not False:
+        return False
+    required_order = (
+        "slot",
+        "tx_index",
+        "outer_instruction_index",
+        "inner_group_index",
+        "event_ordinal",
+    )
+    required_reserves = (
+        "virtual_sol_reserves",
+        "virtual_token_reserves",
+        "real_sol_reserves",
+        "real_token_reserves",
+    )
+    required_balances = ("signer_pre_balance_lamports", "signer_post_balance_lamports")
+    return all(payload.get(name) is not None for name in required_order + required_reserves + required_balances)
+
+
 def validate_event_files(root: Path) -> tuple[bool, list[str]]:
     failures: list[str] = []
     files = event_files(root)
     if not files:
         return False, ["no exec_*.jsonl files found"]
+    birth_count = 0
+    pool_transaction_count = 0
+    probe_ready_pool_transaction_count = 0
     for path in files:
         raw = path.read_bytes()
         if not raw.endswith(b"\n"):
@@ -96,9 +121,27 @@ def validate_event_files(root: Path) -> tuple[bool, list[str]]:
                 failures.append(f"{path}:{line_number}: blank JSONL row")
                 continue
             try:
-                json.loads(line)
+                event = json.loads(line)
             except json.JSONDecodeError as error:
                 failures.append(f"{path}:{line_number}: invalid JSONL: {error.msg}")
+                continue
+            kind = event.get("kind") if isinstance(event, dict) else None
+            if not isinstance(kind, dict):
+                continue
+            if kind.get("type") == "NewPoolDetected":
+                birth_count += 1
+            elif kind.get("type") == "PoolTransaction":
+                pool_transaction_count += 1
+                if has_ace_smoke_trade_shape(kind.get("payload")):
+                    probe_ready_pool_transaction_count += 1
+    if birth_count == 0:
+        failures.append("no NewPoolDetected birth evidence found in exec_*.jsonl")
+    if pool_transaction_count == 0:
+        failures.append("no PoolTransaction evidence found in exec_*.jsonl")
+    if probe_ready_pool_transaction_count == 0:
+        failures.append(
+            "no successful non-synthetic PoolTransaction with balances, full order key, and full reserves"
+        )
     return not failures, failures
 
 

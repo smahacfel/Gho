@@ -92,9 +92,11 @@ write/lock failures zamiast zamieniać brak durable eventu w cichy fakt.
 
 `scripts/ace_core_one_day_capture_health.py` nie jest nową usługą runtime.
 Zapisuje dwa immutable scrape'y loopback, sprawdza ich zero-count, syntax i
-final newline wszystkich `exec_*.jsonl`, logi EventWritera, coverage/fee
-markers oraz kontrolowany shutdown. Następnie tworzy raz manifest-bound
-receipt pod zarezerwowaną ścieżką.
+final newline wszystkich `exec_*.jsonl`, co najmniej jeden birth oraz jeden
+successful, non-synthetic `PoolTransaction` z balances, pełnym order key i
+pełnymi reserves. Sprawdza także logi EventWritera, coverage/fee markers oraz
+kontrolowany shutdown. Następnie tworzy raz manifest-bound receipt pod
+zarezerwowaną ścieżką.
 
 Offline probe wymaga receiptu. Weryfikuje jego schema, run ID i SHA-256
 manifestu oraz odrzuca capture przy niezerowym counterze, writer failure,
