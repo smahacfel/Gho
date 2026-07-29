@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use ghost_core::TransactionCosts;
 use serde::{Deserialize, Serialize};
 
-use crate::rug_scalp_v2::RugScalpRuntimeFeeAuthorityManifestV1;
+use crate::rug_scalp_v2::{RugScalpPumpQuoteAuthorityV1, RugScalpRuntimeFeeAuthorityManifestV1};
 
 /// Frozen transaction-envelope policy. Pump program settlement remains owned
 /// by the independently materialized on-chain fee schedules.
@@ -122,12 +122,24 @@ impl RugRealityCaptureConfigV1 {
         }
         Ok(())
     }
+
+    /// PoolTransaction is an optional EventWriter event. A full-universe
+    /// capture without that tape cannot support the offline ACE probe, so the
+    /// capture must fail before any runtime component is constructed.
+    pub fn validate_event_writer_contract(&self, enable_optional_events: bool) -> Result<()> {
+        if self.enabled && !enable_optional_events {
+            bail!(
+                "rug_reality_capture.enabled requires execution.events.enable_optional_events=true because PoolTransaction evidence is optional"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Immutable run-level authority and cost receipt written once at capture
 /// startup. It is intentionally not emitted per trade and cannot substitute
 /// fixture evidence for the runtime fee registry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RugRealityCaptureRunManifestV1 {
     pub schema_version: u16,
     pub run_id: String,
@@ -138,8 +150,27 @@ pub struct RugRealityCaptureRunManifestV1 {
     pub config_hash: String,
     pub code_hash: String,
     pub binary_hash: String,
+    /// PR1E canonical-runtime authority epoch active for this one capture.
+    /// A zero value decodes old manifests but is not valid input to the ACE
+    /// probe, which requires one explicit authority epoch.
+    #[serde(default)]
+    pub authority_epoch_id: u64,
+    /// Capture-time EventWriter run ID. It is duplicated deliberately so an
+    /// offline consumer can reject tape from a different writer run.
+    #[serde(default)]
+    pub event_writer_run_id: String,
+    /// `PoolTransaction` is optional in EventWriter. Persisting this bit makes
+    /// a disabled optional-event surface an explicit invalid-capture fact,
+    /// rather than trying to infer it from a missing tape after the fact.
+    #[serde(default)]
+    pub event_writer_optional_events_enabled: bool,
     pub cost_profile: RugRealityCostProfileV1,
     pub runtime_fee_authority: RugScalpRuntimeFeeAuthorityManifestV1,
+    /// Serialized typed Pump quote authority frozen before capture. The
+    /// offline probe materializes this exact authority and never performs a
+    /// later RPC lookup for historical slots.
+    #[serde(default)]
+    pub pump_quote_authority: RugScalpPumpQuoteAuthorityV1,
 }
 
 pub fn write_rug_reality_capture_run_manifest_new(
@@ -200,5 +231,15 @@ mod tests {
             },
         };
         assert!(config.validate_enabled_contract().is_err());
+    }
+
+    #[test]
+    fn enabled_capture_requires_optional_transaction_events() {
+        let config = RugRealityCaptureConfigV1 {
+            enabled: true,
+            ..RugRealityCaptureConfigV1::default()
+        };
+        assert!(config.validate_event_writer_contract(false).is_err());
+        assert!(config.validate_event_writer_contract(true).is_ok());
     }
 }

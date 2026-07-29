@@ -30,6 +30,7 @@ use ghost_brain::config::{
     GatekeeperV2Config, GhostBrainConfig, MetricContractFoundationConfigV1,
     MetricContractRolloutMode,
 };
+use ghost_brain::events::EventWriterConfig;
 use ghost_brain::guardian::post_buy::shadow_v2::shadow_v2_artifact_budget_exceeded;
 use ghost_brain::guardian::post_buy::{validate_exit_policy_v1_config, validate_het_pm_v2_config};
 use ghost_brain::oracle::SnapshotEngine;
@@ -825,6 +826,11 @@ async fn run_preflight(
         .rug_reality_capture
         .validate_enabled_contract()
         .and_then(|()| {
+            config
+                .rug_reality_capture
+                .validate_event_writer_contract(config.execution.events.enable_optional_events)
+        })
+        .and_then(|()| {
             if config.rug_reality_capture.enabled && config.rug_scalp_v2.enabled {
                 bail!(
                     "rug_reality_capture.enabled and rug_scalp_v2.enabled are mutually exclusive"
@@ -1449,6 +1455,9 @@ async fn run_launcher() -> Result<()> {
     // full-universe evidence lane.
     if config.rug_reality_capture.enabled {
         config.rug_reality_capture.validate_enabled_contract()?;
+        config
+            .rug_reality_capture
+            .validate_event_writer_contract(config.execution.events.enable_optional_events)?;
         if config.rug_scalp_v2.enabled {
             bail!("rug_reality_capture.enabled and rug_scalp_v2.enabled are mutually exclusive");
         }
@@ -1466,67 +1475,65 @@ async fn run_launcher() -> Result<()> {
     // The rejected V2 detector and the full-universe reality capture share
     // the same typed Pump fee authority.  Both materialise it from the two
     // canonical accounts; neither accepts a serialized schedule as authority.
-    let (runtime_fee_authority_manifest, runtime_fee_authority_costs) = if config
-        .rug_scalp_v2
-        .enabled
-        || config.rug_reality_capture.enabled
-    {
-        let (entry_transaction_costs, exit_transaction_costs, serialized_schedule_present) =
-            if config.rug_scalp_v2.enabled {
-                let supplied_envelope = config
-                    .rug_scalp_v2
-                    .pump_quote_authority
-                    .clone()
-                    .unwrap_or_default();
-                (
-                    supplied_envelope.entry_transaction_costs,
-                    supplied_envelope.exit_transaction_costs,
-                    !supplied_envelope.schedules.is_empty(),
-                )
-            } else {
-                (
-                    config
-                        .rug_reality_capture
-                        .cost_profile
-                        .entry_transaction_costs,
-                    config
-                        .rug_reality_capture
-                        .cost_profile
-                        .exit_transaction_costs,
-                    false,
-                )
-            };
-        if serialized_schedule_present {
-            warn!(
+    let (runtime_fee_authority, runtime_fee_authority_manifest, runtime_fee_authority_costs) =
+        if config.rug_scalp_v2.enabled || config.rug_reality_capture.enabled {
+            let (entry_transaction_costs, exit_transaction_costs, serialized_schedule_present) =
+                if config.rug_scalp_v2.enabled {
+                    let supplied_envelope = config
+                        .rug_scalp_v2
+                        .pump_quote_authority
+                        .clone()
+                        .unwrap_or_default();
+                    (
+                        supplied_envelope.entry_transaction_costs,
+                        supplied_envelope.exit_transaction_costs,
+                        !supplied_envelope.schedules.is_empty(),
+                    )
+                } else {
+                    (
+                        config
+                            .rug_reality_capture
+                            .cost_profile
+                            .entry_transaction_costs,
+                        config
+                            .rug_reality_capture
+                            .cost_profile
+                            .exit_transaction_costs,
+                        false,
+                    )
+                };
+            if serialized_schedule_present {
+                warn!(
                 "RUG_SCALP_SERIALIZED_FEE_SCHEDULES_IGNORED; runtime authority comes only from current on-chain config"
             );
-        }
-        let runtime_fee_rpc = new_async_rpc_client(config.seer.rpc_endpoint.clone());
-        let (authority, manifest) = materialize_rug_scalp_runtime_fee_authority_v1(
-            &runtime_fee_rpc,
-            entry_transaction_costs,
-            exit_transaction_costs,
-        )
-        .await
-        .context("RUG_SCALP_RUNTIME_FEE_AUTHORITY_UNAVAILABLE")?;
-        info!(
-            observed_slot = manifest.observed_slot,
-            effective_slot = manifest.effective_slot,
-            evidence_hash = %manifest.evidence_hash,
-            buy_v2_fee_schedule_id = %manifest.buy_v2_fee_schedule_id,
-            legacy_sell_fee_schedule_id = %manifest.legacy_sell_fee_schedule_id,
-            "RUG_SCALP_RUNTIME_FEE_AUTHORITY_MATERIALIZED"
-        );
-        if config.rug_scalp_v2.enabled {
-            config.rug_scalp_v2.pump_quote_authority = Some(authority);
-        }
-        (
-            Some(manifest),
-            Some((entry_transaction_costs, exit_transaction_costs)),
-        )
-    } else {
-        (None, None)
-    };
+            }
+            let runtime_fee_rpc = new_async_rpc_client(config.seer.rpc_endpoint.clone());
+            let (authority, manifest) = materialize_rug_scalp_runtime_fee_authority_v1(
+                &runtime_fee_rpc,
+                entry_transaction_costs,
+                exit_transaction_costs,
+            )
+            .await
+            .context("RUG_SCALP_RUNTIME_FEE_AUTHORITY_UNAVAILABLE")?;
+            info!(
+                observed_slot = manifest.observed_slot,
+                effective_slot = manifest.effective_slot,
+                evidence_hash = %manifest.evidence_hash,
+                buy_v2_fee_schedule_id = %manifest.buy_v2_fee_schedule_id,
+                legacy_sell_fee_schedule_id = %manifest.legacy_sell_fee_schedule_id,
+                "RUG_SCALP_RUNTIME_FEE_AUTHORITY_MATERIALIZED"
+            );
+            if config.rug_scalp_v2.enabled {
+                config.rug_scalp_v2.pump_quote_authority = Some(authority.clone());
+            }
+            (
+                Some(authority),
+                Some(manifest),
+                Some((entry_transaction_costs, exit_transaction_costs)),
+            )
+        } else {
+            (None, None, None)
+        };
     let rug_scalp_fee_authority_watch = runtime_fee_authority_manifest
         .as_ref()
         .zip(runtime_fee_authority_costs)
@@ -2183,6 +2190,36 @@ async fn run_launcher() -> Result<()> {
 
     // Create Oracle Runtime (per-pool state management and scoring coordination)
     use oracle_runtime::OracleRuntime;
+    // Freeze one PR1E authority epoch before the capture manifest is written.
+    // The same value is then passed into OracleRuntime, so the manifest and
+    // the canonical runtime cannot silently describe different epochs.
+    let pr1_binary_path =
+        std::env::current_exe().context("resolve launcher binary for PR1 authority epoch")?;
+    let pr1_binary_hash = *blake3::hash(&std::fs::read(&pr1_binary_path).with_context(|| {
+        format!(
+            "read launcher binary for PR1 authority epoch: {}",
+            pr1_binary_path.display()
+        )
+    })?)
+    .as_bytes();
+    let pr1_config_hash = *blake3::hash(&std::fs::read(&config_path).with_context(|| {
+        format!(
+            "read launcher config for PR1 authority epoch: {}",
+            config_path.display()
+        )
+    })?)
+    .as_bytes();
+    let pr1_authority_epoch = ghost_launcher::candidate_integrity::Pr1AuthorityEpochV1::new(
+        pr1_binary_hash,
+        pr1_config_hash,
+    );
+    info!(
+        authority_epoch_id = pr1_authority_epoch.epoch_id,
+        binary_hash = %blake3::Hash::from_bytes(pr1_authority_epoch.binary_hash).to_hex(),
+        config_hash = %blake3::Hash::from_bytes(pr1_authority_epoch.config_hash).to_hex(),
+        started_at_unix_ms = pr1_authority_epoch.started_at_unix_ms,
+        "PR1 authority epoch initialized"
+    );
     // This is a full-universe evidence run, not a validation tape or a
     // lifecycle. Its manifest is immutable and is written before the stream
     // starts so later replay cannot alter route, fee, or cost authority.
@@ -2202,11 +2239,15 @@ async fn run_launcher() -> Result<()> {
         })?)
         .to_hex()
         .to_string();
-        let runtime_fee_authority = runtime_fee_authority_manifest.clone().ok_or_else(|| {
-            anyhow::anyhow!("RUG_REALITY_CAPTURE_RUNTIME_FEE_AUTHORITY_UNAVAILABLE")
+        let runtime_fee_authority_manifest =
+            runtime_fee_authority_manifest.clone().ok_or_else(|| {
+                anyhow::anyhow!("RUG_REALITY_CAPTURE_RUNTIME_FEE_AUTHORITY_UNAVAILABLE")
+            })?;
+        let pump_quote_authority = runtime_fee_authority.clone().ok_or_else(|| {
+            anyhow::anyhow!("RUG_REALITY_CAPTURE_TYPED_QUOTE_AUTHORITY_UNAVAILABLE")
         })?;
         let manifest = RugRealityCaptureRunManifestV1 {
-            schema_version: 1,
+            schema_version: 2,
             run_id: config.rug_reality_capture.run_id.clone(),
             observe_only: true,
             signal_detector: "rug_scalp_signal_v2_rejected_overconstrained".to_string(),
@@ -2215,8 +2256,12 @@ async fn run_launcher() -> Result<()> {
             config_hash,
             code_hash: config.rug_reality_capture.code_hash.clone(),
             binary_hash,
+            authority_epoch_id: pr1_authority_epoch.epoch_id,
+            event_writer_run_id: config.rug_reality_capture.run_id.clone(),
+            event_writer_optional_events_enabled: config.execution.events.enable_optional_events,
             cost_profile: config.rug_reality_capture.cost_profile.clone(),
-            runtime_fee_authority,
+            runtime_fee_authority: runtime_fee_authority_manifest,
+            pump_quote_authority,
         };
         let manifest_path = PathBuf::from(&config.rug_reality_capture.manifest_path);
         write_rug_reality_capture_run_manifest_new(&manifest_path, &manifest)?;
@@ -2279,33 +2324,6 @@ async fn run_launcher() -> Result<()> {
         .map(|_| RugScalpValidationTapeBusV1::new());
     let mut oracle_runtime_config =
         oracle_runtime::OracleRuntimeConfig::from_shadow_ledger_config(&config.shadow_ledger);
-    let pr1_binary_path =
-        std::env::current_exe().context("resolve launcher binary for PR1 authority epoch")?;
-    let pr1_binary_hash = *blake3::hash(&std::fs::read(&pr1_binary_path).with_context(|| {
-        format!(
-            "read launcher binary for PR1 authority epoch: {}",
-            pr1_binary_path.display()
-        )
-    })?)
-    .as_bytes();
-    let pr1_config_hash = *blake3::hash(&std::fs::read(&config_path).with_context(|| {
-        format!(
-            "read launcher config for PR1 authority epoch: {}",
-            config_path.display()
-        )
-    })?)
-    .as_bytes();
-    let pr1_authority_epoch = ghost_launcher::candidate_integrity::Pr1AuthorityEpochV1::new(
-        pr1_binary_hash,
-        pr1_config_hash,
-    );
-    info!(
-        authority_epoch_id = pr1_authority_epoch.epoch_id,
-        binary_hash = %blake3::Hash::from_bytes(pr1_authority_epoch.binary_hash).to_hex(),
-        config_hash = %blake3::Hash::from_bytes(pr1_authority_epoch.config_hash).to_hex(),
-        started_at_unix_ms = pr1_authority_epoch.started_at_unix_ms,
-        "PR1 authority epoch initialized"
-    );
     oracle_runtime_config.pr1_authority_epoch = Some(pr1_authority_epoch);
     oracle_runtime_config.session = config.session.clone();
     oracle_runtime_config.tx_intelligence = config.tx_intelligence.clone();
@@ -2755,6 +2773,21 @@ async fn run_launcher() -> Result<()> {
     };
     let oracle_decision_log_path = config.oracle.decision_log_path.clone();
     let oracle_events_output_dir = config.execution.events.output_dir.clone();
+    let oracle_event_writer_override =
+        config
+            .rug_reality_capture
+            .enabled
+            .then(|| oracle_runtime::OracleEventWriterOverrideV1 {
+                run_id: config.rug_reality_capture.run_id.clone(),
+                config: EventWriterConfig {
+                    output_dir: config.execution.events.output_dir.clone(),
+                    rotation_interval_ms: config.execution.events.rotation_interval_ms,
+                    flush_interval_ms: config.execution.events.flush_interval_ms,
+                    max_file_size_bytes: config.execution.events.max_file_size_bytes,
+                    enable_aem_ticks: config.execution.events.enable_aem_ticks,
+                    enable_optional_events: config.execution.events.enable_optional_events,
+                },
+            });
     let oracle_health = Arc::clone(&health);
     let oracle_authoritative_funding_stream_rx = authoritative_funding_stream_rx;
     let oracle_shutdown_rx = shutdown_tx.subscribe();
@@ -2790,6 +2823,7 @@ async fn run_launcher() -> Result<()> {
             config.execution.shadow.lifecycle_log_path.clone(),
             trigger_component,
             oracle_events_output_dir,
+            oracle_event_writer_override,
             Some(oracle_health),
             canonical_account_update_relay_enabled,
             initial_authoritative_funding_stream_available,

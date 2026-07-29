@@ -17667,6 +17667,9 @@ fn pool_transaction_evidence_payload(
         error_code: tx.error_code.clone(),
         signer: tx.signer.clone(),
         wallet: tx.signer.clone(),
+        signer_pre_balance_lamports: tx.signer_pre_balance_lamports,
+        signer_post_balance_lamports: tx.signer_post_balance_lamports,
+        is_synthetic: Some(tx.semantic.event_truth_kind.is_synthetic()),
         quote_amount_sol,
         volume_sol: tx.volume_sol.abs(),
         sol_amount_lamports: tx.sol_amount_lamports,
@@ -26723,6 +26726,7 @@ pub async fn start_oracle_runtime_task(
         shadow_defaults.lifecycle_log_path,
         trigger,
         events_output_dir,
+        None,
         health,
         canonical_account_update_relay_enabled,
         authoritative_funding_stream_available,
@@ -26731,6 +26735,15 @@ pub async fn start_oracle_runtime_task(
         None,
     )
     .await
+}
+
+/// Optional capture-only EventWriter override. The normal runtime preserves
+/// its historical writer defaults; an observe-only full-universe capture can
+/// bind its immutable manifest run ID and configured evidence surface.
+#[derive(Debug, Clone)]
+pub struct OracleEventWriterOverrideV1 {
+    pub run_id: String,
+    pub config: EventWriterConfig,
 }
 
 pub async fn start_oracle_runtime_task_with_funding_availability(
@@ -26750,6 +26763,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     shadow_lifecycle_log_path: Option<String>,
     trigger: Option<Arc<crate::components::trigger::TriggerComponent>>,
     events_output_dir: String,
+    event_writer_override: Option<OracleEventWriterOverrideV1>,
     health: Option<Arc<ghost_core::health::RuntimeHealth>>,
     canonical_account_update_relay_enabled: bool,
     authoritative_funding_stream_available: bool,
@@ -26822,25 +26836,27 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let run_id = format!("launcher-{}", epoch_ms_start);
+    let default_run_id = format!("launcher-{}", epoch_ms_start);
     let lane = match execution_mode {
         ExecutionMode::Live | ExecutionMode::Dual => Lane::Live,
         ExecutionMode::Paper => Lane::Paper,
         ExecutionMode::Shadow => Lane::Shadow,
     };
-    let event_emitter = match EventEmitter::new(
-        EventWriterConfig {
-            output_dir: events_output_dir,
-            enable_optional_events: true,
-            ..Default::default()
-        },
-        run_id.clone(),
-        lane,
-    ) {
+    let default_writer_config = EventWriterConfig {
+        output_dir: events_output_dir,
+        enable_optional_events: true,
+        ..Default::default()
+    };
+    let (event_writer_config, run_id) = match event_writer_override {
+        Some(override_config) => (override_config.config, override_config.run_id),
+        None => (default_writer_config, default_run_id),
+    };
+    let event_writer_output_dir = event_writer_config.output_dir.clone();
+    let event_emitter = match EventEmitter::new(event_writer_config, run_id.clone(), lane) {
         Ok(e) => {
             info!(
-                "📊 EventEmitter initialized (run_id={}, lane={:?}, dir=datasets/events)",
-                run_id, lane
+                "📊 EventEmitter initialized (run_id={}, lane={:?}, dir={})",
+                run_id, lane, event_writer_output_dir
             );
             Some(Arc::new(e))
         }
@@ -51374,6 +51390,7 @@ mod tests {
             None,
             temp.path().join("events").display().to_string(),
             None,
+            None,
             true,
             false,
             false,
@@ -51435,6 +51452,7 @@ mod tests {
                                 Some(temp.path().join("lifecycle.jsonl").display().to_string()),
                                 None,
                                 temp.path().join("events").display().to_string(),
+                                None,
                                 None,
                                 false,
                                 false,

@@ -85,7 +85,7 @@ pub struct RugScalpPumpFeeScheduleV1 {
 /// build the runtime registry. It is persisted into the validation run
 /// manifest so schedule identifiers cannot be separated from their concrete
 /// owner/address/data evidence later.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RugScalpRuntimeFeeAuthorityManifestV1 {
     pub schema_version: u16,
     pub observed_slot: u64,
