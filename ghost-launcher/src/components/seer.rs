@@ -4595,10 +4595,18 @@ pub(crate) fn ingest_pump_observation(
     let receipt = match candidate_integrity_registry.stage_canonical_mutation(canonical) {
         Ok(receipt) => receipt,
         Err(error) => {
+            let candidate_admission_open = candidate_integrity_registry.candidate_admission_open();
+            let registry_available = candidate_integrity_registry.is_available();
+            let admission_generation = candidate_integrity_registry.admission_generation();
+            let authority_epoch_id = candidate_integrity_registry.authority_epoch().epoch_id;
             error!(
                 signature = %canonical.locator.signature,
                 locator = ?canonical.locator,
                 error = %error,
+                candidate_admission_open,
+                registry_available,
+                admission_generation,
+                authority_epoch_id,
                 "Seer: canonical apply receipt staging failed; canonical runtime emission blocked"
             );
             record_integrity_signal(
