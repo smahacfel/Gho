@@ -3,7 +3,7 @@
 //! This module consumes durable evidence after capture completion. It never
 //! subscribes to the event bus and never changes runtime decision behavior.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -15,8 +15,11 @@ use ghost_brain::events::{EventKind, ExecutionEvent, PoolTransactionPayload};
 use ghost_brain::execution::backend::Lane;
 use ghost_core::PumpReserveState;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::rug_reality_capture::RugRealityCaptureRunManifestV1;
+use crate::rug_reality_capture::{
+    RugRealityCaptureHealthEvidenceV1, RugRealityCaptureRunManifestV1,
+};
 use crate::rug_scalp_v2::{
     reserves_after_buy, RugScalpPumpQuoteContractV1, RUG_SCALP_ENTRY_ROUTE, RUG_SCALP_EXIT_ROUTE,
     RUG_SCALP_PUMP_PROGRAM,
@@ -28,6 +31,9 @@ pub const ACE_CORE_SUMMARY_SCHEMA: &str = "ace_core_one_day_summary_v1";
 pub const ACE_CORE_BASELINE_SHA: &str = "43057b296663129ca9b4f572e793474830a5452c";
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const POOL_TRANSACTION_PAYLOAD_SCHEMA_V1: &str = "v1";
+const ACE_CORE_SIGNAL_DETECTOR: &str = "ace_core_one_day_probe_v3_observe_only";
+const ACE_CAPTURE_HEALTH_SCHEMA_VERSION: u16 = 1;
 const CALIBRATION_BIRTHS: usize = 250;
 const CUTOFF_OFFSET_MS: u64 = 11_111;
 const FEATURE_WINDOW_MS: u64 = 8_000;
@@ -148,6 +154,8 @@ pub struct AceCoreCalibrationV1 {
     pub amount_source_label: String,
     pub source_run_id: String,
     pub source_baseline_sha: String,
+    pub source_implementation_sha: String,
+    pub source_code_hash: String,
     pub medians: [f64; 5],
     pub iqrs: [f64; 5],
     pub score_weights: [f64; 5],
@@ -188,6 +196,9 @@ pub struct AceCoreOneDaySummaryV1 {
     pub capture_status: String,
     pub capture_invalid_reasons: Vec<String>,
     pub baseline_sha: String,
+    pub implementation_sha: String,
+    pub code_hash: String,
+    pub binary_hash: String,
     pub run_id: String,
     pub authority_epoch_id: String,
     pub fee_authority_evidence_hash: String,
@@ -203,6 +214,13 @@ pub struct AceCoreOneDaySummaryV1 {
 struct BirthKey {
     base_mint: String,
     bonding_curve: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BirthKeyResolution {
+    OutsideUniverse,
+    Eligible(BirthKey),
+    Malformed(&'static str),
 }
 
 #[derive(Debug, Clone)]
@@ -327,11 +345,22 @@ pub fn run_ace_core_one_day_probe(args: AceCoreOneDayProbeArgs) -> Result<AceCor
 
     let manifest = load_manifest(&args.manifest_path)?;
     let mut invalid_reasons = validate_manifest(&manifest);
-    let tape = read_tape(&args.events_dir, &manifest.run_id)?;
-    invalid_reasons.extend(tape.invalid_reasons.iter().cloned());
+    invalid_reasons.extend(validate_capture_health_evidence(
+        &args.manifest_path,
+        &manifest,
+    ));
+    let mut tape = read_tape(&args.events_dir, &manifest.run_id)?;
 
-    let (births, duplicate_birth_evidence_count) = canonical_births(&tape);
-    let trade_index = strict_trade_index(&tape);
+    let (births, duplicate_birth_evidence_count) = canonical_births(&mut tape);
+    let canonical_birth_keys = births
+        .iter()
+        .filter_map(|birth| match birth_key(&birth.payload) {
+            BirthKeyResolution::Eligible(key) => Some(key),
+            BirthKeyResolution::OutsideUniverse | BirthKeyResolution::Malformed(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let trade_index = strict_trade_index(&mut tape, &canonical_birth_keys);
+    invalid_reasons.extend(tape.invalid_reasons.iter().cloned());
     let quote_contract = if invalid_reasons.is_empty() {
         Some(
             manifest
@@ -358,9 +387,20 @@ pub fn run_ace_core_one_day_probe(args: AceCoreOneDayProbeArgs) -> Result<AceCor
     let mut works = births
         .into_iter()
         .map(|birth| {
-            let key = birth_key(&birth.payload).expect("canonical_births filters eligible keys");
-            let trades = trade_index.get(&key).cloned().unwrap_or_default();
-            let feature_result = calculate_features(&birth, &trades);
+            let (trades, feature_result) = match birth_key(&birth.payload) {
+                BirthKeyResolution::Eligible(key) => {
+                    let trades = trade_index.get(&key).cloned().unwrap_or_default();
+                    let feature_result = calculate_features(&birth, &trades);
+                    (trades, feature_result)
+                }
+                BirthKeyResolution::Malformed(reason) => {
+                    (Vec::new(), Err(format!("malformed_birth:{reason}")))
+                }
+                BirthKeyResolution::OutsideUniverse => (
+                    Vec::new(),
+                    Err("birth_outside_eligible_universe".to_string()),
+                ),
+            };
             CandidateWork {
                 birth,
                 trades,
@@ -418,6 +458,9 @@ pub fn run_ace_core_one_day_probe(args: AceCoreOneDayProbeArgs) -> Result<AceCor
         capture_status,
         capture_invalid_reasons: invalid_reasons.into_iter().collect(),
         baseline_sha: ACE_CORE_BASELINE_SHA.to_string(),
+        implementation_sha: manifest.implementation_sha.clone(),
+        code_hash: manifest.code_hash.clone(),
+        binary_hash: manifest.binary_hash.clone(),
         run_id: manifest.run_id.clone(),
         authority_epoch_id: manifest.authority_epoch_id.to_string(),
         fee_authority_evidence_hash: manifest.runtime_fee_authority.evidence_hash.clone(),
@@ -446,6 +489,8 @@ pub fn run_ace_core_one_day_probe(args: AceCoreOneDayProbeArgs) -> Result<AceCor
                     .expect("validated day2 calibration is retained");
                 if day1_summary.run_id != calibration.source_run_id
                     || day1_summary.baseline_sha != calibration.source_baseline_sha
+                    || day1_summary.implementation_sha != calibration.source_implementation_sha
+                    || day1_summary.code_hash != calibration.source_code_hash
                     || day1_summary.capture_status != "VALID_CAPTURE"
                 {
                     bail!("day2 calibration does not match its day1 probe summary")
@@ -509,20 +554,32 @@ fn load_manifest(path: &Path) -> Result<RugRealityCaptureRunManifestV1> {
 
 fn validate_manifest(manifest: &RugRealityCaptureRunManifestV1) -> BTreeSet<String> {
     let mut reasons = BTreeSet::new();
-    if manifest.schema_version < 2 {
-        reasons.insert("manifest_schema_does_not_freeze_pump_quote_authority".to_string());
+    if manifest.schema_version < 3 {
+        reasons.insert("manifest_schema_does_not_freeze_ace_provenance_and_health".to_string());
     }
     if manifest.run_id.trim().is_empty() {
         reasons.insert("manifest_run_id_missing".to_string());
     }
-    if manifest.config_hash.trim().is_empty()
-        || manifest.code_hash.trim().is_empty()
-        || manifest.binary_hash.trim().is_empty()
-    {
+    if manifest.config_hash.trim().is_empty() || manifest.binary_hash.trim().is_empty() {
         reasons.insert("manifest_config_or_binary_provenance_missing".to_string());
+    }
+    if manifest.baseline_sha != ACE_CORE_BASELINE_SHA {
+        reasons.insert("manifest_baseline_sha_mismatch".to_string());
+    }
+    if !is_full_git_sha(&manifest.implementation_sha) {
+        reasons.insert("manifest_implementation_sha_missing_or_invalid".to_string());
+    }
+    if manifest.code_hash != format!("git:{}", manifest.implementation_sha) {
+        reasons.insert("manifest_code_hash_does_not_match_implementation_sha".to_string());
+    }
+    if manifest.health_evidence_path.trim().is_empty() {
+        reasons.insert("manifest_capture_health_evidence_path_missing".to_string());
     }
     if !manifest.observe_only {
         reasons.insert("manifest_not_observe_only".to_string());
+    }
+    if manifest.signal_detector != ACE_CORE_SIGNAL_DETECTOR {
+        reasons.insert("manifest_signal_detector_not_ace_observe_only".to_string());
     }
     if manifest.entry_route_id != "buy_v2" || manifest.exit_route_id != "legacy_sell" {
         reasons.insert("manifest_route_authority_mismatch".to_string());
@@ -564,6 +621,78 @@ fn validate_manifest(manifest: &RugRealityCaptureRunManifestV1) -> BTreeSet<Stri
         }
     }
     reasons
+}
+
+fn is_full_git_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_capture_health_evidence(
+    manifest_path: &Path,
+    manifest: &RugRealityCaptureRunManifestV1,
+) -> BTreeSet<String> {
+    let mut reasons = BTreeSet::new();
+    let health_path = Path::new(&manifest.health_evidence_path);
+    let bytes = match fs::read(health_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            reasons.insert("capture_health_evidence_missing_or_unreadable".to_string());
+            return reasons;
+        }
+    };
+    let receipt = match serde_json::from_slice::<RugRealityCaptureHealthEvidenceV1>(&bytes) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            reasons.insert("capture_health_evidence_decode_failed".to_string());
+            return reasons;
+        }
+    };
+    if receipt.schema_version != ACE_CAPTURE_HEALTH_SCHEMA_VERSION {
+        reasons.insert("capture_health_evidence_schema_mismatch".to_string());
+    }
+    if receipt.run_id != manifest.run_id {
+        reasons.insert("capture_health_evidence_run_id_mismatch".to_string());
+    }
+    match fs::read(manifest_path) {
+        Ok(manifest_bytes) if receipt.manifest_sha256 == sha256_hex(&manifest_bytes) => {}
+        _ => {
+            reasons.insert("capture_health_evidence_manifest_hash_mismatch".to_string());
+        }
+    }
+    if receipt.start_metrics_sha256.trim().is_empty()
+        || receipt.end_metrics_sha256.trim().is_empty()
+    {
+        reasons.insert("capture_health_metrics_snapshot_provenance_missing".to_string());
+    }
+    if receipt.pr1_runtime_bypass_attempt_total != 0 {
+        reasons.insert("capture_health_pr1_runtime_bypass_attempt_nonzero".to_string());
+    }
+    if receipt.pr1_runtime_candidate_admission_closed_total != 0 {
+        reasons.insert("capture_health_candidate_admission_closed".to_string());
+    }
+    if receipt.pr1_runtime_primary_coverage_gap_total != 0 {
+        reasons.insert("capture_health_primary_local_coverage_gap".to_string());
+    }
+    if receipt.event_writer_write_failure_count != 0 {
+        reasons.insert("capture_health_event_writer_write_failure".to_string());
+    }
+    if receipt.event_writer_lock_failure_count != 0 {
+        reasons.insert("capture_health_event_writer_lock_failure".to_string());
+    }
+    if !receipt.controlled_shutdown {
+        reasons.insert("capture_health_controlled_shutdown_not_proven".to_string());
+    }
+    if !receipt.event_files_cleanly_flushed {
+        reasons.insert("capture_health_event_writer_flush_not_proven".to_string());
+    }
+    if !receipt.log_evidence_clean {
+        reasons.insert("capture_health_log_failure_detected".to_string());
+    }
+    reasons
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn collect_event_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -677,16 +806,40 @@ fn non_empty(value: &str) -> Option<&str> {
     (!value.trim().is_empty()).then_some(value.trim())
 }
 
-fn birth_key(payload: &NewPoolDetectedPayload) -> Option<BirthKey> {
+fn birth_key(payload: &NewPoolDetectedPayload) -> BirthKeyResolution {
     if !payload.is_birth_event
         || payload.amm_program.trim() != RUG_SCALP_PUMP_PROGRAM.to_string()
         || !is_wsol_quote(&payload.quote_mint)
     {
-        return None;
+        return BirthKeyResolution::OutsideUniverse;
     }
-    Some(BirthKey {
-        base_mint: non_empty(&payload.base_mint)?.to_string(),
-        bonding_curve: non_empty(&payload.bonding_curve)?.to_string(),
+    let Some(base_mint) = non_empty(&payload.base_mint) else {
+        return BirthKeyResolution::Malformed("pump_sol_birth_base_mint_missing");
+    };
+    let Some(mint_id) = non_empty(&payload.mint_id) else {
+        return BirthKeyResolution::Malformed("pump_sol_birth_mint_alias_missing");
+    };
+    if base_mint != mint_id {
+        return BirthKeyResolution::Malformed("pump_sol_birth_mint_alias_conflict");
+    }
+    let Some(pool_amm_id) = non_empty(&payload.pool_amm_id) else {
+        return BirthKeyResolution::Malformed("pump_sol_birth_pool_amm_id_missing");
+    };
+    let Some(pool_id) = non_empty(&payload.pool_id) else {
+        return BirthKeyResolution::Malformed("pump_sol_birth_pool_id_missing");
+    };
+    if pool_amm_id != pool_id {
+        return BirthKeyResolution::Malformed("pump_sol_birth_pool_alias_conflict");
+    }
+    let Some(bonding_curve) = non_empty(&payload.bonding_curve) else {
+        return BirthKeyResolution::Malformed("pump_sol_birth_bonding_curve_missing");
+    };
+    if pool_amm_id != bonding_curve {
+        return BirthKeyResolution::Malformed("pump_sol_birth_pool_curve_conflict");
+    }
+    BirthKeyResolution::Eligible(BirthKey {
+        base_mint: base_mint.to_string(),
+        bonding_curve: bonding_curve.to_string(),
     })
 }
 
@@ -711,11 +864,21 @@ fn compare_birth(left: &TapeBirth, right: &TapeBirth) -> std::cmp::Ordering {
         ))
 }
 
-fn canonical_births(tape: &Tape) -> (Vec<TapeBirth>, usize) {
+fn canonical_births(tape: &mut Tape) -> (Vec<TapeBirth>, usize) {
     let mut by_key = BTreeMap::<BirthKey, Vec<TapeBirth>>::new();
+    let mut malformed = Vec::new();
     for birth in tape.births.iter().cloned() {
-        if let Some(key) = birth_key(&birth.payload) {
-            by_key.entry(key).or_default().push(birth);
+        match birth_key(&birth.payload) {
+            BirthKeyResolution::OutsideUniverse => {}
+            BirthKeyResolution::Eligible(key) => {
+                by_key.entry(key).or_default().push(birth);
+            }
+            BirthKeyResolution::Malformed(reason) => {
+                tape.invalid_reasons.insert(reason.to_string());
+                // Keep malformed canonical Pump/SOL births in the terminal
+                // output instead of silently shrinking the denominator.
+                malformed.push(birth);
+            }
         }
     }
     let mut canonical = Vec::with_capacity(by_key.len());
@@ -727,6 +890,7 @@ fn canonical_births(tape: &Tape) -> (Vec<TapeBirth>, usize) {
             canonical.push(first);
         }
     }
+    canonical.extend(malformed);
     canonical.sort_by(compare_birth);
     (canonical, duplicate_count)
 }
@@ -749,7 +913,17 @@ fn canonical_trade_order(payload: &PoolTransactionPayload) -> Option<CanonicalTr
     })
 }
 
-fn strict_trade_key(payload: &PoolTransactionPayload) -> Option<BirthKey> {
+fn strict_trade_key(
+    payload: &PoolTransactionPayload,
+) -> std::result::Result<BirthKey, &'static str> {
+    if payload.schema_version != POOL_TRANSACTION_PAYLOAD_SCHEMA_V1 {
+        return Err("pool_transaction_schema_version_mismatch");
+    }
+    if let Some(quote_mint) = payload.quote_mint.as_deref().and_then(non_empty) {
+        if !is_wsol_quote(quote_mint) {
+            return Err("pool_transaction_quote_mint_not_wsol");
+        }
+    }
     let mut mint_aliases = BTreeSet::new();
     for alias in [
         payload.base_mint.as_deref(),
@@ -760,12 +934,33 @@ fn strict_trade_key(payload: &PoolTransactionPayload) -> Option<BirthKey> {
             mint_aliases.insert(alias.to_string());
         }
     }
-    if mint_aliases.len() != 1 {
-        return None;
+    if mint_aliases.is_empty() {
+        return Err("pool_transaction_mint_alias_missing");
     }
-    Some(BirthKey {
-        base_mint: mint_aliases.into_iter().next().expect("one mint alias"),
-        bonding_curve: non_empty(&payload.bonding_curve)?.to_string(),
+    if mint_aliases.len() != 1 {
+        return Err("pool_transaction_mint_alias_conflict");
+    }
+    let Some(pool_amm_id) = non_empty(&payload.pool_amm_id) else {
+        return Err("pool_transaction_pool_amm_id_missing");
+    };
+    let Some(pool_id) = non_empty(&payload.pool_id) else {
+        return Err("pool_transaction_pool_id_missing");
+    };
+    if pool_amm_id != pool_id {
+        return Err("pool_transaction_pool_alias_conflict");
+    }
+    let Some(bonding_curve) = non_empty(&payload.bonding_curve) else {
+        return Err("pool_transaction_bonding_curve_missing");
+    };
+    if pool_amm_id != bonding_curve {
+        return Err("pool_transaction_pool_curve_conflict");
+    }
+    Ok(BirthKey {
+        base_mint: mint_aliases
+            .into_iter()
+            .next()
+            .expect("non-empty singleton mint aliases"),
+        bonding_curve: bonding_curve.to_string(),
     })
 }
 
@@ -778,6 +973,12 @@ fn full_trade_dedupe_key(payload: &PoolTransactionPayload) -> Option<FullTradeDe
         inner_group_index: payload.inner_group_index?,
         event_ordinal: payload.event_ordinal?,
     })
+}
+
+fn full_trade_material_digest(payload: &PoolTransactionPayload) -> Option<String> {
+    serde_json::to_vec(payload)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn compare_trade(left: &TapeTrade, right: &TapeTrade) -> std::cmp::Ordering {
@@ -807,22 +1008,56 @@ fn compare_trade(left: &TapeTrade, right: &TapeTrade) -> std::cmp::Ordering {
         ))
 }
 
-fn strict_trade_index(tape: &Tape) -> BTreeMap<BirthKey, Vec<TapeTrade>> {
+fn strict_trade_index(
+    tape: &mut Tape,
+    canonical_birth_keys: &BTreeSet<BirthKey>,
+) -> BTreeMap<BirthKey, Vec<TapeTrade>> {
     let mut indexed = BTreeMap::<BirthKey, Vec<TapeTrade>>::new();
     for trade in tape.trades.iter().cloned() {
-        if let Some(key) = strict_trade_key(&trade.payload) {
-            indexed.entry(key).or_default().push(trade);
+        match strict_trade_key(&trade.payload) {
+            Ok(key) if canonical_birth_keys.contains(&key) => {
+                indexed.entry(key).or_default().push(trade);
+            }
+            Ok(_) => {
+                tape.invalid_reasons
+                    .insert("pool_transaction_has_no_canonical_birth".to_string());
+            }
+            Err(reason) => {
+                tape.invalid_reasons.insert(reason.to_string());
+            }
         }
     }
     for trades in indexed.values_mut() {
         trades.sort_by(compare_trade);
-        let mut seen = HashSet::new();
-        trades.retain(|trade| match full_trade_dedupe_key(&trade.payload) {
-            Some(key) => seen.insert(key),
-            // An incomplete key is never silently merged. If this row falls
-            // into the feature window, feature calculation will reject it.
-            None => true,
-        });
+        let mut seen = HashMap::<FullTradeDedupeKey, String>::new();
+        let mut retained = Vec::with_capacity(trades.len());
+        for trade in std::mem::take(trades) {
+            let Some(key) = full_trade_dedupe_key(&trade.payload) else {
+                // A missing full order key is not merged.  The feature
+                // contract continues to classify it if it enters the window.
+                retained.push(trade);
+                continue;
+            };
+            let Some(material_digest) = full_trade_material_digest(&trade.payload) else {
+                tape.invalid_reasons
+                    .insert("pool_transaction_material_payload_unserializable".to_string());
+                continue;
+            };
+            match seen.get(&key) {
+                None => {
+                    seen.insert(key, material_digest);
+                    retained.push(trade);
+                }
+                Some(first_digest) if first_digest == &material_digest => {
+                    // Exact material duplicate is legal delivery duplication.
+                }
+                Some(_) => {
+                    tape.invalid_reasons
+                        .insert("pool_transaction_divergent_full_mutation_duplicate".to_string());
+                }
+            }
+        }
+        *trades = retained;
     }
     indexed
 }
@@ -1085,6 +1320,8 @@ fn create_day1_calibration(
             amount_source_label: "observed_buy_wallet_debit_lamports=signer_pre_balance_lamports-signer_post_balance_lamports".to_string(),
             source_run_id: manifest.run_id.clone(),
             source_baseline_sha: ACE_CORE_BASELINE_SHA.to_string(),
+            source_implementation_sha: manifest.implementation_sha.clone(),
+            source_code_hash: manifest.code_hash.clone(),
             medians,
             iqrs,
             score_weights,
@@ -1155,6 +1392,8 @@ fn validate_day2_calibration(
         || calibration.amount_source_label
             != "observed_buy_wallet_debit_lamports=signer_pre_balance_lamports-signer_post_balance_lamports"
         || calibration.source_baseline_sha != ACE_CORE_BASELINE_SHA
+        || calibration.source_implementation_sha != manifest.implementation_sha
+        || calibration.source_code_hash != manifest.code_hash
         || calibration.source_run_id.trim().is_empty()
         || calibration.source_run_id == manifest.run_id
         || calibration.cutoff_offset_ms != CUTOFF_OFFSET_MS
@@ -1311,7 +1550,7 @@ fn scored_candidate_row(
 
 fn reserve_observation(trade: &TapeTrade) -> Option<ReserveObservation> {
     let payload = &trade.payload;
-    if payload.is_synthetic != Some(false) || payload.complete != Some(false) {
+    if !payload.success || payload.is_synthetic != Some(false) || payload.complete != Some(false) {
         return None;
     }
     Some(ReserveObservation {
@@ -1937,16 +2176,20 @@ mod tests {
     }
 
     fn manifest(run_id: &str) -> RugRealityCaptureRunManifestV1 {
+        let implementation_sha = "1111111111111111111111111111111111111111".to_string();
         RugRealityCaptureRunManifestV1 {
-            schema_version: 2,
+            schema_version: 3,
             run_id: run_id.to_string(),
             observe_only: true,
-            signal_detector: "full_universe_observe_only".to_string(),
+            signal_detector: ACE_CORE_SIGNAL_DETECTOR.to_string(),
             entry_route_id: "buy_v2".to_string(),
             exit_route_id: "legacy_sell".to_string(),
             config_hash: "config-hash".to_string(),
-            code_hash: ACE_CORE_BASELINE_SHA.to_string(),
+            baseline_sha: ACE_CORE_BASELINE_SHA.to_string(),
+            code_hash: format!("git:{implementation_sha}"),
+            implementation_sha,
             binary_hash: "binary-hash".to_string(),
+            health_evidence_path: "health-evidence.json".to_string(),
             authority_epoch_id: 42,
             event_writer_run_id: run_id.to_string(),
             event_writer_optional_events_enabled: true,
@@ -1967,6 +2210,29 @@ mod tests {
             },
             pump_quote_authority: quote_authority(),
         }
+    }
+
+    fn write_valid_health_evidence(
+        manifest_path: &Path,
+        manifest: &RugRealityCaptureRunManifestV1,
+    ) {
+        let receipt = RugRealityCaptureHealthEvidenceV1 {
+            schema_version: ACE_CAPTURE_HEALTH_SCHEMA_VERSION,
+            run_id: manifest.run_id.clone(),
+            manifest_sha256: sha256_hex(&fs::read(manifest_path).expect("manifest bytes")),
+            start_metrics_sha256: "start-metrics".to_string(),
+            end_metrics_sha256: "end-metrics".to_string(),
+            pr1_runtime_bypass_attempt_total: 0,
+            pr1_runtime_candidate_admission_closed_total: 0,
+            pr1_runtime_primary_coverage_gap_total: 0,
+            event_writer_write_failure_count: 0,
+            event_writer_lock_failure_count: 0,
+            controlled_shutdown: true,
+            event_files_cleanly_flushed: true,
+            log_evidence_clean: true,
+        };
+        write_json_new(Path::new(&manifest.health_evidence_path), &receipt)
+            .expect("write valid capture health evidence");
     }
 
     fn set_reserves(trade: &mut TapeTrade, base: u64, quote: u64) {
@@ -2075,13 +2341,19 @@ mod tests {
         first.payload.signature = "same-signature".to_string();
         let mut second = test_trade(1_001, "wallet-1", 2, 1);
         second.payload.signature = "same-signature".to_string();
-        let tape = Tape {
+        let mut tape = Tape {
             births: Vec::new(),
             trades: vec![first, second],
             invalid_reasons: BTreeSet::new(),
         };
+        let birth_keys = [BirthKey {
+            base_mint: "mint".to_string(),
+            bonding_curve: "curve".to_string(),
+        }]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
         assert_eq!(
-            strict_trade_index(&tape)
+            strict_trade_index(&mut tape, &birth_keys)
                 .get(&BirthKey {
                     base_mint: "mint".to_string(),
                     bonding_curve: "curve".to_string(),
@@ -2090,6 +2362,139 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn failed_reserve_row_cannot_be_used_as_entry_state() {
+        let mut work = economic_work(false, false);
+        let cutoff = work.birth.payload.birth_ts_ms + CUTOFF_OFFSET_MS;
+        let entry = work
+            .trades
+            .iter_mut()
+            .find(|trade| trade.payload.event_ts_ms == cutoff)
+            .expect("entry fixture");
+        entry.payload.success = false;
+        let contract = quote_authority().materialize().expect("quote contract");
+        assert!(matches!(
+            calculate_economic_outcome(&work, 10_000_000_000, &contract),
+            Err(EconomicFailure::Reserves("entry_state_missing_or_stale"))
+        ));
+    }
+
+    #[test]
+    fn failed_reserve_rows_cannot_form_trigger_landing_or_confirmation() {
+        let mut work = economic_work(false, false);
+        let cutoff = work.birth.payload.birth_ts_ms + CUTOFF_OFFSET_MS;
+        for trade in &mut work.trades {
+            if trade.payload.event_ts_ms > cutoff {
+                trade.payload.success = false;
+            }
+        }
+        let contract = quote_authority().materialize().expect("quote contract");
+        assert!(matches!(
+            calculate_economic_outcome(&work, 10_000_000_000, &contract),
+            Err(EconomicFailure::SustainCoverage(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_pump_sol_birth_is_retained_and_invalidates_capture() {
+        let mut malformed = test_birth("malformed", 1_000);
+        malformed.payload.base_mint.clear();
+        let mut tape = Tape {
+            births: vec![malformed],
+            trades: Vec::new(),
+            invalid_reasons: BTreeSet::new(),
+        };
+        let (births, duplicates) = canonical_births(&mut tape);
+        assert_eq!(births.len(), 1);
+        assert_eq!(duplicates, 0);
+        assert!(tape
+            .invalid_reasons
+            .contains("pump_sol_birth_base_mint_missing"));
+        assert!(matches!(
+            birth_key(&births[0].payload),
+            BirthKeyResolution::Malformed("pump_sol_birth_base_mint_missing")
+        ));
+    }
+
+    #[test]
+    fn unjoinable_trade_alias_conflict_invalidates_capture() {
+        let birth = test_birth("candidate", 1_000);
+        let mut trade = test_trade(1_100, "wallet", 1, 1);
+        trade.payload.token_mint = Some("conflicting-mint".to_string());
+        let mut tape = Tape {
+            births: vec![birth],
+            trades: vec![trade],
+            invalid_reasons: BTreeSet::new(),
+        };
+        let (births, _) = canonical_births(&mut tape);
+        let keys = births
+            .iter()
+            .filter_map(|birth| match birth_key(&birth.payload) {
+                BirthKeyResolution::Eligible(key) => Some(key),
+                BirthKeyResolution::OutsideUniverse | BirthKeyResolution::Malformed(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let indexed = strict_trade_index(&mut tape, &keys);
+        assert!(indexed.is_empty());
+        assert!(tape
+            .invalid_reasons
+            .contains("pool_transaction_mint_alias_conflict"));
+    }
+
+    #[test]
+    fn divergent_duplicate_full_mutation_key_invalidates_capture() {
+        let birth = test_birth("candidate", 1_000);
+        let first = test_trade(1_100, "wallet-a", 1, 1);
+        let mut conflicting = first.clone();
+        conflicting.payload.signer = "wallet-b".to_string();
+        conflicting.payload.wallet = "wallet-b".to_string();
+        conflicting.event_id = "conflicting-delivery".to_string();
+        conflicting.line_number = 99;
+        let mut tape = Tape {
+            births: vec![birth],
+            trades: vec![first, conflicting],
+            invalid_reasons: BTreeSet::new(),
+        };
+        let (births, _) = canonical_births(&mut tape);
+        let keys = births
+            .iter()
+            .filter_map(|birth| match birth_key(&birth.payload) {
+                BirthKeyResolution::Eligible(key) => Some(key),
+                BirthKeyResolution::OutsideUniverse | BirthKeyResolution::Malformed(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let indexed = strict_trade_index(&mut tape, &keys);
+        assert_eq!(indexed.values().next().expect("trade group").len(), 1);
+        assert!(tape
+            .invalid_reasons
+            .contains("pool_transaction_divergent_full_mutation_duplicate"));
+    }
+
+    #[test]
+    fn unknown_pool_transaction_schema_invalidates_capture() {
+        let birth = test_birth("candidate", 1_000);
+        let mut trade = test_trade(1_100, "wallet", 1, 1);
+        trade.payload.schema_version = "unknown".to_string();
+        let mut tape = Tape {
+            births: vec![birth],
+            trades: vec![trade],
+            invalid_reasons: BTreeSet::new(),
+        };
+        let (births, _) = canonical_births(&mut tape);
+        let keys = births
+            .iter()
+            .filter_map(|birth| match birth_key(&birth.payload) {
+                BirthKeyResolution::Eligible(key) => Some(key),
+                BirthKeyResolution::OutsideUniverse | BirthKeyResolution::Malformed(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let indexed = strict_trade_index(&mut tape, &keys);
+        assert!(indexed.is_empty());
+        assert!(tape
+            .invalid_reasons
+            .contains("pool_transaction_schema_version_mismatch"));
     }
 
     #[test]
@@ -2144,6 +2549,33 @@ mod tests {
         let manifest = manifest("day1");
         assert!(validate_manifest(&manifest).is_empty());
         assert!(manifest.pump_quote_authority.materialize().is_ok());
+    }
+
+    #[test]
+    fn capture_health_evidence_requires_zero_integrity_counters_and_manifest_hash() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = temp.path().join("manifest.json");
+        let mut capture_manifest = manifest("health-run");
+        capture_manifest.health_evidence_path = temp
+            .path()
+            .join("health.json")
+            .to_string_lossy()
+            .into_owned();
+        write_json_new(&manifest_path, &capture_manifest).expect("manifest");
+        write_valid_health_evidence(&manifest_path, &capture_manifest);
+        assert!(validate_capture_health_evidence(&manifest_path, &capture_manifest).is_empty());
+
+        let health_path = Path::new(&capture_manifest.health_evidence_path);
+        let mut receipt: RugRealityCaptureHealthEvidenceV1 =
+            serde_json::from_slice(&fs::read(health_path).expect("health bytes"))
+                .expect("health receipt");
+        receipt.pr1_runtime_bypass_attempt_total = 1;
+        fs::remove_file(health_path).expect("remove fixture health receipt");
+        write_json_new(health_path, &receipt).expect("rewrite health receipt");
+        assert!(
+            validate_capture_health_evidence(&manifest_path, &capture_manifest)
+                .contains("capture_health_pr1_runtime_bypass_attempt_nonzero")
+        );
     }
 
     #[test]
@@ -2297,7 +2729,14 @@ mod tests {
         fs::create_dir_all(&events_dir).expect("events dir");
         let manifest_path = temp.path().join("manifest.json");
         let run_id = "deterministic-day1";
-        write_json_new(&manifest_path, &manifest(run_id)).expect("manifest");
+        let mut capture_manifest = manifest(run_id);
+        capture_manifest.health_evidence_path = temp
+            .path()
+            .join("health-evidence.json")
+            .to_string_lossy()
+            .into_owned();
+        write_json_new(&manifest_path, &capture_manifest).expect("manifest");
+        write_valid_health_evidence(&manifest_path, &capture_manifest);
         let event_path = events_dir.join("exec_deterministic-day1_0000.jsonl");
         let mut event_file = File::create(&event_path).expect("event file");
         for seed in 0..251u64 {
@@ -2309,6 +2748,8 @@ mod tests {
             let curve = format!("curve-{seed}");
             birth.payload.base_mint = mint.clone();
             birth.payload.mint_id = mint.clone();
+            birth.payload.pool_amm_id = curve.clone();
+            birth.payload.pool_id = curve.clone();
             birth.payload.bonding_curve = curve.clone();
             let birth_event = ExecutionEvent::new(
                 EventEnvelope::new(
@@ -2325,6 +2766,8 @@ mod tests {
                 trade.payload.base_mint = Some(mint.clone());
                 trade.payload.mint_id = Some(mint.clone());
                 trade.payload.token_mint = Some(mint.clone());
+                trade.payload.pool_amm_id = curve.clone();
+                trade.payload.pool_id = curve.clone();
                 trade.payload.bonding_curve = curve.clone();
                 let trade_event = ExecutionEvent::new(
                     EventEnvelope::new(

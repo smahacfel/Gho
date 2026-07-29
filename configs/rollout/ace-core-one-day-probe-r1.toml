@@ -77,8 +77,13 @@ enabled = false
 [rug_reality_capture]
 enabled = true
 run_id = "ace-core-one-day-probe-r1-day1"
-manifest_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/run_manifest_v2.json"
-code_hash = "git:43057b296663129ca9b4f572e793474830a5452c"
+manifest_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/run_manifest_v3.json"
+# `implementation_sha` is populated only after the corrective code commit is
+# frozen.  The launcher rejects this placeholder, preventing an unaudited run.
+baseline_sha = "43057b296663129ca9b4f572e793474830a5452c"
+implementation_sha = "PENDING_FINAL_ACE_IMPLEMENTATION_SHA"
+code_hash = "git:PENDING_FINAL_ACE_IMPLEMENTATION_SHA"
+health_evidence_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/capture_health_v1.json"
 
 [rug_reality_capture.cost_profile]
 profile_id = "current-pump-shadow-execution-policy-ace-core-r1"
@@ -114,7 +119,9 @@ enable = true
 wal_enabled = false
 
 [metrics]
-enabled = false
+enabled = true
+bind = "127.0.0.1"
+port = 19090
 
 [gui_backend]
 enabled = false

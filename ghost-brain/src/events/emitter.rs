@@ -101,9 +101,24 @@ impl EventEmitter {
     }
 
     fn emit(&self, event: ExecutionEvent) {
-        if let Ok(mut w) = self.writer.lock() {
-            if let Err(e) = w.write_event(&event) {
-                error!(error = %e, kind = event.kind.type_name(), "EventEmitter: failed to write event");
+        match self.writer.lock() {
+            Ok(mut writer) => {
+                if let Err(error) = writer.write_event(&event) {
+                    ::metrics::counter!("event_writer_write_failure_total", 1u64);
+                    error!(
+                        error = %error,
+                        kind = event.kind.type_name(),
+                        "EventEmitter: failed to write event"
+                    );
+                }
+            }
+            Err(error) => {
+                ::metrics::counter!("event_writer_lock_failure_total", 1u64);
+                error!(
+                    error = %error,
+                    kind = event.kind.type_name(),
+                    "EventEmitter: writer mutex poisoned; event was not persisted"
+                );
             }
         }
     }

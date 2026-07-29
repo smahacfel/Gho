@@ -17815,6 +17815,8 @@ fn complete_canonical_apply(
 ) {
     let Some(receipt) = receipt else {
         increment_counter!("pr1_runtime_bypass_attempt_total");
+        crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
+        warn!("PR1 runtime bypass attempt: canonical downstream apply receipt missing");
         ctx.oracle_runtime
             .candidate_integrity_registry
             .close_candidate_admission_with_integrity_invalidation(
@@ -27410,6 +27412,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                     GhostEvent::NewPoolDetected(pool_data, runtime_permit) => {
                         let Some(runtime_permit) = runtime_permit else {
                             ::metrics::counter!("pr1_runtime_bypass_attempt_total", 1u64);
+                            crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
                             warn!(
                                 pool = %pool_data.pool_amm_id,
                                 mint = %pool_data.base_mint,
@@ -27423,6 +27426,12 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                             &runtime_permit,
                         ) {
                             ::metrics::counter!("pr1_runtime_bypass_attempt_total", 1u64);
+                            crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
+                            warn!(
+                                pool = %pool_data.pool_amm_id,
+                                mint = %pool_data.base_mint,
+                                "NewPoolDetected canonical runtime permit mismatch was rejected"
+                            );
                             let _ = oracle_runtime
                                 .candidate_integrity_registry
                                 .fail_canonical_apply(&runtime_permit.apply_receipt);
@@ -27579,6 +27588,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                     GhostEvent::PoolTransaction(tx, runtime_permit) => {
                         let Some(runtime_permit) = runtime_permit else {
                             ::metrics::counter!("pr1_runtime_bypass_attempt_total", 1u64);
+                            crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
                             warn!(
                                 pool = %tx.pool_amm_id,
                                 signature = %tx.signature,
@@ -27592,6 +27602,12 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                             &runtime_permit,
                         ) {
                             ::metrics::counter!("pr1_runtime_bypass_attempt_total", 1u64);
+                            crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
+                            warn!(
+                                pool = %tx.pool_amm_id,
+                                signature = %tx.signature,
+                                "PoolTransaction canonical runtime permit mismatch was rejected"
+                            );
                             let _ = oracle_runtime
                                 .candidate_integrity_registry
                                 .fail_canonical_apply(&runtime_permit.apply_receipt);

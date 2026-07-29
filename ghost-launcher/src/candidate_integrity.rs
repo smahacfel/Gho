@@ -1607,6 +1607,7 @@ impl CandidateIntegrityRegistry {
         if self.candidate_admission_open.swap(false, Ordering::AcqRel) {
             self.authority_admission_generation
                 .fetch_add(1, Ordering::AcqRel);
+            crate::oracle_metrics::record_pr1_runtime_candidate_admission_closed();
             ::metrics::gauge!(
                 "pr1_runtime_candidate_admission_closed",
                 1.0,
@@ -1623,6 +1624,7 @@ impl CandidateIntegrityRegistry {
         if self.candidate_admission_open.swap(false, Ordering::AcqRel) {
             self.authority_admission_generation
                 .fetch_add(1, Ordering::AcqRel);
+            crate::oracle_metrics::record_pr1_runtime_candidate_admission_closed();
             ::metrics::gauge!(
                 "pr1_runtime_candidate_admission_closed",
                 1.0,

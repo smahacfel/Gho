@@ -4738,6 +4738,7 @@ pub(crate) fn handle_local_coverage_gap_notice(
         "reason" => notice.reason.as_str(),
         "authority_epoch_id" => candidate_integrity_registry.authority_epoch().epoch_id.to_string()
     );
+    crate::oracle_metrics::record_pr1_runtime_primary_coverage_gap();
     error!(
         provider_id = %notice.provider_id,
         reason = notice.reason.as_str(),
@@ -4900,6 +4901,8 @@ pub(crate) fn process_trade_event_for_session_gate(
         SessionTradeDecision::Buffered => {}
         SessionTradeDecision::SilentDrop => {
             increment_counter!("pr1_runtime_bypass_attempt_total");
+            crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
+            warn!("Seer: PR1 runtime bypass attempt because session gate silently dropped trade");
         }
     }
 

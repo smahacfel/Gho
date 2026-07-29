@@ -11,6 +11,51 @@ use prometheus::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// =============================================================================
+// ACE capture integrity metrics
+// =============================================================================
+//
+// PR1 runtime code historically also records through the `metrics` facade.
+// The launcher HTTP endpoint, however, exposes the `prometheus` default
+// registry.  These counters deliberately live in that registry so a bounded
+// capture can prove its PR1 integrity gates from a loopback scrape.
+
+pub static PR1_RUNTIME_BYPASS_ATTEMPT_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::new(
+        "pr1_runtime_bypass_attempt_total",
+        "Canonical PR1 runtime events rejected because their permit was absent or invalid",
+    )
+    .expect("create pr1_runtime_bypass_attempt_total")
+});
+
+pub static PR1_RUNTIME_CANDIDATE_ADMISSION_CLOSED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::new(
+        "pr1_runtime_candidate_admission_closed_total",
+        "Global PR1 candidate-admission closures",
+    )
+    .expect("create pr1_runtime_candidate_admission_closed_total")
+});
+
+pub static PR1_RUNTIME_PRIMARY_COVERAGE_GAP_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::new(
+        "pr1_runtime_primary_coverage_gap_total",
+        "Unrecovered primary-local coverage gaps",
+    )
+    .expect("create pr1_runtime_primary_coverage_gap_total")
+});
+
+pub fn record_pr1_runtime_bypass_attempt() {
+    PR1_RUNTIME_BYPASS_ATTEMPT_TOTAL.inc();
+}
+
+pub fn record_pr1_runtime_candidate_admission_closed() {
+    PR1_RUNTIME_CANDIDATE_ADMISSION_CLOSED_TOTAL.inc();
+}
+
+pub fn record_pr1_runtime_primary_coverage_gap() {
+    PR1_RUNTIME_PRIMARY_COVERAGE_GAP_TOTAL.inc();
+}
+
 /// Counter for real events (PoolTransaction) gathered per pool
 /// Labels: pool (pool AMM ID)
 pub static ORACLE_GATHER_EVENTS_REAL: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -337,6 +382,11 @@ static FSC_LOOKUP_MISSES_ACCUM: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize oracle metrics with the Prometheus registry
 pub fn register_oracle_metrics(registry: &Registry) -> Result<(), Box<dyn std::error::Error>> {
+    registry.register(Box::new(PR1_RUNTIME_BYPASS_ATTEMPT_TOTAL.clone()))?;
+    registry.register(Box::new(
+        PR1_RUNTIME_CANDIDATE_ADMISSION_CLOSED_TOTAL.clone(),
+    ))?;
+    registry.register(Box::new(PR1_RUNTIME_PRIMARY_COVERAGE_GAP_TOTAL.clone()))?;
     registry.register(Box::new(ORACLE_GATHER_EVENTS_REAL.clone()))?;
     registry.register(Box::new(ORACLE_GATHER_EVENTS_SYNTHETIC.clone()))?;
     registry.register(Box::new(ORACLE_GATHER_LAST_REAL_COUNT.clone()))?;
@@ -609,6 +659,15 @@ mod tests {
             .collect();
 
         assert!(names.iter().any(|name| name == "eventbus_active_receivers"));
+        assert!(names
+            .iter()
+            .any(|name| name == "pr1_runtime_bypass_attempt_total"));
+        assert!(names
+            .iter()
+            .any(|name| name == "pr1_runtime_candidate_admission_closed_total"));
+        assert!(names
+            .iter()
+            .any(|name| name == "pr1_runtime_primary_coverage_gap_total"));
         assert!(names.iter().any(|name| name == "eventbus_lag_total"));
         assert!(names.iter().any(|name| name == "cpv_index_entries"));
         assert!(names.iter().any(|name| name == "cpv_index_evictions_total"));

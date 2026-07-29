@@ -267,10 +267,16 @@ Ponowne pobranie fee authority dopiero po 24 h jest niewystarczające: nowo pobr
 
 #### `ghost-launcher/src/rug_reality_capture.rs`
 
-Rozszerzyć istniejący manifest o jeden field:
+Rozszerzyć istniejący manifest o frozen typed authority oraz provenance
+implementacji:
 
 ```rust
 pub pump_quote_authority: RugScalpPumpQuoteAuthorityV1,
+pub baseline_sha: String,
+pub implementation_sha: String,
+pub code_hash: String,
+pub binary_hash: String,
+pub health_evidence_path: String,
 ```
 
 Typ jest już serializowalny i zawiera:
@@ -290,7 +296,14 @@ RugScalpPumpQuoteAuthorityV1
 
 i zapisać go w tym samym istniejącym run manifest.
 
-Nie powstaje osobny registry, receipt framework ani fee service.
+`baseline_sha` pozostaje parentem PR #86. `implementation_sha` jest pełnym,
+zamrożonym SHA commitu implementacji ACE, a `code_hash` musi dokładnie równać
+się `git:<implementation_sha>`. `binary_hash` identyfikuje binarkę capture.
+Probe odrzuca pusty, niepełny albo niespójny provenance.
+
+Nie powstaje osobny runtime registry, health service ani fee service. Powstaje
+wyłącznie jeden post-shutdown, manifest-bound offline receipt health, którego
+probe wymaga przed obliczeniem wyniku.
 
 ### 3.3. Jeden offline Rust probe
 
@@ -357,6 +370,30 @@ enable_aem_ticks = false
 
 Wszystkie ścieżki, `run_id`, manifest path i output directory muszą być nowe. Nie wolno nadpisywać R6 ani wcześniejszych capture.
 
+### 3.5. Minimalny receipt health capture
+
+`scripts/ace_core_one_day_capture_health.py` jest narzędziem operatorowym,
+nie komponentem runtime. Dwa razy zapisuje surowy scrape loopback Prometheus
+z capture process, a po kontrolowanym shutdownie zapisuje jeden immutable
+receipt pod `rug_reality_capture.health_evidence_path`.
+
+Receipt wiąże SHA-256 manifestu, run ID, hash obu scrape'ów i wartości:
+
+```text
+pr1_runtime_bypass_attempt_total
+pr1_runtime_candidate_admission_closed_total
+pr1_runtime_primary_coverage_gap_total
+event_writer_write_failure_count
+event_writer_lock_failure_count
+controlled_shutdown
+event_files_cleanly_flushed
+log_evidence_clean
+```
+
+Każdy counter musi wynosić zero, a trzy końcowe flagi muszą być true. Probe
+czyta receipt offline i fail-closed oznacza cały dzień `INVALID_CAPTURE` przy
+braku, błędnym run ID, hash mismatch manifestu albo dowolnym negatywnym fakcie.
+
 ---
 
 ## 4. Input i strict join
@@ -381,8 +418,13 @@ Zasady:
 
 1. birth musi być `NewPoolDetected` z Pump programem i WSOL quote;
 2. przy powtórzonym birth key wygrywa najwcześniejszy canonical birth; kolejne są reason-coded jako duplicate birth evidence;
-3. trade musi mieć zgodny mint i bonding curve;
-4. trade dedupe key:
+3. malformed Pump/SOL birth nie może zniknąć z denominatora: otrzymuje
+   terminalny `INVALID_CAPTURE`; observation faktycznie poza Pump/SOL
+   universe nie jest birth'em ACE;
+4. trade musi mieć zgodne `pool_amm_id`, `pool_id`, bonding curve oraz
+   wszystkie obecne mint aliases; unjoinable albo nieznany schema trade
+   unieważnia cały capture;
+5. trade dedupe key:
 
 ```text
 signature
@@ -393,9 +435,14 @@ signature
 + event_ordinal
 ```
 
-5. sama signature nigdy nie deduplikuje kilku legalnych mutacji w jednej transakcji;
-6. brak pełnego order key w feature window daje `NON_EVALUABLE_FEATURES`;
-7. brak pełnych czterech reserves w entry/outcome state daje `NON_EVALUABLE_RESERVES` dla danego birth.
+6. sama signature nigdy nie deduplikuje kilku legalnych mutacji w jednej transakcji;
+7. duplicate z tym samym pełnym mutation key jest legalny wyłącznie, gdy cały
+   material payload jest bit-identyczny; divergent duplicate unieważnia
+   capture, nigdy `first-wins`;
+8. brak pełnego order key w feature window daje `NON_EVALUABLE_FEATURES`;
+9. brak pełnych czterech reserves w entry/outcome state daje `NON_EVALUABLE_RESERVES` dla danego birth;
+10. reserve state użyty przez entry, trigger, landing albo confirmation musi
+    mieć `success=true`, `is_synthetic=false` i `complete=false`.
 
 ---
 
@@ -428,9 +475,14 @@ Cały dzień jest `INVALID_CAPTURE`, jeżeli wystąpi którekolwiek z:
 - EventWriter nie domknął plików albo JSONL jest uszkodzony;
 - manifest authority/config/run ID nie zgadza się z tape;
 - capture został uruchomiony z `enable_optional_events = false`;
-- launcher zatrzymał się przed zadeklarowanym końcem dnia bez kontrolowanego flushu.
+- launcher zatrzymał się przed zadeklarowanym końcem dnia bez kontrolowanego flushu;
+- brak jest manifest-bound health receipt albo receipt wykazuje niezerowy
+  bypass/admission/coverage/writer fact.
 
-Nie dodajemy nowego health frameworka. Korzystamy z istniejących PR1E logs/counters i istniejących output files.
+Nie dodajemy nowego health frameworka. Używamy istniejących PR1E paths,
+eksportujemy ich trzy wymagane liczniki przez istniejący loopback Prometheus i
+materializujemy jeden offline receipt z istniejących logs, counters i output
+files.
 
 ---
 
@@ -942,9 +994,13 @@ Dla każdego dnia oraz pooled, jeżeli był Dzień 2:
 
 ```text
 baseline_sha
+implementation_sha
+code_hash
+binary_hash
 run_id
 authority_epoch_id
 fee_authority_evidence_hash
+capture_health_receipt
 birth_count
 calibration_excluded_count
 selected_count
@@ -991,6 +1047,13 @@ Wymagane są wyłącznie testy chroniące wynik:
 16. Landing `>=17%`, confirmation `<17%` daje `sustained_net17_hit=false`.
 17. `enable_optional_events=false` jest odrzucane przez capture preflight.
 18. Ten sam tape + manifest + calibration daje bit-identyczne rows i summary.
+19. Failed reserve row nie może być entry, triggerem, landingiem ani confirmation.
+20. Malformed Pump/SOL birth nie może zniknąć z denominatora.
+21. Unjoinable trade i divergent duplicate pełnego mutation key unieważniają capture.
+22. Nieznany `PoolTransactionPayload.schema_version` unieważnia capture.
+23. Manifest wymaga oddzielnych baseline/implementation/code/binary provenance.
+24. Loopback `/metrics` eksponuje trzy wymagane liczniki PR1.
+25. Brak, mismatch manifestu albo niezerowy fact w health receipt unieważnia capture.
 
 Nie uruchamiamy szerokiej kampanii CI ani review produkcyjnego jako warunku tego eksperymentu. Wystarczą focused tests, `cargo fmt`, build probe binary i jeden krótki fixture smoke.
 
@@ -1003,17 +1066,90 @@ Nie uruchamiamy szerokiej kampanii CI ani review produkcyjnego jako warunku tego
 ```bash
 cargo fmt --all --check
 cargo test -p ghost-launcher ace_core_one_day_probe --lib -- --nocapture
+cargo test -p ghost-launcher oracle_metrics --lib -- --nocapture
+cargo test -p ghost-launcher metrics_server_tests --bin ghost-launcher -- --nocapture
 cargo build --release -p ghost-launcher --bin ghost-launcher --bin ace_core_one_day_probe
 ```
 
-### 17.2. Capture Dnia 1
+### 17.2. Obowiązkowy smoke 2–5 min i health receipt
+
+Najpierw należy uruchomić oddzielny smoke z nowym run ID oraz nowymi
+ścieżkami. Po starcie i widoczności `/metrics`:
+
+```bash
+python3 scripts/ace_core_one_day_capture_health.py snapshot \
+  --metrics-url http://127.0.0.1:19090/metrics \
+  --output <SMOKE_DIR>/metrics_start.prom
+```
+
+Bezpośrednio przed kontrolowanym SIGINT, gdy endpoint nadal działa:
+
+```bash
+python3 scripts/ace_core_one_day_capture_health.py snapshot \
+  --metrics-url http://127.0.0.1:19090/metrics \
+  --output <SMOKE_DIR>/metrics_end.prom
+```
+
+Po kontrolowanym SIGINT i pełnym flushu processu:
+
+```bash
+python3 scripts/ace_core_one_day_capture_health.py finalize \
+  --manifest <SMOKE_MANIFEST> \
+  --events-dir <SMOKE_EVENTS_DIR> \
+  --start-metrics <SMOKE_DIR>/metrics_start.prom \
+  --end-metrics <SMOKE_DIR>/metrics_end.prom \
+  --log <SMOKE_DIR>/system.log \
+  --log <SMOKE_DIR>/oracle.log \
+  --output <SMOKE_HEALTH_RECEIPT>
+```
+
+Smoke jest pozytywny wyłącznie, gdy receipt zostanie zapisany z kodem 0,
+pliki `exec_*.jsonl` rosną, zawierają births i `PoolTransaction` z balances,
+`is_synthetic=false`, pełnym order key i pełnymi reserves. Nie wolno użyć
+artefaktów smoke jako Dnia 1.
+
+### 17.3. Capture Dnia 1
+
+Przed uruchomieniem trzeba zastąpić w configu `implementation_sha` i
+`code_hash` pełnym SHA zamrożonego commitu implementacji. Placeholder jest
+celowo odrzucany przez preflight.
 
 ```bash
 ./target/release/ghost-launcher \
   --config configs/rollout/ace-core-one-day-probe-r1.toml
 ```
 
-Po kontrolowanym zakończeniu capture:
+Po starcie i widoczności `/metrics` należy zapisać pierwszy snapshot:
+
+```bash
+python3 scripts/ace_core_one_day_capture_health.py snapshot \
+  --metrics-url http://127.0.0.1:19090/metrics \
+  --output <DAY1_DIR>/metrics_start.prom
+```
+
+Bezpośrednio przed kontrolowanym zakończeniem capture, gdy endpoint nadal
+działa:
+
+```bash
+python3 scripts/ace_core_one_day_capture_health.py snapshot \
+  --metrics-url http://127.0.0.1:19090/metrics \
+  --output <DAY1_DIR>/metrics_end.prom
+```
+
+Po kontrolowanym SIGINT i pełnym flushu:
+
+```bash
+python3 scripts/ace_core_one_day_capture_health.py finalize \
+  --manifest <DAY1_MANIFEST> \
+  --events-dir <DAY1_EVENTS_DIR> \
+  --start-metrics <DAY1_DIR>/metrics_start.prom \
+  --end-metrics <DAY1_DIR>/metrics_end.prom \
+  --log <DAY1_DIR>/system.log \
+  --log <DAY1_DIR>/oracle.log \
+  --output <DAY1_HEALTH_RECEIPT>
+```
+
+Tylko po `finalize` z kodem 0:
 
 ```bash
 ./target/release/ace_core_one_day_probe \
@@ -1023,7 +1159,7 @@ Po kontrolowanym zakończeniu capture:
   --day-id day1
 ```
 
-### 17.3. Dzień 2, tylko jeżeli wymagany
+### 17.4. Dzień 2, tylko jeżeli wymagany
 
 ```bash
 ./target/release/ace_core_one_day_probe \

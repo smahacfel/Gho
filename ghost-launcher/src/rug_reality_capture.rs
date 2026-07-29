@@ -58,7 +58,17 @@ pub struct RugRealityCaptureConfigV1 {
     pub enabled: bool,
     pub run_id: String,
     pub manifest_path: String,
+    /// Scientific parent against which the experiment is framed.  This is not
+    /// the source revision of the capture implementation.
+    pub baseline_sha: String,
+    /// Immutable Git revision containing the ACE capture/probe implementation.
+    /// The runtime refuses a capture when it is not paired with `code_hash`.
+    pub implementation_sha: String,
     pub code_hash: String,
+    /// Manifest-adjacent, post-shutdown health evidence consumed by the
+    /// offline probe.  The manifest remains immutable; the evidence is written
+    /// once only after the operator has collected the final metrics snapshot.
+    pub health_evidence_path: String,
     pub cost_profile: RugRealityCostProfileV1,
 }
 
@@ -68,7 +78,10 @@ impl Default for RugRealityCaptureConfigV1 {
             enabled: false,
             run_id: String::new(),
             manifest_path: String::new(),
+            baseline_sha: String::new(),
+            implementation_sha: String::new(),
             code_hash: String::new(),
+            health_evidence_path: String::new(),
             cost_profile: RugRealityCostProfileV1::default(),
         }
     }
@@ -85,7 +98,19 @@ impl RugRealityCaptureConfigV1 {
                 "rug_reality_capture.manifest_path",
                 self.manifest_path.as_str(),
             ),
+            (
+                "rug_reality_capture.baseline_sha",
+                self.baseline_sha.as_str(),
+            ),
+            (
+                "rug_reality_capture.implementation_sha",
+                self.implementation_sha.as_str(),
+            ),
             ("rug_reality_capture.code_hash", self.code_hash.as_str()),
+            (
+                "rug_reality_capture.health_evidence_path",
+                self.health_evidence_path.as_str(),
+            ),
             (
                 "rug_reality_capture.cost_profile.profile_id",
                 self.cost_profile.profile_id.as_str(),
@@ -106,6 +131,17 @@ impl RugRealityCaptureConfigV1 {
             if value.trim().is_empty() {
                 bail!("{name} is required when full-universe capture is enabled");
             }
+        }
+        if !is_git_sha(&self.baseline_sha) {
+            bail!("rug_reality_capture.baseline_sha must be a full 40-character Git SHA");
+        }
+        if !is_git_sha(&self.implementation_sha) {
+            bail!("rug_reality_capture.implementation_sha must be a full 40-character Git SHA");
+        }
+        if self.code_hash != format!("git:{}", self.implementation_sha) {
+            bail!(
+                "rug_reality_capture.code_hash must equal git:<rug_reality_capture.implementation_sha>"
+            );
         }
         if self.cost_profile.entry_compute_unit_limit == 0
             || self.cost_profile.exit_compute_unit_limit == 0
@@ -136,6 +172,10 @@ impl RugRealityCaptureConfigV1 {
     }
 }
 
+fn is_git_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Immutable run-level authority and cost receipt written once at capture
 /// startup. It is intentionally not emitted per trade and cannot substitute
 /// fixture evidence for the runtime fee registry.
@@ -148,8 +188,19 @@ pub struct RugRealityCaptureRunManifestV1 {
     pub entry_route_id: String,
     pub exit_route_id: String,
     pub config_hash: String,
+    /// Frozen scientific parent (PR86), distinct from the implementation
+    /// source revision and from the hash of the executable binary.
+    #[serde(default)]
+    pub baseline_sha: String,
+    /// Frozen source revision of the ACE capture/probe implementation.
+    #[serde(default)]
+    pub implementation_sha: String,
     pub code_hash: String,
     pub binary_hash: String,
+    /// Immutable location reserved at startup for the single post-shutdown
+    /// health-evidence artifact.  It is not a registry or a runtime service.
+    #[serde(default)]
+    pub health_evidence_path: String,
     /// PR1E canonical-runtime authority epoch active for this one capture.
     /// A zero value decodes old manifests but is not valid input to the ACE
     /// probe, which requires one explicit authority epoch.
@@ -171,6 +222,31 @@ pub struct RugRealityCaptureRunManifestV1 {
     /// later RPC lookup for historical slots.
     #[serde(default)]
     pub pump_quote_authority: RugScalpPumpQuoteAuthorityV1,
+}
+
+/// One durable, manifest-bound result of the capture health check.
+///
+/// This is deliberately an offline evidence artifact: the launcher does not
+/// mutate it and the probe never opens a metrics endpoint.  The operator first
+/// captures start/end loopback snapshots, then this receipt is materialized
+/// after a controlled shutdown and consumed fail-closed by the probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RugRealityCaptureHealthEvidenceV1 {
+    pub schema_version: u16,
+    pub run_id: String,
+    pub manifest_sha256: String,
+    /// SHA-256 of the immutable pre-capture loopback metrics snapshot.
+    pub start_metrics_sha256: String,
+    /// SHA-256 of the immutable post-shutdown loopback metrics snapshot.
+    pub end_metrics_sha256: String,
+    pub pr1_runtime_bypass_attempt_total: u64,
+    pub pr1_runtime_candidate_admission_closed_total: u64,
+    pub pr1_runtime_primary_coverage_gap_total: u64,
+    pub event_writer_write_failure_count: u64,
+    pub event_writer_lock_failure_count: u64,
+    pub controlled_shutdown: bool,
+    pub event_files_cleanly_flushed: bool,
+    pub log_evidence_clean: bool,
 }
 
 pub fn write_rug_reality_capture_run_manifest_new(
@@ -229,6 +305,7 @@ mod tests {
                 retry_policy_id: "retry".to_string(),
                 ..RugRealityCostProfileV1::default()
             },
+            ..RugRealityCaptureConfigV1::default()
         };
         assert!(config.validate_enabled_contract().is_err());
     }

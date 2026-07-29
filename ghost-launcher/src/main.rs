@@ -1932,6 +1932,7 @@ async fn run_launcher() -> Result<()> {
                             | GhostEvent::PoolTransaction(_, None),
                         ) => {
                             ::metrics::counter!("pr1_runtime_bypass_attempt_total", 1u64);
+                            oracle_metrics::record_pr1_runtime_bypass_attempt();
                         }
                         _ => {}
                     }
@@ -2247,15 +2248,18 @@ async fn run_launcher() -> Result<()> {
             anyhow::anyhow!("RUG_REALITY_CAPTURE_TYPED_QUOTE_AUTHORITY_UNAVAILABLE")
         })?;
         let manifest = RugRealityCaptureRunManifestV1 {
-            schema_version: 2,
+            schema_version: 3,
             run_id: config.rug_reality_capture.run_id.clone(),
             observe_only: true,
-            signal_detector: "rug_scalp_signal_v2_rejected_overconstrained".to_string(),
+            signal_detector: "ace_core_one_day_probe_v3_observe_only".to_string(),
             entry_route_id: "buy_v2".to_string(),
             exit_route_id: "legacy_sell".to_string(),
             config_hash,
+            baseline_sha: config.rug_reality_capture.baseline_sha.clone(),
+            implementation_sha: config.rug_reality_capture.implementation_sha.clone(),
             code_hash: config.rug_reality_capture.code_hash.clone(),
             binary_hash,
+            health_evidence_path: config.rug_reality_capture.health_evidence_path.clone(),
             authority_epoch_id: pr1_authority_epoch.epoch_id,
             event_writer_run_id: config.rug_reality_capture.run_id.clone(),
             event_writer_optional_events_enabled: config.execution.events.enable_optional_events,
@@ -3420,6 +3424,13 @@ mod metrics_server_tests {
             response.contains("pool_identity_promotion_attempts_total"),
             "missing pool_identity_promotion_attempts_total"
         );
+        for required in [
+            "pr1_runtime_bypass_attempt_total",
+            "pr1_runtime_candidate_admission_closed_total",
+            "pr1_runtime_primary_coverage_gap_total",
+        ] {
+            assert!(response.contains(required), "missing {required}");
+        }
     }
 
     /// Non-metrics path must return 404.
