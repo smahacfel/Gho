@@ -4093,9 +4093,20 @@ fn pump_observation_classification_label(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntegritySignalFailureScopeV1 {
+    /// No canonical apply receipt exists. The implicated candidate remains
+    /// blocked, but an unrelated future candidate must not be invalidated.
+    NonCanonicalEvidence,
+    /// A receipt has been staged or the signal belongs to an active canonical
+    /// lifecycle. Missing required integrity evidence closes admission.
+    CanonicalLifecycle,
+}
+
 fn emit_pump_observation_decision(
     candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
     decision: &PumpObservationLedgerDecisionV1,
+    failure_scope: IntegritySignalFailureScopeV1,
 ) -> Result<(), CandidateIntegrityErrorV1> {
     ::metrics::counter!(
         "pump_observation_ledger_decisions_total",
@@ -4193,16 +4204,28 @@ fn emit_pump_observation_decision(
                 1u64,
                 "error" => error.to_string()
             );
-            error!(
-                candidate_pool = %signal.candidate.pool_amm_id,
-                candidate_mint = %signal.candidate.mint,
-                outcome = ?signal.outcome,
-                error = %error,
-                "Seer: CandidateIntegrity update failed; new-candidate admission closed"
-            );
-            candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
-                "candidate_integrity_signal_failed",
-            );
+            match failure_scope {
+                IntegritySignalFailureScopeV1::NonCanonicalEvidence => warn!(
+                    candidate_pool = %signal.candidate.pool_amm_id,
+                    candidate_mint = %signal.candidate.mint,
+                    outcome = ?signal.outcome,
+                    error = %error,
+                    "Seer: CandidateIntegrity non-canonical evidence failed; conflicting candidate remains blocked and global admission stays open"
+                ),
+                IntegritySignalFailureScopeV1::CanonicalLifecycle => {
+                    error!(
+                        candidate_pool = %signal.candidate.pool_amm_id,
+                        candidate_mint = %signal.candidate.mint,
+                        outcome = ?signal.outcome,
+                        error = %error,
+                        "Seer: CandidateIntegrity canonical-lifecycle update failed; new-candidate admission closed"
+                    );
+                    candidate_integrity_registry
+                        .close_candidate_admission_with_integrity_invalidation(
+                            "candidate_integrity_signal_failed",
+                        );
+                }
+            }
             Err(error)
         }
     }
@@ -4475,7 +4498,11 @@ pub(crate) fn ingest_pump_observation(
         .collect::<Vec<_>>();
     let Some(canonical) = result.observation_decision.canonical_mutation.as_ref() else {
         for decision in decisions.iter().copied() {
-            let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
+            let _ = emit_pump_observation_decision(
+                candidate_integrity_registry,
+                decision,
+                IntegritySignalFailureScopeV1::NonCanonicalEvidence,
+            );
         }
         if wrapper_primary_observation_mismatch {
             return CanonicalRuntimeAdmissionV1::Blocked(
@@ -4560,7 +4587,11 @@ pub(crate) fn ingest_pump_observation(
             .as_ref()
             .is_none_or(|signal| signal.outcome != ghost_core::CandidateIntegrityOutcomeV1::Ready)
     }) {
-        if let Err(error) = emit_pump_observation_decision(candidate_integrity_registry, decision) {
+        if let Err(error) = emit_pump_observation_decision(
+            candidate_integrity_registry,
+            decision,
+            IntegritySignalFailureScopeV1::CanonicalLifecycle,
+        ) {
             error!(
                 signature = %receipt.signature,
                 locator = ?receipt.locator,
@@ -4584,7 +4615,11 @@ pub(crate) fn ingest_pump_observation(
             .as_ref()
             .is_some_and(|signal| signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready)
     }) {
-        let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
+        let _ = emit_pump_observation_decision(
+            candidate_integrity_registry,
+            decision,
+            IntegritySignalFailureScopeV1::CanonicalLifecycle,
+        );
     }
     let ready_signals = decisions
         .iter()
@@ -4707,7 +4742,11 @@ fn finalize_pump_observation_ledger(
         }
     };
     for decision in &decisions {
-        let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
+        let _ = emit_pump_observation_decision(
+            candidate_integrity_registry,
+            decision,
+            IntegritySignalFailureScopeV1::CanonicalLifecycle,
+        );
     }
 }
 
@@ -7229,6 +7268,83 @@ mod tests {
                 .canonical_mutation_count,
             1,
             "the primary structural fact remains ledger evidence, but it cannot enter runtime"
+        );
+    }
+
+    #[test]
+    fn integrity_signal_alias_conflict_before_receipt_blocks_only_conflicting_candidate() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::new(
+            CandidateIntegrityRegistryLimitsV1 {
+                max_candidates: 4,
+                max_audit_markers_per_candidate: 4,
+                max_terminal_tombstones: 4,
+            },
+        ));
+        let pool = Pubkey::new_unique();
+        let existing = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint: Pubkey::new_unique(),
+        };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate: existing,
+                outcome: CandidateIntegrityOutcomeV1::Ready,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [0xA2; 32],
+            })
+            .expect("existing pool identity occupies the alias lane");
+
+        // The wrapper/observation mismatch yields non-canonical evidence for
+        // P/B. It collides with P/A before any receipt is staged. P/B is
+        // blocked, P/A is invalidated, and unrelated admissions stay open.
+        let admission = ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(
+                Signature::new_unique(),
+                pool,
+                Pubkey::new_unique(),
+                0,
+            )),
+            1,
+            false,
+            None,
+        );
+
+        assert!(matches!(
+            admission,
+            CanonicalRuntimeAdmissionV1::Blocked(
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+            )
+        ));
+        assert!(
+            registry.candidate_admission_open(),
+            "a conflict before a canonical receipt must not globally close admission"
+        );
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("no receipt was staged"),
+            (0, 0)
+        );
+        assert_eq!(
+            registry
+                .snapshot(existing)
+                .expect("existing alias remains auditable")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+        assert_eq!(
+            ledger
+                .lock()
+                .expect("non-canonical ledger fact")
+                .snapshot()
+                .canonical_mutation_count,
+            0,
+            "the failed non-canonical observation must issue no runtime evidence"
         );
     }
 
