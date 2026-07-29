@@ -4212,6 +4212,23 @@ fn emit_pump_observation_decision(
                     error = %error,
                     "Seer: CandidateIntegrity non-canonical evidence failed; conflicting candidate remains blocked and global admission stays open"
                 ),
+                // An alias conflict is terminal evidence for the implicated
+                // candidate, including when its receipt was already staged.
+                // `record_signal` has invalidated the conflicting identity;
+                // the caller blocks this mutation and reclaims its receipt.
+                // It is not a registry failure and must not invalidate
+                // unrelated future candidate admission.
+                IntegritySignalFailureScopeV1::CanonicalLifecycle
+                    if matches!(error, CandidateIntegrityErrorV1::CandidateAliasConflict) =>
+                {
+                    warn!(
+                        candidate_pool = %signal.candidate.pool_amm_id,
+                        candidate_mint = %signal.candidate.mint,
+                        outcome = ?signal.outcome,
+                        error = %error,
+                        "Seer: CandidateIntegrity canonical evidence alias conflict; candidate remains blocked, staged receipt is reclaimed, and global admission stays open"
+                    );
+                }
                 IntegritySignalFailureScopeV1::CanonicalLifecycle => {
                     error!(
                         candidate_pool = %signal.candidate.pool_amm_id,
@@ -4333,6 +4350,35 @@ fn fail_staged_canonical_runtime_admission(
         );
     }
     candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(reason);
+}
+
+/// An alias conflict is evidence-local even when it was discovered after the
+/// receipt fence was staged. The particular mutation is still blocked and its
+/// fence must be resolved. A failed reclamation, however, is a registry
+/// integrity failure and retains the global fail-closed transition.
+fn reclaim_staged_candidate_alias_conflict(
+    candidate_integrity_registry: &CandidateIntegrityRegistry,
+    receipt: &CanonicalMutationApplyReceiptV1,
+) {
+    match candidate_integrity_registry.fail_canonical_apply(receipt) {
+        Ok(()) | Err(CandidateIntegrityErrorV1::CandidateAliasConflict) => {
+            // `fail_canonical_apply` removes the receipt before recording its
+            // coverage-incomplete signal. That follow-up signal can observe
+            // the same established alias conflict and return this local
+            // error after the fence is already reclaimed.
+        }
+        Err(error) => {
+            error!(
+                signature = %receipt.signature,
+                locator = ?receipt.locator,
+                error = %error,
+                "Seer: staged canonical receipt could not be reclaimed after candidate-local alias conflict; new-candidate admission closed"
+            );
+            candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
+                "candidate_alias_conflict_receipt_reclaim_failed",
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4599,11 +4645,15 @@ pub(crate) fn ingest_pump_observation(
                 error = %error,
                 "Seer: required non-Ready integrity evidence failed after receipt staging; canonical runtime emission blocked"
             );
-            fail_staged_canonical_runtime_admission(
-                candidate_integrity_registry,
-                &receipt,
-                "candidate_integrity_signal_failed_after_receipt_stage",
-            );
+            if matches!(error, CandidateIntegrityErrorV1::CandidateAliasConflict) {
+                reclaim_staged_candidate_alias_conflict(candidate_integrity_registry, &receipt);
+            } else {
+                fail_staged_canonical_runtime_admission(
+                    candidate_integrity_registry,
+                    &receipt,
+                    "candidate_integrity_signal_failed_after_receipt_stage",
+                );
+            }
             return CanonicalRuntimeAdmissionV1::Blocked(
                 CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
             );
@@ -7190,7 +7240,7 @@ mod tests {
     }
 
     #[test]
-    fn integrity_signal_alias_conflict_after_receipt_stage_blocks_permit_and_reclaims_fence() {
+    fn integrity_signal_alias_conflict_after_receipt_stage_blocks_only_conflicting_candidate() {
         let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
         let registry = Arc::new(CandidateIntegrityRegistry::new(
             CandidateIntegrityRegistryLimitsV1 {
@@ -7245,7 +7295,10 @@ mod tests {
             admission.into_permit().is_none(),
             "the Event Bus bridge is reachable only from Apply; an integrity signal failure may issue zero permits"
         );
-        assert!(!registry.candidate_admission_open());
+        assert!(
+            registry.candidate_admission_open(),
+            "a candidate-local alias conflict after receipt staging must not globally close admission"
+        );
         assert_eq!(
             registry
                 .canonical_apply_fence_counts()
