@@ -144,6 +144,25 @@ class AceCaptureHealthTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertFalse(receipt.exists())
 
+    def test_empty_event_file_beside_valid_tape_does_not_fail_finalize(self) -> None:
+        _, manifest, receipt, events, start, end = self.make_fixture()
+        (events / "exec_launcher_empty_0000.jsonl").write_bytes(b"")
+
+        result = health.finalize(self.finalize_args(manifest, events, start, end, receipt))
+
+        self.assertEqual(result, 0)
+        self.assertTrue(receipt.exists())
+
+    def test_nonempty_event_file_without_final_newline_fails_without_receipt(self) -> None:
+        _, manifest, receipt, events, start, end = self.make_fixture()
+        tape = events / "exec_smoke_0000.jsonl"
+        tape.write_bytes(tape.read_bytes()[:-1])
+
+        result = health.finalize(self.finalize_args(manifest, events, start, end, receipt))
+
+        self.assertEqual(result, 2)
+        self.assertFalse(receipt.exists())
+
     def test_fee_authority_invalidation_marker_fails_logs(self) -> None:
         root, _, _, _, _, _ = self.make_fixture()
         log_path = root / "launcher.log"

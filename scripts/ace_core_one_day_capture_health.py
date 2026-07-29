@@ -155,6 +155,8 @@ def validate_event_files(root: Path) -> tuple[bool, list[str]]:
     probe_ready_pool_transaction_count = 0
     for path in files:
         raw = path.read_bytes()
+        if not raw:
+            continue
         if not raw.endswith(b"\n"):
             failures.append(f"{path}: final newline missing")
             continue
