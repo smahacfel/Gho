@@ -27,7 +27,9 @@ use ghost_core::{
 };
 use metrics::increment_counter;
 use once_cell::sync::Lazy;
-use prometheus::{HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts};
+use prometheus::{
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts,
+};
 use seer::{
     config::{
         ConnectionMode, FilterConfig, FundingLaneMode, ProgramStreamPayloadFormat,
@@ -122,7 +124,7 @@ struct OracleRuntimeIpcProfileMetrics {
     prune_items_total: IntCounterVec,
     recv_gap_with_backlog_us: HistogramVec,
     recv_gap_with_backlog_max_us: IntGaugeVec,
-    scheduling_lag_us: HistogramVec,
+    scheduling_lag_us: Histogram,
 }
 
 impl OracleRuntimeIpcProfileMetrics {
