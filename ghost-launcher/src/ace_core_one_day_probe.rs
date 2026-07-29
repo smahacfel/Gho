@@ -33,7 +33,7 @@ pub const ACE_CORE_BASELINE_SHA: &str = "43057b296663129ca9b4f572e793474830a5452
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const POOL_TRANSACTION_PAYLOAD_SCHEMA_V1: &str = "v1";
 const ACE_CORE_SIGNAL_DETECTOR: &str = "ace_core_one_day_probe_v3_observe_only";
-const ACE_CAPTURE_HEALTH_SCHEMA_VERSION: u16 = 1;
+const ACE_CAPTURE_HEALTH_SCHEMA_VERSION: u16 = 2;
 const CALIBRATION_BIRTHS: usize = 250;
 const CUTOFF_OFFSET_MS: u64 = 11_111;
 const FEATURE_WINDOW_MS: u64 = 8_000;
@@ -47,6 +47,11 @@ const PRIMARY_EXIT_LATENCY_MS: u64 = 250;
 const SUSTAIN_CONFIRM_AT_MS: u64 = 1_000;
 const MAX_STATE_LOOKUP_LAG_MS: u64 = 1_000;
 const OUTCOME_HORIZON_MS: u64 = 120_000;
+const SMOKE_MIN_DURATION_MS: u64 = 120_000;
+const SMOKE_MAX_DURATION_MS: u64 = 300_000;
+const DAY1_MIN_DURATION_MS: u64 = 86_400_000;
+const INGRESS_CUTOFF_CONTRACT: &str =
+    "event_ts_ms<=birth_ts_ms+11111 && arrival_ts_ms<=detected_wall_ts_ms+11111";
 
 const CALIBRATION_FILE: &str = "calibration_v1.json";
 const CANDIDATE_ROWS_FILE: &str = "candidate_rows_v1.jsonl";
@@ -124,6 +129,8 @@ pub struct AceCoreCandidateRowV3 {
     pub creator: String,
     pub birth_ts_ms: u64,
     pub cutoff_ts_ms: u64,
+    pub birth_ingress_ts_ms: Option<u64>,
+    pub ingress_cutoff_ts_ms: Option<u64>,
     pub x1_creator_buy_wallet_debit_share: Option<f64>,
     pub x2_new_buyer_intensity_log_ratio: Option<f64>,
     pub x3_first_buy_wallet_debit_lamports: Option<u64>,
@@ -156,6 +163,7 @@ pub struct AceCoreCalibrationV1 {
     pub source_baseline_sha: String,
     pub source_implementation_sha: String,
     pub source_code_hash: String,
+    pub decision_time_contract: String,
     pub medians: [f64; 5],
     pub iqrs: [f64; 5],
     pub score_weights: [f64; 5],
@@ -177,6 +185,12 @@ pub struct AceCoreMetricsV1 {
     pub selected_count: usize,
     pub rest_count: usize,
     pub evaluable_coverage_pct: f64,
+    pub selected_feature_count: usize,
+    pub rest_feature_count: usize,
+    pub selected_outcome_evaluable_count: usize,
+    pub rest_outcome_evaluable_count: usize,
+    pub selected_outcome_coverage_pct: f64,
+    pub rest_outcome_coverage_pct: f64,
     pub selected_mean: Option<f64>,
     pub rest_mean: Option<f64>,
     pub delta_mean: Option<f64>,
@@ -281,10 +295,22 @@ struct CanonicalTradeOrder {
 #[derive(Debug, Clone, Copy)]
 struct ReserveObservation {
     event_ts_ms: u64,
+    arrival_ts_ms: u64,
     slot: u64,
     order: Option<CanonicalTradeOrder>,
     ordinal: (usize, usize),
     reserves: PumpReserveState,
+}
+
+/// The ACE decision is only allowed to consume evidence that was both true on
+/// the chain before the event-time cutoff and actually delivered to the
+/// runtime before the corresponding ingress-time cutoff.  These timestamps
+/// deliberately remain separate: receive time is not canonical chain order,
+/// but it is authoritative for decision-time availability.
+#[derive(Debug, Clone, Copy)]
+struct DecisionCutoffs {
+    event_cutoff_ts_ms: u64,
+    ingress_cutoff_ts_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -659,10 +685,36 @@ fn validate_capture_health_evidence(
             reasons.insert("capture_health_evidence_manifest_hash_mismatch".to_string());
         }
     }
-    if receipt.start_metrics_sha256.trim().is_empty()
+    if receipt.start_snapshot_sha256.trim().is_empty()
+        || receipt.end_snapshot_sha256.trim().is_empty()
+        || receipt.start_metrics_sha256.trim().is_empty()
         || receipt.end_metrics_sha256.trim().is_empty()
     {
         reasons.insert("capture_health_metrics_snapshot_provenance_missing".to_string());
+    }
+    let duration_matches_timestamps = receipt
+        .end_captured_at_unix_ms
+        .checked_sub(receipt.start_captured_at_unix_ms)
+        .is_some_and(|duration| duration == receipt.duration_ms);
+    if receipt.start_captured_at_unix_ms == 0
+        || receipt.end_captured_at_unix_ms == 0
+        || !duration_matches_timestamps
+    {
+        reasons.insert("capture_health_snapshot_time_binding_invalid".to_string());
+    }
+    match receipt.capture_kind.as_str() {
+        "smoke"
+            if (SMOKE_MIN_DURATION_MS..=SMOKE_MAX_DURATION_MS).contains(&receipt.duration_ms) => {}
+        "smoke" => {
+            reasons.insert("capture_health_smoke_duration_out_of_range".to_string());
+        }
+        "day1" if receipt.duration_ms >= DAY1_MIN_DURATION_MS => {}
+        "day1" => {
+            reasons.insert("capture_health_day1_duration_too_short".to_string());
+        }
+        _ => {
+            reasons.insert("capture_health_capture_kind_invalid".to_string());
+        }
     }
     if receipt.pr1_runtime_bypass_attempt_total != 0 {
         reasons.insert("capture_health_pr1_runtime_bypass_attempt_nonzero".to_string());
@@ -1063,23 +1115,70 @@ fn strict_trade_index(
 }
 
 fn compare_candidate_work(left: &CandidateWork, right: &CandidateWork) -> std::cmp::Ordering {
-    compare_birth(&left.birth, &right.birth)
+    (
+        left.birth.payload.detected_wall_ts_ms.unwrap_or(u64::MAX),
+        left.birth.payload.birth_ts_ms,
+        left.birth.payload.event_slot.unwrap_or(u64::MAX),
+        left.birth.payload.signature.as_str(),
+        left.birth.candidate_id.as_str(),
+        left.birth.event_id.as_str(),
+        left.birth.file_ordinal,
+        left.birth.line_number,
+    )
+        .cmp(&(
+            right.birth.payload.detected_wall_ts_ms.unwrap_or(u64::MAX),
+            right.birth.payload.birth_ts_ms,
+            right.birth.payload.event_slot.unwrap_or(u64::MAX),
+            right.birth.payload.signature.as_str(),
+            right.birth.candidate_id.as_str(),
+            right.birth.event_id.as_str(),
+            right.birth.file_ordinal,
+            right.birth.line_number,
+        ))
 }
 
 fn is_successful_buy(payload: &PoolTransactionPayload) -> bool {
     payload.success && payload.is_buy && payload.side.eq_ignore_ascii_case("buy")
 }
 
+fn decision_cutoffs(birth: &TapeBirth) -> std::result::Result<DecisionCutoffs, String> {
+    let birth_ingress_ts_ms = birth
+        .payload
+        .detected_wall_ts_ms
+        .filter(|timestamp| *timestamp > 0)
+        .ok_or_else(|| "birth_detected_wall_timestamp_missing".to_string())?;
+    Ok(DecisionCutoffs {
+        event_cutoff_ts_ms: birth.payload.birth_ts_ms.saturating_add(CUTOFF_OFFSET_MS),
+        ingress_cutoff_ts_ms: birth_ingress_ts_ms.saturating_add(CUTOFF_OFFSET_MS),
+    })
+}
+
+fn is_available_at_decision(
+    event_ts_ms: u64,
+    arrival_ts_ms: u64,
+    cutoffs: DecisionCutoffs,
+) -> bool {
+    arrival_ts_ms > 0
+        && event_ts_ms <= cutoffs.event_cutoff_ts_ms
+        && arrival_ts_ms <= cutoffs.ingress_cutoff_ts_ms
+}
+
 fn feature_buy_debit(
     trade: &TapeTrade,
     birth_ts_ms: u64,
-    cutoff_ts_ms: u64,
+    cutoffs: DecisionCutoffs,
 ) -> std::result::Result<Option<(CanonicalTradeOrder, String, u64)>, String> {
     let payload = &trade.payload;
-    if payload.event_ts_ms < birth_ts_ms || payload.event_ts_ms > cutoff_ts_ms {
+    if payload.event_ts_ms < birth_ts_ms || payload.event_ts_ms > cutoffs.event_cutoff_ts_ms {
         return Ok(None);
     }
     if !is_successful_buy(payload) {
+        return Ok(None);
+    }
+    if payload.arrival_ts_ms == 0 {
+        return Err("successful_buy_arrival_timestamp_missing".to_string());
+    }
+    if !is_available_at_decision(payload.event_ts_ms, payload.arrival_ts_ms, cutoffs) {
         return Ok(None);
     }
     if payload.is_synthetic != Some(false) {
@@ -1113,11 +1212,12 @@ fn calculate_features(
 ) -> std::result::Result<FeatureValues, String> {
     let creator = non_empty(&birth.payload.creator)
         .ok_or_else(|| "birth_creator_identity_missing".to_string())?;
-    let cutoff_ts_ms = birth.payload.birth_ts_ms.saturating_add(CUTOFF_OFFSET_MS);
+    let cutoffs = decision_cutoffs(birth)?;
+    let cutoff_ts_ms = cutoffs.event_cutoff_ts_ms;
     let mut buys = Vec::new();
     for trade in trades {
         if let Some((order, wallet, debit)) =
-            feature_buy_debit(trade, birth.payload.birth_ts_ms, cutoff_ts_ms)?
+            feature_buy_debit(trade, birth.payload.birth_ts_ms, cutoffs)?
         {
             buys.push((
                 trade.payload.event_ts_ms,
@@ -1322,6 +1422,7 @@ fn create_day1_calibration(
             source_baseline_sha: ACE_CORE_BASELINE_SHA.to_string(),
             source_implementation_sha: manifest.implementation_sha.clone(),
             source_code_hash: manifest.code_hash.clone(),
+            decision_time_contract: INGRESS_CUTOFF_CONTRACT.to_string(),
             medians,
             iqrs,
             score_weights,
@@ -1394,6 +1495,7 @@ fn validate_day2_calibration(
         || calibration.source_baseline_sha != ACE_CORE_BASELINE_SHA
         || calibration.source_implementation_sha != manifest.implementation_sha
         || calibration.source_code_hash != manifest.code_hash
+        || calibration.decision_time_contract != INGRESS_CUTOFF_CONTRACT
         || calibration.source_run_id.trim().is_empty()
         || calibration.source_run_id == manifest.run_id
         || calibration.cutoff_offset_ms != CUTOFF_OFFSET_MS
@@ -1437,6 +1539,13 @@ fn base_row(
             .payload
             .birth_ts_ms
             .saturating_add(CUTOFF_OFFSET_MS),
+        birth_ingress_ts_ms: work.birth.payload.detected_wall_ts_ms,
+        ingress_cutoff_ts_ms: work
+            .birth
+            .payload
+            .detected_wall_ts_ms
+            .filter(|timestamp| *timestamp > 0)
+            .map(|timestamp| timestamp.saturating_add(CUTOFF_OFFSET_MS)),
         x1_creator_buy_wallet_debit_share: None,
         x2_new_buyer_intensity_log_ratio: None,
         x3_first_buy_wallet_debit_lamports: None,
@@ -1555,6 +1664,7 @@ fn reserve_observation(trade: &TapeTrade) -> Option<ReserveObservation> {
     }
     Some(ReserveObservation {
         event_ts_ms: payload.event_ts_ms,
+        arrival_ts_ms: payload.arrival_ts_ms,
         slot: canonical_slot(payload)?,
         order: canonical_trade_order(payload),
         ordinal: (trade.file_ordinal, trade.line_number),
@@ -1622,11 +1732,9 @@ fn calculate_economic_outcome(
     x3_lamports: u64,
     quote_contract: &RugScalpPumpQuoteContractV1,
 ) -> std::result::Result<EconomicOutcome, EconomicFailure> {
-    let cutoff_ts_ms = work
-        .birth
-        .payload
-        .birth_ts_ms
-        .saturating_add(CUTOFF_OFFSET_MS);
+    let cutoffs = decision_cutoffs(&work.birth)
+        .map_err(|_| EconomicFailure::Reserves("birth_detected_wall_timestamp_missing"))?;
+    let cutoff_ts_ms = cutoffs.event_cutoff_ts_ms;
     let mut states = work
         .trades
         .iter()
@@ -1637,6 +1745,7 @@ fn calculate_economic_outcome(
     let entry_state = states
         .iter()
         .filter(|state| state.event_ts_ms <= cutoff_ts_ms)
+        .filter(|state| is_available_at_decision(state.event_ts_ms, state.arrival_ts_ms, cutoffs))
         .filter(|state| cutoff_ts_ms.saturating_sub(state.event_ts_ms) <= ENTRY_STATE_MAX_AGE_MS)
         .max_by(|left, right| compare_reserve_observation(left, right))
         .copied()
@@ -1787,6 +1896,11 @@ fn calculate_economic_outcome(
 }
 
 fn metrics_from_rows(rows: &[AceCoreCandidateRowV3]) -> AceCoreMetricsV1 {
+    let selected_feature_count = rows.iter().filter(|row| row.selected == Some(true)).count();
+    let rest_feature_count = rows
+        .iter()
+        .filter(|row| row.selected == Some(false))
+        .count();
     let selected = rows
         .iter()
         .filter(|row| row.status == AceCandidateStatusV3::EvaluableSelected)
@@ -1833,6 +1947,12 @@ fn metrics_from_rows(rows: &[AceCoreCandidateRowV3]) -> AceCoreMetricsV1 {
         } else {
             (selected_count.saturating_add(rest_count) as f64 / rows.len() as f64) * 100.0
         },
+        selected_feature_count,
+        rest_feature_count,
+        selected_outcome_evaluable_count: selected_count,
+        rest_outcome_evaluable_count: rest_count,
+        selected_outcome_coverage_pct: coverage_pct(selected_count, selected_feature_count),
+        rest_outcome_coverage_pct: coverage_pct(rest_count, rest_feature_count),
         delta_mean: selected_mean
             .zip(rest_mean)
             .map(|(left, right)| left - right),
@@ -1848,6 +1968,14 @@ fn metrics_from_rows(rows: &[AceCoreCandidateRowV3]) -> AceCoreMetricsV1 {
         rest_median,
         selected_sustained_net17_hit_rate: selected_hit_rate,
         rest_sustained_net17_hit_rate: rest_hit_rate,
+    }
+}
+
+fn coverage_pct(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        (numerator as f64 / denominator as f64) * 100.0
     }
 }
 
@@ -1895,7 +2023,8 @@ fn pooled_is_promising(metrics: &AceCoreMetricsV1, minimum_selected_count: usize
         && metrics.delta_median.is_some_and(|value| value > 0.0)
         && metrics.selected_mean.is_some_and(|value| value > 0.0)
         && metrics.selected_count >= minimum_selected_count
-        && metrics.evaluable_coverage_pct >= 50.0
+        && metrics.selected_outcome_coverage_pct >= 50.0
+        && metrics.rest_outcome_coverage_pct >= 50.0
 }
 
 fn day_is_negative(metrics: &AceCoreMetricsV1) -> bool {
@@ -2220,8 +2349,14 @@ mod tests {
             schema_version: ACE_CAPTURE_HEALTH_SCHEMA_VERSION,
             run_id: manifest.run_id.clone(),
             manifest_sha256: sha256_hex(&fs::read(manifest_path).expect("manifest bytes")),
+            capture_kind: "smoke".to_string(),
+            start_snapshot_sha256: "start-snapshot".to_string(),
+            end_snapshot_sha256: "end-snapshot".to_string(),
             start_metrics_sha256: "start-metrics".to_string(),
             end_metrics_sha256: "end-metrics".to_string(),
+            start_captured_at_unix_ms: 1_000,
+            end_captured_at_unix_ms: 121_000,
+            duration_ms: 120_000,
             pr1_runtime_bypass_attempt_total: 0,
             pr1_runtime_candidate_admission_closed_total: 0,
             pr1_runtime_primary_coverage_gap_total: 0,
@@ -2336,6 +2471,56 @@ mod tests {
     }
 
     #[test]
+    fn pre_cutoff_trade_arriving_after_ingress_cutoff_cannot_change_features() {
+        let birth = test_birth("candidate", 1_000);
+        let mut trades = feature_trades(birth.payload.birth_ts_ms, 1);
+        let expected = calculate_features(&birth, &trades).expect("feature evidence");
+        let event_cutoff = birth.payload.birth_ts_ms + CUTOFF_OFFSET_MS;
+        let ingress_cutoff = birth
+            .payload
+            .detected_wall_ts_ms
+            .expect("fixture ingress timestamp")
+            + CUTOFF_OFFSET_MS;
+        let mut delayed = test_trade(event_cutoff - 500, "late-arrival-wallet", 99, u64::MAX / 2);
+        delayed.payload.arrival_ts_ms = ingress_cutoff + 1;
+        trades.push(delayed);
+        assert_eq!(calculate_features(&birth, &trades).unwrap(), expected);
+    }
+
+    #[test]
+    fn missing_birth_ingress_timestamp_is_non_evaluable_features() {
+        let mut birth = test_birth("candidate", 1_000);
+        birth.payload.detected_wall_ts_ms = None;
+        let trades = feature_trades(birth.payload.birth_ts_ms, 1);
+        assert_eq!(
+            calculate_features(&birth, &trades),
+            Err("birth_detected_wall_timestamp_missing".to_string())
+        );
+    }
+
+    #[test]
+    fn calibration_order_uses_detected_wall_time_before_chain_birth_time() {
+        let later_chain_earlier_ingress = CandidateWork {
+            birth: test_birth("first-seen", 2_000),
+            trades: Vec::new(),
+            feature_result: Err("fixture".to_string()),
+        };
+        let mut earlier_chain_later_ingress = CandidateWork {
+            birth: test_birth("later-seen", 1_000),
+            trades: Vec::new(),
+            feature_result: Err("fixture".to_string()),
+        };
+        earlier_chain_later_ingress
+            .birth
+            .payload
+            .detected_wall_ts_ms = Some(3_000);
+        assert_eq!(
+            compare_candidate_work(&later_chain_earlier_ingress, &earlier_chain_later_ingress),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
     fn same_signature_multi_mutation_is_not_deduplicated_by_signature_alone() {
         let mut first = test_trade(1_000, "wallet-0", 1, 1);
         first.payload.signature = "same-signature".to_string();
@@ -2379,6 +2564,27 @@ mod tests {
             calculate_economic_outcome(&work, 10_000_000_000, &contract),
             Err(EconomicFailure::Reserves("entry_state_missing_or_stale"))
         ));
+    }
+
+    #[test]
+    fn pre_cutoff_reserve_arriving_after_ingress_cutoff_cannot_be_entry_state() {
+        let mut work = economic_work(false, false);
+        let cutoff = work.birth.payload.birth_ts_ms + CUTOFF_OFFSET_MS;
+        let ingress_cutoff = work
+            .birth
+            .payload
+            .detected_wall_ts_ms
+            .expect("fixture ingress timestamp")
+            + CUTOFF_OFFSET_MS;
+        let mut delayed = test_trade(cutoff, "late-entry-wallet", 99, 10_000_000);
+        delayed.payload.arrival_ts_ms = ingress_cutoff + 1;
+        set_reserves(&mut delayed, 500_000_000_000, 500_000_000_000);
+        let delayed_slot = delayed.payload.slot.expect("fixture slot");
+        work.trades.push(delayed);
+        let contract = quote_authority().materialize().expect("quote contract");
+        let outcome = calculate_economic_outcome(&work, 10_000_000_000, &contract)
+            .expect("legal sustained outcome");
+        assert_ne!(outcome.entry_state_slot, delayed_slot);
     }
 
     #[test]
@@ -2523,6 +2729,70 @@ mod tests {
     }
 
     #[test]
+    fn summary_reports_outcome_coverage_separately_for_selected_and_rest() {
+        let work = feature_work(1);
+        let mut selected_evaluable = base_row(&work, AceCandidateStatusV3::EvaluableSelected, None);
+        selected_evaluable.selected = Some(true);
+        selected_evaluable.best_sustained_proxy_net_return_120s = Some(0.2);
+        selected_evaluable.sustained_net17_hit = Some(true);
+
+        let mut selected_missing = base_row(
+            &work,
+            AceCandidateStatusV3::NonEvaluableSustainCoverage,
+            Some("no_pair".to_string()),
+        );
+        selected_missing.selected = Some(true);
+
+        let mut rest_evaluable = base_row(&work, AceCandidateStatusV3::EvaluableRest, None);
+        rest_evaluable.selected = Some(false);
+        rest_evaluable.best_sustained_proxy_net_return_120s = Some(-0.1);
+        rest_evaluable.sustained_net17_hit = Some(false);
+
+        let mut rest_missing = base_row(
+            &work,
+            AceCandidateStatusV3::NonEvaluableSustainCoverage,
+            Some("no_pair".to_string()),
+        );
+        rest_missing.selected = Some(false);
+
+        let metrics = metrics_from_rows(&[
+            selected_evaluable,
+            selected_missing,
+            rest_evaluable,
+            rest_missing,
+        ]);
+        assert_eq!(metrics.selected_feature_count, 2);
+        assert_eq!(metrics.rest_feature_count, 2);
+        assert_eq!(metrics.selected_outcome_evaluable_count, 1);
+        assert_eq!(metrics.rest_outcome_evaluable_count, 1);
+        assert_eq!(metrics.selected_outcome_coverage_pct, 50.0);
+        assert_eq!(metrics.rest_outcome_coverage_pct, 50.0);
+    }
+
+    #[test]
+    fn promising_requires_outcome_coverage_in_both_cohorts() {
+        let insufficient_rest_coverage = AceCoreMetricsV1 {
+            selected_count: 50,
+            rest_count: 50,
+            selected_mean: Some(0.1),
+            rest_mean: Some(0.0),
+            delta_mean: Some(0.1),
+            selected_median: Some(0.1),
+            rest_median: Some(0.0),
+            delta_median: Some(0.1),
+            selected_outcome_coverage_pct: 50.0,
+            rest_outcome_coverage_pct: 49.0,
+            ..AceCoreMetricsV1::default()
+        };
+        assert!(!pooled_is_promising(&insufficient_rest_coverage, 50));
+        let both_cohorts_covered = AceCoreMetricsV1 {
+            rest_outcome_coverage_pct: 50.0,
+            ..insufficient_rest_coverage
+        };
+        assert!(pooled_is_promising(&both_cohorts_covered, 50));
+    }
+
+    #[test]
     fn day2_rejects_missing_or_mismatched_calibration() {
         let args = AceCoreOneDayProbeArgs {
             events_dir: PathBuf::from("events"),
@@ -2575,6 +2845,35 @@ mod tests {
         assert!(
             validate_capture_health_evidence(&manifest_path, &capture_manifest)
                 .contains("capture_health_pr1_runtime_bypass_attempt_nonzero")
+        );
+    }
+
+    #[test]
+    fn capture_health_evidence_requires_manifest_bound_duration_contract() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = temp.path().join("manifest.json");
+        let mut capture_manifest = manifest("health-duration-run");
+        capture_manifest.health_evidence_path = temp
+            .path()
+            .join("health.json")
+            .to_string_lossy()
+            .into_owned();
+        write_json_new(&manifest_path, &capture_manifest).expect("manifest");
+        write_valid_health_evidence(&manifest_path, &capture_manifest);
+
+        let health_path = Path::new(&capture_manifest.health_evidence_path);
+        let mut receipt: RugRealityCaptureHealthEvidenceV1 =
+            serde_json::from_slice(&fs::read(health_path).expect("health bytes"))
+                .expect("health receipt");
+        receipt.duration_ms = SMOKE_MIN_DURATION_MS - 1;
+        receipt.end_captured_at_unix_ms = receipt
+            .start_captured_at_unix_ms
+            .saturating_add(receipt.duration_ms);
+        fs::remove_file(health_path).expect("remove fixture health receipt");
+        write_json_new(health_path, &receipt).expect("rewrite health receipt");
+        assert!(
+            validate_capture_health_evidence(&manifest_path, &capture_manifest)
+                .contains("capture_health_smoke_duration_out_of_range")
         );
     }
 

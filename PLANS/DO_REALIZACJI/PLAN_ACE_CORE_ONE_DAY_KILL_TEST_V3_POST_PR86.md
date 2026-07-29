@@ -373,11 +373,22 @@ Wszystkie ścieżki, `run_id`, manifest path i output directory muszą być nowe
 ### 3.5. Minimalny receipt health capture
 
 `scripts/ace_core_one_day_capture_health.py` jest narzędziem operatorowym,
-nie komponentem runtime. Dwa razy zapisuje surowy scrape loopback Prometheus
-z capture process, a po kontrolowanym shutdownie zapisuje jeden immutable
-receipt pod `rug_reality_capture.health_evidence_path`.
+nie komponentem runtime. Dwa razy zapisuje immutable, manifest-bound
+snapshot loopback Prometheus z capture process, a po kontrolowanym shutdownie
+zapisuje jeden receipt pod `rug_reality_capture.health_evidence_path`.
 
-Receipt wiąże SHA-256 manifestu, run ID, hash obu scrape'ów i wartości:
+Każdy snapshot zawiera `run_id`, SHA-256 manifestu, `phase = start|end`,
+`capture_kind = smoke|day1`, czas scrape oraz SHA-256 surowego body
+Prometheusa. `finalize` wymaga zgodności obu snapshotów z manifestem i ze
+sobą, rosnącego czasu oraz czasu trwania:
+
+```text
+smoke: 120_000 ms <= duration <= 300_000 ms
+day1:  duration >= 86_400_000 ms
+```
+
+Receipt schema v2 wiąże te identity, hash obu snapshotów, hash obu surowych
+body scrape i wartości:
 
 ```text
 pr1_runtime_bypass_attempt_total
@@ -390,9 +401,15 @@ event_files_cleanly_flushed
 log_evidence_clean
 ```
 
-Każdy counter musi wynosić zero, a trzy końcowe flagi muszą być true. Probe
+Każdy counter musi wynosić zero, a trzy końcowe flagi muszą być true.
+`finalize` przy jakimkolwiek failure kończy się kodem `2` **przed** zapisem
+receiptu; nie pozostawia artefaktu, który mógłby wyglądać jak zdrowy. Probe
 czyta receipt offline i fail-closed oznacza cały dzień `INVALID_CAPTURE` przy
-braku, błędnym run ID, hash mismatch manifestu albo dowolnym negatywnym fakcie.
+braku, błędnym run ID, hash mismatch manifestu, błędnym czasie/duration albo
+dowolnym negatywnym fakcie.
+
+Log gate blokuje także runtime fee-authority invalidation i controlled
+shutdown request oraz niekontrolowane błędy OracleRuntime/component shutdown.
 
 ---
 
@@ -488,31 +505,42 @@ files.
 
 ## 6. Cutoff-safety
 
-Dla każdego birth:
+Dla każdego birth istnieją dwie niezależne granice czasu:
 
 ```text
-cutoff_ts_ms = birth_ts_ms + 11_111
+decision_event_cutoff_ms   = birth_ts_ms + 11_111
+birth_ingress_ms           = detected_wall_ts_ms
+decision_ingress_cutoff_ms = birth_ingress_ms + 11_111
 ```
 
-Do cech wchodzą wyłącznie successful BUY rows:
+`detected_wall_ts_ms` musi istnieć i być dodatni; w przeciwnym razie birth
+jest `NON_EVALUABLE_FEATURES`. Do cech wchodzą wyłącznie successful BUY rows,
+które spełniają **oba** warunki:
 
 ```text
-event_ts_ms <= cutoff_ts_ms
+event_ts_ms   <= decision_event_cutoff_ms
+arrival_ts_ms <= decision_ingress_cutoff_ms
 ```
 
-Post-cutoff state jest outcome-only.
+W ten sposób chain event odnotowany przed cutoffem, lecz dostarczony runtime
+po granicy decyzji, nie tworzy lookahead. Brak dodatniego `arrival_ts_ms` dla
+successful BUY jest `NON_EVALUABLE_FEATURES`; nie ma fallbacku do timestampu
+chain eventu.
+
+Post-cutoff state jest outcome-only. Do outcome nie jest przenoszona bramka
+ingress: jest to obserwowana, późniejsza ścieżka po decyzji.
 
 Entry state dla proxy:
 
 ```text
-ostatni complete=false full-reserve state
-nie późniejszy niż cutoff
+ostatni successful, non-synthetic, complete=false full-reserve state,
+który spełnia oba decision cutoffs
 ```
 
 Dodatkowy warunek:
 
 ```text
-cutoff_ts_ms - entry_state.event_ts_ms <= 1_000 ms
+decision_event_cutoff_ms - entry_state.event_ts_ms <= 1_000 ms
 ```
 
 Brak świeżego entry state daje:
@@ -522,7 +550,8 @@ NON_EVALUABLE_RESERVES
 reason = entry_state_missing_or_stale
 ```
 
-Żaden późniejszy state nie może zostać użyty do rekonstrukcji cutoff features ani entry state.
+Żaden późniejszy ani spóźniony ingress state nie może zostać użyty do
+rekonstrukcji cutoff features ani entry state.
 
 ---
 
@@ -608,6 +637,7 @@ Cały feature row jest non-evaluable, gdy:
 - creator identity jest puste dla x1;
 - wallet identity jest puste;
 - pre/post signer balances są brakujące;
+- `detected_wall_ts_ms` birth albo `arrival_ts_ms` successful BUY jest brakujący;
 - BUY wallet debit jest niedodatni;
 - canonical order jest niekompletny;
 - brakuje pełnego okna 8 s;
@@ -633,6 +663,11 @@ CALIBRATION_EXCLUDED
 ```
 
 i nie wchodzą do finalnych średnich ani median.
+
+Kolejność kalibracji jest deterministycznie przede wszystkim kolejnością
+faktycznego zobaczenia birthów (`detected_wall_ts_ms`), następnie istniejącym
+canonical tie-breakiem; nie jest ustalana wyłącznie przez chain birth
+timestamp.
 
 Dla każdej cechy:
 
@@ -835,7 +870,9 @@ Migracja (`complete == true`) nie jest wyceniana przez Pump curve route i nie tw
   "bonding_curve": "...",
   "creator": "...",
   "birth_ts_ms": 0,
+  "birth_ingress_ts_ms": 0,
   "cutoff_ts_ms": 0,
+  "ingress_cutoff_ts_ms": 0,
 
   "x1_creator_buy_wallet_debit_share": 0.0,
   "x2_new_buyer_intensity_log_ratio": 0.0,
@@ -921,7 +958,8 @@ DELTA_MEAN > 0
 DELTA_MEDIAN > 0
 selected_mean > 0
 selected_count >= 50
-evaluable_coverage_pct >= 50%
+selected_outcome_coverage_pct >= 50%
+rest_outcome_coverage_pct >= 50%
 ```
 
 STOP. Strategia przeżyła tani filtr.
@@ -977,7 +1015,8 @@ pooled DELTA_MEAN > 0
 pooled DELTA_MEDIAN > 0
 pooled selected_mean > 0
 pooled selected_count >= 100
-pooled evaluable_coverage_pct >= 50%
+pooled selected_outcome_coverage_pct >= 50%
+pooled rest_outcome_coverage_pct >= 50%
 ```
 
 ### `ACE_PROBE_INCONCLUSIVE`
@@ -1005,6 +1044,12 @@ birth_count
 calibration_excluded_count
 selected_count
 rest_count
+selected_feature_count
+rest_feature_count
+selected_outcome_evaluable_count
+rest_outcome_evaluable_count
+selected_outcome_coverage_pct
+rest_outcome_coverage_pct
 non_evaluable_count_by_reason
 evaluable_coverage_pct
 
@@ -1054,6 +1099,13 @@ Wymagane są wyłącznie testy chroniące wynik:
 23. Manifest wymaga oddzielnych baseline/implementation/code/binary provenance.
 24. Loopback `/metrics` eksponuje trzy wymagane liczniki PR1.
 25. Brak, mismatch manifestu albo niezerowy fact w health receipt unieważnia capture.
+26. Pre-cutoff trade dostarczony po ingress cutoffie nie zmienia żadnej z x1–x5.
+27. Pre-cutoff reserve state dostarczony po ingress cutoffie nie może być entry state.
+28. Brak `detected_wall_ts_ms` birth albo `arrival_ts_ms` successful BUY jest fail-closed non-evaluable.
+29. Health receipt wymaga manifest-bound start/end snapshotów, poprawnej fazy, czasu i duration; failed finalize nie zapisuje receiptu.
+30. Runtime fee-authority invalidation i niekontrolowane Oracle/component shutdown markers unieważniają health finalize.
+31. Summary raportuje feature i outcome coverage osobno dla SELECTED oraz REST; promising wymaga co najmniej 50% w obu kohortach.
+32. Smoke uruchamia właściwy offline probe; kwalifikacja wymaga `capture_status = VALID_CAPTURE` i pustego `capture_invalid_reasons`.
 
 Nie uruchamiamy szerokiej kampanii CI ani review produkcyjnego jako warunku tego eksperymentu. Wystarczą focused tests, `cargo fmt`, build probe binary i jeden krótki fixture smoke.
 
@@ -1068,6 +1120,7 @@ cargo fmt --all --check
 cargo test -p ghost-launcher ace_core_one_day_probe --lib -- --nocapture
 cargo test -p ghost-launcher oracle_metrics --lib -- --nocapture
 cargo test -p ghost-launcher metrics_server_tests --bin ghost-launcher -- --nocapture
+python3 scripts/test_ace_core_one_day_capture_health.py
 cargo build --release -p ghost-launcher --bin ghost-launcher --bin ace_core_one_day_probe
 ```
 
@@ -1079,7 +1132,10 @@ Najpierw należy uruchomić oddzielny smoke z nowym run ID oraz nowymi
 ```bash
 python3 scripts/ace_core_one_day_capture_health.py snapshot \
   --metrics-url http://127.0.0.1:19090/metrics \
-  --output <SMOKE_DIR>/metrics_start.prom
+  --manifest <SMOKE_MANIFEST> \
+  --phase start \
+  --capture-kind smoke \
+  --output <SMOKE_DIR>/metrics_start.json
 ```
 
 Bezpośrednio przed kontrolowanym SIGINT, gdy endpoint nadal działa:
@@ -1087,7 +1143,10 @@ Bezpośrednio przed kontrolowanym SIGINT, gdy endpoint nadal działa:
 ```bash
 python3 scripts/ace_core_one_day_capture_health.py snapshot \
   --metrics-url http://127.0.0.1:19090/metrics \
-  --output <SMOKE_DIR>/metrics_end.prom
+  --manifest <SMOKE_MANIFEST> \
+  --phase end \
+  --capture-kind smoke \
+  --output <SMOKE_DIR>/metrics_end.json
 ```
 
 Po kontrolowanym SIGINT i pełnym flushu processu:
@@ -1096,23 +1155,41 @@ Po kontrolowanym SIGINT i pełnym flushu processu:
 python3 scripts/ace_core_one_day_capture_health.py finalize \
   --manifest <SMOKE_MANIFEST> \
   --events-dir <SMOKE_EVENTS_DIR> \
-  --start-metrics <SMOKE_DIR>/metrics_start.prom \
-  --end-metrics <SMOKE_DIR>/metrics_end.prom \
+  --start-metrics <SMOKE_DIR>/metrics_start.json \
+  --end-metrics <SMOKE_DIR>/metrics_end.json \
+  --capture-kind smoke \
   --log <SMOKE_DIR>/system.log \
   --log <SMOKE_DIR>/oracle.log \
   --output <SMOKE_HEALTH_RECEIPT>
 ```
 
-Smoke jest pozytywny wyłącznie, gdy receipt zostanie zapisany z kodem 0,
-pliki `exec_*.jsonl` rosną, zawierają births i `PoolTransaction` z balances,
-`is_synthetic=false`, pełnym order key i pełnymi reserves. Nie wolno użyć
+Po receipt z kodem 0 smoke musi uruchomić ten sam offline probe, który będzie
+użyty po Dniu 1:
+
+```bash
+./target/release/ace_core_one_day_probe \
+  --events-dir <SMOKE_EVENTS_DIR> \
+  --manifest <SMOKE_MANIFEST> \
+  --output-dir <SMOKE_PROBE_DIR> \
+  --day-id day1
+
+python3 scripts/ace_core_one_day_capture_health.py verify-probe \
+  --summary <SMOKE_PROBE_DIR>/summary_v1.json
+```
+
+Smoke kwalifikuje do Dnia 1 wyłącznie, gdy `finalize` zapisze receipt z kodem
+0, `verify-probe` zwróci 0 (`capture_status = VALID_CAPTURE` i puste
+`capture_invalid_reasons`), a pliki `exec_*.jsonl` zawierają wymagane birth i
+`PoolTransaction` z balances, `is_synthetic=false`, pełnym order key i
+pełnymi reserves. Mała liczba birthów może dać `ACE_PROBE_INCONCLUSIVE`; nie
+jest to błąd smoke, o ile integrity status jest prawidłowy. Nie wolno użyć
 artefaktów smoke jako Dnia 1.
 
 ### 17.3. Capture Dnia 1
 
-Przed uruchomieniem trzeba zastąpić w configu `implementation_sha` i
-`code_hash` pełnym SHA zamrożonego commitu implementacji. Placeholder jest
-celowo odrzucany przez preflight.
+Przed uruchomieniem `implementation_sha` i `code_hash` configu muszą wskazywać
+pełny SHA zamrożonego commitu implementacji, a nie baseline naukowy PR #86.
+Preflight odrzuca mismatch albo placeholder.
 
 ```bash
 ./target/release/ghost-launcher \
@@ -1124,7 +1201,10 @@ Po starcie i widoczności `/metrics` należy zapisać pierwszy snapshot:
 ```bash
 python3 scripts/ace_core_one_day_capture_health.py snapshot \
   --metrics-url http://127.0.0.1:19090/metrics \
-  --output <DAY1_DIR>/metrics_start.prom
+  --manifest <DAY1_MANIFEST> \
+  --phase start \
+  --capture-kind day1 \
+  --output <DAY1_DIR>/metrics_start.json
 ```
 
 Bezpośrednio przed kontrolowanym zakończeniem capture, gdy endpoint nadal
@@ -1133,7 +1213,10 @@ działa:
 ```bash
 python3 scripts/ace_core_one_day_capture_health.py snapshot \
   --metrics-url http://127.0.0.1:19090/metrics \
-  --output <DAY1_DIR>/metrics_end.prom
+  --manifest <DAY1_MANIFEST> \
+  --phase end \
+  --capture-kind day1 \
+  --output <DAY1_DIR>/metrics_end.json
 ```
 
 Po kontrolowanym SIGINT i pełnym flushu:
@@ -1142,8 +1225,9 @@ Po kontrolowanym SIGINT i pełnym flushu:
 python3 scripts/ace_core_one_day_capture_health.py finalize \
   --manifest <DAY1_MANIFEST> \
   --events-dir <DAY1_EVENTS_DIR> \
-  --start-metrics <DAY1_DIR>/metrics_start.prom \
-  --end-metrics <DAY1_DIR>/metrics_end.prom \
+  --start-metrics <DAY1_DIR>/metrics_start.json \
+  --end-metrics <DAY1_DIR>/metrics_end.json \
+  --capture-kind day1 \
   --log <DAY1_DIR>/system.log \
   --log <DAY1_DIR>/oracle.log \
   --output <DAY1_HEALTH_RECEIPT>
@@ -1157,6 +1241,9 @@ Tylko po `finalize` z kodem 0:
   --manifest <DAY1_MANIFEST> \
   --output-dir <DAY1_PROBE_DIR> \
   --day-id day1
+
+python3 scripts/ace_core_one_day_capture_health.py verify-probe \
+  --summary <DAY1_PROBE_DIR>/summary_v1.json
 ```
 
 ### 17.4. Dzień 2, tylko jeżeli wymagany

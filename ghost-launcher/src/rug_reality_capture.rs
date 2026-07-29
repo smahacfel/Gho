@@ -228,17 +228,29 @@ pub struct RugRealityCaptureRunManifestV1 {
 ///
 /// This is deliberately an offline evidence artifact: the launcher does not
 /// mutate it and the probe never opens a metrics endpoint.  The operator first
-/// captures start/end loopback snapshots, then this receipt is materialized
-/// after a controlled shutdown and consumed fail-closed by the probe.
+/// captures manifest-bound start/end loopback snapshots, then this receipt is
+/// materialized only after a controlled shutdown and consumed fail-closed by
+/// the probe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RugRealityCaptureHealthEvidenceV1 {
     pub schema_version: u16,
     pub run_id: String,
     pub manifest_sha256: String,
-    /// SHA-256 of the immutable pre-capture loopback metrics snapshot.
+    /// `smoke` or `day1`; the probe validates the corresponding duration
+    /// contract rather than trusting a receipt from an arbitrary time span.
+    pub capture_kind: String,
+    /// SHA-256 of the structured start snapshot, which itself binds the run
+    /// and manifest before exposing its raw metrics digest.
+    pub start_snapshot_sha256: String,
+    /// SHA-256 of the structured end snapshot.
+    pub end_snapshot_sha256: String,
+    /// SHA-256 of the raw metrics body captured by the start snapshot.
     pub start_metrics_sha256: String,
-    /// SHA-256 of the immutable post-shutdown loopback metrics snapshot.
+    /// SHA-256 of the raw metrics body captured by the end snapshot.
     pub end_metrics_sha256: String,
+    pub start_captured_at_unix_ms: u64,
+    pub end_captured_at_unix_ms: u64,
+    pub duration_ms: u64,
     pub pr1_runtime_bypass_attempt_total: u64,
     pub pr1_runtime_candidate_admission_closed_total: u64,
     pub pr1_runtime_primary_coverage_gap_total: u64,

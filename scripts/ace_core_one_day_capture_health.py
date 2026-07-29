@@ -16,23 +16,37 @@ import hashlib
 import json
 import re
 import sys
+import time
 import urllib.request
 from pathlib import Path
 from typing import Iterable
 
 
-HEALTH_SCHEMA_VERSION = 1
+HEALTH_SCHEMA_VERSION = 2
+METRICS_SNAPSHOT_SCHEMA_VERSION = 1
 REQUIRED_COUNTERS = (
     "pr1_runtime_bypass_attempt_total",
     "pr1_runtime_candidate_admission_closed_total",
     "pr1_runtime_primary_coverage_gap_total",
 )
+CAPTURE_KINDS = ("smoke", "day1")
+SMOKE_MIN_DURATION_MS = 120_000
+SMOKE_MAX_DURATION_MS = 300_000
+DAY1_MIN_DURATION_MS = 86_400_000
+EVENT_WRITER_WRITE_FAILURE_MARKER = "EventEmitter: failed to write event"
+EVENT_WRITER_LOCK_FAILURE_MARKER = "EventEmitter: writer mutex poisoned; event was not persisted"
 FORBIDDEN_LOG_MARKERS = (
-    "EventEmitter: failed to write event",
-    "EventEmitter: writer mutex poisoned; event was not persisted",
     "Seer: unrecovered primary local coverage gap closes new candidate admission",
     "RUG_REALITY_CAPTURE_RUNTIME_FEE_AUTHORITY_UNAVAILABLE",
     "RUG_REALITY_CAPTURE_TYPED_QUOTE_AUTHORITY_UNAVAILABLE",
+    "RUG_SCALP_RUNTIME_FEE_AUTHORITY_INVALIDATED",
+    "RUG_SCALP_RUNTIME_FEE_AUTHORITY_CHANGE_REQUESTED_CONTROLLED_SHUTDOWN",
+    "Oracle Runtime failed before shutdown signal",
+    "Oracle Runtime task failed before shutdown signal",
+    "Oracle Runtime component shutdown failed",
+)
+FORBIDDEN_LOG_PATTERNS = (
+    re.compile(r"Component shutdown completed with \d+ failure\(s\) or forced abort\(s\)"),
 )
 CONTROLLED_SHUTDOWN_MARKER = "Ghost Launcher shutdown complete"
 
@@ -49,7 +63,22 @@ def write_new(path: Path, data: bytes) -> None:
         handle.flush()
 
 
+def load_manifest(path: Path) -> tuple[bytes, dict[str, object]]:
+    manifest_bytes = path.read_bytes()
+    try:
+        manifest = json.loads(manifest_bytes)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"capture manifest is not valid JSON: {error.msg}") from error
+    if not isinstance(manifest, dict):
+        raise RuntimeError("capture manifest must be a JSON object")
+    run_id = manifest.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise RuntimeError("capture manifest has no run_id")
+    return manifest_bytes, manifest
+
+
 def snapshot(args: argparse.Namespace) -> int:
+    manifest_bytes, manifest = load_manifest(Path(args.manifest))
     request = urllib.request.Request(args.metrics_url, method="GET")
     with urllib.request.urlopen(request, timeout=args.timeout_s) as response:
         if response.status != 200:
@@ -61,7 +90,20 @@ def snapshot(args: argparse.Namespace) -> int:
         raise RuntimeError(
             "metrics endpoint does not expose required ACE health series: " + ", ".join(missing)
         )
-    write_new(Path(args.output), body.rstrip(b"\n"))
+    snapshot_record = {
+        "schema_version": METRICS_SNAPSHOT_SCHEMA_VERSION,
+        "run_id": manifest["run_id"],
+        "manifest_sha256": sha256_hex(manifest_bytes),
+        "phase": args.phase,
+        "capture_kind": args.capture_kind,
+        "captured_at_unix_ms": time.time_ns() // 1_000_000,
+        "counters": values,
+        "raw_metrics_sha256": sha256_hex(body),
+    }
+    write_new(
+        Path(args.output),
+        json.dumps(snapshot_record, sort_keys=True, indent=2).encode("utf-8"),
+    )
     return 0
 
 
@@ -163,11 +205,14 @@ def validate_logs(paths: Iterable[Path]) -> tuple[bool, bool, int, int, list[str
         inspected += 1
         text = path.read_text(encoding="utf-8", errors="replace")
         controlled_shutdown = controlled_shutdown or CONTROLLED_SHUTDOWN_MARKER in text
-        write_failures += text.count(FORBIDDEN_LOG_MARKERS[0])
-        lock_failures += text.count(FORBIDDEN_LOG_MARKERS[1])
-        for marker in FORBIDDEN_LOG_MARKERS[2:]:
+        write_failures += text.count(EVENT_WRITER_WRITE_FAILURE_MARKER)
+        lock_failures += text.count(EVENT_WRITER_LOCK_FAILURE_MARKER)
+        for marker in FORBIDDEN_LOG_MARKERS:
             if marker in text:
                 failures.append(f"{path}: forbidden capture-health marker: {marker}")
+        for pattern in FORBIDDEN_LOG_PATTERNS:
+            if pattern.search(text):
+                failures.append(f"{path}: forbidden capture-health marker: {pattern.pattern}")
     if inspected == 0:
         failures.append("no launcher log files supplied")
     if write_failures:
@@ -179,35 +224,111 @@ def validate_logs(paths: Iterable[Path]) -> tuple[bool, bool, int, int, list[str
     return not failures, controlled_shutdown, write_failures, lock_failures, failures
 
 
+def load_snapshot(
+    path: Path,
+    *,
+    expected_run_id: str,
+    expected_manifest_sha256: str,
+    expected_phase: str,
+    expected_capture_kind: str,
+) -> tuple[dict[str, object] | None, list[str]]:
+    failures: list[str] = []
+    try:
+        snapshot_bytes = path.read_bytes()
+    except OSError as error:
+        return None, [f"{expected_phase} metrics snapshot unreadable: {error}"]
+    try:
+        snapshot = json.loads(snapshot_bytes)
+    except json.JSONDecodeError as error:
+        return None, [f"{expected_phase} metrics snapshot is invalid JSON: {error.msg}"]
+    if not isinstance(snapshot, dict):
+        return None, [f"{expected_phase} metrics snapshot must be a JSON object"]
+    if snapshot.get("schema_version") != METRICS_SNAPSHOT_SCHEMA_VERSION:
+        failures.append(f"{expected_phase} metrics snapshot schema mismatch")
+    if snapshot.get("run_id") != expected_run_id:
+        failures.append(f"{expected_phase} metrics snapshot run_id mismatch")
+    if snapshot.get("manifest_sha256") != expected_manifest_sha256:
+        failures.append(f"{expected_phase} metrics snapshot manifest hash mismatch")
+    if snapshot.get("phase") != expected_phase:
+        failures.append(f"{expected_phase} metrics snapshot phase mismatch")
+    if snapshot.get("capture_kind") != expected_capture_kind:
+        failures.append(f"{expected_phase} metrics snapshot capture kind mismatch")
+    if type(snapshot.get("captured_at_unix_ms")) is not int or snapshot["captured_at_unix_ms"] <= 0:
+        failures.append(f"{expected_phase} metrics snapshot timestamp missing or invalid")
+    if not isinstance(snapshot.get("raw_metrics_sha256"), str) or not snapshot["raw_metrics_sha256"]:
+        failures.append(f"{expected_phase} metrics snapshot raw metrics hash missing")
+    counters = snapshot.get("counters")
+    if not isinstance(counters, dict):
+        failures.append(f"{expected_phase} metrics snapshot counters missing")
+    else:
+        for name in REQUIRED_COUNTERS:
+            value = counters.get(name)
+            if type(value) is not int:
+                failures.append(f"{expected_phase} metrics snapshot missing {name}")
+            elif value != 0:
+                failures.append(f"{expected_phase} metrics {name} is non-zero: {value}")
+    if failures:
+        return None, failures
+    snapshot["snapshot_sha256"] = sha256_hex(snapshot_bytes)
+    return snapshot, []
+
+
+def validate_capture_duration(capture_kind: str, start_ms: int, end_ms: int) -> tuple[int | None, list[str]]:
+    failures: list[str] = []
+    if end_ms <= start_ms:
+        return None, ["metrics snapshots are not strictly ordered in time"]
+    duration_ms = end_ms - start_ms
+    if capture_kind == "smoke":
+        if not SMOKE_MIN_DURATION_MS <= duration_ms <= SMOKE_MAX_DURATION_MS:
+            failures.append(
+                f"smoke duration {duration_ms}ms is outside [{SMOKE_MIN_DURATION_MS}, {SMOKE_MAX_DURATION_MS}]"
+            )
+    elif capture_kind == "day1":
+        if duration_ms < DAY1_MIN_DURATION_MS:
+            failures.append(f"day1 duration {duration_ms}ms is below {DAY1_MIN_DURATION_MS}")
+    else:
+        failures.append(f"unsupported capture kind: {capture_kind}")
+    return duration_ms, failures
+
+
 def finalize(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest)
-    manifest_bytes = manifest_path.read_bytes()
-    manifest = json.loads(manifest_bytes)
-    expected_run_id = manifest.get("run_id")
+    manifest_bytes, manifest = load_manifest(manifest_path)
+    expected_run_id = manifest["run_id"]
     expected_output = Path(manifest.get("health_evidence_path", ""))
     requested_output = Path(args.output)
-    if not expected_run_id:
-        raise RuntimeError("capture manifest has no run_id")
     if expected_output != requested_output:
         raise RuntimeError(
             "--output must exactly equal manifest.health_evidence_path "
             f"({expected_output}), got {requested_output}"
         )
 
-    start_bytes = Path(args.start_metrics).read_bytes()
-    end_bytes = Path(args.end_metrics).read_bytes()
-    start = parse_prometheus_counters(start_bytes.decode("utf-8"), REQUIRED_COUNTERS)
-    end = parse_prometheus_counters(end_bytes.decode("utf-8"), REQUIRED_COUNTERS)
     failures: list[str] = []
-    for name in REQUIRED_COUNTERS:
-        if name not in start:
-            failures.append(f"start metrics snapshot missing {name}")
-        elif start[name] != 0:
-            failures.append(f"start metrics {name} is non-zero: {start[name]}")
-        if name not in end:
-            failures.append(f"end metrics snapshot missing {name}")
-        elif end[name] != 0:
-            failures.append(f"end metrics {name} is non-zero: {end[name]}")
+    manifest_sha256 = sha256_hex(manifest_bytes)
+    start, start_failures = load_snapshot(
+        Path(args.start_metrics),
+        expected_run_id=expected_run_id,
+        expected_manifest_sha256=manifest_sha256,
+        expected_phase="start",
+        expected_capture_kind=args.capture_kind,
+    )
+    end, end_failures = load_snapshot(
+        Path(args.end_metrics),
+        expected_run_id=expected_run_id,
+        expected_manifest_sha256=manifest_sha256,
+        expected_phase="end",
+        expected_capture_kind=args.capture_kind,
+    )
+    failures.extend(start_failures)
+    failures.extend(end_failures)
+    duration_ms: int | None = None
+    if start is not None and end is not None:
+        duration_ms, duration_failures = validate_capture_duration(
+            args.capture_kind,
+            start["captured_at_unix_ms"],
+            end["captured_at_unix_ms"],
+        )
+        failures.extend(duration_failures)
 
     events_ok, event_failures = validate_event_files(Path(args.events_dir))
     failures.extend(event_failures)
@@ -216,19 +337,34 @@ def finalize(args: argparse.Namespace) -> int:
     )
     failures.extend(log_failures)
 
+    if failures:
+        for failure in failures:
+            print(f"[invalid] {failure}", file=sys.stderr)
+        # A failed finalization must not leave a superficially valid receipt at
+        # the manifest-reserved path.  The probe therefore sees a missing
+        # receipt and marks the capture INVALID_CAPTURE.
+        return 2
+
+    assert start is not None and end is not None and duration_ms is not None
     receipt = {
         "schema_version": HEALTH_SCHEMA_VERSION,
         "run_id": expected_run_id,
-        "manifest_sha256": sha256_hex(manifest_bytes),
-        "start_metrics_sha256": sha256_hex(start_bytes),
-        "end_metrics_sha256": sha256_hex(end_bytes),
-        "pr1_runtime_bypass_attempt_total": end.get("pr1_runtime_bypass_attempt_total", 0),
-        "pr1_runtime_candidate_admission_closed_total": end.get(
-            "pr1_runtime_candidate_admission_closed_total", 0
-        ),
-        "pr1_runtime_primary_coverage_gap_total": end.get(
-            "pr1_runtime_primary_coverage_gap_total", 0
-        ),
+        "manifest_sha256": manifest_sha256,
+        "capture_kind": args.capture_kind,
+        "start_snapshot_sha256": start["snapshot_sha256"],
+        "end_snapshot_sha256": end["snapshot_sha256"],
+        "start_metrics_sha256": start["raw_metrics_sha256"],
+        "end_metrics_sha256": end["raw_metrics_sha256"],
+        "start_captured_at_unix_ms": start["captured_at_unix_ms"],
+        "end_captured_at_unix_ms": end["captured_at_unix_ms"],
+        "duration_ms": duration_ms,
+        "pr1_runtime_bypass_attempt_total": end["counters"]["pr1_runtime_bypass_attempt_total"],
+        "pr1_runtime_candidate_admission_closed_total": end["counters"][
+            "pr1_runtime_candidate_admission_closed_total"
+        ],
+        "pr1_runtime_primary_coverage_gap_total": end["counters"][
+            "pr1_runtime_primary_coverage_gap_total"
+        ],
         "event_writer_write_failure_count": writer_failures,
         "event_writer_lock_failure_count": lock_failures,
         "controlled_shutdown": controlled_shutdown,
@@ -236,10 +372,22 @@ def finalize(args: argparse.Namespace) -> int:
         "log_evidence_clean": logs_ok,
     }
     write_new(requested_output, json.dumps(receipt, sort_keys=True, indent=2).encode("utf-8"))
-    if failures:
-        for failure in failures:
-            print(f"[invalid] {failure}", file=sys.stderr)
-        return 2
+    return 0
+
+
+def verify_probe(args: argparse.Namespace) -> int:
+    summary_path = Path(args.summary)
+    try:
+        summary = json.loads(summary_path.read_bytes())
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"probe summary is not valid JSON: {error.msg}") from error
+    if not isinstance(summary, dict):
+        raise RuntimeError("probe summary must be a JSON object")
+    if summary.get("capture_status") != "VALID_CAPTURE":
+        raise RuntimeError("probe summary capture_status is not VALID_CAPTURE")
+    invalid_reasons = summary.get("capture_invalid_reasons")
+    if not isinstance(invalid_reasons, list) or invalid_reasons:
+        raise RuntimeError("probe summary contains capture_invalid_reasons")
     return 0
 
 
@@ -247,7 +395,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    snapshot_command = commands.add_parser("snapshot", help="save a verified loopback metrics scrape")
+    snapshot_command = commands.add_parser(
+        "snapshot", help="save a manifest-bound loopback metrics snapshot"
+    )
+    snapshot_command.add_argument("--manifest", required=True)
+    snapshot_command.add_argument("--phase", required=True, choices=("start", "end"))
+    snapshot_command.add_argument("--capture-kind", required=True, choices=CAPTURE_KINDS)
     snapshot_command.add_argument("--metrics-url", required=True)
     snapshot_command.add_argument("--output", required=True)
     snapshot_command.add_argument("--timeout-s", type=float, default=5.0)
@@ -257,12 +410,19 @@ def parse_args() -> argparse.Namespace:
         "finalize", help="validate capture health and write the manifest-bound receipt"
     )
     finalize_command.add_argument("--manifest", required=True)
+    finalize_command.add_argument("--capture-kind", required=True, choices=CAPTURE_KINDS)
     finalize_command.add_argument("--events-dir", required=True)
     finalize_command.add_argument("--start-metrics", required=True)
     finalize_command.add_argument("--end-metrics", required=True)
     finalize_command.add_argument("--log", action="append", required=True)
     finalize_command.add_argument("--output", required=True)
     finalize_command.set_defaults(handler=finalize)
+
+    verify_probe_command = commands.add_parser(
+        "verify-probe", help="require a valid-capture result from the actual offline ACE probe"
+    )
+    verify_probe_command.add_argument("--summary", required=True)
+    verify_probe_command.set_defaults(handler=verify_probe)
     return parser.parse_args()
 
 
