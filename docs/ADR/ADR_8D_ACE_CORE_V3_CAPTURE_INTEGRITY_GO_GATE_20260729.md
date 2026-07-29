@@ -121,7 +121,7 @@ summary oraz fail-closed odrzuca mismatch.
 Zamrożona implementacja wynosi:
 
 ```text
-implementation_sha = 3bc28fc320518e13c3a5113ed9d1fab1c4e115be
+implementation_sha = 7e5e35165c51ec9d290c8828205b5e6242c6c657
 ```
 
 Config rollout celowo zawiera do czasu zamrożenia commitu placeholder
