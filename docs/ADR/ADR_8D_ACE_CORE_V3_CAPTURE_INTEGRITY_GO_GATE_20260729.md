@@ -1,6 +1,6 @@
 # ADR-8D: ACE Core V3 — bramka integralności capture przed Dniem 1
 
-Status: `IMPLEMENTED / FOCUSED_VALIDATION_PENDING_FINAL_BUILD / DAY1_NOT_STARTED /
+Status: `IMPLEMENTED / FOCUSED_VALIDATION_PASS / RELEASE_BUILD_PASS / DAY1_NOT_STARTED /
 OBSERVE_ONLY / PR2_STILL_BLOCKED`
 
 Typ: ADR-8D / remediation capture-integrity / offline falsification evidence
@@ -116,6 +116,12 @@ binary_hash         = hash faktycznie zbudowanej binarki
 Probe propaguje implementation/code/binary provenance do calibration i
 summary oraz fail-closed odrzuca mismatch.
 
+Zamrożona implementacja wynosi:
+
+```text
+implementation_sha = 3bc28fc320518e13c3a5113ed9d1fab1c4e115be
+```
+
 Config rollout celowo zawiera do czasu zamrożenia commitu placeholder
 `PENDING_FINAL_ACE_IMPLEMENTATION_SHA`; preflight odrzuca taki capture.
 Po utworzeniu immutable commitu implementacji jedyny następny commit
@@ -128,6 +134,18 @@ Focused suite obejmuje dodatkowo failed reserve state we wszystkich rolach,
 malformed birth denominator, unjoinable trade, divergent full-key duplicate,
 schema mismatch, manifest-bound health receipt i rzeczywisty eksport trzech
 series przez `/metrics`.
+
+Na finalnym source/config state wykonano:
+
+```text
+cargo fmt --all --check                                                    PASS
+cargo test -p ghost-launcher ace_core_one_day_probe --lib -- --nocapture  PASS (29/29)
+cargo test -p ghost-launcher oracle_metrics --lib -- --nocapture          PASS (1/1)
+cargo test -p ghost-launcher metrics_server_tests --bin ghost-launcher    PASS (6/6)
+cargo build --release -p ghost-launcher --bin ghost-launcher
+  --bin ace_core_one_day_probe                                             PASS
+python3 -m py_compile scripts/ace_core_one_day_capture_health.py          PASS
+```
 
 Przed Dniem 1 trzeba wykonać w nowym scope 2–5 minut smoke:
 
