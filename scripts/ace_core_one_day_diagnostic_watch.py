@@ -45,7 +45,22 @@ def snapshot_metrics(metrics_url: str | None, output_path: Path | None) -> str |
         return f"metrics_snapshot_failed:{error}"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(raw_metrics)
+    # The snapshot is evidence for the diagnostic classification.  It must be
+    # durable before this watcher asks the launcher to stop the metrics server.
+    with output_path.open("wb") as stream:
+        stream.write(raw_metrics)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return None
+
+
+def preflight_metrics(metrics_url: str) -> str | None:
+    """Verify the configured endpoint before starting to watch saturation."""
+    try:
+        with urllib.request.urlopen(metrics_url, timeout=3) as response:
+            response.read(1)
+    except (OSError, urllib.error.URLError) as error:
+        return f"metrics_preflight_failed:{error}"
     return None
 
 
@@ -124,6 +139,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-seconds", type=float, default=0.25)
     parser.add_argument("--metrics-url")
     parser.add_argument("--metrics-output", type=Path)
+    parser.add_argument(
+        "--preflight-metrics",
+        action="store_true",
+        help="require a successful GET to --metrics-url before watching",
+    )
     parser.add_argument("--status-path", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -133,11 +153,18 @@ def parse_args() -> argparse.Namespace:
         parser.error("--poll-seconds must be positive")
     if (args.metrics_url is None) != (args.metrics_output is None):
         parser.error("--metrics-url and --metrics-output must be supplied together")
+    if args.preflight_metrics and args.metrics_url is None:
+        parser.error("--preflight-metrics requires --metrics-url")
     return args
 
 
 def main() -> int:
     args = parse_args()
+    if args.preflight_metrics:
+        error = preflight_metrics(args.metrics_url)
+        if error is not None:
+            print(error, file=sys.stderr)
+            return 2
     result = watch(
         launcher_stdout_log=args.launcher_stdout_log,
         launcher_pid=args.launcher_pid,

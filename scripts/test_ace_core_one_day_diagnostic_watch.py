@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).with_name("ace_core_one_day_diagnostic_watch.py")
@@ -60,6 +61,28 @@ class AceCoreOneDayDiagnosticWatchTests(unittest.TestCase):
             self.assertEqual(result.reason, "ipc_egress_saturated")
             self.assertTrue(result.marker_seen)
             self.assertIsNone(result.stopped_pid)
+
+    def test_snapshot_is_fsynced_before_stop_can_be_requested(self) -> None:
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b"metric 1\n"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "metrics.prom"
+            with mock.patch.object(WATCHER.urllib.request, "urlopen", return_value=Response()), mock.patch.object(
+                WATCHER.os, "fsync"
+            ) as fsync:
+                error = WATCHER.snapshot_metrics("http://127.0.0.1:19090/metrics", output)
+
+            self.assertIsNone(error)
+            self.assertEqual(output.read_bytes(), b"metric 1\n")
+            fsync.assert_called_once()
 
 
 if __name__ == "__main__":
