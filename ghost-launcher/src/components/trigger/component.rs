@@ -5724,6 +5724,10 @@ pub async fn run_with_oracle(
                     match event {
                         Ok(ghost_event) => {
                             match ghost_event {
+                                GhostEvent::SeerOracleDrainBarrier(_) => {
+                                    // Shutdown-only transport watermark; it is consumed by
+                                    // OracleRuntime and never enters Trigger policy/execution.
+                                }
                                 GhostEvent::NewPoolDetected(pool, Some(_permit)) => {
                                     // 🟢 CHANGED: The "Lobotomy" - Don't score immediately. Cache and wait.
                                     info!(

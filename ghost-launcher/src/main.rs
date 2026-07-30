@@ -98,6 +98,9 @@ const GRPC_SUBSCRIBE_TIMEOUT_SECS: u64 = 5;
 const EXIT_GRPC_SUBSCRIBE_TIMEOUT: i32 = 5;
 /// Exit code when the OracleRuntime task exits before shutdown is requested.
 const EXIT_ORACLE_RUNTIME_STOPPED: i32 = 6;
+/// Exit code when the upstream Seer task exits before shutdown is requested.
+/// Continuing would leave Oracle alive with a silently dead canonical ingest.
+const EXIT_SEER_COMPONENT_STOPPED: i32 = 7;
 const STARTUP_HYDRATION_TIMEOUT_SECS: u64 = 15;
 const STARTUP_HYDRATION_IGNORE_MINTS_ENV: &str = "GHOST_STARTUP_HYDRATION_IGNORE_MINTS";
 /// The production event path processes deep protobuf, account-state and session call chains.
@@ -264,6 +267,13 @@ fn component_shutdown_join_timeout(
     component_name: &str,
     shadow_v2_burnin_config: &ShadowV2BurninConfig,
 ) -> Duration {
+    if component_name == "Seer" {
+        // Seer stops its producers, drains up to 1,024 owned serial BCV2
+        // hydration requests, drains IPC, and then waits for Oracle's Event
+        // Bus acknowledgement. The budget exceeds the hydration owner's
+        // calculated 55.5-minute maximum plus downstream-drain margin.
+        return Duration::from_secs(3_660);
+    }
     if component_name == "PostBuyRuntime" {
         if shadow_v2_burnin_config.enabled && shadow_v2_burnin_config.logging_only {
             return Duration::from_millis(
@@ -3224,6 +3234,36 @@ async fn run_launcher() -> Result<()> {
             }
             std::process::exit(EXIT_ORACLE_RUNTIME_STOPPED);
         }
+        seer_result = async {
+            match seer_handle.as_mut() {
+                Some(handle) => Some(handle.await),
+                None => None,
+            }
+        }, if seer_handle.is_some() => {
+            match seer_result.expect("guarded by seer_handle.is_some()") {
+                Ok(Ok(())) => {
+                    error!(
+                        "Seer component stopped before shutdown signal; exiting with code {} to avoid silent ingest stall",
+                        EXIT_SEER_COMPONENT_STOPPED
+                    );
+                }
+                Ok(Err(err)) => {
+                    error!(
+                        error = %err,
+                        "Seer component failed before shutdown signal; exiting with code {} to avoid silent ingest stall",
+                        EXIT_SEER_COMPONENT_STOPPED
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        "Seer component task failed before shutdown signal; exiting with code {} to avoid silent ingest stall",
+                        EXIT_SEER_COMPONENT_STOPPED
+                    );
+                }
+            }
+            std::process::exit(EXIT_SEER_COMPONENT_STOPPED);
+        }
     }
 
     // Phase 1: stop all upstream Seer producers, including owned hydration,
@@ -3960,7 +4000,7 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
 
         assert_eq!(
             component_shutdown_join_timeout("Seer", &shadow_v2),
-            COMPONENT_SHUTDOWN_JOIN_TIMEOUT
+            Duration::from_secs(3_660)
         );
         assert_eq!(
             component_shutdown_join_timeout("PostBuyRuntime", &shadow_v2),

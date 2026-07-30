@@ -32,6 +32,7 @@ use crate::config::{
 use crate::events::{
     AccountUpdateEvent, CanonicalRuntimePermitV1, DetectedPool, EventBusSender,
     ExecutionJoinMetadata, FundingTransferObserved, GhostEvent, PoolTransaction, PostBuySource,
+    SeerOracleDrainBarrierV1,
 };
 use crate::rug_scalp_v2::{
     append_rug_scalp_jsonl_record, RugScalpCanonicalStateV2, RugScalpEntryAttemptRecordV2,
@@ -2351,6 +2352,7 @@ const fn candidate_integrity_error_label(error: &CandidateIntegrityErrorV1) -> &
         CandidateIntegrityErrorV1::CandidateMissing => "candidate_missing",
         CandidateIntegrityErrorV1::TerminalRetirementPending => "terminal_retirement_pending",
         CandidateIntegrityErrorV1::CandidateAliasConflict => "candidate_alias_conflict",
+        CandidateIntegrityErrorV1::TerminalCleanupInProgress => "terminal_cleanup_in_progress",
         CandidateIntegrityErrorV1::NotReady(_) => "not_ready",
         CandidateIntegrityErrorV1::GenerationChanged { .. } => "generation_changed",
         CandidateIntegrityErrorV1::AdmissionClosed { .. } => "admission_closed",
@@ -4866,8 +4868,34 @@ impl OracleRuntime {
         // 1. Get identity before removing (needed for ShadowLedger cleanup and key translation)
         let identity = self.pool_identities.get_by_pool(&pool_amm_id);
         let base_mint_key = identity.map(|entry| entry.base_mint);
+        let terminal_candidate = identity.map(|entry| PumpCandidateIdentityV1 {
+            pool_amm_id,
+            mint: *entry.base_mint,
+        });
         let had_detected_pool = self.lookup_detected_pool(&pool_amm_id).is_some();
         let had_runtime_state = self.runtime_pool_state(&pool_amm_id).is_some();
+
+        // Linearize terminal cleanup before any runtime identity can be
+        // removed. The registry marks the per-candidate barrier and snapshots
+        // outstanding receipts under one lock, so concurrent canonical staging
+        // cannot create a new obligation between reclamation and retirement.
+        if let Some(candidate) = terminal_candidate {
+            if let Err(error) = self
+                .candidate_integrity_registry
+                .fail_pending_canonical_applies_for_candidate(candidate)
+            {
+                warn!(
+                    pool = %pool_amm_id,
+                    base_mint = %candidate.mint,
+                    error = %error,
+                    "CandidateIntegrity terminal cleanup barrier could not reclaim receipts; closing new candidate admission"
+                );
+                self.candidate_integrity_registry
+                    .close_candidate_admission_with_integrity_invalidation(
+                        "terminal_candidate_receipt_reclaim_failed",
+                    );
+            }
+        }
 
         let removed_session = self.session_manager.remove_session(&pool_amm_id);
 
@@ -4962,6 +4990,23 @@ impl OracleRuntime {
         self.pool_identities.remove_by_pool(&pool_amm_id);
         self.runtime_pool_states.write().remove(&pool_amm_id);
         self.detected_pools.write().remove(&pool_amm_id);
+        if let Some(candidate) = terminal_candidate {
+            if let Err(error) = self
+                .candidate_integrity_registry
+                .finish_terminal_candidate_cleanup(candidate)
+            {
+                warn!(
+                    pool = %pool_amm_id,
+                    base_mint = %candidate.mint,
+                    error = %error,
+                    "CandidateIntegrity terminal cleanup barrier could not finish after identity removal; closing new candidate admission"
+                );
+                self.candidate_integrity_registry
+                    .close_candidate_admission_with_integrity_invalidation(
+                        "terminal_candidate_cleanup_finish_failed",
+                    );
+            }
+        }
 
         info!(pool = %pool_amm_id, reason, "🗑️  USUNIETO BASE MINT Z RUNTIME");
         true
@@ -18001,6 +18046,18 @@ fn should_mark_pool_as_strategically_rejected(result: &PoolObservationResult) ->
     result.disposition == PoolObservationDispositionV1::StrategicTerminal
 }
 
+/// Acknowledges the shutdown-only watermark emitted after Seer has drained
+/// its IPC bridge. Reaching this arm proves that all preceding Seer Event-Bus
+/// emissions have been observed by the Oracle loop before launcher shutdown
+/// may signal Oracle to stop.
+fn acknowledge_seer_oracle_drain_barrier(barrier: &SeerOracleDrainBarrierV1) {
+    barrier.acknowledge_oracle_processed();
+    info!(
+        barrier_sequence = barrier.sequence(),
+        "ORACLE_EVENT_BUS_DRAIN_COMPLETE"
+    );
+}
+
 /// Resolve receipts whose only downstream owner was the pool task that has
 /// just completed.  This must run before any runtime identity/session cleanup:
 /// `retire_terminal_candidate` deliberately rejects unresolved obligations.
@@ -27423,6 +27480,10 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                 };
 
                 match event {
+                    GhostEvent::SeerOracleDrainBarrier(barrier) => {
+                        acknowledge_seer_oracle_drain_barrier(barrier.as_ref());
+                    }
+
                     GhostEvent::CandidateIntegrity(signal) => {
                         oracle_runtime.record_candidate_integrity_signal((*signal).clone());
                     }

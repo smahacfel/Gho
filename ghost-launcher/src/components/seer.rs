@@ -9,7 +9,7 @@ use crate::config::{
 };
 use crate::events::{
     AccountUpdateEvent, CanonicalRuntimePermitV1, DetectedPool, EventBusSender,
-    FundingTransferObserved, GhostEvent,
+    FundingTransferObserved, GhostEvent, SeerOracleDrainBarrierV1,
 };
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -74,6 +74,17 @@ const SESSION_ACCOUNT_UPDATE_BUFFER_GLOBAL_CAP: usize = 4_096;
 const SESSION_POOL_REGISTRY_FALLBACK_TTL: Duration = Duration::from_secs(30 * 60);
 const SESSION_POOL_REGISTRY_FALLBACK_CAP: usize = 16_384;
 const SEER_CORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Oracle remains alive while Seer turns its local IPC drain into an
+/// Event-Bus-consumer acknowledgement. This is distinct from producer stop:
+/// a local queue drain alone does not prove Oracle has applied the final bus
+/// event.
+const SEER_ORACLE_DRAIN_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
+// BCV2 owns a serial queue of up to 1,024 accepted RPC requests. Its bounded
+// worst-case drain is roughly 55.5 minutes; this outer timeout must not abort
+// the owner before it can report a truthful drain result.
+const SEER_DISPATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3_600);
+const SEER_IPC_RECEIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+static SEER_ORACLE_DRAIN_BARRIER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SESSION_POOL_BRIDGE_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
 const NLN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 
@@ -4600,6 +4611,20 @@ pub(crate) fn ingest_pump_observation(
     };
     let receipt = match candidate_integrity_registry.stage_canonical_mutation(canonical) {
         Ok(receipt) => receipt,
+        Err(CandidateIntegrityErrorV1::TerminalCleanupInProgress) => {
+            // Oracle has linearized terminal cleanup for this exact candidate.
+            // Do not create a new permit or receipt in the cleanup window;
+            // this is a candidate-local late mutation, not a global registry
+            // failure.
+            warn!(
+                signature = %canonical.locator.signature,
+                locator = ?canonical.locator,
+                "Seer: canonical mutation arrived during terminal candidate cleanup; emission suppressed without closing global admission"
+            );
+            return CanonicalRuntimeAdmissionV1::NoApply(
+                CanonicalRuntimeNoApplyReasonV1::Suppressed,
+            );
+        }
         Err(error) => {
             error!(
                 signature = %canonical.locator.signature,
@@ -6633,9 +6658,37 @@ pub async fn run(
         let egress_backlog = ipc_sender_drain.current_queue_length();
         let downstream_backlog = ipc_receiver.pending_len();
         if events_sent == events_received && egress_backlog == 0 && downstream_backlog == 0 {
+            let event_bus_tx = event_bus_tx.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Seer IPC drain reached Event Bus boundary without an Oracle Event Bus sender"
+                )
+            })?;
+            let barrier_sequence =
+                SEER_ORACLE_DRAIN_BARRIER_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+            let barrier = Arc::new(SeerOracleDrainBarrierV1::new(barrier_sequence));
+            event_bus_tx
+                .send(GhostEvent::SeerOracleDrainBarrier(Arc::clone(&barrier)))
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                    "Seer could not emit Oracle drain barrier sequence={barrier_sequence}: {error}"
+                )
+                })?;
+            tokio::time::timeout(
+                SEER_ORACLE_DRAIN_BARRIER_TIMEOUT,
+                barrier.wait_for_oracle_processed(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!(
+                "Oracle did not acknowledge Event Bus drain barrier sequence={barrier_sequence} within {} ms",
+                SEER_ORACLE_DRAIN_BARRIER_TIMEOUT.as_millis()
+            ))?;
             info!(
                 events_sent,
-                events_received, egress_backlog, downstream_backlog, "SEER_IPC_DRAIN_COMPLETE"
+                events_received,
+                egress_backlog,
+                downstream_backlog,
+                barrier_sequence = barrier.sequence(),
+                "SEER_IPC_DRAIN_COMPLETE"
             );
             Ok(())
         } else {
@@ -6686,7 +6739,12 @@ pub async fn run(
         }
     }
 
-    match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, seer.shutdown_dispatchers()).await {
+    match tokio::time::timeout(
+        SEER_DISPATCHER_SHUTDOWN_TIMEOUT,
+        seer.shutdown_dispatchers(),
+    )
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             error!("Seer: dispatcher drain/flush/join failed: {}", err);
@@ -6697,16 +6755,16 @@ pub async fn run(
         Err(_) => {
             error!(
                 "Seer: dispatcher shutdown exceeded {:?}",
-                SEER_CORE_SHUTDOWN_TIMEOUT
+                SEER_DISPATCHER_SHUTDOWN_TIMEOUT
             );
             shutdown_failures.push(format!(
                 "Seer dispatcher shutdown exceeded {:?}",
-                SEER_CORE_SHUTDOWN_TIMEOUT
+                SEER_DISPATCHER_SHUTDOWN_TIMEOUT
             ));
         }
     }
 
-    match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, &mut ipc_handle).await {
+    match tokio::time::timeout(SEER_IPC_RECEIVER_SHUTDOWN_TIMEOUT, &mut ipc_handle).await {
         Ok(Ok(Ok(()))) => {
             info!("Seer: IPC receiver drained and stopped");
         }
@@ -6726,7 +6784,7 @@ pub async fn run(
             let _ = ipc_handle.await;
             shutdown_failures.push(format!(
                 "Seer IPC receiver did not drain within {:?}",
-                SEER_CORE_SHUTDOWN_TIMEOUT
+                SEER_IPC_RECEIVER_SHUTDOWN_TIMEOUT
             ));
         }
     }

@@ -35,6 +35,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -54,6 +55,61 @@ pub struct CanonicalRuntimePermitV1 {
     pub(crate) authority_epoch_id: u64,
     pub(crate) locator: RawPumpMutationLocatorV1,
     pub(crate) primary_payload_hash_blake3: [u8; 32],
+}
+
+/// One-shot, in-process shutdown watermark from Seer's IPC bridge to the
+/// Oracle event-loop consumer.
+///
+/// The marker is emitted only after Seer has drained its own IPC queues.  Its
+/// acknowledgement is released exclusively by Oracle after this exact event
+/// reaches the Oracle event loop, which proves that every preceding Seer
+/// Event-Bus emission was observed before Oracle is allowed to stop.
+#[derive(Clone)]
+pub struct SeerOracleDrainBarrierV1 {
+    sequence: u64,
+    oracle_processed: Arc<AtomicBool>,
+    oracle_processed_notify: Arc<tokio::sync::Notify>,
+}
+
+impl std::fmt::Debug for SeerOracleDrainBarrierV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SeerOracleDrainBarrierV1")
+            .field("sequence", &self.sequence)
+            .field(
+                "oracle_processed",
+                &self.oracle_processed.load(Ordering::Acquire),
+            )
+            .finish()
+    }
+}
+
+impl SeerOracleDrainBarrierV1 {
+    #[must_use]
+    pub(crate) fn new(sequence: u64) -> Self {
+        Self {
+            sequence,
+            oracle_processed: Arc::new(AtomicBool::new(false)),
+            oracle_processed_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub(crate) fn acknowledge_oracle_processed(&self) {
+        if !self.oracle_processed.swap(true, Ordering::AcqRel) {
+            self.oracle_processed_notify.notify_waiters();
+        }
+    }
+
+    pub(crate) async fn wait_for_oracle_processed(&self) {
+        while !self.oracle_processed.load(Ordering::Acquire) {
+            self.oracle_processed_notify.notified().await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1365,6 +1421,10 @@ impl LegacyPathDescriptor {
 /// All inter-component communication flows through these events.
 #[derive(Debug, Clone)]
 pub enum GhostEvent {
+    /// Shutdown-only Event-Bus watermark.  Oracle acknowledges it only after
+    /// all preceding Seer emissions have reached the Oracle consumer.
+    SeerOracleDrainBarrier(Arc<SeerOracleDrainBarrierV1>),
+
     /// Technical candidate-integrity state produced at ingest/account
     /// boundaries. This is not a Gatekeeper verdict or a strategy event.
     CandidateIntegrity(Arc<ghost_core::CandidateIntegritySignalV1>),
@@ -1783,6 +1843,7 @@ impl GhostEvent {
     /// Get the event type as a string (for logging/metrics)
     pub fn event_type(&self) -> &'static str {
         match self {
+            GhostEvent::SeerOracleDrainBarrier(_) => "seer_oracle_drain_barrier",
             GhostEvent::CandidateIntegrity(_) => "candidate_integrity",
             GhostEvent::NewPoolDetected(_, _) => "new_pool_detected",
             GhostEvent::PoolTransaction(_, _) => "pool_transaction",
@@ -2535,6 +2596,37 @@ mod tests {
             update_event_bus_lag_window("oracle", 60, base + Duration::from_secs(72)),
             Some(111)
         );
+    }
+
+    #[tokio::test]
+    async fn seer_oracle_drain_barrier_acknowledges_only_after_bus_delivery() {
+        let (tx, mut rx) = create_event_bus();
+        let barrier = Arc::new(SeerOracleDrainBarrierV1::new(7));
+        tx.send(GhostEvent::custom(
+            "preceding_seer_event",
+            serde_json::json!({}),
+        ))
+        .expect("receiver is subscribed");
+        tx.send(GhostEvent::SeerOracleDrainBarrier(Arc::clone(&barrier)))
+            .expect("receiver is subscribed");
+
+        assert!(matches!(
+            rx.recv().await.expect("preceding Event Bus event"),
+            GhostEvent::Custom(_, _)
+        ));
+        let GhostEvent::SeerOracleDrainBarrier(received_barrier) =
+            rx.recv().await.expect("drain barrier event")
+        else {
+            panic!("expected shutdown drain barrier after preceding event");
+        };
+        received_barrier.acknowledge_oracle_processed();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            barrier.wait_for_oracle_processed(),
+        )
+        .await
+        .expect("acknowledged barrier resolves the upstream wait");
+        assert_eq!(barrier.sequence(), 7);
     }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -265,6 +265,13 @@ struct CandidateIntegrityRegistryStateV1 {
     by_pool: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
     by_mint: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
     canonical_apply_fence: CanonicalApplyFenceV1,
+    /// Per-candidate linearization fence for terminal Oracle cleanup.
+    ///
+    /// Once present, no new canonical apply receipt may be staged for this
+    /// candidate until Oracle has reclaimed every existing obligation,
+    /// retired the candidate, and removed its runtime identity. This prevents
+    /// a receipt from appearing between a reclaim snapshot and retirement.
+    terminal_cleanup_barriers: HashSet<PumpCandidateIdentityV1>,
     terminal_tombstones: TerminalCandidateTombstonesV1,
     /// A bounded handoff to the Seer-owned PumpObservationLedger. Oracle
     /// lifecycle cleanup creates it; Seer's periodic ledger finalizer drains
@@ -279,6 +286,7 @@ impl CandidateIntegrityRegistryStateV1 {
             by_pool: HashMap::new(),
             by_mint: HashMap::new(),
             canonical_apply_fence: CanonicalApplyFenceV1::default(),
+            terminal_cleanup_barriers: HashSet::new(),
             terminal_tombstones: TerminalCandidateTombstonesV1::new(max_terminal_tombstones),
             terminal_ledger_retirements: VecDeque::with_capacity(max_terminal_tombstones.min(4096)),
         }
@@ -395,6 +403,8 @@ pub struct CandidateIntegrityRegistry {
     transition_before_commit_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
     #[cfg(test)]
     close_after_state_lock_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
+    #[cfg(test)]
+    terminal_cleanup_after_snapshot_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -413,6 +423,8 @@ pub enum CandidateIntegrityErrorV1 {
     CandidateMissing,
     #[error("candidate terminal retirement has unresolved canonical apply receipts")]
     TerminalRetirementPending,
+    #[error("candidate terminal cleanup is in progress; canonical staging is blocked")]
+    TerminalCleanupInProgress,
     #[error("candidate identity aliases disagree")]
     CandidateAliasConflict,
     #[error("candidate integrity is not Ready: {0:?}")]
@@ -632,6 +644,8 @@ impl CandidateIntegrityRegistry {
             transition_before_commit_hook: Mutex::new(None),
             #[cfg(test)]
             close_after_state_lock_hook: Mutex::new(None),
+            #[cfg(test)]
+            terminal_cleanup_after_snapshot_hook: Mutex::new(None),
         }
     }
 
@@ -666,6 +680,9 @@ impl CandidateIntegrityRegistry {
             evidence_hash_blake3: canonical.primary_raw_provenance.payload_hash_blake3,
         };
         let mut state = self.lock_state()?;
+        if state.terminal_cleanup_barriers.contains(&candidate) {
+            return Err(CandidateIntegrityErrorV1::TerminalCleanupInProgress);
+        }
         if let Some(existing) = state
             .canonical_apply_fence
             .receipts_by_runtime_key
@@ -957,7 +974,11 @@ impl CandidateIntegrityRegistry {
     ) -> Result<usize, CandidateIntegrityErrorV1> {
         self.require_available()?;
         let pending = {
-            let state = self.lock_state()?;
+            let mut state = self.lock_state()?;
+            // This insertion and receipt snapshot share one lock acquisition.
+            // A concurrent stage therefore observes the barrier and cannot
+            // create a receipt in the former snapshot→cleanup gap.
+            state.terminal_cleanup_barriers.insert(candidate);
             state
                 .canonical_apply_fence
                 .receipts_by_runtime_key
@@ -969,10 +990,29 @@ impl CandidateIntegrityRegistry {
                 .collect::<Vec<_>>()
         };
 
+        #[cfg(test)]
+        self.invoke_terminal_cleanup_after_snapshot_hook();
+
         for receipt in &pending {
             self.fail_canonical_apply(receipt)?;
         }
         Ok(pending.len())
+    }
+
+    /// Release the terminal-cleanup linearization fence after Oracle has
+    /// removed the runtime identity. The fence must never be released while a
+    /// receipt remains unresolved.
+    pub(crate) fn finish_terminal_candidate_cleanup(
+        &self,
+        candidate: PumpCandidateIdentityV1,
+    ) -> Result<(), CandidateIntegrityErrorV1> {
+        self.require_available()?;
+        let mut state = self.lock_state()?;
+        if Self::has_unresolved_canonical_receipt(&state, candidate) {
+            return Err(CandidateIntegrityErrorV1::TerminalRetirementPending);
+        }
+        state.terminal_cleanup_barriers.remove(&candidate);
+        Ok(())
     }
 
     pub(crate) fn fail_ready_release(
@@ -1849,6 +1889,17 @@ impl CandidateIntegrityRegistry {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_terminal_cleanup_after_snapshot_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .terminal_cleanup_after_snapshot_hook
+            .lock()
+            .expect("test terminal cleanup hook mutex") = hook.map(TransitionBeforeCommitHookV1);
+    }
+
+    #[cfg(test)]
     fn invoke_transition_before_commit_hook(&self) {
         let hook = self
             .transition_before_commit_hook
@@ -1866,6 +1917,18 @@ impl CandidateIntegrityRegistry {
             .close_after_state_lock_hook
             .lock()
             .expect("test close hook mutex")
+            .clone();
+        if let Some(hook) = hook {
+            (hook.0)();
+        }
+    }
+
+    #[cfg(test)]
+    fn invoke_terminal_cleanup_after_snapshot_hook(&self) {
+        let hook = self
+            .terminal_cleanup_after_snapshot_hook
+            .lock()
+            .expect("test terminal cleanup hook mutex")
             .clone();
         if let Some(hook) = hook {
             (hook.0)();
@@ -3396,6 +3459,66 @@ mod tests {
             .receipts_by_runtime_key
             .contains_key(&receipt.runtime_key));
         assert_eq!(state.terminal_tombstones.retained_count(), 0);
+    }
+
+    #[test]
+    fn terminal_cleanup_barrier_blocks_receipt_staging_between_reclaim_and_retirement() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = candidate();
+        registry
+            .record_signal(signal(candidate, CandidateIntegrityOutcomeV1::Ready, 0x11))
+            .expect("candidate must be admitted before terminal cleanup");
+
+        let owned = canonical(Signature::new_unique(), 0, candidate);
+        let _owned_receipt = registry
+            .stage_canonical_mutation(&owned)
+            .expect("receipt owned by terminal task");
+
+        let snapshot_taken = Arc::new(Barrier::new(2));
+        let release_reclaim = Arc::new(Barrier::new(2));
+        let snapshot_hook = Arc::clone(&snapshot_taken);
+        let release_hook = Arc::clone(&release_reclaim);
+        registry.set_terminal_cleanup_after_snapshot_hook(Some(Arc::new(move || {
+            snapshot_hook.wait();
+            release_hook.wait();
+        })));
+
+        let reclaim_registry = Arc::clone(&registry);
+        let reclaim_thread = std::thread::spawn(move || {
+            reclaim_registry.fail_pending_canonical_applies_for_candidate(candidate)
+        });
+        snapshot_taken.wait();
+
+        let late = canonical(Signature::new_unique(), 1, candidate);
+        assert_eq!(
+            registry.stage_canonical_mutation(&late),
+            Err(CandidateIntegrityErrorV1::TerminalCleanupInProgress),
+            "a receipt must not enter after the reclaim snapshot and before retirement"
+        );
+        release_reclaim.wait();
+        assert_eq!(
+            reclaim_thread
+                .join()
+                .expect("terminal reclaim thread join")
+                .expect("terminal reclaim under barrier"),
+            1
+        );
+        registry.set_terminal_cleanup_after_snapshot_hook(None);
+        assert!(
+            registry.retire_terminal_candidate(candidate).is_ok(),
+            "all obligations were reclaimed before retirement"
+        );
+        registry
+            .finish_terminal_candidate_cleanup(candidate)
+            .expect("barrier releases only after terminal cleanup");
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("fence counts"),
+            (0, 0),
+            "terminal cleanup leaves no unresolved receipt or proof"
+        );
+        assert!(registry.candidate_admission_open());
     }
 
     #[test]
