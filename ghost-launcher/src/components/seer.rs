@@ -4426,22 +4426,60 @@ impl CanonicalRuntimeAdmissionV1 {
     }
 }
 
-pub(crate) fn authorize_pool_runtime_disposition(
+/// Returns the disposition that must stop a primary raw pool detection before
+/// it enters the canonical Ledger/receipt plane.
+///
+/// `ContinuityOnly` and `Suppressed` are deliberately not candidate-admission
+/// structural mutations.  In particular, a PumpSwap continuity observation
+/// can share its mint with the Pump candidate it follows.  Giving it a
+/// CandidateIntegrity permit and then reclaiming that permit would leave a
+/// terminal alias tombstone that can block the real Pump candidate's later
+/// downstream apply acknowledgement.
+fn pre_admission_pool_detection_no_apply_reason(
+    primary_raw: bool,
     disposition: PoolDetectionRuntimeDispositionV1,
-    permit: &CanonicalRuntimePermitV1,
-    candidate_integrity_registry: &CandidateIntegrityRegistry,
-) -> Result<(), CanonicalRuntimeNoApplyReasonV1> {
+) -> Option<CanonicalRuntimeNoApplyReasonV1> {
+    if !primary_raw {
+        return None;
+    }
+
     match disposition {
-        PoolDetectionRuntimeDispositionV1::CandidateAdmission => Ok(()),
+        PoolDetectionRuntimeDispositionV1::CandidateAdmission => None,
         PoolDetectionRuntimeDispositionV1::ContinuityOnly => {
-            fail_canonical_apply(candidate_integrity_registry, Some(&permit.apply_receipt));
-            Err(CanonicalRuntimeNoApplyReasonV1::ContinuityOnly)
+            Some(CanonicalRuntimeNoApplyReasonV1::ContinuityOnly)
         }
         PoolDetectionRuntimeDispositionV1::Suppressed => {
-            fail_canonical_apply(candidate_integrity_registry, Some(&permit.apply_receipt));
-            Err(CanonicalRuntimeNoApplyReasonV1::Suppressed)
+            Some(CanonicalRuntimeNoApplyReasonV1::Suppressed)
         }
     }
+}
+
+/// Applies the PoolDetected-specific admission boundary before a raw
+/// observation can mutate the canonical Ledger or CandidateIntegrity state.
+/// Non-primary observations retain the existing witness-only ingestion path;
+/// only primary non-admission dispositions bypass it.
+pub(crate) fn ingest_pool_detection_observation(
+    primary_raw: bool,
+    disposition: PoolDetectionRuntimeDispositionV1,
+    ledger: &Arc<Mutex<PumpObservationLedgerV1>>,
+    candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
+    observation: Option<ObservedPumpMutationV1>,
+    now_monotonic_ns: u64,
+    boundary_payload_aligned: bool,
+    missing_primary_signal: Option<CandidateIntegritySignalV1>,
+) -> CanonicalRuntimeAdmissionV1 {
+    if let Some(reason) = pre_admission_pool_detection_no_apply_reason(primary_raw, disposition) {
+        return CanonicalRuntimeAdmissionV1::NoApply(reason);
+    }
+
+    ingest_pump_observation(
+        ledger,
+        candidate_integrity_registry,
+        observation,
+        now_monotonic_ns,
+        boundary_payload_aligned,
+        missing_primary_signal,
+    )
 }
 
 fn no_apply_reason(
@@ -6132,7 +6170,9 @@ pub async fn run(
                         event.observation.as_ref().is_some_and(|observation| {
                             pool_candidate_matches_primary_observation(candidate, observation)
                         });
-                    let admission = ingest_pump_observation(
+                    let admission = ingest_pool_detection_observation(
+                        primary_raw,
+                        event.runtime_disposition,
                         &pump_observation_ledger_ipc,
                         &candidate_integrity_registry_ipc,
                         event.observation.clone(),
@@ -6165,12 +6205,41 @@ pub async fn run(
                     let permit = match admission {
                         CanonicalRuntimeAdmissionV1::Apply(permit) => permit,
                         CanonicalRuntimeAdmissionV1::NoApply(reason) => {
-                            debug!(
-                                pool = %candidate.pool_amm_id,
-                                mint = %candidate.base_mint,
-                                reason = ?reason,
-                                "Seer: pool wrapper has no canonical runtime permit"
-                            );
+                            match reason {
+                                CanonicalRuntimeNoApplyReasonV1::ContinuityOnly => {
+                                    ::metrics::counter!(
+                                        "seer_pool_detection_runtime_disposition_total",
+                                        1u64,
+                                        "disposition" => "continuity_only"
+                                    );
+                                    info!(
+                                        pool = %candidate.pool_amm_id,
+                                        mint = %candidate.base_mint,
+                                        continuity_observation_pool = ?event.continuity_observation_pool,
+                                        "Seer: continuity-only pool bypassed canonical Ledger and CandidateIntegrity before runtime admission; existing confirmed-position monitoring remains independent"
+                                    );
+                                }
+                                CanonicalRuntimeNoApplyReasonV1::Suppressed => {
+                                    ::metrics::counter!(
+                                        "seer_pool_detection_runtime_disposition_total",
+                                        1u64,
+                                        "disposition" => "suppressed"
+                                    );
+                                    info!(
+                                        pool = %candidate.pool_amm_id,
+                                        mint = %candidate.base_mint,
+                                        "Seer: suppressed pool bypassed canonical Ledger and CandidateIntegrity before runtime admission"
+                                    );
+                                }
+                                _ => {
+                                    debug!(
+                                        pool = %candidate.pool_amm_id,
+                                        mint = %candidate.base_mint,
+                                        reason = ?reason,
+                                        "Seer: pool wrapper has no canonical runtime permit"
+                                    );
+                                }
+                            }
                             continue;
                         }
                         CanonicalRuntimeAdmissionV1::Blocked(outcome) => {
@@ -6183,44 +6252,6 @@ pub async fn run(
                             continue;
                         }
                     };
-                    if let Err(reason) = authorize_pool_runtime_disposition(
-                        event.runtime_disposition,
-                        &permit,
-                        candidate_integrity_registry_ipc.as_ref(),
-                    ) {
-                        match reason {
-                            CanonicalRuntimeNoApplyReasonV1::ContinuityOnly => {
-                                ::metrics::counter!(
-                                    "seer_pool_detection_runtime_disposition_total",
-                                    1u64,
-                                    "disposition" => "continuity_only"
-                                );
-                                info!(
-                                    pool = %candidate.pool_amm_id,
-                                    mint = %candidate.base_mint,
-                                    continuity_observation_pool = ?event.continuity_observation_pool,
-                                    "Seer: continuity-only pool cannot create a candidate session or structural runtime event; existing confirmed-position monitoring remains independent"
-                                );
-                            }
-                            CanonicalRuntimeNoApplyReasonV1::Suppressed => {
-                                ::metrics::counter!(
-                                    "seer_pool_detection_runtime_disposition_total",
-                                    1u64,
-                                    "disposition" => "suppressed"
-                                );
-                                info!(
-                                    pool = %candidate.pool_amm_id,
-                                    mint = %candidate.base_mint,
-                                    "Seer: canonical raw observation retained, but suppressed pool is not admitted to runtime"
-                                );
-                            }
-                            _ => unreachable!(
-                                "pool runtime disposition returns only continuity/suppressed"
-                            ),
-                        }
-                        continue;
-                    }
-
                     info!(
                         "Seer: Pool detected via IPC - pool={}, amm={}, priority={:?}",
                         candidate.pool_amm_id, candidate.amm_program_id, event.priority
@@ -7011,10 +7042,10 @@ pub fn trade_event_to_pool_transaction(
 #[cfg(test)]
 mod tests {
     use super::{
-        authorize_pool_runtime_disposition, detected_pool_from_candidate, detection_clock_summary,
-        emit_account_update_to_event_bus, emit_execution_account_evidence_to_event_bus,
-        emit_funding_transfer_to_event_bus, finalize_pump_observation_ledger,
-        handle_local_coverage_gap_notice, ingest_pump_observation,
+        detected_pool_from_candidate, detection_clock_summary, emit_account_update_to_event_bus,
+        emit_execution_account_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
+        finalize_pump_observation_ledger, handle_local_coverage_gap_notice,
+        ingest_pool_detection_observation, ingest_pump_observation,
         is_primary_raw_runtime_authority, missing_primary_observation_signal,
         nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
         pool_candidate_matches_primary_observation, process_pool_detected_event_for_session_gate,
@@ -8024,38 +8055,57 @@ mod tests {
         ))
     }
 
-    #[tokio::test]
-    async fn pr1e_continuity_only_has_zero_structural_runtime_emissions() {
-        let (event_tx, mut event_rx) = create_event_bus();
+    #[test]
+    fn pr1e_continuity_only_bypasses_pre_admission_without_alias_tombstone() {
         let pool = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let candidate = make_candidate(pool, mint);
         let registry = Arc::new(CandidateIntegrityRegistry::default());
-        let permit = runtime_permit_for_candidate(&registry, &candidate, 1);
+        let permit = runtime_permit_for_candidate(&registry, &candidate, 29);
+        let continuity_pool = Pubkey::new_unique();
+        let continuity_candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: continuity_pool,
+            mint,
+        };
+        let continuity_observation =
+            primary_trade_observation(Signature::new_unique(), continuity_pool, mint, 30);
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
 
-        assert_eq!(
-            authorize_pool_runtime_disposition(
+        assert!(matches!(
+            ingest_pool_detection_observation(
+                true,
                 seer::ipc::PoolDetectionRuntimeDispositionV1::ContinuityOnly,
-                &permit,
-                registry.as_ref(),
+                &ledger,
+                &registry,
+                Some(continuity_observation),
+                30,
+                true,
+                Some(missing_primary_observation_signal(
+                    continuity_candidate,
+                    Some(Signature::new_unique()),
+                )),
             ),
-            Err(CanonicalRuntimeNoApplyReasonV1::ContinuityOnly)
-        );
+            CanonicalRuntimeAdmissionV1::NoApply(CanonicalRuntimeNoApplyReasonV1::ContinuityOnly)
+        ));
+
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), event_rx.recv())
-                .await
-                .is_err(),
-            "ContinuityOnly must not emit NewPoolDetected or PoolTransaction"
+            registry.snapshot(continuity_candidate).is_err(),
+            "ContinuityOnly must not create a CandidateIntegrity record"
         );
-        assert_eq!(event_tx.receiver_count(), 1);
-        assert!(
+        assert_eq!(
             registry
-                .evaluation_guard(PumpCandidateIdentityV1 {
-                    pool_amm_id: pool,
-                    mint,
-                })
-                .is_err(),
-            "ContinuityOnly must not make the candidate eligible for MFS"
+                .terminal_tombstone_count()
+                .expect("tombstone count"),
+            0,
+            "ContinuityOnly must not leave an alias tombstone for the shared mint"
+        );
+
+        registry
+            .mark_canonical_apply_succeeded(&permit.apply_receipt)
+            .expect("the real Pump candidate must still acknowledge downstream apply");
+        assert!(
+            registry.candidate_admission_open(),
+            "the continuity alias must remain candidate-local and keep global admission open"
         );
     }
 
