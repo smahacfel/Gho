@@ -77,9 +77,11 @@ valid Pump receipt staged
 
 Po focused testach wymagane są: `cargo fmt --all --check`, istniejący PR1E
 qualification case dla `continuity_only_restored_position`, release build obu
-binarek oraz nowy 10-minutowy qualifying smoke. Dzień 1 może wystartować
-wyłącznie, jeżeli smoke przejdzie wszystkie ustalone health i offline-probe
-bramki.
+binarek oraz nowy 10-minutowy qualifying smoke. Health helper zachowuje
+fail-closed duration contract i teraz dopuszcza dokładnie tę zleconą górną
+granicę (`600_000 ms`); test odrzuca nawet jeden milisekundowy overshoot.
+Dzień 1 może wystartować wyłącznie, jeżeli smoke przejdzie wszystkie ustalone
+health i offline-probe bramki.
 
 ## D4. Poza zakresem
 

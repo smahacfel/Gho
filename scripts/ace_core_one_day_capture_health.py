@@ -31,7 +31,10 @@ REQUIRED_COUNTERS = (
 )
 CAPTURE_KINDS = ("smoke", "day1")
 SMOKE_MIN_DURATION_MS = 120_000
-SMOKE_MAX_DURATION_MS = 300_000
+# A qualifying transport/canonical-admission smoke needs enough steady-state
+# time to expose a recurring ingress issue.  The operational contract is ten
+# minutes; callers still receive a fail-closed rejection outside this window.
+SMOKE_MAX_DURATION_MS = 600_000
 DAY1_MIN_DURATION_MS = 86_400_000
 EVENT_WRITER_WRITE_FAILURE_MARKER = "EventEmitter: failed to write event"
 EVENT_WRITER_LOCK_FAILURE_MARKER = "EventEmitter: writer mutex poisoned; event was not persisted"

@@ -135,6 +135,19 @@ class AceCaptureHealthTests(unittest.TestCase):
         self.assertTrue(saved["end_snapshot_sha256"])
         self.assertTrue(root.exists())
 
+    def test_ten_minute_smoke_duration_is_the_upper_bound(self) -> None:
+        duration_ms, failures = health.validate_capture_duration(
+            "smoke", 1_000, 1_000 + health.SMOKE_MAX_DURATION_MS
+        )
+        self.assertEqual(duration_ms, health.SMOKE_MAX_DURATION_MS)
+        self.assertEqual(failures, [])
+
+        _, failures = health.validate_capture_duration(
+            "smoke", 1_000, 1_001 + health.SMOKE_MAX_DURATION_MS
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("outside", failures[0])
+
     def test_invalid_snapshot_does_not_write_health_receipt(self) -> None:
         _, manifest, receipt, events, start, end = self.make_fixture()
         snapshot = json.loads(end.read_bytes())
