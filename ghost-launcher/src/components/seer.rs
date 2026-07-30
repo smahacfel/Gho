@@ -4064,6 +4064,12 @@ fn session_bridge_prune_interval(ttl: Duration, detected_pool_ttl: Duration) -> 
         .max(Duration::from_millis(50))
 }
 
+fn pump_observation_ledger_finalization_interval(
+    config: PumpObservationLedgerConfigV1,
+) -> Duration {
+    Duration::from_nanos(config.correlation_window_ns)
+}
+
 fn pump_observation_classification_label(
     classification: PumpObservationClassificationV1,
 ) -> &'static str {
@@ -5733,6 +5739,8 @@ pub async fn run(
     // silently inheriting an opaque `default()` inside the runtime path.
     // `try_new` rejects zero capacities before candidate admission begins.
     let pump_observation_ledger_config = PumpObservationLedgerConfigV1::default();
+    let pump_observation_ledger_finalization_interval =
+        pump_observation_ledger_finalization_interval(pump_observation_ledger_config);
     let pump_observation_ledger = Arc::new(Mutex::new(
         PumpObservationLedgerV1::try_new(pump_observation_ledger_config).map_err(|error| {
             anyhow::anyhow!("invalid PR1E PumpObservationLedger config: {error}")
@@ -5929,6 +5937,10 @@ pub async fn run(
             SESSION_POOL_TRADE_BUFFER_TTL,
             detected_pool_ttl,
         ));
+        let mut ledger_finalization_interval =
+            tokio::time::interval(pump_observation_ledger_finalization_interval);
+        ledger_finalization_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The IPC coverage control plane retains a bounded monotonic prefix
         // of notices. Track the prefix already classified so secondary audit
         // metrics are not replayed on every subsequent notice. An overflow is
@@ -5998,6 +6010,9 @@ pub async fn run(
                         session_account_update_bridge.prune_expired(Instant::now());
                     record_session_account_update_expired(expired_updates);
                     record_session_account_update_detected_key_expired(expired_update_keys);
+                    continue;
+                }
+                _ = ledger_finalization_interval.tick() => {
                     finalize_pump_observation_ledger(
                         &pump_observation_ledger_ipc,
                         &candidate_integrity_registry_ipc,
@@ -6858,8 +6873,8 @@ mod tests {
         is_primary_raw_runtime_authority, missing_primary_observation_signal,
         nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
         pool_candidate_matches_primary_observation, process_pool_detected_event_for_session_gate,
-        process_trade_event_for_session_gate, pumpswap_program_id,
-        select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
+        process_trade_event_for_session_gate, pump_observation_ledger_finalization_interval,
+        pumpswap_program_id, select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
         trade_has_forwardable_identity, trade_matches_primary_observation,
         validate_pr1e_startup_contract, CanonicalRuntimeAdmissionV1,
         CanonicalRuntimeNoApplyReasonV1, NlnArtifactDeliveryState, NlnArtifactOverflowReasonV1,
@@ -6908,6 +6923,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pump_observation_ledger_finalizer_uses_the_correlation_window_cadence() {
+        let config = PumpObservationLedgerConfigV1::default();
+
+        assert_eq!(
+            pump_observation_ledger_finalization_interval(config),
+            Duration::from_millis(250),
+        );
+    }
     #[test]
     fn pr1d_ordering_ingest_never_publishes_ready_before_downstream_apply() {
         let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
