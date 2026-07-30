@@ -48,7 +48,9 @@ const SUSTAIN_CONFIRM_AT_MS: u64 = 1_000;
 const MAX_STATE_LOOKUP_LAG_MS: u64 = 1_000;
 const OUTCOME_HORIZON_MS: u64 = 120_000;
 const SMOKE_MIN_DURATION_MS: u64 = 120_000;
-const SMOKE_MAX_DURATION_MS: u64 = 300_000;
+// Must stay identical to scripts/ace_core_one_day_capture_health.py.  A
+// manifest-bound qualifying smoke is allowed to run for at most ten minutes.
+const SMOKE_MAX_DURATION_MS: u64 = 600_000;
 const DAY1_MIN_DURATION_MS: u64 = 86_400_000;
 const INGRESS_CUTOFF_CONTRACT: &str =
     "event_ts_ms<=birth_ts_ms+11111 && arrival_ts_ms<=detected_wall_ts_ms+11111";
@@ -2871,6 +2873,44 @@ mod tests {
             .saturating_add(receipt.duration_ms);
         fs::remove_file(health_path).expect("remove fixture health receipt");
         write_json_new(health_path, &receipt).expect("rewrite health receipt");
+        assert!(
+            validate_capture_health_evidence(&manifest_path, &capture_manifest)
+                .contains("capture_health_smoke_duration_out_of_range")
+        );
+    }
+
+    #[test]
+    fn capture_health_evidence_accepts_exact_ten_minute_smoke_upper_bound() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = temp.path().join("manifest.json");
+        let mut capture_manifest = manifest("health-ten-minute-run");
+        capture_manifest.health_evidence_path = temp
+            .path()
+            .join("health.json")
+            .to_string_lossy()
+            .into_owned();
+        write_json_new(&manifest_path, &capture_manifest).expect("manifest");
+        write_valid_health_evidence(&manifest_path, &capture_manifest);
+
+        let health_path = Path::new(&capture_manifest.health_evidence_path);
+        let mut receipt: RugRealityCaptureHealthEvidenceV1 =
+            serde_json::from_slice(&fs::read(health_path).expect("health bytes"))
+                .expect("health receipt");
+        receipt.duration_ms = SMOKE_MAX_DURATION_MS;
+        receipt.end_captured_at_unix_ms = receipt
+            .start_captured_at_unix_ms
+            .saturating_add(receipt.duration_ms);
+        fs::remove_file(health_path).expect("remove fixture health receipt");
+        write_json_new(health_path, &receipt).expect("rewrite health receipt");
+        assert!(validate_capture_health_evidence(&manifest_path, &capture_manifest).is_empty());
+
+        let mut over_limit = receipt;
+        over_limit.duration_ms = SMOKE_MAX_DURATION_MS + 1;
+        over_limit.end_captured_at_unix_ms = over_limit
+            .start_captured_at_unix_ms
+            .saturating_add(over_limit.duration_ms);
+        fs::remove_file(health_path).expect("remove upper-bound health receipt");
+        write_json_new(health_path, &over_limit).expect("rewrite upper-bound receipt");
         assert!(
             validate_capture_health_evidence(&manifest_path, &capture_manifest)
                 .contains("capture_health_smoke_duration_out_of_range")
