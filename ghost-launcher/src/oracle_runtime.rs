@@ -18001,6 +18001,24 @@ fn should_mark_pool_as_strategically_rejected(result: &PoolObservationResult) ->
     result.disposition == PoolObservationDispositionV1::StrategicTerminal
 }
 
+/// Resolve receipts whose only downstream owner was the pool task that has
+/// just completed.  This must run before any runtime identity/session cleanup:
+/// `retire_terminal_candidate` deliberately rejects unresolved obligations.
+fn reclaim_terminal_pool_receipts_before_cleanup(
+    oracle_runtime: &OracleRuntime,
+    pool_id: Pubkey,
+) -> Result<usize, CandidateIntegrityErrorV1> {
+    let Some(identity) = oracle_runtime.lookup_pool_identity(&pool_id) else {
+        return Ok(0);
+    };
+    oracle_runtime
+        .candidate_integrity_registry
+        .fail_pending_canonical_applies_for_candidate(PumpCandidateIdentityV1 {
+            pool_amm_id: pool_id,
+            mint: *identity.base_mint,
+        })
+}
+
 fn ensure_pool_observation_session(
     ctx: &PoolObservationContext,
     pool_id: Pubkey,
@@ -28163,6 +28181,38 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                             1u64
                         );
                     }
+                    match reclaim_terminal_pool_receipts_before_cleanup(
+                        oracle_runtime.as_ref(),
+                        result.pool_id,
+                    ) {
+                        Ok(reclaimed_receipt_count) => {
+                            if reclaimed_receipt_count > 0 {
+                                info!(
+                                    pool = %result.pool_id,
+                                    reclaimed_receipt_count,
+                                    unresolved_receipt_count = 0_u64,
+                                    "CANDIDATE_INTEGRITY_TERMINAL_RECEIPTS_RECLAIMED_BEFORE_POOL_CLEANUP"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            // A registry/fence failure while resolving a
+                            // terminal task's still-owned receipts remains a
+                            // global integrity failure.  Cleanup continues on
+                            // the existing path, but no new candidate may be
+                            // admitted through an unverifiable transition.
+                            warn!(
+                                pool = %result.pool_id,
+                                error = %error,
+                                "CandidateIntegrity terminal receipt reclaim failed; closing new candidate admission"
+                            );
+                            oracle_runtime
+                                .candidate_integrity_registry
+                                .close_candidate_admission_with_integrity_invalidation(
+                                    "terminal_candidate_receipt_reclaim_failed",
+                                );
+                        }
+                    }
                     snapshot_engine.remove_pool(result.pool_id);
                     let _ = oracle_runtime
                         .remove_pool_with_reason(result.pool_id, "pool_task_done_cleanup");
@@ -28385,9 +28435,10 @@ mod tests {
     use ghost_core::{
         CanonicalPumpOrderKeyV1, ExecutionAccountEvidenceSource, ExecutionAccountEvidenceStatus,
         GatekeeperDecision as WalGatekeeperDecision, ObservationProvenanceV1,
-        ObservationSourceFamilyV1, ObservedPumpMutationV1, PumpMutationClaimsV1,
-        PumpMutationFamilyV1, PumpObservationLedgerV1, PumpTradeSideV1, RawProviderRoleV1,
-        RawPumpMutationLocatorV1, Wal, WalRecord,
+        ObservationSourceFamilyV1, ObservedPumpMutationV1, PumpEconomicCertificationStatusV1,
+        PumpMutationClaimsV1, PumpMutationFamilyV1, PumpObservationLedgerV1, PumpTradeSideV1,
+        RawProviderRoleV1, RawPumpMutationLocatorV1, StructuralCanonicalPumpMutationV1, Wal,
+        WalRecord,
     };
     use solana_sdk::signature::Keypair;
     use solana_sdk::signer::Signer;
@@ -47060,6 +47111,128 @@ mod tests {
         assert_eq!(
             integrity.audit_markers.last().map(|marker| marker.action),
             Some(CandidateIntegrityConflictActionV1::TerminalVerdictImmutableAudit)
+        );
+    }
+
+    #[test]
+    fn terminal_result_path_reclaims_staged_receipts_before_cleanup_and_blocks_late_apply() {
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+        let pool_id = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool_id,
+            mint: base_mint,
+        };
+        assert!(runtime.register_new_pool(
+            pool_id,
+            base_mint,
+            EnhancedCandidate {
+                pool_amm_id: pool_id,
+                base_mint,
+                bonding_curve,
+                initial_liquidity_sol: 8.0,
+                ..Default::default()
+            },
+            None,
+        ));
+
+        let signature = Signature::new_unique();
+        let locator = RawPumpMutationLocatorV1 {
+            program_id: Pubkey::new_unique(),
+            signature,
+            outer_instruction_index: 3,
+            inner_instruction_path: vec![3],
+            semantic_event_ordinal: 15,
+        };
+        let receipt = runtime
+            .candidate_integrity_registry
+            .stage_canonical_mutation(&StructuralCanonicalPumpMutationV1 {
+                mutation_family: PumpMutationFamilyV1::Trade,
+                locator: locator.clone(),
+                order: CanonicalPumpOrderKeyV1 {
+                    slot: 436_062_972,
+                    tx_index: 407,
+                    outer_instruction_index: locator.outer_instruction_index,
+                    inner_instruction_path: locator.inner_instruction_path.clone(),
+                    semantic_event_ordinal: locator.semantic_event_ordinal,
+                },
+                claims: PumpMutationClaimsV1 {
+                    curve: Some(pool_id),
+                    mint: Some(base_mint),
+                    success: Some(true),
+                    ..PumpMutationClaimsV1::default()
+                },
+                primary_raw_provenance: ObservationProvenanceV1 {
+                    source_family: ObservationSourceFamilyV1::RawYellowstone,
+                    source_id: "test".to_string(),
+                    provider_id: "primary".to_string(),
+                    schema_id: "test".to_string(),
+                    payload_hash_blake3: [67; 32],
+                    received_at_monotonic_ns: 1,
+                },
+                economics_status: PumpEconomicCertificationStatusV1::PendingAnchor,
+            })
+            .expect("stage receipt before terminal result wins the select");
+
+        assert_eq!(
+            runtime
+                .candidate_integrity_registry
+                .canonical_apply_fence_counts()
+                .expect("one unresolved receipt before terminal cleanup"),
+            (1, 0)
+        );
+
+        // This is the result_rx ordering: the pool task is terminal, so the
+        // receipt has no remaining downstream owner and is reclaimed before
+        // any session, identity, or pool cleanup begins.
+        assert_eq!(
+            reclaim_terminal_pool_receipts_before_cleanup(&runtime, pool_id)
+                .expect("terminal receipt reclaim"),
+            1
+        );
+        assert_eq!(
+            runtime
+                .candidate_integrity_registry
+                .canonical_apply_fence_counts()
+                .expect("terminal reclaim removes every unresolved receipt"),
+            (0, 0)
+        );
+        assert!(runtime
+            .candidate_integrity_registry
+            .candidate_admission_open());
+
+        assert!(runtime.remove_pool_with_reason(pool_id, "test_terminal_result_cleanup"));
+        assert!(runtime
+            .candidate_integrity_registry
+            .candidate_admission_open());
+        assert!(
+            runtime.lookup_pool_identity(&pool_id).is_none(),
+            "cleanup must not retain a pool after its receipts are terminal"
+        );
+        assert!(matches!(
+            runtime
+                .candidate_integrity_registry
+                .mark_canonical_apply_succeeded(&receipt),
+            Err(CandidateIntegrityErrorV1::CandidateMissing)
+        ));
+        assert!(matches!(
+            runtime
+                .candidate_integrity_registry
+                .evaluation_guard(candidate),
+            Err(CandidateIntegrityErrorV1::CandidateMissing)
+        ));
+        assert_eq!(
+            runtime
+                .candidate_integrity_registry
+                .canonical_apply_fence_counts()
+                .expect("late canonical apply cannot recreate a receipt or pool"),
+            (0, 0)
         );
     }
 

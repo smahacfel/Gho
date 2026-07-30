@@ -974,6 +974,39 @@ impl CandidateIntegrityRegistry {
         Ok(())
     }
 
+    /// Resolve the canonical-apply obligations that still belong to one
+    /// terminal Oracle candidate.
+    ///
+    /// The caller has already proved that the per-pool observation task is
+    /// terminal, so no remaining receipt can receive a downstream apply
+    /// acknowledgement from that task.  This intentionally delegates every
+    /// individual transition to [`Self::fail_canonical_apply`]: it does not
+    /// delete fence entries, bypass identity checks, or weaken the bounded
+    /// receipt/proof lifecycle.
+    pub(crate) fn fail_pending_canonical_applies_for_candidate(
+        &self,
+        candidate: PumpCandidateIdentityV1,
+    ) -> Result<usize, CandidateIntegrityErrorV1> {
+        self.require_available()?;
+        let pending = {
+            let state = self.lock_state()?;
+            state
+                .canonical_apply_fence
+                .receipts_by_runtime_key
+                .values()
+                .filter(|entry| {
+                    entry.receipt.candidate == candidate && !entry.applied && !entry.failed
+                })
+                .map(|entry| entry.receipt.clone())
+                .collect::<Vec<_>>()
+        };
+
+        for receipt in &pending {
+            self.fail_canonical_apply(receipt)?;
+        }
+        Ok(pending.len())
+    }
+
     pub(crate) fn fail_ready_release(
         &self,
         release: &CandidateIntegrityReadyReleaseV1,
