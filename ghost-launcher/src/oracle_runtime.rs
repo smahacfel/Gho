@@ -4876,24 +4876,38 @@ impl OracleRuntime {
         let had_runtime_state = self.runtime_pool_state(&pool_amm_id).is_some();
 
         // Linearize terminal cleanup before any runtime identity can be
-        // removed. The registry marks the per-candidate barrier and snapshots
-        // outstanding receipts under one lock, so concurrent canonical staging
-        // cannot create a new obligation between reclamation and retirement.
+        // removed. The registry marks the per-candidate barrier, waits for a
+        // pre-existing ledger→receipt ingest lease to finish, and only then
+        // snapshots outstanding receipts. This is the single owner of the
+        // terminal reclaim sequence: result_rx must not reclaim separately.
         if let Some(candidate) = terminal_candidate {
-            if let Err(error) = self
+            match self
                 .candidate_integrity_registry
                 .fail_pending_canonical_applies_for_candidate(candidate)
             {
-                warn!(
-                    pool = %pool_amm_id,
-                    base_mint = %candidate.mint,
-                    error = %error,
-                    "CandidateIntegrity terminal cleanup barrier could not reclaim receipts; closing new candidate admission"
-                );
-                self.candidate_integrity_registry
-                    .close_candidate_admission_with_integrity_invalidation(
-                        "terminal_candidate_receipt_reclaim_failed",
+                Ok(reclaimed_receipt_count) => {
+                    if reclaimed_receipt_count > 0 {
+                        info!(
+                            pool = %pool_amm_id,
+                            base_mint = %candidate.mint,
+                            reclaimed_receipt_count,
+                            unresolved_receipt_count = 0_u64,
+                            "CANDIDATE_INTEGRITY_TERMINAL_RECEIPTS_RECLAIMED_BEFORE_POOL_CLEANUP"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        pool = %pool_amm_id,
+                        base_mint = %candidate.mint,
+                        error = %error,
+                        "CandidateIntegrity terminal cleanup barrier could not reclaim receipts; closing new candidate admission"
                     );
+                    self.candidate_integrity_registry
+                        .close_candidate_admission_with_integrity_invalidation(
+                            "terminal_candidate_receipt_reclaim_failed",
+                        );
+                }
             }
         }
 
@@ -18058,24 +18072,6 @@ fn acknowledge_seer_oracle_drain_barrier(barrier: &SeerOracleDrainBarrierV1) {
     );
 }
 
-/// Resolve receipts whose only downstream owner was the pool task that has
-/// just completed.  This must run before any runtime identity/session cleanup:
-/// `retire_terminal_candidate` deliberately rejects unresolved obligations.
-fn reclaim_terminal_pool_receipts_before_cleanup(
-    oracle_runtime: &OracleRuntime,
-    pool_id: Pubkey,
-) -> Result<usize, CandidateIntegrityErrorV1> {
-    let Some(identity) = oracle_runtime.lookup_pool_identity(&pool_id) else {
-        return Ok(0);
-    };
-    oracle_runtime
-        .candidate_integrity_registry
-        .fail_pending_canonical_applies_for_candidate(PumpCandidateIdentityV1 {
-            pool_amm_id: pool_id,
-            mint: *identity.base_mint,
-        })
-}
-
 fn ensure_pool_observation_session(
     ctx: &PoolObservationContext,
     pool_id: Pubkey,
@@ -28241,38 +28237,6 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                             "candidate_integrity_technical_cleanup_total",
                             1u64
                         );
-                    }
-                    match reclaim_terminal_pool_receipts_before_cleanup(
-                        oracle_runtime.as_ref(),
-                        result.pool_id,
-                    ) {
-                        Ok(reclaimed_receipt_count) => {
-                            if reclaimed_receipt_count > 0 {
-                                info!(
-                                    pool = %result.pool_id,
-                                    reclaimed_receipt_count,
-                                    unresolved_receipt_count = 0_u64,
-                                    "CANDIDATE_INTEGRITY_TERMINAL_RECEIPTS_RECLAIMED_BEFORE_POOL_CLEANUP"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            // A registry/fence failure while resolving a
-                            // terminal task's still-owned receipts remains a
-                            // global integrity failure.  Cleanup continues on
-                            // the existing path, but no new candidate may be
-                            // admitted through an unverifiable transition.
-                            warn!(
-                                pool = %result.pool_id,
-                                error = %error,
-                                "CandidateIntegrity terminal receipt reclaim failed; closing new candidate admission"
-                            );
-                            oracle_runtime
-                                .candidate_integrity_registry
-                                .close_candidate_admission_with_integrity_invalidation(
-                                    "terminal_candidate_receipt_reclaim_failed",
-                                );
-                        }
                     }
                     snapshot_engine.remove_pool(result.pool_id);
                     let _ = oracle_runtime
@@ -47249,14 +47213,10 @@ mod tests {
             (1, 0)
         );
 
-        // This is the result_rx ordering: the pool task is terminal, so the
-        // receipt has no remaining downstream owner and is reclaimed before
-        // any session, identity, or pool cleanup begins.
-        assert_eq!(
-            reclaim_terminal_pool_receipts_before_cleanup(&runtime, pool_id)
-                .expect("terminal receipt reclaim"),
-            1
-        );
+        // `remove_pool_with_reason` is the sole terminal owner. It reclaims
+        // the receipt before removing any session or identity; result_rx must
+        // not perform a second reclaim in front of this call.
+        assert!(runtime.remove_pool_with_reason(pool_id, "test_terminal_result_cleanup"));
         assert_eq!(
             runtime
                 .candidate_integrity_registry
@@ -47268,7 +47228,6 @@ mod tests {
             .candidate_integrity_registry
             .candidate_admission_open());
 
-        assert!(runtime.remove_pool_with_reason(pool_id, "test_terminal_result_cleanup"));
         assert!(runtime
             .candidate_integrity_registry
             .candidate_admission_open());

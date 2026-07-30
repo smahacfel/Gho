@@ -35,10 +35,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 use crate::candidate_integrity::CanonicalMutationApplyReceiptV1;
 use ghost_core::RawPumpMutationLocatorV1;
@@ -67,8 +67,11 @@ pub struct CanonicalRuntimePermitV1 {
 #[derive(Clone)]
 pub struct SeerOracleDrainBarrierV1 {
     sequence: u64,
-    oracle_processed: Arc<AtomicBool>,
-    oracle_processed_notify: Arc<tokio::sync::Notify>,
+    /// `watch` retains the latest acknowledgement.  Unlike `Notify`, an
+    /// acknowledgement published between the initial false observation and
+    /// `changed().await` remains visible to a later waiter.
+    oracle_processed_tx: watch::Sender<bool>,
+    oracle_processed_rx: watch::Receiver<bool>,
 }
 
 impl std::fmt::Debug for SeerOracleDrainBarrierV1 {
@@ -76,10 +79,7 @@ impl std::fmt::Debug for SeerOracleDrainBarrierV1 {
         formatter
             .debug_struct("SeerOracleDrainBarrierV1")
             .field("sequence", &self.sequence)
-            .field(
-                "oracle_processed",
-                &self.oracle_processed.load(Ordering::Acquire),
-            )
+            .field("oracle_processed", &*self.oracle_processed_rx.borrow())
             .finish()
     }
 }
@@ -87,10 +87,11 @@ impl std::fmt::Debug for SeerOracleDrainBarrierV1 {
 impl SeerOracleDrainBarrierV1 {
     #[must_use]
     pub(crate) fn new(sequence: u64) -> Self {
+        let (oracle_processed_tx, oracle_processed_rx) = watch::channel(false);
         Self {
             sequence,
-            oracle_processed: Arc::new(AtomicBool::new(false)),
-            oracle_processed_notify: Arc::new(tokio::sync::Notify::new()),
+            oracle_processed_tx,
+            oracle_processed_rx,
         }
     }
 
@@ -100,15 +101,32 @@ impl SeerOracleDrainBarrierV1 {
     }
 
     pub(crate) fn acknowledge_oracle_processed(&self) {
-        if !self.oracle_processed.swap(true, Ordering::AcqRel) {
-            self.oracle_processed_notify.notify_waiters();
-        }
+        self.oracle_processed_tx.send_if_modified(|processed| {
+            if *processed {
+                false
+            } else {
+                *processed = true;
+                true
+            }
+        });
     }
 
     pub(crate) async fn wait_for_oracle_processed(&self) {
-        while !self.oracle_processed.load(Ordering::Acquire) {
-            self.oracle_processed_notify.notified().await;
+        let mut oracle_processed_rx = self.oracle_processed_rx.clone();
+        while !*oracle_processed_rx.borrow_and_update() {
+            // The sender is retained by the barrier itself for its complete
+            // lifetime. A closed watch channel therefore cannot mean a valid
+            // drain acknowledgement; it is nevertheless impossible here in
+            // normal ownership and returning avoids a shutdown wait panic.
+            if oracle_processed_rx.changed().await.is_err() {
+                return;
+            }
         }
+    }
+
+    #[cfg(test)]
+    fn oracle_processed_subscriber_for_test(&self) -> watch::Receiver<bool> {
+        self.oracle_processed_rx.clone()
     }
 }
 
@@ -2627,6 +2645,31 @@ mod tests {
         .await
         .expect("acknowledged barrier resolves the upstream wait");
         assert_eq!(barrier.sequence(), 7);
+    }
+
+    #[tokio::test]
+    async fn seer_oracle_drain_barrier_retains_ack_between_false_check_and_wait_arm() {
+        let barrier = SeerOracleDrainBarrierV1::new(8);
+        let mut oracle_processed_rx = barrier.oracle_processed_subscriber_for_test();
+
+        // Deterministically reproduce the former lost-wakeup window: the
+        // waiter observes false, Oracle acknowledges, and only then the
+        // waiter arms its wait. `watch` retains the new version, so
+        // `changed()` must resolve instead of timing out.
+        assert!(!*oracle_processed_rx.borrow_and_update());
+        barrier.acknowledge_oracle_processed();
+        tokio::time::timeout(Duration::from_millis(100), oracle_processed_rx.changed())
+            .await
+            .expect("ack published before wait arm must remain observable")
+            .expect("barrier owns the watch sender until shutdown completes");
+        assert!(*oracle_processed_rx.borrow_and_update());
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            barrier.wait_for_oracle_processed(),
+        )
+        .await
+        .expect("retained acknowledgement resolves the production waiter");
     }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -4515,6 +4515,60 @@ pub(crate) fn ingest_pump_observation(
         && observation.raw_provider_role == Some(RawProviderRoleV1::PrimaryAuthority);
     let wrapper_primary_observation_mismatch =
         !boundary_payload_aligned && missing_primary_signal.is_some();
+
+    // A terminal candidate must be blocked before it can mutate the
+    // Observation Ledger. This lease remains live only for the synchronous
+    // ledger-observe → canonical-receipt-stage section below. If terminal
+    // cleanup has already linearized, no active Ledger record is created; if
+    // ingest got here first, cleanup waits for the lease to leave a matching
+    // receipt before it retires the Ledger handoff.
+    let primary_observation_candidate =
+        if observation_is_declared_primary && boundary_payload_aligned {
+            observation.claims.curve.zip(observation.claims.mint)
+        } else {
+            None
+        };
+    let canonical_observation_lease = if let Some((pool_amm_id, mint)) =
+        primary_observation_candidate
+    {
+        let candidate = PumpCandidateIdentityV1 { pool_amm_id, mint };
+        match candidate_integrity_registry.acquire_canonical_observation_lease(candidate) {
+            Ok(lease) => Some(lease),
+            Err(CandidateIntegrityErrorV1::TerminalCleanupInProgress) => {
+                warn!(
+                    pool = %pool_amm_id,
+                    mint = %mint,
+                    signature = %observation.signature,
+                    "Seer: primary Pump observation arrived after terminal cleanup linearization; Ledger mutation suppressed"
+                );
+                return CanonicalRuntimeAdmissionV1::NoApply(
+                    CanonicalRuntimeNoApplyReasonV1::Suppressed,
+                );
+            }
+            Err(error) => {
+                error!(
+                    pool = %pool_amm_id,
+                    mint = %mint,
+                    signature = %observation.signature,
+                    error = %error,
+                    "Seer: canonical observation lease acquisition failed before Ledger mutation; canonical runtime emission blocked"
+                );
+                record_integrity_signal(
+                    candidate_integrity_registry,
+                    missing_primary_signal,
+                    "canonical_observation_lease_failed",
+                );
+                candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
+                    "canonical_observation_lease_failed",
+                );
+                return CanonicalRuntimeAdmissionV1::Blocked(
+                    CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let result: PumpObservationLedgerResultV1 = match ledger.lock() {
         Ok(mut ledger) if !boundary_payload_aligned && observation_is_declared_primary => {
             ledger.observe_primary_boundary_mismatch(observation)
@@ -4609,7 +4663,11 @@ pub(crate) fn ingest_pump_observation(
         }
         return CanonicalRuntimeAdmissionV1::NoApply(reason);
     };
-    let receipt = match candidate_integrity_registry.stage_canonical_mutation(canonical) {
+    let receipt = match canonical_observation_lease
+        .as_ref()
+        .ok_or(CandidateIntegrityErrorV1::CandidateMissing)
+        .and_then(|lease| lease.stage_canonical_mutation(canonical))
+    {
         Ok(receipt) => receipt,
         Err(CandidateIntegrityErrorV1::TerminalCleanupInProgress) => {
             // Oracle has linearized terminal cleanup for this exact candidate.
@@ -4653,7 +4711,6 @@ pub(crate) fn ingest_pump_observation(
             );
         }
     };
-
     // A canonical receipt is the ownership fence for this runtime mutation.
     // It must exist before a derived non-Ready signal can classify the
     // candidate as terminal pre-session evidence; otherwise that signal could
@@ -4779,12 +4836,17 @@ pub(crate) fn ingest_pump_observation(
         1u64,
         "authority_epoch_id" => authority_epoch_id.to_string()
     );
-    CanonicalRuntimeAdmissionV1::Apply(CanonicalRuntimePermitV1 {
+    let permit = CanonicalRuntimePermitV1 {
         authority_epoch_id,
         locator: canonical.locator.clone(),
         primary_payload_hash_blake3: canonical.primary_raw_provenance.payload_hash_blake3,
         apply_receipt: receipt,
-    })
+    };
+    // The lease also covers the synchronous integrity work required to issue
+    // the permit. A terminal cleanup can reclaim only after this complete
+    // canonical ingest step has either returned a permit or failed locally.
+    drop(canonical_observation_lease);
+    CanonicalRuntimeAdmissionV1::Apply(permit)
 }
 
 fn finalize_pump_observation_ledger(
@@ -6996,7 +7058,7 @@ mod tests {
     use serde_json::{json, Value};
     use solana_sdk::{pubkey::Pubkey, signature::Signature};
     use std::str::FromStr;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::{broadcast, mpsc};
 
@@ -7272,6 +7334,127 @@ mod tests {
             .drain_terminal_ledger_retirements()
             .expect("retirement handoff was drained")
             .is_empty());
+    }
+
+    #[test]
+    fn terminal_cleanup_lease_prevents_late_ledger_mutation_before_receipt_reclaim() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint,
+        };
+        let ingest_lease_acquired = Arc::new(Barrier::new(2));
+        let release_ingest = Arc::new(Barrier::new(2));
+        let lease_hook_entered = Arc::clone(&ingest_lease_acquired);
+        let lease_hook_release = Arc::clone(&release_ingest);
+        registry.set_canonical_observation_lease_acquired_hook(Some(Arc::new(move || {
+            lease_hook_entered.wait();
+            lease_hook_release.wait();
+        })));
+
+        let cleanup_barrier_installed = Arc::new(Barrier::new(2));
+        let release_cleanup = Arc::new(Barrier::new(2));
+        let cleanup_hook_entered = Arc::clone(&cleanup_barrier_installed);
+        let cleanup_hook_release = Arc::clone(&release_cleanup);
+        registry.set_terminal_cleanup_barrier_installed_hook(Some(Arc::new(move || {
+            cleanup_hook_entered.wait();
+            cleanup_hook_release.wait();
+        })));
+
+        let ingest_ledger = Arc::clone(&ledger);
+        let ingest_registry = Arc::clone(&registry);
+        let ingest_thread = std::thread::spawn(move || {
+            let mut observation = primary_trade_observation(Signature::new_unique(), pool, mint, 0);
+            observation.raw_transaction_mutation_count = Some(1);
+            ingest_pump_observation(
+                &ingest_ledger,
+                &ingest_registry,
+                Some(observation),
+                1,
+                true,
+                None,
+            )
+        });
+        ingest_lease_acquired.wait();
+
+        let cleanup_registry = Arc::clone(&registry);
+        let cleanup_thread = std::thread::spawn(move || {
+            cleanup_registry.fail_pending_canonical_applies_for_candidate(candidate)
+        });
+        cleanup_barrier_installed.wait();
+
+        // The terminal barrier now wins any second ingest before it can call
+        // `ledger.observe`. This is the exact pre-ledger half of the race that
+        // the former receipt-only barrier left open.
+        let late_admission = ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(
+                Signature::new_unique(),
+                pool,
+                mint,
+                1,
+            )),
+            2,
+            true,
+            None,
+        );
+        assert!(matches!(
+            late_admission,
+            CanonicalRuntimeAdmissionV1::NoApply(CanonicalRuntimeNoApplyReasonV1::Suppressed)
+        ));
+        assert_eq!(
+            ledger
+                .lock()
+                .expect("ledger remains untouched before leased ingest resumes")
+                .snapshot()
+                .canonical_mutation_count,
+            0
+        );
+
+        // Let cleanup reach its lease wait, then allow the already-issued
+        // ingest lease to complete ledger mutation and receipt staging.
+        release_cleanup.wait();
+        release_ingest.wait();
+        let leased_ingest_admission = ingest_thread.join().expect("ingest thread join");
+        assert!(
+            matches!(leased_ingest_admission, CanonicalRuntimeAdmissionV1::Apply(_)),
+            "pre-barrier ingest must issue its permit before terminal cleanup reclaims the staged receipt, got {leased_ingest_admission:?}"
+        );
+        assert_eq!(
+            cleanup_thread
+                .join()
+                .expect("cleanup thread join")
+                .expect("terminal cleanup after lease release"),
+            1
+        );
+
+        // The failed terminal receipt produces the normal bounded ledger
+        // retirement handoff. Drain it only after the receipt is terminal;
+        // neither an active Ledger record nor an unresolved proof remains.
+        assert!(registry
+            .retire_terminal_candidate(candidate)
+            .expect("terminal retirement after reclaim"));
+        registry
+            .finish_terminal_candidate_cleanup(candidate)
+            .expect("finish terminal cleanup after retirement");
+        finalize_pump_observation_ledger(&ledger, &registry, 3);
+        let snapshot = ledger.lock().expect("terminal ledger snapshot").snapshot();
+        assert_eq!(snapshot.canonical_mutation_count, 0);
+        assert_eq!(snapshot.retained_terminal_canonical_tombstone_count, 1);
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("all canonical obligations terminal"),
+            (0, 0)
+        );
+        assert!(registry.candidate_admission_open());
+
+        registry.set_canonical_observation_lease_acquired_hook(None);
+        registry.set_terminal_cleanup_barrier_installed_hook(None);
     }
 
     #[test]

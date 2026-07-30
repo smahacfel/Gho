@@ -4083,10 +4083,6 @@ struct Bcv2HydrationLifecycle {
     tx: Option<tokio::sync::mpsc::Sender<Bcv2HydrationRequest>>,
     rx: Option<tokio::sync::mpsc::Receiver<Bcv2HydrationRequest>>,
     worker: Option<tokio::task::JoinHandle<()>>,
-    /// Typed RpcMissing evidence emitted for normal enqueue failures is owned
-    /// by the hydration lifecycle too. It must complete before IPC shuts down
-    /// and therefore cannot become a detached shutdown producer.
-    immediate_evidence_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 enum Bcv2HydrationEnqueueResult {
@@ -4123,7 +4119,6 @@ impl Bcv2HydrationService {
                 tx: Some(tx),
                 rx: Some(rx),
                 worker: None,
-                immediate_evidence_tasks: Vec::new(),
             })),
             queued_pubkeys: Arc::new(DashSet::new()),
             ipc_sender,
@@ -4175,15 +4170,9 @@ impl Bcv2HydrationService {
                 {
                     Ok(()) => Bcv2HydrationEnqueueResult::Accepted,
                     Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
-                        self.spawn_owned_missing_evidence(&mut lifecycle, &request, "queue_full");
                         Bcv2HydrationEnqueueResult::Full(request)
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(request)) => {
-                        self.spawn_owned_missing_evidence(
-                            &mut lifecycle,
-                            &request,
-                            "worker_closed",
-                        );
                         Bcv2HydrationEnqueueResult::WorkerClosed(request)
                     }
                 }
@@ -4214,28 +4203,22 @@ impl Bcv2HydrationService {
                 self.queued_pubkeys.remove(&request.pubkey);
                 let evidence = Bcv2RpcHydrationEvidence::missing(None, "queue_full", 0, 0, 0);
                 record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
+                self.try_emit_missing_evidence(&request, "queue_full");
             }
             Bcv2HydrationEnqueueResult::WorkerClosed(request) => {
                 self.queued_pubkeys.remove(&request.pubkey);
                 let evidence = Bcv2RpcHydrationEvidence::missing(None, "worker_closed", 0, 0, 0);
                 record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
+                self.try_emit_missing_evidence(&request, "worker_closed");
             }
         }
     }
 
-    /// Restore the pre-shutdown typed `RpcMissing` contract for normal
-    /// hydration enqueue failures. The task is deliberately retained by the
-    /// lifecycle and joined during shutdown, unlike the former detached
-    /// background send.
-    fn spawn_owned_missing_evidence(
-        &self,
-        lifecycle: &mut Bcv2HydrationLifecycle,
-        request: &Bcv2HydrationRequest,
-        reason: &'static str,
-    ) {
-        lifecycle
-            .immediate_evidence_tasks
-            .retain(|task| !task.is_finished());
+    /// Restore the normal typed `RpcMissing` contract without creating one
+    /// Tokio task per hydration enqueue failure. This attempts the existing
+    /// bounded IPC FIFO synchronously; its typed saturation error follows the
+    /// normal fail-closed local-coverage-gap path.
+    fn try_emit_missing_evidence(&self, request: &Bcv2HydrationRequest, reason: &'static str) {
         let Some(ipc_sender) = self.ipc_sender.clone() else {
             return;
         };
@@ -4243,36 +4226,15 @@ impl Bcv2HydrationService {
             request,
             &Bcv2RpcHydrationEvidence::missing(None, reason, 0, 0, 0),
         );
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                lifecycle
-                    .immediate_evidence_tasks
-                    .push(handle.spawn(async move {
-                        let send_result = tokio::time::timeout(
-                            Duration::from_millis(BCV2_EVIDENCE_SEND_TIMEOUT_MS),
-                            ipc_sender
-                                .send_execution_account_evidence(evidence, EventPriority::High),
-                        )
-                        .await;
-                        match send_result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => warn!(
-                                error = %error,
-                                source = "rpc_hydration_enqueue_failure",
-                                "BCV2_EXECUTION_ACCOUNT_EVIDENCE_SEND_FAILED"
-                            ),
-                            Err(_) => warn!(
-                                timeout_ms = BCV2_EVIDENCE_SEND_TIMEOUT_MS,
-                                source = "rpc_hydration_enqueue_failure",
-                                "BCV2_EXECUTION_ACCOUNT_EVIDENCE_SEND_TIMEOUT"
-                            ),
-                        }
-                    }));
-            }
-            Err(_) => warn!(
+        if let Err(error) =
+            ipc_sender.try_send_execution_account_evidence(evidence, EventPriority::High)
+        {
+            warn!(
+                error = %error,
                 source = "rpc_hydration_enqueue_failure",
-                "BCV2_EXECUTION_ACCOUNT_EVIDENCE_SEND_SKIPPED_NO_RUNTIME"
-            ),
+                reason,
+                "BCV2_EXECUTION_ACCOUNT_EVIDENCE_SEND_FAILED"
+            );
         }
     }
 
@@ -4280,7 +4242,7 @@ impl Bcv2HydrationService {
     /// point, and join the only hydration producer before the IPC dispatcher
     /// is allowed to stop accepting evidence.
     async fn shutdown_and_join(&self, timeout: Duration) -> Result<(), String> {
-        let (worker, immediate_evidence_tasks) = {
+        let worker = {
             let mut lifecycle = self.lifecycle.lock();
             lifecycle.accepting = false;
             // Closing the owned sender is the worker shutdown signal. The
@@ -4288,10 +4250,7 @@ impl Bcv2HydrationService {
             lifecycle.tx.take();
             // If no worker was ever needed, close the idle receiver too.
             lifecycle.rx.take();
-            (
-                lifecycle.worker.take(),
-                std::mem::take(&mut lifecycle.immediate_evidence_tasks),
-            )
+            lifecycle.worker.take()
         };
 
         let deadline = Instant::now() + timeout;
@@ -4313,24 +4272,6 @@ impl Bcv2HydrationService {
             }
         }
 
-        for mut task in immediate_evidence_tasks {
-            match tokio::time::timeout(remaining(), &mut task).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    return Err(format!(
-                        "BCV2 immediate RpcMissing evidence task join failed: {error}"
-                    ));
-                }
-                Err(_) => {
-                    task.abort();
-                    let _ = task.await;
-                    return Err(format!(
-                        "BCV2 immediate RpcMissing evidence did not drain within {} ms",
-                        timeout.as_millis()
-                    ));
-                }
-            }
-        }
         Ok(())
     }
 }
