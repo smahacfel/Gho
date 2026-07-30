@@ -1477,6 +1477,14 @@ impl IpcReceiver {
         self.local_coverage_gap_rx.clone()
     }
 
+    /// Number of accepted events still waiting for launcher-side handling.
+    /// This is an observation-only shutdown invariant; it does not alter
+    /// backpressure or receiver scheduling.
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.receiver.len()
+    }
+
     /// Record handling latency for the given event using the shared helper.
     fn record_latency(&self, event: &SeerEvent) {
         if let Ok(duration) = event_detected_at(event).elapsed() {

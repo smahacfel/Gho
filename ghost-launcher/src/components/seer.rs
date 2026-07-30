@@ -5835,6 +5835,9 @@ pub async fn run(
     // Create IPC channel for candidate forwarding
     let (ipc_sender, mut ipc_receiver, ipc_metrics) =
         create_ipc_channel(seer_config.ipc_config.clone());
+    // The component owns this clone solely to measure the terminal egress
+    // invariant after the receiver has drained. It does not send runtime work.
+    let ipc_sender_drain = ipc_sender.clone();
     let mut local_coverage_gap_rx = ipc_receiver.local_coverage_gap_receiver();
 
     // Create Seer instance (optionally with ShadowLedger for live curve updates)
@@ -6624,6 +6627,22 @@ pub async fn run(
         }
         warn!("Seer: IPC receiver task has exited - no more pool events will be processed!");
         warn!("Seer: This usually means the Seer core component has stopped or the IPC channel closed");
+
+        let events_sent = ipc_metrics.events_sent.get();
+        let events_received = ipc_metrics.events_received.get();
+        let egress_backlog = ipc_sender_drain.current_queue_length();
+        let downstream_backlog = ipc_receiver.pending_len();
+        if events_sent == events_received && egress_backlog == 0 && downstream_backlog == 0 {
+            info!(
+                events_sent,
+                events_received, egress_backlog, downstream_backlog, "SEER_IPC_DRAIN_COMPLETE"
+            );
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Seer IPC drain invariant failed: events_sent={events_sent} events_received={events_received} egress_backlog={egress_backlog} downstream_backlog={downstream_backlog}"
+            ))
+        }
     });
 
     // Wait for shutdown signal
@@ -6688,8 +6707,14 @@ pub async fn run(
     }
 
     match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, &mut ipc_handle).await {
-        Ok(Ok(())) => {
+        Ok(Ok(Ok(()))) => {
             info!("Seer: IPC receiver drained and stopped");
+        }
+        Ok(Ok(Err(error))) => {
+            error!(error = %error, "Seer: IPC receiver completed without a valid drain");
+            shutdown_failures.push(format!(
+                "Seer IPC receiver completed without a valid drain: {error}"
+            ));
         }
         Ok(Err(join_err)) => {
             shutdown_failures.push(format!(
@@ -6874,14 +6899,15 @@ mod tests {
         nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
         pool_candidate_matches_primary_observation, process_pool_detected_event_for_session_gate,
         process_trade_event_for_session_gate, pump_observation_ledger_finalization_interval,
-        pumpswap_program_id, select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
-        trade_has_forwardable_identity, trade_matches_primary_observation,
-        validate_pr1e_startup_contract, CanonicalRuntimeAdmissionV1,
-        CanonicalRuntimeNoApplyReasonV1, NlnArtifactDeliveryState, NlnArtifactOverflowReasonV1,
-        NlnArtifactRecord, NlnArtifactWriter, NlnProgramStreamCaptureTopic,
-        NlnTradePoolIdentityResolver, NlnTradeResolveDecision, SessionAccountUpdateBridge,
-        SessionAccountUpdateDecision, SessionBcv2Context, SessionExecutionAccountEvidenceDecision,
-        SessionPoolTradeBridge, SessionTradeDecision, TOKEN_PROGRAM_ID,
+        pumpswap_program_id, select_nln_program_stream_subscriptions,
+        trade_event_to_pool_transaction, trade_has_forwardable_identity,
+        trade_matches_primary_observation, validate_pr1e_startup_contract,
+        CanonicalRuntimeAdmissionV1, CanonicalRuntimeNoApplyReasonV1, NlnArtifactDeliveryState,
+        NlnArtifactOverflowReasonV1, NlnArtifactRecord, NlnArtifactWriter,
+        NlnProgramStreamCaptureTopic, NlnTradePoolIdentityResolver, NlnTradeResolveDecision,
+        SessionAccountUpdateBridge, SessionAccountUpdateDecision, SessionBcv2Context,
+        SessionExecutionAccountEvidenceDecision, SessionPoolTradeBridge, SessionTradeDecision,
+        TOKEN_PROGRAM_ID,
     };
     use crate::candidate_integrity::{
         CandidateIntegrityRegistry, CandidateIntegrityRegistryLimitsV1,

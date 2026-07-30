@@ -2602,6 +2602,16 @@ impl Seer {
             }
         }
 
+        // BCV2 hydration owns an async producer that may emit execution
+        // evidence. It must finish every request accepted before shutdown
+        // before IPC stops accepting evidence, otherwise a late hydration
+        // result races a disconnected dispatcher.
+        if let Some(parser) = self.parser.as_ref() {
+            if let Err(err) = parser.shutdown_bcv2_hydration(remaining()).await {
+                failures.push(format!("BCV2 hydration shutdown failed: {err}"));
+            }
+        }
+
         if let Some(sender) = self.ipc_sender.clone() {
             let step_timeout = remaining();
             let task = tokio::task::spawn_blocking(move || sender.shutdown_and_join(step_timeout));

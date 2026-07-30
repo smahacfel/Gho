@@ -15,10 +15,7 @@ use parking_lot::Mutex as ParkingMutex;
 ///   • Resolve queue for account updates that arrive before curve→mint mapping exists
 use std::{
     collections::VecDeque,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -4052,18 +4049,6 @@ fn bcv2_rpc_hydration_execution_evidence(
     )
 }
 
-fn emit_bcv2_rpc_hydration_evidence_background(
-    ipc_sender: Option<&IpcSender>,
-    request: &Bcv2HydrationRequest,
-    evidence: &Bcv2RpcHydrationEvidence,
-) {
-    emit_execution_account_evidence_background(
-        ipc_sender,
-        bcv2_rpc_hydration_execution_evidence(request, evidence),
-        "rpc_hydration",
-    );
-}
-
 async fn send_bcv2_rpc_hydration_evidence(
     ipc_sender: Option<&IpcSender>,
     request: &Bcv2HydrationRequest,
@@ -4077,12 +4062,25 @@ async fn send_bcv2_rpc_hydration_evidence(
     .await;
 }
 
+struct Bcv2HydrationLifecycle {
+    accepting: bool,
+    tx: Option<tokio::sync::mpsc::Sender<Bcv2HydrationRequest>>,
+    rx: Option<tokio::sync::mpsc::Receiver<Bcv2HydrationRequest>>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+enum Bcv2HydrationEnqueueResult {
+    Accepted,
+    RejectedDuringShutdown(Bcv2HydrationRequest),
+    WorkerUnavailable(Bcv2HydrationRequest),
+    Full(Bcv2HydrationRequest),
+    WorkerClosed(Bcv2HydrationRequest),
+}
+
 #[derive(Clone)]
 struct Bcv2HydrationService {
     endpoint: Arc<str>,
-    tx: tokio::sync::mpsc::Sender<Bcv2HydrationRequest>,
-    rx: Arc<ParkingMutex<Option<tokio::sync::mpsc::Receiver<Bcv2HydrationRequest>>>>,
-    worker_started: Arc<AtomicBool>,
+    lifecycle: Arc<ParkingMutex<Bcv2HydrationLifecycle>>,
     queued_pubkeys: Arc<DashSet<String>>,
     ipc_sender: Option<IpcSender>,
 }
@@ -4092,39 +4090,37 @@ impl Bcv2HydrationService {
         let (tx, rx) = tokio::sync::mpsc::channel(BCV2_RPC_HYDRATION_QUEUE_CAP);
         Self {
             endpoint: Arc::from(endpoint.into()),
-            tx,
-            rx: Arc::new(ParkingMutex::new(Some(rx))),
-            worker_started: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(ParkingMutex::new(Bcv2HydrationLifecycle {
+                accepting: true,
+                tx: Some(tx),
+                rx: Some(rx),
+                worker: None,
+            })),
             queued_pubkeys: Arc::new(DashSet::new()),
             ipc_sender,
         }
     }
 
-    fn ensure_worker_started(&self) -> bool {
-        if self
-            .worker_started
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+    fn ensure_worker_started(&self, lifecycle: &mut Bcv2HydrationLifecycle) -> bool {
+        if lifecycle.worker.is_some() {
             return true;
         }
 
-        let Some(rx) = self.rx.lock().take() else {
-            return true;
+        let Some(rx) = lifecycle.rx.take() else {
+            return false;
         };
         let endpoint = Arc::clone(&self.endpoint);
         let queued_pubkeys = Arc::clone(&self.queued_pubkeys);
         let ipc_sender = self.ipc_sender.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(async move {
+                lifecycle.worker = Some(handle.spawn(async move {
                     run_bcv2_hydration_worker(endpoint, rx, queued_pubkeys, ipc_sender).await;
-                });
+                }));
                 true
             }
             Err(_) => {
-                *self.rx.lock() = Some(rx);
-                self.worker_started.store(false, Ordering::SeqCst);
+                lifecycle.rx = Some(rx);
                 false
             }
         }
@@ -4135,39 +4131,91 @@ impl Bcv2HydrationService {
             return;
         }
 
-        if !self.ensure_worker_started() {
-            self.queued_pubkeys.remove(&request.pubkey);
-            let evidence = Bcv2RpcHydrationEvidence::missing(None, "no_tokio_runtime", 0, 0, 0);
-            record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
-            emit_bcv2_rpc_hydration_evidence_background(
-                self.ipc_sender.as_ref(),
-                &request,
-                &evidence,
-            );
-            return;
-        }
+        let enqueue_result = {
+            let mut lifecycle = self.lifecycle.lock();
+            if !lifecycle.accepting {
+                Bcv2HydrationEnqueueResult::RejectedDuringShutdown(request)
+            } else if !self.ensure_worker_started(&mut lifecycle) {
+                Bcv2HydrationEnqueueResult::WorkerUnavailable(request)
+            } else {
+                match lifecycle
+                    .tx
+                    .as_ref()
+                    .expect("accepting hydration lifecycle retains its sender")
+                    .try_send(request)
+                {
+                    Ok(()) => Bcv2HydrationEnqueueResult::Accepted,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
+                        Bcv2HydrationEnqueueResult::Full(request)
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(request)) => {
+                        Bcv2HydrationEnqueueResult::WorkerClosed(request)
+                    }
+                }
+            }
+        };
 
-        match self.tx.try_send(request) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
+        match enqueue_result {
+            Bcv2HydrationEnqueueResult::Accepted => {}
+            Bcv2HydrationEnqueueResult::RejectedDuringShutdown(request) => {
+                self.queued_pubkeys.remove(&request.pubkey);
+                debug!(
+                    pubkey = %request.pubkey,
+                    signature = %request.signature,
+                    "BCV2 hydration request rejected after owned shutdown began"
+                );
+            }
+            Bcv2HydrationEnqueueResult::WorkerUnavailable(request) => {
+                self.queued_pubkeys.remove(&request.pubkey);
+                let evidence = Bcv2RpcHydrationEvidence::missing(None, "no_tokio_runtime", 0, 0, 0);
+                record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
+                warn!(
+                    pubkey = %request.pubkey,
+                    signature = %request.signature,
+                    "BCV2_EXECUTION_ACCOUNT_EVIDENCE_SEND_SKIPPED_NO_RUNTIME"
+                );
+            }
+            Bcv2HydrationEnqueueResult::Full(request) => {
                 self.queued_pubkeys.remove(&request.pubkey);
                 let evidence = Bcv2RpcHydrationEvidence::missing(None, "queue_full", 0, 0, 0);
                 record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
-                emit_bcv2_rpc_hydration_evidence_background(
-                    self.ipc_sender.as_ref(),
-                    &request,
-                    &evidence,
-                );
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(request)) => {
+            Bcv2HydrationEnqueueResult::WorkerClosed(request) => {
                 self.queued_pubkeys.remove(&request.pubkey);
                 let evidence = Bcv2RpcHydrationEvidence::missing(None, "worker_closed", 0, 0, 0);
                 record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
-                emit_bcv2_rpc_hydration_evidence_background(
-                    self.ipc_sender.as_ref(),
-                    &request,
-                    &evidence,
-                );
+            }
+        }
+    }
+
+    /// Close intake, drain every request accepted before that linearization
+    /// point, and join the only hydration producer before the IPC dispatcher
+    /// is allowed to stop accepting evidence.
+    async fn shutdown_and_join(&self, timeout: Duration) -> Result<(), String> {
+        let worker = {
+            let mut lifecycle = self.lifecycle.lock();
+            lifecycle.accepting = false;
+            // Closing the owned sender is the worker shutdown signal. The
+            // receiver keeps draining its currently in-flight and queued work.
+            lifecycle.tx.take();
+            // If no worker was ever needed, close the idle receiver too.
+            lifecycle.rx.take();
+            lifecycle.worker.take()
+        };
+
+        let Some(mut worker) = worker else {
+            return Ok(());
+        };
+        match tokio::time::timeout(timeout, &mut worker).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(format!("BCV2 hydration worker join failed: {error}")),
+            Err(_) => {
+                worker.abort();
+                let _ = worker.await;
+                Err(format!(
+                    "BCV2 hydration worker did not drain within {} ms",
+                    timeout.as_millis()
+                ))
             }
         }
     }
@@ -4374,6 +4422,16 @@ impl BinaryParser {
             complete_tracker: CompleteTracker::new(),
             ipc_sender,
             bcv2_hydrator,
+        }
+    }
+
+    /// Stop the owned BCV2 hydration producer before its IPC sink starts
+    /// draining. Requests accepted before shutdown are completed in order;
+    /// requests observed afterward are rejected without creating new evidence.
+    pub async fn shutdown_bcv2_hydration(&self, timeout: Duration) -> Result<(), String> {
+        match self.bcv2_hydrator.as_ref() {
+            Some(hydrator) => hydrator.shutdown_and_join(timeout).await,
+            None => Ok(()),
         }
     }
 
@@ -11730,6 +11788,76 @@ mod tests {
                 observed_slot: Some(42),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn bcv2_hydration_shutdown_drains_accepted_evidence_before_ipc_shutdown() {
+        let (ipc_sender, mut ipc_receiver, ipc_metrics) =
+            create_ipc_channel(IpcChannelConfig::default());
+        let hydration = Bcv2HydrationService::new("http://127.0.0.1:1", Some(ipc_sender.clone()));
+        let account_pubkey = Pubkey::new_unique();
+        let mut request = sample_bcv2_hydration_request(
+            account_pubkey,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        // This forces the worker down its immediate, deterministic evidence
+        // path rather than contacting an RPC endpoint during the test.
+        request.pubkey = "not-a-valid-pubkey".to_string();
+
+        hydration.enqueue(request);
+        hydration
+            .shutdown_and_join(Duration::from_secs(1))
+            .await
+            .expect("owned hydration worker must drain accepted work");
+        ipc_sender
+            .shutdown_and_join(Duration::from_secs(1))
+            .expect("IPC may stop only after hydration joins");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), ipc_receiver.recv())
+            .await
+            .expect("accepted hydration evidence must reach IPC")
+            .expect("drained IPC must contain the accepted evidence");
+        let SeerEvent::ExecutionAccountEvidence(event) = event else {
+            panic!("expected BCV2 hydration execution evidence");
+        };
+        assert_eq!(
+            event.evidence.source,
+            ExecutionAccountEvidenceSource::RpcHydration
+        );
+        assert_eq!(ipc_metrics.events_sent.get(), 1);
+        assert_eq!(ipc_metrics.events_received.get(), 1);
+        assert_eq!(ipc_sender.current_queue_length(), 0);
+        assert_eq!(ipc_receiver.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn bcv2_hydration_rejects_new_work_after_owned_shutdown_starts() {
+        let (ipc_sender, mut ipc_receiver, ipc_metrics) =
+            create_ipc_channel(IpcChannelConfig::default());
+        let hydration = Bcv2HydrationService::new("http://127.0.0.1:1", Some(ipc_sender.clone()));
+
+        hydration
+            .shutdown_and_join(Duration::from_secs(1))
+            .await
+            .expect("idle owned hydration worker must shut down cleanly");
+        hydration.enqueue(sample_bcv2_hydration_request(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ));
+        ipc_sender
+            .shutdown_and_join(Duration::from_secs(1))
+            .expect("IPC shutdown must not receive rejected hydration work");
+
+        assert!(
+            ipc_receiver.recv().await.is_none(),
+            "hydration shutdown must reject new work without sending evidence"
+        );
+        assert_eq!(ipc_metrics.events_sent.get(), 0);
+        assert_eq!(ipc_metrics.events_received.get(), 0);
     }
 
     #[test]

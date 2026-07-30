@@ -1720,8 +1720,12 @@ async fn run_launcher() -> Result<()> {
     // Print banner
     print_banner(&config);
 
-    // Create shutdown channel
+    // The generic component channel remains for listeners that do not own
+    // ingest or canonical application. Seer and Oracle have distinct phases:
+    // upstream must drain into the still-live Oracle before Oracle stops.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let (seer_shutdown_tx, _) = broadcast::channel::<()>(1);
+    let (oracle_shutdown_tx, _) = broadcast::channel::<()>(1);
 
     // ========================================
     // EVENT BUS CREATION (Issue Criptocopenhaegen/ghost#156: Increased buffer to 10,240)
@@ -2794,7 +2798,7 @@ async fn run_launcher() -> Result<()> {
             });
     let oracle_health = Arc::clone(&health);
     let oracle_authoritative_funding_stream_rx = authoritative_funding_stream_rx;
-    let oracle_shutdown_rx = shutdown_tx.subscribe();
+    let oracle_shutdown_rx = oracle_shutdown_tx.subscribe();
     let oracle_authoritative_funding_coverage_gate_enabled =
         config.seer.enabled && matches!(config.seer.funding_lane_mode.as_str(), "full_chain");
 
@@ -2859,11 +2863,14 @@ async fn run_launcher() -> Result<()> {
 
     info!("🚀 Proceeding with event producer startup (Seer, Trigger, etc.)...");
 
-    // Start Seer component with event bus and SnapshotEngine
+    // Start Seer component with event bus and SnapshotEngine. Its handle is
+    // deliberately kept outside the generic component list because Seer owns
+    // upstream producer drain and must finish before Oracle is told to stop.
+    let mut seer_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
     if config.seer.enabled {
         info!("Starting Seer component...");
         let seer_config = config.seer.clone();
-        let shutdown_rx = shutdown_tx.subscribe();
+        let shutdown_rx = seer_shutdown_tx.subscribe();
         let seer_event_tx = event_bus_tx.clone();
         let seer_snapshot_engine = Arc::clone(&snapshot_engine);
         let oracle_runtime_for_paradox = Arc::clone(&oracle_runtime);
@@ -2880,7 +2887,7 @@ async fn run_launcher() -> Result<()> {
         .context("PR1E Seer startup contract failed")?;
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = ghost_launcher::components::seer::run(
+            ghost_launcher::components::seer::run(
                 seer_config,
                 shutdown_rx,
                 Some(seer_event_tx),
@@ -2894,11 +2901,8 @@ async fn run_launcher() -> Result<()> {
                 seer_candidate_integrity_registry,
             )
             .await
-            {
-                error!("Seer component error: {}", e);
-            }
         });
-        handles.push(("Seer", handle));
+        seer_handle = Some(handle);
 
         // Spawn a task to wait for and connect the Paradox receiver
         tokio::spawn(async move {
@@ -3222,14 +3226,45 @@ async fn run_launcher() -> Result<()> {
         }
     }
 
-    // Send shutdown message to TuningService
-    if let Err(e) = tuning_tx_clone.send(TuningMessage::Shutdown).await {
-        warn!("Error sending TuningService shutdown message: {}", e);
+    // Phase 1: stop all upstream Seer producers, including owned hydration,
+    // and drain their IPC work into the still-running Oracle consumer.
+    let mut component_shutdown_failures = 0usize;
+    if let Some(mut handle) = seer_handle {
+        info!("Waiting for Seer upstream drain before stopping Oracle Runtime...");
+        let join_timeout = component_shutdown_join_timeout("Seer", &shadow_v2_burnin_config);
+        if let Err(error) = seer_shutdown_tx.send(()) {
+            component_shutdown_failures += 1;
+            error!(error = %error, "Seer shutdown phase could not notify its receiver");
+        }
+        match tokio::time::timeout(join_timeout, &mut handle).await {
+            Ok(Ok(Ok(()))) => {
+                info!("Seer upstream drain completed before Oracle shutdown");
+            }
+            Ok(Ok(Err(error))) => {
+                component_shutdown_failures += 1;
+                error!(error = %error, "Seer component shutdown failed");
+            }
+            Ok(Err(error)) => {
+                component_shutdown_failures += 1;
+                error!(error = %error, "Seer component task join failed during shutdown");
+            }
+            Err(_) => {
+                component_shutdown_failures += 1;
+                error!(
+                    timeout_secs = join_timeout.as_secs(),
+                    "Seer component shutdown timed out; aborting task"
+                );
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
     }
 
-    // Send shutdown signal to all components
-    if let Err(e) = shutdown_tx.send(()) {
-        warn!("Error sending shutdown signal: {}", e);
+    // Phase 2: all Seer producers and the IPC receiver have either drained or
+    // reported failure; only now may Oracle stop applying downstream events.
+    if let Err(error) = oracle_shutdown_tx.send(()) {
+        component_shutdown_failures += 1;
+        error!(error = %error, "Oracle Runtime shutdown phase could not notify its receiver");
     }
 
     info!("Waiting for Oracle Runtime to shut down...");
@@ -3248,10 +3283,20 @@ async fn run_launcher() -> Result<()> {
         }
     };
 
+    component_shutdown_failures += usize::from(oracle_shutdown_failed);
+
+    // Remaining components have no authority to produce Seer IPC evidence and
+    // can shut down only after the upstream → Oracle phase has completed.
+    if let Err(e) = tuning_tx_clone.send(TuningMessage::Shutdown).await {
+        warn!("Error sending TuningService shutdown message: {}", e);
+    }
+    if let Err(e) = shutdown_tx.send(()) {
+        warn!("Error sending shutdown signal: {}", e);
+    }
+
     // Wait for all components to shut down. The timeout is a shutdown-only
     // circuit breaker: a stuck diagnostics task must not keep the launcher
     // alive indefinitely after global shutdown has been requested.
-    let mut component_shutdown_failures = usize::from(oracle_shutdown_failed);
     for (name, handle) in handles {
         info!("Waiting for {} to shut down...", name);
         let abort_handle = handle.abort_handle();
@@ -3288,7 +3333,14 @@ async fn run_launcher() -> Result<()> {
         }
     }
     info!("Ghost Launcher shutdown complete");
-    Ok(())
+    if component_shutdown_failures == 0 {
+        Ok(())
+    } else {
+        bail!(
+            "Ghost Launcher shutdown completed with {} component failure(s) or forced abort(s)",
+            component_shutdown_failures
+        );
+    }
 }
 
 /// Handle a single HTTP connection for the metrics server.
