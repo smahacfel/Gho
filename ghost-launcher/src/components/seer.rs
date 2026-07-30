@@ -4523,6 +4523,12 @@ fn session_bridge_prune_interval(ttl: Duration, detected_pool_ttl: Duration) -> 
         .max(Duration::from_millis(50))
 }
 
+fn pump_observation_ledger_finalization_interval(
+    config: PumpObservationLedgerConfigV1,
+) -> Duration {
+    Duration::from_nanos(config.correlation_window_ns)
+}
+
 fn pump_observation_classification_label(
     classification: PumpObservationClassificationV1,
 ) -> &'static str {
@@ -6238,6 +6244,8 @@ pub async fn run(
     // silently inheriting an opaque `default()` inside the runtime path.
     // `try_new` rejects zero capacities before candidate admission begins.
     let pump_observation_ledger_config = PumpObservationLedgerConfigV1::default();
+    let pump_observation_ledger_finalization_interval =
+        pump_observation_ledger_finalization_interval(pump_observation_ledger_config);
     let pump_observation_ledger = Arc::new(Mutex::new(
         PumpObservationLedgerV1::try_new(pump_observation_ledger_config).map_err(|error| {
             anyhow::anyhow!("invalid PR1E PumpObservationLedger config: {error}")
@@ -6437,6 +6445,10 @@ pub async fn run(
             SESSION_POOL_TRADE_BUFFER_TTL,
             detected_pool_ttl,
         ));
+        let mut ledger_finalization_interval =
+            tokio::time::interval(pump_observation_ledger_finalization_interval);
+        ledger_finalization_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The IPC coverage control plane retains a bounded monotonic prefix
         // of notices. Track the prefix already classified so secondary audit
         // metrics are not replayed on every subsequent notice. An overflow is
@@ -6537,6 +6549,21 @@ pub async fn run(
                     );
                     record_session_account_update_expired(expired_updates);
                     record_session_account_update_detected_key_expired(expired_update_keys);
+                    record_oracle_runtime_ipc_prune_stage(
+                        "total",
+                        prune_started_at.elapsed(),
+                        expired_permit_count
+                            .saturating_add(expired_detected)
+                            .saturating_add(expired_updates)
+                            .saturating_add(expired_update_keys)
+                            .saturating_add(expired_evidence)
+                    );
+                    continue;
+                }
+                _ = ledger_finalization_interval.tick() => {
+                    record_oracle_runtime_ipc_select_branch("ledger_finalization_interval");
+                    last_selected_branch = "ledger_finalization_interval";
+                    let finalization_started_at = Instant::now();
                     let ledger_finalization_started_at = Instant::now();
                     let finalization = collect_pump_observation_ledger_finalization(
                         &pump_observation_ledger_ipc,
@@ -6564,14 +6591,10 @@ pub async fn run(
                         emitted_ledger_decisions,
                     );
                     record_oracle_runtime_ipc_prune_stage(
-                        "total",
-                        prune_started_at.elapsed(),
-                        expired_permit_count
-                            .saturating_add(expired_detected)
-                            .saturating_add(expired_updates)
-                            .saturating_add(expired_update_keys)
-                            .saturating_add(expired_evidence)
-                            .saturating_add(finalization.retired_terminal_candidates)
+                        "ledger_finalization_total",
+                        finalization_started_at.elapsed(),
+                        finalization
+                            .retired_terminal_candidates
                             .saturating_add(emitted_ledger_decisions),
                     );
                     continue;
@@ -7478,9 +7501,10 @@ mod tests {
         nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
         oracle_runtime_ipc_profile_metrics, pool_candidate_matches_primary_observation,
         process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
-        pumpswap_program_id, record_oracle_runtime_ipc_prune_stage,
-        record_oracle_runtime_ipc_recv_gap, record_oracle_runtime_ipc_select_branch,
-        select_nln_program_stream_subscriptions, should_emit_oracle_runtime_ipc_recv_gap_marker,
+        pump_observation_ledger_finalization_interval, pumpswap_program_id,
+        record_oracle_runtime_ipc_prune_stage, record_oracle_runtime_ipc_recv_gap,
+        record_oracle_runtime_ipc_select_branch, select_nln_program_stream_subscriptions,
+        should_emit_oracle_runtime_ipc_recv_gap_marker,
         should_emit_oracle_runtime_slow_event_marker, trade_event_to_pool_transaction,
         trade_has_forwardable_identity, trade_matches_primary_observation,
         validate_pr1e_startup_contract, CanonicalRuntimeAdmissionV1,
@@ -7570,6 +7594,16 @@ mod tests {
             Some(started),
             started + ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL
         ));
+    }
+
+    #[test]
+    fn pump_observation_ledger_finalizer_uses_the_correlation_window_cadence() {
+        let config = PumpObservationLedgerConfigV1::default();
+
+        assert_eq!(
+            pump_observation_ledger_finalization_interval(config),
+            Duration::from_millis(250),
+        );
     }
 
     #[test]
