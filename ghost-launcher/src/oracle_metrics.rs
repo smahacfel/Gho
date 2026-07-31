@@ -44,6 +44,31 @@ pub static PR1_RUNTIME_PRIMARY_COVERAGE_GAP_TOTAL: Lazy<IntCounter> = Lazy::new(
     .expect("create pr1_runtime_primary_coverage_gap_total")
 });
 
+/// A bounded capture may continue after a proved incomplete canonical segment
+/// so it can preserve later tape.  Finalization rejects such a run; this
+/// counter prevents that continuation from being mistaken for a valid capture.
+pub static ACE_CAPTURE_SEGMENT_INVALID_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::new(
+        "ace_capture_segment_invalid_total",
+        "Canonical ACE capture segments that cannot be proved complete",
+    )
+    .expect("create ace_capture_segment_invalid_total")
+});
+
+/// Typed failures observed by the ACE resilience boundary.  The class and
+/// static callsite code make optional/transient failures auditable without
+/// granting them global process authority.
+pub static ACE_CAPTURE_FAILURE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        prometheus::opts!(
+            "ace_capture_failure_total",
+            "Typed ACE capture failures by class and static callsite"
+        ),
+        &["class", "code"],
+    )
+    .expect("create ace_capture_failure_total")
+});
+
 pub fn record_pr1_runtime_bypass_attempt() {
     PR1_RUNTIME_BYPASS_ATTEMPT_TOTAL.inc();
 }
@@ -54,6 +79,16 @@ pub fn record_pr1_runtime_candidate_admission_closed() {
 
 pub fn record_pr1_runtime_primary_coverage_gap() {
     PR1_RUNTIME_PRIMARY_COVERAGE_GAP_TOTAL.inc();
+}
+
+pub fn record_ace_capture_segment_invalid() {
+    ACE_CAPTURE_SEGMENT_INVALID_TOTAL.inc();
+}
+
+pub fn record_ace_capture_failure(class: &str, code: &str) {
+    ACE_CAPTURE_FAILURE_TOTAL
+        .with_label_values(&[class, code])
+        .inc();
 }
 
 /// Counter for real events (PoolTransaction) gathered per pool
@@ -387,6 +422,8 @@ pub fn register_oracle_metrics(registry: &Registry) -> Result<(), Box<dyn std::e
         PR1_RUNTIME_CANDIDATE_ADMISSION_CLOSED_TOTAL.clone(),
     ))?;
     registry.register(Box::new(PR1_RUNTIME_PRIMARY_COVERAGE_GAP_TOTAL.clone()))?;
+    registry.register(Box::new(ACE_CAPTURE_SEGMENT_INVALID_TOTAL.clone()))?;
+    registry.register(Box::new(ACE_CAPTURE_FAILURE_TOTAL.clone()))?;
     registry.register(Box::new(ORACLE_GATHER_EVENTS_REAL.clone()))?;
     registry.register(Box::new(ORACLE_GATHER_EVENTS_SYNTHETIC.clone()))?;
     registry.register(Box::new(ORACLE_GATHER_LAST_REAL_COUNT.clone()))?;

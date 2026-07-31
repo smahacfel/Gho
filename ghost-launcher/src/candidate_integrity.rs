@@ -4,6 +4,7 @@
 //! for new candidates. It remains independent from strategy verdicts and from
 //! protective handling of already confirmed positions.
 
+use crate::capture_resilience::CaptureFailureClassV1;
 use ghost_core::{
     CandidateIntegrityOutcomeV1, CandidateIntegritySignalV1, PumpCandidateIdentityV1,
     PumpMutationFamilyV1, RawPumpMutationLocatorV1, StructuralCanonicalPumpMutationV1,
@@ -464,7 +465,7 @@ pub struct CandidateIntegritySignalResultV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum CandidateIntegrityErrorV1 {
-    #[error("candidate integrity registry mutex is poisoned")]
+    #[error("candidate integrity registry is unavailable")]
     RegistryUnavailable,
     #[error("candidate integrity registry capacity exceeded")]
     RegistryCapacityExceeded,
@@ -489,6 +490,35 @@ pub enum CandidateIntegrityErrorV1 {
         expected: CandidateLifecyclePhaseV1,
         actual: CandidateLifecyclePhaseV1,
     },
+}
+
+impl CandidateIntegrityErrorV1 {
+    /// Classify the error at the registry boundary.  This deliberately does
+    /// not decide whether an already-invalid capture is acceptable; it only
+    /// decides whether an individual callsite may close unrelated candidate
+    /// admission.
+    pub const fn capture_failure_class(&self) -> CaptureFailureClassV1 {
+        match self {
+            // Registry unavailability is only produced after `mark_unavailable`
+            // or a real poisoned state lock.  Both are internal integrity
+            // failures, not aliases for a transient external dependency.
+            Self::RegistryUnavailable => CaptureFailureClassV1::GlobalRuntimeFatal,
+            // Bounded registry/receipt/tombstone capacity means the affected
+            // canonical interval cannot be proved complete. Preserve later
+            // tape and let finalization reject the segment.
+            Self::RegistryCapacityExceeded => CaptureFailureClassV1::CaptureSegmentInvalid,
+            // These errors are bound to a candidate, lifecycle transition, or
+            // late evidence and must never close unrelated admission.
+            Self::CandidateMissing
+            | Self::TerminalRetirementPending
+            | Self::TerminalCleanupInProgress
+            | Self::CandidateAliasConflict
+            | Self::NotReady(_)
+            | Self::GenerationChanged { .. }
+            | Self::AdmissionClosed { .. }
+            | Self::PhaseMismatch { .. } => CaptureFailureClassV1::CandidateLocal,
+        }
+    }
 }
 
 impl CandidateIntegrityRegistry {
@@ -852,9 +882,6 @@ impl CandidateIntegrityRegistry {
         if state.canonical_apply_fence.receipts_by_runtime_key.len() >= self.limits.max_candidates {
             drop(state);
             let _ = self.record_signal(Self::coverage_incomplete_signal(&receipt))?;
-            self.close_candidate_admission_with_integrity_invalidation(
-                "canonical_receipt_capacity_exhausted",
-            );
             return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
         }
         state.canonical_apply_fence.receipts_by_runtime_key.insert(
@@ -1389,9 +1416,6 @@ impl CandidateIntegrityRegistry {
             for signal in failure_signals {
                 let _ = self.record_signal(signal)?;
             }
-            self.close_candidate_admission_with_integrity_invalidation(
-                "canonical_inventory_proof_capacity_exhausted",
-            );
             return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
         }
         let Some(entry) = state
@@ -1526,7 +1550,6 @@ impl CandidateIntegrityRegistry {
                 };
             if state.records.len() >= capacity {
                 drop(state);
-                self.mark_unavailable("candidate_registry_capacity_exhausted");
                 return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
             }
             state
@@ -1630,7 +1653,6 @@ impl CandidateIntegrityRegistry {
                 }
                 Err(error) => {
                     drop(state);
-                    self.mark_unavailable("pre_session_terminal_retirement_capacity_exhausted");
                     return Err(error);
                 }
             }
@@ -1888,9 +1910,11 @@ impl CandidateIntegrityRegistry {
     /// Close new-candidate admission and synchronously turn every mutable
     /// candidate record into typed technical integrity evidence.
     ///
-    /// This is used by cross-candidate failures such as a primary local
-    /// coverage gap. Already-started submit/confirmation flows are not
-    /// cancelled: they retain reconciliation authority, while confirmed
+    /// This is reserved for proved global registry or canonical-application
+    /// corruption. A primary-local coverage gap is instead recorded as a
+    /// capture-segment invalidation so later canonical tape can still be
+    /// preserved for forensics. Already-started submit/confirmation flows are
+    /// not cancelled: they retain reconciliation authority, while confirmed
     /// positions keep their protective lifecycle untouched.
     pub fn close_candidate_admission_with_integrity_invalidation(&self, reason: &'static str) {
         self.close_candidate_admission(reason);
@@ -2959,7 +2983,7 @@ mod tests {
     }
 
     #[test]
-    fn fence_capacity_fail_closes_new_candidate_without_evicting_unresolved_receipt() {
+    fn fence_capacity_invalidates_only_the_capture_segment_without_closing_admission() {
         let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
             max_candidates: 1,
             max_audit_markers_per_candidate: 2,
@@ -2989,6 +3013,23 @@ mod tests {
             .canonical_apply_fence
             .receipts_by_runtime_key
             .contains_key(&pending_receipt.runtime_key));
+        drop(state);
+        assert!(registry.candidate_admission_open());
+        assert_eq!(
+            CandidateIntegrityErrorV1::RegistryCapacityExceeded.capture_failure_class(),
+            CaptureFailureClassV1::CaptureSegmentInvalid
+        );
+    }
+
+    #[test]
+    fn alias_conflict_is_candidate_local_not_global_admission_authority() {
+        let registry = CandidateIntegrityRegistry::default();
+
+        assert_eq!(
+            CandidateIntegrityErrorV1::CandidateAliasConflict.capture_failure_class(),
+            CaptureFailureClassV1::CandidateLocal
+        );
+        assert!(registry.candidate_admission_open());
     }
 
     #[test]
@@ -3030,6 +3071,8 @@ mod tests {
             .canonical_apply_fence
             .proofs_by_signature_candidate
             .contains_key(&(receipt.signature, receipt.candidate)));
+        drop(state);
+        assert!(registry.candidate_admission_open());
     }
 
     #[test]

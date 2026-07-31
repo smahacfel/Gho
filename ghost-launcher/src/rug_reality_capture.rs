@@ -254,6 +254,11 @@ pub struct RugRealityCaptureHealthEvidenceV1 {
     pub pr1_runtime_bypass_attempt_total: u64,
     pub pr1_runtime_candidate_admission_closed_total: u64,
     pub pr1_runtime_primary_coverage_gap_total: u64,
+    /// Non-zero when the launcher deliberately continued after an interval
+    /// whose canonical completeness could not be proved. Such continuation is
+    /// forensic only; the offline probe rejects the capture.
+    #[serde(default)]
+    pub ace_capture_segment_invalid_total: u64,
     pub event_writer_write_failure_count: u64,
     pub event_writer_lock_failure_count: u64,
     pub controlled_shutdown: bool,

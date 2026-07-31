@@ -53,6 +53,68 @@ const PUMP_FEE_CONFIG_ACCOUNT_LEN: usize = 4_073;
 const PUMP_FEE_CONFIG_KNOWN_PREFIX_LEN: usize = 153;
 const BPS_DENOMINATOR: u64 = 10_000;
 
+/// Stable diagnostic class for a refresh of the immutable two-account fee
+/// authority.  Transport failures are intentionally distinct from an
+/// on-chain semantic contradiction: the former may be retried/advisory while
+/// the latter remains evidence about the optional RUG lane itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RugScalpFeeAuthorityRefreshErrorClassV1 {
+    Timeout,
+    RateLimited,
+    HttpStatus,
+    Transport,
+    Decode,
+    SemanticValidation,
+}
+
+impl RugScalpFeeAuthorityRefreshErrorClassV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::RateLimited => "http_429",
+            Self::HttpStatus => "http_status",
+            Self::Transport => "transport",
+            Self::Decode => "decode",
+            Self::SemanticValidation => "semantic_validation",
+        }
+    }
+}
+
+/// Classify without losing the raw error text at the callsite.  Solana's RPC
+/// client wraps transport implementations, so the diagnostic boundary uses
+/// conservative string recognition and defaults to `transport` only for
+/// known connection-family messages; all other failures remain semantic.
+pub fn classify_rug_scalp_fee_authority_refresh_error(
+    error: &anyhow::Error,
+) -> RugScalpFeeAuthorityRefreshErrorClassV1 {
+    let text = error.to_string().to_ascii_lowercase();
+    if text.contains("timeout") || text.contains("timed out") {
+        RugScalpFeeAuthorityRefreshErrorClassV1::Timeout
+    } else if text.contains("429") || text.contains("too many requests") {
+        RugScalpFeeAuthorityRefreshErrorClassV1::RateLimited
+    } else if text.contains("http status")
+        || text.contains("http error")
+        || text.contains("status code")
+    {
+        RugScalpFeeAuthorityRefreshErrorClassV1::HttpStatus
+    } else if text.contains("connection")
+        || text.contains("dns")
+        || text.contains("reset")
+        || text.contains("transport")
+        || text.contains("network")
+    {
+        RugScalpFeeAuthorityRefreshErrorClassV1::Transport
+    } else if text.contains("decode")
+        || text.contains("discriminator")
+        || text.contains("layout")
+        || text.contains("account data")
+    {
+        RugScalpFeeAuthorityRefreshErrorClassV1::Decode
+    } else {
+        RugScalpFeeAuthorityRefreshErrorClassV1::SemanticValidation
+    }
+}
+
 /// Frozen runtime authority for the two and only two Pump routes used by the
 /// prospective RUG experiment.  The serialized form is deliberately only an
 /// input to [`RuntimeProgramFeeScheduleRegistryV1`]: fixture evidence is
@@ -2515,6 +2577,38 @@ mod tests {
     use super::*;
     use ghost_core::EventSemanticEnvelope;
     use ghost_core::{FeeRounding, ProgramFeeRule, ProgramFeeScheduleEvidenceV1, PumpQuoteError};
+
+    #[test]
+    fn fee_authority_refresh_classifies_transient_errors_separately_from_semantic_errors() {
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!("request timed out")),
+            RugScalpFeeAuthorityRefreshErrorClassV1::Timeout
+        );
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!("HTTP status 429")),
+            RugScalpFeeAuthorityRefreshErrorClassV1::RateLimited
+        );
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!("connection reset by peer")),
+            RugScalpFeeAuthorityRefreshErrorClassV1::Transport
+        );
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!("HTTP status 503")),
+            RugScalpFeeAuthorityRefreshErrorClassV1::HttpStatus
+        );
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!(
+                "account discriminator decode failed"
+            )),
+            RugScalpFeeAuthorityRefreshErrorClassV1::Decode
+        );
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!(
+                "Pump global/fee_config protocol fee conflict"
+            )),
+            RugScalpFeeAuthorityRefreshErrorClassV1::SemanticValidation
+        );
+    }
 
     fn runtime_schedule(
         route_variant: PumpRouteVariant,

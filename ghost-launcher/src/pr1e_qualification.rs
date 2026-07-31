@@ -1390,23 +1390,30 @@ async fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV
                 &notice,
             ));
             assert!(
-                !registry.candidate_admission_open(),
-                "primary IPC coverage gap closes candidate admission before MFS/Gatekeeper/submit"
+                registry.candidate_admission_open(),
+                "primary IPC coverage gap invalidates the capture segment but preserves later canonical ingest"
             );
-            assert!(registry.evaluation_guard(candidate).is_err());
-            assert!(matches!(
-                ingest_pump_observation(
-                    &ledger,
-                    &registry,
-                    Some(primary_trade_observation(signature, pool, mint, 0, Some(1))),
-                    1,
-                    true,
-                    None,
-                ),
-                CanonicalRuntimeAdmissionV1::Blocked(
-                    CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
-                )
-            ));
+            let late_pool = Pubkey::new_unique();
+            let late_mint = Pubkey::new_unique();
+            let late_signature = Signature::new_unique();
+            let late_admission = ingest_pump_observation(
+                &ledger,
+                &registry,
+                Some(primary_initialize_pool_observation(
+                    late_signature,
+                    late_pool,
+                    late_mint,
+                    0,
+                    Some(1),
+                )),
+                2,
+                true,
+                None,
+            );
+            assert!(
+                matches!(late_admission, CanonicalRuntimeAdmissionV1::Apply(_)),
+                "a prior segment gap must not globally block subsequent primary ingest"
+            );
             CrossLayerExecutionV1 {
                 difference_class: Some("PRIMARY_BOUNDARY_INCOMPLETE"),
                 ..CrossLayerExecutionV1::default()

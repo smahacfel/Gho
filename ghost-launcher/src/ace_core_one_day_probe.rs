@@ -33,7 +33,7 @@ pub const ACE_CORE_BASELINE_SHA: &str = "43057b296663129ca9b4f572e793474830a5452
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const POOL_TRANSACTION_PAYLOAD_SCHEMA_V1: &str = "v1";
 const ACE_CORE_SIGNAL_DETECTOR: &str = "ace_core_one_day_probe_v3_observe_only";
-const ACE_CAPTURE_HEALTH_SCHEMA_VERSION: u16 = 2;
+const ACE_CAPTURE_HEALTH_SCHEMA_VERSION: u16 = 3;
 const CALIBRATION_BIRTHS: usize = 250;
 const CUTOFF_OFFSET_MS: u64 = 11_111;
 const FEATURE_WINDOW_MS: u64 = 8_000;
@@ -51,6 +51,11 @@ const SMOKE_MIN_DURATION_MS: u64 = 120_000;
 // Must stay identical to scripts/ace_core_one_day_capture_health.py.  A
 // manifest-bound qualifying smoke is allowed to run for at most ten minutes.
 const SMOKE_MAX_DURATION_MS: u64 = 600_000;
+// Must stay identical to scripts/ace_core_one_day_capture_health.py.  A
+// resilience soak is deliberately not a Day-1 capture and must last at least
+// thirty minutes while remaining bounded enough to retain its diagnostic role.
+const SOAK_MIN_DURATION_MS: u64 = 1_800_000;
+const SOAK_MAX_DURATION_MS: u64 = 2_100_000;
 const DAY1_MIN_DURATION_MS: u64 = 86_400_000;
 const INGRESS_CUTOFF_CONTRACT: &str =
     "event_ts_ms<=birth_ts_ms+11111 && arrival_ts_ms<=detected_wall_ts_ms+11111";
@@ -710,6 +715,10 @@ fn validate_capture_health_evidence(
         "smoke" => {
             reasons.insert("capture_health_smoke_duration_out_of_range".to_string());
         }
+        "soak" if (SOAK_MIN_DURATION_MS..=SOAK_MAX_DURATION_MS).contains(&receipt.duration_ms) => {}
+        "soak" => {
+            reasons.insert("capture_health_soak_duration_out_of_range".to_string());
+        }
         "day1" if receipt.duration_ms >= DAY1_MIN_DURATION_MS => {}
         "day1" => {
             reasons.insert("capture_health_day1_duration_too_short".to_string());
@@ -726,6 +735,9 @@ fn validate_capture_health_evidence(
     }
     if receipt.pr1_runtime_primary_coverage_gap_total != 0 {
         reasons.insert("capture_health_primary_local_coverage_gap".to_string());
+    }
+    if receipt.ace_capture_segment_invalid_total != 0 {
+        reasons.insert("capture_health_segment_invalid".to_string());
     }
     if receipt.event_writer_write_failure_count != 0 {
         reasons.insert("capture_health_event_writer_write_failure".to_string());
@@ -2362,6 +2374,7 @@ mod tests {
             pr1_runtime_bypass_attempt_total: 0,
             pr1_runtime_candidate_admission_closed_total: 0,
             pr1_runtime_primary_coverage_gap_total: 0,
+            ace_capture_segment_invalid_total: 0,
             event_writer_write_failure_count: 0,
             event_writer_lock_failure_count: 0,
             controlled_shutdown: true,
@@ -2914,6 +2927,44 @@ mod tests {
         assert!(
             validate_capture_health_evidence(&manifest_path, &capture_manifest)
                 .contains("capture_health_smoke_duration_out_of_range")
+        );
+    }
+
+    #[test]
+    fn capture_health_evidence_accepts_only_the_bounded_resilience_soak_window() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = temp.path().join("manifest.json");
+        let mut capture_manifest = manifest("health-soak-run");
+        capture_manifest.health_evidence_path = temp
+            .path()
+            .join("health.json")
+            .to_string_lossy()
+            .into_owned();
+        write_json_new(&manifest_path, &capture_manifest).expect("manifest");
+        write_valid_health_evidence(&manifest_path, &capture_manifest);
+
+        let health_path = Path::new(&capture_manifest.health_evidence_path);
+        let mut receipt: RugRealityCaptureHealthEvidenceV1 =
+            serde_json::from_slice(&fs::read(health_path).expect("health bytes"))
+                .expect("health receipt");
+        receipt.capture_kind = "soak".to_string();
+        receipt.duration_ms = SOAK_MIN_DURATION_MS;
+        receipt.end_captured_at_unix_ms = receipt
+            .start_captured_at_unix_ms
+            .saturating_add(receipt.duration_ms);
+        fs::remove_file(health_path).expect("remove fixture health receipt");
+        write_json_new(health_path, &receipt).expect("rewrite health receipt");
+        assert!(validate_capture_health_evidence(&manifest_path, &capture_manifest).is_empty());
+
+        receipt.duration_ms = SOAK_MIN_DURATION_MS - 1;
+        receipt.end_captured_at_unix_ms = receipt
+            .start_captured_at_unix_ms
+            .saturating_add(receipt.duration_ms);
+        fs::remove_file(health_path).expect("remove lower-bound health receipt");
+        write_json_new(health_path, &receipt).expect("rewrite lower-bound receipt");
+        assert!(
+            validate_capture_health_evidence(&manifest_path, &capture_manifest)
+                .contains("capture_health_soak_duration_out_of_range")
         );
     }
 

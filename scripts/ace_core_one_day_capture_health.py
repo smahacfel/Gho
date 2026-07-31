@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -22,19 +23,25 @@ from pathlib import Path
 from typing import Iterable
 
 
-HEALTH_SCHEMA_VERSION = 2
+HEALTH_SCHEMA_VERSION = 3
 METRICS_SNAPSHOT_SCHEMA_VERSION = 1
 REQUIRED_COUNTERS = (
     "pr1_runtime_bypass_attempt_total",
     "pr1_runtime_candidate_admission_closed_total",
     "pr1_runtime_primary_coverage_gap_total",
+    "ace_capture_segment_invalid_total",
 )
-CAPTURE_KINDS = ("smoke", "day1")
+CAPTURE_KINDS = ("smoke", "soak", "day1")
 SMOKE_MIN_DURATION_MS = 120_000
 # A qualifying transport/canonical-admission smoke needs enough steady-state
 # time to expose a recurring ingress issue.  The operational contract is ten
 # minutes; callers still receive a fail-closed rejection outside this window.
 SMOKE_MAX_DURATION_MS = 600_000
+SOAK_MIN_DURATION_MS = 1_800_000
+# A resilience soak is deliberately distinct from Day 1.  The upper bound
+# prevents an arbitrary long capture from being relabelled as a successful
+# soak instead of receiving the stricter Day-1 evidence contract.
+SOAK_MAX_DURATION_MS = 2_100_000
 DAY1_MIN_DURATION_MS = 86_400_000
 EVENT_WRITER_WRITE_FAILURE_MARKER = "EventEmitter: failed to write event"
 EVENT_WRITER_LOCK_FAILURE_MARKER = "EventEmitter: writer mutex poisoned; event was not persisted"
@@ -42,8 +49,6 @@ FORBIDDEN_LOG_MARKERS = (
     "Seer: unrecovered primary local coverage gap closes new candidate admission",
     "RUG_REALITY_CAPTURE_RUNTIME_FEE_AUTHORITY_UNAVAILABLE",
     "RUG_REALITY_CAPTURE_TYPED_QUOTE_AUTHORITY_UNAVAILABLE",
-    "RUG_SCALP_RUNTIME_FEE_AUTHORITY_INVALIDATED",
-    "RUG_SCALP_RUNTIME_FEE_AUTHORITY_CHANGE_REQUESTED_CONTROLLED_SHUTDOWN",
     "Oracle Runtime failed before shutdown signal",
     "Oracle Runtime task failed before shutdown signal",
     "Oracle Runtime component shutdown failed",
@@ -64,6 +69,7 @@ def write_new(path: Path, data: bytes) -> None:
         handle.write(data)
         handle.write(b"\n")
         handle.flush()
+        os.fsync(handle.fileno())
 
 
 def load_manifest(path: Path) -> tuple[bytes, dict[str, object]]:
@@ -258,6 +264,9 @@ def load_snapshot(
         failures.append(f"{expected_phase} metrics snapshot phase mismatch")
     if snapshot.get("capture_kind") != expected_capture_kind:
         failures.append(f"{expected_phase} metrics snapshot capture kind mismatch")
+    source = snapshot.get("source", "direct")
+    if source not in ("direct", "last_known_good"):
+        failures.append(f"{expected_phase} metrics snapshot source is invalid")
     if type(snapshot.get("captured_at_unix_ms")) is not int or snapshot["captured_at_unix_ms"] <= 0:
         failures.append(f"{expected_phase} metrics snapshot timestamp missing or invalid")
     if not isinstance(snapshot.get("raw_metrics_sha256"), str) or not snapshot["raw_metrics_sha256"]:
@@ -278,6 +287,44 @@ def load_snapshot(
     return snapshot, []
 
 
+def load_lifecycle_status(
+    path: Path,
+    *,
+    expected_run_id: str,
+    expected_manifest_sha256: str,
+) -> list[str]:
+    """Validate a supervisor artifact without treating /metrics as authority.
+
+    A missing or failed final scrape is still fail-closed for a valid health
+    receipt, but the lifecycle status provides the durable root cause and
+    process liveness fact instead of falsely calling the HTTP endpoint the
+    cause of the capture failure.
+    """
+    try:
+        status = json.loads(path.read_bytes())
+    except OSError as error:
+        return [f"lifecycle status unreadable: {error}"]
+    except json.JSONDecodeError as error:
+        return [f"lifecycle status invalid JSON: {error.msg}"]
+    if not isinstance(status, dict):
+        return ["lifecycle status must be a JSON object"]
+    failures: list[str] = []
+    if status.get("schema_version") != 1:
+        failures.append("lifecycle status schema mismatch")
+    if status.get("run_id") != expected_run_id:
+        failures.append("lifecycle status run_id mismatch")
+    if status.get("manifest_sha256") != expected_manifest_sha256:
+        failures.append("lifecycle status manifest hash mismatch")
+    if status.get("launcher_returncode") not in (0, None):
+        failures.append(
+            "launcher exited non-zero according to lifecycle status: "
+            f"{status.get('launcher_returncode')} reason={status.get('exit_reason')}"
+        )
+    if status.get("launcher_returncode") is None:
+        failures.append("launcher lifecycle status has no terminal return code")
+    return failures
+
+
 def validate_capture_duration(capture_kind: str, start_ms: int, end_ms: int) -> tuple[int | None, list[str]]:
     failures: list[str] = []
     if end_ms <= start_ms:
@@ -287,6 +334,11 @@ def validate_capture_duration(capture_kind: str, start_ms: int, end_ms: int) -> 
         if not SMOKE_MIN_DURATION_MS <= duration_ms <= SMOKE_MAX_DURATION_MS:
             failures.append(
                 f"smoke duration {duration_ms}ms is outside [{SMOKE_MIN_DURATION_MS}, {SMOKE_MAX_DURATION_MS}]"
+            )
+    elif capture_kind == "soak":
+        if not SOAK_MIN_DURATION_MS <= duration_ms <= SOAK_MAX_DURATION_MS:
+            failures.append(
+                f"soak duration {duration_ms}ms is outside [{SOAK_MIN_DURATION_MS}, {SOAK_MAX_DURATION_MS}]"
             )
     elif capture_kind == "day1":
         if duration_ms < DAY1_MIN_DURATION_MS:
@@ -310,6 +362,14 @@ def finalize(args: argparse.Namespace) -> int:
 
     failures: list[str] = []
     manifest_sha256 = sha256_hex(manifest_bytes)
+    if getattr(args, "lifecycle_status", None):
+        failures.extend(
+            load_lifecycle_status(
+                Path(args.lifecycle_status),
+                expected_run_id=expected_run_id,
+                expected_manifest_sha256=manifest_sha256,
+            )
+        )
     start, start_failures = load_snapshot(
         Path(args.start_metrics),
         expected_run_id=expected_run_id,
@@ -360,6 +420,8 @@ def finalize(args: argparse.Namespace) -> int:
         "end_snapshot_sha256": end["snapshot_sha256"],
         "start_metrics_sha256": start["raw_metrics_sha256"],
         "end_metrics_sha256": end["raw_metrics_sha256"],
+        "start_metrics_source": start.get("source", "direct"),
+        "end_metrics_source": end.get("source", "direct"),
         "start_captured_at_unix_ms": start["captured_at_unix_ms"],
         "end_captured_at_unix_ms": end["captured_at_unix_ms"],
         "duration_ms": duration_ms,
@@ -369,6 +431,9 @@ def finalize(args: argparse.Namespace) -> int:
         ],
         "pr1_runtime_primary_coverage_gap_total": end["counters"][
             "pr1_runtime_primary_coverage_gap_total"
+        ],
+        "ace_capture_segment_invalid_total": end["counters"][
+            "ace_capture_segment_invalid_total"
         ],
         "event_writer_write_failure_count": writer_failures,
         "event_writer_lock_failure_count": lock_failures,
@@ -420,6 +485,10 @@ def parse_args() -> argparse.Namespace:
     finalize_command.add_argument("--start-metrics", required=True)
     finalize_command.add_argument("--end-metrics", required=True)
     finalize_command.add_argument("--log", action="append", required=True)
+    finalize_command.add_argument(
+        "--lifecycle-status",
+        help="optional manifest-bound supervisor status; records process truth when /metrics disappeared",
+    )
     finalize_command.add_argument("--output", required=True)
     finalize_command.set_defaults(handler=finalize)
 
