@@ -17868,6 +17868,35 @@ struct PoolObservationResult {
     retain_runtime_pool: bool,
 }
 
+/// Result of reconciling a downstream-applied mutation with the PR1E receipt
+/// fence.  An alias conflict is intentionally candidate-local: the receipt is
+/// failed and reclaimed by `CandidateIntegrityRegistry`, but no new Ready
+/// release is issued and unrelated candidate admission remains available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanonicalApplyAcknowledgementV1 {
+    Released { ready_count: usize },
+    CandidateAliasConflict,
+}
+
+fn acknowledge_canonical_apply(
+    candidate_integrity_registry: &CandidateIntegrityRegistry,
+    receipt: &CanonicalMutationApplyReceiptV1,
+) -> Result<CanonicalApplyAcknowledgementV1, CandidateIntegrityErrorV1> {
+    match candidate_integrity_registry.mark_canonical_apply_succeeded(receipt) {
+        Ok(released) => Ok(CanonicalApplyAcknowledgementV1::Released {
+            ready_count: released.len(),
+        }),
+        // `mark_canonical_apply_succeeded` has already made this receipt
+        // terminal and reclaimed its proof fence before returning this error.
+        // The applied mutation must not receive a Ready release, but this is
+        // evidence-local rather than a registry-wide availability failure.
+        Err(CandidateIntegrityErrorV1::CandidateAliasConflict) => {
+            Ok(CanonicalApplyAcknowledgementV1::CandidateAliasConflict)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn complete_canonical_apply(
     ctx: &PoolObservationContext,
     receipt: Option<&CanonicalMutationApplyReceiptV1>,
@@ -17883,20 +17912,25 @@ fn complete_canonical_apply(
             );
         return;
     };
-    match ctx
-        .oracle_runtime
-        .candidate_integrity_registry
-        .mark_canonical_apply_succeeded(receipt)
-    {
-        Ok(released) => {
+    match acknowledge_canonical_apply(&ctx.oracle_runtime.candidate_integrity_registry, receipt) {
+        Ok(CanonicalApplyAcknowledgementV1::Released { ready_count }) => {
             ::metrics::counter!(
                 "pr1_runtime_canonical_apply_succeeded_total",
                 1u64,
                 "authority_epoch_id" => receipt.authority_epoch_id.to_string()
             );
-            if !released.is_empty() {
-                ::metrics::counter!("candidate_integrity_ready_total", released.len() as u64);
+            if ready_count > 0 {
+                ::metrics::counter!("candidate_integrity_ready_total", ready_count as u64);
             }
+        }
+        Ok(CanonicalApplyAcknowledgementV1::CandidateAliasConflict) => {
+            warn!(
+                signature = %receipt.signature,
+                locator = ?receipt.locator,
+                candidate_pool = %receipt.candidate.pool_amm_id,
+                candidate_mint = %receipt.candidate.mint,
+                "canonical mutation applied downstream, but candidate-local alias conflict reclaimed its receipt; no Ready release issued and global admission remains open"
+            );
         }
         Err(error) => {
             warn!(
@@ -47136,6 +47170,107 @@ mod tests {
         assert_eq!(
             integrity.audit_markers.last().map(|marker| marker.action),
             Some(CandidateIntegrityConflictActionV1::TerminalVerdictImmutableAudit)
+        );
+    }
+
+    #[test]
+    fn downstream_candidate_alias_conflict_reclaims_receipt_without_closing_global_admission() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let signature = Signature::new_unique();
+        let target = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+        };
+        let locator = RawPumpMutationLocatorV1 {
+            program_id: Pubkey::new_unique(),
+            signature,
+            outer_instruction_index: 2,
+            inner_instruction_path: vec![8],
+            semantic_event_ordinal: 29,
+        };
+        let canonical = StructuralCanonicalPumpMutationV1 {
+            mutation_family: PumpMutationFamilyV1::Trade,
+            locator: locator.clone(),
+            order: CanonicalPumpOrderKeyV1 {
+                slot: 436_250_277,
+                tx_index: 0,
+                outer_instruction_index: locator.outer_instruction_index,
+                inner_instruction_path: locator.inner_instruction_path.clone(),
+                semantic_event_ordinal: locator.semantic_event_ordinal,
+            },
+            claims: PumpMutationClaimsV1 {
+                curve: Some(target.pool_amm_id),
+                mint: Some(target.mint),
+                side: Some(PumpTradeSideV1::Buy),
+                success: Some(true),
+                token_amount_units: Some(35_411_336_443),
+                ..PumpMutationClaimsV1::default()
+            },
+            primary_raw_provenance: ObservationProvenanceV1 {
+                source_family: ObservationSourceFamilyV1::RawYellowstone,
+                source_id: "test-yellowstone".to_string(),
+                provider_id: "primary".to_string(),
+                schema_id: "yellowstone.subscribe_update_transaction.prost.v1".to_string(),
+                payload_hash_blake3: [0x7A; 32],
+                received_at_monotonic_ns: 1,
+            },
+            economics_status: PumpEconomicCertificationStatusV1::PendingAnchor,
+        };
+        let receipt = registry
+            .stage_canonical_mutation(&canonical)
+            .expect("target receipt stages before downstream apply");
+        let ready_signal = CandidateIntegritySignalV1 {
+            candidate: target,
+            outcome: CandidateIntegrityOutcomeV1::Ready,
+            signature: Some(signature),
+            locator: Some(locator),
+            conflict_fields: Vec::new(),
+            evidence_hash_blake3: [0x7A; 32],
+        };
+        registry
+            .seal_complete_transaction_inventory(signature, &[ready_signal])
+            .expect("the target fence is sealed before the concurrent alias arrives");
+
+        // Reproduce the production timing boundary: an unrelated candidate
+        // claims the same mint after the target receipt was staged and sealed,
+        // but before Oracle acknowledges the already-applied target mutation.
+        let conflicting = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: target.mint,
+        };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate: conflicting,
+                outcome: CandidateIntegrityOutcomeV1::Ready,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [0x7B; 32],
+            })
+            .expect("the conflicting alias is independently present before the ack");
+
+        assert_eq!(
+            acknowledge_canonical_apply(&registry, &receipt)
+                .expect("alias conflict is a local acknowledgement outcome"),
+            CanonicalApplyAcknowledgementV1::CandidateAliasConflict
+        );
+        assert!(
+            registry.candidate_admission_open(),
+            "one downstream candidate alias conflict must not close unrelated admission"
+        );
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("conflicted downstream receipt is terminally reclaimed"),
+            (0, 0),
+            "the local conflict may not strand a receipt or proof obligation"
+        );
+        assert!(
+            matches!(
+                registry.evaluation_guard(target),
+                Err(CandidateIntegrityErrorV1::CandidateAliasConflict)
+            ),
+            "the conflicted candidate must remain ineligible for evaluation"
         );
     }
 
