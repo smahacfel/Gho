@@ -5815,6 +5815,11 @@ pub async fn run_with_oracle(
                                     // AccountUpdate events are consumed by OracleRuntime for
                                     // reconciliation; Trigger does not need to process them.
                                 }
+                                GhostEvent::FullUniverseReserveEvidence(_) => {
+                                    // ACE reserve evidence is a capture-only durable lane.
+                                    // It must never reach Trigger, Gatekeeper policy, or any
+                                    // execution surface.
+                                }
                                 GhostEvent::ShadowBuySimulated(_) => {
                                     // Compare-only shadow entry results are not consumed here.
                                 }

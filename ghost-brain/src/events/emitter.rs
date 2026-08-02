@@ -193,6 +193,23 @@ impl EventEmitter {
         ));
     }
 
+    /// Emit a durable canonical reserve-state row for the full-universe ACE
+    /// tape. The caller must supply an already validated primary AccountUpdate;
+    /// this helper intentionally performs no quote, price, or latest-state
+    /// reconstruction.
+    pub fn emit_pool_reserve_state(
+        &self,
+        candidate_id: &CandidateId,
+        payload: PoolReserveStatePayload,
+    ) {
+        let mut env = self.make_envelope_at(candidate_id, payload.event_ts_ms);
+        env.slot = Some(payload.slot);
+        self.emit(ExecutionEvent::new(
+            env,
+            EventKind::PoolReserveState(payload),
+        ));
+    }
+
     /// Emit a CandidateEvent (Gatekeeper PASS).
     pub fn emit_candidate(
         &self,
@@ -748,6 +765,56 @@ mod tests {
             "unavailable_missing_curve_state_source"
         );
         assert_eq!(parsed["envelope"]["slot"], 124);
+    }
+
+    #[test]
+    fn test_emit_pool_reserve_state_is_first_class_optional_evidence() {
+        let (emitter, tmp) = make_emitter();
+        emitter.emit_pool_reserve_state(
+            &"mint:curve:1700000001000".to_string(),
+            PoolReserveStatePayload {
+                schema_version: "v1".to_string(),
+                bonding_curve: "curve".to_string(),
+                pool_amm_id: "curve".to_string(),
+                pool_id: "curve".to_string(),
+                base_mint: "mint".to_string(),
+                mint_id: "mint".to_string(),
+                slot: 125,
+                event_slot: 125,
+                event_ts_ms: 1_700_000_001_250,
+                timestamp_ms: 1_700_000_001_250,
+                arrival_ts_ms: 1_700_000_001_251,
+                write_version: Some(7),
+                sequence_number: 9,
+                txn_signature: None,
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_000_000_000_000,
+                real_sol_reserves: 400_000_000,
+                real_token_reserves: 123_000_000,
+                complete: false,
+                provider_id: Some("primary".to_string()),
+                provider_role: Some("PrimaryAuthority".to_string()),
+                account_data_hash: Some("raw-hash".to_string()),
+                source_account_pubkey: Some("curve".to_string()),
+                source_account_owner_or_program: Some("pump".to_string()),
+                source: "primary_canonical_account_update".to_string(),
+            },
+        );
+        emitter.flush().unwrap();
+
+        let jsonl_path = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .expect("jsonl event file");
+        let content = std::fs::read_to_string(jsonl_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(parsed["kind"]["type"], "PoolReserveState");
+        assert_eq!(parsed["kind"]["payload"]["bonding_curve"], "curve");
+        assert_eq!(parsed["kind"]["payload"]["event_slot"], 125);
+        assert_eq!(parsed["kind"]["payload"]["complete"], false);
+        assert_eq!(parsed["envelope"]["slot"], 125);
     }
 
     #[test]

@@ -2507,6 +2507,20 @@ impl Seer {
         self.health = Some(health);
     }
 
+    /// Restrict primary-global AccountUpdate transport to curves explicitly
+    /// registered by candidate/create processing. This is used only by the
+    /// observe-only ACE full-universe capture to keep unrelated global curve
+    /// churn out of the bounded raw ingress queue.
+    ///
+    /// The method must be called before `run()` starts the gRPC connector.
+    pub fn enable_primary_global_account_update_registry_scope(&mut self) -> bool {
+        let Some(connection) = self.grpc_connection.as_mut() else {
+            return false;
+        };
+        connection.enable_primary_global_account_update_registry_scope();
+        true
+    }
+
     /// Attach a shared WAL handle for raw/parsed ingest durability.
     pub fn with_wal(mut self, wal: Arc<Wal>) -> Self {
         if let Some(connection) = self.grpc_connection.as_ref() {
@@ -3906,6 +3920,20 @@ impl Seer {
         ::metrics::increment_counter!("seer.account_updates.received_total");
         let primary_authority =
             provider_role == Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
+
+        if self.grpc_connection.as_ref().is_some_and(|connection| {
+            connection.primary_global_account_update_registry_scope_enabled()
+                && primary_authority
+                && !connection.is_capture_account_watched(&pubkey)
+        }) {
+            // This is a defensive duplicate of the transport-router scope.
+            // It matters for injected/replayed events: no untracked AccountUpdate
+            // may teach the registry a new curve during ACE capture.
+            ::metrics::increment_counter!(
+                "seer_primary_global_account_update_suppressed_untracked_total"
+            );
+            return Ok(true);
+        }
 
         if let Some(context) = self.bcv2_context_for_account_update(pubkey) {
             self.emit_bcv2_account_update_evidence(context, slot, write_version, owner, data.len())

@@ -11,7 +11,9 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ghost_brain::events::schema::NewPoolDetectedPayload;
-use ghost_brain::events::{EventKind, ExecutionEvent, PoolTransactionPayload};
+use ghost_brain::events::{
+    EventKind, ExecutionEvent, PoolReserveStatePayload, PoolTransactionPayload,
+};
 use ghost_brain::execution::backend::Lane;
 use ghost_core::PumpReserveState;
 use serde::{Deserialize, Serialize};
@@ -32,6 +34,7 @@ pub const ACE_CORE_BASELINE_SHA: &str = "43057b296663129ca9b4f572e793474830a5452
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const POOL_TRANSACTION_PAYLOAD_SCHEMA_V1: &str = "v1";
+const POOL_RESERVE_STATE_PAYLOAD_SCHEMA_V1: &str = "v1";
 const ACE_CORE_SIGNAL_DETECTOR: &str = "ace_core_one_day_probe_v3_observe_only";
 const ACE_CAPTURE_HEALTH_SCHEMA_VERSION: u16 = 3;
 const CALIBRATION_BIRTHS: usize = 250;
@@ -261,10 +264,19 @@ struct TapeTrade {
     line_number: usize,
 }
 
+#[derive(Debug, Clone)]
+struct TapeReserveState {
+    payload: PoolReserveStatePayload,
+    event_id: String,
+    file_ordinal: usize,
+    line_number: usize,
+}
+
 #[derive(Debug, Default)]
 struct Tape {
     births: Vec<TapeBirth>,
     trades: Vec<TapeTrade>,
+    reserve_states: Vec<TapeReserveState>,
     invalid_reasons: BTreeSet<String>,
 }
 
@@ -272,6 +284,7 @@ struct Tape {
 struct CandidateWork {
     birth: TapeBirth,
     trades: Vec<TapeTrade>,
+    reserve_states: Vec<TapeReserveState>,
     feature_result: std::result::Result<FeatureValues, String>,
 }
 
@@ -305,6 +318,8 @@ struct ReserveObservation {
     arrival_ts_ms: u64,
     slot: u64,
     order: Option<CanonicalTradeOrder>,
+    write_version: Option<u64>,
+    sequence_number: u64,
     ordinal: (usize, usize),
     reserves: PumpReserveState,
 }
@@ -368,6 +383,15 @@ struct FullTradeDedupeKey {
     event_ordinal: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct FullReserveStateDedupeKey {
+    base_mint: String,
+    bonding_curve: String,
+    slot: u64,
+    write_version: Option<u64>,
+    sequence_number: u64,
+}
+
 /// Run the strictly offline ACE Core one-day probe.
 ///
 /// The function intentionally accepts only persisted evidence paths. It never
@@ -393,6 +417,7 @@ pub fn run_ace_core_one_day_probe(args: AceCoreOneDayProbeArgs) -> Result<AceCor
         })
         .collect::<BTreeSet<_>>();
     let trade_index = strict_trade_index(&mut tape, &canonical_birth_keys);
+    let reserve_state_index = strict_reserve_state_index(&mut tape, &canonical_birth_keys);
     invalid_reasons.extend(tape.invalid_reasons.iter().cloned());
     let quote_contract = if invalid_reasons.is_empty() {
         Some(
@@ -420,16 +445,20 @@ pub fn run_ace_core_one_day_probe(args: AceCoreOneDayProbeArgs) -> Result<AceCor
     let mut works = births
         .into_iter()
         .map(|birth| {
-            let (trades, feature_result) = match birth_key(&birth.payload) {
+            let (trades, reserve_states, feature_result) = match birth_key(&birth.payload) {
                 BirthKeyResolution::Eligible(key) => {
                     let trades = trade_index.get(&key).cloned().unwrap_or_default();
+                    let reserve_states = reserve_state_index.get(&key).cloned().unwrap_or_default();
                     let feature_result = calculate_features(&birth, &trades);
-                    (trades, feature_result)
+                    (trades, reserve_states, feature_result)
                 }
-                BirthKeyResolution::Malformed(reason) => {
-                    (Vec::new(), Err(format!("malformed_birth:{reason}")))
-                }
+                BirthKeyResolution::Malformed(reason) => (
+                    Vec::new(),
+                    Vec::new(),
+                    Err(format!("malformed_birth:{reason}")),
+                ),
                 BirthKeyResolution::OutsideUniverse => (
+                    Vec::new(),
                     Vec::new(),
                     Err("birth_outside_eligible_universe".to_string()),
                 ),
@@ -437,6 +466,7 @@ pub fn run_ace_core_one_day_probe(args: AceCoreOneDayProbeArgs) -> Result<AceCor
             CandidateWork {
                 birth,
                 trades,
+                reserve_states,
                 feature_result,
             }
         })
@@ -857,6 +887,14 @@ fn read_tape(events_dir: &Path, expected_run_id: &str) -> Result<Tape> {
                     file_ordinal,
                     line_number,
                 }),
+                EventKind::PoolReserveState(payload) => {
+                    tape.reserve_states.push(TapeReserveState {
+                        payload,
+                        event_id: event.envelope.event_id,
+                        file_ordinal,
+                        line_number,
+                    })
+                }
                 _ => {}
             }
         }
@@ -1124,6 +1162,134 @@ fn strict_trade_index(
             }
         }
         *trades = retained;
+    }
+    indexed
+}
+
+fn strict_reserve_state_key(
+    payload: &PoolReserveStatePayload,
+) -> std::result::Result<BirthKey, &'static str> {
+    if payload.schema_version != POOL_RESERVE_STATE_PAYLOAD_SCHEMA_V1 {
+        return Err("pool_reserve_state_schema_version_mismatch");
+    }
+    let Some(base_mint) = non_empty(&payload.base_mint) else {
+        return Err("pool_reserve_state_base_mint_missing");
+    };
+    let Some(mint_id) = non_empty(&payload.mint_id) else {
+        return Err("pool_reserve_state_mint_alias_missing");
+    };
+    if base_mint != mint_id {
+        return Err("pool_reserve_state_mint_alias_conflict");
+    }
+    let Some(pool_amm_id) = non_empty(&payload.pool_amm_id) else {
+        return Err("pool_reserve_state_pool_amm_id_missing");
+    };
+    let Some(pool_id) = non_empty(&payload.pool_id) else {
+        return Err("pool_reserve_state_pool_id_missing");
+    };
+    let Some(bonding_curve) = non_empty(&payload.bonding_curve) else {
+        return Err("pool_reserve_state_bonding_curve_missing");
+    };
+    if pool_amm_id != pool_id || pool_amm_id != bonding_curve {
+        return Err("pool_reserve_state_pool_curve_alias_conflict");
+    }
+    if payload.event_slot != payload.slot {
+        return Err("pool_reserve_state_slot_alias_conflict");
+    }
+    if payload.event_ts_ms == 0 || payload.arrival_ts_ms == 0 {
+        return Err("pool_reserve_state_timestamp_missing");
+    }
+    Ok(BirthKey {
+        base_mint: base_mint.to_string(),
+        bonding_curve: bonding_curve.to_string(),
+    })
+}
+
+fn full_reserve_state_dedupe_key(payload: &PoolReserveStatePayload) -> FullReserveStateDedupeKey {
+    FullReserveStateDedupeKey {
+        base_mint: payload.base_mint.clone(),
+        bonding_curve: payload.bonding_curve.clone(),
+        slot: payload.slot,
+        write_version: payload.write_version,
+        sequence_number: payload.sequence_number,
+    }
+}
+
+fn reserve_state_material_digest(payload: &PoolReserveStatePayload) -> Option<String> {
+    serde_json::to_vec(payload)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn compare_reserve_state(left: &TapeReserveState, right: &TapeReserveState) -> std::cmp::Ordering {
+    (
+        left.payload.event_ts_ms,
+        left.payload.slot,
+        left.payload.write_version.unwrap_or(u64::MAX),
+        left.payload.sequence_number,
+        left.event_id.as_str(),
+        left.file_ordinal,
+        left.line_number,
+    )
+        .cmp(&(
+            right.payload.event_ts_ms,
+            right.payload.slot,
+            right.payload.write_version.unwrap_or(u64::MAX),
+            right.payload.sequence_number,
+            right.event_id.as_str(),
+            right.file_ordinal,
+            right.line_number,
+        ))
+}
+
+/// Strictly index direct durable reserve-state evidence.  Unlike legacy
+/// trade-attached reserves, these rows are allowed to exist without an exact
+/// transaction tuple; identity, timestamps, order and payload consistency are
+/// nevertheless fail-closed.
+fn strict_reserve_state_index(
+    tape: &mut Tape,
+    canonical_birth_keys: &BTreeSet<BirthKey>,
+) -> BTreeMap<BirthKey, Vec<TapeReserveState>> {
+    let mut indexed = BTreeMap::<BirthKey, Vec<TapeReserveState>>::new();
+    for state in tape.reserve_states.iter().cloned() {
+        match strict_reserve_state_key(&state.payload) {
+            Ok(key) if canonical_birth_keys.contains(&key) => {
+                indexed.entry(key).or_default().push(state);
+            }
+            Ok(_) => {
+                tape.invalid_reasons
+                    .insert("pool_reserve_state_has_no_canonical_birth".to_string());
+            }
+            Err(reason) => {
+                tape.invalid_reasons.insert(reason.to_string());
+            }
+        }
+    }
+    for states in indexed.values_mut() {
+        states.sort_by(compare_reserve_state);
+        let mut seen = HashMap::<FullReserveStateDedupeKey, String>::new();
+        let mut retained = Vec::with_capacity(states.len());
+        for state in std::mem::take(states) {
+            let key = full_reserve_state_dedupe_key(&state.payload);
+            let Some(material_digest) = reserve_state_material_digest(&state.payload) else {
+                tape.invalid_reasons
+                    .insert("pool_reserve_state_material_payload_unserializable".to_string());
+                continue;
+            };
+            match seen.get(&key) {
+                None => {
+                    seen.insert(key, material_digest);
+                    retained.push(state);
+                }
+                Some(first_digest) if first_digest == &material_digest => {}
+                Some(_) => {
+                    tape.invalid_reasons.insert(
+                        "pool_reserve_state_divergent_canonical_write_duplicate".to_string(),
+                    );
+                }
+            }
+        }
+        *states = retained;
     }
     indexed
 }
@@ -1681,6 +1847,8 @@ fn reserve_observation(trade: &TapeTrade) -> Option<ReserveObservation> {
         arrival_ts_ms: payload.arrival_ts_ms,
         slot: canonical_slot(payload)?,
         order: canonical_trade_order(payload),
+        write_version: None,
+        sequence_number: 0,
         ordinal: (trade.file_ordinal, trade.line_number),
         reserves: PumpReserveState {
             virtual_base_reserves: payload.virtual_token_reserves?,
@@ -1691,16 +1859,48 @@ fn reserve_observation(trade: &TapeTrade) -> Option<ReserveObservation> {
     })
 }
 
+fn direct_reserve_observation(state: &TapeReserveState) -> Option<ReserveObservation> {
+    let payload = &state.payload;
+    if payload.complete || payload.event_ts_ms == 0 || payload.arrival_ts_ms == 0 {
+        return None;
+    }
+    Some(ReserveObservation {
+        event_ts_ms: payload.event_ts_ms,
+        arrival_ts_ms: payload.arrival_ts_ms,
+        slot: payload.slot,
+        order: None,
+        write_version: payload.write_version,
+        sequence_number: payload.sequence_number,
+        ordinal: (state.file_ordinal, state.line_number),
+        reserves: PumpReserveState {
+            virtual_base_reserves: payload.virtual_token_reserves,
+            virtual_quote_reserves: payload.virtual_sol_reserves,
+            real_base_reserves: payload.real_token_reserves,
+            real_quote_reserves: payload.real_sol_reserves,
+        },
+    })
+}
+
 fn compare_reserve_observation(
     left: &ReserveObservation,
     right: &ReserveObservation,
 ) -> std::cmp::Ordering {
-    (left.event_ts_ms, left.slot, left.order, left.ordinal).cmp(&(
-        right.event_ts_ms,
-        right.slot,
-        right.order,
-        right.ordinal,
-    ))
+    (
+        left.event_ts_ms,
+        left.slot,
+        left.order,
+        left.write_version,
+        left.sequence_number,
+        left.ordinal,
+    )
+        .cmp(&(
+            right.event_ts_ms,
+            right.slot,
+            right.order,
+            right.write_version,
+            right.sequence_number,
+            right.ordinal,
+        ))
 }
 
 fn absolute_virtual_price_impact_bps(
@@ -1749,12 +1949,22 @@ fn calculate_economic_outcome(
     let cutoffs = decision_cutoffs(&work.birth)
         .map_err(|_| EconomicFailure::Reserves("birth_detected_wall_timestamp_missing"))?;
     let cutoff_ts_ms = cutoffs.event_cutoff_ts_ms;
-    let mut states = work
-        .trades
-        .iter()
-        .filter_map(reserve_observation)
-        .filter(|state| state.event_ts_ms >= work.birth.payload.birth_ts_ms)
-        .collect::<Vec<_>>();
+    // New capture runs persist direct canonical AccountUpdate evidence.  The
+    // legacy trade-attached state path remains only for backward-compatible
+    // offline fixtures; it is never a mutable/latest-state fallback.
+    let mut states = if work.reserve_states.is_empty() {
+        work.trades
+            .iter()
+            .filter_map(reserve_observation)
+            .filter(|state| state.event_ts_ms >= work.birth.payload.birth_ts_ms)
+            .collect::<Vec<_>>()
+    } else {
+        work.reserve_states
+            .iter()
+            .filter_map(direct_reserve_observation)
+            .filter(|state| state.event_ts_ms >= work.birth.payload.birth_ts_ms)
+            .collect::<Vec<_>>()
+    };
     states.sort_by(compare_reserve_observation);
     let entry_state = states
         .iter()
@@ -2281,6 +2491,7 @@ mod tests {
         CandidateWork {
             birth,
             trades,
+            reserve_states: Vec::new(),
             feature_result,
         }
     }
@@ -2394,6 +2605,47 @@ mod tests {
         trade.payload.is_synthetic = Some(false);
     }
 
+    fn direct_reserve_state_from_trade(trade: &TapeTrade) -> TapeReserveState {
+        let payload = &trade.payload;
+        TapeReserveState {
+            payload: PoolReserveStatePayload {
+                schema_version: POOL_RESERVE_STATE_PAYLOAD_SCHEMA_V1.to_string(),
+                bonding_curve: payload.bonding_curve.clone(),
+                pool_amm_id: payload.pool_amm_id.clone(),
+                pool_id: payload.pool_id.clone(),
+                base_mint: payload.base_mint.clone().expect("fixture base mint"),
+                mint_id: payload.mint_id.clone().expect("fixture mint alias"),
+                slot: canonical_slot(payload).expect("fixture slot"),
+                event_slot: canonical_slot(payload).expect("fixture event slot"),
+                event_ts_ms: payload.event_ts_ms,
+                timestamp_ms: payload.event_ts_ms,
+                arrival_ts_ms: payload.arrival_ts_ms,
+                write_version: Some(payload.event_ordinal.expect("fixture ordinal") as u64),
+                sequence_number: payload.event_ordinal.expect("fixture ordinal") as u64,
+                txn_signature: None,
+                virtual_sol_reserves: payload.virtual_sol_reserves.expect("fixture virtual SOL"),
+                virtual_token_reserves: payload
+                    .virtual_token_reserves
+                    .expect("fixture virtual token"),
+                real_sol_reserves: payload.real_sol_reserves.expect("fixture real SOL"),
+                real_token_reserves: payload.real_token_reserves.expect("fixture real token"),
+                complete: payload.complete.expect("fixture complete"),
+                provider_id: Some("primary".to_string()),
+                provider_role: Some("PrimaryAuthority".to_string()),
+                account_data_hash: Some(format!(
+                    "fixture-state-{}",
+                    payload.event_ordinal.unwrap()
+                )),
+                source_account_pubkey: Some(payload.bonding_curve.clone()),
+                source_account_owner_or_program: Some(RUG_SCALP_PUMP_PROGRAM.to_string()),
+                source: "primary_canonical_account_update".to_string(),
+            },
+            event_id: format!("reserve-state-{}", payload.event_ordinal.unwrap()),
+            file_ordinal: trade.file_ordinal,
+            line_number: trade.line_number,
+        }
+    }
+
     fn economic_work(
         confirmation_matches_entry: bool,
         confirmation_same_slot: bool,
@@ -2422,6 +2674,7 @@ mod tests {
             feature_result: calculate_features(&birth, &trades),
             birth,
             trades,
+            reserve_states: Vec::new(),
         }
     }
 
@@ -2518,11 +2771,13 @@ mod tests {
         let later_chain_earlier_ingress = CandidateWork {
             birth: test_birth("first-seen", 2_000),
             trades: Vec::new(),
+            reserve_states: Vec::new(),
             feature_result: Err("fixture".to_string()),
         };
         let mut earlier_chain_later_ingress = CandidateWork {
             birth: test_birth("later-seen", 1_000),
             trades: Vec::new(),
+            reserve_states: Vec::new(),
             feature_result: Err("fixture".to_string()),
         };
         earlier_chain_later_ingress
@@ -2544,6 +2799,7 @@ mod tests {
         let mut tape = Tape {
             births: Vec::new(),
             trades: vec![first, second],
+            reserve_states: Vec::new(),
             invalid_reasons: BTreeSet::new(),
         };
         let birth_keys = [BirthKey {
@@ -2619,12 +2875,68 @@ mod tests {
     }
 
     #[test]
+    fn direct_reserve_state_lane_supports_outcome_without_trade_attached_reserves() {
+        let mut work = economic_work(false, false);
+        work.reserve_states = work
+            .trades
+            .iter()
+            .filter(|trade| trade.payload.event_ts_ms >= work.birth.payload.birth_ts_ms)
+            .map(direct_reserve_state_from_trade)
+            .collect();
+
+        // Deliberately destroy the legacy trade-attached reserve path after
+        // first-class state evidence has been captured. A direct state lane
+        // must remain sufficient; it cannot silently fall back to a mutable
+        // latest state, price, or transaction amount.
+        for trade in &mut work.trades {
+            trade.payload.success = false;
+            trade.payload.virtual_sol_reserves = None;
+            trade.payload.virtual_token_reserves = None;
+            trade.payload.real_sol_reserves = None;
+            trade.payload.real_token_reserves = None;
+        }
+        let contract = quote_authority().materialize().expect("quote contract");
+        let outcome = calculate_economic_outcome(&work, 10_000_000_000, &contract)
+            .expect("direct primary states must supply the legal outcome path");
+        assert!(outcome.best_net_return.is_finite());
+    }
+
+    #[test]
+    fn divergent_direct_reserve_state_duplicate_invalidates_capture() {
+        let state = direct_reserve_state_from_trade(&test_trade(2_000, "wallet", 1, 1));
+        let mut conflicting = state.clone();
+        conflicting.payload.real_sol_reserves =
+            conflicting.payload.real_sol_reserves.saturating_add(1);
+        conflicting.event_id = "conflicting-state-delivery".to_string();
+        let mut tape = Tape {
+            births: vec![test_birth("candidate", 1_000)],
+            trades: Vec::new(),
+            reserve_states: vec![state, conflicting],
+            invalid_reasons: BTreeSet::new(),
+        };
+        let (births, _) = canonical_births(&mut tape);
+        let keys = births
+            .iter()
+            .filter_map(|birth| match birth_key(&birth.payload) {
+                BirthKeyResolution::Eligible(key) => Some(key),
+                BirthKeyResolution::OutsideUniverse | BirthKeyResolution::Malformed(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let indexed = strict_reserve_state_index(&mut tape, &keys);
+        assert_eq!(indexed.values().next().expect("state group").len(), 1);
+        assert!(tape
+            .invalid_reasons
+            .contains("pool_reserve_state_divergent_canonical_write_duplicate"));
+    }
+
+    #[test]
     fn malformed_pump_sol_birth_is_retained_and_invalidates_capture() {
         let mut malformed = test_birth("malformed", 1_000);
         malformed.payload.base_mint.clear();
         let mut tape = Tape {
             births: vec![malformed],
             trades: Vec::new(),
+            reserve_states: Vec::new(),
             invalid_reasons: BTreeSet::new(),
         };
         let (births, duplicates) = canonical_births(&mut tape);
@@ -2647,6 +2959,7 @@ mod tests {
         let mut tape = Tape {
             births: vec![birth],
             trades: vec![trade],
+            reserve_states: Vec::new(),
             invalid_reasons: BTreeSet::new(),
         };
         let (births, _) = canonical_births(&mut tape);
@@ -2676,6 +2989,7 @@ mod tests {
         let mut tape = Tape {
             births: vec![birth],
             trades: vec![first, conflicting],
+            reserve_states: Vec::new(),
             invalid_reasons: BTreeSet::new(),
         };
         let (births, _) = canonical_births(&mut tape);
@@ -2701,6 +3015,7 @@ mod tests {
         let mut tape = Tape {
             births: vec![birth],
             trades: vec![trade],
+            reserve_states: Vec::new(),
             invalid_reasons: BTreeSet::new(),
         };
         let (births, _) = canonical_births(&mut tape);

@@ -1571,6 +1571,12 @@ pub enum GhostEvent {
     /// `OracleRuntime::process_account_update(...)` to drive corrective
     /// reconciliation. Shadow Ledger remains primary; this is corrective only.
     AccountUpdate(AccountUpdateEvent),
+
+    /// Capture-only canonical reserve evidence for a PR1E-admitted Pump
+    /// candidate. This bypasses the session-state relay intentionally: it is
+    /// consumed only by the full-universe tape writer and must not mutate
+    /// AccountStateCore, Gatekeeper, Trigger, or execution state.
+    FullUniverseReserveEvidence(AccountUpdateEvent),
 }
 
 impl GhostEvent {
@@ -1876,6 +1882,7 @@ impl GhostEvent {
             GhostEvent::GeyserTransaction { .. } => "geyser_transaction",
             GhostEvent::Custom(_, _) => "custom",
             GhostEvent::AccountUpdate(_) => "account_update",
+            GhostEvent::FullUniverseReserveEvidence(_) => "full_universe_reserve_evidence",
         }
     }
 }

@@ -87,7 +87,28 @@ const SEER_DISPATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3_600);
 const SEER_IPC_RECEIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 static SEER_ORACLE_DRAIN_BARRIER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SESSION_POOL_BRIDGE_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
+/// ACE V3 needs post-cutoff states through 120 seconds after an 11_111 ms
+/// decision window.  This retention is deliberately separate from the
+/// session bridge's 120 s convenience TTL: the latter is a runtime-session
+/// lifecycle bound, not an outcome-evidence contract.
+const FULL_UNIVERSE_RESERVE_EVIDENCE_RETENTION: Duration = Duration::from_secs(140);
 const NLN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
+fn validate_full_universe_reserve_evidence_retention(
+    full_universe_reality_capture_enabled: bool,
+    watched_pools_ttl_ms: u64,
+) -> Result<()> {
+    if full_universe_reality_capture_enabled
+        && watched_pools_ttl_ms < FULL_UNIVERSE_RESERVE_EVIDENCE_RETENTION.as_millis() as u64
+    {
+        return Err(anyhow::anyhow!(
+            "ACE full-universe capture requires seer.watched_pools_ttl_ms >= {} to cover the durable reserve outcome horizon; got {}",
+            FULL_UNIVERSE_RESERVE_EVIDENCE_RETENTION.as_millis(),
+            watched_pools_ttl_ms,
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 struct NlnArtifactCaptureConfig {
@@ -3688,6 +3709,67 @@ impl SessionAccountUpdateBridge {
     }
 }
 
+/// Capture-only registry for reserve-state evidence.
+///
+/// `SessionAccountUpdateBridge` is allowed to expire when a runtime session
+/// no longer needs AccountStateCore input. ACE outcome evidence cannot share
+/// that lifecycle: its legal horizon extends beyond the session TTL. This
+/// bridge is intentionally narrow: it registers only PR1E-admitted Pump
+/// candidates, forwards only exact `(base_mint, bonding_curve)` matches, and
+/// never buffers arbitrary global account updates.
+#[derive(Debug)]
+struct FullUniverseReserveEvidenceBridge {
+    by_bonding_curve: HashMap<Pubkey, (Pubkey, Instant)>,
+    retention: Duration,
+    cap: usize,
+}
+
+impl FullUniverseReserveEvidenceBridge {
+    fn new(retention: Duration, cap: usize) -> Self {
+        Self {
+            by_bonding_curve: HashMap::new(),
+            retention,
+            cap: cap.max(1),
+        }
+    }
+
+    /// Returns false rather than evicting an evidence subject. A cap breach is
+    /// therefore visible to the caller as a capture-segment integrity fault,
+    /// never a silent loss of one candidate's outcome path.
+    fn register_detected_pool(
+        &mut self,
+        candidate: &seer::types::CandidatePool,
+        now: Instant,
+    ) -> bool {
+        self.prune_expired(now);
+        if !self.by_bonding_curve.contains_key(&candidate.bonding_curve)
+            && self.by_bonding_curve.len() >= self.cap
+        {
+            return false;
+        }
+        self.by_bonding_curve
+            .insert(candidate.bonding_curve, (candidate.base_mint, now));
+        true
+    }
+
+    fn accepts(&mut self, update: &seer::ipc::DetectedAccountUpdateEvent, now: Instant) -> bool {
+        self.prune_expired(now);
+        self.by_bonding_curve
+            .get(&update.bonding_curve)
+            .is_some_and(|(base_mint, _)| *base_mint == update.base_mint)
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        self.by_bonding_curve
+            .retain(|_, (_, registered_at)| now.duration_since(*registered_at) <= self.retention);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_bonding_curve.len()
+    }
+}
+
 pub struct SessionPoolTradeBridge {
     detected_pools: HashMap<Pubkey, Instant>,
     detected_pool_order: VecDeque<Pubkey>,
@@ -5265,7 +5347,7 @@ pub(crate) fn process_pool_detected_event_for_session_gate(
 ) -> SessionTradeFlushResult {
     let detected_pool = detected_pool_from_candidate(candidate, detected_ms);
 
-    info!(
+    tracing::debug!(
         "Seer: 🚀 Emitting NewPoolDetected: pool_amm_id={}, base_mint={}, slot={:?}, amm_program={}",
         detected_pool.pool_amm_id,
         detected_pool.base_mint,
@@ -5294,7 +5376,7 @@ pub(crate) fn process_pool_detected_event_for_session_gate(
         if let Some(health) = health {
             health.mark_bus_event();
         }
-        info!(
+        tracing::debug!(
             "Seer: ✅ Event emitted to Event Bus for new pool: pool={}, receivers={}",
             detected_pool.pool_amm_id,
             tx.receiver_count()
@@ -5367,7 +5449,7 @@ fn emit_pool_transaction_to_event_bus(
 ) -> bool {
     let pool_tx = trade_event_to_pool_transaction(trade);
 
-    info!(
+    tracing::debug!(
         "Seer: 🚀 Emitting PoolTransaction: {} pool={} volume={:.4} SOL replayed_from_session_buffer={}",
         if trade.is_buy { "BUY" } else { "SELL" },
         pool_tx.pool_amm_id,
@@ -5382,7 +5464,7 @@ fn emit_pool_transaction_to_event_bus(
         if let Some(health) = health {
             health.mark_bus_event();
         }
-        info!(
+        tracing::debug!(
             "Seer: ✅ PoolTransaction ZOSTAŁA PRZEKAZANA DO MAGISTRALI ZDARZEŃ: receivers={} replayed_from_session_buffer={}",
             tx.receiver_count(),
             replayed_from_session_buffer
@@ -5397,7 +5479,7 @@ fn emit_account_update_to_event_bus(
     health: Option<&Arc<RuntimeHealth>>,
     replayed_from_session_buffer: bool,
 ) {
-    tracing::info!(
+    tracing::debug!(
         base_mint = %update.base_mint,
         bonding_curve = %update.bonding_curve,
         slot = update.slot,
@@ -5408,7 +5490,60 @@ fn emit_account_update_to_event_bus(
         replayed_from_session_buffer,
         "DIAG_ACCOUNT_UPDATE_RELAY"
     );
-    let ghost_event = GhostEvent::AccountUpdate(AccountUpdateEvent {
+    let ghost_event = GhostEvent::AccountUpdate(account_update_event_from_detected(update));
+    if let Err(e) = tx.send(ghost_event) {
+        tracing::debug!(
+            "Seer: AccountUpdate event not delivered (no receivers or lag): {}",
+            e
+        );
+        return;
+    }
+    if let Some(health) = health {
+        health.mark_bus_event();
+    }
+}
+
+/// Emit a capture-only state row without routing it through session state,
+/// AccountStateCore, Gatekeeper, or execution. This is the only valid path for
+/// ACE outcome evidence after the normal session relay has expired.
+fn emit_full_universe_reserve_evidence_to_event_bus(
+    tx: &EventBusSender,
+    update: &seer::ipc::DetectedAccountUpdateEvent,
+    health: Option<&Arc<RuntimeHealth>>,
+) {
+    let ghost_event =
+        GhostEvent::FullUniverseReserveEvidence(account_update_event_from_detected(update));
+    if let Err(error) = tx.send(ghost_event) {
+        ::metrics::counter!(
+            "seer_full_universe_reserve_evidence_send_failed_total",
+            1u64
+        );
+        warn!(
+            base_mint = %update.base_mint,
+            bonding_curve = %update.bonding_curve,
+            slot = update.slot,
+            error = %error,
+            "ACE_FULL_UNIVERSE_RESERVE_EVIDENCE_SEND_FAILED"
+        );
+        return;
+    }
+    ::metrics::counter!("seer_full_universe_reserve_evidence_emitted_total", 1u64);
+    if let Some(health) = health {
+        health.mark_bus_event();
+    }
+}
+
+#[inline]
+fn is_canonical_full_universe_reserve_evidence(
+    update: &seer::ipc::DetectedAccountUpdateEvent,
+) -> bool {
+    is_primary_raw_runtime_authority(update.provider_role)
+}
+
+fn account_update_event_from_detected(
+    update: &seer::ipc::DetectedAccountUpdateEvent,
+) -> AccountUpdateEvent {
+    AccountUpdateEvent {
         provider_id: update.provider_id.clone(),
         provider_role: update.provider_role,
         semantic: update.semantic,
@@ -5432,16 +5567,6 @@ fn emit_account_update_to_event_bus(
         replay_buffer_dwell_ms: update.replay_buffer_dwell_ms,
         detected_at: update.detected_at,
         sequence_number: update.sequence_number,
-    });
-    if let Err(e) = tx.send(ghost_event) {
-        tracing::debug!(
-            "Seer: AccountUpdate event not delivered (no receivers or lag): {}",
-            e
-        );
-        return;
-    }
-    if let Some(health) = health {
-        health.mark_bus_event();
     }
 }
 
@@ -5792,9 +5917,22 @@ pub async fn run(
     health: Option<Arc<RuntimeHealth>>,
     authoritative_funding_stream_tx: Option<watch::Sender<bool>>,
     canonical_account_update_relay_enabled: bool,
+    full_universe_reality_capture_enabled: bool,
     candidate_integrity_registry: Arc<CandidateIntegrityRegistry>,
 ) -> Result<()> {
     info!("Seer: Initializing component");
+
+    // The ACE V3 sustained-outcome contract needs a state as late as
+    // 11_111 ms (decision window) + 120_000 ms (outcome horizon) after
+    // detection.  The exact-account transport registry owns the upstream
+    // admission gate for those AccountUpdates, so its retention must outlive
+    // that contract.  Do not silently extend this at runtime: an explicit
+    // rollout value makes an insufficient tape fail at startup rather than
+    // quietly lose its final outcome states.
+    validate_full_universe_reserve_evidence_retention(
+        full_universe_reality_capture_enabled,
+        config.watched_pools_ttl_ms,
+    )?;
 
     validate_pr1e_startup_contract(
         &config,
@@ -6102,6 +6240,18 @@ pub async fn run(
         seer_instance = seer_instance.with_wal(wal);
     }
 
+    if full_universe_reality_capture_enabled {
+        if !seer_instance.enable_primary_global_account_update_registry_scope() {
+            return Err(anyhow::anyhow!(
+                "ACE full-universe capture requires a primary gRPC connection for candidate-scoped AccountUpdate ingress"
+            ));
+        }
+        info!(
+            retention_ms = FULL_UNIVERSE_RESERVE_EVIDENCE_RETENTION.as_millis(),
+            "ACE_FULL_UNIVERSE_ACCOUNT_UPDATE_SCOPE_ENABLED"
+        );
+    }
+
     let nln_authoritative_funding_stream_tx = authoritative_funding_stream_tx.clone();
     if let Some(tx) = authoritative_funding_stream_tx {
         if seer_instance.set_authoritative_funding_stream_availability_sender(tx) {
@@ -6181,6 +6331,13 @@ pub async fn run(
         );
         let mut session_account_update_bridge =
             SessionAccountUpdateBridge::from_runtime_config(detected_pool_ttl, detected_pool_cap);
+        let mut full_universe_reserve_evidence_bridge =
+            full_universe_reality_capture_enabled.then(|| {
+                FullUniverseReserveEvidenceBridge::new(
+                    FULL_UNIVERSE_RESERVE_EVIDENCE_RETENTION,
+                    detected_pool_cap,
+                )
+            });
         let mut prune_interval = tokio::time::interval(session_bridge_prune_interval(
             SESSION_POOL_TRADE_BUFFER_TTL,
             detected_pool_ttl,
@@ -6552,6 +6709,23 @@ pub async fn run(
                             permit.clone(),
                             &candidate_integrity_registry_ipc,
                         );
+                        if let Some(bridge) = full_universe_reserve_evidence_bridge.as_mut() {
+                            if !bridge.register_detected_pool(candidate, now) {
+                                // No eviction is allowed for an ACE evidence subject:
+                                // losing its reserve horizon would manufacture an
+                                // apparently clean but incomplete denominator.
+                                error!(
+                                    pool = %candidate.pool_amm_id,
+                                    base_mint = %candidate.base_mint,
+                                    cap = detected_pool_cap,
+                                    "ACE_FULL_UNIVERSE_RESERVE_EVIDENCE_CAP_EXHAUSTED"
+                                );
+                                record_capture_failure(
+                                    CaptureFailureClassV1::CaptureSegmentInvalid,
+                                    "full_universe_reserve_evidence_cap_exhausted",
+                                );
+                            }
+                        }
                         let nln_replay_ready = match nln_trade_pool_resolver_ipc.lock() {
                             Ok(mut resolver) => {
                                 let result = resolver.register_candidate(candidate, now);
@@ -6584,7 +6758,7 @@ pub async fn run(
                                 "nln_trade_canonical_replay_suppressed_total",
                                 nln_replay_ready.len() as u64
                             );
-                            info!(
+                            tracing::debug!(
                                 mint = %candidate.base_mint,
                                 pool = %candidate.pool_amm_id,
                                 witness_count = nln_replay_ready.len(),
@@ -6769,7 +6943,7 @@ pub async fn run(
                             } else {
                                 trade.min_sol_output as f64 / 1_000_000_000.0
                             };
-                            info!(
+                            tracing::debug!(
                                 "Seer: 🔄 Trade detected via IPC - {} on pool={}, mint={}, sol_volume={:.6} SOL, token_amount={:.6}, signer={}",
                                 if trade.is_buy { "BUY" } else { "SELL" },
                                 trade.pool_amm_id,
@@ -6832,8 +7006,20 @@ pub async fn run(
                 seer::ipc::SeerEvent::AccountUpdate(au) => {
                     if canonical_account_update_relay_enabled {
                         if let Some(ref tx) = event_bus_tx {
-                            let ingress = session_account_update_bridge
-                                .ingest_account_update(&au, Instant::now());
+                            let now = Instant::now();
+                            if is_canonical_full_universe_reserve_evidence(&au)
+                                && full_universe_reserve_evidence_bridge
+                                    .as_mut()
+                                    .is_some_and(|bridge| bridge.accepts(&au, now))
+                            {
+                                emit_full_universe_reserve_evidence_to_event_bus(
+                                    tx,
+                                    &au,
+                                    health_ipc.as_ref(),
+                                );
+                            }
+                            let ingress =
+                                session_account_update_bridge.ingest_account_update(&au, now);
                             record_session_account_update_expired(ingress.expired_count);
                             record_session_account_update_detected_key_expired(
                                 ingress.expired_detected_keys,
@@ -7185,22 +7371,24 @@ pub fn trade_event_to_pool_transaction(
 mod tests {
     use super::{
         detected_pool_from_candidate, detection_clock_summary, emit_account_update_to_event_bus,
-        emit_execution_account_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
+        emit_execution_account_evidence_to_event_bus,
+        emit_full_universe_reserve_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
         finalize_pump_observation_ledger, handle_local_coverage_gap_notice,
         ingest_pool_detection_observation, ingest_pump_observation,
-        is_primary_raw_runtime_authority, missing_primary_observation_signal,
-        nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
-        pool_candidate_matches_primary_observation, process_pool_detected_event_for_session_gate,
-        process_trade_event_for_session_gate, pump_observation_ledger_finalization_interval,
-        pumpswap_program_id, select_nln_program_stream_subscriptions,
-        trade_event_to_pool_transaction, trade_has_forwardable_identity,
-        trade_matches_primary_observation, validate_pr1e_startup_contract,
-        CanonicalRuntimeAdmissionV1, CanonicalRuntimeNoApplyReasonV1, NlnArtifactDeliveryState,
-        NlnArtifactOverflowReasonV1, NlnArtifactRecord, NlnArtifactWriter,
-        NlnProgramStreamCaptureTopic, NlnTradePoolIdentityResolver, NlnTradeResolveDecision,
-        SessionAccountUpdateBridge, SessionAccountUpdateDecision, SessionBcv2Context,
-        SessionExecutionAccountEvidenceDecision, SessionPoolTradeBridge, SessionTradeDecision,
-        TOKEN_PROGRAM_ID,
+        is_canonical_full_universe_reserve_evidence, is_primary_raw_runtime_authority,
+        missing_primary_observation_signal, nln_normalization_error_row,
+        nln_route_manifest_evidence_candidate_row, pool_candidate_matches_primary_observation,
+        process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
+        pump_observation_ledger_finalization_interval, pumpswap_program_id,
+        select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
+        trade_has_forwardable_identity, trade_matches_primary_observation,
+        validate_full_universe_reserve_evidence_retention, validate_pr1e_startup_contract,
+        CanonicalRuntimeAdmissionV1, CanonicalRuntimeNoApplyReasonV1,
+        FullUniverseReserveEvidenceBridge, NlnArtifactDeliveryState, NlnArtifactOverflowReasonV1,
+        NlnArtifactRecord, NlnArtifactWriter, NlnProgramStreamCaptureTopic,
+        NlnTradePoolIdentityResolver, NlnTradeResolveDecision, SessionAccountUpdateBridge,
+        SessionAccountUpdateDecision, SessionBcv2Context, SessionExecutionAccountEvidenceDecision,
+        SessionPoolTradeBridge, SessionTradeDecision, TOKEN_PROGRAM_ID,
     };
     use crate::candidate_integrity::{
         CandidateIntegrityRegistry, CandidateIntegrityRegistryLimitsV1,
@@ -8649,6 +8837,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             Arc::new(CandidateIntegrityRegistry::default()),
         ));
 
@@ -8680,6 +8869,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             Arc::new(CandidateIntegrityRegistry::default()),
         )
         .await
@@ -8702,6 +8892,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             registry,
         )
@@ -10453,6 +10644,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_universe_reserve_evidence_outlives_session_ttl_without_entering_session_state() {
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut candidate = make_candidate(pool, mint);
+        // The generic fixture intentionally uses an unrelated `bonding_curve`;
+        // this capture test needs the physical Pump curve identity to match the
+        // AccountUpdate subject exactly.
+        candidate.bonding_curve = pool;
+        let mut update = make_account_update(mint, pool);
+        update.provider_role = Some(RawProviderRoleV1::PrimaryAuthority);
+        let now = Instant::now();
+        let mut bridge = FullUniverseReserveEvidenceBridge::new(Duration::from_secs(140), 8);
+        assert!(bridge.register_detected_pool(&candidate, now));
+        assert_eq!(bridge.len(), 1);
+        assert!(is_canonical_full_universe_reserve_evidence(&update));
+        assert!(
+            bridge.accepts(&update, now + Duration::from_secs(131)),
+            "ACE state horizon exceeds the 120 s session TTL and must remain capture-visible"
+        );
+
+        let (tx, mut rx) = create_event_bus();
+        emit_full_universe_reserve_evidence_to_event_bus(&tx, &update, None);
+        match recv_only_event(&mut rx).await {
+            GhostEvent::FullUniverseReserveEvidence(event) => {
+                assert_eq!(event.base_mint, mint);
+                assert_eq!(event.bonding_curve, pool);
+            }
+            other => panic!(
+                "expected capture-only reserve evidence, got {}",
+                other.event_type()
+            ),
+        }
+
+        let unrelated = make_account_update(Pubkey::new_unique(), Pubkey::new_unique());
+        assert!(!bridge.accepts(&unrelated, now + Duration::from_secs(131)));
+
+        let mut secondary = update.clone();
+        secondary.provider_role = Some(RawProviderRoleV1::SecondaryWitness);
+        assert!(
+            !is_canonical_full_universe_reserve_evidence(&secondary),
+            "secondary witness state must never enter the canonical ACE reserve lane"
+        );
+    }
+
+    #[tokio::test]
     async fn seer_canonical_trade_without_pool_detected_is_buffered_without_emission() {
         let (tx, mut rx) = create_event_bus();
         let pool = Pubkey::new_unique();
@@ -10565,6 +10801,13 @@ mod tests {
                 other.event_type()
             ),
         }
+    }
+
+    #[test]
+    fn ace_reserve_evidence_requires_transport_ttl_through_outcome_horizon() {
+        assert!(validate_full_universe_reserve_evidence_retention(true, 120_000).is_err());
+        assert!(validate_full_universe_reserve_evidence_retention(true, 140_000).is_ok());
+        assert!(validate_full_universe_reserve_evidence_retention(false, 120_000).is_ok());
     }
 
     #[tokio::test]

@@ -2940,6 +2940,10 @@ async fn run_launcher() -> Result<()> {
     let oracle_shutdown_rx = oracle_shutdown_tx.subscribe();
     let oracle_authoritative_funding_coverage_gate_enabled =
         config.seer.enabled && matches!(config.seer.funding_lane_mode.as_str(), "full_chain");
+    // Compute this while the full config is still available.  The Oracle task
+    // below owns some non-Copy config fields, whereas this boolean is later
+    // passed to the independently started Seer producer.
+    let seer_full_universe_reality_capture_enabled = is_ace_observe_only_capture(&config);
 
     let mut oracle_handle = tokio::spawn(async move {
         info!("📡 Oracle Runtime initializing...");
@@ -3018,6 +3022,9 @@ async fn run_launcher() -> Result<()> {
         let seer_health = Arc::clone(&health);
         let seer_authoritative_funding_stream_tx = authoritative_funding_stream_tx.clone();
         let seer_candidate_integrity_registry = oracle_runtime.candidate_integrity_registry();
+        // The ingress scope changes are valid only for the inert ACE capture
+        // contract, never merely because a caller enabled the broader reality
+        // capture feature in another runtime mode.
         ghost_launcher::components::seer::validate_pr1e_startup_contract(
             &seer_config,
             Some(&seer_event_tx),
@@ -3037,6 +3044,7 @@ async fn run_launcher() -> Result<()> {
                 Some(seer_health),
                 seer_authoritative_funding_stream_tx,
                 canonical_account_update_relay_enabled,
+                seer_full_universe_reality_capture_enabled,
                 seer_candidate_integrity_registry,
             )
             .await

@@ -62,7 +62,9 @@ use ghost_brain::oracle::{ApprovedPools, SnapshotEngine};
 // [INTEGRATION] Import additional engines
 use ghost_brain::chaos::amm_math::AmmPool;
 use ghost_brain::chaos::engine::{ChaosEngine, MarketScenario, SimulationConfig};
-use ghost_brain::events::{EventEmitter, EventWriterConfig, PoolTransactionPayload};
+use ghost_brain::events::{
+    EventEmitter, EventWriterConfig, PoolReserveStatePayload, PoolTransactionPayload,
+};
 use ghost_brain::oracle::engine::PanicProvider;
 use ghost_brain::oracle::snapshot_engine::{
     derive_price_canonical, DataSource, InitPoolEvent, PoolLifecycle, TxEvent,
@@ -17710,6 +17712,98 @@ fn emit_pool_transaction_evidence_event(
     );
 }
 
+/// Persist a primary AccountUpdate as a first-class reserve-state row for the
+/// ACE full-universe tape. This is intentionally independent from the exact
+/// trade-state join above: a legal outcome state need not share a trade's
+/// `(slot, virtual reserves)` tuple. No latest-state cache, RPC read, price,
+/// or transaction amount is used here.
+fn emit_full_universe_reserve_state_evidence_event(
+    emitter: &EventEmitter,
+    event: &AccountUpdateEvent,
+) {
+    let Some(real_sol_reserves) = event.real_sol_reserves else {
+        ::metrics::counter!(
+            "ace_full_universe_reserve_state_not_emitted_total",
+            1u64,
+            "reason" => "real_sol_reserves_missing"
+        );
+        return;
+    };
+    let Some(real_token_reserves) = event.real_token_reserves else {
+        ::metrics::counter!(
+            "ace_full_universe_reserve_state_not_emitted_total",
+            1u64,
+            "reason" => "real_token_reserves_missing"
+        );
+        return;
+    };
+    let complete = match event.complete {
+        0 => false,
+        1 => true,
+        _ => {
+            ::metrics::counter!(
+                "ace_full_universe_reserve_state_not_emitted_total",
+                1u64,
+                "reason" => "complete_flag_invalid"
+            );
+            return;
+        }
+    };
+    let Some(event_ts_ms) = event.event_time.effective_event_ts_ms() else {
+        ::metrics::counter!(
+            "ace_full_universe_reserve_state_not_emitted_total",
+            1u64,
+            "reason" => "event_timestamp_missing"
+        );
+        return;
+    };
+    let Some(arrival_ts_ms) = event.event_time.ingress_wall_ts_ms else {
+        ::metrics::counter!(
+            "ace_full_universe_reserve_state_not_emitted_total",
+            1u64,
+            "reason" => "arrival_timestamp_missing"
+        );
+        return;
+    };
+
+    let base_mint = event.base_mint.to_string();
+    let bonding_curve = event.bonding_curve.to_string();
+    let candidate_id = format!("{base_mint}:{bonding_curve}:{event_ts_ms}");
+    emitter.emit_pool_reserve_state(
+        &candidate_id,
+        PoolReserveStatePayload {
+            schema_version: "v1".to_string(),
+            bonding_curve: bonding_curve.clone(),
+            pool_amm_id: bonding_curve.clone(),
+            pool_id: bonding_curve,
+            base_mint: base_mint.clone(),
+            mint_id: base_mint,
+            slot: event.slot,
+            event_slot: event.slot,
+            event_ts_ms,
+            timestamp_ms: event_ts_ms,
+            arrival_ts_ms,
+            write_version: event.write_version,
+            sequence_number: event.sequence_number,
+            txn_signature: event.txn_signature.map(|signature| signature.to_string()),
+            virtual_sol_reserves: event.sol_reserves,
+            virtual_token_reserves: event.token_reserves,
+            real_sol_reserves,
+            real_token_reserves,
+            complete,
+            provider_id: event.provider_id.clone(),
+            provider_role: event.provider_role.map(|role| format!("{role:?}")),
+            account_data_hash: event.account_data_hash.clone(),
+            source_account_pubkey: event.source_account_pubkey.map(|key| key.to_string()),
+            source_account_owner_or_program: event
+                .source_account_owner_or_program
+                .map(|key| key.to_string()),
+            source: "primary_canonical_account_update".to_string(),
+        },
+    );
+    ::metrics::counter!("ace_full_universe_reserve_state_emitted_total", 1u64);
+}
+
 fn pool_transaction_evidence_payload(
     tx: &PoolTransaction,
     pool_id: Pubkey,
@@ -28246,6 +28340,15 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         oracle_runtime.record_execution_account_evidence(event.evidence.clone());
                     }
 
+                    // Capture-only lane. Its producer has already limited
+                    // events to PR1E-admitted candidates; do not route these
+                    // writes into AccountStateCore or any decision component.
+                    GhostEvent::FullUniverseReserveEvidence(event) => {
+                        if let Some(emitter) = ctx.event_emitter.as_ref() {
+                            emit_full_universe_reserve_state_evidence_event(emitter, &event);
+                        }
+                    }
+
                     GhostEvent::GatekeeperCommitted {
                         pool_amm_id,
                         base_mint,
@@ -35692,7 +35795,7 @@ mod tests {
             provider_id: None,
             provider_role: None,
             semantic: Default::default(),
-            event_time: ghost_core::EventTimeMetadata::default(),
+            event_time: ghost_core::EventTimeMetadata::new(Some(1_000), Some(1_001), Some(1)),
             base_mint: Pubkey::new_unique(),
             bonding_curve,
             curve_finality: CurveFinality::Provisional,
@@ -35713,6 +35816,53 @@ mod tests {
             detected_at: SystemTime::now(),
             sequence_number: 1,
         }
+    }
+
+    #[test]
+    fn full_universe_reserve_state_is_durable_without_a_trade_join() {
+        let directory = tempdir().expect("temporary event directory");
+        let emitter = EventEmitter::new(
+            EventWriterConfig {
+                output_dir: directory.path().display().to_string(),
+                enable_optional_events: true,
+                ..Default::default()
+            },
+            "ace-reserve-state-test".to_string(),
+            Lane::Shadow,
+        )
+        .expect("event emitter");
+        let curve = Pubkey::new_unique();
+        let update = full_universe_account_update(
+            curve,
+            4_242,
+            30_000_000_000,
+            1_000_000_000_000,
+            400_000_000,
+            123_000_000,
+        );
+
+        // No PoolTransaction is constructed: the whole point of this lane is
+        // that a legal primary curve write must not need an exact trade tuple
+        // in order to remain available to offline entry/outcome reconstruction.
+        emit_full_universe_reserve_state_evidence_event(&emitter, &update);
+        emitter.flush().expect("flush reserve evidence");
+
+        let jsonl_path = std::fs::read_dir(directory.path())
+            .expect("read event directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .expect("event jsonl");
+        let line = std::fs::read_to_string(jsonl_path).expect("read state row");
+        let row: serde_json::Value = serde_json::from_str(line.trim()).expect("decode state row");
+        assert_eq!(row["kind"]["type"], "PoolReserveState");
+        assert_eq!(row["kind"]["payload"]["bonding_curve"], curve.to_string());
+        assert_eq!(row["kind"]["payload"]["slot"], 4_242);
+        assert_eq!(row["kind"]["payload"]["real_sol_reserves"], 400_000_000);
+        assert_eq!(row["kind"]["payload"]["complete"], false);
     }
 
     #[test]

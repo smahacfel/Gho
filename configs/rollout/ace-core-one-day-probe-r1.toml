@@ -8,6 +8,9 @@ mode = "production"
 ghost_brain_config_path = "../../ghost-brain/ghost_brain_config.toml"
 
 [seer]
+ # The durable reserve-state lane must retain the exact candidate curve for
+ # the 11.111 s feature cutoff plus the 120 s sustained-outcome horizon.
+watched_pools_ttl_ms = 140000
 enabled = true
 source_mode = "grpc"
 commitment = "processed"
