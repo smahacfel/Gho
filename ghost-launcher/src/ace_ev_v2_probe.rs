@@ -229,6 +229,7 @@ enum InternalTerminalStatus {
     EntryFilledExitFilled,
     EntryFailedPriceProtection,
     EntryFailedNoLandingState,
+    PostEntryValidityBoundLossFloor,
     PostEntryUnsupportedRouteLossFloor,
     ExitStateUnavailableLossFloor,
 }
@@ -243,6 +244,7 @@ impl InternalTerminalStatus {
             Self::EntryFailedPriceProtection => "ENTRY_FAILED_PRICE_PROTECTION",
             Self::EntryFailedNoLandingState => "ENTRY_FAILED_NO_LANDING_STATE",
             Self::EntryFilledExitFilled
+            | Self::PostEntryValidityBoundLossFloor
             | Self::PostEntryUnsupportedRouteLossFloor
             | Self::ExitStateUnavailableLossFloor => "ENTRY_FILLED",
         }
@@ -253,6 +255,7 @@ impl InternalTerminalStatus {
             Self::EntryFilledExitFilled => "EXIT_FILLED",
             Self::EntryFailedPriceProtection => "ENTRY_FAILED_PRICE_PROTECTION",
             Self::EntryFailedNoLandingState => "ENTRY_FAILED_NO_LANDING_STATE",
+            Self::PostEntryValidityBoundLossFloor => "POST_ENTRY_VALIDITY_BOUND_LOSS_FLOOR",
             Self::PostEntryUnsupportedRouteLossFloor => "POST_ENTRY_UNSUPPORTED_ROUTE_LOSS_FLOOR",
             Self::ExitStateUnavailableLossFloor => "EXIT_STATE_UNAVAILABLE_LOSS_FLOOR",
         }
@@ -262,6 +265,7 @@ impl InternalTerminalStatus {
         matches!(
             self,
             Self::EntryFilledExitFilled
+                | Self::PostEntryValidityBoundLossFloor
                 | Self::PostEntryUnsupportedRouteLossFloor
                 | Self::ExitStateUnavailableLossFloor
         )
@@ -1032,7 +1036,6 @@ fn calculate_features_v2(
         .ok_or_else(|| "birth_creator_identity_missing".to_string())?;
     let cutoffs = tape::decision_cutoffs(birth)?;
     let mut buys = Vec::<FeatureBuy>::new();
-    let mut successful_buy_count = 0u64;
     let mut successful_sell_count = 0u64;
     for trade in trades {
         let payload = &trade.payload;
@@ -1043,28 +1046,37 @@ fn calculate_features_v2(
         {
             continue;
         }
-        let Some(order) = tape::canonical_trade_order(payload) else {
-            continue;
-        };
-        if payload.is_buy && payload.side.eq_ignore_ascii_case("buy") {
-            successful_buy_count = successful_buy_count.saturating_add(1);
-            let Some(signer) = tape::non_empty(&payload.signer) else {
-                continue;
-            };
+        let declares_buy = payload.is_buy || payload.side.eq_ignore_ascii_case("buy");
+        if declares_buy {
+            // A feature vector represents the complete successful BUY flow
+            // known at decision time.  Keeping one well-formed BUY while
+            // silently omitting another successful BUY would make F1-F6 and
+            // F7 describe different populations.  Fail this candidate before
+            // enrollment instead of manufacturing a partial-flow vector.
+            let feature_evidence_incomplete =
+                || "successful_buy_feature_evidence_incomplete".to_string();
+            if !payload.is_buy || !payload.side.eq_ignore_ascii_case("buy") {
+                return Err(feature_evidence_incomplete());
+            }
+            let order =
+                tape::canonical_trade_order(payload).ok_or_else(feature_evidence_incomplete)?;
+            let signer =
+                tape::non_empty(&payload.signer).ok_or_else(feature_evidence_incomplete)?;
             if let Some(wallet) = tape::non_empty(&payload.wallet) {
                 if wallet != signer {
-                    continue;
+                    return Err(feature_evidence_incomplete());
                 }
             }
-            let Some(pre) = payload.signer_pre_balance_lamports else {
-                continue;
-            };
-            let Some(post) = payload.signer_post_balance_lamports else {
-                continue;
-            };
-            let Some(debit_lamports) = pre.checked_sub(post).filter(|debit| *debit > 0) else {
-                continue;
-            };
+            let pre = payload
+                .signer_pre_balance_lamports
+                .ok_or_else(feature_evidence_incomplete)?;
+            let post = payload
+                .signer_post_balance_lamports
+                .ok_or_else(feature_evidence_incomplete)?;
+            let debit_lamports = pre
+                .checked_sub(post)
+                .filter(|debit| *debit > 0)
+                .ok_or_else(feature_evidence_incomplete)?;
             buys.push(FeatureBuy {
                 event_ts_ms: payload.event_ts_ms,
                 arrival_ts_ms: payload.arrival_ts_ms,
@@ -1081,6 +1093,10 @@ fn calculate_features_v2(
     if buys.is_empty() {
         return Err("successful_buy_wallet_debit_evidence_missing".to_string());
     }
+    // Every retained BUY has just passed the same evidence contract used by
+    // F1-F6, so F7's buy denominator is now provably drawn from that exact
+    // same population.
+    let successful_buy_count = buys.len() as u64;
     buys.sort_by(compare_feature_buy);
     let total_buy_debit = buys.iter().try_fold(0u64, |sum, buy| {
         sum.checked_add(buy.debit_lamports)
@@ -1490,6 +1506,7 @@ pub fn run_ace_ev_v2_evaluator(args: AceEvV2EvaluateArgs) -> Result<AceEvV2Summa
             matches!(
                 row.terminal_status.as_str(),
                 "EXIT_FILLED"
+                    | "POST_ENTRY_VALIDITY_BOUND_LOSS_FLOOR"
                     | "POST_ENTRY_UNSUPPORTED_ROUTE_LOSS_FLOOR"
                     | "EXIT_STATE_UNAVAILABLE_LOSS_FLOOR"
             )
@@ -2121,17 +2138,38 @@ fn simulate_terminal_outcome(
             )
         }
     };
+    // The landed BuyV2 has now passed its instruction protection and the
+    // frozen wallet-debit cap.  It is an irrevocable simulated fill.  Any
+    // later validity or route failure must remain in the enrolled cohort as a
+    // conservative post-entry loss floor; it must never be rewritten as a
+    // cheaper ENTRY_FAILED attempt.
     let reserves_after_entry = reserves_after_buy(entry_landing.reserves, &entry_quote);
     let entry_impact_bps =
         match tape::absolute_virtual_price_impact_bps(entry_landing.reserves, reserves_after_entry)
         {
             Some(value) if value <= MAX_ENTRY_IMPACT_BPS => value,
-            _ => {
-                return entry_failed_price_protection(
-                    Some(entry_landing),
-                    Some(entry_total_debit_lamports),
+            Some(value) => {
+                return post_entry_loss_floor(
+                    InternalTerminalStatus::PostEntryValidityBoundLossFloor,
+                    Some("landed_entry_impact_exceeds_5pct"),
+                    entry_landing,
+                    entry_total_debit_lamports,
+                    Some(value),
                     None,
-                    entry_attempt_cost,
+                    0,
+                    0,
+                )
+            }
+            None => {
+                return post_entry_loss_floor(
+                    InternalTerminalStatus::PostEntryValidityBoundLossFloor,
+                    Some("landed_entry_impact_unavailable"),
+                    entry_landing,
+                    entry_total_debit_lamports,
+                    None,
+                    None,
+                    0,
+                    0,
                 )
             }
         };
@@ -2142,11 +2180,15 @@ fn simulate_terminal_outcome(
     ) {
         Ok(value) => value,
         Err(_) => {
-            return entry_failed_price_protection(
-                Some(entry_landing),
-                Some(entry_total_debit_lamports),
+            return post_entry_loss_floor(
+                InternalTerminalStatus::PostEntryUnsupportedRouteLossFloor,
+                Some("immediate_exit_quote_unavailable"),
+                entry_landing,
+                entry_total_debit_lamports,
                 Some(entry_impact_bps),
-                entry_attempt_cost,
+                None,
+                0,
+                0,
             )
         }
     };
@@ -2155,12 +2197,28 @@ fn simulate_terminal_outcome(
         tape::reserve_state_after_quote(reserves_after_entry, &immediate_exit_quote),
     ) {
         Some(value) if value <= MAX_IMMEDIATE_EXIT_IMPACT_BPS => value,
-        _ => {
-            return entry_failed_price_protection(
-                Some(entry_landing),
-                Some(entry_total_debit_lamports),
+        Some(value) => {
+            return post_entry_loss_floor(
+                InternalTerminalStatus::PostEntryValidityBoundLossFloor,
+                Some("immediate_exit_impact_exceeds_5pct"),
+                entry_landing,
+                entry_total_debit_lamports,
                 Some(entry_impact_bps),
-                entry_attempt_cost,
+                Some(value),
+                0,
+                0,
+            )
+        }
+        None => {
+            return post_entry_loss_floor(
+                InternalTerminalStatus::PostEntryValidityBoundLossFloor,
+                Some("immediate_exit_impact_unavailable"),
+                entry_landing,
+                entry_total_debit_lamports,
+                Some(entry_impact_bps),
+                None,
+                0,
+                0,
             )
         }
     };
@@ -2218,8 +2276,8 @@ fn simulate_terminal_outcome(
                         Some("unsupported_route"),
                         entry_landing,
                         entry_total_debit_lamports,
-                        entry_impact_bps,
-                        immediate_exit_impact_bps,
+                        Some(entry_impact_bps),
+                        Some(immediate_exit_impact_bps),
                         failed_take_profit_attempts,
                         cumulative_failed_exit_cost_lamports,
                     );
@@ -2267,8 +2325,8 @@ fn simulate_terminal_outcome(
                             Some("typed_exit_route_unavailable"),
                             entry_landing,
                             entry_total_debit_lamports,
-                            entry_impact_bps,
-                            immediate_exit_impact_bps,
+                            Some(entry_impact_bps),
+                            Some(immediate_exit_impact_bps),
                             failed_take_profit_attempts,
                             cumulative_failed_exit_cost_lamports,
                         );
@@ -2351,8 +2409,8 @@ fn simulate_terminal_outcome(
                             Some("exit_attempt_cost_unavailable"),
                             entry_landing,
                             entry_total_debit_lamports,
-                            entry_impact_bps,
-                            immediate_exit_impact_bps,
+                            Some(entry_impact_bps),
+                            Some(immediate_exit_impact_bps),
                             failed_take_profit_attempts,
                             cumulative_failed_exit_cost_lamports,
                         )
@@ -2368,8 +2426,8 @@ fn simulate_terminal_outcome(
                     Some("unsupported_route"),
                     entry_landing,
                     entry_total_debit_lamports,
-                    entry_impact_bps,
-                    immediate_exit_impact_bps,
+                    Some(entry_impact_bps),
+                    Some(immediate_exit_impact_bps),
                     failed_take_profit_attempts,
                     cumulative_failed_exit_cost_lamports,
                 );
@@ -2380,8 +2438,8 @@ fn simulate_terminal_outcome(
                     None,
                     entry_landing,
                     entry_total_debit_lamports,
-                    entry_impact_bps,
-                    immediate_exit_impact_bps,
+                    Some(entry_impact_bps),
+                    Some(immediate_exit_impact_bps),
                     failed_take_profit_attempts,
                     cumulative_failed_exit_cost_lamports,
                 );
@@ -2442,8 +2500,8 @@ fn post_entry_loss_floor(
     subtype: Option<&'static str>,
     entry_landing: DirectState,
     entry_total_debit_lamports: u64,
-    entry_impact_bps: u32,
-    immediate_exit_impact_bps: u32,
+    entry_impact_bps: Option<u32>,
+    immediate_exit_impact_bps: Option<u32>,
     failed_take_profit_attempts: u8,
     cumulative_failed_exit_cost_lamports: u64,
 ) -> TerminalOutcome {
@@ -2456,12 +2514,23 @@ fn post_entry_loss_floor(
         profit17_hit: false,
         entry_landing: Some(entry_landing),
         entry_total_debit_lamports: Some(entry_total_debit_lamports),
-        entry_impact_bps: Some(entry_impact_bps),
-        immediate_exit_impact_bps: Some(immediate_exit_impact_bps),
-        exit_reason: if status == InternalTerminalStatus::PostEntryUnsupportedRouteLossFloor {
-            "unsupported_route_loss_floor"
-        } else {
-            "exit_state_unavailable_loss_floor"
+        entry_impact_bps,
+        immediate_exit_impact_bps,
+        exit_reason: match status {
+            InternalTerminalStatus::PostEntryValidityBoundLossFloor => {
+                "post_entry_validity_bound_loss_floor"
+            }
+            InternalTerminalStatus::PostEntryUnsupportedRouteLossFloor => {
+                "unsupported_route_loss_floor"
+            }
+            InternalTerminalStatus::ExitStateUnavailableLossFloor => {
+                "exit_state_unavailable_loss_floor"
+            }
+            InternalTerminalStatus::EntryFilledExitFilled
+            | InternalTerminalStatus::EntryFailedPriceProtection
+            | InternalTerminalStatus::EntryFailedNoLandingState => {
+                unreachable!("post_entry_loss_floor requires a post-entry terminal status")
+            }
         },
         exit_trigger_event_ts_ms: None,
         exit_trigger_arrival_ts_ms: None,
@@ -2473,19 +2542,12 @@ fn post_entry_loss_floor(
 }
 
 fn compare_state_after_entry(state: DirectState, entry: DirectState) -> bool {
-    (
-        state.arrival_ts_ms,
-        state.event_ts_ms,
-        state.slot,
-        state.write_version,
-        state.sequence_number,
-    ) > (
-        entry.arrival_ts_ms,
-        entry.event_ts_ms,
-        entry.slot,
-        entry.write_version,
-        entry.sequence_number,
-    )
+    // Arrival after entry means the evaluator could observe this state only
+    // after the fill.  It is insufficient on its own: a delayed historical
+    // account write must never be quoted as the post-entry curve.  The state
+    // also has to advance the canonical chain-order axis.
+    state.arrival_ts_ms > entry.arrival_ts_ms
+        && compare_state_chain(&state, &entry) == Ordering::Greater
 }
 
 fn post_entry_creator_sell(
@@ -2748,6 +2810,15 @@ fn count_terminal_statuses(rows: &[AceEvV2CandidateOutcomeV1]) -> BTreeMap<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghost_core::{
+        FeeRounding, ProgramFeeRule, ProgramFeeSchedule, ProgramFeeScheduleEvidenceV1,
+        PumpRouteVariant, TransactionCosts,
+    };
+
+    use crate::rug_scalp_v2::{
+        RugScalpPumpFeeScheduleV1, RugScalpPumpQuoteAuthorityV1, RUG_SCALP_ENTRY_ROUTE,
+        RUG_SCALP_EXIT_ROUTE,
+    };
 
     fn birth() -> tape::TapeBirth {
         tape::TapeBirth {
@@ -2862,6 +2933,104 @@ mod tests {
         }
     }
 
+    fn direct_state_with_reserves(
+        event_ts_ms: u64,
+        arrival_ts_ms: u64,
+        slot: u64,
+        virtual_base_reserves: u64,
+        virtual_quote_reserves: u64,
+    ) -> DirectState {
+        DirectState {
+            reserves: PumpReserveState {
+                virtual_base_reserves,
+                virtual_quote_reserves,
+                real_base_reserves: virtual_base_reserves,
+                real_quote_reserves: virtual_quote_reserves,
+            },
+            ..direct_state(event_ts_ms, arrival_ts_ms, slot)
+        }
+    }
+
+    fn test_quote_schedule(route_variant: PumpRouteVariant, id: &str) -> RugScalpPumpFeeScheduleV1 {
+        RugScalpPumpFeeScheduleV1 {
+            route_variant,
+            schedule: ProgramFeeSchedule {
+                fee_schedule_id: id.to_string(),
+                effective_slot: 0,
+                evidence: ProgramFeeScheduleEvidenceV1::OnChainConfig {
+                    config_pubkey: format!("fixture-{id}"),
+                    owner_program: crate::rug_scalp_v2::RUG_SCALP_PUMP_PROGRAM.to_string(),
+                    account_data_hash: format!("fixture-hash-{id}"),
+                    observed_slot: 0,
+                },
+                rules: vec![ProgramFeeRule {
+                    component_id: "fixture-fee".to_string(),
+                    numerator: 1,
+                    denominator: 10_000,
+                    rounding: FeeRounding::Ceil,
+                }],
+            },
+        }
+    }
+
+    fn test_quote_contract() -> RugScalpPumpQuoteContractV1 {
+        test_quote_contract_with_exit_effective_slot(0)
+    }
+
+    fn test_quote_contract_with_exit_effective_slot(
+        exit_effective_slot: u64,
+    ) -> RugScalpPumpQuoteContractV1 {
+        let mut exit_schedule = test_quote_schedule(RUG_SCALP_EXIT_ROUTE, "legacy-sell");
+        exit_schedule.schedule.effective_slot = exit_effective_slot;
+        if let ProgramFeeScheduleEvidenceV1::OnChainConfig { observed_slot, .. } =
+            &mut exit_schedule.schedule.evidence
+        {
+            *observed_slot = exit_effective_slot;
+        }
+        RugScalpPumpQuoteAuthorityV1 {
+            schedules: vec![
+                test_quote_schedule(RUG_SCALP_ENTRY_ROUTE, "buy-v2"),
+                exit_schedule,
+            ],
+            entry_transaction_costs: TransactionCosts::default(),
+            exit_transaction_costs: TransactionCosts::default(),
+        }
+        .materialize()
+        .expect("fixture quote authority materializes")
+    }
+
+    fn plan_for_landed_entry(
+        entry_landing: DirectState,
+        fixed_token_amount_raw: u64,
+        fixed_max_sol_cost_lamports: u64,
+    ) -> PreEntryPlan {
+        PreEntryPlan {
+            birth: birth(),
+            trades: Vec::new(),
+            states: vec![entry_landing],
+            cutoffs: tape::DecisionCutoffs {
+                event_cutoff_ts_ms: 11_111,
+                ingress_cutoff_ts_ms: 11_111,
+            },
+            features: AceEvV2FeatureVectorV1 {
+                f1_log_unique_first_buyers: 0.0,
+                f2_log_total_first_buy_flow: 0.0,
+                f3_buyer_acceleration: 0.0,
+                f4_creator_buy_share: 0.0,
+                f5_first_buy_flow_hhi: 0.0,
+                f6_same_slot_first_buy_flow_share: 0.0,
+                f7_pre_cutoff_sell_buy_log_ratio: 0.0,
+            },
+            normalized_features: [0.0; 7],
+            decision_state: entry_landing,
+            fixed_token_amount_raw,
+            fixed_max_sol_cost_lamports,
+            decision_entry_total_debit_lamports: 0,
+            decision_entry_impact_bps: 0,
+            decision_immediate_exit_impact_bps: 0,
+        }
+    }
+
     #[test]
     fn one_and_two_first_buy_wallets_produce_full_f1_through_f7() {
         let birth = birth();
@@ -2948,6 +3117,111 @@ mod tests {
         assert!(matches!(
             find_landed_state(&arrival_late, 11_111, 11_111, 250, 1_000),
             LandingResult::Unavailable
+        ));
+    }
+
+    #[test]
+    fn landed_buy_v2_over_5pct_impact_is_filled_validity_loss_floor_not_entry_failure() {
+        let quote_contract = test_quote_contract();
+        // A 0.15 SOL capped BuyV2 against a 5 SOL virtual quote reserve is a
+        // legal instruction, but its landed self-impact is deliberately above
+        // the frozen 5% validity bound.
+        let entry_landing =
+            direct_state_with_reserves(11_361, 11_361, 10, 1_000_000_000_000, 5_000_000_000);
+        let entry_cost = quote_contract
+            .entry_transaction_cost_lamports()
+            .expect("fixture entry transaction cost");
+        let quote = quote_contract
+            .quote_buy_v2_under_wallet_cap(
+                entry_landing.slot,
+                entry_landing.reserves,
+                ENTRY_TOTAL_WALLET_DEBIT_CAP_LAMPORTS - entry_cost,
+            )
+            .expect("landed BuyV2 quote");
+        assert!(quote.instruction_limit_check.passed);
+        let plan = plan_for_landed_entry(
+            entry_landing,
+            quote.token_amount,
+            quote.instruction_limit_check.limit,
+        );
+
+        let outcome =
+            simulate_terminal_outcome(&plan, &quote_contract, ENTRY_LATENCY_MS, EXIT_LATENCY_MS);
+
+        assert_eq!(
+            outcome.status,
+            InternalTerminalStatus::PostEntryValidityBoundLossFloor
+        );
+        assert_eq!(outcome.status.entry_status(), "ENTRY_FILLED");
+        assert_eq!(outcome.subtype, Some("landed_entry_impact_exceeds_5pct"));
+        assert_eq!(
+            outcome.terminal_net_pnl_lamports,
+            -(outcome.entry_total_debit_lamports.expect("landed fill") as i128)
+        );
+    }
+
+    #[test]
+    fn landed_buy_v2_with_unavailable_immediate_sell_is_route_loss_floor() {
+        // BuyV2 authority exists at slot 10, but LegacySell authority starts
+        // only at a future slot. The landed BuyV2 must remain filled; the
+        // immediate exit-route failure is post-entry, not a rewritable entry
+        // attempt failure.
+        let quote_contract = test_quote_contract_with_exit_effective_slot(11);
+        let entry_landing = direct_state(11_361, 11_361, 10);
+        let entry_cost = quote_contract
+            .entry_transaction_cost_lamports()
+            .expect("fixture entry transaction cost");
+        let quote = quote_contract
+            .quote_buy_v2_under_wallet_cap(
+                entry_landing.slot,
+                entry_landing.reserves,
+                ENTRY_TOTAL_WALLET_DEBIT_CAP_LAMPORTS - entry_cost,
+            )
+            .expect("landed BuyV2 quote");
+        assert!(quote.instruction_limit_check.passed);
+        let plan = plan_for_landed_entry(
+            entry_landing,
+            quote.token_amount,
+            quote.instruction_limit_check.limit,
+        );
+        let outcome =
+            simulate_terminal_outcome(&plan, &quote_contract, ENTRY_LATENCY_MS, EXIT_LATENCY_MS);
+
+        assert_eq!(
+            outcome.status,
+            InternalTerminalStatus::PostEntryUnsupportedRouteLossFloor
+        );
+        assert_eq!(outcome.status.entry_status(), "ENTRY_FILLED");
+        assert_eq!(outcome.subtype, Some("immediate_exit_quote_unavailable"));
+        assert_eq!(
+            outcome.terminal_net_pnl_lamports,
+            -(outcome.entry_total_debit_lamports.expect("landed fill") as i128)
+        );
+    }
+
+    #[test]
+    fn delayed_historical_reserve_state_cannot_trigger_post_entry_exit() {
+        let entry = direct_state(20_000, 20_000, 20);
+        // It arrived later, but its canonical state is older in both event
+        // time and slot. It must never be quoted as a post-entry curve state.
+        let delayed_historical = direct_state(19_999, 20_001, 19);
+        assert!(!compare_state_after_entry(delayed_historical, entry));
+
+        let truly_post_entry = direct_state(20_001, 20_001, 21);
+        assert!(compare_state_after_entry(truly_post_entry, entry));
+    }
+
+    #[test]
+    fn incomplete_successful_buy_makes_entire_pre_entry_feature_set_non_evaluable() {
+        let birth = birth();
+        let cutoff = birth.payload.birth_ts_ms + FEATURE_CUTOFF_MS;
+        let complete = trade(cutoff - 2_000, cutoff - 2_000, "wallet-a", 10, 1, 4_000_000);
+        let mut incomplete = trade(cutoff - 1_000, cutoff - 1_000, "wallet-b", 11, 2, 2_000_000);
+        incomplete.payload.signer_pre_balance_lamports = None;
+
+        assert!(matches!(
+            calculate_features_v2(&birth, &[complete, incomplete]),
+            Err(reason) if reason == "successful_buy_feature_evidence_incomplete"
         ));
     }
 

@@ -137,7 +137,13 @@ def event_files(root: Path) -> list[Path]:
     return sorted(path for path in root.rglob("exec_*.jsonl") if path.is_file())
 
 
-def has_ace_smoke_trade_shape(payload: object) -> bool:
+def has_ace_feature_ready_trade_shape(payload: object) -> bool:
+    """Return whether a durable trade can supply the V2 feature lane.
+
+    Reserve evidence deliberately does not live on this row.  A trade and an
+    account write have different cardinality and ordering, so an exact join is
+    neither necessary nor sufficient evidence for the direct-state lane.
+    """
     if not isinstance(payload, dict):
         return False
     if payload.get("success") is not True or payload.get("is_synthetic") is not False:
@@ -149,14 +155,44 @@ def has_ace_smoke_trade_shape(payload: object) -> bool:
         "inner_group_index",
         "event_ordinal",
     )
+    required_balances = ("signer_pre_balance_lamports", "signer_post_balance_lamports")
+    return all(payload.get(name) is not None for name in required_order + required_balances)
+
+
+def has_ace_direct_primary_reserve_state_shape(payload: object) -> bool:
+    """Return whether a first-class PrimaryAuthority reserve row is durable.
+
+    This mirrors the direct-state contract consumed by the V2 evaluator.  It
+    is intentionally independent of PoolTransaction so health evidence cannot
+    regress to the legacy trade-attached-reserves join.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("schema_version") != "v1":
+        return False
+    if payload.get("provider_role") != "PrimaryAuthority":
+        return False
+    required_identity = ("bonding_curve", "pool_amm_id", "pool_id", "base_mint", "mint_id")
+    if any(not isinstance(payload.get(name), str) or not payload[name].strip() for name in required_identity):
+        return False
+    if (
+        payload["pool_amm_id"] != payload["pool_id"]
+        or payload["pool_amm_id"] != payload["bonding_curve"]
+        or payload["base_mint"] != payload["mint_id"]
+    ):
+        return False
+    required_timing = ("slot", "event_slot", "event_ts_ms", "arrival_ts_ms")
+    if any(not isinstance(payload.get(name), int) or payload[name] <= 0 for name in required_timing):
+        return False
+    if payload["slot"] != payload["event_slot"]:
+        return False
     required_reserves = (
         "virtual_sol_reserves",
         "virtual_token_reserves",
         "real_sol_reserves",
         "real_token_reserves",
     )
-    required_balances = ("signer_pre_balance_lamports", "signer_post_balance_lamports")
-    return all(payload.get(name) is not None for name in required_order + required_reserves + required_balances)
+    return all(isinstance(payload.get(name), int) and payload[name] >= 0 for name in required_reserves)
 
 
 def validate_event_files(root: Path) -> tuple[bool, list[str]]:
@@ -166,7 +202,8 @@ def validate_event_files(root: Path) -> tuple[bool, list[str]]:
         return False, ["no exec_*.jsonl files found"]
     birth_count = 0
     pool_transaction_count = 0
-    probe_ready_pool_transaction_count = 0
+    feature_ready_pool_transaction_count = 0
+    direct_primary_reserve_state_count = 0
     for path in files:
         raw = path.read_bytes()
         if not raw:
@@ -190,15 +227,22 @@ def validate_event_files(root: Path) -> tuple[bool, list[str]]:
                 birth_count += 1
             elif kind.get("type") == "PoolTransaction":
                 pool_transaction_count += 1
-                if has_ace_smoke_trade_shape(kind.get("payload")):
-                    probe_ready_pool_transaction_count += 1
+                if has_ace_feature_ready_trade_shape(kind.get("payload")):
+                    feature_ready_pool_transaction_count += 1
+            elif kind.get("type") == "PoolReserveState":
+                if has_ace_direct_primary_reserve_state_shape(kind.get("payload")):
+                    direct_primary_reserve_state_count += 1
     if birth_count == 0:
         failures.append("no NewPoolDetected birth evidence found in exec_*.jsonl")
     if pool_transaction_count == 0:
         failures.append("no PoolTransaction evidence found in exec_*.jsonl")
-    if probe_ready_pool_transaction_count == 0:
+    if feature_ready_pool_transaction_count == 0:
         failures.append(
-            "no successful non-synthetic PoolTransaction with balances, full order key, and full reserves"
+            "no successful non-synthetic PoolTransaction with balances and full order key"
+        )
+    if direct_primary_reserve_state_count == 0:
+        failures.append(
+            "no direct PrimaryAuthority PoolReserveState with schema v1, full identity, timestamps, and reserves"
         )
     return not failures, failures
 

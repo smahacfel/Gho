@@ -70,8 +70,32 @@ class AceCaptureHealthTests(unittest.TestCase):
                 },
             }
         }
+        reserve_state = {
+            "kind": {
+                "type": "PoolReserveState",
+                "payload": {
+                    "schema_version": "v1",
+                    "bonding_curve": "curve",
+                    "pool_amm_id": "curve",
+                    "pool_id": "curve",
+                    "base_mint": "mint",
+                    "mint_id": "mint",
+                    "slot": 2,
+                    "event_slot": 2,
+                    "event_ts_ms": 2,
+                    "arrival_ts_ms": 2,
+                    "virtual_sol_reserves": 1,
+                    "virtual_token_reserves": 1,
+                    "real_sol_reserves": 1,
+                    "real_token_reserves": 1,
+                    "complete": False,
+                    "provider_role": "PrimaryAuthority",
+                },
+            }
+        }
         (events_dir / "exec_smoke_0000.jsonl").write_text(
-            json.dumps(event) + "\n" + json.dumps(trade) + "\n", encoding="utf-8"
+            json.dumps(event) + "\n" + json.dumps(trade) + "\n" + json.dumps(reserve_state) + "\n",
+            encoding="utf-8",
         )
         log_path.write_text("Ghost Launcher shutdown complete\n", encoding="utf-8")
         return (
@@ -228,6 +252,37 @@ class AceCaptureHealthTests(unittest.TestCase):
 
         self.assertEqual(result, 2)
         self.assertFalse(receipt.exists())
+
+    def test_feature_ready_trade_and_direct_reserve_state_are_independently_required(self) -> None:
+        _, _, _, events, _, _ = self.make_fixture()
+        tape = events / "exec_smoke_0000.jsonl"
+        rows = [json.loads(line) for line in tape.read_text(encoding="utf-8").splitlines()]
+        trade_payload = rows[1]["kind"]["payload"]
+        for field in (
+            "virtual_sol_reserves",
+            "virtual_token_reserves",
+            "real_sol_reserves",
+            "real_token_reserves",
+        ):
+            trade_payload.pop(field)
+        tape.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+        passed, failures = health.validate_event_files(events)
+        self.assertTrue(passed, failures)
+
+        tape.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows[:-1]),
+            encoding="utf-8",
+        )
+        passed, failures = health.validate_event_files(events)
+        self.assertFalse(passed)
+        self.assertIn(
+            "no direct PrimaryAuthority PoolReserveState with schema v1, full identity, timestamps, and reserves",
+            failures,
+        )
 
     def test_lifecycle_status_preserves_launcher_root_cause_when_metrics_are_unavailable(self) -> None:
         root, manifest, _, _, _, _ = self.make_fixture()
