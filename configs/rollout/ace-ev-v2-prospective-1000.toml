@@ -78,8 +78,8 @@ manifest_path = "/root/Gho_ingest/logs/ace_ev_v2/UNFROZEN_SCOPE/run_manifest_v3.
 baseline_sha = "43057b296663129ca9b4f572e793474830a5452c"
 # Replaced in a separate config-only provenance freeze after the functional
 # commit is immutable. Never run an UNFROZEN template.
-implementation_sha = "UNFROZEN_FUNCTIONAL_SHA"
-code_hash = "git:UNFROZEN_FUNCTIONAL_SHA"
+implementation_sha = "bbcdda29b84c13a063c2a7d365fc533004ce5942"
+code_hash = "git:bbcdda29b84c13a063c2a7d365fc533004ce5942"
 health_evidence_path = "/root/Gho_ingest/logs/ace_ev_v2/UNFROZEN_SCOPE/capture_health_v1.json"
 
 [rug_reality_capture.cost_profile]
