@@ -31,7 +31,7 @@ REQUIRED_COUNTERS = (
     "pr1_runtime_primary_coverage_gap_total",
     "ace_capture_segment_invalid_total",
 )
-CAPTURE_KINDS = ("smoke", "soak", "yield_qualification", "day1")
+CAPTURE_KINDS = ("smoke", "soak", "yield_qualification", "day1", "prospective")
 SMOKE_MIN_DURATION_MS = 120_000
 # A qualifying transport/canonical-admission smoke needs enough steady-state
 # time to expose a recurring ingress issue.  The operational contract is ten
@@ -48,6 +48,7 @@ SOAK_MAX_DURATION_MS = 2_100_000
 YIELD_QUALIFICATION_MIN_DURATION_MS = 3_750_000
 YIELD_QUALIFICATION_MAX_DURATION_MS = 3_900_000
 DAY1_MIN_DURATION_MS = 86_400_000
+PROSPECTIVE_MAX_DURATION_MS = 21_750_000
 EVENT_WRITER_WRITE_FAILURE_MARKER = "EventEmitter: failed to write event"
 EVENT_WRITER_LOCK_FAILURE_MARKER = "EventEmitter: writer mutex poisoned; event was not persisted"
 FORBIDDEN_LOG_MARKERS = (
@@ -374,6 +375,100 @@ def load_lifecycle_status(
     return failures
 
 
+def load_lifecycle_status_record(
+    path: Path,
+    *,
+    expected_run_id: str,
+    expected_manifest_sha256: str,
+) -> tuple[dict[str, object] | None, list[str]]:
+    """Load the supervisor's terminal record without granting metrics authority."""
+    try:
+        status = json.loads(path.read_bytes())
+    except OSError as error:
+        return None, [f"lifecycle status unreadable: {error}"]
+    except json.JSONDecodeError as error:
+        return None, [f"lifecycle status invalid JSON: {error.msg}"]
+    if not isinstance(status, dict):
+        return None, ["lifecycle status must be a JSON object"]
+    failures: list[str] = []
+    if status.get("schema_version") != 1:
+        failures.append("lifecycle status schema mismatch")
+    if status.get("run_id") != expected_run_id:
+        failures.append("lifecycle status run_id mismatch")
+    if status.get("manifest_sha256") != expected_manifest_sha256:
+        failures.append("lifecycle status manifest hash mismatch")
+    if status.get("launcher_returncode") != 0:
+        failures.append(
+            "launcher lifecycle status is not a clean terminal zero: "
+            f"rc={status.get('launcher_returncode')} reason={status.get('exit_reason')}"
+        )
+    return (status if not failures else None), failures
+
+
+def validate_prospective_terminalization(
+    *,
+    terminalization: str | None,
+    stop_evidence_path: str | None,
+    lifecycle_status: dict[str, object] | None,
+    expected_run_id: str,
+    expected_manifest_sha256: str,
+) -> tuple[str | None, list[str]]:
+    """Bind a prospective receipt to its monitor receipt or timeout reason.
+
+    The Rust final evaluator independently recomputes the candidate cohort.  This
+    helper only makes sure that an untrusted file cannot make the supervisor
+    stop a capture without leaving immutable, run-bound evidence.
+    """
+    failures: list[str] = []
+    if terminalization not in ("TARGET_REACHED", "MAX_DURATION_INSUFFICIENT_YIELD"):
+        return None, ["prospective terminalization missing or invalid"]
+    if lifecycle_status is None:
+        return None, ["prospective capture requires lifecycle status"]
+    expected_reason = (
+        "target_reached" if terminalization == "TARGET_REACHED" else "max_duration_insufficient_yield"
+    )
+    if lifecycle_status.get("stop_reason") != expected_reason:
+        failures.append(
+            "prospective lifecycle stop_reason mismatch: "
+            f"expected={expected_reason} actual={lifecycle_status.get('stop_reason')}"
+        )
+    if terminalization == "MAX_DURATION_INSUFFICIENT_YIELD":
+        if stop_evidence_path:
+            failures.append("prospective timeout must not supply target stop evidence")
+        return None, failures
+    if not stop_evidence_path:
+        return None, failures + ["prospective target reached requires stop evidence"]
+    path = Path(stop_evidence_path)
+    try:
+        raw = path.read_bytes()
+        evidence = json.loads(raw)
+    except OSError as error:
+        return None, failures + [f"prospective stop evidence unreadable: {error}"]
+    except json.JSONDecodeError as error:
+        return None, failures + [f"prospective stop evidence invalid JSON: {error.msg}"]
+    if not isinstance(evidence, dict):
+        return None, failures + ["prospective stop evidence must be an object"]
+    if evidence.get("schema") != "ace_ev_v2_prospective_stop_evidence_v1":
+        failures.append("prospective stop evidence schema mismatch")
+    if evidence.get("run_id") != expected_run_id:
+        failures.append("prospective stop evidence run_id mismatch")
+    if evidence.get("manifest_sha256") != expected_manifest_sha256:
+        failures.append("prospective stop evidence manifest hash mismatch")
+    if evidence.get("target_terminal_outcomes") != 1000:
+        failures.append("prospective stop evidence target mismatch")
+    if evidence.get("terminal_outcome_count") != 1000:
+        failures.append("prospective stop evidence terminal count mismatch")
+    if not isinstance(evidence.get("cohort_candidate_order_sha256"), str) or not evidence[
+        "cohort_candidate_order_sha256"
+    ]:
+        failures.append("prospective stop evidence cohort hash missing")
+    if not isinstance(evidence.get("complete_file_prefixes"), list) or not evidence[
+        "complete_file_prefixes"
+    ]:
+        failures.append("prospective stop evidence file prefixes missing")
+    return sha256_hex(raw), failures
+
+
 def validate_capture_duration(capture_kind: str, start_ms: int, end_ms: int) -> tuple[int | None, list[str]]:
     failures: list[str] = []
     if end_ms <= start_ms:
@@ -399,6 +494,11 @@ def validate_capture_duration(capture_kind: str, start_ms: int, end_ms: int) -> 
     elif capture_kind == "day1":
         if duration_ms < DAY1_MIN_DURATION_MS:
             failures.append(f"day1 duration {duration_ms}ms is below {DAY1_MIN_DURATION_MS}")
+    elif capture_kind == "prospective":
+        if duration_ms > PROSPECTIVE_MAX_DURATION_MS:
+            failures.append(
+                f"prospective duration {duration_ms}ms exceeds {PROSPECTIVE_MAX_DURATION_MS}ms"
+            )
     else:
         failures.append(f"unsupported capture kind: {capture_kind}")
     return duration_ms, failures
@@ -418,14 +518,14 @@ def finalize(args: argparse.Namespace) -> int:
 
     failures: list[str] = []
     manifest_sha256 = sha256_hex(manifest_bytes)
+    lifecycle_status: dict[str, object] | None = None
     if getattr(args, "lifecycle_status", None):
-        failures.extend(
-            load_lifecycle_status(
-                Path(args.lifecycle_status),
-                expected_run_id=expected_run_id,
-                expected_manifest_sha256=manifest_sha256,
-            )
+        lifecycle_status, lifecycle_failures = load_lifecycle_status_record(
+            Path(args.lifecycle_status),
+            expected_run_id=expected_run_id,
+            expected_manifest_sha256=manifest_sha256,
         )
+        failures.extend(lifecycle_failures)
     start, start_failures = load_snapshot(
         Path(args.start_metrics),
         expected_run_id=expected_run_id,
@@ -457,6 +557,19 @@ def finalize(args: argparse.Namespace) -> int:
         [Path(path) for path in args.log]
     )
     failures.extend(log_failures)
+
+    prospective_stop_evidence_sha256: str | None = None
+    if args.capture_kind == "prospective":
+        prospective_stop_evidence_sha256, prospective_failures = validate_prospective_terminalization(
+            terminalization=getattr(args, "prospective_terminalization", None),
+            stop_evidence_path=getattr(args, "prospective_stop_evidence", None),
+            lifecycle_status=lifecycle_status,
+            expected_run_id=expected_run_id,
+            expected_manifest_sha256=manifest_sha256,
+        )
+        failures.extend(prospective_failures)
+    elif getattr(args, "prospective_terminalization", None) or getattr(args, "prospective_stop_evidence", None):
+        failures.append("prospective terminalization arguments are invalid for this capture kind")
 
     if failures:
         for failure in failures:
@@ -496,6 +609,10 @@ def finalize(args: argparse.Namespace) -> int:
         "controlled_shutdown": controlled_shutdown,
         "event_files_cleanly_flushed": events_ok,
         "log_evidence_clean": logs_ok,
+        "prospective_terminalization": (
+            args.prospective_terminalization if args.capture_kind == "prospective" else None
+        ),
+        "prospective_stop_evidence_sha256": prospective_stop_evidence_sha256,
     }
     write_new(requested_output, json.dumps(receipt, sort_keys=True, indent=2).encode("utf-8"))
     return 0
@@ -544,6 +661,14 @@ def parse_args() -> argparse.Namespace:
     finalize_command.add_argument(
         "--lifecycle-status",
         help="optional manifest-bound supervisor status; records process truth when /metrics disappeared",
+    )
+    finalize_command.add_argument(
+        "--prospective-terminalization",
+        choices=("TARGET_REACHED", "MAX_DURATION_INSUFFICIENT_YIELD"),
+    )
+    finalize_command.add_argument(
+        "--prospective-stop-evidence",
+        help="immutable monitor evidence; required only for prospective TARGET_REACHED",
     )
     finalize_command.add_argument("--output", required=True)
     finalize_command.set_defaults(handler=finalize)

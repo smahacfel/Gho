@@ -328,6 +328,53 @@ class AceCaptureHealthTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "capture_status"):
             health.verify_probe(argparse.Namespace(summary=str(summary_path)))
 
+    def test_prospective_timeout_is_insufficient_yield_not_invalid_capture(self) -> None:
+        root, manifest, receipt, events, start, end = self.make_fixture()
+        manifest_sha256 = health.sha256_hex(manifest.read_bytes())
+        for path, phase, captured_at in (
+            (start, "start", 1_000),
+            (end, "end", 1_000 + health.PROSPECTIVE_MAX_DURATION_MS),
+        ):
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+            snapshot["capture_kind"] = "prospective"
+            snapshot["phase"] = phase
+            snapshot["captured_at_unix_ms"] = captured_at
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+        lifecycle = root / "lifecycle_status.json"
+        lifecycle.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": "smoke-run",
+                    "manifest_sha256": manifest_sha256,
+                    "launcher_returncode": 0,
+                    "exit_reason": "Ghost Launcher shutdown complete",
+                    "stop_reason": "max_duration_insufficient_yield",
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            manifest=str(manifest),
+            capture_kind="prospective",
+            events_dir=str(events),
+            start_metrics=str(start),
+            end_metrics=str(end),
+            log=[str(root / "launcher.log")],
+            lifecycle_status=str(lifecycle),
+            prospective_terminalization="MAX_DURATION_INSUFFICIENT_YIELD",
+            prospective_stop_evidence=None,
+            output=str(receipt),
+        )
+
+        self.assertEqual(health.finalize(args), 0)
+        saved = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual(saved["capture_kind"], "prospective")
+        self.assertEqual(
+            saved["prospective_terminalization"], "MAX_DURATION_INSUFFICIENT_YIELD"
+        )
+        self.assertIsNone(saved["prospective_stop_evidence_sha256"])
+
 
 if __name__ == "__main__":
     unittest.main()

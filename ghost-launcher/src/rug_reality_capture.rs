@@ -236,8 +236,8 @@ pub struct RugRealityCaptureHealthEvidenceV1 {
     pub schema_version: u16,
     pub run_id: String,
     pub manifest_sha256: String,
-    /// `smoke` or `day1`; the probe validates the corresponding duration
-    /// contract rather than trusting a receipt from an arbitrary time span.
+    /// Capture-kind-specific duration and terminalization contract; the probe
+    /// validates it rather than trusting a receipt from an arbitrary span.
     pub capture_kind: String,
     /// SHA-256 of the structured start snapshot, which itself binds the run
     /// and manifest before exposing its raw metrics digest.
@@ -264,6 +264,15 @@ pub struct RugRealityCaptureHealthEvidenceV1 {
     pub controlled_shutdown: bool,
     pub event_files_cleanly_flushed: bool,
     pub log_evidence_clean: bool,
+    /// Present only for the bounded ACE-EV V2 prospective capture.  The
+    /// health helper binds this to either monitor-produced immutable target
+    /// evidence or the supervisor's max-duration termination.
+    #[serde(default)]
+    pub prospective_terminalization: Option<String>,
+    /// SHA-256 of `prospective_stop_evidence_v1.json` when the target cohort
+    /// was reached.  It remains absent for legal insufficient-yield timeout.
+    #[serde(default)]
+    pub prospective_stop_evidence_sha256: Option<String>,
 }
 
 pub fn write_rug_reality_capture_run_manifest_new(

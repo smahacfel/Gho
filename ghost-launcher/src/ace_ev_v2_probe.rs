@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ghost_brain::events::schema::{
@@ -32,6 +34,9 @@ pub const ACE_EV_V2_FEATURE_SCALE_SCHEMA: &str = "ace_ev_v2_feature_scale_v1";
 pub const ACE_EV_V2_OUTCOME_SCHEMA: &str = "ace_ev_v2_candidate_outcome_v1";
 pub const ACE_EV_V2_SCREENING_SCHEMA: &str = "ace_ev_v2_screening_v1";
 pub const ACE_EV_V2_SUMMARY_SCHEMA: &str = "ace_ev_v2_summary_v1";
+pub const ACE_EV_V2_PROSPECTIVE_AMENDMENT_SCHEMA: &str = "ace_ev_v2_prospective_1000_amendment_v1";
+pub const ACE_EV_V2_PROSPECTIVE_STOP_EVIDENCE_SCHEMA: &str =
+    "ace_ev_v2_prospective_stop_evidence_v1";
 pub const ACE_EV_V2_ESTIMAND_ID: &str = "pump_bonding_curve_only_zero_recovery_floor_v1";
 pub const ACE_EV_V2_FEATURE_ORDER: [&str; 7] = ["F1", "F2", "F3", "F4", "F5", "F6", "F7"];
 
@@ -49,13 +54,17 @@ const TAKE_PROFIT_BPS: u64 = 1_700;
 const MAX_TAKE_PROFIT_ATTEMPTS: u8 = 3;
 const QUALIFICATION_ENROLLMENT_MS: u64 = 3_600_000;
 const OUTCOME_DRAIN_MS: u64 = 150_000;
-const DAY1_DURATION_MS: u64 = 86_400_000;
+const PROSPECTIVE_MAX_ENROLLMENT_MS: u64 = 21_600_000;
 const QUALIFICATION_MIN_TERMINAL_OUTCOMES: usize = 12;
 const QUALIFICATION_MIN_SUCCESSFUL_ENTRIES_WITH_TERMINAL_EXIT: usize = 6;
-const ENROLLMENT_LIMIT: usize = 250;
+const QUALIFICATION_ENROLLMENT_LIMIT: usize = 250;
+const PROSPECTIVE_ENROLLMENT_LIMIT: usize = 1_000;
 const TRAIN_ROWS: usize = 100;
 const THRESHOLD_CALIBRATION_ROWS: usize = 50;
 const UNTOUCHED_TEST_ROWS: usize = 100;
+const PROSPECTIVE_TRAIN_ROWS: usize = 400;
+const PROSPECTIVE_THRESHOLD_ROWS: usize = 200;
+const PROSPECTIVE_UNTOUCHED_TEST_ROWS: usize = 400;
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
 const FEATURE_SCALE_FILE: &str = "feature_scale_v1.json";
@@ -79,7 +88,7 @@ pub struct AceEvV2FreezeScaleArgs {
 #[serde(rename_all = "snake_case")]
 pub enum AceEvV2CaptureKind {
     YieldQualification,
-    Prospective250,
+    Prospective1000,
 }
 
 impl std::str::FromStr for AceEvV2CaptureKind {
@@ -88,9 +97,9 @@ impl std::str::FromStr for AceEvV2CaptureKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim() {
             "yield_qualification" => Ok(Self::YieldQualification),
-            "prospective_250" => Ok(Self::Prospective250),
+            "prospective_1000" => Ok(Self::Prospective1000),
             other => {
-                bail!("--capture-kind must be yield_qualification or prospective_250, got {other}")
+                bail!("--capture-kind must be yield_qualification or prospective_1000, got {other}")
             }
         }
     }
@@ -100,23 +109,28 @@ impl AceEvV2CaptureKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::YieldQualification => "yield_qualification",
-            Self::Prospective250 => "prospective_250",
+            Self::Prospective1000 => "prospective_1000",
         }
     }
 
     const fn health_capture_kind(self) -> &'static str {
         match self {
             Self::YieldQualification => "yield_qualification",
-            Self::Prospective250 => "day1",
+            Self::Prospective1000 => "prospective",
         }
     }
 
     const fn enrollment_window_ms(self) -> u64 {
         match self {
             Self::YieldQualification => QUALIFICATION_ENROLLMENT_MS,
-            // The prospective protocol reserves its final 150 seconds for
-            // outcomes already enrolled; no new candidate may enter then.
-            Self::Prospective250 => DAY1_DURATION_MS - OUTCOME_DRAIN_MS,
+            Self::Prospective1000 => PROSPECTIVE_MAX_ENROLLMENT_MS,
+        }
+    }
+
+    const fn enrollment_limit(self) -> usize {
+        match self {
+            Self::YieldQualification => QUALIFICATION_ENROLLMENT_LIMIT,
+            Self::Prospective1000 => PROSPECTIVE_ENROLLMENT_LIMIT,
         }
     }
 }
@@ -129,6 +143,61 @@ pub struct AceEvV2EvaluateArgs {
     pub feature_scale_path: PathBuf,
     pub output_dir: PathBuf,
     pub capture_kind: AceEvV2CaptureKind,
+    /// Required only for `prospective_1000`; it is a separately frozen
+    /// outcome-blind amendment and is never inferred from mutable CLI state.
+    pub amendment_path: Option<PathBuf>,
+    /// Required only for a target-reached prospective final evaluation.
+    pub stop_evidence_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AceEvV2MonitorArgs {
+    pub events_dir: PathBuf,
+    pub manifest_path: PathBuf,
+    pub contract_path: PathBuf,
+    pub amendment_path: PathBuf,
+    pub feature_scale_path: PathBuf,
+    /// Immutable, manifest-bound start snapshot written by the supervisor.
+    pub start_metrics_path: PathBuf,
+    pub stop_evidence_path: PathBuf,
+    pub poll_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AceEvV2ProspectiveAmendmentV1 {
+    pub schema: String,
+    pub amendment_id: String,
+    pub base_contract_sha256: String,
+    pub target_terminal_outcomes: usize,
+    pub train_rows: usize,
+    pub threshold_calibration_rows: usize,
+    pub untouched_test_rows: usize,
+    pub max_enrollment_ms: u64,
+    pub outcome_drain_ms: u64,
+    pub test_min_entry_filled: usize,
+    pub test_min_exit_filled: usize,
+    pub positive_min_selected: usize,
+    pub positive_min_selected_entry_filled: usize,
+    pub positive_min_selected_exit_filled: usize,
+    pub positive_max_top1_positive_pnl_share: f64,
+    pub positive_max_top3_positive_pnl_share: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AceEvV2ProspectiveStopEvidenceV1 {
+    pub schema: String,
+    pub run_id: String,
+    pub manifest_sha256: String,
+    pub base_contract_sha256: String,
+    pub amendment_sha256: String,
+    pub feature_scale_sha256: String,
+    pub implementation_sha: String,
+    pub target_terminal_outcomes: usize,
+    pub terminal_outcome_count: usize,
+    pub cohort_candidate_order_sha256: String,
+    pub complete_file_prefixes: Vec<tape::TapeCompletePrefixV1>,
+    pub stop_captured_at_unix_ms: u64,
+    pub monitor_binary_blake3: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +411,16 @@ pub struct AceEvV2SummaryV1 {
     pub binary_hash: String,
     pub feature_scale_sha256: String,
     pub contract_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prospective_amendment_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prospective_stop_evidence_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cohort_candidate_order_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prospective_terminalization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_outcomes_sha256: Option<String>,
     pub total_canonical_births: usize,
     pub pre_entry_eligible_count: usize,
     pub enrollment_closed: bool,
@@ -530,6 +609,68 @@ fn load_contract_bytes(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn load_prospective_amendment(
+    path: &Path,
+    base_contract_sha256: &str,
+) -> Result<(AceEvV2ProspectiveAmendmentV1, String)> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("read ACE-EV V2 prospective amendment {}", path.display()))?;
+    let amendment: AceEvV2ProspectiveAmendmentV1 = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode ACE-EV V2 prospective amendment {}", path.display()))?;
+    if amendment.schema != ACE_EV_V2_PROSPECTIVE_AMENDMENT_SCHEMA
+        || amendment.amendment_id != "ACE_EV_V2_PROSPECTIVE_1000"
+        || amendment.base_contract_sha256 != base_contract_sha256
+        || amendment.target_terminal_outcomes != PROSPECTIVE_ENROLLMENT_LIMIT
+        || amendment.train_rows != PROSPECTIVE_TRAIN_ROWS
+        || amendment.threshold_calibration_rows != PROSPECTIVE_THRESHOLD_ROWS
+        || amendment.untouched_test_rows != PROSPECTIVE_UNTOUCHED_TEST_ROWS
+        || amendment.train_rows
+            + amendment.threshold_calibration_rows
+            + amendment.untouched_test_rows
+            != amendment.target_terminal_outcomes
+        || amendment.max_enrollment_ms != PROSPECTIVE_MAX_ENROLLMENT_MS
+        || amendment.outcome_drain_ms != OUTCOME_DRAIN_MS
+        || amendment.test_min_entry_filled != 60
+        || amendment.test_min_exit_filled != 25
+        || amendment.positive_min_selected != 80
+        || amendment.positive_min_selected_entry_filled != 20
+        || amendment.positive_min_selected_exit_filled != 10
+        || amendment.positive_max_top1_positive_pnl_share != 0.25
+        || amendment.positive_max_top3_positive_pnl_share != 0.50
+    {
+        bail!("ACE-EV V2 prospective amendment contract mismatch")
+    }
+    Ok((amendment, sha256_hex(&bytes)))
+}
+
+fn load_monitor_start_snapshot(
+    path: &Path,
+    manifest_path: &Path,
+    manifest: &RugRealityCaptureRunManifestV1,
+) -> Result<u64> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("read prospective start snapshot {}", path.display()))?;
+    let snapshot: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode prospective start snapshot {}", path.display()))?;
+    let manifest_sha256 = sha256_hex(
+        &fs::read(manifest_path)
+            .with_context(|| format!("read prospective manifest {}", manifest_path.display()))?,
+    );
+    if snapshot.pointer("/schema_version").and_then(Value::as_u64) != Some(1)
+        || snapshot.pointer("/capture_kind").and_then(Value::as_str) != Some("prospective")
+        || snapshot.pointer("/run_id").and_then(Value::as_str) != Some(manifest.run_id.as_str())
+        || snapshot.pointer("/manifest_sha256").and_then(Value::as_str)
+            != Some(manifest_sha256.as_str())
+    {
+        bail!("prospective start snapshot provenance mismatch")
+    }
+    snapshot
+        .pointer("/captured_at_unix_ms")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow!("prospective start snapshot timestamp missing"))
+}
+
 fn validate_frozen_contract_semantics(contract: &Value) -> Result<()> {
     let required = [
         (
@@ -577,7 +718,10 @@ fn validate_frozen_contract_semantics(contract: &Value) -> Result<()> {
             "/exit/take_profit_max_attempts",
             serde_json::json!(MAX_TAKE_PROFIT_ATTEMPTS),
         ),
-        ("/enrollment/limit", serde_json::json!(ENROLLMENT_LIMIT)),
+        (
+            "/enrollment/limit",
+            serde_json::json!(QUALIFICATION_ENROLLMENT_LIMIT),
+        ),
         (
             "/enrollment/outcome_drain_ms",
             serde_json::json!(OUTCOME_DRAIN_MS),
@@ -1235,6 +1379,21 @@ pub fn run_ace_ev_v2_evaluator(args: AceEvV2EvaluateArgs) -> Result<AceEvV2Summa
     create_output_dir_new(&args.output_dir)?;
     let contract_bytes = load_contract_bytes(&args.contract_path)?;
     let contract_sha256 = sha256_hex(&contract_bytes);
+    let prospective_amendment = match args.capture_kind {
+        AceEvV2CaptureKind::YieldQualification => {
+            if args.amendment_path.is_some() || args.stop_evidence_path.is_some() {
+                bail!("yield qualification must not receive prospective amendment or stop evidence")
+            }
+            None
+        }
+        AceEvV2CaptureKind::Prospective1000 => {
+            let path = args
+                .amendment_path
+                .as_deref()
+                .ok_or_else(|| anyhow!("prospective_1000 requires --amendment"))?;
+            Some(load_prospective_amendment(path, &contract_sha256)?)
+        }
+    };
     let scale_bytes = fs::read(&args.feature_scale_path).with_context(|| {
         format!(
             "read ACE-EV V2 feature scale {}",
@@ -1425,9 +1584,10 @@ pub fn run_ace_ev_v2_evaluator(args: AceEvV2EvaluateArgs) -> Result<AceEvV2Summa
         }
     }
     let plans = enrollment_eligible_plans;
-    let enrollment_closed = plans.len() >= ENROLLMENT_LIMIT
+    let enrollment_limit = args.capture_kind.enrollment_limit();
+    let enrollment_closed = plans.len() >= enrollment_limit
         || health_receipt.end_captured_at_unix_ms >= enrollment_deadline_ms;
-    let enrolled_plans = plans.iter().take(ENROLLMENT_LIMIT).collect::<Vec<_>>();
+    let enrolled_plans = plans.iter().take(enrollment_limit).collect::<Vec<_>>();
     let outcome_drain_deadline = enrolled_plans
         .iter()
         .map(|plan| required_outcome_drain_deadline(plan))
@@ -1458,25 +1618,33 @@ pub fn run_ace_ev_v2_evaluator(args: AceEvV2EvaluateArgs) -> Result<AceEvV2Summa
         return Ok(summary);
     }
     let mut outcomes = Vec::new();
-    for (index, plan) in plans.iter().take(ENROLLMENT_LIMIT).enumerate() {
+    for (index, plan) in plans.iter().take(enrollment_limit).enumerate() {
         let outcome =
             simulate_terminal_outcome(plan, &quote_contract, ENTRY_LATENCY_MS, EXIT_LATENCY_MS);
         let stress = simulate_terminal_outcome(plan, &quote_contract, 1_000, 1_000);
-        outcomes.push(outcome_row(plan, index + 1, outcome, stress));
+        outcomes.push(outcome_row(
+            plan,
+            index + 1,
+            outcome,
+            stress,
+            args.capture_kind,
+        ));
     }
-    for plan in plans.iter().skip(ENROLLMENT_LIMIT) {
+    for plan in plans.iter().skip(enrollment_limit) {
         *screening_reason_counts
-            .entry("cohort_closed_after_250_pre_entry_candidates".to_string())
+            .entry(format!(
+                "cohort_closed_after_{enrollment_limit}_pre_entry_candidates"
+            ))
             .or_default() += 1;
         screening_rows.push(screening_row(
             &plan.birth,
             Some(plan.features),
             Some(candidate_order_for(&plan.birth)),
             AceEvV2ScreeningStatus::NotEnrolledCohortClosed,
-            "cohort_closed_after_250_pre_entry_candidates",
+            &format!("cohort_closed_after_{enrollment_limit}_pre_entry_candidates"),
         ));
     }
-    for plan in plans.iter().take(ENROLLMENT_LIMIT) {
+    for plan in plans.iter().take(enrollment_limit) {
         screening_rows.push(screening_row(
             &plan.birth,
             Some(plan.features),
@@ -1500,6 +1668,7 @@ pub fn run_ace_ev_v2_evaluator(args: AceEvV2EvaluateArgs) -> Result<AceEvV2Summa
             ))
     });
     let terminal_status_counts = count_terminal_statuses(&outcomes);
+    let outcomes_sha256 = candidate_rows_sha256(&outcomes)?;
     let successful_entry_count = outcomes
         .iter()
         .filter(|row| {
@@ -1529,10 +1698,18 @@ pub fn run_ace_ev_v2_evaluator(args: AceEvV2EvaluateArgs) -> Result<AceEvV2Summa
                 "ACE_EV_V2_YIELD_QUALIFICATION_FAIL".to_string()
             }
         }
-        AceEvV2CaptureKind::Prospective250 if terminal_outcome_count == ENROLLMENT_LIMIT => {
-            "ACE_EV_V2_OUTCOMES_READY_FOR_FIT".to_string()
-        }
-        AceEvV2CaptureKind::Prospective250 => "ACE_EV_V2_INSUFFICIENT_YIELD".to_string(),
+        AceEvV2CaptureKind::Prospective1000 => prospective_terminal_status(
+            &args,
+            &manifest,
+            &health_receipt,
+            &contract_sha256,
+            &feature_scale_sha256,
+            prospective_amendment
+                .as_ref()
+                .expect("prospective amendment was validated"),
+            terminal_outcome_count,
+            &outcomes,
+        )?,
     };
     let summary = AceEvV2SummaryV1 {
         schema: ACE_EV_V2_SUMMARY_SCHEMA.to_string(),
@@ -1545,8 +1722,26 @@ pub fn run_ace_ev_v2_evaluator(args: AceEvV2EvaluateArgs) -> Result<AceEvV2Summa
         implementation_sha: manifest.implementation_sha.clone(),
         code_hash: manifest.code_hash.clone(),
         binary_hash: manifest.binary_hash.clone(),
-        feature_scale_sha256,
-        contract_sha256,
+        feature_scale_sha256: feature_scale_sha256.clone(),
+        contract_sha256: contract_sha256.clone(),
+        prospective_amendment_sha256: prospective_amendment.as_ref().map(|(_, sha)| sha.clone()),
+        prospective_stop_evidence_sha256: prospective_stop_evidence_sha256(
+            &args,
+            prospective_amendment.as_ref().map(|(_, sha)| sha.as_str()),
+            &manifest,
+            &contract_sha256,
+            &feature_scale_sha256,
+            &outcomes,
+        )?,
+        cohort_candidate_order_sha256: (args.capture_kind == AceEvV2CaptureKind::Prospective1000)
+            .then(|| candidate_cohort_sha256(&outcomes)),
+        prospective_terminalization: prospective_amendment.as_ref().map(|_| {
+            health_receipt
+                .prospective_terminalization
+                .clone()
+                .unwrap_or_default()
+        }),
+        candidate_outcomes_sha256: Some(outcomes_sha256),
         total_canonical_births: births.len(),
         pre_entry_eligible_count: plans.len(),
         enrollment_closed,
@@ -1562,6 +1757,212 @@ pub fn run_ace_ev_v2_evaluator(args: AceEvV2EvaluateArgs) -> Result<AceEvV2Summa
     write_candidate_rows_new(&args.output_dir.join(OUTCOMES_FILE), &outcomes)?;
     write_json_new(&args.output_dir.join(SUMMARY_FILE), &summary)?;
     Ok(summary)
+}
+
+/// Observe a growing, durable shadow tape and write immutable target evidence
+/// once the *first* 1,000 candidate-order rows all have terminal outcomes.
+///
+/// This is deliberately an offline reader: it has no RPC, Event Bus, or
+/// runtime mutation capability.  It shares the strict indexes, feature
+/// eligibility, candidate ordering, pre-entry plan construction, and terminal
+/// state machine with the final evaluator.  The only relaxed I/O rule is that
+/// a currently-being-written final JSONL row is ignored until its newline is
+/// durable.
+pub fn run_ace_ev_v2_monitor(args: AceEvV2MonitorArgs) -> Result<()> {
+    if args.poll_interval_ms == 0 {
+        bail!("prospective monitor poll interval must be positive")
+    }
+    if args.stop_evidence_path.exists() {
+        bail!(
+            "prospective stop evidence already exists and is immutable: {}",
+            args.stop_evidence_path.display()
+        )
+    }
+    let contract_bytes = load_contract_bytes(&args.contract_path)?;
+    let contract_sha256 = sha256_hex(&contract_bytes);
+    let (amendment, amendment_sha256) =
+        load_prospective_amendment(&args.amendment_path, &contract_sha256)?;
+    let scale_bytes = fs::read(&args.feature_scale_path).with_context(|| {
+        format!(
+            "read ACE-EV V2 feature scale {}",
+            args.feature_scale_path.display()
+        )
+    })?;
+    let feature_scale: AceEvV2FeatureScaleV1 = serde_json::from_slice(&scale_bytes)
+        .with_context(|| format!("decode feature scale {}", args.feature_scale_path.display()))?;
+    validate_feature_scale(&feature_scale, &contract_sha256)?;
+    let feature_scale_sha256 = sha256_hex(&scale_bytes);
+    let manifest_bytes = fs::read(&args.manifest_path)
+        .with_context(|| format!("read capture manifest {}", args.manifest_path.display()))?;
+    let manifest: RugRealityCaptureRunManifestV1 = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("decode capture manifest {}", args.manifest_path.display()))?;
+    let manifest_sha256 = sha256_hex(&manifest_bytes);
+    let manifest_reasons = validate_v2_capture_manifest_base(&manifest);
+    if !manifest_reasons.is_empty() {
+        bail!(
+            "prospective monitor manifest invalid: {}",
+            manifest_reasons.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    }
+    let capture_start_ms =
+        load_monitor_start_snapshot(&args.start_metrics_path, &args.manifest_path, &manifest)?;
+    let quote_contract = manifest
+        .pump_quote_authority
+        .materialize()
+        .context("materialize capture-time typed Pump quote authority for prospective monitor")?;
+    let monitor_binary_blake3 = blake3::hash(
+        &fs::read(std::env::current_exe().context("resolve monitor executable")?)
+            .context("read monitor executable for BLAKE3 provenance")?,
+    )
+    .to_hex()
+    .to_string();
+
+    loop {
+        let (mut tape_rows, complete_file_prefixes) =
+            tape::read_tape_complete_prefix(&args.events_dir, &manifest.run_id)?;
+        let latest_arrival_ms = latest_tape_arrival_ms(&tape_rows);
+        let plans = build_monitor_pre_entry_plans(&mut tape_rows, &feature_scale, &quote_contract)?;
+        let enrollment_deadline_ms = capture_start_ms.saturating_add(amendment.max_enrollment_ms);
+        let cohort = plans
+            .iter()
+            .filter(|plan| {
+                candidate_order_for(&plan.birth).decision_ingress_cutoff_ms
+                    <= enrollment_deadline_ms
+            })
+            .take(amendment.target_terminal_outcomes)
+            .collect::<Vec<_>>();
+        if let Some(required_drain) =
+            prospective_cohort_drain_deadline(&cohort, amendment.target_terminal_outcomes)
+        {
+            // The monitor cannot turn an unknown future path into a loss
+            // floor.  An earlier pending candidate therefore blocks a later,
+            // fast terminal candidate from owning the stop decision.
+            if latest_arrival_ms >= required_drain {
+                let outcomes = cohort
+                    .iter()
+                    .enumerate()
+                    .map(|(index, plan)| {
+                        outcome_row(
+                            plan,
+                            index + 1,
+                            simulate_terminal_outcome(
+                                plan,
+                                &quote_contract,
+                                ENTRY_LATENCY_MS,
+                                EXIT_LATENCY_MS,
+                            ),
+                            simulate_terminal_outcome(plan, &quote_contract, 1_000, 1_000),
+                            AceEvV2CaptureKind::Prospective1000,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let evidence = prospective_stop_evidence_for_target(
+                    &manifest.run_id,
+                    &manifest.implementation_sha,
+                    &manifest_sha256,
+                    &contract_sha256,
+                    &amendment_sha256,
+                    &feature_scale_sha256,
+                    amendment.target_terminal_outcomes,
+                    &outcomes,
+                    complete_file_prefixes,
+                    unix_now_ms()?,
+                    &monitor_binary_blake3,
+                )
+                .expect("target-sized prospective cohort was just constructed");
+                write_json_new(&args.stop_evidence_path, &evidence)?;
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(args.poll_interval_ms));
+    }
+}
+
+fn unix_now_ms() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock predates Unix epoch while writing prospective stop evidence")?
+        .as_millis()
+        .try_into()
+        .context("prospective stop timestamp does not fit u64")?)
+}
+
+fn build_monitor_pre_entry_plans(
+    tape_rows: &mut tape::Tape,
+    feature_scale: &AceEvV2FeatureScaleV1,
+    quote_contract: &RugScalpPumpQuoteContractV1,
+) -> Result<Vec<PreEntryPlan>> {
+    let (births, _) = tape::canonical_births(tape_rows);
+    let canonical_birth_keys = births
+        .iter()
+        .filter_map(|birth| match tape::birth_key(&birth.payload) {
+            tape::BirthKeyResolution::Eligible(key) => Some(key),
+            tape::BirthKeyResolution::OutsideUniverse | tape::BirthKeyResolution::Malformed(_) => {
+                None
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    let trade_index = tape::strict_trade_index(tape_rows, &canonical_birth_keys);
+    let reserve_index = tape::strict_reserve_state_index(tape_rows, &canonical_birth_keys);
+    if !tape_rows.invalid_reasons.is_empty() {
+        bail!(
+            "prospective monitor tape invalid: {}",
+            tape_rows
+                .invalid_reasons
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+    let mut plans = Vec::new();
+    for birth in births {
+        let tape::BirthKeyResolution::Eligible(key) = tape::birth_key(&birth.payload) else {
+            continue;
+        };
+        let states =
+            direct_states_from_tape(reserve_index.get(&key).map(Vec::as_slice).unwrap_or(&[]))
+                .map_err(|reason| {
+                    anyhow!("prospective monitor direct-state contract failure: {reason}")
+                })?;
+        if let Ok(plan) = make_pre_entry_plan(
+            &birth,
+            trade_index.get(&key).cloned().unwrap_or_default(),
+            states,
+            feature_scale,
+            quote_contract,
+        ) {
+            plans.push(plan);
+        }
+    }
+    plans.sort_by(|left, right| {
+        candidate_order_for(&left.birth).cmp(&candidate_order_for(&right.birth))
+    });
+    Ok(plans)
+}
+
+fn latest_tape_arrival_ms(tape_rows: &tape::Tape) -> u64 {
+    let birth_arrival = tape_rows
+        .births
+        .iter()
+        .filter_map(|birth| birth.payload.detected_wall_ts_ms)
+        .max();
+    let trade_arrival = tape_rows
+        .trades
+        .iter()
+        .map(|trade| trade.payload.arrival_ts_ms)
+        .max();
+    let state_arrival = tape_rows
+        .reserve_states
+        .iter()
+        .map(|state| state.payload.arrival_ts_ms)
+        .max();
+    birth_arrival
+        .into_iter()
+        .chain(trade_arrival)
+        .chain(state_arrival)
+        .max()
+        .unwrap_or(0)
 }
 
 fn validate_feature_scale(scale: &AceEvV2FeatureScaleV1, contract_sha256: &str) -> Result<()> {
@@ -1591,6 +1992,17 @@ fn validate_feature_scale(scale: &AceEvV2FeatureScaleV1, contract_sha256: &str) 
 
 fn validate_v2_capture_manifest(
     manifest_path: &Path,
+    manifest: &RugRealityCaptureRunManifestV1,
+) -> BTreeSet<String> {
+    let mut reasons = validate_v2_capture_manifest_base(manifest);
+    reasons.extend(tape::validate_capture_health_evidence(
+        manifest_path,
+        manifest,
+    ));
+    reasons
+}
+
+fn validate_v2_capture_manifest_base(
     manifest: &RugRealityCaptureRunManifestV1,
 ) -> BTreeSet<String> {
     let mut reasons = BTreeSet::new();
@@ -1639,10 +2051,6 @@ fn validate_v2_capture_manifest(
     if manifest.pump_quote_authority.materialize().is_err() {
         reasons.insert("manifest_pump_quote_authority_unmaterializable".to_string());
     }
-    reasons.extend(tape::validate_capture_health_evidence(
-        manifest_path,
-        manifest,
-    ));
     reasons
 }
 
@@ -1658,6 +2066,219 @@ fn load_capture_health_receipt(
         bail!("capture health receipt run_id mismatch")
     }
     Ok(receipt)
+}
+
+fn candidate_cohort_sha256(rows: &[AceEvV2CandidateOutcomeV1]) -> String {
+    let mut hasher = Sha256::new();
+    for row in rows {
+        hasher.update((row.enrollment_index as u64).to_be_bytes());
+        for value in [
+            row.candidate_id.as_str(),
+            row.base_mint.as_str(),
+            row.bonding_curve.as_str(),
+            row.candidate_order.bonding_curve.as_str(),
+            row.candidate_order.base_mint.as_str(),
+        ] {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        hasher.update(row.candidate_order.decision_ingress_cutoff_ms.to_be_bytes());
+        hasher.update(row.candidate_order.birth_ts_ms.to_be_bytes());
+        hasher.update(row.candidate_order.event_slot.to_be_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Return the latest outcome horizon that must be observed before all rows in
+/// the target candidate-order cohort are terminal.  The cohort is deliberately
+/// selected before this check: a later fast candidate must not bypass an
+/// earlier candidate that is still pending its bounded outcome window.
+fn prospective_cohort_drain_deadline(cohort: &[&PreEntryPlan], target: usize) -> Option<u64> {
+    (cohort.len() == target).then(|| {
+        cohort
+            .iter()
+            .map(|plan| required_outcome_drain_deadline(plan))
+            .max()
+            .unwrap_or(0)
+    })
+}
+
+/// Construct, but never overwrite, the immutable monitor-to-supervisor
+/// receipt.  Returning `None` below the target makes the 999-row case a
+/// non-event rather than an ambiguous partial stop request.  When more rows
+/// are supplied, only the first candidate-order target participates, which is
+/// the same boundary the final evaluator reconstitutes after shutdown.
+fn prospective_stop_evidence_for_target(
+    run_id: &str,
+    implementation_sha: &str,
+    manifest_sha256: &str,
+    contract_sha256: &str,
+    amendment_sha256: &str,
+    feature_scale_sha256: &str,
+    target: usize,
+    outcomes: &[AceEvV2CandidateOutcomeV1],
+    complete_file_prefixes: Vec<tape::TapeCompletePrefixV1>,
+    stop_captured_at_unix_ms: u64,
+    monitor_binary_blake3: &str,
+) -> Option<AceEvV2ProspectiveStopEvidenceV1> {
+    let target_rows = outcomes.get(..target)?;
+    Some(AceEvV2ProspectiveStopEvidenceV1 {
+        schema: ACE_EV_V2_PROSPECTIVE_STOP_EVIDENCE_SCHEMA.to_string(),
+        run_id: run_id.to_string(),
+        manifest_sha256: manifest_sha256.to_string(),
+        base_contract_sha256: contract_sha256.to_string(),
+        amendment_sha256: amendment_sha256.to_string(),
+        feature_scale_sha256: feature_scale_sha256.to_string(),
+        implementation_sha: implementation_sha.to_string(),
+        target_terminal_outcomes: target,
+        terminal_outcome_count: target_rows.len(),
+        cohort_candidate_order_sha256: candidate_cohort_sha256(target_rows),
+        complete_file_prefixes,
+        stop_captured_at_unix_ms,
+        monitor_binary_blake3: monitor_binary_blake3.to_string(),
+    })
+}
+
+fn read_prospective_stop_evidence(
+    path: &Path,
+) -> Result<(AceEvV2ProspectiveStopEvidenceV1, String)> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("read prospective stop evidence {}", path.display()))?;
+    let evidence: AceEvV2ProspectiveStopEvidenceV1 = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode prospective stop evidence {}", path.display()))?;
+    Ok((evidence, sha256_hex(&bytes)))
+}
+
+fn validate_prospective_stop_evidence(
+    evidence: &AceEvV2ProspectiveStopEvidenceV1,
+    manifest: &RugRealityCaptureRunManifestV1,
+    manifest_sha256: &str,
+    contract_sha256: &str,
+    amendment_sha256: &str,
+    feature_scale_sha256: &str,
+    expected_cohort_sha256: &str,
+) -> Result<()> {
+    if evidence.schema != ACE_EV_V2_PROSPECTIVE_STOP_EVIDENCE_SCHEMA
+        || evidence.run_id != manifest.run_id
+        || evidence.manifest_sha256 != manifest_sha256
+        || evidence.base_contract_sha256 != contract_sha256
+        || evidence.amendment_sha256 != amendment_sha256
+        || evidence.feature_scale_sha256 != feature_scale_sha256
+        || evidence.implementation_sha != manifest.implementation_sha
+        || evidence.target_terminal_outcomes != PROSPECTIVE_ENROLLMENT_LIMIT
+        || evidence.terminal_outcome_count != PROSPECTIVE_ENROLLMENT_LIMIT
+        || evidence.stop_captured_at_unix_ms == 0
+        || evidence.monitor_binary_blake3.trim().is_empty()
+        || evidence.complete_file_prefixes.is_empty()
+    {
+        bail!("prospective stop evidence contract mismatch")
+    }
+    ensure_prospective_cohort_hash(
+        &evidence.cohort_candidate_order_sha256,
+        expected_cohort_sha256,
+    )?;
+    let mut last = None::<&str>;
+    for prefix in &evidence.complete_file_prefixes {
+        if prefix.relative_path.trim().is_empty()
+            || last.is_some_and(|previous| previous >= prefix.relative_path.as_str())
+        {
+            bail!("prospective stop evidence file-prefix ordering invalid")
+        }
+        last = Some(&prefix.relative_path);
+    }
+    Ok(())
+}
+
+fn ensure_prospective_cohort_hash(actual: &str, expected: &str) -> Result<()> {
+    if actual != expected {
+        bail!("prospective stop evidence cohort hash mismatch")
+    }
+    Ok(())
+}
+
+fn prospective_terminal_status(
+    args: &AceEvV2EvaluateArgs,
+    manifest: &RugRealityCaptureRunManifestV1,
+    health_receipt: &RugRealityCaptureHealthEvidenceV1,
+    contract_sha256: &str,
+    feature_scale_sha256: &str,
+    amendment: &(AceEvV2ProspectiveAmendmentV1, String),
+    terminal_outcome_count: usize,
+    outcomes: &[AceEvV2CandidateOutcomeV1],
+) -> Result<String> {
+    match health_receipt.prospective_terminalization.as_deref() {
+        Some("TARGET_REACHED") => {
+            if terminal_outcome_count != amendment.0.target_terminal_outcomes {
+                bail!("prospective target receipt does not have exactly 1000 terminal rows")
+            }
+            let path = args.stop_evidence_path.as_deref().ok_or_else(|| {
+                anyhow!("TARGET_REACHED prospective capture requires --stop-evidence")
+            })?;
+            let (evidence, _) = read_prospective_stop_evidence(path)?;
+            let manifest_sha256 = sha256_hex(&fs::read(&args.manifest_path)?);
+            validate_prospective_stop_evidence(
+                &evidence,
+                manifest,
+                &manifest_sha256,
+                contract_sha256,
+                &amendment.1,
+                feature_scale_sha256,
+                &candidate_cohort_sha256(outcomes),
+            )?;
+            let receipt_hash = health_receipt
+                .prospective_stop_evidence_sha256
+                .as_deref()
+                .ok_or_else(|| anyhow!("prospective health receipt lacks stop evidence hash"))?;
+            let (_, evidence_hash) = read_prospective_stop_evidence(path)?;
+            if receipt_hash != evidence_hash {
+                bail!("prospective health receipt stop evidence hash mismatch")
+            }
+            Ok("ACE_EV_V2_OUTCOMES_READY_FOR_FIT".to_string())
+        }
+        Some("MAX_DURATION_INSUFFICIENT_YIELD") => {
+            if terminal_outcome_count >= amendment.0.target_terminal_outcomes {
+                bail!("prospective max-duration receipt conflicts with reached target")
+            }
+            if args.stop_evidence_path.is_some() {
+                bail!("max-duration prospective capture must not supply target stop evidence")
+            }
+            Ok("ACE_EV_V2_INSUFFICIENT_YIELD".to_string())
+        }
+        _ => bail!("prospective health receipt terminalization is missing or invalid"),
+    }
+}
+
+fn prospective_stop_evidence_sha256(
+    args: &AceEvV2EvaluateArgs,
+    amendment_sha256: Option<&str>,
+    manifest: &RugRealityCaptureRunManifestV1,
+    contract_sha256: &str,
+    feature_scale_sha256: &str,
+    outcomes: &[AceEvV2CandidateOutcomeV1],
+) -> Result<Option<String>> {
+    if args.capture_kind != AceEvV2CaptureKind::Prospective1000 {
+        return Ok(None);
+    }
+    let receipt = load_capture_health_receipt(manifest)?;
+    if receipt.prospective_terminalization.as_deref() != Some("TARGET_REACHED") {
+        return Ok(None);
+    }
+    let path = args
+        .stop_evidence_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("TARGET_REACHED prospective capture requires --stop-evidence"))?;
+    let (evidence, hash) = read_prospective_stop_evidence(path)?;
+    let manifest_sha256 = sha256_hex(&fs::read(&args.manifest_path)?);
+    validate_prospective_stop_evidence(
+        &evidence,
+        manifest,
+        &manifest_sha256,
+        contract_sha256,
+        amendment_sha256.ok_or_else(|| anyhow!("prospective amendment hash missing"))?,
+        feature_scale_sha256,
+        &candidate_cohort_sha256(outcomes),
+    )?;
+    Ok(Some(hash))
 }
 
 fn required_outcome_drain_deadline(plan: &PreEntryPlan) -> u64 {
@@ -1695,6 +2316,11 @@ fn invalid_capture_summary(
         binary_hash: manifest.binary_hash.clone(),
         feature_scale_sha256: feature_scale_sha256.to_string(),
         contract_sha256: contract_sha256.to_string(),
+        prospective_amendment_sha256: None,
+        prospective_stop_evidence_sha256: None,
+        cohort_candidate_order_sha256: None,
+        prospective_terminalization: None,
+        candidate_outcomes_sha256: None,
         total_canonical_births,
         pre_entry_eligible_count: 0,
         enrollment_closed: false,
@@ -2024,6 +2650,16 @@ fn write_candidate_rows_new<T: Serialize>(path: &Path, rows: &[T]) -> Result<()>
         .sync_all()
         .with_context(|| format!("sync ACE-EV V2 row file {}", path.display()))?;
     Ok(())
+}
+
+fn candidate_rows_sha256<T: Serialize>(rows: &[T]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for row in rows {
+        let bytes = serde_json::to_vec(row).context("serialize candidate row for output hash")?;
+        hasher.update(bytes);
+        hasher.update(b"\n");
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2737,8 +3373,9 @@ fn outcome_row(
     enrollment_index: usize,
     outcome: TerminalOutcome,
     stress: TerminalOutcome,
+    capture_kind: AceEvV2CaptureKind,
 ) -> AceEvV2CandidateOutcomeV1 {
-    let split = split_for_enrollment_index(enrollment_index);
+    let split = split_for_capture_kind(capture_kind, enrollment_index);
     let stress_latency_1s = AceEvV2StressOutcomeV1 {
         entry_latency_ms: 1_000,
         exit_latency_ms: 1_000,
@@ -2789,10 +3426,17 @@ fn outcome_row(
     }
 }
 
-fn split_for_enrollment_index(enrollment_index: usize) -> &'static str {
-    if enrollment_index <= TRAIN_ROWS {
+fn split_for_capture_kind(
+    capture_kind: AceEvV2CaptureKind,
+    enrollment_index: usize,
+) -> &'static str {
+    let (train_rows, threshold_rows) = match capture_kind {
+        AceEvV2CaptureKind::YieldQualification => (TRAIN_ROWS, THRESHOLD_CALIBRATION_ROWS),
+        AceEvV2CaptureKind::Prospective1000 => (PROSPECTIVE_TRAIN_ROWS, PROSPECTIVE_THRESHOLD_ROWS),
+    };
+    if enrollment_index <= train_rows {
         "TRAIN"
-    } else if enrollment_index <= TRAIN_ROWS + THRESHOLD_CALIBRATION_ROWS {
+    } else if enrollment_index <= train_rows + threshold_rows {
         "THRESHOLD_CALIBRATION"
     } else {
         "UNTOUCHED_TEST"
@@ -3028,6 +3672,73 @@ mod tests {
             decision_entry_total_debit_lamports: 0,
             decision_entry_impact_bps: 0,
             decision_immediate_exit_impact_bps: 0,
+        }
+    }
+
+    fn terminal_candidate(index: usize) -> AceEvV2CandidateOutcomeV1 {
+        let candidate_id = format!("candidate-{index:04}");
+        let base_mint = format!("mint-{index:04}");
+        let bonding_curve = format!("curve-{index:04}");
+        AceEvV2CandidateOutcomeV1 {
+            schema: ACE_EV_V2_OUTCOME_SCHEMA.to_string(),
+            estimand_id: ACE_EV_V2_ESTIMAND_ID.to_string(),
+            enrollment_index: index,
+            split: split_for_capture_kind(AceEvV2CaptureKind::Prospective1000, index).to_string(),
+            candidate_id,
+            base_mint: base_mint.clone(),
+            bonding_curve: bonding_curve.clone(),
+            creator: "creator".to_string(),
+            candidate_order: CandidateOrderV1 {
+                decision_ingress_cutoff_ms: index as u64,
+                birth_ts_ms: index as u64,
+                event_slot: index as u64,
+                bonding_curve,
+                base_mint,
+            },
+            birth_ts_ms: index as u64,
+            decision_event_cutoff_ms: index as u64,
+            decision_ingress_cutoff_ms: index as u64,
+            feature_vector: AceEvV2FeatureVectorV1 {
+                f1_log_unique_first_buyers: 0.0,
+                f2_log_total_first_buy_flow: 0.0,
+                f3_buyer_acceleration: 0.0,
+                f4_creator_buy_share: 0.0,
+                f5_first_buy_flow_hhi: 0.0,
+                f6_same_slot_first_buy_flow_share: 0.0,
+                f7_pre_cutoff_sell_buy_log_ratio: 0.0,
+            },
+            normalized_features: [0.0; 7],
+            decision_state_slot: index as u64,
+            entry_landing_state_slot: None,
+            entry_status: "ENTRY_FAILED_NO_LANDING_STATE".to_string(),
+            fixed_token_amount_raw: 0,
+            fixed_max_sol_cost_lamports: 0,
+            entry_total_debit_lamports: None,
+            entry_impact_bps: None,
+            immediate_exit_impact_bps: None,
+            entry_landed_arrival_ts_ms: None,
+            terminal_status: "ENTRY_FAILED_NO_LANDING_STATE".to_string(),
+            terminal_status_subtype: None,
+            terminal_net_pnl_lamports: 0,
+            terminal_net_pnl_sol: 0.0,
+            terminal_net_return: None,
+            profit17_hit: false,
+            exit_reason: "entry_failed_no_landing_state".to_string(),
+            exit_trigger_event_ts_ms: None,
+            exit_trigger_arrival_ts_ms: None,
+            exit_landing_state_slot: None,
+            failed_take_profit_attempts: 0,
+            cumulative_failed_exit_cost_lamports: 0,
+            post_entry_route_loss: false,
+            stress_latency_1s: AceEvV2StressOutcomeV1 {
+                entry_latency_ms: 1_000,
+                exit_latency_ms: 1_000,
+                terminal_status: "ENTRY_FAILED_NO_LANDING_STATE".to_string(),
+                terminal_net_pnl_lamports: 0,
+                terminal_net_pnl_sol: 0.0,
+                profit17_hit: false,
+                exit_reason: "entry_failed_no_landing_state".to_string(),
+            },
         }
     }
 
@@ -3276,11 +3987,179 @@ mod tests {
         second.payload.detected_wall_ts_ms = Some(11);
         second.payload.birth_ts_ms = 99;
         assert!(candidate_order_for(&first) < candidate_order_for(&second));
-        assert_eq!(split_for_enrollment_index(100), "TRAIN");
-        assert_eq!(split_for_enrollment_index(101), "THRESHOLD_CALIBRATION");
-        assert_eq!(split_for_enrollment_index(150), "THRESHOLD_CALIBRATION");
-        assert_eq!(split_for_enrollment_index(151), "UNTOUCHED_TEST");
-        assert_eq!(split_for_enrollment_index(250), "UNTOUCHED_TEST");
+        assert_eq!(
+            split_for_capture_kind(AceEvV2CaptureKind::YieldQualification, 100),
+            "TRAIN"
+        );
+        assert_eq!(
+            split_for_capture_kind(AceEvV2CaptureKind::YieldQualification, 101),
+            "THRESHOLD_CALIBRATION"
+        );
+        assert_eq!(
+            split_for_capture_kind(AceEvV2CaptureKind::YieldQualification, 150),
+            "THRESHOLD_CALIBRATION"
+        );
+        assert_eq!(
+            split_for_capture_kind(AceEvV2CaptureKind::YieldQualification, 151),
+            "UNTOUCHED_TEST"
+        );
+        assert_eq!(
+            split_for_capture_kind(AceEvV2CaptureKind::Prospective1000, 400),
+            "TRAIN"
+        );
+        assert_eq!(
+            split_for_capture_kind(AceEvV2CaptureKind::Prospective1000, 401),
+            "THRESHOLD_CALIBRATION"
+        );
+        assert_eq!(
+            split_for_capture_kind(AceEvV2CaptureKind::Prospective1000, 600),
+            "THRESHOLD_CALIBRATION"
+        );
+        assert_eq!(
+            split_for_capture_kind(AceEvV2CaptureKind::Prospective1000, 601),
+            "UNTOUCHED_TEST"
+        );
+    }
+
+    #[test]
+    fn prospective_monitor_writes_no_target_evidence_at_999_and_exact_evidence_at_1000() {
+        let rows_999 = (1..=999).map(terminal_candidate).collect::<Vec<_>>();
+        assert!(prospective_stop_evidence_for_target(
+            "run",
+            "implementation",
+            "manifest",
+            "contract",
+            "amendment",
+            "scale",
+            PROSPECTIVE_ENROLLMENT_LIMIT,
+            &rows_999,
+            vec![tape::TapeCompletePrefixV1 {
+                relative_path: "exec_run_0000.jsonl".to_string(),
+                complete_offset: 1,
+            }],
+            1,
+            "monitor",
+        )
+        .is_none());
+
+        let rows_1000 = (1..=1_000).map(terminal_candidate).collect::<Vec<_>>();
+        let evidence = prospective_stop_evidence_for_target(
+            "run",
+            "implementation",
+            "manifest",
+            "contract",
+            "amendment",
+            "scale",
+            PROSPECTIVE_ENROLLMENT_LIMIT,
+            &rows_1000,
+            vec![tape::TapeCompletePrefixV1 {
+                relative_path: "exec_run_0000.jsonl".to_string(),
+                complete_offset: 1,
+            }],
+            1,
+            "monitor",
+        )
+        .expect("the 1000th terminal row produces immutable stop evidence");
+        assert_eq!(evidence.target_terminal_outcomes, 1_000);
+        assert_eq!(evidence.terminal_outcome_count, 1_000);
+        assert_eq!(
+            evidence.cohort_candidate_order_sha256,
+            candidate_cohort_sha256(&rows_1000)
+        );
+    }
+
+    #[test]
+    fn prospective_1001st_terminal_row_cannot_change_first_1000_cohort_hash() {
+        let rows_1000 = (1..=1_000).map(terminal_candidate).collect::<Vec<_>>();
+        let rows_1001 = (1..=1_001).map(terminal_candidate).collect::<Vec<_>>();
+        let from_1000 = prospective_stop_evidence_for_target(
+            "run",
+            "implementation",
+            "manifest",
+            "contract",
+            "amendment",
+            "scale",
+            1_000,
+            &rows_1000,
+            vec![tape::TapeCompletePrefixV1 {
+                relative_path: "exec_run_0000.jsonl".to_string(),
+                complete_offset: 1,
+            }],
+            1,
+            "monitor",
+        )
+        .expect("1000 rows");
+        let from_1001 = prospective_stop_evidence_for_target(
+            "run",
+            "implementation",
+            "manifest",
+            "contract",
+            "amendment",
+            "scale",
+            1_000,
+            &rows_1001,
+            vec![tape::TapeCompletePrefixV1 {
+                relative_path: "exec_run_0000.jsonl".to_string(),
+                complete_offset: 2,
+            }],
+            2,
+            "monitor",
+        )
+        .expect("first 1000 rows remain the target cohort");
+        assert_eq!(
+            from_1000.cohort_candidate_order_sha256,
+            from_1001.cohort_candidate_order_sha256
+        );
+        assert_ne!(
+            candidate_cohort_sha256(&rows_1000),
+            candidate_cohort_sha256(&rows_1001)
+        );
+    }
+
+    #[test]
+    fn earlier_pending_candidate_blocks_later_fast_terminal_candidate_from_monitor_stop() {
+        let pending = plan_for_landed_entry(direct_state(12_000, 12_000, 1), 1, 1);
+        let mut later_fast = pending.clone();
+        later_fast.cutoffs.ingress_cutoff_ts_ms = 1;
+        let mut plans = vec![&pending];
+        plans.extend(std::iter::repeat(&later_fast).take(PROSPECTIVE_ENROLLMENT_LIMIT - 1));
+        let required = prospective_cohort_drain_deadline(&plans, PROSPECTIVE_ENROLLMENT_LIMIT)
+            .expect("full candidate-order cohort");
+        assert!(required > required_outcome_drain_deadline(&later_fast));
+        assert!(required > 1);
+        // A tape advanced only past the fast later candidate is not allowed to
+        // produce target evidence; the earliest pending candidate owns the
+        // cohort watermark.
+        assert!(1 < required);
+    }
+
+    #[test]
+    fn final_reconciliation_rejects_tampered_cohort_hash() {
+        let rows = (1..=1_000).map(terminal_candidate).collect::<Vec<_>>();
+        let evidence = prospective_stop_evidence_for_target(
+            "run",
+            "implementation",
+            "manifest",
+            "contract",
+            "amendment",
+            "scale",
+            1_000,
+            &rows,
+            vec![tape::TapeCompletePrefixV1 {
+                relative_path: "exec_run_0000.jsonl".to_string(),
+                complete_offset: 1,
+            }],
+            1,
+            "monitor",
+        )
+        .expect("target evidence");
+        let mut tampered = evidence.clone();
+        tampered.cohort_candidate_order_sha256 = "tampered".to_string();
+        assert!(ensure_prospective_cohort_hash(
+            &tampered.cohort_candidate_order_sha256,
+            &candidate_cohort_sha256(&rows),
+        )
+        .is_err());
     }
 
     #[test]

@@ -65,6 +65,10 @@ const SOAK_MAX_DURATION_MS: u64 = 2_100_000;
 const YIELD_QUALIFICATION_MIN_DURATION_MS: u64 = 3_750_000;
 const YIELD_QUALIFICATION_MAX_DURATION_MS: u64 = 3_900_000;
 const DAY1_MIN_DURATION_MS: u64 = 86_400_000;
+// ACE-EV V2 prospective enrollment is bounded to six hours, followed by the
+// same 150 s terminal-outcome drain.  Unlike day1 this kind is valid only
+// when its health receipt names one of the two explicit terminalizations.
+const PROSPECTIVE_MAX_DURATION_MS: u64 = 21_750_000;
 const INGRESS_CUTOFF_CONTRACT: &str =
     "event_ts_ms<=birth_ts_ms+11111 && arrival_ts_ms<=detected_wall_ts_ms+11111";
 
@@ -283,6 +287,19 @@ pub(crate) struct Tape {
     pub(crate) trades: Vec<TapeTrade>,
     pub(crate) reserve_states: Vec<TapeReserveState>,
     pub(crate) invalid_reasons: BTreeSet<String>,
+}
+
+/// Immutable boundary of a live JSONL file consumed by an offline monitor.
+///
+/// A monitor must never parse a partially written JSON row.  `complete_offset`
+/// is therefore the byte offset immediately after the last newline that was
+/// present when the file was read.  It is carried into the prospective stop
+/// evidence so the final evaluator can prove which durable prefix selected the
+/// cohort.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TapeCompletePrefixV1 {
+    pub(crate) relative_path: String,
+    pub(crate) complete_offset: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -764,6 +781,32 @@ pub(crate) fn validate_capture_health_evidence(
         "day1" => {
             reasons.insert("capture_health_day1_duration_too_short".to_string());
         }
+        "prospective" if receipt.duration_ms <= PROSPECTIVE_MAX_DURATION_MS => {
+            match receipt.prospective_terminalization.as_deref() {
+                Some("TARGET_REACHED")
+                    if receipt
+                        .prospective_stop_evidence_sha256
+                        .as_deref()
+                        .is_some_and(|hash| !hash.trim().is_empty()) => {}
+                Some("TARGET_REACHED") => {
+                    reasons.insert("capture_health_prospective_stop_evidence_missing".to_string());
+                }
+                Some("MAX_DURATION_INSUFFICIENT_YIELD")
+                    if receipt.prospective_stop_evidence_sha256.is_none() => {}
+                Some("MAX_DURATION_INSUFFICIENT_YIELD") => {
+                    reasons.insert(
+                        "capture_health_prospective_timeout_has_target_evidence".to_string(),
+                    );
+                }
+                _ => {
+                    reasons
+                        .insert("capture_health_prospective_terminalization_invalid".to_string());
+                }
+            }
+        }
+        "prospective" => {
+            reasons.insert("capture_health_prospective_duration_out_of_range".to_string());
+        }
         _ => {
             reasons.insert("capture_health_capture_kind_invalid".to_string());
         }
@@ -839,28 +882,62 @@ fn collect_event_files_inner(root: &Path, files: &mut Vec<PathBuf>) -> Result<()
 }
 
 pub(crate) fn read_tape(events_dir: &Path, expected_run_id: &str) -> Result<Tape> {
+    read_tape_inner(events_dir, expected_run_id, false).map(|(tape, _)| tape)
+}
+
+/// Read only newline-complete rows from a growing EventWriter tape.
+///
+/// Unlike [`read_tape`], an unfinished final row is intentionally excluded
+/// rather than classified as a capture failure.  This is exclusively for the
+/// live, offline prospective monitor; the final post-shutdown evaluator stays
+/// strict and uses `read_tape`.
+pub(crate) fn read_tape_complete_prefix(
+    events_dir: &Path,
+    expected_run_id: &str,
+) -> Result<(Tape, Vec<TapeCompletePrefixV1>)> {
+    read_tape_inner(events_dir, expected_run_id, true)
+}
+
+fn read_tape_inner(
+    events_dir: &Path,
+    expected_run_id: &str,
+    allow_incomplete_tail: bool,
+) -> Result<(Tape, Vec<TapeCompletePrefixV1>)> {
     let files = collect_event_files(events_dir)?;
     let mut tape = Tape::default();
+    let mut prefixes = Vec::with_capacity(files.len());
     for (file_ordinal, path) in files.iter().enumerate() {
-        let file =
-            File::open(path).with_context(|| format!("open event tape {}", path.display()))?;
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
+        let raw = fs::read(path).with_context(|| format!("read event tape {}", path.display()))?;
+        let complete_len = raw
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|offset| offset + 1)
+            .unwrap_or(0);
+        let relative_path = path
+            .strip_prefix(events_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        prefixes.push(TapeCompletePrefixV1 {
+            relative_path,
+            complete_offset: complete_len as u64,
+        });
+        if !allow_incomplete_tail && complete_len != raw.len() {
+            tape.invalid_reasons
+                .insert("event_writer_not_cleanly_flushed".to_string());
+        }
+        let complete = &raw[..complete_len];
         let mut line_number = 0usize;
-        loop {
-            line.clear();
-            let count = reader
-                .read_line(&mut line)
-                .with_context(|| format!("read event tape {}", path.display()))?;
-            if count == 0 {
-                break;
-            }
+        for raw_line in complete.split_inclusive(|byte| *byte == b'\n') {
             line_number += 1;
-            if !line.ends_with('\n') {
-                tape.invalid_reasons
-                    .insert("event_writer_not_cleanly_flushed".to_string());
-                continue;
-            }
+            let line = match std::str::from_utf8(raw_line) {
+                Ok(line) => line,
+                Err(_) => {
+                    tape.invalid_reasons
+                        .insert("event_jsonl_decode_failed".to_string());
+                    continue;
+                }
+            };
             if line.trim().is_empty() {
                 tape.invalid_reasons
                     .insert("event_jsonl_blank_line".to_string());
@@ -910,7 +987,7 @@ pub(crate) fn read_tape(events_dir: &Path, expected_run_id: &str) -> Result<Tape
             }
         }
     }
-    Ok(tape)
+    Ok((tape, prefixes))
 }
 
 pub(crate) fn is_wsol_quote(quote_mint: &str) -> bool {
@@ -2604,6 +2681,8 @@ mod tests {
             controlled_shutdown: true,
             event_files_cleanly_flushed: true,
             log_evidence_clean: true,
+            prospective_terminalization: None,
+            prospective_stop_evidence_sha256: None,
         };
         write_json_new(Path::new(&manifest.health_evidence_path), &receipt)
             .expect("write valid capture health evidence");
@@ -3581,5 +3660,35 @@ mod tests {
             EventKind::NewPoolDetected(test_birth("c", 1).payload),
         );
         assert_eq!(event.envelope.lane, Lane::Shadow);
+    }
+
+    #[test]
+    fn live_monitor_reader_ignores_only_an_incomplete_jsonl_tail() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let events_dir = temp.path().join("events");
+        fs::create_dir_all(&events_dir).expect("events dir");
+        let run_id = "prospective-live-prefix";
+        let event = ExecutionEvent::new(
+            EventEnvelope::new(run_id.to_string(), Lane::Shadow, "candidate".to_string(), 1),
+            EventKind::NewPoolDetected(test_birth("candidate", 1).payload),
+        );
+        let event_path = events_dir.join("exec_prospective-live-prefix_0000.jsonl");
+        let mut file = File::create(&event_path).expect("event file");
+        serde_json::to_writer(&mut file, &event).expect("complete event");
+        file.write_all(b"\n{\"unterminated\":")
+            .expect("partial tail");
+        file.sync_all().expect("sync partial tape");
+
+        let (prefix, offsets) = read_tape_complete_prefix(&events_dir, run_id)
+            .expect("prefix reader accepts the durable row");
+        assert_eq!(prefix.births.len(), 1);
+        assert!(prefix.invalid_reasons.is_empty());
+        assert_eq!(offsets.len(), 1);
+        assert!(offsets[0].complete_offset < fs::metadata(&event_path).unwrap().len());
+
+        let strict = read_tape(&events_dir, run_id).expect("strict reader returns tape status");
+        assert!(strict
+            .invalid_reasons
+            .contains("event_writer_not_cleanly_flushed"));
     }
 }

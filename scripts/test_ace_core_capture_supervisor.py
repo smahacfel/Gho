@@ -7,7 +7,9 @@ import importlib.util
 import json
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -147,6 +149,142 @@ class AceCaptureSupervisorTests(unittest.TestCase):
         snapshot = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual(snapshot["source"], "last_known_good")
         self.assertEqual(snapshot["captured_at_unix_ms"], observed_at)
+
+    def test_prospective_stop_evidence_is_run_bound_before_supervisor_owns_shutdown(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="ace-prospective-stop-test-"))
+        evidence_path = root / "prospective_stop_evidence_v1.json"
+        manifest = {"run_id": "prospective-run", "implementation_sha": "a" * 40}
+        evidence = {
+            "schema": "ace_ev_v2_prospective_stop_evidence_v1",
+            "run_id": "prospective-run",
+            "manifest_sha256": "b" * 64,
+            "base_contract_sha256": "c" * 64,
+            "amendment_sha256": "d" * 64,
+            "feature_scale_sha256": "e" * 64,
+            "implementation_sha": "a" * 40,
+            "target_terminal_outcomes": 1000,
+            "terminal_outcome_count": 1000,
+            "cohort_candidate_order_sha256": "f" * 64,
+            "complete_file_prefixes": [
+                {"relative_path": "exec_prospective_0000.jsonl", "complete_offset": 42}
+            ],
+        }
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        self.assertTrue(
+            supervisor.prospective_stop_evidence_is_valid(
+                evidence_path,
+                manifest=manifest,
+                manifest_sha256="b" * 64,
+                base_contract_sha256="c" * 64,
+                amendment_sha256="d" * 64,
+                feature_scale_sha256="e" * 64,
+            )
+        )
+        for field, invalid_value in (
+            ("run_id", "foreign-run"),
+            ("manifest_sha256", "0" * 64),
+            ("base_contract_sha256", "0" * 64),
+            ("feature_scale_sha256", "0" * 64),
+        ):
+            tampered = dict(evidence)
+            tampered[field] = invalid_value
+            evidence_path.write_text(json.dumps(tampered), encoding="utf-8")
+            self.assertFalse(
+                supervisor.prospective_stop_evidence_is_valid(
+                    evidence_path,
+                    manifest=manifest,
+                    manifest_sha256="b" * 64,
+                    base_contract_sha256="c" * 64,
+                    amendment_sha256="d" * 64,
+                    feature_scale_sha256="e" * 64,
+                ),
+                field,
+            )
+
+    def test_prospective_supervisor_takes_snapshots_then_owns_target_shutdown(self) -> None:
+        class MetricsHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - HTTP handler API
+                body = (
+                    "pr1_runtime_bypass_attempt_total 0\n"
+                    "pr1_runtime_candidate_admission_closed_total 0\n"
+                    "pr1_runtime_primary_coverage_gap_total 0\n"
+                    "ace_capture_segment_invalid_total 0\n"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        root = Path(tempfile.mkdtemp(prefix="ace-prospective-supervisor-test-"))
+        manifest_path = root / "manifest.json"
+        manifest = {"run_id": "prospective-run", "implementation_sha": "a" * 40}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_sha256 = supervisor.sha256_hex(manifest_path.read_bytes())
+        evidence_path = root / "prospective_stop_evidence_v1.json"
+        evidence_path.write_text(
+            json.dumps(
+                {
+                    "schema": "ace_ev_v2_prospective_stop_evidence_v1",
+                    "run_id": "prospective-run",
+                    "manifest_sha256": manifest_sha256,
+                    "base_contract_sha256": "b" * 64,
+                    "amendment_sha256": "c" * 64,
+                    "feature_scale_sha256": "d" * 64,
+                    "implementation_sha": "a" * 40,
+                    "target_terminal_outcomes": 1000,
+                    "terminal_outcome_count": 1000,
+                    "cohort_candidate_order_sha256": "e" * 64,
+                    "complete_file_prefixes": [
+                        {"relative_path": "exec_prospective_0000.jsonl", "complete_offset": 42}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MetricsHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            metrics_url = f"http://127.0.0.1:{server.server_port}/metrics"
+            args = type("Args", (), {
+                "manifest": str(manifest_path),
+                "capture_kind": "prospective",
+                "metrics_url": metrics_url,
+                "status_output": str(root / "lifecycle_status.json"),
+                "start_snapshot": str(root / "start_metrics.json"),
+                "end_snapshot": str(root / "end_metrics.json"),
+                "stdout": str(root / "launcher.stdout.log"),
+                "stderr": str(root / "launcher.stderr.log"),
+                "duration_s": None,
+                "max_duration_s": 2.0,
+                "stop_evidence_path": str(evidence_path),
+                "prospective_base_contract_sha256": "b" * 64,
+                "prospective_amendment_sha256": "c" * 64,
+                "prospective_feature_scale_sha256": "d" * 64,
+                "poll_s": 0.01,
+                "metrics_timeout_s": 1.0,
+                "last_known_good_max_age_s": 5.0,
+                "shutdown_timeout_s": 5.0,
+                "manifest_ready_timeout_s": 1.0,
+                "launcher_command": [
+                    sys.executable,
+                    "-c",
+                    "import signal,sys,time; signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); time.sleep(30)",
+                ],
+            })()
+            self.assertEqual(supervisor.supervise(args), 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+        status = json.loads((root / "lifecycle_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["stop_reason"], "target_reached")
+        self.assertEqual(status["launcher_returncode"], 0)
+        self.assertTrue((root / "start_metrics.json").is_file())
+        self.assertTrue((root / "end_metrics.json").is_file())
 
 
 if __name__ == "__main__":

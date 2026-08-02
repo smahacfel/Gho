@@ -10,7 +10,11 @@ without NumPy or scikit-learn.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
+import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 
@@ -49,18 +53,18 @@ def row(index: int) -> dict:
 
 
 class AceEvV2FitContractTests(unittest.TestCase):
-    def test_exact_chronological_100_50_100_contract_is_accepted(self) -> None:
-        FIT.require_terminal_rows([row(index) for index in range(1, 251)])
+    def test_exact_chronological_400_200_400_contract_is_accepted(self) -> None:
+        FIT.require_terminal_rows([row(index) for index in range(1, 1001)])
 
     def test_untouched_test_split_cannot_be_relabelled_as_training(self) -> None:
-        rows = [row(index) for index in range(1, 251)]
-        rows[150]["split"] = "TRAIN"
+        rows = [row(index) for index in range(1, 1001)]
+        rows[600]["split"] = "TRAIN"
         with self.assertRaisesRegex(ValueError, "expected split UNTOUCHED_TEST"):
             FIT.require_terminal_rows(rows)
 
     def test_candidate_order_regression_is_rejected_before_fit(self) -> None:
-        rows = [row(index) for index in range(1, 251)]
-        rows[151]["candidate_order"]["decision_ingress_cutoff_ms"] = 1
+        rows = [row(index) for index in range(1, 1001)]
+        rows[601]["candidate_order"]["decision_ingress_cutoff_ms"] = 1
         with self.assertRaisesRegex(ValueError, "candidate_order is not monotonic"):
             FIT.require_terminal_rows(rows)
 
@@ -75,6 +79,62 @@ class AceEvV2FitContractTests(unittest.TestCase):
         dominates, share = FIT.route_loss_dominates(rows)
         self.assertTrue(dominates)
         self.assertAlmostEqual(share, 1.0 / 1.1)
+
+    def test_source_binding_rejects_a_tampered_feature_scale_hash_before_fit(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ace-ev-v2-source-binding-") as temp:
+            root = Path(temp)
+            contract = root / "contract.json"
+            contract.write_text('{"schema":"ace_ev_v2_contract_v1"}\n', encoding="utf-8")
+            outcomes = root / "outcomes.jsonl"
+            outcomes.write_bytes(b"")
+            feature_scale = root / "feature_scale.json"
+            feature_scale.write_text('{"scale":"fixture"}\n', encoding="utf-8")
+            amendment = root / "amendment.json"
+            contract_hash = hashlib.sha256(contract.read_bytes()).hexdigest()
+            amendment.write_text(
+                json.dumps(
+                    {
+                        "schema": FIT.AMENDMENT_SCHEMA,
+                        "base_contract_sha256": contract_hash,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            summary = root / "summary.json"
+            summary.write_text(
+                json.dumps(
+                    {
+                        "schema": "ace_ev_v2_summary_v1",
+                        "capture_kind": "prospective_1000",
+                        "capture_status": "VALID_CAPTURE",
+                        "terminal_status": "ACE_EV_V2_OUTCOMES_READY_FOR_FIT",
+                        "prospective_terminalization": "TARGET_REACHED",
+                        "prospective_stop_evidence_sha256": "d" * 64,
+                        "implementation_sha": "a" * 40,
+                        "code_hash": "git:" + "a" * 40,
+                        "contract_sha256": contract_hash,
+                        "feature_scale_sha256": "0" * 64,
+                        "prospective_amendment_sha256": hashlib.sha256(
+                            amendment.read_bytes()
+                        ).hexdigest(),
+                        "cohort_candidate_order_sha256": "c" * 64,
+                        "candidate_outcomes_sha256": hashlib.sha256(
+                            outcomes.read_bytes()
+                        ).hexdigest(),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            args = Namespace(
+                summary=summary,
+                feature_scale=feature_scale,
+                amendment=amendment,
+                implementation_sha="a" * 40,
+            )
+            with self.assertRaisesRegex(ValueError, "feature-scale hash mismatch"):
+                FIT.load_prospective_sources(args, contract.read_bytes(), outcomes.read_bytes())
 
 
 if __name__ == "__main__":

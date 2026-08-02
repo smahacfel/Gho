@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Fit the one frozen ACE-EV V2 Huber model strictly offline.
+"""Fit the one frozen ACE-EV V2 PROSPECTIVE_1000 Huber model offline only.
 
-This script consumes the 250 terminal rows emitted by ``ace_ev_v2_probe``.
-It has no RPC, no capture, no Event Bus, and no authority over a running
-launcher.  TRAIN (1-100) is the only fitting partition.  The middle 50 rows
-only freeze ``tau`` from predictions; the final 100 rows are untouched until
-the one final evaluation.
+This script consumes exactly the run-bound terminal cohort emitted by
+``ace_ev_v2_probe``.  It has no RPC, no capture, no Event Bus, and no
+authority over a running launcher.  TRAIN (1-400) is the only fitting
+partition.  The middle 200 rows freeze ``tau`` from predictions; the final
+400 rows remain untouched until the one final evaluation.
 """
 
 from __future__ import annotations
@@ -35,14 +35,17 @@ for _thread_var in (
 SCHEMA = "ace_ev_v2_huber_fit_v1"
 PREDICTIONS_SCHEMA = "ace_ev_v2_test_predictions_v1"
 FEATURE_COUNT = 7
-TRAIN_ROWS = 100
-THRESHOLD_ROWS = 50
-TEST_ROWS = 100
+TRAIN_ROWS = 400
+THRESHOLD_ROWS = 200
+TEST_ROWS = 400
 EXPECTED_ROWS = TRAIN_ROWS + THRESHOLD_ROWS + TEST_ROWS
 EPSILON = 1.35
 ALPHA = 1.0
 TOL = 1e-5
 MAX_ITER = 1000
+PINNED_NUMPY_VERSION = "2.3.2"
+PINNED_SCIKIT_LEARN_VERSION = "1.7.1"
+AMENDMENT_SCHEMA = "ace_ev_v2_prospective_1000_amendment_v1"
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -70,6 +73,51 @@ def load_contract(path: Path) -> tuple[bytes, dict[str, Any]]:
     if value.get("schema") != "ace_ev_v2_contract_v1":
         raise ValueError("ACE-EV V2 contract schema mismatch")
     return data, value
+
+
+def load_prospective_sources(
+    args: argparse.Namespace, contract_bytes: bytes, outcomes_bytes: bytes
+) -> tuple[bytes, bytes, dict[str, Any]]:
+    summary_bytes = args.summary.read_bytes()
+    summary = json.loads(summary_bytes)
+    if not isinstance(summary, dict) or summary.get("schema") != "ace_ev_v2_summary_v1":
+        raise ValueError("source summary schema mismatch")
+    if summary.get("capture_kind") != "prospective_1000":
+        raise ValueError("source summary capture_kind is not prospective_1000")
+    if summary.get("capture_status") != "VALID_CAPTURE":
+        raise ValueError("source summary capture_status is not VALID_CAPTURE")
+    if summary.get("terminal_status") != "ACE_EV_V2_OUTCOMES_READY_FOR_FIT":
+        raise ValueError("source summary terminal_status is not fit-ready")
+    if summary.get("prospective_terminalization") != "TARGET_REACHED":
+        raise ValueError("source summary prospective terminalization is not TARGET_REACHED")
+    if not isinstance(summary.get("prospective_stop_evidence_sha256"), str) or not summary[
+        "prospective_stop_evidence_sha256"
+    ]:
+        raise ValueError("source summary prospective stop-evidence hash missing")
+    if summary.get("implementation_sha") != args.implementation_sha:
+        raise ValueError("source summary implementation_sha mismatch")
+    if summary.get("code_hash") != f"git:{args.implementation_sha}":
+        raise ValueError("source summary code_hash mismatch")
+    if summary.get("contract_sha256") != sha256_bytes(contract_bytes):
+        raise ValueError("source summary contract hash mismatch")
+    scale_bytes = args.feature_scale.read_bytes()
+    if summary.get("feature_scale_sha256") != sha256_bytes(scale_bytes):
+        raise ValueError("source summary feature-scale hash mismatch")
+    amendment_bytes = args.amendment.read_bytes()
+    amendment = json.loads(amendment_bytes)
+    if not isinstance(amendment, dict) or amendment.get("schema") != AMENDMENT_SCHEMA:
+        raise ValueError("prospective amendment schema mismatch")
+    if amendment.get("base_contract_sha256") != sha256_bytes(contract_bytes):
+        raise ValueError("prospective amendment contract hash mismatch")
+    if summary.get("prospective_amendment_sha256") != sha256_bytes(amendment_bytes):
+        raise ValueError("source summary amendment hash mismatch")
+    if not isinstance(summary.get("cohort_candidate_order_sha256"), str) or not summary[
+        "cohort_candidate_order_sha256"
+    ]:
+        raise ValueError("source summary cohort hash missing")
+    if summary.get("candidate_outcomes_sha256") != sha256_bytes(outcomes_bytes):
+        raise ValueError("source summary outcomes hash mismatch")
+    return summary_bytes, scale_bytes, amendment
 
 
 def require_terminal_rows(rows: list[dict[str, Any]]) -> None:
@@ -171,10 +219,23 @@ def fit(args: argparse.Namespace) -> int:
         )
         return 2
 
-    outcomes_bytes = args.outcomes.read_bytes()
     contract_bytes, contract = load_contract(args.contract)
+    outcomes_bytes = args.outcomes.read_bytes()
+    summary_bytes, scale_bytes, amendment = load_prospective_sources(
+        args, contract_bytes, outcomes_bytes
+    )
+    if np.__version__ != PINNED_NUMPY_VERSION or sklearn.__version__ != PINNED_SCIKIT_LEARN_VERSION:
+        print(
+            "ACE_EV_V2_MODEL_DEPENDENCY_VERSION_MISMATCH: "
+            f"numpy={np.__version__} expected={PINNED_NUMPY_VERSION} "
+            f"scikit_learn={sklearn.__version__} expected={PINNED_SCIKIT_LEARN_VERSION}",
+            file=sys.stderr,
+        )
+        return 2
     rows = read_jsonl(args.outcomes)
     require_terminal_rows(rows)
+    if amendment.get("target_terminal_outcomes") != EXPECTED_ROWS:
+        raise ValueError("prospective amendment target does not equal 1000")
     create_output_dir(args.output_dir)
 
     train = rows[:TRAIN_ROWS]
@@ -244,9 +305,22 @@ def fit(args: argparse.Namespace) -> int:
     positive_selected_pnl = [max(value, 0.0) for value in selected_pnl]
     positive_sum = sum(positive_selected_pnl)
     top_1_positive_share = max(positive_selected_pnl, default=0.0) / positive_sum if positive_sum > 0.0 else None
+    top_3_positive_share = (
+        sum(sorted(positive_selected_pnl, reverse=True)[:3]) / positive_sum
+        if positive_sum > 0.0
+        else None
+    )
+    test_entry_filled_count = sum(row.get("entry_status") == "ENTRY_FILLED" for row in test)
+    test_exit_filled_count = sum(row.get("terminal_status") == "EXIT_FILLED" for row in test)
+    selected_entry_filled_count = sum(row.get("entry_status") == "ENTRY_FILLED" for row in selected_rows)
+    selected_exit_filled_count = sum(row.get("terminal_status") == "EXIT_FILLED" for row in selected_rows)
+    adequate_executable_exposure = test_entry_filled_count >= 60 and test_exit_filled_count >= 25
 
     positive = (
-        len(selected_rows) >= 20
+        adequate_executable_exposure
+        and len(selected_rows) >= 80
+        and selected_entry_filled_count >= 20
+        and selected_exit_filled_count >= 10
         and selected_mean is not None
         and rest_mean is not None
         and selected_median is not None
@@ -260,11 +334,14 @@ def fit(args: argparse.Namespace) -> int:
         and selected_median >= rest_median
         and selected_hit_rate > rest_hit_rate
         and top_1_positive_share is not None
-        and top_1_positive_share <= 0.5
+        and top_1_positive_share <= 0.25
+        and top_3_positive_share is not None
+        and top_3_positive_share <= 0.5
         and stress_selected_mean > stress_rest_mean
     )
     falsified = (
-        len(selected_rows) >= 20
+        adequate_executable_exposure
+        and len(selected_rows) >= 20
         and selected_mean is not None
         and rest_mean is not None
         and selected_median is not None
@@ -277,7 +354,10 @@ def fit(args: argparse.Namespace) -> int:
         and selected_hit_rate <= rest_hit_rate
     )
     _, route_loss_share = route_loss_dominates(test)
-    if positive:
+    if not adequate_executable_exposure:
+        terminal_status = "ACE_EV_V2_INCONCLUSIVE"
+        subtype = "insufficient_executable_exposure"
+    elif positive:
         terminal_status = "ACE_EV_V2_POSITIVE_SIGNAL"
         subtype = None
     elif falsified:
@@ -311,6 +391,9 @@ def fit(args: argparse.Namespace) -> int:
         "terminal_status": terminal_status,
         "terminal_status_subtype": subtype,
         "source_outcomes_sha256": sha256_bytes(outcomes_bytes),
+        "source_summary_sha256": sha256_bytes(summary_bytes),
+        "source_feature_scale_sha256": sha256_bytes(scale_bytes),
+        "source_amendment_sha256": sha256_bytes(args.amendment.read_bytes()),
         "contract_sha256": sha256_bytes(contract_bytes),
         "python_version": sys.version,
         "platform": platform.platform(),
@@ -346,6 +429,12 @@ def fit(args: argparse.Namespace) -> int:
             "selected_profit17_hit_rate": selected_hit_rate,
             "rest_profit17_hit_rate": rest_hit_rate,
             "top_1_positive_pnl_share": top_1_positive_share,
+            "top_3_positive_pnl_share": top_3_positive_share,
+            "entry_filled_count": test_entry_filled_count,
+            "exit_filled_count": test_exit_filled_count,
+            "selected_entry_filled_count": selected_entry_filled_count,
+            "selected_exit_filled_count": selected_exit_filled_count,
+            "adequate_executable_exposure": adequate_executable_exposure,
             "stress_latency_1s_selected_mean_net_pnl_sol": stress_selected_mean,
             "stress_latency_1s_rest_mean_net_pnl_sol": stress_rest_mean,
             "unsupported_route_loss_share_of_test_losses": route_loss_share,
@@ -362,6 +451,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--outcomes", type=Path, required=True)
     parser.add_argument("--contract", type=Path, required=True)
+    parser.add_argument("--amendment", type=Path, required=True)
+    parser.add_argument("--feature-scale", type=Path, required=True)
+    parser.add_argument("--summary", type=Path, required=True)
+    parser.add_argument("--implementation-sha", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 

@@ -6,8 +6,8 @@ use std::str::FromStr;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ghost_launcher::ace_ev_v2_probe::{
-    freeze_feature_scale, run_ace_ev_v2_evaluator, AceEvV2CaptureKind, AceEvV2EvaluateArgs,
-    AceEvV2FreezeScaleArgs,
+    freeze_feature_scale, run_ace_ev_v2_evaluator, run_ace_ev_v2_monitor, AceEvV2CaptureKind,
+    AceEvV2EvaluateArgs, AceEvV2FreezeScaleArgs, AceEvV2MonitorArgs,
 };
 
 #[derive(Debug, Parser)]
@@ -52,6 +52,33 @@ enum Command {
         output_dir: PathBuf,
         #[arg(long)]
         capture_kind: String,
+        /// Required for capture-kind prospective_1000.
+        #[arg(long)]
+        amendment: Option<PathBuf>,
+        /// Required when finalizing a TARGET_REACHED prospective capture.
+        #[arg(long)]
+        stop_evidence: Option<PathBuf>,
+    },
+    /// Monitor only newline-complete durable rows and create immutable
+    /// prospective target evidence once the first 1,000 ordered outcomes are
+    /// terminal.  This command has no RPC or runtime authority.
+    Monitor {
+        #[arg(long)]
+        events_dir: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        contract: PathBuf,
+        #[arg(long)]
+        amendment: PathBuf,
+        #[arg(long)]
+        feature_scale: PathBuf,
+        #[arg(long)]
+        start_metrics: PathBuf,
+        #[arg(long)]
+        stop_evidence: PathBuf,
+        #[arg(long, default_value_t = 1_000)]
+        poll_interval_ms: u64,
     },
 }
 
@@ -85,6 +112,8 @@ fn main() -> Result<()> {
             feature_scale,
             output_dir,
             capture_kind,
+            amendment,
+            stop_evidence,
         } => {
             let summary = run_ace_ev_v2_evaluator(AceEvV2EvaluateArgs {
                 events_dir,
@@ -93,6 +122,8 @@ fn main() -> Result<()> {
                 feature_scale_path: feature_scale,
                 output_dir,
                 capture_kind: AceEvV2CaptureKind::from_str(&capture_kind)?,
+                amendment_path: amendment,
+                stop_evidence_path: stop_evidence,
             })?;
             println!(
                 "{} capture_status={} enrolled={} terminal_outcomes={}",
@@ -101,6 +132,28 @@ fn main() -> Result<()> {
                 summary.enrolled_count,
                 summary.terminal_outcome_count
             );
+        }
+        Command::Monitor {
+            events_dir,
+            manifest,
+            contract,
+            amendment,
+            feature_scale,
+            start_metrics,
+            stop_evidence,
+            poll_interval_ms,
+        } => {
+            run_ace_ev_v2_monitor(AceEvV2MonitorArgs {
+                events_dir,
+                manifest_path: manifest,
+                contract_path: contract,
+                amendment_path: amendment,
+                feature_scale_path: feature_scale,
+                start_metrics_path: start_metrics,
+                stop_evidence_path: stop_evidence,
+                poll_interval_ms,
+            })?;
+            println!("ACE_EV_V2_PROSPECTIVE_TARGET_REACHED");
         }
     }
     Ok(())

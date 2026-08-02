@@ -188,6 +188,9 @@ class LifecycleState:
     launcher_returncode: int | None = None
     shutdown_requested: bool = False
     shutdown_signal: str | None = None
+    # Explicit supervisor-owned reason for a normal controlled shutdown.  It
+    # is distinct from `exit_reason`, which is derived from launcher logs.
+    stop_reason: str | None = None
     endpoint_state: str = "unknown"
     exit_reason: str | None = None
     end_snapshot_source: str | None = None
@@ -254,6 +257,44 @@ def wait_for_manifest(
     raise RuntimeError(f"capture manifest was not materialized within {timeout_s}s: {path}")
 
 
+def prospective_stop_evidence_is_valid(
+    path: Path,
+    *,
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+    base_contract_sha256: str,
+    amendment_sha256: str,
+    feature_scale_sha256: str,
+) -> bool:
+    """Validate only the immutable monitor-to-supervisor handoff boundary.
+
+    The Rust final evaluator recomputes the candidate-order cohort after
+    shutdown.  The supervisor checks enough provenance here to ensure a stale
+    or foreign evidence file cannot own the launcher shutdown signal.
+    """
+    try:
+        evidence = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(evidence, dict):
+        return False
+    return (
+        evidence.get("schema") == "ace_ev_v2_prospective_stop_evidence_v1"
+        and evidence.get("run_id") == manifest.get("run_id")
+        and evidence.get("manifest_sha256") == manifest_sha256
+        and evidence.get("base_contract_sha256") == base_contract_sha256
+        and evidence.get("amendment_sha256") == amendment_sha256
+        and evidence.get("feature_scale_sha256") == feature_scale_sha256
+        and evidence.get("implementation_sha") == manifest.get("implementation_sha")
+        and evidence.get("target_terminal_outcomes") == 1000
+        and evidence.get("terminal_outcome_count") == 1000
+        and isinstance(evidence.get("cohort_candidate_order_sha256"), str)
+        and bool(evidence.get("cohort_candidate_order_sha256"))
+        and isinstance(evidence.get("complete_file_prefixes"), list)
+        and bool(evidence.get("complete_file_prefixes"))
+    )
+
+
 def supervise(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest)
     stdout_path = Path(args.stdout)
@@ -316,11 +357,13 @@ def supervise(args: argparse.Namespace) -> int:
             launcher_pid=process.pid,
         )
         start = time.monotonic()
+        max_duration_s = args.max_duration_s if args.capture_kind == "prospective" else args.duration_s
+        assert max_duration_s is not None
         start_snapshot_taken = False
         end_snapshot_taken = False
         last_known_good: tuple[bytes, int] | None = None
         try:
-            while process.poll() is None and time.monotonic() - start < args.duration_s:
+            while process.poll() is None and time.monotonic() - start < max_duration_s:
                 body = record_scrape(state, args.metrics_url, args.metrics_timeout_s)
                 if body is not None:
                     assert state.metrics.last_success_at_unix_ms is not None
@@ -341,6 +384,22 @@ def supervise(args: argparse.Namespace) -> int:
                         # concern; do not turn it into process authority.
                         state.metrics.failure(error)
                 write_atomic_json(status_path, state.as_json())
+                if (
+                    args.capture_kind == "prospective"
+                    and start_snapshot_taken
+                    and args.stop_evidence_path
+                    and Path(args.stop_evidence_path).is_file()
+                    and prospective_stop_evidence_is_valid(
+                        Path(args.stop_evidence_path),
+                        manifest=manifest,
+                        manifest_sha256=manifest_sha256,
+                        base_contract_sha256=args.prospective_base_contract_sha256,
+                        amendment_sha256=args.prospective_amendment_sha256,
+                        feature_scale_sha256=args.prospective_feature_scale_sha256,
+                    )
+                ):
+                    state.stop_reason = "target_reached"
+                    break
                 if body is None:
                     time.sleep(
                         metrics_retry_delay_s(args.poll_s, state.metrics.consecutive_failures)
@@ -352,6 +411,12 @@ def supervise(args: argparse.Namespace) -> int:
             # fails, the lifecycle state preserves the error but the process is
             # still allowed to shut down cleanly.
             if process.poll() is None:
+                if state.stop_reason is None:
+                    state.stop_reason = (
+                        "max_duration_insufficient_yield"
+                        if args.capture_kind == "prospective"
+                        else "duration_elapsed"
+                    )
                 body = record_scrape(state, args.metrics_url, args.metrics_timeout_s)
                 if body is not None:
                     assert state.metrics.last_success_at_unix_ms is not None
@@ -421,7 +486,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", required=True)
     parser.add_argument(
         "--capture-kind",
-        choices=("smoke", "soak", "yield_qualification", "day1"),
+        choices=("smoke", "soak", "yield_qualification", "day1", "prospective"),
         required=True,
     )
     parser.add_argument("--metrics-url", required=True)
@@ -438,7 +503,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--stdout", required=True)
     parser.add_argument("--stderr", required=True)
-    parser.add_argument("--duration-s", type=float, required=True)
+    parser.add_argument("--duration-s", type=float)
+    parser.add_argument(
+        "--max-duration-s",
+        type=float,
+        help="required only for prospective; includes its bounded outcome drain",
+    )
+    parser.add_argument(
+        "--stop-evidence-path",
+        help="immutable Rust monitor evidence which can trigger prospective shutdown",
+    )
+    parser.add_argument("--prospective-base-contract-sha256")
+    parser.add_argument("--prospective-amendment-sha256")
+    parser.add_argument("--prospective-feature-scale-sha256")
     parser.add_argument("--poll-s", type=float, default=1.0)
     parser.add_argument("--metrics-timeout-s", type=float, default=2.0)
     parser.add_argument(
@@ -457,8 +534,26 @@ def parse_args() -> argparse.Namespace:
         args.launcher_command = args.launcher_command[1:]
     if not args.launcher_command:
         parser.error("launcher command is required after --")
+    if args.capture_kind == "prospective":
+        if args.duration_s is not None:
+            parser.error("prospective uses --max-duration-s, not --duration-s")
+        if args.max_duration_s is None or args.max_duration_s <= 0:
+            parser.error("prospective requires positive --max-duration-s")
+        if not args.stop_evidence_path:
+            parser.error("prospective requires --stop-evidence-path")
+        if not all(
+            isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+            for value in (
+                args.prospective_base_contract_sha256,
+                args.prospective_amendment_sha256,
+                args.prospective_feature_scale_sha256,
+            )
+        ):
+            parser.error("prospective requires three lowercase SHA-256 provenance arguments")
+    elif args.duration_s is None or args.duration_s <= 0 or args.max_duration_s is not None:
+        parser.error("non-prospective captures require positive --duration-s and no --max-duration-s")
     if (
-        args.duration_s <= 0
+        (args.duration_s is not None and args.duration_s <= 0)
         or args.poll_s <= 0
         or args.metrics_timeout_s <= 0
         or args.last_known_good_max_age_s <= 0
