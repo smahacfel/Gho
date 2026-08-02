@@ -83,10 +83,11 @@ enabled = true
 run_id = "ace-ev-v2-prospective-250-UNFROZEN_SCOPE"
 manifest_path = "/root/Gho_ingest/logs/ace_ev_v2/UNFROZEN_SCOPE/run_manifest_v3.json"
 baseline_sha = "43057b296663129ca9b4f572e793474830a5452c"
-# This temporary parent SHA is intentionally replaced only by the later
-# config-only provenance-freeze commit after the functional V2 commit exists.
-implementation_sha = "adf57f0f0f0b70cb2f036e4db345d0ec060bd5f8"
-code_hash = "git:adf57f0f0f0b70cb2f036e4db345d0ec060bd5f8"
+# Frozen functional source revision for the offline evaluator and capture
+# contract. The config-only commit carrying these fields is deliberately not
+# included in the implementation SHA.
+implementation_sha = "e1fdd567c72bba735e5a73d25e67af137164cd4e"
+code_hash = "git:e1fdd567c72bba735e5a73d25e67af137164cd4e"
 health_evidence_path = "/root/Gho_ingest/logs/ace_ev_v2/UNFROZEN_SCOPE/capture_health_v1.json"
 
 [rug_reality_capture.cost_profile]
