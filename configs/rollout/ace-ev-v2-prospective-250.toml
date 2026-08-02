@@ -86,8 +86,8 @@ baseline_sha = "43057b296663129ca9b4f572e793474830a5452c"
 # Frozen functional source revision for the offline evaluator and capture
 # contract. The config-only commit carrying these fields is deliberately not
 # included in the implementation SHA.
-implementation_sha = "e1fdd567c72bba735e5a73d25e67af137164cd4e"
-code_hash = "git:e1fdd567c72bba735e5a73d25e67af137164cd4e"
+implementation_sha = "dde5bae6a8f8cc64fd8f95e6c1eaed45d2e64547"
+code_hash = "git:dde5bae6a8f8cc64fd8f95e6c1eaed45d2e64547"
 health_evidence_path = "/root/Gho_ingest/logs/ace_ev_v2/UNFROZEN_SCOPE/capture_health_v1.json"
 
 [rug_reality_capture.cost_profile]
