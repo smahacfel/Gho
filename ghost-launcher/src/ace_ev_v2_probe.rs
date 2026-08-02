@@ -88,6 +88,7 @@ pub struct AceEvV2FreezeScaleArgs {
 #[serde(rename_all = "snake_case")]
 pub enum AceEvV2CaptureKind {
     YieldQualification,
+    #[serde(rename = "prospective_1000")]
     Prospective1000,
 }
 
@@ -3740,6 +3741,21 @@ mod tests {
                 exit_reason: "entry_failed_no_landing_state".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn prospective_capture_kind_serializes_to_the_frozen_model_contract_name() {
+        assert_eq!(
+            serde_json::to_string(&AceEvV2CaptureKind::Prospective1000)
+                .expect("serialize prospective capture kind"),
+            "\"prospective_1000\""
+        );
+        assert_eq!(
+            "prospective_1000"
+                .parse::<AceEvV2CaptureKind>()
+                .expect("parse frozen prospective capture kind"),
+            AceEvV2CaptureKind::Prospective1000
+        );
     }
 
     #[test]
