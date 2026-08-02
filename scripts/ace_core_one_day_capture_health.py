@@ -31,7 +31,7 @@ REQUIRED_COUNTERS = (
     "pr1_runtime_primary_coverage_gap_total",
     "ace_capture_segment_invalid_total",
 )
-CAPTURE_KINDS = ("smoke", "soak", "day1")
+CAPTURE_KINDS = ("smoke", "soak", "yield_qualification", "day1")
 SMOKE_MIN_DURATION_MS = 120_000
 # A qualifying transport/canonical-admission smoke needs enough steady-state
 # time to expose a recurring ingress issue.  The operational contract is ten
@@ -42,6 +42,11 @@ SOAK_MIN_DURATION_MS = 1_800_000
 # prevents an arbitrary long capture from being relabelled as a successful
 # soak instead of receiving the stricter Day-1 evidence contract.
 SOAK_MAX_DURATION_MS = 2_100_000
+# ACE-EV V2 qualification is a bounded 60-minute enrollment period followed
+# by a 150-second terminal-outcome drain.  The small upper allowance is only
+# for supervisor/snapshot scheduling and must remain mirrored by Rust.
+YIELD_QUALIFICATION_MIN_DURATION_MS = 3_750_000
+YIELD_QUALIFICATION_MAX_DURATION_MS = 3_900_000
 DAY1_MIN_DURATION_MS = 86_400_000
 EVENT_WRITER_WRITE_FAILURE_MARKER = "EventEmitter: failed to write event"
 EVENT_WRITER_LOCK_FAILURE_MARKER = "EventEmitter: writer mutex poisoned; event was not persisted"
@@ -339,6 +344,13 @@ def validate_capture_duration(capture_kind: str, start_ms: int, end_ms: int) -> 
         if not SOAK_MIN_DURATION_MS <= duration_ms <= SOAK_MAX_DURATION_MS:
             failures.append(
                 f"soak duration {duration_ms}ms is outside [{SOAK_MIN_DURATION_MS}, {SOAK_MAX_DURATION_MS}]"
+            )
+    elif capture_kind == "yield_qualification":
+        if not YIELD_QUALIFICATION_MIN_DURATION_MS <= duration_ms <= YIELD_QUALIFICATION_MAX_DURATION_MS:
+            failures.append(
+                "yield qualification duration "
+                f"{duration_ms}ms is outside "
+                f"[{YIELD_QUALIFICATION_MIN_DURATION_MS}, {YIELD_QUALIFICATION_MAX_DURATION_MS}]"
             )
     elif capture_kind == "day1":
         if duration_ms < DAY1_MIN_DURATION_MS:

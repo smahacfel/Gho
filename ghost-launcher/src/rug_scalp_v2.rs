@@ -677,7 +677,11 @@ impl RugScalpPumpQuoteContractV1 {
         self.entry_transaction_costs.net_wallet_debit()
     }
 
-    fn exit_transaction_cost_lamports(&self) -> Result<u64, PumpQuoteError> {
+    /// Frozen cost of one full-position sell attempt.  Offline ACE-EV V2
+    /// records this cost when a typed take-profit instruction misses its
+    /// landed min-output protection; it never treats a failed attempt as a
+    /// free hypothetical retry.
+    pub(crate) fn exit_transaction_cost_lamports(&self) -> Result<u64, PumpQuoteError> {
         self.exit_transaction_costs.net_wallet_debit()
     }
 
@@ -712,19 +716,53 @@ impl RugScalpPumpQuoteContractV1 {
         best.ok_or(PumpQuoteError::ZeroAmount)
     }
 
+    /// Re-quote the *already selected* BuyV2 base amount on a landed state.
+    /// The original instruction cap remains immutable: callers cannot resize
+    /// upward after observing a more favourable landed reserve state.
+    pub(crate) fn quote_buy_v2_exact_base_out_with_max_sol_cost(
+        &self,
+        slot: u64,
+        reserves: PumpReserveState,
+        token_amount: u64,
+        max_sol_cost: u64,
+    ) -> Result<PumpQuoteV1, PumpQuoteError> {
+        self.registry.quote_exact_base_out(
+            RUG_SCALP_ENTRY_ROUTE,
+            slot,
+            reserves,
+            token_amount,
+            max_sol_cost,
+        )
+    }
+
     fn quote_exit_value(
         &self,
         slot: u64,
         reserves: PumpReserveState,
         token_amount: u64,
+        min_program_credit: u64,
     ) -> Result<PumpQuoteV1, PumpQuoteError> {
         self.registry.quote_exact_base_in_sell(
             RUG_SCALP_EXIT_ROUTE,
             slot,
             reserves,
             token_amount,
-            0,
+            min_program_credit,
         )
+    }
+
+    /// Typed full-position sell quote with an explicit instruction min-output
+    /// floor.  It exposes the program-level credit separately from transaction
+    /// costs so an offline state machine can account for failed take-profit
+    /// attempts without pretending a min-output rejection filled.
+    pub(crate) fn quote_full_position_exit_with_min_program_credit(
+        &self,
+        slot: u64,
+        reserves: PumpReserveState,
+        token_amount: u64,
+        min_program_credit: u64,
+    ) -> Result<PumpQuoteV1, PumpQuoteError> {
+        self.quote_exit_value(slot, reserves, token_amount, min_program_credit)
     }
 
     pub(crate) fn executable_exit_value_lamports(
@@ -733,7 +771,7 @@ impl RugScalpPumpQuoteContractV1 {
         reserves: PumpReserveState,
         token_amount: u64,
     ) -> Result<(PumpQuoteV1, u64), PumpQuoteError> {
-        let quote = self.quote_exit_value(slot, reserves, token_amount)?;
+        let quote = self.quote_exit_value(slot, reserves, token_amount, 0)?;
         let net = quote
             .program_settlement
             .wallet_debit_or_credit

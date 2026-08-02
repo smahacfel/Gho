@@ -32,9 +32,9 @@ pub const ACE_CORE_CALIBRATION_SCHEMA: &str = "ace_core_one_day_calibration_v1";
 pub const ACE_CORE_SUMMARY_SCHEMA: &str = "ace_core_one_day_summary_v1";
 pub const ACE_CORE_BASELINE_SHA: &str = "43057b296663129ca9b4f572e793474830a5452c";
 
-const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
-const POOL_TRANSACTION_PAYLOAD_SCHEMA_V1: &str = "v1";
-const POOL_RESERVE_STATE_PAYLOAD_SCHEMA_V1: &str = "v1";
+pub(crate) const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+pub(crate) const POOL_TRANSACTION_PAYLOAD_SCHEMA_V1: &str = "v1";
+pub(crate) const POOL_RESERVE_STATE_PAYLOAD_SCHEMA_V1: &str = "v1";
 const ACE_CORE_SIGNAL_DETECTOR: &str = "ace_core_one_day_probe_v3_observe_only";
 const ACE_CAPTURE_HEALTH_SCHEMA_VERSION: u16 = 3;
 const CALIBRATION_BIRTHS: usize = 250;
@@ -59,6 +59,11 @@ const SMOKE_MAX_DURATION_MS: u64 = 600_000;
 // thirty minutes while remaining bounded enough to retain its diagnostic role.
 const SOAK_MIN_DURATION_MS: u64 = 1_800_000;
 const SOAK_MAX_DURATION_MS: u64 = 2_100_000;
+// Must stay identical to scripts/ace_core_one_day_capture_health.py.  ACE-EV
+// V2 yield qualification is one hour of enrollment plus a 150 s drain, with a
+// narrow scheduling allowance for supervisor-owned snapshots.
+const YIELD_QUALIFICATION_MIN_DURATION_MS: u64 = 3_750_000;
+const YIELD_QUALIFICATION_MAX_DURATION_MS: u64 = 3_900_000;
 const DAY1_MIN_DURATION_MS: u64 = 86_400_000;
 const INGRESS_CUTOFF_CONTRACT: &str =
     "event_ts_ms<=birth_ts_ms+11111 && arrival_ts_ms<=detected_wall_ts_ms+11111";
@@ -235,49 +240,49 @@ pub struct AceCoreOneDaySummaryV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct BirthKey {
-    base_mint: String,
-    bonding_curve: String,
+pub(crate) struct BirthKey {
+    pub(crate) base_mint: String,
+    pub(crate) bonding_curve: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BirthKeyResolution {
+pub(crate) enum BirthKeyResolution {
     OutsideUniverse,
     Eligible(BirthKey),
     Malformed(&'static str),
 }
 
 #[derive(Debug, Clone)]
-struct TapeBirth {
-    candidate_id: String,
-    payload: NewPoolDetectedPayload,
-    event_id: String,
-    file_ordinal: usize,
-    line_number: usize,
+pub(crate) struct TapeBirth {
+    pub(crate) candidate_id: String,
+    pub(crate) payload: NewPoolDetectedPayload,
+    pub(crate) event_id: String,
+    pub(crate) file_ordinal: usize,
+    pub(crate) line_number: usize,
 }
 
 #[derive(Debug, Clone)]
-struct TapeTrade {
-    payload: PoolTransactionPayload,
-    event_id: String,
-    file_ordinal: usize,
-    line_number: usize,
+pub(crate) struct TapeTrade {
+    pub(crate) payload: PoolTransactionPayload,
+    pub(crate) event_id: String,
+    pub(crate) file_ordinal: usize,
+    pub(crate) line_number: usize,
 }
 
 #[derive(Debug, Clone)]
-struct TapeReserveState {
-    payload: PoolReserveStatePayload,
-    event_id: String,
-    file_ordinal: usize,
-    line_number: usize,
+pub(crate) struct TapeReserveState {
+    pub(crate) payload: PoolReserveStatePayload,
+    pub(crate) event_id: String,
+    pub(crate) file_ordinal: usize,
+    pub(crate) line_number: usize,
 }
 
 #[derive(Debug, Default)]
-struct Tape {
-    births: Vec<TapeBirth>,
-    trades: Vec<TapeTrade>,
-    reserve_states: Vec<TapeReserveState>,
-    invalid_reasons: BTreeSet<String>,
+pub(crate) struct Tape {
+    pub(crate) births: Vec<TapeBirth>,
+    pub(crate) trades: Vec<TapeTrade>,
+    pub(crate) reserve_states: Vec<TapeReserveState>,
+    pub(crate) invalid_reasons: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -304,24 +309,24 @@ impl FeatureValues {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct CanonicalTradeOrder {
-    slot: u64,
-    tx_index: u32,
-    outer_instruction_index: u32,
-    inner_group_index: u32,
-    event_ordinal: u32,
+pub(crate) struct CanonicalTradeOrder {
+    pub(crate) slot: u64,
+    pub(crate) tx_index: u32,
+    pub(crate) outer_instruction_index: u32,
+    pub(crate) inner_group_index: u32,
+    pub(crate) event_ordinal: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ReserveObservation {
-    event_ts_ms: u64,
-    arrival_ts_ms: u64,
-    slot: u64,
-    order: Option<CanonicalTradeOrder>,
-    write_version: Option<u64>,
-    sequence_number: u64,
-    ordinal: (usize, usize),
-    reserves: PumpReserveState,
+pub(crate) struct ReserveObservation {
+    pub(crate) event_ts_ms: u64,
+    pub(crate) arrival_ts_ms: u64,
+    pub(crate) slot: u64,
+    pub(crate) order: Option<CanonicalTradeOrder>,
+    pub(crate) write_version: Option<u64>,
+    pub(crate) sequence_number: u64,
+    pub(crate) ordinal: (usize, usize),
+    pub(crate) reserves: PumpReserveState,
 }
 
 /// The ACE decision is only allowed to consume evidence that was both true on
@@ -330,9 +335,9 @@ struct ReserveObservation {
 /// deliberately remain separate: receive time is not canonical chain order,
 /// but it is authoritative for decision-time availability.
 #[derive(Debug, Clone, Copy)]
-struct DecisionCutoffs {
-    event_cutoff_ts_ms: u64,
-    ingress_cutoff_ts_ms: u64,
+pub(crate) struct DecisionCutoffs {
+    pub(crate) event_cutoff_ts_ms: u64,
+    pub(crate) ingress_cutoff_ts_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -608,7 +613,7 @@ fn create_output_dir_new(path: &Path) -> Result<()> {
     })
 }
 
-fn load_manifest(path: &Path) -> Result<RugRealityCaptureRunManifestV1> {
+pub(crate) fn load_manifest(path: &Path) -> Result<RugRealityCaptureRunManifestV1> {
     let bytes = fs::read(path)
         .with_context(|| format!("read ACE probe capture manifest {}", path.display()))?;
     serde_json::from_slice(&bytes)
@@ -690,7 +695,7 @@ fn is_full_git_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn validate_capture_health_evidence(
+pub(crate) fn validate_capture_health_evidence(
     manifest_path: &Path,
     manifest: &RugRealityCaptureRunManifestV1,
 ) -> BTreeSet<String> {
@@ -749,6 +754,12 @@ fn validate_capture_health_evidence(
         "soak" => {
             reasons.insert("capture_health_soak_duration_out_of_range".to_string());
         }
+        "yield_qualification"
+            if (YIELD_QUALIFICATION_MIN_DURATION_MS..=YIELD_QUALIFICATION_MAX_DURATION_MS)
+                .contains(&receipt.duration_ms) => {}
+        "yield_qualification" => {
+            reasons.insert("capture_health_yield_qualification_duration_out_of_range".to_string());
+        }
         "day1" if receipt.duration_ms >= DAY1_MIN_DURATION_MS => {}
         "day1" => {
             reasons.insert("capture_health_day1_duration_too_short".to_string());
@@ -787,7 +798,7 @@ fn validate_capture_health_evidence(
     reasons
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -827,7 +838,7 @@ fn collect_event_files_inner(root: &Path, files: &mut Vec<PathBuf>) -> Result<()
     Ok(())
 }
 
-fn read_tape(events_dir: &Path, expected_run_id: &str) -> Result<Tape> {
+pub(crate) fn read_tape(events_dir: &Path, expected_run_id: &str) -> Result<Tape> {
     let files = collect_event_files(events_dir)?;
     let mut tape = Tape::default();
     for (file_ordinal, path) in files.iter().enumerate() {
@@ -902,15 +913,15 @@ fn read_tape(events_dir: &Path, expected_run_id: &str) -> Result<Tape> {
     Ok(tape)
 }
 
-fn is_wsol_quote(quote_mint: &str) -> bool {
+pub(crate) fn is_wsol_quote(quote_mint: &str) -> bool {
     matches!(quote_mint.trim(), "SOL" | "WSOL" | WSOL_MINT)
 }
 
-fn non_empty(value: &str) -> Option<&str> {
+pub(crate) fn non_empty(value: &str) -> Option<&str> {
     (!value.trim().is_empty()).then_some(value.trim())
 }
 
-fn birth_key(payload: &NewPoolDetectedPayload) -> BirthKeyResolution {
+pub(crate) fn birth_key(payload: &NewPoolDetectedPayload) -> BirthKeyResolution {
     if !payload.is_birth_event
         || payload.amm_program.trim() != RUG_SCALP_PUMP_PROGRAM.to_string()
         || !is_wsol_quote(&payload.quote_mint)
@@ -968,7 +979,7 @@ fn compare_birth(left: &TapeBirth, right: &TapeBirth) -> std::cmp::Ordering {
         ))
 }
 
-fn canonical_births(tape: &mut Tape) -> (Vec<TapeBirth>, usize) {
+pub(crate) fn canonical_births(tape: &mut Tape) -> (Vec<TapeBirth>, usize) {
     let mut by_key = BTreeMap::<BirthKey, Vec<TapeBirth>>::new();
     let mut malformed = Vec::new();
     for birth in tape.births.iter().cloned() {
@@ -999,7 +1010,7 @@ fn canonical_births(tape: &mut Tape) -> (Vec<TapeBirth>, usize) {
     (canonical, duplicate_count)
 }
 
-fn canonical_slot(payload: &PoolTransactionPayload) -> Option<u64> {
+pub(crate) fn canonical_slot(payload: &PoolTransactionPayload) -> Option<u64> {
     match (payload.event_slot, payload.slot) {
         (Some(event_slot), Some(slot)) if event_slot != slot => None,
         (Some(slot), _) | (_, Some(slot)) => Some(slot),
@@ -1007,7 +1018,9 @@ fn canonical_slot(payload: &PoolTransactionPayload) -> Option<u64> {
     }
 }
 
-fn canonical_trade_order(payload: &PoolTransactionPayload) -> Option<CanonicalTradeOrder> {
+pub(crate) fn canonical_trade_order(
+    payload: &PoolTransactionPayload,
+) -> Option<CanonicalTradeOrder> {
     Some(CanonicalTradeOrder {
         slot: canonical_slot(payload)?,
         tx_index: payload.tx_index?,
@@ -1112,7 +1125,7 @@ fn compare_trade(left: &TapeTrade, right: &TapeTrade) -> std::cmp::Ordering {
         ))
 }
 
-fn strict_trade_index(
+pub(crate) fn strict_trade_index(
     tape: &mut Tape,
     canonical_birth_keys: &BTreeSet<BirthKey>,
 ) -> BTreeMap<BirthKey, Vec<TapeTrade>> {
@@ -1246,7 +1259,7 @@ fn compare_reserve_state(left: &TapeReserveState, right: &TapeReserveState) -> s
 /// trade-attached reserves, these rows are allowed to exist without an exact
 /// transaction tuple; identity, timestamps, order and payload consistency are
 /// nevertheless fail-closed.
-fn strict_reserve_state_index(
+pub(crate) fn strict_reserve_state_index(
     tape: &mut Tape,
     canonical_birth_keys: &BTreeSet<BirthKey>,
 ) -> BTreeMap<BirthKey, Vec<TapeReserveState>> {
@@ -1317,11 +1330,11 @@ fn compare_candidate_work(left: &CandidateWork, right: &CandidateWork) -> std::c
         ))
 }
 
-fn is_successful_buy(payload: &PoolTransactionPayload) -> bool {
+pub(crate) fn is_successful_buy(payload: &PoolTransactionPayload) -> bool {
     payload.success && payload.is_buy && payload.side.eq_ignore_ascii_case("buy")
 }
 
-fn decision_cutoffs(birth: &TapeBirth) -> std::result::Result<DecisionCutoffs, String> {
+pub(crate) fn decision_cutoffs(birth: &TapeBirth) -> std::result::Result<DecisionCutoffs, String> {
     let birth_ingress_ts_ms = birth
         .payload
         .detected_wall_ts_ms
@@ -1333,7 +1346,7 @@ fn decision_cutoffs(birth: &TapeBirth) -> std::result::Result<DecisionCutoffs, S
     })
 }
 
-fn is_available_at_decision(
+pub(crate) fn is_available_at_decision(
     event_ts_ms: u64,
     arrival_ts_ms: u64,
     cutoffs: DecisionCutoffs,
@@ -1343,7 +1356,7 @@ fn is_available_at_decision(
         && arrival_ts_ms <= cutoffs.ingress_cutoff_ts_ms
 }
 
-fn feature_buy_debit(
+pub(crate) fn feature_buy_debit(
     trade: &TapeTrade,
     birth_ts_ms: u64,
     cutoffs: DecisionCutoffs,
@@ -1859,7 +1872,7 @@ fn reserve_observation(trade: &TapeTrade) -> Option<ReserveObservation> {
     })
 }
 
-fn direct_reserve_observation(state: &TapeReserveState) -> Option<ReserveObservation> {
+pub(crate) fn direct_reserve_observation(state: &TapeReserveState) -> Option<ReserveObservation> {
     let payload = &state.payload;
     if payload.complete || payload.event_ts_ms == 0 || payload.arrival_ts_ms == 0 {
         return None;
@@ -1881,7 +1894,7 @@ fn direct_reserve_observation(state: &TapeReserveState) -> Option<ReserveObserva
     })
 }
 
-fn compare_reserve_observation(
+pub(crate) fn compare_reserve_observation(
     left: &ReserveObservation,
     right: &ReserveObservation,
 ) -> std::cmp::Ordering {
@@ -1903,7 +1916,7 @@ fn compare_reserve_observation(
         ))
 }
 
-fn absolute_virtual_price_impact_bps(
+pub(crate) fn absolute_virtual_price_impact_bps(
     before: PumpReserveState,
     after: PumpReserveState,
 ) -> Option<u32> {
@@ -1927,7 +1940,7 @@ fn absolute_virtual_price_impact_bps(
     u32::try_from(rounded_up).ok()
 }
 
-fn reserve_state_after_quote(
+pub(crate) fn reserve_state_after_quote(
     before: PumpReserveState,
     quote: &ghost_core::PumpQuoteV1,
 ) -> PumpReserveState {
@@ -3280,6 +3293,44 @@ mod tests {
         assert!(
             validate_capture_health_evidence(&manifest_path, &capture_manifest)
                 .contains("capture_health_soak_duration_out_of_range")
+        );
+    }
+
+    #[test]
+    fn capture_health_evidence_accepts_only_the_bounded_v2_yield_qualification_window() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = temp.path().join("manifest.json");
+        let mut capture_manifest = manifest("v2-yield-qualification-run");
+        capture_manifest.health_evidence_path = temp
+            .path()
+            .join("health.json")
+            .to_string_lossy()
+            .into_owned();
+        write_json_new(&manifest_path, &capture_manifest).expect("manifest");
+        write_valid_health_evidence(&manifest_path, &capture_manifest);
+
+        let health_path = Path::new(&capture_manifest.health_evidence_path);
+        let mut receipt: RugRealityCaptureHealthEvidenceV1 =
+            serde_json::from_slice(&fs::read(health_path).expect("health bytes"))
+                .expect("health receipt");
+        receipt.capture_kind = "yield_qualification".to_string();
+        receipt.duration_ms = YIELD_QUALIFICATION_MIN_DURATION_MS;
+        receipt.end_captured_at_unix_ms = receipt
+            .start_captured_at_unix_ms
+            .saturating_add(receipt.duration_ms);
+        fs::remove_file(health_path).expect("remove fixture health receipt");
+        write_json_new(health_path, &receipt).expect("rewrite health receipt");
+        assert!(validate_capture_health_evidence(&manifest_path, &capture_manifest).is_empty());
+
+        receipt.duration_ms = YIELD_QUALIFICATION_MIN_DURATION_MS - 1;
+        receipt.end_captured_at_unix_ms = receipt
+            .start_captured_at_unix_ms
+            .saturating_add(receipt.duration_ms);
+        fs::remove_file(health_path).expect("remove lower-bound health receipt");
+        write_json_new(health_path, &receipt).expect("rewrite lower-bound receipt");
+        assert!(
+            validate_capture_health_evidence(&manifest_path, &capture_manifest)
+                .contains("capture_health_yield_qualification_duration_out_of_range")
         );
     }
 

@@ -419,7 +419,11 @@ def supervise(args: argparse.Namespace) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--capture-kind", choices=("smoke", "soak", "day1"), required=True)
+    parser.add_argument(
+        "--capture-kind",
+        choices=("smoke", "soak", "yield_qualification", "day1"),
+        required=True,
+    )
     parser.add_argument("--metrics-url", required=True)
     parser.add_argument("--status-output", required=True)
     parser.add_argument(

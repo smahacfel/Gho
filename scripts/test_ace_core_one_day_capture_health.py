@@ -161,6 +161,23 @@ class AceCaptureHealthTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("outside", failures[0])
 
+    def test_ace_ev_v2_yield_qualification_has_its_own_enrollment_plus_drain_contract(self) -> None:
+        duration_ms, failures = health.validate_capture_duration(
+            "yield_qualification",
+            1_000,
+            1_000 + health.YIELD_QUALIFICATION_MIN_DURATION_MS,
+        )
+        self.assertEqual(duration_ms, health.YIELD_QUALIFICATION_MIN_DURATION_MS)
+        self.assertEqual(failures, [])
+
+        _, failures = health.validate_capture_duration(
+            "yield_qualification",
+            1_000,
+            1_000 + health.YIELD_QUALIFICATION_MIN_DURATION_MS - 1,
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("yield qualification duration", failures[0])
+
     def test_invalid_snapshot_does_not_write_health_receipt(self) -> None:
         _, manifest, receipt, events, start, end = self.make_fixture()
         snapshot = json.loads(end.read_bytes())
