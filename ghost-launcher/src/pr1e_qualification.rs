@@ -11,7 +11,7 @@ use crate::{
         CandidateTerminalTransitionV1,
     },
     components::seer::{
-        authorize_pool_runtime_disposition, handle_local_coverage_gap_notice,
+        handle_local_coverage_gap_notice, ingest_pool_detection_observation,
         ingest_pump_observation, process_pool_detected_event_for_session_gate,
         process_trade_event_for_session_gate, replay_buffered_canonical_trades,
         CanonicalRuntimeAdmissionV1, CanonicalRuntimeNoApplyReasonV1,
@@ -1299,21 +1299,41 @@ async fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV
         "account_update_duplicate" => execute_account_state_scenario(false),
         "account_same_version_different_hash" => execute_account_state_scenario(true),
         "continuity_only_restored_position" => {
-            let permit = primary_permit(
+            let continuity_pool = Pubkey::new_unique();
+            let continuity_candidate = PumpCandidateIdentityV1 {
+                pool_amm_id: continuity_pool,
+                mint,
+            };
+            let admission = ingest_pool_detection_observation(
+                true,
+                PoolDetectionRuntimeDispositionV1::ContinuityOnly,
                 &ledger,
                 &registry,
-                primary_trade_observation(signature, pool, mint, 0, Some(1)),
+                Some(primary_trade_observation(
+                    signature,
+                    continuity_pool,
+                    mint,
+                    0,
+                    Some(1),
+                )),
                 1,
+                true,
+                None,
             );
-            assert_eq!(
-                authorize_pool_runtime_disposition(
-                    PoolDetectionRuntimeDispositionV1::ContinuityOnly,
-                    &permit,
-                    registry.as_ref(),
-                ),
-                Err(CanonicalRuntimeNoApplyReasonV1::ContinuityOnly)
+            assert!(matches!(
+                admission,
+                CanonicalRuntimeAdmissionV1::NoApply(
+                    CanonicalRuntimeNoApplyReasonV1::ContinuityOnly
+                )
+            ));
+            assert!(
+                registry.snapshot(continuity_candidate).is_err(),
+                "continuity-only observation must not create a candidate record"
             );
-            assert!(registry.evaluation_guard(candidate).is_err());
+            assert!(
+                registry.candidate_admission_open(),
+                "continuity-only observation must not close global admission"
+            );
             CrossLayerExecutionV1::default()
         }
         "queue_saturation" => {
@@ -1370,23 +1390,30 @@ async fn execute_cross_layer_scenario(scenario_id: &str) -> CrossLayerExecutionV
                 &notice,
             ));
             assert!(
-                !registry.candidate_admission_open(),
-                "primary IPC coverage gap closes candidate admission before MFS/Gatekeeper/submit"
+                registry.candidate_admission_open(),
+                "primary IPC coverage gap invalidates the capture segment but preserves later canonical ingest"
             );
-            assert!(registry.evaluation_guard(candidate).is_err());
-            assert!(matches!(
-                ingest_pump_observation(
-                    &ledger,
-                    &registry,
-                    Some(primary_trade_observation(signature, pool, mint, 0, Some(1))),
-                    1,
-                    true,
-                    None,
-                ),
-                CanonicalRuntimeAdmissionV1::Blocked(
-                    CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
-                )
-            ));
+            let late_pool = Pubkey::new_unique();
+            let late_mint = Pubkey::new_unique();
+            let late_signature = Signature::new_unique();
+            let late_admission = ingest_pump_observation(
+                &ledger,
+                &registry,
+                Some(primary_initialize_pool_observation(
+                    late_signature,
+                    late_pool,
+                    late_mint,
+                    0,
+                    Some(1),
+                )),
+                2,
+                true,
+                None,
+            );
+            assert!(
+                matches!(late_admission, CanonicalRuntimeAdmissionV1::Apply(_)),
+                "a prior segment gap must not globally block subsequent primary ingest"
+            );
             CrossLayerExecutionV1 {
                 difference_class: Some("PRIMARY_BOUNDARY_INCOMPLETE"),
                 ..CrossLayerExecutionV1::default()

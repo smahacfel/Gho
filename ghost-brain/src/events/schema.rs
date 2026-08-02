@@ -122,6 +122,10 @@ pub enum EventKind {
     // ── Ingest / selector evidence ──────────────────────────────────────
     NewPoolDetected(NewPoolDetectedPayload),
     PoolTransaction(PoolTransactionPayload),
+    /// Canonical Pump bonding-curve state retained independently of a
+    /// transaction join. This is durable observe-only evidence for offline
+    /// capture analysis; it is not a Gatekeeper input or execution event.
+    PoolReserveState(PoolReserveStatePayload),
 
     // ── Mandatory (12) ──────────────────────────────────────────────────
     Candidate(CandidatePayload),
@@ -150,6 +154,7 @@ impl EventKind {
         match self {
             Self::NewPoolDetected(_) => "NewPoolDetected",
             Self::PoolTransaction(_) => "PoolTransaction",
+            Self::PoolReserveState(_) => "PoolReserveState",
             Self::Candidate(_) => "Candidate",
             Self::EntrySubmitted(_) => "EntrySubmitted",
             Self::EntryFilled(_) => "EntryFilled",
@@ -174,6 +179,7 @@ impl EventKind {
         matches!(
             self,
             Self::PoolTransaction(_)
+                | Self::PoolReserveState(_)
                 | Self::ExecutionStressChanged(_)
                 | Self::OracleStale(_)
                 | Self::LedgerDegraded(_)
@@ -390,6 +396,75 @@ pub struct PoolTransactionPayload {
 
 const fn default_pool_transaction_success() -> bool {
     true
+}
+
+/// Durable canonical Pump bonding-curve state for the ACE full-universe tape.
+///
+/// A state update is deliberately a first-class evidence row instead of an
+/// optional field on `PoolTransactionPayload`: Yellowstone account writes and
+/// parsed trades have different cardinality and ordering. Requiring an exact
+/// trade join as the only persistence path loses legal entry/outcome states.
+/// This payload carries raw primary-account evidence only and must never be
+/// reconstructed from a price, an RPC read, or mutable runtime state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolReserveStatePayload {
+    /// Payload schema marker for strict offline decoding.
+    pub schema_version: String,
+    /// Canonical physical Pump bonding-curve account.
+    pub bonding_curve: String,
+    /// Alias retained for strict pool identity joins.
+    pub pool_amm_id: String,
+    /// Alias retained for historical pool normalizers.
+    pub pool_id: String,
+    /// Canonical base mint resolved at canonical candidate admission.
+    pub base_mint: String,
+    /// Alias retained for strict mint identity joins.
+    pub mint_id: String,
+    /// Raw canonical account-write slot.
+    pub slot: u64,
+    /// Alias retained for normalizers that use `event_slot`.
+    pub event_slot: u64,
+    /// Primary account event time in epoch milliseconds.
+    pub event_ts_ms: u64,
+    /// Alias retained for historical normalizers.
+    pub timestamp_ms: u64,
+    /// Local ingress time in epoch milliseconds.
+    pub arrival_ts_ms: u64,
+    /// Yellowstone write version when supplied by the provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_version: Option<u64>,
+    /// Producer-side monotonically increasing source sequence number.
+    pub sequence_number: u64,
+    /// Transaction signature associated with the account write when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txn_signature: Option<String>,
+    /// Canonical virtual SOL reserves in raw lamports.
+    pub virtual_sol_reserves: u64,
+    /// Canonical virtual token reserves in raw base-token units.
+    pub virtual_token_reserves: u64,
+    /// Canonical real SOL reserves in raw lamports.
+    pub real_sol_reserves: u64,
+    /// Canonical real token reserves in raw base-token units.
+    pub real_token_reserves: u64,
+    /// Pump curve completion state. `false` is a legal pre-migration state.
+    pub complete: bool,
+    /// Stable raw provider identifier when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Configured provider role serialized as a stable diagnostic label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_role: Option<String>,
+    /// Hash of raw account bytes, when supplied by canonical ingest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_data_hash: Option<String>,
+    /// Physical account whose bytes were hashed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_account_pubkey: Option<String>,
+    /// Owner/program of the raw account evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_account_owner_or_program: Option<String>,
+    /// Fixed source label; no RPC or price-derived substitute is permitted.
+    pub source: String,
 }
 
 /// 1. CandidateEvent — Gatekeeper PASS

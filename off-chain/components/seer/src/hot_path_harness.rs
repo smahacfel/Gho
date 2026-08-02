@@ -24,8 +24,9 @@ use crate::{
     config::SeerConfig,
     grpc_connection::{
         pump_event_to_geyser_event, route_update_for_hot_path_harness,
-        route_update_for_hot_path_harness_with_capture, DualLaneChannel, PumpEvent, TransportStats,
-        GRPC_GLOBAL_STREAM_SOURCE_LABEL, PUMP_FUN_PROGRAM_ID, PUMP_SWAP_PROGRAM_ID,
+        route_update_for_hot_path_harness_with_capture,
+        route_update_for_hot_path_harness_with_registry_scope, DualLaneChannel, PumpEvent,
+        TransportStats, GRPC_GLOBAL_STREAM_SOURCE_LABEL, PUMP_FUN_PROGRAM_ID, PUMP_SWAP_PROGRAM_ID,
     },
     hot_path_metrics,
     ipc::{create_ipc_channel, BackpressurePolicy, EventPriority, IpcChannelConfig, IpcError},
@@ -387,6 +388,26 @@ fn canonical_parity_digest<T: Serialize>(snapshots: &[T]) -> String {
 
 fn minimal_account_event() -> GeyserEvent {
     route_update_for_hot_path_harness(account_update(77)).expect("account fixture must normalize")
+}
+
+#[test]
+fn ace_capture_account_scope_keeps_registered_curve_and_excludes_untracked_global_write() {
+    let untracked =
+        route_update_for_hot_path_harness_with_registry_scope(account_update(77), true, None, true)
+            .expect("untracked account route");
+    assert!(
+        untracked.is_none(),
+        "unrelated global AccountUpdate must not enter the bounded capture ingress"
+    );
+
+    let tracked = route_update_for_hot_path_harness_with_registry_scope(
+        account_update(77),
+        true,
+        Some(deterministic_pubkey(77).to_string()),
+        true,
+    )
+    .expect("tracked account route");
+    assert!(matches!(tracked, Some(GeyserEvent::AccountUpdate { .. })));
 }
 
 fn queued_account_event(account_event: &GeyserEvent, slot: u64) -> PumpEvent {

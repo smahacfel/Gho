@@ -37,6 +37,7 @@
 
 pub mod ace_core_one_day_probe;
 pub mod candidate_integrity;
+pub mod capture_resilience;
 pub mod components;
 pub mod config;
 pub mod events;

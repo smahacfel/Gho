@@ -21,6 +21,7 @@ use crate::candidate_integrity::{
     CandidateIntegritySubmitGuardV1, CandidateSubmitTransitionV1, CandidateTerminalTransitionV1,
     CanonicalMutationApplyReceiptV1, Pr1AuthorityEpochV1,
 };
+use crate::capture_resilience::{record_capture_failure, CaptureFailureClassV1};
 use crate::components::post_buy_runtime::{
     DirectPostBuyHandoff, DirectPostBuyHandoffAck, DirectPostBuySender,
 };
@@ -32,6 +33,7 @@ use crate::config::{
 use crate::events::{
     AccountUpdateEvent, CanonicalRuntimePermitV1, DetectedPool, EventBusSender,
     ExecutionJoinMetadata, FundingTransferObserved, GhostEvent, PoolTransaction, PostBuySource,
+    SeerOracleDrainBarrierV1,
 };
 use crate::rug_scalp_v2::{
     append_rug_scalp_jsonl_record, RugScalpCanonicalStateV2, RugScalpEntryAttemptRecordV2,
@@ -60,7 +62,9 @@ use ghost_brain::oracle::{ApprovedPools, SnapshotEngine};
 // [INTEGRATION] Import additional engines
 use ghost_brain::chaos::amm_math::AmmPool;
 use ghost_brain::chaos::engine::{ChaosEngine, MarketScenario, SimulationConfig};
-use ghost_brain::events::{EventEmitter, EventWriterConfig, PoolTransactionPayload};
+use ghost_brain::events::{
+    EventEmitter, EventWriterConfig, PoolReserveStatePayload, PoolTransactionPayload,
+};
 use ghost_brain::oracle::engine::PanicProvider;
 use ghost_brain::oracle::snapshot_engine::{
     derive_price_canonical, DataSource, InitPoolEvent, PoolLifecycle, TxEvent,
@@ -2351,6 +2355,7 @@ const fn candidate_integrity_error_label(error: &CandidateIntegrityErrorV1) -> &
         CandidateIntegrityErrorV1::CandidateMissing => "candidate_missing",
         CandidateIntegrityErrorV1::TerminalRetirementPending => "terminal_retirement_pending",
         CandidateIntegrityErrorV1::CandidateAliasConflict => "candidate_alias_conflict",
+        CandidateIntegrityErrorV1::TerminalCleanupInProgress => "terminal_cleanup_in_progress",
         CandidateIntegrityErrorV1::NotReady(_) => "not_ready",
         CandidateIntegrityErrorV1::GenerationChanged { .. } => "generation_changed",
         CandidateIntegrityErrorV1::AdmissionClosed { .. } => "admission_closed",
@@ -2993,18 +2998,42 @@ impl OracleRuntime {
                     1u64,
                     "error" => candidate_integrity_error_label(&error)
                 );
-                error!(
+                let class = self.apply_candidate_integrity_failure_policy(
+                    &error,
+                    "candidate_integrity_signal_failed",
+                );
+                warn!(
                     pool = %candidate.pool_amm_id,
                     base_mint = %candidate.mint,
+                    failure_class = class.as_str(),
                     error = %error,
-                    "CandidateIntegrity registry unavailable; new-candidate admission is fail-closed"
+                    "CandidateIntegrity signal could not be recorded"
                 );
-                self.candidate_integrity_registry
-                    .close_candidate_admission_with_integrity_invalidation(
-                        "candidate_integrity_signal_failed",
-                    );
             }
         }
+    }
+
+    /// The Oracle owns no implicit global-close path: every registry error is
+    /// classified first.  Candidate-local and segment-invalid failures retain
+    /// evidence while allowing independent candidates and the launcher to
+    /// continue. Only internal registry corruption may close admission.
+    fn apply_candidate_integrity_failure_policy(
+        &self,
+        error: &CandidateIntegrityErrorV1,
+        reason: &'static str,
+    ) -> CaptureFailureClassV1 {
+        let class = error.capture_failure_class();
+        record_capture_failure(class, reason);
+        if class.closes_candidate_admission() {
+            error!(
+                reason,
+                error = %error,
+                "CandidateIntegrity global runtime fatal closes new-candidate admission"
+            );
+            self.candidate_integrity_registry
+                .close_candidate_admission_with_integrity_invalidation(reason);
+        }
+        class
     }
 
     fn active_buy_route_manifest_cache_enabled(&self) -> bool {
@@ -4866,8 +4895,52 @@ impl OracleRuntime {
         // 1. Get identity before removing (needed for ShadowLedger cleanup and key translation)
         let identity = self.pool_identities.get_by_pool(&pool_amm_id);
         let base_mint_key = identity.map(|entry| entry.base_mint);
+        let terminal_candidate = identity.map(|entry| PumpCandidateIdentityV1 {
+            pool_amm_id,
+            mint: *entry.base_mint,
+        });
         let had_detected_pool = self.lookup_detected_pool(&pool_amm_id).is_some();
         let had_runtime_state = self.runtime_pool_state(&pool_amm_id).is_some();
+
+        // Linearize terminal cleanup before any runtime identity can be
+        // removed. The registry marks the per-candidate barrier, waits for a
+        // pre-existing ledger→receipt ingest lease to finish, and only then
+        // snapshots outstanding receipts. This is the single owner of the
+        // terminal reclaim sequence: result_rx must not reclaim separately.
+        if let Some(candidate) = terminal_candidate {
+            match self
+                .candidate_integrity_registry
+                .fail_pending_canonical_applies_for_candidate(candidate)
+            {
+                Ok(reclaimed_receipt_count) => {
+                    if reclaimed_receipt_count > 0 {
+                        info!(
+                            pool = %pool_amm_id,
+                            base_mint = %candidate.mint,
+                            reclaimed_receipt_count,
+                            unresolved_receipt_count = 0_u64,
+                            "CANDIDATE_INTEGRITY_TERMINAL_RECEIPTS_RECLAIMED_BEFORE_POOL_CLEANUP"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        pool = %pool_amm_id,
+                        base_mint = %candidate.mint,
+                        error = %error,
+                        "CandidateIntegrity terminal cleanup barrier could not reclaim receipts"
+                    );
+                    let _ = self.apply_candidate_integrity_failure_policy(
+                        &error,
+                        "terminal_candidate_receipt_reclaim_failed",
+                    );
+                    // Do not remove identity/session state after an unresolved
+                    // receipt failure.  Retaining the candidate is bounded and
+                    // is safer than silently deleting its proof obligation.
+                    return false;
+                }
+            }
+        }
 
         let removed_session = self.session_manager.remove_session(&pool_amm_id);
 
@@ -4939,18 +5012,18 @@ impl OracleRuntime {
                 Err(error) => {
                     // Runtime cleanup must never silently discard a candidate
                     // whose bounded ledger/registry retention cannot be
-                    // proved. Existing position continuity continues, but
-                    // new admission fails closed.
+                    // proved. Keep the failure typed; only a classified
+                    // registry corruption closes unrelated admission.
                     warn!(
                         pool = %pool_amm_id,
                         base_mint = %identity.base_mint,
                         error = %error,
-                        "CandidateIntegrity terminal retirement unavailable; closing new candidate admission"
+                        "CandidateIntegrity terminal retirement unavailable"
                     );
-                    self.candidate_integrity_registry
-                        .close_candidate_admission_with_integrity_invalidation(
-                            "terminal_candidate_retirement_failed",
-                        );
+                    let _ = self.apply_candidate_integrity_failure_policy(
+                        &error,
+                        "terminal_candidate_retirement_failed",
+                    );
                 }
             }
             retain_terminal_account_evidence(
@@ -4962,6 +5035,23 @@ impl OracleRuntime {
         self.pool_identities.remove_by_pool(&pool_amm_id);
         self.runtime_pool_states.write().remove(&pool_amm_id);
         self.detected_pools.write().remove(&pool_amm_id);
+        if let Some(candidate) = terminal_candidate {
+            if let Err(error) = self
+                .candidate_integrity_registry
+                .finish_terminal_candidate_cleanup(candidate)
+            {
+                warn!(
+                    pool = %pool_amm_id,
+                    base_mint = %candidate.mint,
+                    error = %error,
+                    "CandidateIntegrity terminal cleanup barrier could not finish after identity removal"
+                );
+                let _ = self.apply_candidate_integrity_failure_policy(
+                    &error,
+                    "terminal_candidate_cleanup_finish_failed",
+                );
+            }
+        }
 
         info!(pool = %pool_amm_id, reason, "🗑️  USUNIETO BASE MINT Z RUNTIME");
         true
@@ -17622,6 +17712,98 @@ fn emit_pool_transaction_evidence_event(
     );
 }
 
+/// Persist a primary AccountUpdate as a first-class reserve-state row for the
+/// ACE full-universe tape. This is intentionally independent from the exact
+/// trade-state join above: a legal outcome state need not share a trade's
+/// `(slot, virtual reserves)` tuple. No latest-state cache, RPC read, price,
+/// or transaction amount is used here.
+fn emit_full_universe_reserve_state_evidence_event(
+    emitter: &EventEmitter,
+    event: &AccountUpdateEvent,
+) {
+    let Some(real_sol_reserves) = event.real_sol_reserves else {
+        ::metrics::counter!(
+            "ace_full_universe_reserve_state_not_emitted_total",
+            1u64,
+            "reason" => "real_sol_reserves_missing"
+        );
+        return;
+    };
+    let Some(real_token_reserves) = event.real_token_reserves else {
+        ::metrics::counter!(
+            "ace_full_universe_reserve_state_not_emitted_total",
+            1u64,
+            "reason" => "real_token_reserves_missing"
+        );
+        return;
+    };
+    let complete = match event.complete {
+        0 => false,
+        1 => true,
+        _ => {
+            ::metrics::counter!(
+                "ace_full_universe_reserve_state_not_emitted_total",
+                1u64,
+                "reason" => "complete_flag_invalid"
+            );
+            return;
+        }
+    };
+    let Some(event_ts_ms) = event.event_time.effective_event_ts_ms() else {
+        ::metrics::counter!(
+            "ace_full_universe_reserve_state_not_emitted_total",
+            1u64,
+            "reason" => "event_timestamp_missing"
+        );
+        return;
+    };
+    let Some(arrival_ts_ms) = event.event_time.ingress_wall_ts_ms else {
+        ::metrics::counter!(
+            "ace_full_universe_reserve_state_not_emitted_total",
+            1u64,
+            "reason" => "arrival_timestamp_missing"
+        );
+        return;
+    };
+
+    let base_mint = event.base_mint.to_string();
+    let bonding_curve = event.bonding_curve.to_string();
+    let candidate_id = format!("{base_mint}:{bonding_curve}:{event_ts_ms}");
+    emitter.emit_pool_reserve_state(
+        &candidate_id,
+        PoolReserveStatePayload {
+            schema_version: "v1".to_string(),
+            bonding_curve: bonding_curve.clone(),
+            pool_amm_id: bonding_curve.clone(),
+            pool_id: bonding_curve,
+            base_mint: base_mint.clone(),
+            mint_id: base_mint,
+            slot: event.slot,
+            event_slot: event.slot,
+            event_ts_ms,
+            timestamp_ms: event_ts_ms,
+            arrival_ts_ms,
+            write_version: event.write_version,
+            sequence_number: event.sequence_number,
+            txn_signature: event.txn_signature.map(|signature| signature.to_string()),
+            virtual_sol_reserves: event.sol_reserves,
+            virtual_token_reserves: event.token_reserves,
+            real_sol_reserves,
+            real_token_reserves,
+            complete,
+            provider_id: event.provider_id.clone(),
+            provider_role: event.provider_role.map(|role| format!("{role:?}")),
+            account_data_hash: event.account_data_hash.clone(),
+            source_account_pubkey: event.source_account_pubkey.map(|key| key.to_string()),
+            source_account_owner_or_program: event
+                .source_account_owner_or_program
+                .map(|key| key.to_string()),
+            source: "primary_canonical_account_update".to_string(),
+        },
+    );
+    ::metrics::counter!("ace_full_universe_reserve_state_emitted_total", 1u64);
+}
+
 fn pool_transaction_evidence_payload(
     tx: &PoolTransaction,
     pool_id: Pubkey,
@@ -17809,6 +17991,35 @@ struct PoolObservationResult {
     retain_runtime_pool: bool,
 }
 
+/// Result of reconciling a downstream-applied mutation with the PR1E receipt
+/// fence.  An alias conflict is intentionally candidate-local: the receipt is
+/// failed and reclaimed by `CandidateIntegrityRegistry`, but no new Ready
+/// release is issued and unrelated candidate admission remains available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanonicalApplyAcknowledgementV1 {
+    Released { ready_count: usize },
+    CandidateAliasConflict,
+}
+
+fn acknowledge_canonical_apply(
+    candidate_integrity_registry: &CandidateIntegrityRegistry,
+    receipt: &CanonicalMutationApplyReceiptV1,
+) -> Result<CanonicalApplyAcknowledgementV1, CandidateIntegrityErrorV1> {
+    match candidate_integrity_registry.mark_canonical_apply_succeeded(receipt) {
+        Ok(released) => Ok(CanonicalApplyAcknowledgementV1::Released {
+            ready_count: released.len(),
+        }),
+        // `mark_canonical_apply_succeeded` has already made this receipt
+        // terminal and reclaimed its proof fence before returning this error.
+        // The applied mutation must not receive a Ready release, but this is
+        // evidence-local rather than a registry-wide availability failure.
+        Err(CandidateIntegrityErrorV1::CandidateAliasConflict) => {
+            Ok(CanonicalApplyAcknowledgementV1::CandidateAliasConflict)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn complete_canonical_apply(
     ctx: &PoolObservationContext,
     receipt: Option<&CanonicalMutationApplyReceiptV1>,
@@ -17816,6 +18027,10 @@ fn complete_canonical_apply(
     let Some(receipt) = receipt else {
         increment_counter!("pr1_runtime_bypass_attempt_total");
         crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
+        record_capture_failure(
+            CaptureFailureClassV1::GlobalRuntimeFatal,
+            "downstream_apply_receipt_missing",
+        );
         warn!("PR1 runtime bypass attempt: canonical downstream apply receipt missing");
         ctx.oracle_runtime
             .candidate_integrity_registry
@@ -17824,20 +18039,25 @@ fn complete_canonical_apply(
             );
         return;
     };
-    match ctx
-        .oracle_runtime
-        .candidate_integrity_registry
-        .mark_canonical_apply_succeeded(receipt)
-    {
-        Ok(released) => {
+    match acknowledge_canonical_apply(&ctx.oracle_runtime.candidate_integrity_registry, receipt) {
+        Ok(CanonicalApplyAcknowledgementV1::Released { ready_count }) => {
             ::metrics::counter!(
                 "pr1_runtime_canonical_apply_succeeded_total",
                 1u64,
                 "authority_epoch_id" => receipt.authority_epoch_id.to_string()
             );
-            if !released.is_empty() {
-                ::metrics::counter!("candidate_integrity_ready_total", released.len() as u64);
+            if ready_count > 0 {
+                ::metrics::counter!("candidate_integrity_ready_total", ready_count as u64);
             }
+        }
+        Ok(CanonicalApplyAcknowledgementV1::CandidateAliasConflict) => {
+            warn!(
+                signature = %receipt.signature,
+                locator = ?receipt.locator,
+                candidate_pool = %receipt.candidate.pool_amm_id,
+                candidate_mint = %receipt.candidate.mint,
+                "canonical mutation applied downstream, but candidate-local alias conflict reclaimed its receipt; no Ready release issued and global admission remains open"
+            );
         }
         Err(error) => {
             warn!(
@@ -17848,9 +18068,9 @@ fn complete_canonical_apply(
                 error = %error,
                 "canonical mutation applied downstream, but CandidateIntegrity proof could not be completed"
             );
-            ctx.oracle_runtime
-                .candidate_integrity_registry
-                .close_candidate_admission_with_integrity_invalidation("ready_publication_failed");
+            let _ = ctx
+                .oracle_runtime
+                .apply_candidate_integrity_failure_policy(&error, "ready_publication_failed");
         }
     }
 }
@@ -17879,6 +18099,9 @@ fn resolve_canonical_apply(
             error = %error,
             "canonical mutation was not newly applied; CandidateIntegrity apply proof invalidated"
         );
+        let _ = ctx
+            .oracle_runtime
+            .apply_candidate_integrity_failure_policy(&error, "canonical_apply_reclaim_failed");
     }
     ::metrics::counter!(
         "pr1_runtime_canonical_apply_failed_total",
@@ -17899,6 +18122,13 @@ fn send_pool_observation_result(
             warn!(
                 pool = %pool_id,
                 "per-pool result delivery failed because the Oracle result receiver is closed"
+            );
+            // The result receiver is core Oracle ownership, not an optional
+            // lane. Preserve the existing fatal invariant explicitly rather
+            // than letting a generic send error choose the policy.
+            record_capture_failure(
+                CaptureFailureClassV1::GlobalRuntimeFatal,
+                "pool_result_delivery_failed",
             );
             ctx.oracle_runtime
                 .candidate_integrity_registry
@@ -17999,6 +18229,18 @@ fn should_cleanup_pool_after_observation(result: &PoolObservationResult) -> bool
 
 fn should_mark_pool_as_strategically_rejected(result: &PoolObservationResult) -> bool {
     result.disposition == PoolObservationDispositionV1::StrategicTerminal
+}
+
+/// Acknowledges the shutdown-only watermark emitted after Seer has drained
+/// its IPC bridge. Reaching this arm proves that all preceding Seer Event-Bus
+/// emissions have been observed by the Oracle loop before launcher shutdown
+/// may signal Oracle to stop.
+fn acknowledge_seer_oracle_drain_barrier(barrier: &SeerOracleDrainBarrierV1) {
+    barrier.acknowledge_oracle_processed();
+    info!(
+        barrier_sequence = barrier.sequence(),
+        "ORACLE_EVENT_BUS_DRAIN_COMPLETE"
+    );
 }
 
 fn ensure_pool_observation_session(
@@ -19149,10 +19391,11 @@ async fn hydrate_buy_path_metadata(
                 match maybe_msg {
                     Some(PoolObservationMsg::NewPool(pd, receipt, _)) => {
                         if let Some(receipt) = receipt.as_ref() {
-                            let _ = ctx
-                                .oracle_runtime
-                                .candidate_integrity_registry
-                                .fail_canonical_apply(receipt);
+                            resolve_canonical_apply(
+                                ctx,
+                                Some(receipt),
+                                CanonicalMutationApplyOutcomeV1::Failed,
+                            );
                         }
                         info!(
                             "POOL_TASK_BUY_METADATA_HYDRATED pool={} source=late_new_pool mint={}",
@@ -19171,10 +19414,11 @@ async fn hydrate_buy_path_metadata(
                     }
                     Some(PoolObservationMsg::Transaction(_, receipt)) => {
                         if let Some(receipt) = receipt.as_ref() {
-                            let _ = ctx
-                                .oracle_runtime
-                                .candidate_integrity_registry
-                                .fail_canonical_apply(receipt);
+                            resolve_canonical_apply(
+                                ctx,
+                                Some(receipt),
+                                CanonicalMutationApplyOutcomeV1::Failed,
+                            );
                         }
                         continue;
                     }
@@ -19248,10 +19492,11 @@ fn apply_trigger_readiness_message(
                     tx.as_ref(),
                 );
             if let Some(receipt) = receipt.as_ref() {
-                let _ = ctx
-                    .oracle_runtime
-                    .candidate_integrity_registry
-                    .fail_canonical_apply(receipt);
+                resolve_canonical_apply(
+                    ctx,
+                    Some(receipt),
+                    CanonicalMutationApplyOutcomeV1::Failed,
+                );
             }
         }
         PoolObservationMsg::NewPool(pd, receipt, _) => {
@@ -19265,10 +19510,11 @@ fn apply_trigger_readiness_message(
                 pool_data,
             );
             if let Some(receipt) = receipt.as_ref() {
-                let _ = ctx
-                    .oracle_runtime
-                    .candidate_integrity_registry
-                    .fail_canonical_apply(receipt);
+                resolve_canonical_apply(
+                    ctx,
+                    Some(receipt),
+                    CanonicalMutationApplyOutcomeV1::Failed,
+                );
             }
         }
     }
@@ -19530,10 +19776,11 @@ fn apply_active_buy_route_evidence_message(
                     enriched.as_ref(),
                 );
             if let Some(receipt) = receipt.as_ref() {
-                let _ = ctx
-                    .oracle_runtime
-                    .candidate_integrity_registry
-                    .fail_canonical_apply(receipt);
+                resolve_canonical_apply(
+                    ctx,
+                    Some(receipt),
+                    CanonicalMutationApplyOutcomeV1::Failed,
+                );
             }
             Some(enriched)
         }
@@ -19548,10 +19795,11 @@ fn apply_active_buy_route_evidence_message(
                 pool_data,
             );
             if let Some(receipt) = receipt.as_ref() {
-                let _ = ctx
-                    .oracle_runtime
-                    .candidate_integrity_registry
-                    .fail_canonical_apply(receipt);
+                resolve_canonical_apply(
+                    ctx,
+                    Some(receipt),
+                    CanonicalMutationApplyOutcomeV1::Failed,
+                );
             }
             None
         }
@@ -25363,10 +25611,11 @@ async fn pool_observation_task(
     ) else {
         warn!(pool = %pool_id, "ZADANIE OBSERWACJI PULI ZOSTAŁO PRZERWANE PRZED OTWARCIEM SESJI");
         if let Some(receipt) = initial_apply_receipt.as_ref() {
-            let _ = ctx
-                .oracle_runtime
-                .candidate_integrity_registry
-                .fail_canonical_apply(receipt);
+            resolve_canonical_apply(
+                ctx.as_ref(),
+                Some(receipt),
+                CanonicalMutationApplyOutcomeV1::Failed,
+            );
         }
         let _ = send_pool_observation_result(
             ctx.as_ref(),
@@ -27380,12 +27629,19 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                 error = %error,
                                 "CandidateIntegrity shadow apply fence invalidation failed after Event Bus lag"
                             );
-                        }
-                        oracle_runtime
-                            .candidate_integrity_registry
-                            .close_candidate_admission_with_integrity_invalidation(
-                                "event_bus_lagged",
+                            let _ = oracle_runtime.apply_candidate_integrity_failure_policy(
+                                &error,
+                                "event_bus_lagged_receipt_invalidation_failed",
                             );
+                        }
+                        record_capture_failure(
+                            CaptureFailureClassV1::CaptureSegmentInvalid,
+                            "event_bus_lagged",
+                        );
+                        error!(
+                            skipped_events = n,
+                            "Oracle Event Bus lag invalidated the affected capture segment; global admission remains open"
+                        );
                         ctx.session_manager.mark_metric_contract_stream_gap();
                         if let Some(tape) = rug_scalp_validation_tape.as_mut() {
                             let records = tape.mark_stream_gap("oracle_broadcast_lag");
@@ -27405,6 +27661,10 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                 };
 
                 match event {
+                    GhostEvent::SeerOracleDrainBarrier(barrier) => {
+                        acknowledge_seer_oracle_drain_barrier(barrier.as_ref());
+                    }
+
                     GhostEvent::CandidateIntegrity(signal) => {
                         oracle_runtime.record_candidate_integrity_signal((*signal).clone());
                     }
@@ -27432,9 +27692,11 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                 mint = %pool_data.base_mint,
                                 "NewPoolDetected canonical runtime permit mismatch was rejected"
                             );
-                            let _ = oracle_runtime
-                                .candidate_integrity_registry
-                                .fail_canonical_apply(&runtime_permit.apply_receipt);
+                            resolve_canonical_apply(
+                                ctx.as_ref(),
+                                Some(&runtime_permit.apply_receipt),
+                                CanonicalMutationApplyOutcomeV1::Failed,
+                            );
                             continue;
                         }
                         let apply_receipt = Some(runtime_permit.apply_receipt.clone());
@@ -27473,9 +27735,11 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                         || rejected_pools.contains(&base_mint)
                                     {
                                         if let Some(receipt) = apply_receipt.as_ref() {
-                                            let _ = oracle_runtime
-                                                .candidate_integrity_registry
-                                                .fail_canonical_apply(receipt);
+                                            resolve_canonical_apply(
+                                                ctx.as_ref(),
+                                                Some(receipt),
+                                                CanonicalMutationApplyOutcomeV1::Failed,
+                                            );
                                         }
                                         warn!(
                                             "TX_IGNORED_ZOMBIE pool={} mint={} reason=REJECTED_POOL_REGISTRATION",
@@ -27578,9 +27842,11 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         }
                         if !canonical_apply_admitted {
                             if let Some(receipt) = apply_receipt.as_ref() {
-                                let _ = oracle_runtime
-                                    .candidate_integrity_registry
-                                    .fail_canonical_apply(receipt);
+                                resolve_canonical_apply(
+                                    ctx.as_ref(),
+                                    Some(receipt),
+                                    CanonicalMutationApplyOutcomeV1::Failed,
+                                );
                             }
                         }
                     }
@@ -27608,9 +27874,11 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                 signature = %tx.signature,
                                 "PoolTransaction canonical runtime permit mismatch was rejected"
                             );
-                            let _ = oracle_runtime
-                                .candidate_integrity_registry
-                                .fail_canonical_apply(&runtime_permit.apply_receipt);
+                            resolve_canonical_apply(
+                                ctx.as_ref(),
+                                Some(&runtime_permit.apply_receipt),
+                                CanonicalMutationApplyOutcomeV1::Failed,
+                            );
                             continue;
                         }
                         let apply_receipt = Some(runtime_permit.apply_receipt.clone());
@@ -27949,9 +28217,11 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                     .is_some_and(|m| rejected_pools.contains(m))
                             {
                                 if let Some(receipt) = apply_receipt.as_ref() {
-                                    let _ = oracle_runtime
-                                        .candidate_integrity_registry
-                                        .fail_canonical_apply(receipt);
+                                    resolve_canonical_apply(
+                                        ctx.as_ref(),
+                                        Some(receipt),
+                                        CanonicalMutationApplyOutcomeV1::Failed,
+                                    );
                                 }
                                 continue;
                             }
@@ -28041,9 +28311,11 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         }
                         if !canonical_apply_admitted {
                             if let Some(receipt) = apply_receipt.as_ref() {
-                                let _ = oracle_runtime
-                                    .candidate_integrity_registry
-                                    .fail_canonical_apply(receipt);
+                                resolve_canonical_apply(
+                                    ctx.as_ref(),
+                                    Some(receipt),
+                                    CanonicalMutationApplyOutcomeV1::Failed,
+                                );
                             }
                         }
                     }
@@ -28066,6 +28338,15 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
 
                     GhostEvent::ExecutionAccountEvidence(event) => {
                         oracle_runtime.record_execution_account_evidence(event.evidence.clone());
+                    }
+
+                    // Capture-only lane. Its producer has already limited
+                    // events to PR1E-admitted candidates; do not route these
+                    // writes into AccountStateCore or any decision component.
+                    GhostEvent::FullUniverseReserveEvidence(event) => {
+                        if let Some(emitter) = ctx.event_emitter.as_ref() {
+                            emit_full_universe_reserve_state_evidence_event(emitter, &event);
+                        }
                     }
 
                     GhostEvent::GatekeeperCommitted {
@@ -28385,9 +28666,10 @@ mod tests {
     use ghost_core::{
         CanonicalPumpOrderKeyV1, ExecutionAccountEvidenceSource, ExecutionAccountEvidenceStatus,
         GatekeeperDecision as WalGatekeeperDecision, ObservationProvenanceV1,
-        ObservationSourceFamilyV1, ObservedPumpMutationV1, PumpMutationClaimsV1,
-        PumpMutationFamilyV1, PumpObservationLedgerV1, PumpTradeSideV1, RawProviderRoleV1,
-        RawPumpMutationLocatorV1, Wal, WalRecord,
+        ObservationSourceFamilyV1, ObservedPumpMutationV1, PumpEconomicCertificationStatusV1,
+        PumpMutationClaimsV1, PumpMutationFamilyV1, PumpObservationLedgerV1, PumpTradeSideV1,
+        RawProviderRoleV1, RawPumpMutationLocatorV1, StructuralCanonicalPumpMutationV1, Wal,
+        WalRecord,
     };
     use solana_sdk::signature::Keypair;
     use solana_sdk::signer::Signer;
@@ -35513,7 +35795,7 @@ mod tests {
             provider_id: None,
             provider_role: None,
             semantic: Default::default(),
-            event_time: ghost_core::EventTimeMetadata::default(),
+            event_time: ghost_core::EventTimeMetadata::new(Some(1_000), Some(1_001), Some(1)),
             base_mint: Pubkey::new_unique(),
             bonding_curve,
             curve_finality: CurveFinality::Provisional,
@@ -35534,6 +35816,53 @@ mod tests {
             detected_at: SystemTime::now(),
             sequence_number: 1,
         }
+    }
+
+    #[test]
+    fn full_universe_reserve_state_is_durable_without_a_trade_join() {
+        let directory = tempdir().expect("temporary event directory");
+        let emitter = EventEmitter::new(
+            EventWriterConfig {
+                output_dir: directory.path().display().to_string(),
+                enable_optional_events: true,
+                ..Default::default()
+            },
+            "ace-reserve-state-test".to_string(),
+            Lane::Shadow,
+        )
+        .expect("event emitter");
+        let curve = Pubkey::new_unique();
+        let update = full_universe_account_update(
+            curve,
+            4_242,
+            30_000_000_000,
+            1_000_000_000_000,
+            400_000_000,
+            123_000_000,
+        );
+
+        // No PoolTransaction is constructed: the whole point of this lane is
+        // that a legal primary curve write must not need an exact trade tuple
+        // in order to remain available to offline entry/outcome reconstruction.
+        emit_full_universe_reserve_state_evidence_event(&emitter, &update);
+        emitter.flush().expect("flush reserve evidence");
+
+        let jsonl_path = std::fs::read_dir(directory.path())
+            .expect("read event directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .expect("event jsonl");
+        let line = std::fs::read_to_string(jsonl_path).expect("read state row");
+        let row: serde_json::Value = serde_json::from_str(line.trim()).expect("decode state row");
+        assert_eq!(row["kind"]["type"], "PoolReserveState");
+        assert_eq!(row["kind"]["payload"]["bonding_curve"], curve.to_string());
+        assert_eq!(row["kind"]["payload"]["slot"], 4_242);
+        assert_eq!(row["kind"]["payload"]["real_sol_reserves"], 400_000_000);
+        assert_eq!(row["kind"]["payload"]["complete"], false);
     }
 
     #[test]
@@ -47060,6 +47389,224 @@ mod tests {
         assert_eq!(
             integrity.audit_markers.last().map(|marker| marker.action),
             Some(CandidateIntegrityConflictActionV1::TerminalVerdictImmutableAudit)
+        );
+    }
+
+    #[test]
+    fn downstream_candidate_alias_conflict_reclaims_receipt_without_closing_global_admission() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let signature = Signature::new_unique();
+        let target = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+        };
+        let locator = RawPumpMutationLocatorV1 {
+            program_id: Pubkey::new_unique(),
+            signature,
+            outer_instruction_index: 2,
+            inner_instruction_path: vec![8],
+            semantic_event_ordinal: 29,
+        };
+        let canonical = StructuralCanonicalPumpMutationV1 {
+            mutation_family: PumpMutationFamilyV1::Trade,
+            locator: locator.clone(),
+            order: CanonicalPumpOrderKeyV1 {
+                slot: 436_250_277,
+                tx_index: 0,
+                outer_instruction_index: locator.outer_instruction_index,
+                inner_instruction_path: locator.inner_instruction_path.clone(),
+                semantic_event_ordinal: locator.semantic_event_ordinal,
+            },
+            claims: PumpMutationClaimsV1 {
+                curve: Some(target.pool_amm_id),
+                mint: Some(target.mint),
+                side: Some(PumpTradeSideV1::Buy),
+                success: Some(true),
+                token_amount_units: Some(35_411_336_443),
+                ..PumpMutationClaimsV1::default()
+            },
+            primary_raw_provenance: ObservationProvenanceV1 {
+                source_family: ObservationSourceFamilyV1::RawYellowstone,
+                source_id: "test-yellowstone".to_string(),
+                provider_id: "primary".to_string(),
+                schema_id: "yellowstone.subscribe_update_transaction.prost.v1".to_string(),
+                payload_hash_blake3: [0x7A; 32],
+                received_at_monotonic_ns: 1,
+            },
+            economics_status: PumpEconomicCertificationStatusV1::PendingAnchor,
+        };
+        let receipt = registry
+            .stage_canonical_mutation(&canonical)
+            .expect("target receipt stages before downstream apply");
+        let ready_signal = CandidateIntegritySignalV1 {
+            candidate: target,
+            outcome: CandidateIntegrityOutcomeV1::Ready,
+            signature: Some(signature),
+            locator: Some(locator),
+            conflict_fields: Vec::new(),
+            evidence_hash_blake3: [0x7A; 32],
+        };
+        registry
+            .seal_complete_transaction_inventory(signature, &[ready_signal])
+            .expect("the target fence is sealed before the concurrent alias arrives");
+
+        // Reproduce the production timing boundary: an unrelated candidate
+        // claims the same mint after the target receipt was staged and sealed,
+        // but before Oracle acknowledges the already-applied target mutation.
+        let conflicting = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: target.mint,
+        };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate: conflicting,
+                outcome: CandidateIntegrityOutcomeV1::Ready,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [0x7B; 32],
+            })
+            .expect("the conflicting alias is independently present before the ack");
+
+        assert_eq!(
+            acknowledge_canonical_apply(&registry, &receipt)
+                .expect("alias conflict is a local acknowledgement outcome"),
+            CanonicalApplyAcknowledgementV1::CandidateAliasConflict
+        );
+        assert!(
+            registry.candidate_admission_open(),
+            "one downstream candidate alias conflict must not close unrelated admission"
+        );
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("conflicted downstream receipt is terminally reclaimed"),
+            (0, 0),
+            "the local conflict may not strand a receipt or proof obligation"
+        );
+        assert!(
+            matches!(
+                registry.evaluation_guard(target),
+                Err(CandidateIntegrityErrorV1::CandidateAliasConflict)
+            ),
+            "the conflicted candidate must remain ineligible for evaluation"
+        );
+    }
+
+    #[test]
+    fn terminal_result_path_reclaims_staged_receipts_before_cleanup_and_blocks_late_apply() {
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+        let pool_id = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool_id,
+            mint: base_mint,
+        };
+        assert!(runtime.register_new_pool(
+            pool_id,
+            base_mint,
+            EnhancedCandidate {
+                pool_amm_id: pool_id,
+                base_mint,
+                bonding_curve,
+                initial_liquidity_sol: 8.0,
+                ..Default::default()
+            },
+            None,
+        ));
+
+        let signature = Signature::new_unique();
+        let locator = RawPumpMutationLocatorV1 {
+            program_id: Pubkey::new_unique(),
+            signature,
+            outer_instruction_index: 3,
+            inner_instruction_path: vec![3],
+            semantic_event_ordinal: 15,
+        };
+        let receipt = runtime
+            .candidate_integrity_registry
+            .stage_canonical_mutation(&StructuralCanonicalPumpMutationV1 {
+                mutation_family: PumpMutationFamilyV1::Trade,
+                locator: locator.clone(),
+                order: CanonicalPumpOrderKeyV1 {
+                    slot: 436_062_972,
+                    tx_index: 407,
+                    outer_instruction_index: locator.outer_instruction_index,
+                    inner_instruction_path: locator.inner_instruction_path.clone(),
+                    semantic_event_ordinal: locator.semantic_event_ordinal,
+                },
+                claims: PumpMutationClaimsV1 {
+                    curve: Some(pool_id),
+                    mint: Some(base_mint),
+                    success: Some(true),
+                    ..PumpMutationClaimsV1::default()
+                },
+                primary_raw_provenance: ObservationProvenanceV1 {
+                    source_family: ObservationSourceFamilyV1::RawYellowstone,
+                    source_id: "test".to_string(),
+                    provider_id: "primary".to_string(),
+                    schema_id: "test".to_string(),
+                    payload_hash_blake3: [67; 32],
+                    received_at_monotonic_ns: 1,
+                },
+                economics_status: PumpEconomicCertificationStatusV1::PendingAnchor,
+            })
+            .expect("stage receipt before terminal result wins the select");
+
+        assert_eq!(
+            runtime
+                .candidate_integrity_registry
+                .canonical_apply_fence_counts()
+                .expect("one unresolved receipt before terminal cleanup"),
+            (1, 0)
+        );
+
+        // `remove_pool_with_reason` is the sole terminal owner. It reclaims
+        // the receipt before removing any session or identity; result_rx must
+        // not perform a second reclaim in front of this call.
+        assert!(runtime.remove_pool_with_reason(pool_id, "test_terminal_result_cleanup"));
+        assert_eq!(
+            runtime
+                .candidate_integrity_registry
+                .canonical_apply_fence_counts()
+                .expect("terminal reclaim removes every unresolved receipt"),
+            (0, 0)
+        );
+        assert!(runtime
+            .candidate_integrity_registry
+            .candidate_admission_open());
+
+        assert!(runtime
+            .candidate_integrity_registry
+            .candidate_admission_open());
+        assert!(
+            runtime.lookup_pool_identity(&pool_id).is_none(),
+            "cleanup must not retain a pool after its receipts are terminal"
+        );
+        assert!(matches!(
+            runtime
+                .candidate_integrity_registry
+                .mark_canonical_apply_succeeded(&receipt),
+            Err(CandidateIntegrityErrorV1::CandidateMissing)
+        ));
+        assert!(matches!(
+            runtime
+                .candidate_integrity_registry
+                .evaluation_guard(candidate),
+            Err(CandidateIntegrityErrorV1::CandidateMissing)
+        ));
+        assert_eq!(
+            runtime
+                .candidate_integrity_registry
+                .canonical_apply_fence_counts()
+                .expect("late canonical apply cannot recreate a receipt or pool"),
+            (0, 0)
         );
     }
 

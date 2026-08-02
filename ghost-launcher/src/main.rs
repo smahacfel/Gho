@@ -60,7 +60,10 @@ use ghost_launcher::{
     rug_reality_capture::{
         write_rug_reality_capture_run_manifest_new, RugRealityCaptureRunManifestV1,
     },
-    rug_scalp_v2::materialize_rug_scalp_runtime_fee_authority_v1,
+    rug_scalp_v2::{
+        classify_rug_scalp_fee_authority_refresh_error,
+        materialize_rug_scalp_runtime_fee_authority_v1, RugScalpFeeAuthorityRefreshErrorClassV1,
+    },
     rug_scalp_validation_tape::{RugScalpValidationRunContextV1, RugScalpValidationTapeBusV1},
     tx_intelligence::TxIntelligenceConfig,
     wal_recovery,
@@ -71,6 +74,7 @@ use seer::{
     rpc_http_auth_applies_to_url, DEFAULT_RPC_AUTH_HEADER, LEGACY_PROVIDER_AUTH_HEADER_ENV,
     LEGACY_PROVIDER_AUTH_TOKEN_ENV, RPC_HTTP_AUTH_HEADER_ENV, RPC_HTTP_AUTH_TOKEN_ENV,
 };
+use solana_client::nonblocking::rpc_client::RpcClient as AsyncRpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Signer};
 use std::env;
@@ -98,6 +102,9 @@ const GRPC_SUBSCRIBE_TIMEOUT_SECS: u64 = 5;
 const EXIT_GRPC_SUBSCRIBE_TIMEOUT: i32 = 5;
 /// Exit code when the OracleRuntime task exits before shutdown is requested.
 const EXIT_ORACLE_RUNTIME_STOPPED: i32 = 6;
+/// Exit code when the upstream Seer task exits before shutdown is requested.
+/// Continuing would leave Oracle alive with a silently dead canonical ingest.
+const EXIT_SEER_COMPONENT_STOPPED: i32 = 7;
 const STARTUP_HYDRATION_TIMEOUT_SECS: u64 = 15;
 const STARTUP_HYDRATION_IGNORE_MINTS_ENV: &str = "GHOST_STARTUP_HYDRATION_IGNORE_MINTS";
 /// The production event path processes deep protobuf, account-state and session call chains.
@@ -107,6 +114,118 @@ const LAUNCHER_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 const COMPONENT_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const POST_BUY_RUNTIME_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 const SHADOW_V2_POST_BUY_JOIN_MARGIN: Duration = Duration::from_secs(30);
+const RUG_FEE_AUTHORITY_STARTUP_MAX_ATTEMPTS: u32 = 5;
+const RUG_FEE_AUTHORITY_REFRESH_BASE_BACKOFF: Duration = Duration::from_millis(250);
+const RUG_FEE_AUTHORITY_REFRESH_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// This is intentionally stricter than merely `execution_mode=shadow`: it is
+/// the inert full-universe ACE capture contract which must not delegate
+/// process authority to optional RUG V2 or execution components.
+fn is_ace_observe_only_capture(config: &LauncherConfig) -> bool {
+    config.rug_reality_capture.enabled
+        && config.execution.execution_mode == ExecutionMode::Shadow
+        && !config.trigger.enabled
+        && !config.rug_scalp_v2.enabled
+        && !config.p37_shadow_probe.enabled
+}
+
+/// A fee refresh has runtime authority only for an enabled RUG V2 consumer.
+/// Reality capture freezes its typed authority at startup and consumes it
+/// offline, so it must never start this optional watcher.
+fn should_start_rug_fee_authority_watch(config: &LauncherConfig) -> bool {
+    config.rug_scalp_v2.enabled
+}
+
+/// Pure transition contract for the optional RUG V2 fee-authority watcher.
+/// It intentionally contains no launcher, shutdown, or CandidateIntegrity
+/// handle, making it impossible for a refresh result to acquire those powers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RugFeeAuthorityWatchTransitionV1 {
+    Healthy {
+        recovered_failures: u32,
+    },
+    Retry {
+        error_class: RugScalpFeeAuthorityRefreshErrorClassV1,
+        consecutive_failures: u32,
+    },
+    AuthorityChanged,
+}
+
+fn advance_rug_fee_authority_watch(
+    initial_evidence_hash: &str,
+    observed: Result<&str, RugScalpFeeAuthorityRefreshErrorClassV1>,
+    consecutive_failures: &mut u32,
+) -> RugFeeAuthorityWatchTransitionV1 {
+    match observed {
+        Ok(observed_hash) if observed_hash == initial_evidence_hash => {
+            let recovered_failures = std::mem::take(consecutive_failures);
+            RugFeeAuthorityWatchTransitionV1::Healthy { recovered_failures }
+        }
+        Ok(_) => RugFeeAuthorityWatchTransitionV1::AuthorityChanged,
+        Err(error_class) => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            RugFeeAuthorityWatchTransitionV1::Retry {
+                error_class,
+                consecutive_failures: *consecutive_failures,
+            }
+        }
+    }
+}
+
+fn rug_fee_authority_retry_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(7);
+    let base_ms = RUG_FEE_AUTHORITY_REFRESH_BASE_BACKOFF
+        .as_millis()
+        .saturating_mul(1_u128 << exponent)
+        .min(RUG_FEE_AUTHORITY_REFRESH_MAX_BACKOFF.as_millis()) as u64;
+    // Process- and attempt-specific bounded jitter avoids synchronized retry
+    // bursts without introducing another runtime dependency.
+    let jitter_ms =
+        (u64::from(std::process::id()).wrapping_add(u64::from(attempt).wrapping_mul(37))) % 101;
+    Duration::from_millis(base_ms.saturating_add(jitter_ms))
+}
+
+async fn materialize_rug_fee_authority_with_bounded_retry(
+    rpc: &AsyncRpcClient,
+    entry_transaction_costs: ghost_core::TransactionCosts,
+    exit_transaction_costs: ghost_core::TransactionCosts,
+) -> Result<(
+    ghost_launcher::rug_scalp_v2::RugScalpPumpQuoteAuthorityV1,
+    ghost_launcher::rug_scalp_v2::RugScalpRuntimeFeeAuthorityManifestV1,
+)> {
+    let mut last_error = None;
+    for attempt in 1..=RUG_FEE_AUTHORITY_STARTUP_MAX_ATTEMPTS {
+        match materialize_rug_scalp_runtime_fee_authority_v1(
+            rpc,
+            entry_transaction_costs.clone(),
+            exit_transaction_costs.clone(),
+        )
+        .await
+        {
+            Ok(authority) => {
+                if attempt > 1 {
+                    info!(attempt, "RUG_SCALP_RUNTIME_FEE_AUTHORITY_STARTUP_RECOVERED");
+                }
+                return Ok(authority);
+            }
+            Err(error) => {
+                let class = classify_rug_scalp_fee_authority_refresh_error(&error);
+                warn!(
+                    attempt,
+                    max_attempts = RUG_FEE_AUTHORITY_STARTUP_MAX_ATTEMPTS,
+                    error_class = class.as_str(),
+                    error = %error,
+                    "RUG_SCALP_RUNTIME_FEE_AUTHORITY_STARTUP_RETRY"
+                );
+                last_error = Some(error);
+                if attempt < RUG_FEE_AUTHORITY_STARTUP_MAX_ATTEMPTS {
+                    tokio::time::sleep(rug_fee_authority_retry_delay(attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.expect("bounded authority retry has at least one attempt"))
+}
 
 fn load_startup_hydration_ignore_mints(config_path: &Path) -> Result<Vec<Pubkey>> {
     let Some(raw) = LauncherConfig::lookup_secret_value_for_config_path(
@@ -264,6 +383,13 @@ fn component_shutdown_join_timeout(
     component_name: &str,
     shadow_v2_burnin_config: &ShadowV2BurninConfig,
 ) -> Duration {
+    if component_name == "Seer" {
+        // Seer stops its producers, drains up to 1,024 owned serial BCV2
+        // hydration requests, drains IPC, and then waits for Oracle's Event
+        // Bus acknowledgement. The budget exceeds the hydration owner's
+        // calculated 55.5-minute maximum plus downstream-drain margin.
+        return Duration::from_secs(3_660);
+    }
     if component_name == "PostBuyRuntime" {
         if shadow_v2_burnin_config.enabled && shadow_v2_burnin_config.logging_only {
             return Duration::from_millis(
@@ -1471,6 +1597,7 @@ async fn run_launcher() -> Result<()> {
             bail!("rug_reality_capture.enabled requires p37_shadow_probe.enabled=false");
         }
     }
+    let ace_observe_only_capture = is_ace_observe_only_capture(&config);
 
     // The rejected V2 detector and the full-universe reality capture share
     // the same typed Pump fee authority.  Both materialise it from the two
@@ -1508,7 +1635,7 @@ async fn run_launcher() -> Result<()> {
             );
             }
             let runtime_fee_rpc = new_async_rpc_client(config.seer.rpc_endpoint.clone());
-            let (authority, manifest) = materialize_rug_scalp_runtime_fee_authority_v1(
+            let (authority, manifest) = materialize_rug_fee_authority_with_bounded_retry(
                 &runtime_fee_rpc,
                 entry_transaction_costs,
                 exit_transaction_costs,
@@ -1534,19 +1661,31 @@ async fn run_launcher() -> Result<()> {
         } else {
             (None, None, None)
         };
-    let rug_scalp_fee_authority_watch = runtime_fee_authority_manifest
-        .as_ref()
-        .zip(runtime_fee_authority_costs)
-        .map(
-            |(manifest, (entry_transaction_costs, exit_transaction_costs))| {
-                (
-                    config.seer.rpc_endpoint.clone(),
-                    entry_transaction_costs,
-                    exit_transaction_costs,
-                    manifest.evidence_hash.clone(),
+    // The ACE capture freezes typed authority at startup into its immutable
+    // manifest. It has no active RUG V2 reducer or execution consumer, so a
+    // later optional refresh cannot own shutdown or candidate admission.
+    let rug_scalp_fee_authority_watch = should_start_rug_fee_authority_watch(&config)
+        .then(|| {
+            runtime_fee_authority_manifest
+                .as_ref()
+                .zip(runtime_fee_authority_costs)
+                .map(
+                    |(manifest, (entry_transaction_costs, exit_transaction_costs))| {
+                        (
+                            config.seer.rpc_endpoint.clone(),
+                            entry_transaction_costs,
+                            exit_transaction_costs,
+                            manifest.evidence_hash.clone(),
+                        )
+                    },
                 )
-            },
+        })
+        .flatten();
+    if ace_observe_only_capture {
+        info!(
+            "ACE_CAPTURE_RUNTIME_FEE_AUTHORITY_WATCH_DISABLED: immutable startup authority is sufficient for observe-only offline quoting"
         );
+    }
 
     // ── CONFIG FINGERPRINT (always, single INFO line) ───────────────
     config.log_config_fingerprint();
@@ -1720,8 +1859,12 @@ async fn run_launcher() -> Result<()> {
     // Print banner
     print_banner(&config);
 
-    // Create shutdown channel
+    // The generic component channel remains for listeners that do not own
+    // ingest or canonical application. Seer and Oracle have distinct phases:
+    // upstream must drain into the still-live Oracle before Oracle stops.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let (seer_shutdown_tx, _) = broadcast::channel::<()>(1);
+    let (oracle_shutdown_tx, _) = broadcast::channel::<()>(1);
 
     // ========================================
     // EVENT BUS CREATION (Issue Criptocopenhaegen/ghost#156: Increased buffer to 10,240)
@@ -2794,9 +2937,13 @@ async fn run_launcher() -> Result<()> {
             });
     let oracle_health = Arc::clone(&health);
     let oracle_authoritative_funding_stream_rx = authoritative_funding_stream_rx;
-    let oracle_shutdown_rx = shutdown_tx.subscribe();
+    let oracle_shutdown_rx = oracle_shutdown_tx.subscribe();
     let oracle_authoritative_funding_coverage_gate_enabled =
         config.seer.enabled && matches!(config.seer.funding_lane_mode.as_str(), "full_chain");
+    // Compute this while the full config is still available.  The Oracle task
+    // below owns some non-Copy config fields, whereas this boolean is later
+    // passed to the independently started Seer producer.
+    let seer_full_universe_reality_capture_enabled = is_ace_observe_only_capture(&config);
 
     let mut oracle_handle = tokio::spawn(async move {
         info!("📡 Oracle Runtime initializing...");
@@ -2859,11 +3006,14 @@ async fn run_launcher() -> Result<()> {
 
     info!("🚀 Proceeding with event producer startup (Seer, Trigger, etc.)...");
 
-    // Start Seer component with event bus and SnapshotEngine
+    // Start Seer component with event bus and SnapshotEngine. Its handle is
+    // deliberately kept outside the generic component list because Seer owns
+    // upstream producer drain and must finish before Oracle is told to stop.
+    let mut seer_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
     if config.seer.enabled {
         info!("Starting Seer component...");
         let seer_config = config.seer.clone();
-        let shutdown_rx = shutdown_tx.subscribe();
+        let shutdown_rx = seer_shutdown_tx.subscribe();
         let seer_event_tx = event_bus_tx.clone();
         let seer_snapshot_engine = Arc::clone(&snapshot_engine);
         let oracle_runtime_for_paradox = Arc::clone(&oracle_runtime);
@@ -2872,6 +3022,9 @@ async fn run_launcher() -> Result<()> {
         let seer_health = Arc::clone(&health);
         let seer_authoritative_funding_stream_tx = authoritative_funding_stream_tx.clone();
         let seer_candidate_integrity_registry = oracle_runtime.candidate_integrity_registry();
+        // The ingress scope changes are valid only for the inert ACE capture
+        // contract, never merely because a caller enabled the broader reality
+        // capture feature in another runtime mode.
         ghost_launcher::components::seer::validate_pr1e_startup_contract(
             &seer_config,
             Some(&seer_event_tx),
@@ -2880,7 +3033,7 @@ async fn run_launcher() -> Result<()> {
         .context("PR1E Seer startup contract failed")?;
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = ghost_launcher::components::seer::run(
+            ghost_launcher::components::seer::run(
                 seer_config,
                 shutdown_rx,
                 Some(seer_event_tx),
@@ -2891,14 +3044,12 @@ async fn run_launcher() -> Result<()> {
                 Some(seer_health),
                 seer_authoritative_funding_stream_tx,
                 canonical_account_update_relay_enabled,
+                seer_full_universe_reality_capture_enabled,
                 seer_candidate_integrity_registry,
             )
             .await
-            {
-                error!("Seer component error: {}", e);
-            }
         });
-        handles.push(("Seer", handle));
+        seer_handle = Some(handle);
 
         // Spawn a task to wait for and connect the Paradox receiver
         tokio::spawn(async move {
@@ -3061,18 +3212,36 @@ async fn run_launcher() -> Result<()> {
         .unwrap_or(false);
     let watchdog_health = Arc::clone(&health);
     let watchdog_shutdown_rx = shutdown_tx.subscribe();
+    let watchdog_escalation = if ace_observe_only_capture {
+        ghost_launcher::components::watchdog::WatchdogEscalationV1::AdvisoryCapture
+    } else {
+        ghost_launcher::components::watchdog::WatchdogEscalationV1::FatalExit
+    };
     let watchdog_handle = tokio::spawn(async move {
-        ghost_launcher::components::watchdog::run_with_shutdown(
+        ghost_launcher::components::watchdog::run_with_shutdown_policy(
             watchdog_health,
             is_grpc_mode,
             Some(watchdog_shutdown_rx),
+            watchdog_escalation,
         )
         .await;
     });
     handles.push(("Watchdog", watchdog_handle));
 
-    let shadow_v2_artifact_budget_guard_enabled =
-        shadow_v2_burnin_config.enabled && shadow_v2_burnin_config.artifact_budget_enabled;
+    // A Shadow-V2 artifact budget is a separate experimental lane. It must
+    // never acquire global authority over a full-universe, observe-only ACE
+    // capture, even if an unrelated Brain TOML leaves that feature enabled.
+    let shadow_v2_artifact_budget_guard_enabled = !ace_observe_only_capture
+        && shadow_v2_burnin_config.enabled
+        && shadow_v2_burnin_config.artifact_budget_enabled;
+    if ace_observe_only_capture
+        && shadow_v2_burnin_config.enabled
+        && shadow_v2_burnin_config.artifact_budget_enabled
+    {
+        warn!(
+            "ACE_CAPTURE_SHADOW_V2_ARTIFACT_BUDGET_GUARD_DISABLED: unrelated experimental guard has no ACE shutdown authority"
+        );
+    }
     let mut shadow_v2_artifact_budget_shutdown_rx = shutdown_tx.subscribe();
     if shadow_v2_artifact_budget_guard_enabled {
         let shadow_v2_artifact_budget_shutdown_tx = shutdown_tx.clone();
@@ -3100,71 +3269,151 @@ async fn run_launcher() -> Result<()> {
         ));
     }
 
-    // The snapshot authority is immutable for a run. Polling the exact two
-    // canonical accounts is deliberately narrow: a data/owner/layout change
-    // does not hot-swap economic rules under an existing attempt. Instead it
-    // ends the capture fail-closed, so the next clean run must rematerialise a
-    // new registry and manifest before any RUG quote can be emitted.
-    let (rug_scalp_fee_authority_changed_tx, mut rug_scalp_fee_authority_changed_rx) =
-        oneshot::channel::<String>();
-    let rug_scalp_fee_authority_watch_enabled = if let Some((
-        rpc_url,
-        entry_transaction_costs,
-        exit_transaction_costs,
-        initial_evidence_hash,
-    )) = rug_scalp_fee_authority_watch
+    // RUG V2 may keep an optional watcher for its own evidence lane. It is
+    // advisory-only: transient RPC errors receive bounded backoff and a real
+    // authority change degrades that lane rather than terminating unrelated
+    // canonical ingest. ACE never starts this watcher (see above).
+    if let Some((rpc_url, entry_transaction_costs, exit_transaction_costs, initial_evidence_hash)) =
+        rug_scalp_fee_authority_watch
     {
         let mut shutdown_rx = shutdown_tx.subscribe();
         let authority_watch_handle = tokio::spawn(async move {
             let rpc = new_async_rpc_client(rpc_url);
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut consecutive_failures = 0_u32;
+            let mut last_success = std::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => break,
-                    _ = ticker.tick() => {
+                    _ = tokio::time::sleep(if consecutive_failures == 0 {
+                        Duration::from_secs(1)
+                    } else {
+                        rug_fee_authority_retry_delay(consecutive_failures)
+                    }) => {
                         let outcome = materialize_rug_scalp_runtime_fee_authority_v1(
                             &rpc,
                             entry_transaction_costs,
                             exit_transaction_costs,
                         ).await;
-                        let reason = match outcome {
-                            Ok((_, manifest)) if manifest.evidence_hash == initial_evidence_hash => continue,
-                            Ok((_, manifest)) => format!(
-                                "runtime_fee_authority_changed:old={} new={} observed_slot={}",
-                                initial_evidence_hash,
-                                manifest.evidence_hash,
-                                manifest.observed_slot,
-                            ),
-                            Err(error) => format!("runtime_fee_authority_refresh_failed:{error}"),
-                        };
-                        error!(reason = %reason, "RUG_SCALP_RUNTIME_FEE_AUTHORITY_INVALIDATED");
-                        let _ = rug_scalp_fee_authority_changed_tx.send(reason);
-                        break;
+                        match outcome {
+                            Ok((_, manifest)) => match advance_rug_fee_authority_watch(
+                                &initial_evidence_hash,
+                                Ok(&manifest.evidence_hash),
+                                &mut consecutive_failures,
+                            ) {
+                                RugFeeAuthorityWatchTransitionV1::Healthy { recovered_failures } => {
+                                if recovered_failures > 0 {
+                                    info!(
+                                        recovered_failures,
+                                        last_success_age_ms = last_success.elapsed().as_millis() as u64,
+                                        "RUG_SCALP_RUNTIME_FEE_AUTHORITY_REFRESH_RECOVERED"
+                                    );
+                                }
+                                last_success = std::time::Instant::now();
+                                continue;
+                            }
+                                RugFeeAuthorityWatchTransitionV1::AuthorityChanged => {
+                                let reason = format!(
+                                    "runtime_fee_authority_changed:old={} new={} observed_slot={}",
+                                    initial_evidence_hash,
+                                    manifest.evidence_hash,
+                                    manifest.observed_slot,
+                                );
+                                ghost_launcher::capture_resilience::record_capture_failure(
+                                    ghost_launcher::capture_resilience::CaptureFailureClassV1::OptionalLaneDegraded,
+                                    "rug_fee_authority_changed",
+                                );
+                                warn!(reason = %reason, "RUG_SCALP_RUNTIME_FEE_AUTHORITY_CHANGED_ADVISORY");
+                                break;
+                            }
+                                RugFeeAuthorityWatchTransitionV1::Retry {
+                                    error_class,
+                                    consecutive_failures: failure_count,
+                                } => {
+                                    // Keep this branch non-fatal even if a future
+                                    // refactor makes the pure transition contract
+                                    // inconsistent with the materialization result.
+                                    // The watcher is optional evidence authority,
+                                    // never launcher or PR1E admission authority.
+                                    ghost_launcher::capture_resilience::record_capture_failure(
+                                        ghost_launcher::capture_resilience::CaptureFailureClassV1::OptionalLaneDegraded,
+                                        "rug_fee_authority_watch_transition_mismatch",
+                                    );
+                                    error!(
+                                        error_class = error_class.as_str(),
+                                        consecutive_failures = failure_count,
+                                        "RUG_SCALP_RUNTIME_FEE_AUTHORITY_WATCH_TRANSITION_MISMATCH_ADVISORY"
+                                    );
+                                    break;
+                                }
+                            },
+                            Err(error) => {
+                                let class = classify_rug_scalp_fee_authority_refresh_error(&error);
+                                let transition = advance_rug_fee_authority_watch(
+                                    &initial_evidence_hash,
+                                    Err(class),
+                                    &mut consecutive_failures,
+                                );
+                                let RugFeeAuthorityWatchTransitionV1::Retry {
+                                    error_class,
+                                    consecutive_failures: failure_count,
+                                } = transition else {
+                                    ghost_launcher::capture_resilience::record_capture_failure(
+                                        ghost_launcher::capture_resilience::CaptureFailureClassV1::OptionalLaneDegraded,
+                                        "rug_fee_authority_watch_transition_mismatch",
+                                    );
+                                    error!(
+                                        transition = ?transition,
+                                        "RUG_SCALP_RUNTIME_FEE_AUTHORITY_WATCH_TRANSITION_MISMATCH_ADVISORY"
+                                    );
+                                    break;
+                                };
+                                ghost_launcher::capture_resilience::record_capture_failure(
+                                    ghost_launcher::capture_resilience::CaptureFailureClassV1::TransientExternalDependency,
+                                    "rug_fee_authority_refresh_failed",
+                                );
+                                warn!(
+                                    error_class = error_class.as_str(),
+                                    consecutive_failures = failure_count,
+                                    last_success_age_ms = last_success.elapsed().as_millis() as u64,
+                                    error = %error,
+                                    "RUG_SCALP_RUNTIME_FEE_AUTHORITY_REFRESH_DEGRADED"
+                                );
+                                continue;
+                            }
+                        }
                     }
                 }
             }
         });
         handles.push(("RugScalpRuntimeFeeAuthorityWatch", authority_watch_handle));
-        true
-    } else {
-        false
-    };
+    }
 
     // ── STARTUP GUARD: gRPC subscribe-proof within 5 s ──────────────
     if is_grpc_mode {
         let guard_health = Arc::clone(&health);
+        let ace_observe_only_capture = ace_observe_only_capture;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(GRPC_SUBSCRIBE_TIMEOUT_SECS)).await;
             let sent_ts = guard_health
                 .subscribe_sent_ts_ms
                 .load(std::sync::atomic::Ordering::Relaxed);
             if sent_ts == 0 {
-                error!(
-                    "STARTUP GUARD: gRPC subscribe was NOT sent within {} s — exiting with code {}",
-                    GRPC_SUBSCRIBE_TIMEOUT_SECS, EXIT_GRPC_SUBSCRIBE_TIMEOUT,
-                );
-                std::process::exit(EXIT_GRPC_SUBSCRIBE_TIMEOUT);
+                if ace_observe_only_capture {
+                    ghost_launcher::capture_resilience::record_capture_failure(
+                        ghost_launcher::capture_resilience::CaptureFailureClassV1::TransientExternalDependency,
+                        "grpc_subscribe_startup_timeout",
+                    );
+                    warn!(
+                        "ACE_CAPTURE_GRPC_SUBSCRIBE_STARTUP_DELAYED_ADVISORY: no subscribe proof after {} s; launcher remains alive",
+                        GRPC_SUBSCRIBE_TIMEOUT_SECS,
+                    );
+                } else {
+                    error!(
+                        "STARTUP GUARD: gRPC subscribe was NOT sent within {} s — exiting with code {}",
+                        GRPC_SUBSCRIBE_TIMEOUT_SECS, EXIT_GRPC_SUBSCRIBE_TIMEOUT,
+                    );
+                    std::process::exit(EXIT_GRPC_SUBSCRIBE_TIMEOUT);
+                }
             }
         });
     }
@@ -3188,12 +3437,6 @@ async fn run_launcher() -> Result<()> {
             error!(
                 "Shadow V2 artifact budget guard requested shutdown; stopping all components..."
             );
-        }
-        authority_change = &mut rug_scalp_fee_authority_changed_rx, if rug_scalp_fee_authority_watch_enabled => {
-            let reason = authority_change.unwrap_or_else(|_| {
-                "runtime_fee_authority_watch_terminated_without_a_result".to_string()
-            });
-            error!(reason = %reason, "RUG_SCALP_RUNTIME_FEE_AUTHORITY_CHANGE_REQUESTED_CONTROLLED_SHUTDOWN");
         }
         oracle_result = &mut oracle_handle => {
             match oracle_result {
@@ -3220,16 +3463,77 @@ async fn run_launcher() -> Result<()> {
             }
             std::process::exit(EXIT_ORACLE_RUNTIME_STOPPED);
         }
+        seer_result = async {
+            match seer_handle.as_mut() {
+                Some(handle) => Some(handle.await),
+                None => None,
+            }
+        }, if seer_handle.is_some() => {
+            match seer_result.expect("guarded by seer_handle.is_some()") {
+                Ok(Ok(())) => {
+                    error!(
+                        "Seer component stopped before shutdown signal; exiting with code {} to avoid silent ingest stall",
+                        EXIT_SEER_COMPONENT_STOPPED
+                    );
+                }
+                Ok(Err(err)) => {
+                    error!(
+                        error = %err,
+                        "Seer component failed before shutdown signal; exiting with code {} to avoid silent ingest stall",
+                        EXIT_SEER_COMPONENT_STOPPED
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        "Seer component task failed before shutdown signal; exiting with code {} to avoid silent ingest stall",
+                        EXIT_SEER_COMPONENT_STOPPED
+                    );
+                }
+            }
+            std::process::exit(EXIT_SEER_COMPONENT_STOPPED);
+        }
     }
 
-    // Send shutdown message to TuningService
-    if let Err(e) = tuning_tx_clone.send(TuningMessage::Shutdown).await {
-        warn!("Error sending TuningService shutdown message: {}", e);
+    // Phase 1: stop all upstream Seer producers, including owned hydration,
+    // and drain their IPC work into the still-running Oracle consumer.
+    let mut component_shutdown_failures = 0usize;
+    if let Some(mut handle) = seer_handle {
+        info!("Waiting for Seer upstream drain before stopping Oracle Runtime...");
+        let join_timeout = component_shutdown_join_timeout("Seer", &shadow_v2_burnin_config);
+        if let Err(error) = seer_shutdown_tx.send(()) {
+            component_shutdown_failures += 1;
+            error!(error = %error, "Seer shutdown phase could not notify its receiver");
+        }
+        match tokio::time::timeout(join_timeout, &mut handle).await {
+            Ok(Ok(Ok(()))) => {
+                info!("Seer upstream drain completed before Oracle shutdown");
+            }
+            Ok(Ok(Err(error))) => {
+                component_shutdown_failures += 1;
+                error!(error = %error, "Seer component shutdown failed");
+            }
+            Ok(Err(error)) => {
+                component_shutdown_failures += 1;
+                error!(error = %error, "Seer component task join failed during shutdown");
+            }
+            Err(_) => {
+                component_shutdown_failures += 1;
+                error!(
+                    timeout_secs = join_timeout.as_secs(),
+                    "Seer component shutdown timed out; aborting task"
+                );
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
     }
 
-    // Send shutdown signal to all components
-    if let Err(e) = shutdown_tx.send(()) {
-        warn!("Error sending shutdown signal: {}", e);
+    // Phase 2: all Seer producers and the IPC receiver have either drained or
+    // reported failure; only now may Oracle stop applying downstream events.
+    if let Err(error) = oracle_shutdown_tx.send(()) {
+        component_shutdown_failures += 1;
+        error!(error = %error, "Oracle Runtime shutdown phase could not notify its receiver");
     }
 
     info!("Waiting for Oracle Runtime to shut down...");
@@ -3248,10 +3552,20 @@ async fn run_launcher() -> Result<()> {
         }
     };
 
+    component_shutdown_failures += usize::from(oracle_shutdown_failed);
+
+    // Remaining components have no authority to produce Seer IPC evidence and
+    // can shut down only after the upstream → Oracle phase has completed.
+    if let Err(e) = tuning_tx_clone.send(TuningMessage::Shutdown).await {
+        warn!("Error sending TuningService shutdown message: {}", e);
+    }
+    if let Err(e) = shutdown_tx.send(()) {
+        warn!("Error sending shutdown signal: {}", e);
+    }
+
     // Wait for all components to shut down. The timeout is a shutdown-only
     // circuit breaker: a stuck diagnostics task must not keep the launcher
     // alive indefinitely after global shutdown has been requested.
-    let mut component_shutdown_failures = usize::from(oracle_shutdown_failed);
     for (name, handle) in handles {
         info!("Waiting for {} to shut down...", name);
         let abort_handle = handle.abort_handle();
@@ -3288,7 +3602,14 @@ async fn run_launcher() -> Result<()> {
         }
     }
     info!("Ghost Launcher shutdown complete");
-    Ok(())
+    if component_shutdown_failures == 0 {
+        Ok(())
+    } else {
+        bail!(
+            "Ghost Launcher shutdown completed with {} component failure(s) or forced abort(s)",
+            component_shutdown_failures
+        );
+    }
 }
 
 /// Handle a single HTTP connection for the metrics server.
@@ -3744,6 +4065,87 @@ mod tests {
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    #[test]
+    fn ace_observe_only_capture_disables_optional_fee_authority_watch() {
+        let mut config = LauncherConfig::default();
+        config.rug_reality_capture.enabled = true;
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.enabled = false;
+        config.rug_scalp_v2.enabled = false;
+        config.p37_shadow_probe.enabled = false;
+
+        assert!(is_ace_observe_only_capture(&config));
+        assert!(!should_start_rug_fee_authority_watch(&config));
+
+        config.rug_scalp_v2.enabled = true;
+        assert!(!is_ace_observe_only_capture(&config));
+        assert!(should_start_rug_fee_authority_watch(&config));
+    }
+
+    #[test]
+    fn fee_authority_retry_backoff_is_bounded_and_increases_before_cap() {
+        let first = rug_fee_authority_retry_delay(1);
+        let later = rug_fee_authority_retry_delay(5);
+        let capped = rug_fee_authority_retry_delay(64);
+
+        assert!(later > first);
+        assert!(capped <= RUG_FEE_AUTHORITY_REFRESH_MAX_BACKOFF + Duration::from_millis(100));
+    }
+
+    #[test]
+    fn optional_fee_watch_retries_transient_failures_recovers_and_never_has_shutdown_transition() {
+        let mut failures = 0_u32;
+        let first = advance_rug_fee_authority_watch(
+            "authority-a",
+            Err(RugScalpFeeAuthorityRefreshErrorClassV1::Timeout),
+            &mut failures,
+        );
+        assert_eq!(
+            first,
+            RugFeeAuthorityWatchTransitionV1::Retry {
+                error_class: RugScalpFeeAuthorityRefreshErrorClassV1::Timeout,
+                consecutive_failures: 1,
+            }
+        );
+        let second = advance_rug_fee_authority_watch(
+            "authority-a",
+            Err(RugScalpFeeAuthorityRefreshErrorClassV1::RateLimited),
+            &mut failures,
+        );
+        assert_eq!(
+            second,
+            RugFeeAuthorityWatchTransitionV1::Retry {
+                error_class: RugScalpFeeAuthorityRefreshErrorClassV1::RateLimited,
+                consecutive_failures: 2,
+            }
+        );
+        let third = advance_rug_fee_authority_watch(
+            "authority-a",
+            Err(RugScalpFeeAuthorityRefreshErrorClassV1::HttpStatus),
+            &mut failures,
+        );
+        assert_eq!(
+            third,
+            RugFeeAuthorityWatchTransitionV1::Retry {
+                error_class: RugScalpFeeAuthorityRefreshErrorClassV1::HttpStatus,
+                consecutive_failures: 3,
+            }
+        );
+
+        assert_eq!(
+            advance_rug_fee_authority_watch("authority-a", Ok("authority-a"), &mut failures),
+            RugFeeAuthorityWatchTransitionV1::Healthy {
+                recovered_failures: 3,
+            }
+        );
+        assert_eq!(failures, 0);
+        assert_eq!(
+            advance_rug_fee_authority_watch("authority-a", Ok("authority-b"), &mut failures),
+            RugFeeAuthorityWatchTransitionV1::AuthorityChanged,
+            "an authority change only degrades the optional RUG lane; it has no shutdown variant"
+        );
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<String>,
@@ -3908,7 +4310,7 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
 
         assert_eq!(
             component_shutdown_join_timeout("Seer", &shadow_v2),
-            COMPONENT_SHUTDOWN_JOIN_TIMEOUT
+            Duration::from_secs(3_660)
         );
         assert_eq!(
             component_shutdown_join_timeout("PostBuyRuntime", &shadow_v2),

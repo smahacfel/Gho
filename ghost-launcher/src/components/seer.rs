@@ -3,13 +3,14 @@
 use crate::candidate_integrity::{
     CandidateIntegrityErrorV1, CandidateIntegrityRegistry, CanonicalMutationApplyReceiptV1,
 };
+use crate::capture_resilience::{record_capture_failure, CaptureFailureClassV1};
 use crate::config::{
     redact_endpoint_for_logs, ProgramStreamsQuotaPolicy as LauncherProgramStreamsQuotaPolicy,
     SeerCommitment, SeerComponentConfig,
 };
 use crate::events::{
     AccountUpdateEvent, CanonicalRuntimePermitV1, DetectedPool, EventBusSender,
-    FundingTransferObserved, GhostEvent,
+    FundingTransferObserved, GhostEvent, SeerOracleDrainBarrierV1,
 };
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -74,8 +75,40 @@ const SESSION_ACCOUNT_UPDATE_BUFFER_GLOBAL_CAP: usize = 4_096;
 const SESSION_POOL_REGISTRY_FALLBACK_TTL: Duration = Duration::from_secs(30 * 60);
 const SESSION_POOL_REGISTRY_FALLBACK_CAP: usize = 16_384;
 const SEER_CORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Oracle remains alive while Seer turns its local IPC drain into an
+/// Event-Bus-consumer acknowledgement. This is distinct from producer stop:
+/// a local queue drain alone does not prove Oracle has applied the final bus
+/// event.
+const SEER_ORACLE_DRAIN_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
+// BCV2 owns a serial queue of up to 1,024 accepted RPC requests. Its bounded
+// worst-case drain is roughly 55.5 minutes; this outer timeout must not abort
+// the owner before it can report a truthful drain result.
+const SEER_DISPATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3_600);
+const SEER_IPC_RECEIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+static SEER_ORACLE_DRAIN_BARRIER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SESSION_POOL_BRIDGE_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
+/// ACE V3 needs post-cutoff states through 120 seconds after an 11_111 ms
+/// decision window.  This retention is deliberately separate from the
+/// session bridge's 120 s convenience TTL: the latter is a runtime-session
+/// lifecycle bound, not an outcome-evidence contract.
+const FULL_UNIVERSE_RESERVE_EVIDENCE_RETENTION: Duration = Duration::from_secs(140);
 const NLN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
+fn validate_full_universe_reserve_evidence_retention(
+    full_universe_reality_capture_enabled: bool,
+    watched_pools_ttl_ms: u64,
+) -> Result<()> {
+    if full_universe_reality_capture_enabled
+        && watched_pools_ttl_ms < FULL_UNIVERSE_RESERVE_EVIDENCE_RETENTION.as_millis() as u64
+    {
+        return Err(anyhow::anyhow!(
+            "ACE full-universe capture requires seer.watched_pools_ttl_ms >= {} to cover the durable reserve outcome horizon; got {}",
+            FULL_UNIVERSE_RESERVE_EVIDENCE_RETENTION.as_millis(),
+            watched_pools_ttl_ms,
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 struct NlnArtifactCaptureConfig {
@@ -3676,6 +3709,67 @@ impl SessionAccountUpdateBridge {
     }
 }
 
+/// Capture-only registry for reserve-state evidence.
+///
+/// `SessionAccountUpdateBridge` is allowed to expire when a runtime session
+/// no longer needs AccountStateCore input. ACE outcome evidence cannot share
+/// that lifecycle: its legal horizon extends beyond the session TTL. This
+/// bridge is intentionally narrow: it registers only PR1E-admitted Pump
+/// candidates, forwards only exact `(base_mint, bonding_curve)` matches, and
+/// never buffers arbitrary global account updates.
+#[derive(Debug)]
+struct FullUniverseReserveEvidenceBridge {
+    by_bonding_curve: HashMap<Pubkey, (Pubkey, Instant)>,
+    retention: Duration,
+    cap: usize,
+}
+
+impl FullUniverseReserveEvidenceBridge {
+    fn new(retention: Duration, cap: usize) -> Self {
+        Self {
+            by_bonding_curve: HashMap::new(),
+            retention,
+            cap: cap.max(1),
+        }
+    }
+
+    /// Returns false rather than evicting an evidence subject. A cap breach is
+    /// therefore visible to the caller as a capture-segment integrity fault,
+    /// never a silent loss of one candidate's outcome path.
+    fn register_detected_pool(
+        &mut self,
+        candidate: &seer::types::CandidatePool,
+        now: Instant,
+    ) -> bool {
+        self.prune_expired(now);
+        if !self.by_bonding_curve.contains_key(&candidate.bonding_curve)
+            && self.by_bonding_curve.len() >= self.cap
+        {
+            return false;
+        }
+        self.by_bonding_curve
+            .insert(candidate.bonding_curve, (candidate.base_mint, now));
+        true
+    }
+
+    fn accepts(&mut self, update: &seer::ipc::DetectedAccountUpdateEvent, now: Instant) -> bool {
+        self.prune_expired(now);
+        self.by_bonding_curve
+            .get(&update.bonding_curve)
+            .is_some_and(|(base_mint, _)| *base_mint == update.base_mint)
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        self.by_bonding_curve
+            .retain(|_, (_, registered_at)| now.duration_since(*registered_at) <= self.retention);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_bonding_curve.len()
+    }
+}
+
 pub struct SessionPoolTradeBridge {
     detected_pools: HashMap<Pubkey, Instant>,
     detected_pool_order: VecDeque<Pubkey>,
@@ -4064,6 +4158,12 @@ fn session_bridge_prune_interval(ttl: Duration, detected_pool_ttl: Duration) -> 
         .max(Duration::from_millis(50))
 }
 
+fn pump_observation_ledger_finalization_interval(
+    config: PumpObservationLedgerConfigV1,
+) -> Duration {
+    Duration::from_nanos(config.correlation_window_ns)
+}
+
 fn pump_observation_classification_label(
     classification: PumpObservationClassificationV1,
 ) -> &'static str {
@@ -4204,11 +4304,17 @@ fn emit_pump_observation_decision(
                 1u64,
                 "error" => error.to_string()
             );
+            let class = apply_candidate_integrity_failure_policy(
+                candidate_integrity_registry,
+                &error,
+                "candidate_integrity_signal_failed",
+            );
             match failure_scope {
                 IntegritySignalFailureScopeV1::NonCanonicalEvidence => warn!(
                     candidate_pool = %signal.candidate.pool_amm_id,
                     candidate_mint = %signal.candidate.mint,
                     outcome = ?signal.outcome,
+                    failure_class = class.as_str(),
                     error = %error,
                     "Seer: CandidateIntegrity non-canonical evidence failed; conflicting candidate remains blocked and global admission stays open"
                 ),
@@ -4224,23 +4330,21 @@ fn emit_pump_observation_decision(
                     warn!(
                         candidate_pool = %signal.candidate.pool_amm_id,
                         candidate_mint = %signal.candidate.mint,
-                        outcome = ?signal.outcome,
+                    outcome = ?signal.outcome,
+                    failure_class = class.as_str(),
                         error = %error,
                         "Seer: CandidateIntegrity canonical evidence alias conflict; candidate remains blocked, staged receipt is reclaimed, and global admission stays open"
                     );
                 }
                 IntegritySignalFailureScopeV1::CanonicalLifecycle => {
-                    error!(
+                    warn!(
                         candidate_pool = %signal.candidate.pool_amm_id,
                         candidate_mint = %signal.candidate.mint,
                         outcome = ?signal.outcome,
+                        failure_class = class.as_str(),
                         error = %error,
-                        "Seer: CandidateIntegrity canonical-lifecycle update failed; new-candidate admission closed"
+                        "Seer: CandidateIntegrity canonical-lifecycle update failed"
                     );
-                    candidate_integrity_registry
-                        .close_candidate_admission_with_integrity_invalidation(
-                            "candidate_integrity_signal_failed",
-                        );
                 }
             }
             Err(error)
@@ -4308,37 +4412,102 @@ fn record_integrity_signal(
                 1u64,
                 "error" => error.to_string()
             );
-            error!(
+            let class = apply_candidate_integrity_failure_policy(
+                candidate_integrity_registry,
+                &error,
+                reason,
+            );
+            warn!(
                 candidate_pool = %signal.candidate.pool_amm_id,
                 candidate_mint = %signal.candidate.mint,
                 reason,
+                failure_class = class.as_str(),
                 error = %error,
-                "Seer: CandidateIntegrity signal could not be recorded; candidate admission is fail-closed"
+                "Seer: CandidateIntegrity signal could not be recorded"
+            );
+        }
+    }
+}
+
+/// Apply the single authority rule for CandidateIntegrity callsites.  No
+/// caller may infer global admission authority from a generic `Err(_)`.
+fn apply_candidate_integrity_failure_policy(
+    candidate_integrity_registry: &CandidateIntegrityRegistry,
+    error: &CandidateIntegrityErrorV1,
+    reason: &'static str,
+) -> CaptureFailureClassV1 {
+    let class = error.capture_failure_class();
+    record_capture_failure(class, reason);
+    match class {
+        CaptureFailureClassV1::GlobalRuntimeFatal => {
+            error!(
+                reason,
+                error = %error,
+                "Seer: CandidateIntegrity internal integrity failure closes new-candidate admission"
             );
             candidate_integrity_registry
                 .close_candidate_admission_with_integrity_invalidation(reason);
         }
+        CaptureFailureClassV1::CaptureSegmentInvalid => {
+            error!(
+                reason,
+                error = %error,
+                "Seer: canonical capture segment is invalid; preserving later tape with global admission open"
+            );
+        }
+        CaptureFailureClassV1::CandidateLocal => {
+            warn!(
+                reason,
+                error = %error,
+                "Seer: candidate-local integrity failure blocks only the affected mutation"
+            );
+        }
+        CaptureFailureClassV1::OptionalLaneDegraded
+        | CaptureFailureClassV1::TransientExternalDependency
+        | CaptureFailureClassV1::RecoverableTransportGap => {
+            warn!(
+                reason,
+                error = %error,
+                "Seer: non-fatal capture failure was retained as typed evidence"
+            );
+        }
     }
+    class
 }
 
 fn fail_canonical_apply(
     candidate_integrity_registry: &CandidateIntegrityRegistry,
     receipt: Option<&CanonicalMutationApplyReceiptV1>,
+    reason: &'static str,
 ) {
     if let Some(receipt) = receipt {
-        let _ = candidate_integrity_registry.fail_canonical_apply(receipt);
+        if let Err(error) = candidate_integrity_registry.fail_canonical_apply(receipt) {
+            warn!(
+                signature = %receipt.signature,
+                locator = ?receipt.locator,
+                reason,
+                error = %error,
+                "Seer: canonical apply receipt could not be reclaimed"
+            );
+            let _ = apply_candidate_integrity_failure_policy(
+                candidate_integrity_registry,
+                &error,
+                "canonical_apply_reclaim_failed",
+            );
+        }
     }
 }
 
 /// A staged canonical receipt is an ownership obligation even when the
 /// integrity evidence that should accompany it cannot be recorded.  Never
-/// issue a runtime permit after that failure: resolve the receipt if possible,
-/// then close admission.  The close is deliberately idempotent because the
-/// recording path may already have made the same fail-closed transition.
+/// issue a runtime permit after that failure: resolve the receipt if possible.
+/// Only a classified internal registry failure retains global admission-close
+/// authority; candidate-local and segment-invalid failures remain typed.
 fn fail_staged_canonical_runtime_admission(
     candidate_integrity_registry: &CandidateIntegrityRegistry,
     receipt: &CanonicalMutationApplyReceiptV1,
     reason: &'static str,
+    original_failure_class: CaptureFailureClassV1,
 ) {
     if let Err(error) = candidate_integrity_registry.fail_canonical_apply(receipt) {
         error!(
@@ -4348,8 +4517,16 @@ fn fail_staged_canonical_runtime_admission(
             reason,
             "Seer: staged canonical receipt could not be resolved after integrity admission failure"
         );
+        let _ = apply_candidate_integrity_failure_policy(
+            candidate_integrity_registry,
+            &error,
+            "staged_canonical_receipt_reclaim_failed",
+        );
     }
-    candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(reason);
+    record_capture_failure(original_failure_class, reason);
+    if original_failure_class.closes_candidate_admission() {
+        candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(reason);
+    }
 }
 
 /// An alias conflict is evidence-local even when it was discovered after the
@@ -4374,7 +4551,9 @@ fn reclaim_staged_candidate_alias_conflict(
                 error = %error,
                 "Seer: staged canonical receipt could not be reclaimed after candidate-local alias conflict; new-candidate admission closed"
             );
-            candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
+            let _ = apply_candidate_integrity_failure_policy(
+                candidate_integrity_registry,
+                &error,
                 "candidate_alias_conflict_receipt_reclaim_failed",
             );
         }
@@ -4409,22 +4588,60 @@ impl CanonicalRuntimeAdmissionV1 {
     }
 }
 
-pub(crate) fn authorize_pool_runtime_disposition(
+/// Returns the disposition that must stop a primary raw pool detection before
+/// it enters the canonical Ledger/receipt plane.
+///
+/// `ContinuityOnly` and `Suppressed` are deliberately not candidate-admission
+/// structural mutations.  In particular, a PumpSwap continuity observation
+/// can share its mint with the Pump candidate it follows.  Giving it a
+/// CandidateIntegrity permit and then reclaiming that permit would leave a
+/// terminal alias tombstone that can block the real Pump candidate's later
+/// downstream apply acknowledgement.
+fn pre_admission_pool_detection_no_apply_reason(
+    primary_raw: bool,
     disposition: PoolDetectionRuntimeDispositionV1,
-    permit: &CanonicalRuntimePermitV1,
-    candidate_integrity_registry: &CandidateIntegrityRegistry,
-) -> Result<(), CanonicalRuntimeNoApplyReasonV1> {
+) -> Option<CanonicalRuntimeNoApplyReasonV1> {
+    if !primary_raw {
+        return None;
+    }
+
     match disposition {
-        PoolDetectionRuntimeDispositionV1::CandidateAdmission => Ok(()),
+        PoolDetectionRuntimeDispositionV1::CandidateAdmission => None,
         PoolDetectionRuntimeDispositionV1::ContinuityOnly => {
-            fail_canonical_apply(candidate_integrity_registry, Some(&permit.apply_receipt));
-            Err(CanonicalRuntimeNoApplyReasonV1::ContinuityOnly)
+            Some(CanonicalRuntimeNoApplyReasonV1::ContinuityOnly)
         }
         PoolDetectionRuntimeDispositionV1::Suppressed => {
-            fail_canonical_apply(candidate_integrity_registry, Some(&permit.apply_receipt));
-            Err(CanonicalRuntimeNoApplyReasonV1::Suppressed)
+            Some(CanonicalRuntimeNoApplyReasonV1::Suppressed)
         }
     }
+}
+
+/// Applies the PoolDetected-specific admission boundary before a raw
+/// observation can mutate the canonical Ledger or CandidateIntegrity state.
+/// Non-primary observations retain the existing witness-only ingestion path;
+/// only primary non-admission dispositions bypass it.
+pub(crate) fn ingest_pool_detection_observation(
+    primary_raw: bool,
+    disposition: PoolDetectionRuntimeDispositionV1,
+    ledger: &Arc<Mutex<PumpObservationLedgerV1>>,
+    candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
+    observation: Option<ObservedPumpMutationV1>,
+    now_monotonic_ns: u64,
+    boundary_payload_aligned: bool,
+    missing_primary_signal: Option<CandidateIntegritySignalV1>,
+) -> CanonicalRuntimeAdmissionV1 {
+    if let Some(reason) = pre_admission_pool_detection_no_apply_reason(primary_raw, disposition) {
+        return CanonicalRuntimeAdmissionV1::NoApply(reason);
+    }
+
+    ingest_pump_observation(
+        ledger,
+        candidate_integrity_registry,
+        observation,
+        now_monotonic_ns,
+        boundary_payload_aligned,
+        missing_primary_signal,
+    )
 }
 
 fn no_apply_reason(
@@ -4498,6 +4715,62 @@ pub(crate) fn ingest_pump_observation(
         && observation.raw_provider_role == Some(RawProviderRoleV1::PrimaryAuthority);
     let wrapper_primary_observation_mismatch =
         !boundary_payload_aligned && missing_primary_signal.is_some();
+
+    // A terminal candidate must be blocked before it can mutate the
+    // Observation Ledger. This lease remains live only for the synchronous
+    // ledger-observe → canonical-receipt-stage section below. If terminal
+    // cleanup has already linearized, no active Ledger record is created; if
+    // ingest got here first, cleanup waits for the lease to leave a matching
+    // receipt before it retires the Ledger handoff.
+    let primary_observation_candidate =
+        if observation_is_declared_primary && boundary_payload_aligned {
+            observation.claims.curve.zip(observation.claims.mint)
+        } else {
+            None
+        };
+    let canonical_observation_lease = if let Some((pool_amm_id, mint)) =
+        primary_observation_candidate
+    {
+        let candidate = PumpCandidateIdentityV1 { pool_amm_id, mint };
+        match candidate_integrity_registry.acquire_canonical_observation_lease(candidate) {
+            Ok(lease) => Some(lease),
+            Err(CandidateIntegrityErrorV1::TerminalCleanupInProgress) => {
+                warn!(
+                    pool = %pool_amm_id,
+                    mint = %mint,
+                    signature = %observation.signature,
+                    "Seer: primary Pump observation arrived after terminal cleanup linearization; Ledger mutation suppressed"
+                );
+                return CanonicalRuntimeAdmissionV1::NoApply(
+                    CanonicalRuntimeNoApplyReasonV1::Suppressed,
+                );
+            }
+            Err(error) => {
+                error!(
+                    pool = %pool_amm_id,
+                    mint = %mint,
+                    signature = %observation.signature,
+                    error = %error,
+                    "Seer: canonical observation lease acquisition failed before Ledger mutation; canonical runtime emission blocked"
+                );
+                record_integrity_signal(
+                    candidate_integrity_registry,
+                    missing_primary_signal,
+                    "canonical_observation_lease_failed",
+                );
+                let _ = apply_candidate_integrity_failure_policy(
+                    candidate_integrity_registry,
+                    &error,
+                    "canonical_observation_lease_failed",
+                );
+                return CanonicalRuntimeAdmissionV1::Blocked(
+                    CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let result: PumpObservationLedgerResultV1 = match ledger.lock() {
         Ok(mut ledger) if !boundary_payload_aligned && observation_is_declared_primary => {
             ledger.observe_primary_boundary_mismatch(observation)
@@ -4571,8 +4844,12 @@ pub(crate) fn ingest_pump_observation(
                 && result.observation_decision.classification
                     == PumpObservationClassificationV1::EvidenceCapacityExceeded
             {
-                candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
+                record_capture_failure(
+                    CaptureFailureClassV1::CaptureSegmentInvalid,
                     "ledger_primary_coverage_incomplete",
+                );
+                error!(
+                    "Seer: Pump observation ledger capacity made one canonical capture segment invalid; global admission remains open"
                 );
             }
             return CanonicalRuntimeAdmissionV1::Blocked(signal.outcome);
@@ -4592,8 +4869,26 @@ pub(crate) fn ingest_pump_observation(
         }
         return CanonicalRuntimeAdmissionV1::NoApply(reason);
     };
-    let receipt = match candidate_integrity_registry.stage_canonical_mutation(canonical) {
+    let receipt = match canonical_observation_lease
+        .as_ref()
+        .ok_or(CandidateIntegrityErrorV1::CandidateMissing)
+        .and_then(|lease| lease.stage_canonical_mutation(canonical))
+    {
         Ok(receipt) => receipt,
+        Err(CandidateIntegrityErrorV1::TerminalCleanupInProgress) => {
+            // Oracle has linearized terminal cleanup for this exact candidate.
+            // Do not create a new permit or receipt in the cleanup window;
+            // this is a candidate-local late mutation, not a global registry
+            // failure.
+            warn!(
+                signature = %canonical.locator.signature,
+                locator = ?canonical.locator,
+                "Seer: canonical mutation arrived during terminal candidate cleanup; emission suppressed without closing global admission"
+            );
+            return CanonicalRuntimeAdmissionV1::NoApply(
+                CanonicalRuntimeNoApplyReasonV1::Suppressed,
+            );
+        }
         Err(error) => {
             error!(
                 signature = %canonical.locator.signature,
@@ -4615,14 +4910,16 @@ pub(crate) fn ingest_pump_observation(
                     .to_string(),
                 "reason" => "receipt_stage_failed"
             );
-            candidate_integrity_registry
-                .close_candidate_admission_with_integrity_invalidation("receipt_stage_failed");
+            let _ = apply_candidate_integrity_failure_policy(
+                candidate_integrity_registry,
+                &error,
+                "receipt_stage_failed",
+            );
             return CanonicalRuntimeAdmissionV1::Blocked(
                 CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
             );
         }
     };
-
     // A canonical receipt is the ownership fence for this runtime mutation.
     // It must exist before a derived non-Ready signal can classify the
     // candidate as terminal pre-session evidence; otherwise that signal could
@@ -4652,6 +4949,7 @@ pub(crate) fn ingest_pump_observation(
                     candidate_integrity_registry,
                     &receipt,
                     "candidate_integrity_signal_failed_after_receipt_stage",
+                    error.capture_failure_class(),
                 );
             }
             return CanonicalRuntimeAdmissionV1::Blocked(
@@ -4695,7 +4993,6 @@ pub(crate) fn ingest_pump_observation(
                     CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
                 );
             }
-            let _ = candidate_integrity_registry.fail_canonical_apply(&receipt);
             error!(
                 signature = %receipt.signature,
                 locator = ?receipt.locator,
@@ -4716,8 +5013,12 @@ pub(crate) fn ingest_pump_observation(
                     .to_string(),
                 "reason" => "inventory_seal_failed"
             );
-            candidate_integrity_registry
-                .close_candidate_admission_with_integrity_invalidation("inventory_seal_failed");
+            fail_staged_canonical_runtime_admission(
+                candidate_integrity_registry,
+                &receipt,
+                "inventory_seal_failed",
+                error.capture_failure_class(),
+            );
             return CanonicalRuntimeAdmissionV1::Blocked(
                 CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
             );
@@ -4737,6 +5038,11 @@ pub(crate) fn ingest_pump_observation(
             candidate_integrity_registry,
             &receipt,
             "candidate_integrity_unavailable_before_runtime_permit",
+            if candidate_integrity_registry.is_available() {
+                CaptureFailureClassV1::CandidateLocal
+            } else {
+                CaptureFailureClassV1::GlobalRuntimeFatal
+            },
         );
         return CanonicalRuntimeAdmissionV1::Blocked(
             CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
@@ -4748,12 +5054,17 @@ pub(crate) fn ingest_pump_observation(
         1u64,
         "authority_epoch_id" => authority_epoch_id.to_string()
     );
-    CanonicalRuntimeAdmissionV1::Apply(CanonicalRuntimePermitV1 {
+    let permit = CanonicalRuntimePermitV1 {
         authority_epoch_id,
         locator: canonical.locator.clone(),
         primary_payload_hash_blake3: canonical.primary_raw_provenance.payload_hash_blake3,
         apply_receipt: receipt,
-    })
+    };
+    // The lease also covers the synchronous integrity work required to issue
+    // the permit. A terminal cleanup can reclaim only after this complete
+    // canonical ingest step has either returned a permit or failed locally.
+    drop(canonical_observation_lease);
+    CanonicalRuntimeAdmissionV1::Apply(permit)
 }
 
 fn finalize_pump_observation_ledger(
@@ -4772,10 +5083,11 @@ fn finalize_pump_observation_ledger(
                         error = %error,
                         "Seer: CandidateIntegrity terminal-retirement handoff unavailable"
                     );
-                    candidate_integrity_registry
-                        .close_candidate_admission_with_integrity_invalidation(
-                            "terminal_retirement_handoff_unavailable",
-                        );
+                    let _ = apply_candidate_integrity_failure_policy(
+                        candidate_integrity_registry,
+                        &error,
+                        "terminal_retirement_handoff_unavailable",
+                    );
                     return;
                 }
             };
@@ -4817,10 +5129,10 @@ fn finalize_pump_observation_ledger(
 
 /// Apply the active PR1E consequence of an unrecovered local coverage gap.
 ///
-/// A primary raw gap means a decision window may be missing structural input,
-/// so new candidate admission is closed globally and every mutable candidate
-/// gets typed `PrimaryRawCoverageIncomplete` evidence. A gap from any witness
-/// lane is still audited but never becomes a second authority decision.
+/// A primary raw gap means one capture segment may be missing structural
+/// input.  It is recorded as a typed, finalizer-visible invalidation while the
+/// launcher continues to preserve later tape. A gap from any witness lane is
+/// still audited but never becomes a second authority decision.
 pub(crate) fn handle_local_coverage_gap_notice(
     candidate_integrity_registry: &CandidateIntegrityRegistry,
     configured_primary_provider_id: &str,
@@ -4843,13 +5155,15 @@ pub(crate) fn handle_local_coverage_gap_notice(
         "authority_epoch_id" => candidate_integrity_registry.authority_epoch().epoch_id.to_string()
     );
     crate::oracle_metrics::record_pr1_runtime_primary_coverage_gap();
+    record_capture_failure(
+        CaptureFailureClassV1::CaptureSegmentInvalid,
+        "primary_local_coverage_gap",
+    );
     error!(
         provider_id = %notice.provider_id,
         reason = notice.reason.as_str(),
-        "Seer: unrecovered primary local coverage gap closes new candidate admission"
+        "Seer: unrecovered primary local coverage gap invalidates this capture segment; global admission remains open"
     );
-    candidate_integrity_registry
-        .close_candidate_admission_with_integrity_invalidation("primary_local_coverage_gap");
     true
 }
 
@@ -4987,7 +5301,11 @@ pub(crate) fn process_trade_event_for_session_gate(
     record_session_buffer_expired(gating_result.expired_count);
     record_session_buffer_evictions(gating_result.evicted_per_pool, gating_result.evicted_global);
     for failed in &gating_result.failed_permits {
-        let _ = candidate_integrity_registry.fail_canonical_apply(&failed.apply_receipt);
+        fail_canonical_apply(
+            candidate_integrity_registry,
+            Some(&failed.apply_receipt),
+            "session_trade_buffer_expired_or_evicted",
+        );
         ::metrics::counter!(
             "pr1_runtime_canonical_apply_failed_total",
             1u64,
@@ -4999,7 +5317,11 @@ pub(crate) fn process_trade_event_for_session_gate(
     match gating_result.decision {
         SessionTradeDecision::ForwardNow => {
             if !emit_pool_transaction_to_event_bus(tx, trade, permit.clone(), health, false) {
-                let _ = candidate_integrity_registry.fail_canonical_apply(&permit.apply_receipt);
+                fail_canonical_apply(
+                    candidate_integrity_registry,
+                    Some(&permit.apply_receipt),
+                    "pool_transaction_event_bus_emit_failed",
+                );
             }
         }
         SessionTradeDecision::Buffered => {}
@@ -5025,7 +5347,7 @@ pub(crate) fn process_pool_detected_event_for_session_gate(
 ) -> SessionTradeFlushResult {
     let detected_pool = detected_pool_from_candidate(candidate, detected_ms);
 
-    info!(
+    tracing::debug!(
         "Seer: 🚀 Emitting NewPoolDetected: pool_amm_id={}, base_mint={}, slot={:?}, amm_program={}",
         detected_pool.pool_amm_id,
         detected_pool.base_mint,
@@ -5038,7 +5360,11 @@ pub(crate) fn process_pool_detected_event_for_session_gate(
         permit.clone(),
     )) {
         error!("Seer: ❌ Failed to emit NewPoolDetected event: {}", e);
-        let _ = candidate_integrity_registry.fail_canonical_apply(&permit.apply_receipt);
+        fail_canonical_apply(
+            candidate_integrity_registry,
+            Some(&permit.apply_receipt),
+            "new_pool_event_bus_emit_failed",
+        );
         return SessionTradeFlushResult {
             replay_ready: Vec::new(),
             expired_count: 0,
@@ -5050,7 +5376,7 @@ pub(crate) fn process_pool_detected_event_for_session_gate(
         if let Some(health) = health {
             health.mark_bus_event();
         }
-        info!(
+        tracing::debug!(
             "Seer: ✅ Event emitted to Event Bus for new pool: pool={}, receivers={}",
             detected_pool.pool_amm_id,
             tx.receiver_count()
@@ -5079,7 +5405,11 @@ pub(crate) fn replay_buffered_canonical_trades(
     record_session_detected_pool_expired(flush_result.expired_detected_pools);
     record_session_detected_pool_evicted(flush_result.evicted_detected_pools);
     for failed in &flush_result.failed_permits {
-        let _ = candidate_integrity_registry.fail_canonical_apply(&failed.apply_receipt);
+        fail_canonical_apply(
+            candidate_integrity_registry,
+            Some(&failed.apply_receipt),
+            "session_trade_replay_buffer_expired_or_evicted",
+        );
     }
 
     if !flush_result.replay_ready.is_empty() {
@@ -5100,8 +5430,11 @@ pub(crate) fn replay_buffered_canonical_trades(
                 health,
                 true,
             ) {
-                let _ = candidate_integrity_registry
-                    .fail_canonical_apply(&buffered.permit.apply_receipt);
+                fail_canonical_apply(
+                    candidate_integrity_registry,
+                    Some(&buffered.permit.apply_receipt),
+                    "replayed_pool_transaction_event_bus_emit_failed",
+                );
             }
         }
     }
@@ -5116,7 +5449,7 @@ fn emit_pool_transaction_to_event_bus(
 ) -> bool {
     let pool_tx = trade_event_to_pool_transaction(trade);
 
-    info!(
+    tracing::debug!(
         "Seer: 🚀 Emitting PoolTransaction: {} pool={} volume={:.4} SOL replayed_from_session_buffer={}",
         if trade.is_buy { "BUY" } else { "SELL" },
         pool_tx.pool_amm_id,
@@ -5131,7 +5464,7 @@ fn emit_pool_transaction_to_event_bus(
         if let Some(health) = health {
             health.mark_bus_event();
         }
-        info!(
+        tracing::debug!(
             "Seer: ✅ PoolTransaction ZOSTAŁA PRZEKAZANA DO MAGISTRALI ZDARZEŃ: receivers={} replayed_from_session_buffer={}",
             tx.receiver_count(),
             replayed_from_session_buffer
@@ -5146,7 +5479,7 @@ fn emit_account_update_to_event_bus(
     health: Option<&Arc<RuntimeHealth>>,
     replayed_from_session_buffer: bool,
 ) {
-    tracing::info!(
+    tracing::debug!(
         base_mint = %update.base_mint,
         bonding_curve = %update.bonding_curve,
         slot = update.slot,
@@ -5157,7 +5490,60 @@ fn emit_account_update_to_event_bus(
         replayed_from_session_buffer,
         "DIAG_ACCOUNT_UPDATE_RELAY"
     );
-    let ghost_event = GhostEvent::AccountUpdate(AccountUpdateEvent {
+    let ghost_event = GhostEvent::AccountUpdate(account_update_event_from_detected(update));
+    if let Err(e) = tx.send(ghost_event) {
+        tracing::debug!(
+            "Seer: AccountUpdate event not delivered (no receivers or lag): {}",
+            e
+        );
+        return;
+    }
+    if let Some(health) = health {
+        health.mark_bus_event();
+    }
+}
+
+/// Emit a capture-only state row without routing it through session state,
+/// AccountStateCore, Gatekeeper, or execution. This is the only valid path for
+/// ACE outcome evidence after the normal session relay has expired.
+fn emit_full_universe_reserve_evidence_to_event_bus(
+    tx: &EventBusSender,
+    update: &seer::ipc::DetectedAccountUpdateEvent,
+    health: Option<&Arc<RuntimeHealth>>,
+) {
+    let ghost_event =
+        GhostEvent::FullUniverseReserveEvidence(account_update_event_from_detected(update));
+    if let Err(error) = tx.send(ghost_event) {
+        ::metrics::counter!(
+            "seer_full_universe_reserve_evidence_send_failed_total",
+            1u64
+        );
+        warn!(
+            base_mint = %update.base_mint,
+            bonding_curve = %update.bonding_curve,
+            slot = update.slot,
+            error = %error,
+            "ACE_FULL_UNIVERSE_RESERVE_EVIDENCE_SEND_FAILED"
+        );
+        return;
+    }
+    ::metrics::counter!("seer_full_universe_reserve_evidence_emitted_total", 1u64);
+    if let Some(health) = health {
+        health.mark_bus_event();
+    }
+}
+
+#[inline]
+fn is_canonical_full_universe_reserve_evidence(
+    update: &seer::ipc::DetectedAccountUpdateEvent,
+) -> bool {
+    is_primary_raw_runtime_authority(update.provider_role)
+}
+
+fn account_update_event_from_detected(
+    update: &seer::ipc::DetectedAccountUpdateEvent,
+) -> AccountUpdateEvent {
+    AccountUpdateEvent {
         provider_id: update.provider_id.clone(),
         provider_role: update.provider_role,
         semantic: update.semantic,
@@ -5181,16 +5567,6 @@ fn emit_account_update_to_event_bus(
         replay_buffer_dwell_ms: update.replay_buffer_dwell_ms,
         detected_at: update.detected_at,
         sequence_number: update.sequence_number,
-    });
-    if let Err(e) = tx.send(ghost_event) {
-        tracing::debug!(
-            "Seer: AccountUpdate event not delivered (no receivers or lag): {}",
-            e
-        );
-        return;
-    }
-    if let Some(health) = health {
-        health.mark_bus_event();
     }
 }
 
@@ -5541,9 +5917,22 @@ pub async fn run(
     health: Option<Arc<RuntimeHealth>>,
     authoritative_funding_stream_tx: Option<watch::Sender<bool>>,
     canonical_account_update_relay_enabled: bool,
+    full_universe_reality_capture_enabled: bool,
     candidate_integrity_registry: Arc<CandidateIntegrityRegistry>,
 ) -> Result<()> {
     info!("Seer: Initializing component");
+
+    // The ACE V3 sustained-outcome contract needs a state as late as
+    // 11_111 ms (decision window) + 120_000 ms (outcome horizon) after
+    // detection.  The exact-account transport registry owns the upstream
+    // admission gate for those AccountUpdates, so its retention must outlive
+    // that contract.  Do not silently extend this at runtime: an explicit
+    // rollout value makes an insufficient tape fail at startup rather than
+    // quietly lose its final outcome states.
+    validate_full_universe_reserve_evidence_retention(
+        full_universe_reality_capture_enabled,
+        config.watched_pools_ttl_ms,
+    )?;
 
     validate_pr1e_startup_contract(
         &config,
@@ -5733,6 +6122,8 @@ pub async fn run(
     // silently inheriting an opaque `default()` inside the runtime path.
     // `try_new` rejects zero capacities before candidate admission begins.
     let pump_observation_ledger_config = PumpObservationLedgerConfigV1::default();
+    let pump_observation_ledger_finalization_interval =
+        pump_observation_ledger_finalization_interval(pump_observation_ledger_config);
     let pump_observation_ledger = Arc::new(Mutex::new(
         PumpObservationLedgerV1::try_new(pump_observation_ledger_config).map_err(|error| {
             anyhow::anyhow!("invalid PR1E PumpObservationLedger config: {error}")
@@ -5827,6 +6218,9 @@ pub async fn run(
     // Create IPC channel for candidate forwarding
     let (ipc_sender, mut ipc_receiver, ipc_metrics) =
         create_ipc_channel(seer_config.ipc_config.clone());
+    // The component owns this clone solely to measure the terminal egress
+    // invariant after the receiver has drained. It does not send runtime work.
+    let ipc_sender_drain = ipc_sender.clone();
     let mut local_coverage_gap_rx = ipc_receiver.local_coverage_gap_receiver();
 
     // Create Seer instance (optionally with ShadowLedger for live curve updates)
@@ -5844,6 +6238,18 @@ pub async fn run(
 
     if let Some(wal) = wal {
         seer_instance = seer_instance.with_wal(wal);
+    }
+
+    if full_universe_reality_capture_enabled {
+        if !seer_instance.enable_primary_global_account_update_registry_scope() {
+            return Err(anyhow::anyhow!(
+                "ACE full-universe capture requires a primary gRPC connection for candidate-scoped AccountUpdate ingress"
+            ));
+        }
+        info!(
+            retention_ms = FULL_UNIVERSE_RESERVE_EVIDENCE_RETENTION.as_millis(),
+            "ACE_FULL_UNIVERSE_ACCOUNT_UPDATE_SCOPE_ENABLED"
+        );
     }
 
     let nln_authoritative_funding_stream_tx = authoritative_funding_stream_tx.clone();
@@ -5925,10 +6331,21 @@ pub async fn run(
         );
         let mut session_account_update_bridge =
             SessionAccountUpdateBridge::from_runtime_config(detected_pool_ttl, detected_pool_cap);
+        let mut full_universe_reserve_evidence_bridge =
+            full_universe_reality_capture_enabled.then(|| {
+                FullUniverseReserveEvidenceBridge::new(
+                    FULL_UNIVERSE_RESERVE_EVIDENCE_RETENTION,
+                    detected_pool_cap,
+                )
+            });
         let mut prune_interval = tokio::time::interval(session_bridge_prune_interval(
             SESSION_POOL_TRADE_BUFFER_TTL,
             detected_pool_ttl,
         ));
+        let mut ledger_finalization_interval =
+            tokio::time::interval(pump_observation_ledger_finalization_interval);
+        ledger_finalization_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The IPC coverage control plane retains a bounded monotonic prefix
         // of notices. Track the prefix already classified so secondary audit
         // metrics are not replayed on every subsequent notice. An overflow is
@@ -5936,24 +6353,30 @@ pub async fn run(
         // be disproven.
         let mut handled_local_coverage_gap_notices = 0usize;
         let mut local_coverage_gap_control_overflow_handled = false;
+        // Losing this optional control sender must not terminate the IPC
+        // receiver.  It invalidates the affected capture segment and the
+        // finalizer will reject it, but the primary tape must remain alive to
+        // preserve all later evidence.  The `if` guard also prevents a closed
+        // watch channel from winning `select!` in a busy loop.
+        let mut local_coverage_gap_control_open = true;
         info!("Seer: Starting IPC event processing");
         info!("Seer: IPC receiver task is now listening for pool detection events from Seer core");
 
         loop {
             let seer_event = tokio::select! {
-                gap_changed = local_coverage_gap_rx.changed() => {
+                gap_changed = local_coverage_gap_rx.changed(), if local_coverage_gap_control_open => {
                     match gap_changed {
                         Ok(()) => {
                             let gap_state = local_coverage_gap_rx.borrow_and_update().clone();
                             if gap_state.overflowed && !local_coverage_gap_control_overflow_handled {
                                 local_coverage_gap_control_overflow_handled = true;
                                 error!(
-                                    "Seer: bounded local coverage-gap control retention overflowed; closing new candidate admission"
+                                    "Seer: bounded local coverage-gap control retention overflowed; capture segment invalid while global admission remains open"
                                 );
-                                candidate_integrity_registry_ipc
-                                    .close_candidate_admission_with_integrity_invalidation(
-                                        "local_coverage_gap_control_overflow",
-                                    );
+                                record_capture_failure(
+                                    CaptureFailureClassV1::CaptureSegmentInvalid,
+                                    "local_coverage_gap_control_overflow",
+                                );
                             }
                             for notice in gap_state
                                 .notices
@@ -5971,11 +6394,12 @@ pub async fn run(
                         }
                         Err(_) => {
                             warn!("Seer: local coverage-gap control channel closed");
-                            candidate_integrity_registry_ipc
-                                .close_candidate_admission_with_integrity_invalidation(
-                                    "local_coverage_gap_control_channel_closed",
-                                );
-                            break;
+                            record_capture_failure(
+                                CaptureFailureClassV1::CaptureSegmentInvalid,
+                                "local_coverage_gap_control_channel_closed",
+                            );
+                            local_coverage_gap_control_open = false;
+                            continue;
                         }
                     }
                 }
@@ -5985,8 +6409,11 @@ pub async fn run(
                     record_session_buffer_expired(expired_permits.len());
                     record_session_detected_pool_expired(expired_detected);
                     for expired in expired_permits {
-                        let _ = candidate_integrity_registry_ipc
-                            .fail_canonical_apply(&expired.apply_receipt);
+                        fail_canonical_apply(
+                            candidate_integrity_registry_ipc.as_ref(),
+                            Some(&expired.apply_receipt),
+                            "session_trade_buffer_expired",
+                        );
                         ::metrics::counter!(
                             "pr1_runtime_canonical_apply_failed_total",
                             1u64,
@@ -5998,6 +6425,9 @@ pub async fn run(
                         session_account_update_bridge.prune_expired(Instant::now());
                     record_session_account_update_expired(expired_updates);
                     record_session_account_update_detected_key_expired(expired_update_keys);
+                    continue;
+                }
+                _ = ledger_finalization_interval.tick() => {
                     finalize_pump_observation_ledger(
                         &pump_observation_ledger_ipc,
                         &candidate_integrity_registry_ipc,
@@ -6027,7 +6457,9 @@ pub async fn run(
                         event.observation.as_ref().is_some_and(|observation| {
                             pool_candidate_matches_primary_observation(candidate, observation)
                         });
-                    let admission = ingest_pump_observation(
+                    let admission = ingest_pool_detection_observation(
+                        primary_raw,
+                        event.runtime_disposition,
                         &pump_observation_ledger_ipc,
                         &candidate_integrity_registry_ipc,
                         event.observation.clone(),
@@ -6060,12 +6492,41 @@ pub async fn run(
                     let permit = match admission {
                         CanonicalRuntimeAdmissionV1::Apply(permit) => permit,
                         CanonicalRuntimeAdmissionV1::NoApply(reason) => {
-                            debug!(
-                                pool = %candidate.pool_amm_id,
-                                mint = %candidate.base_mint,
-                                reason = ?reason,
-                                "Seer: pool wrapper has no canonical runtime permit"
-                            );
+                            match reason {
+                                CanonicalRuntimeNoApplyReasonV1::ContinuityOnly => {
+                                    ::metrics::counter!(
+                                        "seer_pool_detection_runtime_disposition_total",
+                                        1u64,
+                                        "disposition" => "continuity_only"
+                                    );
+                                    info!(
+                                        pool = %candidate.pool_amm_id,
+                                        mint = %candidate.base_mint,
+                                        continuity_observation_pool = ?event.continuity_observation_pool,
+                                        "Seer: continuity-only pool bypassed canonical Ledger and CandidateIntegrity before runtime admission; existing confirmed-position monitoring remains independent"
+                                    );
+                                }
+                                CanonicalRuntimeNoApplyReasonV1::Suppressed => {
+                                    ::metrics::counter!(
+                                        "seer_pool_detection_runtime_disposition_total",
+                                        1u64,
+                                        "disposition" => "suppressed"
+                                    );
+                                    info!(
+                                        pool = %candidate.pool_amm_id,
+                                        mint = %candidate.base_mint,
+                                        "Seer: suppressed pool bypassed canonical Ledger and CandidateIntegrity before runtime admission"
+                                    );
+                                }
+                                _ => {
+                                    debug!(
+                                        pool = %candidate.pool_amm_id,
+                                        mint = %candidate.base_mint,
+                                        reason = ?reason,
+                                        "Seer: pool wrapper has no canonical runtime permit"
+                                    );
+                                }
+                            }
                             continue;
                         }
                         CanonicalRuntimeAdmissionV1::Blocked(outcome) => {
@@ -6078,44 +6539,6 @@ pub async fn run(
                             continue;
                         }
                     };
-                    if let Err(reason) = authorize_pool_runtime_disposition(
-                        event.runtime_disposition,
-                        &permit,
-                        candidate_integrity_registry_ipc.as_ref(),
-                    ) {
-                        match reason {
-                            CanonicalRuntimeNoApplyReasonV1::ContinuityOnly => {
-                                ::metrics::counter!(
-                                    "seer_pool_detection_runtime_disposition_total",
-                                    1u64,
-                                    "disposition" => "continuity_only"
-                                );
-                                info!(
-                                    pool = %candidate.pool_amm_id,
-                                    mint = %candidate.base_mint,
-                                    continuity_observation_pool = ?event.continuity_observation_pool,
-                                    "Seer: continuity-only pool cannot create a candidate session or structural runtime event; existing confirmed-position monitoring remains independent"
-                                );
-                            }
-                            CanonicalRuntimeNoApplyReasonV1::Suppressed => {
-                                ::metrics::counter!(
-                                    "seer_pool_detection_runtime_disposition_total",
-                                    1u64,
-                                    "disposition" => "suppressed"
-                                );
-                                info!(
-                                    pool = %candidate.pool_amm_id,
-                                    mint = %candidate.base_mint,
-                                    "Seer: canonical raw observation retained, but suppressed pool is not admitted to runtime"
-                                );
-                            }
-                            _ => unreachable!(
-                                "pool runtime disposition returns only continuity/suppressed"
-                            ),
-                        }
-                        continue;
-                    }
-
                     info!(
                         "Seer: Pool detected via IPC - pool={}, amm={}, priority={:?}",
                         candidate.pool_amm_id, candidate.amm_program_id, event.priority
@@ -6175,6 +6598,7 @@ pub async fn run(
                         fail_canonical_apply(
                             &candidate_integrity_registry_ipc,
                             Some(&permit.apply_receipt),
+                            "last_gate_invalid_base_mint_program_id",
                         );
                         continue; // Skip this pool - do not emit, do not bootstrap
                     }
@@ -6194,6 +6618,7 @@ pub async fn run(
                         fail_canonical_apply(
                             &candidate_integrity_registry_ipc,
                             Some(&permit.apply_receipt),
+                            "last_gate_invalid_base_mint_global_state",
                         );
                         continue;
                     }
@@ -6213,6 +6638,7 @@ pub async fn run(
                         fail_canonical_apply(
                             &candidate_integrity_registry_ipc,
                             Some(&permit.apply_receipt),
+                            "last_gate_invalid_bonding_curve_program_id",
                         );
                         continue;
                     }
@@ -6232,6 +6658,7 @@ pub async fn run(
                         fail_canonical_apply(
                             &candidate_integrity_registry_ipc,
                             Some(&permit.apply_receipt),
+                            "last_gate_invalid_bonding_curve_global_state",
                         );
                         continue;
                     }
@@ -6251,6 +6678,7 @@ pub async fn run(
                         fail_canonical_apply(
                             &candidate_integrity_registry_ipc,
                             Some(&permit.apply_receipt),
+                            "last_gate_invalid_amm_program_id",
                         );
                         continue;
                     }
@@ -6281,6 +6709,23 @@ pub async fn run(
                             permit.clone(),
                             &candidate_integrity_registry_ipc,
                         );
+                        if let Some(bridge) = full_universe_reserve_evidence_bridge.as_mut() {
+                            if !bridge.register_detected_pool(candidate, now) {
+                                // No eviction is allowed for an ACE evidence subject:
+                                // losing its reserve horizon would manufacture an
+                                // apparently clean but incomplete denominator.
+                                error!(
+                                    pool = %candidate.pool_amm_id,
+                                    base_mint = %candidate.base_mint,
+                                    cap = detected_pool_cap,
+                                    "ACE_FULL_UNIVERSE_RESERVE_EVIDENCE_CAP_EXHAUSTED"
+                                );
+                                record_capture_failure(
+                                    CaptureFailureClassV1::CaptureSegmentInvalid,
+                                    "full_universe_reserve_evidence_cap_exhausted",
+                                );
+                            }
+                        }
                         let nln_replay_ready = match nln_trade_pool_resolver_ipc.lock() {
                             Ok(mut resolver) => {
                                 let result = resolver.register_candidate(candidate, now);
@@ -6313,7 +6758,7 @@ pub async fn run(
                                 "nln_trade_canonical_replay_suppressed_total",
                                 nln_replay_ready.len() as u64
                             );
-                            info!(
+                            tracing::debug!(
                                 mint = %candidate.base_mint,
                                 pool = %candidate.pool_amm_id,
                                 witness_count = nln_replay_ready.len(),
@@ -6351,6 +6796,7 @@ pub async fn run(
                         fail_canonical_apply(
                             &candidate_integrity_registry_ipc,
                             Some(&permit.apply_receipt),
+                            "event_bus_sender_unavailable_for_pool_detection",
                         );
                         let flush_result = session_trade_bridge
                             .register_detected_pool(candidate.pool_amm_id, Instant::now());
@@ -6451,6 +6897,7 @@ pub async fn run(
                         fail_canonical_apply(
                             &candidate_integrity_registry_ipc,
                             Some(&permit.apply_receipt),
+                            "trade_identity_not_forwardable",
                         );
                         continue;
                     }
@@ -6496,7 +6943,7 @@ pub async fn run(
                             } else {
                                 trade.min_sol_output as f64 / 1_000_000_000.0
                             };
-                            info!(
+                            tracing::debug!(
                                 "Seer: 🔄 Trade detected via IPC - {} on pool={}, mint={}, sol_volume={:.6} SOL, token_amount={:.6}, signer={}",
                                 if trade.is_buy { "BUY" } else { "SELL" },
                                 trade.pool_amm_id,
@@ -6510,6 +6957,7 @@ pub async fn run(
                         fail_canonical_apply(
                             &candidate_integrity_registry_ipc,
                             Some(&permit.apply_receipt),
+                            "event_bus_sender_unavailable_for_trade",
                         );
                     }
                 }
@@ -6558,8 +7006,20 @@ pub async fn run(
                 seer::ipc::SeerEvent::AccountUpdate(au) => {
                     if canonical_account_update_relay_enabled {
                         if let Some(ref tx) = event_bus_tx {
-                            let ingress = session_account_update_bridge
-                                .ingest_account_update(&au, Instant::now());
+                            let now = Instant::now();
+                            if is_canonical_full_universe_reserve_evidence(&au)
+                                && full_universe_reserve_evidence_bridge
+                                    .as_mut()
+                                    .is_some_and(|bridge| bridge.accepts(&au, now))
+                            {
+                                emit_full_universe_reserve_evidence_to_event_bus(
+                                    tx,
+                                    &au,
+                                    health_ipc.as_ref(),
+                                );
+                            }
+                            let ingress =
+                                session_account_update_bridge.ingest_account_update(&au, now);
                             record_session_account_update_expired(ingress.expired_count);
                             record_session_account_update_detected_key_expired(
                                 ingress.expired_detected_keys,
@@ -6599,7 +7059,11 @@ pub async fn run(
         }
 
         for pending in session_trade_bridge.drain_pending_permits() {
-            let _ = candidate_integrity_registry_ipc.fail_canonical_apply(&pending.apply_receipt);
+            fail_canonical_apply(
+                candidate_integrity_registry_ipc.as_ref(),
+                Some(&pending.apply_receipt),
+                "clean_shutdown_unresolved_buffer",
+            );
             ::metrics::counter!(
                 "pr1_runtime_canonical_apply_failed_total",
                 1u64,
@@ -6609,6 +7073,50 @@ pub async fn run(
         }
         warn!("Seer: IPC receiver task has exited - no more pool events will be processed!");
         warn!("Seer: This usually means the Seer core component has stopped or the IPC channel closed");
+
+        let events_sent = ipc_metrics.events_sent.get();
+        let events_received = ipc_metrics.events_received.get();
+        let egress_backlog = ipc_sender_drain.current_queue_length();
+        let downstream_backlog = ipc_receiver.pending_len();
+        if events_sent == events_received && egress_backlog == 0 && downstream_backlog == 0 {
+            let event_bus_tx = event_bus_tx.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Seer IPC drain reached Event Bus boundary without an Oracle Event Bus sender"
+                )
+            })?;
+            let barrier_sequence =
+                SEER_ORACLE_DRAIN_BARRIER_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+            let barrier = Arc::new(SeerOracleDrainBarrierV1::new(barrier_sequence));
+            event_bus_tx
+                .send(GhostEvent::SeerOracleDrainBarrier(Arc::clone(&barrier)))
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                    "Seer could not emit Oracle drain barrier sequence={barrier_sequence}: {error}"
+                )
+                })?;
+            tokio::time::timeout(
+                SEER_ORACLE_DRAIN_BARRIER_TIMEOUT,
+                barrier.wait_for_oracle_processed(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!(
+                "Oracle did not acknowledge Event Bus drain barrier sequence={barrier_sequence} within {} ms",
+                SEER_ORACLE_DRAIN_BARRIER_TIMEOUT.as_millis()
+            ))?;
+            info!(
+                events_sent,
+                events_received,
+                egress_backlog,
+                downstream_backlog,
+                barrier_sequence = barrier.sequence(),
+                "SEER_IPC_DRAIN_COMPLETE"
+            );
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Seer IPC drain invariant failed: events_sent={events_sent} events_received={events_received} egress_backlog={egress_backlog} downstream_backlog={downstream_backlog}"
+            ))
+        }
     });
 
     // Wait for shutdown signal
@@ -6652,7 +7160,12 @@ pub async fn run(
         }
     }
 
-    match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, seer.shutdown_dispatchers()).await {
+    match tokio::time::timeout(
+        SEER_DISPATCHER_SHUTDOWN_TIMEOUT,
+        seer.shutdown_dispatchers(),
+    )
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             error!("Seer: dispatcher drain/flush/join failed: {}", err);
@@ -6663,18 +7176,24 @@ pub async fn run(
         Err(_) => {
             error!(
                 "Seer: dispatcher shutdown exceeded {:?}",
-                SEER_CORE_SHUTDOWN_TIMEOUT
+                SEER_DISPATCHER_SHUTDOWN_TIMEOUT
             );
             shutdown_failures.push(format!(
                 "Seer dispatcher shutdown exceeded {:?}",
-                SEER_CORE_SHUTDOWN_TIMEOUT
+                SEER_DISPATCHER_SHUTDOWN_TIMEOUT
             ));
         }
     }
 
-    match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, &mut ipc_handle).await {
-        Ok(Ok(())) => {
+    match tokio::time::timeout(SEER_IPC_RECEIVER_SHUTDOWN_TIMEOUT, &mut ipc_handle).await {
+        Ok(Ok(Ok(()))) => {
             info!("Seer: IPC receiver drained and stopped");
+        }
+        Ok(Ok(Err(error))) => {
+            error!(error = %error, "Seer: IPC receiver completed without a valid drain");
+            shutdown_failures.push(format!(
+                "Seer IPC receiver completed without a valid drain: {error}"
+            ));
         }
         Ok(Err(join_err)) => {
             shutdown_failures.push(format!(
@@ -6686,7 +7205,7 @@ pub async fn run(
             let _ = ipc_handle.await;
             shutdown_failures.push(format!(
                 "Seer IPC receiver did not drain within {:?}",
-                SEER_CORE_SHUTDOWN_TIMEOUT
+                SEER_IPC_RECEIVER_SHUTDOWN_TIMEOUT
             ));
         }
     }
@@ -6851,18 +7370,21 @@ pub fn trade_event_to_pool_transaction(
 #[cfg(test)]
 mod tests {
     use super::{
-        authorize_pool_runtime_disposition, detected_pool_from_candidate, detection_clock_summary,
-        emit_account_update_to_event_bus, emit_execution_account_evidence_to_event_bus,
-        emit_funding_transfer_to_event_bus, finalize_pump_observation_ledger,
-        handle_local_coverage_gap_notice, ingest_pump_observation,
-        is_primary_raw_runtime_authority, missing_primary_observation_signal,
-        nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
-        pool_candidate_matches_primary_observation, process_pool_detected_event_for_session_gate,
-        process_trade_event_for_session_gate, pumpswap_program_id,
+        detected_pool_from_candidate, detection_clock_summary, emit_account_update_to_event_bus,
+        emit_execution_account_evidence_to_event_bus,
+        emit_full_universe_reserve_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
+        finalize_pump_observation_ledger, handle_local_coverage_gap_notice,
+        ingest_pool_detection_observation, ingest_pump_observation,
+        is_canonical_full_universe_reserve_evidence, is_primary_raw_runtime_authority,
+        missing_primary_observation_signal, nln_normalization_error_row,
+        nln_route_manifest_evidence_candidate_row, pool_candidate_matches_primary_observation,
+        process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
+        pump_observation_ledger_finalization_interval, pumpswap_program_id,
         select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
         trade_has_forwardable_identity, trade_matches_primary_observation,
-        validate_pr1e_startup_contract, CanonicalRuntimeAdmissionV1,
-        CanonicalRuntimeNoApplyReasonV1, NlnArtifactDeliveryState, NlnArtifactOverflowReasonV1,
+        validate_full_universe_reserve_evidence_retention, validate_pr1e_startup_contract,
+        CanonicalRuntimeAdmissionV1, CanonicalRuntimeNoApplyReasonV1,
+        FullUniverseReserveEvidenceBridge, NlnArtifactDeliveryState, NlnArtifactOverflowReasonV1,
         NlnArtifactRecord, NlnArtifactWriter, NlnProgramStreamCaptureTopic,
         NlnTradePoolIdentityResolver, NlnTradeResolveDecision, SessionAccountUpdateBridge,
         SessionAccountUpdateDecision, SessionBcv2Context, SessionExecutionAccountEvidenceDecision,
@@ -6897,7 +7419,7 @@ mod tests {
     use serde_json::{json, Value};
     use solana_sdk::{pubkey::Pubkey, signature::Signature};
     use std::str::FromStr;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::{broadcast, mpsc};
 
@@ -6908,6 +7430,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pump_observation_ledger_finalizer_uses_the_correlation_window_cadence() {
+        let config = PumpObservationLedgerConfigV1::default();
+
+        assert_eq!(
+            pump_observation_ledger_finalization_interval(config),
+            Duration::from_millis(250),
+        );
+    }
     #[test]
     fn pr1d_ordering_ingest_never_publishes_ready_before_downstream_apply() {
         let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
@@ -6984,27 +7515,24 @@ mod tests {
     }
 
     #[test]
-    fn primary_local_coverage_gap_invalidates_issued_guard_before_mfs() {
-        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+    fn primary_local_coverage_gap_invalidates_capture_without_closing_global_admission() {
         let registry = Arc::new(CandidateIntegrityRegistry::default());
-        let signature = Signature::new_unique();
         let pool = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        let permit = expect_runtime_permit(ingest_pump_observation(
-            &ledger,
-            &registry,
-            Some(primary_trade_observation(signature, pool, mint, 0)),
-            1,
-            true,
-            None,
-        ));
-        registry
-            .mark_canonical_apply_succeeded(&permit.apply_receipt)
-            .expect("downstream canonical apply reaches Ready before the gap");
         let candidate = PumpCandidateIdentityV1 {
             pool_amm_id: pool,
             mint,
         };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate,
+                outcome: CandidateIntegrityOutcomeV1::Ready,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [0x5A; 32],
+            })
+            .expect("fixture records an unrelated Ready candidate before the gap");
         let guard = registry
             .evaluation_guard(candidate)
             .expect("Ready candidate receives an evaluation guard before the gap");
@@ -7018,16 +7546,12 @@ mod tests {
             },
         ));
 
-        assert!(matches!(
-            guard.mark_mfs_materialized(),
-            Err(crate::candidate_integrity::CandidateIntegrityErrorV1::AdmissionClosed { .. })
-        ));
-        let snapshot = registry.snapshot(candidate).expect("retained evidence");
-        assert_eq!(
-            snapshot.outcome,
-            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        guard.mark_mfs_materialized().expect(
+            "a capture segment gap does not retroactively close unrelated runtime admission",
         );
-        assert!(!registry.candidate_admission_open());
+        let snapshot = registry.snapshot(candidate).expect("retained evidence");
+        assert_eq!(snapshot.outcome, CandidateIntegrityOutcomeV1::Ready);
+        assert!(registry.candidate_admission_open());
     }
 
     #[test]
@@ -7046,7 +7570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primary_ipc_saturation_reaches_launcher_control_plane_and_invalidates_admission() {
+    async fn primary_ipc_saturation_marks_capture_gap_without_invalidating_admission() {
         // This deliberately crosses the real Seer IPC queue, its independent
         // coverage-gap watch channel and the launcher-side control handler.
         // No direct synthetic gap is injected into CandidateIntegrity.
@@ -7113,8 +7637,8 @@ mod tests {
             "primary",
             notice,
         ));
-        assert!(guard.mark_mfs_materialized().is_err());
-        assert!(!registry.candidate_admission_open());
+        assert!(guard.mark_mfs_materialized().is_ok());
+        assert!(registry.candidate_admission_open());
     }
 
     #[test]
@@ -7164,6 +7688,127 @@ mod tests {
             .drain_terminal_ledger_retirements()
             .expect("retirement handoff was drained")
             .is_empty());
+    }
+
+    #[test]
+    fn terminal_cleanup_lease_prevents_late_ledger_mutation_before_receipt_reclaim() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint,
+        };
+        let ingest_lease_acquired = Arc::new(Barrier::new(2));
+        let release_ingest = Arc::new(Barrier::new(2));
+        let lease_hook_entered = Arc::clone(&ingest_lease_acquired);
+        let lease_hook_release = Arc::clone(&release_ingest);
+        registry.set_canonical_observation_lease_acquired_hook(Some(Arc::new(move || {
+            lease_hook_entered.wait();
+            lease_hook_release.wait();
+        })));
+
+        let cleanup_barrier_installed = Arc::new(Barrier::new(2));
+        let release_cleanup = Arc::new(Barrier::new(2));
+        let cleanup_hook_entered = Arc::clone(&cleanup_barrier_installed);
+        let cleanup_hook_release = Arc::clone(&release_cleanup);
+        registry.set_terminal_cleanup_barrier_installed_hook(Some(Arc::new(move || {
+            cleanup_hook_entered.wait();
+            cleanup_hook_release.wait();
+        })));
+
+        let ingest_ledger = Arc::clone(&ledger);
+        let ingest_registry = Arc::clone(&registry);
+        let ingest_thread = std::thread::spawn(move || {
+            let mut observation = primary_trade_observation(Signature::new_unique(), pool, mint, 0);
+            observation.raw_transaction_mutation_count = Some(1);
+            ingest_pump_observation(
+                &ingest_ledger,
+                &ingest_registry,
+                Some(observation),
+                1,
+                true,
+                None,
+            )
+        });
+        ingest_lease_acquired.wait();
+
+        let cleanup_registry = Arc::clone(&registry);
+        let cleanup_thread = std::thread::spawn(move || {
+            cleanup_registry.fail_pending_canonical_applies_for_candidate(candidate)
+        });
+        cleanup_barrier_installed.wait();
+
+        // The terminal barrier now wins any second ingest before it can call
+        // `ledger.observe`. This is the exact pre-ledger half of the race that
+        // the former receipt-only barrier left open.
+        let late_admission = ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(
+                Signature::new_unique(),
+                pool,
+                mint,
+                1,
+            )),
+            2,
+            true,
+            None,
+        );
+        assert!(matches!(
+            late_admission,
+            CanonicalRuntimeAdmissionV1::NoApply(CanonicalRuntimeNoApplyReasonV1::Suppressed)
+        ));
+        assert_eq!(
+            ledger
+                .lock()
+                .expect("ledger remains untouched before leased ingest resumes")
+                .snapshot()
+                .canonical_mutation_count,
+            0
+        );
+
+        // Let cleanup reach its lease wait, then allow the already-issued
+        // ingest lease to complete ledger mutation and receipt staging.
+        release_cleanup.wait();
+        release_ingest.wait();
+        let leased_ingest_admission = ingest_thread.join().expect("ingest thread join");
+        assert!(
+            matches!(leased_ingest_admission, CanonicalRuntimeAdmissionV1::Apply(_)),
+            "pre-barrier ingest must issue its permit before terminal cleanup reclaims the staged receipt, got {leased_ingest_admission:?}"
+        );
+        assert_eq!(
+            cleanup_thread
+                .join()
+                .expect("cleanup thread join")
+                .expect("terminal cleanup after lease release"),
+            1
+        );
+
+        // The failed terminal receipt produces the normal bounded ledger
+        // retirement handoff. Drain it only after the receipt is terminal;
+        // neither an active Ledger record nor an unresolved proof remains.
+        assert!(registry
+            .retire_terminal_candidate(candidate)
+            .expect("terminal retirement after reclaim"));
+        registry
+            .finish_terminal_candidate_cleanup(candidate)
+            .expect("finish terminal cleanup after retirement");
+        finalize_pump_observation_ledger(&ledger, &registry, 3);
+        let snapshot = ledger.lock().expect("terminal ledger snapshot").snapshot();
+        assert_eq!(snapshot.canonical_mutation_count, 0);
+        assert_eq!(snapshot.retained_terminal_canonical_tombstone_count, 1);
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("all canonical obligations terminal"),
+            (0, 0)
+        );
+        assert!(registry.candidate_admission_open());
+
+        registry.set_canonical_observation_lease_acquired_hook(None);
+        registry.set_terminal_cleanup_barrier_installed_hook(None);
     }
 
     #[test]
@@ -7733,38 +8378,57 @@ mod tests {
         ))
     }
 
-    #[tokio::test]
-    async fn pr1e_continuity_only_has_zero_structural_runtime_emissions() {
-        let (event_tx, mut event_rx) = create_event_bus();
+    #[test]
+    fn pr1e_continuity_only_bypasses_pre_admission_without_alias_tombstone() {
         let pool = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let candidate = make_candidate(pool, mint);
         let registry = Arc::new(CandidateIntegrityRegistry::default());
-        let permit = runtime_permit_for_candidate(&registry, &candidate, 1);
+        let permit = runtime_permit_for_candidate(&registry, &candidate, 29);
+        let continuity_pool = Pubkey::new_unique();
+        let continuity_candidate = PumpCandidateIdentityV1 {
+            pool_amm_id: continuity_pool,
+            mint,
+        };
+        let continuity_observation =
+            primary_trade_observation(Signature::new_unique(), continuity_pool, mint, 30);
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
 
-        assert_eq!(
-            authorize_pool_runtime_disposition(
+        assert!(matches!(
+            ingest_pool_detection_observation(
+                true,
                 seer::ipc::PoolDetectionRuntimeDispositionV1::ContinuityOnly,
-                &permit,
-                registry.as_ref(),
+                &ledger,
+                &registry,
+                Some(continuity_observation),
+                30,
+                true,
+                Some(missing_primary_observation_signal(
+                    continuity_candidate,
+                    Some(Signature::new_unique()),
+                )),
             ),
-            Err(CanonicalRuntimeNoApplyReasonV1::ContinuityOnly)
-        );
+            CanonicalRuntimeAdmissionV1::NoApply(CanonicalRuntimeNoApplyReasonV1::ContinuityOnly)
+        ));
+
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), event_rx.recv())
-                .await
-                .is_err(),
-            "ContinuityOnly must not emit NewPoolDetected or PoolTransaction"
+            registry.snapshot(continuity_candidate).is_err(),
+            "ContinuityOnly must not create a CandidateIntegrity record"
         );
-        assert_eq!(event_tx.receiver_count(), 1);
-        assert!(
+        assert_eq!(
             registry
-                .evaluation_guard(PumpCandidateIdentityV1 {
-                    pool_amm_id: pool,
-                    mint,
-                })
-                .is_err(),
-            "ContinuityOnly must not make the candidate eligible for MFS"
+                .terminal_tombstone_count()
+                .expect("tombstone count"),
+            0,
+            "ContinuityOnly must not leave an alias tombstone for the shared mint"
+        );
+
+        registry
+            .mark_canonical_apply_succeeded(&permit.apply_receipt)
+            .expect("the real Pump candidate must still acknowledge downstream apply");
+        assert!(
+            registry.candidate_admission_open(),
+            "the continuity alias must remain candidate-local and keep global admission open"
         );
     }
 
@@ -8173,6 +8837,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             Arc::new(CandidateIntegrityRegistry::default()),
         ));
 
@@ -8204,6 +8869,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             Arc::new(CandidateIntegrityRegistry::default()),
         )
         .await
@@ -8226,6 +8892,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             registry,
         )
@@ -9977,6 +10644,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_universe_reserve_evidence_outlives_session_ttl_without_entering_session_state() {
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut candidate = make_candidate(pool, mint);
+        // The generic fixture intentionally uses an unrelated `bonding_curve`;
+        // this capture test needs the physical Pump curve identity to match the
+        // AccountUpdate subject exactly.
+        candidate.bonding_curve = pool;
+        let mut update = make_account_update(mint, pool);
+        update.provider_role = Some(RawProviderRoleV1::PrimaryAuthority);
+        let now = Instant::now();
+        let mut bridge = FullUniverseReserveEvidenceBridge::new(Duration::from_secs(140), 8);
+        assert!(bridge.register_detected_pool(&candidate, now));
+        assert_eq!(bridge.len(), 1);
+        assert!(is_canonical_full_universe_reserve_evidence(&update));
+        assert!(
+            bridge.accepts(&update, now + Duration::from_secs(131)),
+            "ACE state horizon exceeds the 120 s session TTL and must remain capture-visible"
+        );
+
+        let (tx, mut rx) = create_event_bus();
+        emit_full_universe_reserve_evidence_to_event_bus(&tx, &update, None);
+        match recv_only_event(&mut rx).await {
+            GhostEvent::FullUniverseReserveEvidence(event) => {
+                assert_eq!(event.base_mint, mint);
+                assert_eq!(event.bonding_curve, pool);
+            }
+            other => panic!(
+                "expected capture-only reserve evidence, got {}",
+                other.event_type()
+            ),
+        }
+
+        let unrelated = make_account_update(Pubkey::new_unique(), Pubkey::new_unique());
+        assert!(!bridge.accepts(&unrelated, now + Duration::from_secs(131)));
+
+        let mut secondary = update.clone();
+        secondary.provider_role = Some(RawProviderRoleV1::SecondaryWitness);
+        assert!(
+            !is_canonical_full_universe_reserve_evidence(&secondary),
+            "secondary witness state must never enter the canonical ACE reserve lane"
+        );
+    }
+
+    #[tokio::test]
     async fn seer_canonical_trade_without_pool_detected_is_buffered_without_emission() {
         let (tx, mut rx) = create_event_bus();
         let pool = Pubkey::new_unique();
@@ -10089,6 +10801,13 @@ mod tests {
                 other.event_type()
             ),
         }
+    }
+
+    #[test]
+    fn ace_reserve_evidence_requires_transport_ttl_through_outcome_horizon() {
+        assert!(validate_full_universe_reserve_evidence_retention(true, 120_000).is_err());
+        assert!(validate_full_universe_reserve_evidence_retention(true, 140_000).is_ok());
+        assert!(validate_full_universe_reserve_evidence_retention(false, 120_000).is_ok());
     }
 
     #[tokio::test]

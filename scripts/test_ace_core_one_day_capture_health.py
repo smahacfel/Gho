@@ -135,6 +135,32 @@ class AceCaptureHealthTests(unittest.TestCase):
         self.assertTrue(saved["end_snapshot_sha256"])
         self.assertTrue(root.exists())
 
+    def test_ten_minute_smoke_duration_is_the_upper_bound(self) -> None:
+        duration_ms, failures = health.validate_capture_duration(
+            "smoke", 1_000, 1_000 + health.SMOKE_MAX_DURATION_MS
+        )
+        self.assertEqual(duration_ms, health.SMOKE_MAX_DURATION_MS)
+        self.assertEqual(failures, [])
+
+        _, failures = health.validate_capture_duration(
+            "smoke", 1_000, 1_001 + health.SMOKE_MAX_DURATION_MS
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("outside", failures[0])
+
+    def test_thirty_minute_resilience_soak_has_its_own_duration_contract(self) -> None:
+        duration_ms, failures = health.validate_capture_duration(
+            "soak", 1_000, 1_000 + health.SOAK_MIN_DURATION_MS
+        )
+        self.assertEqual(duration_ms, health.SOAK_MIN_DURATION_MS)
+        self.assertEqual(failures, [])
+
+        _, failures = health.validate_capture_duration(
+            "soak", 1_000, 1_000 + health.SOAK_MIN_DURATION_MS - 1
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("outside", failures[0])
+
     def test_invalid_snapshot_does_not_write_health_receipt(self) -> None:
         _, manifest, receipt, events, start, end = self.make_fixture()
         snapshot = json.loads(end.read_bytes())
@@ -163,17 +189,52 @@ class AceCaptureHealthTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertFalse(receipt.exists())
 
-    def test_fee_authority_invalidation_marker_fails_logs(self) -> None:
+    def test_fee_authority_advisory_marker_does_not_invalidate_ace_logs(self) -> None:
         root, _, _, _, _, _ = self.make_fixture()
         log_path = root / "launcher.log"
         log_path.write_text(
             "Ghost Launcher shutdown complete\n"
-            "RUG_SCALP_RUNTIME_FEE_AUTHORITY_INVALIDATED\n",
+            "RUG_SCALP_RUNTIME_FEE_AUTHORITY_CHANGED_ADVISORY\n",
             encoding="utf-8",
         )
         logs_ok, _, _, _, failures = health.validate_logs([log_path])
-        self.assertFalse(logs_ok)
-        self.assertTrue(any("RUG_SCALP_RUNTIME_FEE_AUTHORITY_INVALIDATED" in item for item in failures))
+        self.assertTrue(logs_ok)
+        self.assertEqual(failures, [])
+
+    def test_segment_invalid_counter_fails_without_claiming_valid_capture(self) -> None:
+        _, manifest, receipt, events, start, end = self.make_fixture()
+        snapshot = json.loads(end.read_bytes())
+        snapshot["counters"]["ace_capture_segment_invalid_total"] = 1
+        end.write_text(json.dumps(snapshot), encoding="utf-8")
+
+        result = health.finalize(self.finalize_args(manifest, events, start, end, receipt))
+
+        self.assertEqual(result, 2)
+        self.assertFalse(receipt.exists())
+
+    def test_lifecycle_status_preserves_launcher_root_cause_when_metrics_are_unavailable(self) -> None:
+        root, manifest, _, _, _, _ = self.make_fixture()
+        status = root / "lifecycle_status.json"
+        status.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": "smoke-run",
+                    "manifest_sha256": health.sha256_hex(manifest.read_bytes()),
+                    "launcher_returncode": 1,
+                    "exit_reason": "semantic_runtime_failure",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        failures = health.load_lifecycle_status(
+            status,
+            expected_run_id="smoke-run",
+            expected_manifest_sha256=health.sha256_hex(manifest.read_bytes()),
+        )
+
+        self.assertTrue(any("semantic_runtime_failure" in item for item in failures))
 
     def test_verify_probe_requires_valid_capture_without_invalid_reasons(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="ace-probe-summary-test-"))

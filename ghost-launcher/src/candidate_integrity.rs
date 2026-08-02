@@ -4,6 +4,7 @@
 //! for new candidates. It remains independent from strategy verdicts and from
 //! protective handling of already confirmed positions.
 
+use crate::capture_resilience::CaptureFailureClassV1;
 use ghost_core::{
     CandidateIntegrityOutcomeV1, CandidateIntegritySignalV1, PumpCandidateIdentityV1,
     PumpMutationFamilyV1, RawPumpMutationLocatorV1, StructuralCanonicalPumpMutationV1,
@@ -13,7 +14,7 @@ use solana_sdk::signature::Signature;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -265,6 +266,22 @@ struct CandidateIntegrityRegistryStateV1 {
     by_pool: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
     by_mint: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
     canonical_apply_fence: CanonicalApplyFenceV1,
+    /// Per-candidate linearization fence for terminal Oracle cleanup.
+    ///
+    /// Once present, no new canonical apply receipt may be staged for this
+    /// candidate until Oracle has reclaimed every existing obligation,
+    /// retired the candidate, and removed its runtime identity. This prevents
+    /// a receipt from appearing between a reclaim snapshot and retirement.
+    terminal_cleanup_barriers: HashSet<PumpCandidateIdentityV1>,
+    /// In-flight ingest leases that have passed the CandidateIntegrity
+    /// boundary but have not yet completed the corresponding
+    /// `PumpObservationLedger::observe` plus receipt-stage sequence.
+    ///
+    /// A terminal cleanup installs its barrier first and then waits only for
+    /// these short, synchronous critical sections. This is the
+    /// linearization point which prevents the ledger from accepting a late
+    /// canonical mutation after its terminal retirement handoff was drained.
+    canonical_observation_leases: HashMap<PumpCandidateIdentityV1, usize>,
     terminal_tombstones: TerminalCandidateTombstonesV1,
     /// A bounded handoff to the Seer-owned PumpObservationLedger. Oracle
     /// lifecycle cleanup creates it; Seer's periodic ledger finalizer drains
@@ -279,6 +296,8 @@ impl CandidateIntegrityRegistryStateV1 {
             by_pool: HashMap::new(),
             by_mint: HashMap::new(),
             canonical_apply_fence: CanonicalApplyFenceV1::default(),
+            terminal_cleanup_barriers: HashSet::new(),
+            canonical_observation_leases: HashMap::new(),
             terminal_tombstones: TerminalCandidateTombstonesV1::new(max_terminal_tombstones),
             terminal_ledger_retirements: VecDeque::with_capacity(max_terminal_tombstones.min(4096)),
         }
@@ -381,6 +400,11 @@ pub struct CandidateIntegrityRegistry {
     limits: CandidateIntegrityRegistryLimitsV1,
     authority_epoch: Pr1AuthorityEpochV1,
     state: Mutex<CandidateIntegrityRegistryStateV1>,
+    /// Wakes terminal cleanup after the last short ingest lease for a
+    /// candidate releases. It is paired with `state`, so cleanup never
+    /// observes a zero count before the matching lease has completed its
+    /// ledger mutation and receipt stage.
+    canonical_observation_lease_released: Condvar,
     available: AtomicBool,
     candidate_admission_open: AtomicBool,
     /// Monotonic global admission fence. A guard carries the value observed
@@ -395,6 +419,42 @@ pub struct CandidateIntegrityRegistry {
     transition_before_commit_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
     #[cfg(test)]
     close_after_state_lock_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
+    #[cfg(test)]
+    terminal_cleanup_after_snapshot_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
+    #[cfg(test)]
+    canonical_observation_lease_acquired_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
+    #[cfg(test)]
+    terminal_cleanup_barrier_installed_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
+}
+
+/// Typed ownership of the short critical region from primary observation
+/// intake through `PumpObservationLedger::observe` and the matching canonical
+/// receipt stage.
+///
+/// It carries no evaluation or execution authority. Its sole purpose is to
+/// make terminal cleanup and canonical ingest linearizable for one candidate:
+/// cleanup first installs its barrier, then waits for already-issued leases;
+/// later leases are rejected before they can mutate the ledger.
+pub(crate) struct CandidateCanonicalObservationLeaseV1 {
+    registry: Arc<CandidateIntegrityRegistry>,
+    candidate: PumpCandidateIdentityV1,
+}
+
+impl CandidateCanonicalObservationLeaseV1 {
+    pub(crate) fn stage_canonical_mutation(
+        &self,
+        canonical: &StructuralCanonicalPumpMutationV1,
+    ) -> Result<CanonicalMutationApplyReceiptV1, CandidateIntegrityErrorV1> {
+        self.registry
+            .stage_canonical_mutation_with_lease(canonical, self.candidate)
+    }
+}
+
+impl Drop for CandidateCanonicalObservationLeaseV1 {
+    fn drop(&mut self) {
+        self.registry
+            .release_canonical_observation_lease(self.candidate);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -405,7 +465,7 @@ pub struct CandidateIntegritySignalResultV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum CandidateIntegrityErrorV1 {
-    #[error("candidate integrity registry mutex is poisoned")]
+    #[error("candidate integrity registry is unavailable")]
     RegistryUnavailable,
     #[error("candidate integrity registry capacity exceeded")]
     RegistryCapacityExceeded,
@@ -413,6 +473,8 @@ pub enum CandidateIntegrityErrorV1 {
     CandidateMissing,
     #[error("candidate terminal retirement has unresolved canonical apply receipts")]
     TerminalRetirementPending,
+    #[error("candidate terminal cleanup is in progress; canonical staging is blocked")]
+    TerminalCleanupInProgress,
     #[error("candidate identity aliases disagree")]
     CandidateAliasConflict,
     #[error("candidate integrity is not Ready: {0:?}")]
@@ -428,6 +490,35 @@ pub enum CandidateIntegrityErrorV1 {
         expected: CandidateLifecyclePhaseV1,
         actual: CandidateLifecyclePhaseV1,
     },
+}
+
+impl CandidateIntegrityErrorV1 {
+    /// Classify the error at the registry boundary.  This deliberately does
+    /// not decide whether an already-invalid capture is acceptable; it only
+    /// decides whether an individual callsite may close unrelated candidate
+    /// admission.
+    pub const fn capture_failure_class(&self) -> CaptureFailureClassV1 {
+        match self {
+            // Registry unavailability is only produced after `mark_unavailable`
+            // or a real poisoned state lock.  Both are internal integrity
+            // failures, not aliases for a transient external dependency.
+            Self::RegistryUnavailable => CaptureFailureClassV1::GlobalRuntimeFatal,
+            // Bounded registry/receipt/tombstone capacity means the affected
+            // canonical interval cannot be proved complete. Preserve later
+            // tape and let finalization reject the segment.
+            Self::RegistryCapacityExceeded => CaptureFailureClassV1::CaptureSegmentInvalid,
+            // These errors are bound to a candidate, lifecycle transition, or
+            // late evidence and must never close unrelated admission.
+            Self::CandidateMissing
+            | Self::TerminalRetirementPending
+            | Self::TerminalCleanupInProgress
+            | Self::CandidateAliasConflict
+            | Self::NotReady(_)
+            | Self::GenerationChanged { .. }
+            | Self::AdmissionClosed { .. }
+            | Self::PhaseMismatch { .. } => CaptureFailureClassV1::CandidateLocal,
+        }
+    }
 }
 
 impl CandidateIntegrityRegistry {
@@ -543,7 +634,14 @@ impl CandidateIntegrityRegistry {
         }
         Self::cleanup_canonical_apply_fence_for_candidate(&mut state, candidate);
 
-        let retire = !Self::has_unresolved_canonical_receipt(&state, candidate)
+        // A terminal Oracle cleanup owns the final record retirement after it
+        // has reclaimed all receipt obligations. Keeping that record live
+        // while its per-candidate barrier is installed prevents
+        // `fail_canonical_apply` from racing the sole cleanup owner and
+        // turning a valid terminal reclaim into a later CandidateMissing.
+        let terminal_cleanup_owns_retirement = state.terminal_cleanup_barriers.contains(&candidate);
+        let retire = !terminal_cleanup_owns_retirement
+            && !Self::has_unresolved_canonical_receipt(&state, candidate)
             && state.records.get(&candidate).is_some_and(|record| {
                 record.outcome != CandidateIntegrityOutcomeV1::Ready
                     && record.lifecycle_phase == CandidateLifecyclePhaseV1::PreMfs
@@ -625,6 +723,7 @@ impl CandidateIntegrityRegistry {
             )),
             limits,
             authority_epoch,
+            canonical_observation_lease_released: Condvar::new(),
             available: AtomicBool::new(true),
             candidate_admission_open: AtomicBool::new(true),
             authority_admission_generation: AtomicU64::new(1),
@@ -632,12 +731,99 @@ impl CandidateIntegrityRegistry {
             transition_before_commit_hook: Mutex::new(None),
             #[cfg(test)]
             close_after_state_lock_hook: Mutex::new(None),
+            #[cfg(test)]
+            terminal_cleanup_after_snapshot_hook: Mutex::new(None),
+            #[cfg(test)]
+            canonical_observation_lease_acquired_hook: Mutex::new(None),
+            #[cfg(test)]
+            terminal_cleanup_barrier_installed_hook: Mutex::new(None),
         }
     }
 
+    /// Acquire the candidate-local lease that must cover a primary
+    /// `PumpObservationLedger::observe` and its subsequent canonical receipt
+    /// stage. The lease is intentionally acquired before the ledger mutation:
+    /// a terminal cleanup that wins first rejects this call without allowing a
+    /// new active canonical Ledger record to be created.
+    pub(crate) fn acquire_canonical_observation_lease(
+        self: &Arc<Self>,
+        candidate: PumpCandidateIdentityV1,
+    ) -> Result<CandidateCanonicalObservationLeaseV1, CandidateIntegrityErrorV1> {
+        self.require_candidate_admission_open()?;
+        self.require_available()?;
+        let mut state = self.lock_state()?;
+        if state.terminal_cleanup_barriers.contains(&candidate)
+            || state.terminal_tombstones.get(candidate).is_some()
+        {
+            return Err(CandidateIntegrityErrorV1::TerminalCleanupInProgress);
+        }
+        if !state.canonical_observation_leases.contains_key(&candidate)
+            && state.canonical_observation_leases.len() >= self.limits.max_candidates
+        {
+            return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
+        }
+        *state
+            .canonical_observation_leases
+            .entry(candidate)
+            .or_insert(0) += 1;
+        drop(state);
+        #[cfg(test)]
+        self.invoke_canonical_observation_lease_acquired_hook();
+        Ok(CandidateCanonicalObservationLeaseV1 {
+            registry: Arc::clone(self),
+            candidate,
+        })
+    }
+
+    fn release_canonical_observation_lease(&self, candidate: PumpCandidateIdentityV1) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                self.available.store(false, Ordering::Release);
+                self.force_close_candidate_admission_without_state(
+                    "canonical_observation_lease_mutex_poisoned",
+                );
+                return;
+            }
+        };
+        match state.canonical_observation_leases.get_mut(&candidate) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                state.canonical_observation_leases.remove(&candidate);
+                self.canonical_observation_lease_released.notify_all();
+            }
+            None => {
+                self.available.store(false, Ordering::Release);
+                drop(state);
+                self.close_candidate_admission("canonical_observation_lease_missing_on_release");
+            }
+        }
+    }
+
+    /// Stage a canonical receipt only while the matching pre-ledger lease is
+    /// held. The lease is what permits a mutation that began before a terminal
+    /// barrier to finish its ledger→receipt sequence; terminal cleanup waits
+    /// for that lease before reclaiming and retiring the candidate.
+    fn stage_canonical_mutation_with_lease(
+        &self,
+        canonical: &StructuralCanonicalPumpMutationV1,
+        lease_candidate: PumpCandidateIdentityV1,
+    ) -> Result<CanonicalMutationApplyReceiptV1, CandidateIntegrityErrorV1> {
+        self.stage_canonical_mutation_inner(canonical, Some(lease_candidate))
+    }
+
+    #[cfg(test)]
     pub(crate) fn stage_canonical_mutation(
         &self,
         canonical: &StructuralCanonicalPumpMutationV1,
+    ) -> Result<CanonicalMutationApplyReceiptV1, CandidateIntegrityErrorV1> {
+        self.stage_canonical_mutation_inner(canonical, None)
+    }
+
+    fn stage_canonical_mutation_inner(
+        &self,
+        canonical: &StructuralCanonicalPumpMutationV1,
+        lease_candidate: Option<PumpCandidateIdentityV1>,
     ) -> Result<CanonicalMutationApplyReceiptV1, CandidateIntegrityErrorV1> {
         self.require_candidate_admission_open()?;
         self.require_available()?;
@@ -651,6 +837,11 @@ impl CandidateIntegrityRegistry {
                 .mint
                 .ok_or(CandidateIntegrityErrorV1::CandidateMissing)?,
         };
+        if let Some(lease_candidate) = lease_candidate {
+            if lease_candidate != candidate {
+                return Err(CandidateIntegrityErrorV1::CandidateAliasConflict);
+            }
+        }
         let runtime_key = RuntimeMutationApplyKeyV1 {
             mutation_family: canonical.mutation_family,
             signature: canonical.locator.signature,
@@ -666,6 +857,16 @@ impl CandidateIntegrityRegistry {
             evidence_hash_blake3: canonical.primary_raw_provenance.payload_hash_blake3,
         };
         let mut state = self.lock_state()?;
+        let matching_lease_is_active = lease_candidate.is_some_and(|lease_candidate| {
+            lease_candidate == candidate
+                && state
+                    .canonical_observation_leases
+                    .get(&candidate)
+                    .is_some_and(|count| *count > 0)
+        });
+        if state.terminal_cleanup_barriers.contains(&candidate) && !matching_lease_is_active {
+            return Err(CandidateIntegrityErrorV1::TerminalCleanupInProgress);
+        }
         if let Some(existing) = state
             .canonical_apply_fence
             .receipts_by_runtime_key
@@ -681,9 +882,6 @@ impl CandidateIntegrityRegistry {
         if state.canonical_apply_fence.receipts_by_runtime_key.len() >= self.limits.max_candidates {
             drop(state);
             let _ = self.record_signal(Self::coverage_incomplete_signal(&receipt))?;
-            self.close_candidate_admission_with_integrity_invalidation(
-                "canonical_receipt_capacity_exhausted",
-            );
             return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
         }
         state.canonical_apply_fence.receipts_by_runtime_key.insert(
@@ -942,6 +1140,86 @@ impl CandidateIntegrityRegistry {
         Ok(())
     }
 
+    /// Resolve the canonical-apply obligations that still belong to one
+    /// terminal Oracle candidate.
+    ///
+    /// The caller has already proved that the per-pool observation task is
+    /// terminal, so no remaining receipt can receive a downstream apply
+    /// acknowledgement from that task.  This intentionally delegates every
+    /// individual transition to [`Self::fail_canonical_apply`]: it does not
+    /// delete fence entries, bypass identity checks, or weaken the bounded
+    /// receipt/proof lifecycle.
+    pub(crate) fn fail_pending_canonical_applies_for_candidate(
+        &self,
+        candidate: PumpCandidateIdentityV1,
+    ) -> Result<usize, CandidateIntegrityErrorV1> {
+        self.require_available()?;
+        let pending = {
+            let mut state = self.lock_state()?;
+            // The barrier linearizes cleanup ahead of new ingest. A lease
+            // that was already issued is allowed to finish its short
+            // ledger→receipt sequence; waiting here prevents this terminal
+            // retirement from draining the Ledger handoff before that mutation
+            // is either fenced by a receipt or rejected locally.
+            state.terminal_cleanup_barriers.insert(candidate);
+            #[cfg(test)]
+            {
+                drop(state);
+                self.invoke_terminal_cleanup_barrier_installed_hook();
+                state = self.lock_state()?;
+            }
+            while state
+                .canonical_observation_leases
+                .get(&candidate)
+                .is_some_and(|count| *count > 0)
+            {
+                state = match self.canonical_observation_lease_released.wait(state) {
+                    Ok(state) => state,
+                    Err(_) => {
+                        self.available.store(false, Ordering::Release);
+                        self.force_close_candidate_admission_without_state(
+                            "canonical_observation_lease_wait_mutex_poisoned",
+                        );
+                        return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
+                    }
+                };
+            }
+            state
+                .canonical_apply_fence
+                .receipts_by_runtime_key
+                .values()
+                .filter(|entry| {
+                    entry.receipt.candidate == candidate && !entry.applied && !entry.failed
+                })
+                .map(|entry| entry.receipt.clone())
+                .collect::<Vec<_>>()
+        };
+
+        #[cfg(test)]
+        self.invoke_terminal_cleanup_after_snapshot_hook();
+
+        for receipt in &pending {
+            self.fail_canonical_apply(receipt)?;
+        }
+        Ok(pending.len())
+    }
+
+    /// Release the terminal-cleanup linearization fence after Oracle has
+    /// removed the runtime identity. The fence must never be released while a
+    /// receipt remains unresolved.
+    pub(crate) fn finish_terminal_candidate_cleanup(
+        &self,
+        candidate: PumpCandidateIdentityV1,
+    ) -> Result<(), CandidateIntegrityErrorV1> {
+        self.require_available()?;
+        let mut state = self.lock_state()?;
+        if Self::has_unresolved_canonical_receipt(&state, candidate) {
+            return Err(CandidateIntegrityErrorV1::TerminalRetirementPending);
+        }
+        state.terminal_cleanup_barriers.remove(&candidate);
+        Ok(())
+    }
+
     pub(crate) fn fail_ready_release(
         &self,
         release: &CandidateIntegrityReadyReleaseV1,
@@ -1138,9 +1416,6 @@ impl CandidateIntegrityRegistry {
             for signal in failure_signals {
                 let _ = self.record_signal(signal)?;
             }
-            self.close_candidate_admission_with_integrity_invalidation(
-                "canonical_inventory_proof_capacity_exhausted",
-            );
             return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
         }
         let Some(entry) = state
@@ -1275,7 +1550,6 @@ impl CandidateIntegrityRegistry {
                 };
             if state.records.len() >= capacity {
                 drop(state);
-                self.mark_unavailable("candidate_registry_capacity_exhausted");
                 return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
             }
             state
@@ -1379,7 +1653,6 @@ impl CandidateIntegrityRegistry {
                 }
                 Err(error) => {
                     drop(state);
-                    self.mark_unavailable("pre_session_terminal_retirement_capacity_exhausted");
                     return Err(error);
                 }
             }
@@ -1637,9 +1910,11 @@ impl CandidateIntegrityRegistry {
     /// Close new-candidate admission and synchronously turn every mutable
     /// candidate record into typed technical integrity evidence.
     ///
-    /// This is used by cross-candidate failures such as a primary local
-    /// coverage gap. Already-started submit/confirmation flows are not
-    /// cancelled: they retain reconciliation authority, while confirmed
+    /// This is reserved for proved global registry or canonical-application
+    /// corruption. A primary-local coverage gap is instead recorded as a
+    /// capture-segment invalidation so later canonical tape can still be
+    /// preserved for forensics. Already-started submit/confirmation flows are
+    /// not cancelled: they retain reconciliation authority, while confirmed
     /// positions keep their protective lifecycle untouched.
     pub fn close_candidate_admission_with_integrity_invalidation(&self, reason: &'static str) {
         self.close_candidate_admission(reason);
@@ -1816,6 +2091,41 @@ impl CandidateIntegrityRegistry {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_terminal_cleanup_after_snapshot_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .terminal_cleanup_after_snapshot_hook
+            .lock()
+            .expect("test terminal cleanup hook mutex") = hook.map(TransitionBeforeCommitHookV1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_canonical_observation_lease_acquired_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .canonical_observation_lease_acquired_hook
+            .lock()
+            .expect("test canonical observation lease hook mutex") =
+            hook.map(TransitionBeforeCommitHookV1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_terminal_cleanup_barrier_installed_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .terminal_cleanup_barrier_installed_hook
+            .lock()
+            .expect("test terminal cleanup barrier hook mutex") =
+            hook.map(TransitionBeforeCommitHookV1);
+    }
+
+    #[cfg(test)]
     fn invoke_transition_before_commit_hook(&self) {
         let hook = self
             .transition_before_commit_hook
@@ -1833,6 +2143,42 @@ impl CandidateIntegrityRegistry {
             .close_after_state_lock_hook
             .lock()
             .expect("test close hook mutex")
+            .clone();
+        if let Some(hook) = hook {
+            (hook.0)();
+        }
+    }
+
+    #[cfg(test)]
+    fn invoke_terminal_cleanup_after_snapshot_hook(&self) {
+        let hook = self
+            .terminal_cleanup_after_snapshot_hook
+            .lock()
+            .expect("test terminal cleanup hook mutex")
+            .clone();
+        if let Some(hook) = hook {
+            (hook.0)();
+        }
+    }
+
+    #[cfg(test)]
+    fn invoke_canonical_observation_lease_acquired_hook(&self) {
+        let hook = self
+            .canonical_observation_lease_acquired_hook
+            .lock()
+            .expect("test canonical observation lease hook mutex")
+            .clone();
+        if let Some(hook) = hook {
+            (hook.0)();
+        }
+    }
+
+    #[cfg(test)]
+    fn invoke_terminal_cleanup_barrier_installed_hook(&self) {
+        let hook = self
+            .terminal_cleanup_barrier_installed_hook
+            .lock()
+            .expect("test terminal cleanup barrier hook mutex")
             .clone();
         if let Some(hook) = hook {
             (hook.0)();
@@ -2637,7 +2983,7 @@ mod tests {
     }
 
     #[test]
-    fn fence_capacity_fail_closes_new_candidate_without_evicting_unresolved_receipt() {
+    fn fence_capacity_invalidates_only_the_capture_segment_without_closing_admission() {
         let registry = CandidateIntegrityRegistry::new(CandidateIntegrityRegistryLimitsV1 {
             max_candidates: 1,
             max_audit_markers_per_candidate: 2,
@@ -2667,6 +3013,23 @@ mod tests {
             .canonical_apply_fence
             .receipts_by_runtime_key
             .contains_key(&pending_receipt.runtime_key));
+        drop(state);
+        assert!(registry.candidate_admission_open());
+        assert_eq!(
+            CandidateIntegrityErrorV1::RegistryCapacityExceeded.capture_failure_class(),
+            CaptureFailureClassV1::CaptureSegmentInvalid
+        );
+    }
+
+    #[test]
+    fn alias_conflict_is_candidate_local_not_global_admission_authority() {
+        let registry = CandidateIntegrityRegistry::default();
+
+        assert_eq!(
+            CandidateIntegrityErrorV1::CandidateAliasConflict.capture_failure_class(),
+            CaptureFailureClassV1::CandidateLocal
+        );
+        assert!(registry.candidate_admission_open());
     }
 
     #[test]
@@ -2708,6 +3071,8 @@ mod tests {
             .canonical_apply_fence
             .proofs_by_signature_candidate
             .contains_key(&(receipt.signature, receipt.candidate)));
+        drop(state);
+        assert!(registry.candidate_admission_open());
     }
 
     #[test]
@@ -3363,6 +3728,66 @@ mod tests {
             .receipts_by_runtime_key
             .contains_key(&receipt.runtime_key));
         assert_eq!(state.terminal_tombstones.retained_count(), 0);
+    }
+
+    #[test]
+    fn terminal_cleanup_barrier_blocks_receipt_staging_between_reclaim_and_retirement() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let candidate = candidate();
+        registry
+            .record_signal(signal(candidate, CandidateIntegrityOutcomeV1::Ready, 0x11))
+            .expect("candidate must be admitted before terminal cleanup");
+
+        let owned = canonical(Signature::new_unique(), 0, candidate);
+        let _owned_receipt = registry
+            .stage_canonical_mutation(&owned)
+            .expect("receipt owned by terminal task");
+
+        let snapshot_taken = Arc::new(Barrier::new(2));
+        let release_reclaim = Arc::new(Barrier::new(2));
+        let snapshot_hook = Arc::clone(&snapshot_taken);
+        let release_hook = Arc::clone(&release_reclaim);
+        registry.set_terminal_cleanup_after_snapshot_hook(Some(Arc::new(move || {
+            snapshot_hook.wait();
+            release_hook.wait();
+        })));
+
+        let reclaim_registry = Arc::clone(&registry);
+        let reclaim_thread = std::thread::spawn(move || {
+            reclaim_registry.fail_pending_canonical_applies_for_candidate(candidate)
+        });
+        snapshot_taken.wait();
+
+        let late = canonical(Signature::new_unique(), 1, candidate);
+        assert_eq!(
+            registry.stage_canonical_mutation(&late),
+            Err(CandidateIntegrityErrorV1::TerminalCleanupInProgress),
+            "a receipt must not enter after the reclaim snapshot and before retirement"
+        );
+        release_reclaim.wait();
+        assert_eq!(
+            reclaim_thread
+                .join()
+                .expect("terminal reclaim thread join")
+                .expect("terminal reclaim under barrier"),
+            1
+        );
+        registry.set_terminal_cleanup_after_snapshot_hook(None);
+        assert!(
+            registry.retire_terminal_candidate(candidate).is_ok(),
+            "all obligations were reclaimed before retirement"
+        );
+        registry
+            .finish_terminal_candidate_cleanup(candidate)
+            .expect("barrier releases only after terminal cleanup");
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("fence counts"),
+            (0, 0),
+            "terminal cleanup leaves no unresolved receipt or proof"
+        );
+        assert!(registry.candidate_admission_open());
     }
 
     #[test]
