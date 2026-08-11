@@ -1,0 +1,56 @@
+name: Token Redistribution Guard Validation
+
+on:
+  push:
+    branches:
+      - agent/token-redistribution-guard
+    paths:
+      - ci/token-guard.patch.part*
+      - .github/workflows/token-redistribution-guard-ci.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -C target-cpu=x86-64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Apply candidate diff
+        run: |
+          cat ci/token-guard.patch.part* | base64 -d | gzip -d > /tmp/token_guard.patch
+          git apply --check /tmp/token_guard.patch
+          git apply /tmp/token_guard.patch
+      - name: Install Rust and protobuf compiler
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: token-redistribution-guard-v1
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Targeted detector and parser tests
+        run: |
+          cargo test -p ghost-launcher token_redistribution --lib
+          cargo test -p seer extracts_owner_resolved_legacy_and_token_2022_transfer_legs --lib
+          cargo test -p seer token_transfer_extractor_ignores_same_owner_ata_moves --lib
+          cargo test -p ghost-launcher seer_token_transfer_emits_owner_resolved_bus_event --lib
+      - name: Directly affected runtime suites
+        run: |
+          cargo test -p ghost-launcher components::post_buy_runtime --lib
+          cargo test -p ghost-launcher --test gatekeeper_policy_tests
+          cargo test -p ghost-launcher --test session_lifecycle_tests
+      - name: Changed crate checks
+        run: |
+          cargo check -p seer
+          cargo check -p ghost-launcher
+          cargo check -p ghost-brain
