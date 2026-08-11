@@ -242,6 +242,9 @@ max_observation_window_ms = 8000
 dust_threshold_sol = 0.001
 burst_window_ms = 400
 
+[token_redistribution]
+distinct_recipient_threshold = 3
+
 [oracle.sampling_loop]
 sampling_duration_ms = 1
 initial_cycle_delay_ms = 0

@@ -8467,6 +8467,45 @@ impl GatekeeperBuffer {
         }
     }
 
+    /// Deterministic terminal reject for owner-resolved SPL token fan-out.
+    pub fn reject_token_redistribution(
+        &mut self,
+        source_owner: &Pubkey,
+        distinct_recipient_count: u32,
+    ) -> GatekeeperVerdict {
+        self.rejected = true;
+        let reason = format!(
+            "TOKEN_REDISTRIBUTION: source_owner={} distinct_recipients={}",
+            source_owner, distinct_recipient_count
+        );
+        let mut assessment = self.run_assessment();
+        let decision = GatekeeperDecision {
+            hard_fail_reason: Some(reason.clone()),
+            core1_passed: false,
+            core2_passed: false,
+            core3_passed: false,
+            dev_unknown: false,
+            soft_points: 0,
+            max_soft_points_possible: 0,
+            effective_max_soft_points: 0,
+            soft_signals: SoftSignals::default(),
+            sybil_policy: SybilPolicyDiagnostics::default(),
+            selector_soft_score: SelectorSoftScoreDiagnostics::default(),
+            alpha_gate: AlphaGateDiagnostics::not_run(self.config.enable_alpha_gate),
+            prosperity_filter: ProsperityFilterDiagnostics::not_run(
+                self.config.enable_prosperity_filter,
+            ),
+            total_soft_points: 0,
+            verdict_buy: false,
+            verdict_type: GatekeeperVerdictType::RejectHardFail,
+            reason_chain: reason.clone(),
+            reason_code: Some(GatekeeperReasonCode::RejectTokenRedistribution),
+            gatekeeper_strength: None,
+        };
+        attach_policy_decision_compat_fields(&mut assessment, decision, &self.config);
+        GatekeeperVerdict::Reject { assessment, reason }
+    }
+
     /// Build a terminal hard-fail reject from the buffer's current assessment state.
     pub fn reject_hard_fail(&mut self, reason: String) -> GatekeeperVerdict {
         self.rejected = true;

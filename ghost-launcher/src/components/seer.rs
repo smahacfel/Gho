@@ -9,7 +9,7 @@ use crate::config::{
 };
 use crate::events::{
     AccountUpdateEvent, CanonicalRuntimePermitV1, DetectedPool, EventBusSender,
-    FundingTransferObserved, GhostEvent,
+    FundingTransferObserved, GhostEvent, TokenTransferObserved,
 };
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -251,6 +251,7 @@ fn oracle_runtime_ipc_event_kind(event: &seer::ipc::SeerEvent) -> &'static str {
         seer::ipc::SeerEvent::PoolDetected(_) => "pool_detected",
         seer::ipc::SeerEvent::Trade(_) => "trade",
         seer::ipc::SeerEvent::FundingTransfer(_) => "funding_transfer",
+        seer::ipc::SeerEvent::TokenTransfer(_) => "token_transfer",
         seer::ipc::SeerEvent::AccountUpdate(_) => "account_update",
         seer::ipc::SeerEvent::ExecutionAccountEvidence(_) => "execution_account_evidence",
     }
@@ -405,6 +406,7 @@ fn oracle_runtime_ipc_slow_identity(
             event.txn_signature.map(|signature| signature.to_string()),
         ),
         seer::ipc::SeerEvent::FundingTransfer(_)
+        | seer::ipc::SeerEvent::TokenTransfer(_)
         | seer::ipc::SeerEvent::ExecutionAccountEvidence(_) => (None, None),
     }
 }
@@ -5742,6 +5744,47 @@ fn emit_funding_transfer_to_event_bus(
     }
 }
 
+fn emit_token_transfer_to_event_bus(
+    tx: &EventBusSender,
+    transfer_event: &seer::ipc::DetectedTokenTransferEvent,
+    health: Option<&Arc<RuntimeHealth>>,
+) {
+    let transfer = &transfer_event.transfer;
+    let ghost_event = GhostEvent::token_transfer_observed(TokenTransferObserved {
+        semantic: transfer.semantic.clone(),
+        slot: transfer.slot,
+        event_ordinal: transfer.event_ordinal,
+        tx_index: transfer.tx_index,
+        outer_instruction_index: transfer.outer_instruction_index,
+        inner_group_index: transfer.inner_group_index,
+        cpi_stack_height: transfer.cpi_stack_height,
+        event_time: transfer.event_time.clone(),
+        arrival_ts_ms: transfer.arrival_ts_ms,
+        signature: transfer.signature,
+        mint: transfer.mint,
+        source_token_account: transfer.source_token_account,
+        destination_token_account: transfer.destination_token_account,
+        source_owner: transfer.source_owner,
+        destination_owner: transfer.destination_owner,
+        raw_amount: transfer.raw_amount,
+        full_chain_coverage: transfer.full_chain_coverage,
+        provenance: transfer.provenance,
+        lane_health: transfer_event.lane_health,
+        detected_at: transfer_event.detected_at,
+        sequence_number: transfer_event.sequence_number,
+    });
+    if let Err(error) = tx.send(ghost_event) {
+        tracing::debug!(
+            "Seer: TokenTransfer event not delivered (no receivers or lag): {}",
+            error
+        );
+        return;
+    }
+    if let Some(health) = health {
+        health.mark_bus_event();
+    }
+}
+
 fn emit_execution_account_evidence_to_event_bus(
     tx: &EventBusSender,
     evidence_event: &seer::ipc::DetectedExecutionAccountEvidenceEvent,
@@ -7146,6 +7189,13 @@ pub async fn run(
                     }
                 }
 
+                seer::ipc::SeerEvent::TokenTransfer(transfer_event) => {
+                    ipc_event_profile.transition_to("token_transfer::event_bus_bridge");
+                    if let Some(ref tx) = event_bus_tx {
+                        emit_token_transfer_to_event_bus(tx, transfer_event, health_ipc.as_ref());
+                    }
+                }
+
                 seer::ipc::SeerEvent::ExecutionAccountEvidence(evidence_event) => {
                     ipc_event_profile.transition_to("execution_account_evidence::session_bridge");
                     if let Some(ref tx) = event_bus_tx {
@@ -7495,16 +7545,16 @@ mod tests {
     use super::{
         authorize_pool_runtime_disposition, detected_pool_from_candidate, detection_clock_summary,
         emit_account_update_to_event_bus, emit_execution_account_evidence_to_event_bus,
-        emit_funding_transfer_to_event_bus, finalize_pump_observation_ledger,
-        handle_local_coverage_gap_notice, ingest_pump_observation,
-        is_primary_raw_runtime_authority, missing_primary_observation_signal,
-        nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
-        oracle_runtime_ipc_profile_metrics, pool_candidate_matches_primary_observation,
-        process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
-        pump_observation_ledger_finalization_interval, pumpswap_program_id,
-        record_oracle_runtime_ipc_prune_stage, record_oracle_runtime_ipc_recv_gap,
-        record_oracle_runtime_ipc_select_branch, select_nln_program_stream_subscriptions,
-        should_emit_oracle_runtime_ipc_recv_gap_marker,
+        emit_funding_transfer_to_event_bus, emit_token_transfer_to_event_bus,
+        finalize_pump_observation_ledger, handle_local_coverage_gap_notice,
+        ingest_pump_observation, is_primary_raw_runtime_authority,
+        missing_primary_observation_signal, nln_normalization_error_row,
+        nln_route_manifest_evidence_candidate_row, oracle_runtime_ipc_profile_metrics,
+        pool_candidate_matches_primary_observation, process_pool_detected_event_for_session_gate,
+        process_trade_event_for_session_gate, pump_observation_ledger_finalization_interval,
+        pumpswap_program_id, record_oracle_runtime_ipc_prune_stage,
+        record_oracle_runtime_ipc_recv_gap, record_oracle_runtime_ipc_select_branch,
+        select_nln_program_stream_subscriptions, should_emit_oracle_runtime_ipc_recv_gap_marker,
         should_emit_oracle_runtime_slow_event_marker, trade_event_to_pool_transaction,
         trade_has_forwardable_identity, trade_matches_primary_observation,
         validate_pr1e_startup_contract, CanonicalRuntimeAdmissionV1,
@@ -7531,8 +7581,9 @@ mod tests {
     use seer::ipc::{
         create_ipc_channel, AccountUpdateReplayOrigin, BackpressurePolicy,
         DetectedAccountUpdateEvent, DetectedExecutionAccountEvidenceEvent,
-        DetectedFundingTransferEvent, DetectedPoolEvent, DetectedTradeEvent, EventPriority,
-        FundingTransferEvent, IpcChannelConfig, IpcError, LocalCoverageGapNoticeV1, SeerEvent,
+        DetectedFundingTransferEvent, DetectedPoolEvent, DetectedTokenTransferEvent,
+        DetectedTradeEvent, EventPriority, FundingTransferEvent, IpcChannelConfig, IpcError,
+        LocalCoverageGapNoticeV1, SeerEvent, TokenTransferEvent,
     };
     use seer::nln_program_streams::{
         NlnIngestMeta, NlnProgramStreamMessage, NlnPumpFunTradeEvent, PumpFunTradeSide,
@@ -11018,6 +11069,64 @@ mod tests {
                 "expected FundingTransferObserved, got {}",
                 other.event_type()
             ),
+        }
+    }
+
+    #[tokio::test]
+    async fn seer_token_transfer_emits_owner_resolved_bus_event() {
+        let (tx, mut rx) = create_event_bus();
+        let mint = Pubkey::new_unique();
+        let source_token_account = Pubkey::new_unique();
+        let destination_token_account = Pubkey::new_unique();
+        let source_owner = Pubkey::new_unique();
+        let destination_owner = Pubkey::new_unique();
+        let signature = Signature::new_unique();
+        let event = DetectedTokenTransferEvent {
+            transfer: TokenTransferEvent {
+                semantic: ghost_core::EventSemanticEnvelope::default(),
+                slot: Some(42),
+                event_ordinal: Some(5),
+                tx_index: Some(6),
+                outer_instruction_index: Some(7),
+                inner_group_index: Some(7),
+                cpi_stack_height: Some(2),
+                event_time: ghost_core::EventTimeMetadata::default(),
+                arrival_ts_ms: 8,
+                signature,
+                mint,
+                source_token_account,
+                destination_token_account,
+                source_owner,
+                destination_owner,
+                raw_amount: 9,
+                full_chain_coverage: true,
+                provenance: seer::ipc::FundingTransferProvenance::authoritative_full_feed_live(),
+            },
+            lane_health: seer::ipc::FundingLaneRuntimeHealth::default(),
+            detected_at: SystemTime::now(),
+            sequence_number: 10,
+            priority: EventPriority::High,
+        };
+
+        emit_token_transfer_to_event_bus(&tx, &event, None);
+
+        match recv_only_event(&mut rx).await {
+            GhostEvent::TokenTransferObserved(observed) => {
+                assert_eq!(observed.signature, signature);
+                assert_eq!(observed.mint, mint);
+                assert_eq!(observed.source_token_account, source_token_account);
+                assert_eq!(
+                    observed.destination_token_account,
+                    destination_token_account
+                );
+                assert_eq!(observed.source_owner, source_owner);
+                assert_eq!(observed.destination_owner, destination_owner);
+                assert_eq!(observed.raw_amount, 9);
+                assert_eq!(observed.event_ordinal, Some(5));
+                assert!(observed.full_chain_coverage);
+                assert_eq!(observed.sequence_number, 10);
+            }
+            other => panic!("expected TokenTransferObserved, got {}", other.event_type()),
         }
     }
 

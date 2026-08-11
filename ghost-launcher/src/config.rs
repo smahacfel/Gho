@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::rug_reality_capture::RugRealityCaptureConfigV1;
 use crate::rug_scalp_v2::RugScalpV2Config;
+use crate::token_redistribution::TokenRedistributionConfig;
 
 const DEFAULT_SECRET_ENV_FILE: &str = ".env";
 const OPERATOR_NLN_GRPC_ENDPOINT: &str = "grpc.nln.clr3.org:443";
@@ -99,6 +100,10 @@ pub struct LauncherConfig {
     /// Tx intelligence runtime defaults.
     #[serde(default)]
     pub tx_intelligence: TxIntelligenceRuntimeConfig,
+
+    /// Deterministic owner-to-owner SPL fan-out guard.
+    #[serde(default)]
+    pub token_redistribution: TokenRedistributionConfig,
 
     /// Logging configuration
     #[serde(default)]

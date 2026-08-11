@@ -1041,6 +1041,80 @@ impl FundingTransferObserved {
     }
 }
 
+/// Owner-resolved SPL token transfer for a mint currently in Ghost lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenTransferObserved {
+    #[serde(default)]
+    pub semantic: EventSemanticEnvelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_ordinal: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_instruction_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_group_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpi_stack_height: Option<u32>,
+    #[serde(default)]
+    pub event_time: EventTimeMetadata,
+    #[serde(default)]
+    pub arrival_ts_ms: u64,
+    pub signature: solana_sdk::signature::Signature,
+    pub mint: solana_sdk::pubkey::Pubkey,
+    pub source_token_account: solana_sdk::pubkey::Pubkey,
+    pub destination_token_account: solana_sdk::pubkey::Pubkey,
+    pub source_owner: solana_sdk::pubkey::Pubkey,
+    pub destination_owner: solana_sdk::pubkey::Pubkey,
+    pub raw_amount: u64,
+    #[serde(default)]
+    pub full_chain_coverage: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "FundingTransferProvenance::is_legacy_default"
+    )]
+    pub provenance: FundingTransferProvenance,
+    #[serde(default, skip_serializing_if = "FundingLaneRuntimeHealth::is_default")]
+    pub lane_health: FundingLaneRuntimeHealth,
+    pub detected_at: std::time::SystemTime,
+    pub sequence_number: u64,
+}
+
+impl TokenTransferObserved {
+    pub fn effective_event_ts_ms(&self) -> Option<u64> {
+        self.event_time.effective_event_ts_ms()
+    }
+
+    pub fn compat_event_ts_ms(&self) -> Option<u64> {
+        self.event_time.compat_event_ts_ms(Some(self.arrival_ts_ms))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenRedistributionPhase {
+    PreBuy,
+    PostBuy,
+}
+
+/// One-shot deterministic hard signal emitted when an owner fans out to the
+/// configured number of distinct external recipient owners.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenRedistributionDetected {
+    pub pool_amm_id: solana_sdk::pubkey::Pubkey,
+    pub base_mint: solana_sdk::pubkey::Pubkey,
+    pub source_owner: solana_sdk::pubkey::Pubkey,
+    pub distinct_recipient_count: u32,
+    pub phase: TokenRedistributionPhase,
+    pub signature: solana_sdk::signature::Signature,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u64>,
+    pub event_ordinal: u32,
+    pub detected_at: std::time::SystemTime,
+}
+
 /// Role-aware execution account evidence on the launcher event bus.
 ///
 /// This event carries account-existence/loadability evidence for a concrete
@@ -1379,6 +1453,12 @@ pub enum GhostEvent {
     /// A funding transfer observation was observed on the bus.
     FundingTransferObserved(Arc<FundingTransferObserved>),
 
+    /// Owner-resolved SPL token transfer for an active Ghost mint.
+    TokenTransferObserved(Arc<TokenTransferObserved>),
+
+    /// Internal hard signal routed to the canonical pre/post-buy owners.
+    TokenRedistributionDetected(Arc<TokenRedistributionDetected>),
+
     /// Role-aware evidence for a concrete execution account.
     ExecutionAccountEvidence(Arc<ExecutionAccountEvidenceEvent>),
 
@@ -1616,6 +1696,14 @@ impl GhostEvent {
         GhostEvent::FundingTransferObserved(Arc::new(transfer))
     }
 
+    pub fn token_transfer_observed(transfer: TokenTransferObserved) -> Self {
+        GhostEvent::TokenTransferObserved(Arc::new(transfer))
+    }
+
+    pub fn token_redistribution_detected(signal: TokenRedistributionDetected) -> Self {
+        GhostEvent::TokenRedistributionDetected(Arc::new(signal))
+    }
+
     /// Create an ExecutionAccountEvidence event.
     pub fn execution_account_evidence(
         evidence: ExecutionAccountEvidence,
@@ -1775,6 +1863,7 @@ impl GhostEvent {
             GhostEvent::PoolScored(_) => Some(RuntimePlane::LegacyObservation),
             GhostEvent::TransactionSent { .. } => Some(RuntimePlane::CanonicalDecision),
             GhostEvent::PostBuySubmitted { .. } => Some(RuntimePlane::PostBuyMonitoring),
+            GhostEvent::TokenRedistributionDetected(_) => Some(RuntimePlane::PostBuyMonitoring),
             GhostEvent::ShadowBuySimulated(_) => Some(RuntimePlane::ShadowSimulation),
             _ => None,
         }
@@ -1787,6 +1876,8 @@ impl GhostEvent {
             GhostEvent::NewPoolDetected(_, _) => "new_pool_detected",
             GhostEvent::PoolTransaction(_, _) => "pool_transaction",
             GhostEvent::FundingTransferObserved(_) => "funding_transfer_observed",
+            GhostEvent::TokenTransferObserved(_) => "token_transfer_observed",
+            GhostEvent::TokenRedistributionDetected(_) => "token_redistribution_detected",
             GhostEvent::ExecutionAccountEvidence(_) => "execution_account_evidence",
             GhostEvent::PoolScored(_) => "pool_scored",
             GhostEvent::GatekeeperCommitted { .. } => "gatekeeper_committed",

@@ -53,6 +53,7 @@ pub enum GatekeeperReasonCode {
     RejectSelectorBelowBuy,
     RejectLowAlpha,
     RejectLowProsperity,
+    RejectTokenRedistribution,
 
     // ── IWIM (post-Gatekeeper veto gate) ──
     RejectIwimVeto,
@@ -156,6 +157,7 @@ impl GatekeeperReasonCode {
             "REJECT_SYBIL_INTERFERENCE" => Self::RejectSybilInterference,
             "REJECT_LOW_ALPHA" => Self::RejectLowAlpha,
             "REJECT_LOW_PROSPERITY" => Self::RejectLowProsperity,
+            "REJECT_TOKEN_REDISTRIBUTION" => Self::RejectTokenRedistribution,
             "REJECT_IWIM_VETO" => Self::RejectIwimVeto,
             "REJECT_IWIM_LOW_CONF" => Self::RejectIwimLowConf,
             "REJECT_IWIM_UNKNOWN_STRICT" => Self::RejectIwimUnknownStrict,
@@ -208,6 +210,7 @@ mod tests {
             GatekeeperReasonCode::BuyNormal,
             GatekeeperReasonCode::HardFailStrictMetricThreshold,
             GatekeeperReasonCode::RejectPddEntryDrift,
+            GatekeeperReasonCode::RejectTokenRedistribution,
             GatekeeperReasonCode::TimeoutPhase1NoData,
             GatekeeperReasonCode::ShadowInsufficientData,
         ];

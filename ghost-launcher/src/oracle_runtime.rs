@@ -32,6 +32,7 @@ use crate::config::{
 use crate::events::{
     AccountUpdateEvent, CanonicalRuntimePermitV1, DetectedPool, EventBusSender,
     ExecutionJoinMetadata, FundingTransferObserved, GhostEvent, PoolTransaction, PostBuySource,
+    TokenRedistributionDetected, TokenRedistributionPhase,
 };
 use crate::rug_scalp_v2::{
     append_rug_scalp_jsonl_record, RugScalpCanonicalStateV2, RugScalpEntryAttemptRecordV2,
@@ -47,6 +48,7 @@ use crate::session::observation::CanonicalMutationApplyOutcomeV1;
 use crate::session::{
     OpenSessionRequest, PoolObservationSession, SessionConfig, SessionManager, SharedSession,
 };
+use crate::token_redistribution::{TokenRedistributionConfig, TokenRedistributionIndex};
 use crate::tx_intelligence::{CrossPoolVelocityConfig, FundingSourceConfig};
 use ghost_brain::config::PanicConfig;
 use ghost_brain::execution::backend::Lane;
@@ -1927,6 +1929,7 @@ pub struct OracleRuntimeConfig {
     pub session: SessionRuntimeConfig,
     pub tx_intelligence: TxIntelligenceRuntimeConfig,
     pub funding_source_config: FundingSourceConfig,
+    pub token_redistribution: TokenRedistributionConfig,
     /// Frozen startup-resolved metric-contract settings. PR2A validates and
     /// retains this value for PR2B; it does not materialize the MFS root.
     pub metric_contract_effective_config:
@@ -1998,6 +2001,7 @@ impl OracleRuntimeConfig {
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(
                 &GatekeeperV2Config::default(),
             ),
+            token_redistribution: TokenRedistributionConfig::default(),
             metric_contract_effective_config: None,
             metric_contract_funding_source_producer_config: None,
             metric_contract_pr2c_enabled: false,
@@ -2025,6 +2029,7 @@ impl OracleRuntimeConfig {
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(
                 &GatekeeperV2Config::default(),
             ),
+            token_redistribution: TokenRedistributionConfig::default(),
             metric_contract_effective_config: None,
             metric_contract_funding_source_producer_config: None,
             metric_contract_pr2c_enabled: false,
@@ -2093,6 +2098,7 @@ impl Default for OracleRuntimeConfig {
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(
                 &GatekeeperV2Config::default(),
             ),
+            token_redistribution: TokenRedistributionConfig::default(),
             metric_contract_effective_config: None,
             metric_contract_funding_source_producer_config: None,
             metric_contract_pr2c_enabled: false,
@@ -2241,6 +2247,7 @@ pub struct OracleRuntime {
     shadow_ledger: Arc<ShadowLedger>,
     rpc_client: Option<Arc<RpcClient>>,
     session_manager: Arc<SessionManager>,
+    token_redistribution_index: Arc<TokenRedistributionIndex>,
 
     live_pipeline: Arc<ghost_core::shadow_ledger::LivePipeline>,
     commit_coordinator: Arc<LauncherCommitCoordinator>,
@@ -2846,6 +2853,10 @@ impl OracleRuntime {
             config.p37_shadow_probe.max_scan_concurrent,
             config.p37_shadow_probe.max_concurrent,
         ));
+        let token_redistribution_index = Arc::new(TokenRedistributionIndex::new(
+            config.token_redistribution,
+            config.session.max_sessions.saturating_mul(2).max(1),
+        ));
         let runtime = Self {
             config,
             hyper_oracle,
@@ -2854,6 +2865,7 @@ impl OracleRuntime {
             shadow_ledger,
             rpc_client,
             session_manager,
+            token_redistribution_index,
             live_pipeline,
             commit_coordinator: Arc::new(LauncherCommitCoordinator::new()),
             committed_bootstrap_snapshots: RwLock::new(HashMap::new()),
@@ -2945,6 +2957,10 @@ impl OracleRuntime {
 
     pub fn session_manager(&self) -> Arc<SessionManager> {
         Arc::clone(&self.session_manager)
+    }
+
+    pub fn token_redistribution_index(&self) -> Arc<TokenRedistributionIndex> {
+        Arc::clone(&self.token_redistribution_index)
     }
 
     pub fn execution_account_evidence_store(&self) -> Arc<ExecutionAccountEvidenceStore> {
@@ -17788,6 +17804,8 @@ enum PoolObservationMsg {
         Option<CanonicalMutationApplyReceiptV1>,
         CanonicalMutationApplyOutcomeV1,
     ),
+    /// One-shot deterministic owner fan-out signal for this pool.
+    TokenRedistribution(Arc<TokenRedistributionDetected>),
 }
 
 /// Result sent back from a per-pool task on terminal verdict.
@@ -18449,6 +18467,26 @@ enum PoolObservationEnqueueOutcomeV1 {
     Failed,
 }
 
+async fn dispatch_token_redistribution_exit(
+    ctx: &PoolObservationContext,
+    signal: TokenRedistributionDetected,
+) -> bool {
+    let event = GhostEvent::token_redistribution_detected(signal);
+    if let Some(sender) = ctx.post_buy_tx.as_ref() {
+        if sender
+            .send(DirectPostBuyHandoff::without_ack(event.clone()))
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+        warn!(
+            "Token redistribution direct post-buy lane closed; falling back to the canonical event bus"
+        );
+    }
+    ctx.event_tx.send(event).is_ok()
+}
+
 fn enqueue_pool_observation_msg(
     sender: &tokio::sync::mpsc::Sender<PoolObservationMsg>,
     pool_id: Pubkey,
@@ -18574,6 +18612,42 @@ struct FscAuthoritativeBuyGateStatus {
     coverage_window_ready: bool,
     authoritative_buy_gate_open: bool,
     coverage_window_remaining_ms: u64,
+}
+
+fn track_token_redistribution_pre_buy(
+    index: &TokenRedistributionIndex,
+    pool_id: Pubkey,
+    base_mint: Pubkey,
+    pool: &DetectedPool,
+    now_ms: u64,
+) -> bool {
+    let mut market_accounts = vec![pool_id];
+    if let Ok(bonding_curve) = Pubkey::from_str(&pool.bonding_curve) {
+        market_accounts.push(bonding_curve);
+    }
+    index.track_pre_buy(pool_id, base_mint, market_accounts, now_ms)
+}
+
+fn add_token_redistribution_market_accounts_from_tx(
+    index: &TokenRedistributionIndex,
+    mint: Pubkey,
+    pool_id: Pubkey,
+    tx: &PoolTransaction,
+) {
+    let mut accounts = vec![pool_id];
+    for candidate in [
+        tx.associated_bonding_curve.as_deref(),
+        tx.creator_vault.as_deref(),
+        tx.bonding_curve_v2.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(account) = Pubkey::from_str(candidate) {
+            accounts.push(account);
+        }
+    }
+    index.add_market_accounts(mint, accounts);
 }
 
 fn observe_funding_transfer(
@@ -19196,6 +19270,7 @@ async fn hydrate_buy_path_metadata(
                         }
                         continue;
                     }
+                    Some(PoolObservationMsg::TokenRedistribution(_)) => continue,
                     None => return BuyPathMetadataSource::Missing,
                 }
             }
@@ -19289,6 +19364,7 @@ fn apply_trigger_readiness_message(
                     .fail_canonical_apply(receipt);
             }
         }
+        PoolObservationMsg::TokenRedistribution(_) => {}
     }
 }
 
@@ -19573,6 +19649,7 @@ fn apply_active_buy_route_evidence_message(
             }
             None
         }
+        PoolObservationMsg::TokenRedistribution(_) => None,
     }
 }
 
@@ -20141,6 +20218,11 @@ async fn execute_gatekeeper_buy_path(
                                     }
                                     bought = applied.bought;
                                     retain_runtime_pool = applied.retain_runtime_pool;
+                                    if bought || retain_runtime_pool {
+                                        ctx.oracle_runtime
+                                            .token_redistribution_index
+                                            .promote_post_buy(&buy_mint);
+                                    }
                                     buy_close_reason = applied.close_reason;
                                     shadow_execution_outcome = applied.shadow_execution_outcome;
                                 }
@@ -25701,6 +25783,13 @@ async fn pool_observation_task(
                         );
                         Ok(GatekeeperVerdict::Wait)
                     }
+                    Some(PoolObservationMsg::TokenRedistribution(signal)) => {
+                        let mut session = session.write();
+                        Ok(session.gatekeeper_buffer_mut().reject_token_redistribution(
+                            &signal.source_owner,
+                            signal.distinct_recipient_count,
+                        ))
+                    }
                     None => {
                         // Channel closed — force terminal evaluation on the collected snapshot.
                         let mut session = session.write();
@@ -25792,6 +25881,26 @@ async fn pool_observation_task(
                 );
                 return;
             }
+        };
+
+        let verdict = if matches!(&verdict, GatekeeperVerdict::Buy { .. }) {
+            base_mint_pubkey
+                .and_then(|mint| {
+                    ctx.oracle_runtime
+                        .token_redistribution_index
+                        .signal_for_mint(&mint)
+                })
+                .map_or(verdict, |signal| {
+                    session
+                        .write()
+                        .gatekeeper_buffer_mut()
+                        .reject_token_redistribution(
+                            &signal.source_owner,
+                            signal.distinct_recipient_count,
+                        )
+                })
+        } else {
+            verdict
         };
 
         match verdict {
@@ -27056,6 +27165,9 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         "startup",
         true,
     );
+    oracle_runtime
+        .token_redistribution_index
+        .set_stream_available(authoritative_funding_stream_available);
 
     let ctx = Arc::new(PoolObservationContext {
         oracle_runtime: oracle_runtime.clone(),
@@ -27277,6 +27389,9 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                 "seer_lane_health",
                                 false,
                             );
+                            ctx.oracle_runtime
+                                .token_redistribution_index
+                                .set_stream_available(available);
                             refresh_fsc_authoritative_buy_gate_status(
                                 ctx.session_manager.as_ref(),
                                 &ctx.funding_source_config,
@@ -27288,7 +27403,10 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         }
                         Err(_) => {
                             authoritative_funding_stream_signal_closed = true;
-                            warn!("FSC authoritative funding availability signal closed; retaining last known state");
+                            ctx.oracle_runtime
+                                .token_redistribution_index
+                                .set_stream_available(false);
+                            warn!("FSC authoritative funding availability signal closed; token redistribution coverage marked unavailable");
                         }
                     }
                 }
@@ -27405,6 +27523,9 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                 "event_bus_lagged",
                             );
                         ctx.session_manager.mark_metric_contract_stream_gap();
+                        ctx.oracle_runtime
+                            .token_redistribution_index
+                            .mark_coverage_gap();
                         if let Some(tape) = rug_scalp_validation_tape.as_mut() {
                             let records = tape.mark_stream_gap("oracle_broadcast_lag");
                             let _ = enqueue_rug_scalp_validation_records(
@@ -27519,6 +27640,25 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                         {
                                             oracle_runtime
                                                 .remember_detected_pool(pool_id, pool_data.clone());
+                                            if !track_token_redistribution_pre_buy(
+                                                oracle_runtime.token_redistribution_index.as_ref(),
+                                                pool_id,
+                                                base_mint,
+                                                pool_data.as_ref(),
+                                                registered_wall_ts_ms,
+                                            ) {
+                                                warn!(
+                                                    pool = %pool_id,
+                                                    mint = %base_mint,
+                                                    "Token redistribution state cap reached; pool metadata delivery failed closed"
+                                                );
+                                                if let Some(receipt) = apply_receipt.as_ref() {
+                                                    let _ = oracle_runtime
+                                                        .candidate_integrity_registry
+                                                        .fail_canonical_apply(receipt);
+                                                }
+                                                continue;
+                                            }
                                         }
                                         // Forward pool data to existing task
                                         let delivery = enqueue_pool_observation_msg(
@@ -27558,6 +27698,30 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                     if apply_outcome
                                         == CanonicalMutationApplyOutcomeV1::AppliedNewMutation
                                     {
+                                        if !track_token_redistribution_pre_buy(
+                                            oracle_runtime.token_redistribution_index.as_ref(),
+                                            pool_id,
+                                            base_mint,
+                                            pool_data.as_ref(),
+                                            registered_wall_ts_ms,
+                                        ) {
+                                            warn!(
+                                                pool = %pool_id,
+                                                mint = %base_mint,
+                                                "Token redistribution state cap reached; pool registration failed closed"
+                                            );
+                                            if let Some(receipt) = apply_receipt.as_ref() {
+                                                let _ = oracle_runtime
+                                                    .candidate_integrity_registry
+                                                    .fail_canonical_apply(receipt);
+                                            }
+                                            snapshot_engine.remove_pool(pool_id);
+                                            let _ = oracle_runtime.remove_pool_with_reason(
+                                                pool_id,
+                                                "token_redistribution_state_cap",
+                                            );
+                                            continue;
+                                        }
                                         // Spawn per-pool observation task
                                         let (task_tx, task_rx) = tokio::sync::mpsc::channel(
                                             POOL_TASK_CHANNEL_CAPACITY,
@@ -27671,6 +27835,14 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                 base_mint,
                                 tx.as_ref(),
                             );
+                            if let Some(mint) = base_mint {
+                                add_token_redistribution_market_accounts_from_tx(
+                                    oracle_runtime.token_redistribution_index.as_ref(),
+                                    mint,
+                                    pool_id,
+                                    tx.as_ref(),
+                                );
+                            }
 
                             // RUG signal ownership is intentionally parallel to
                             // Gatekeeper routing.  It sees canonical evidence,
@@ -28066,6 +28238,86 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         }
                     }
 
+                    GhostEvent::TokenTransferObserved(transfer) => {
+                        if let Some(mut signal) = oracle_runtime
+                            .token_redistribution_index
+                            .observe(transfer.as_ref())
+                        {
+                            ::metrics::counter!(
+                                "token_redistribution_detected_total",
+                                1u64,
+                                "phase" => match signal.phase {
+                                    TokenRedistributionPhase::PreBuy => "pre_buy",
+                                    TokenRedistributionPhase::PostBuy => "post_buy",
+                                }
+                            );
+                            warn!(
+                                pool = %signal.pool_amm_id,
+                                mint = %signal.base_mint,
+                                source_owner = %signal.source_owner,
+                                distinct_recipients = signal.distinct_recipient_count,
+                                phase = ?signal.phase,
+                                signature = %signal.signature,
+                                slot = ?signal.slot,
+                                event_ordinal = signal.event_ordinal,
+                                "TOKEN_REDISTRIBUTION_DETECTED"
+                            );
+
+                            if signal.phase == TokenRedistributionPhase::PreBuy {
+                                if let Some(handle) = pool_task_handles.get(&signal.pool_amm_id) {
+                                    let task_tx = handle.tx.clone();
+                                    if task_tx
+                                        .send(PoolObservationMsg::TokenRedistribution(Arc::new(
+                                            signal.clone(),
+                                        )))
+                                        .await
+                                        .is_err()
+                                    {
+                                        oracle_runtime
+                                            .candidate_integrity_registry
+                                            .close_candidate_admission_with_integrity_invalidation(
+                                                "token_redistribution_signal_delivery_failed",
+                                            );
+                                        warn!(
+                                            pool = %signal.pool_amm_id,
+                                            mint = %signal.base_mint,
+                                            "Token redistribution pre-buy signal delivery failed closed"
+                                        );
+                                    }
+                                    continue;
+                                }
+
+                                let post_buy_active = oracle_runtime
+                                    .effective_runtime_pool_state(
+                                        &signal.pool_amm_id,
+                                        Some(&signal.base_mint),
+                                    )
+                                    .is_some_and(PoolState::allows_runtime_relay);
+                                if !post_buy_active {
+                                    oracle_runtime
+                                        .token_redistribution_index
+                                        .remove_mint(&signal.base_mint);
+                                    continue;
+                                }
+                                oracle_runtime
+                                    .token_redistribution_index
+                                    .promote_post_buy(&signal.base_mint);
+                                signal.phase = TokenRedistributionPhase::PostBuy;
+                            }
+
+                            if !dispatch_token_redistribution_exit(ctx.as_ref(), signal.clone()).await {
+                                oracle_runtime
+                                    .token_redistribution_index
+                                    .mark_coverage_gap();
+                                error!(
+                                    pool = %signal.pool_amm_id,
+                                    mint = %signal.base_mint,
+                                    "Token redistribution post-buy EXIT signal could not be delivered"
+                                );
+                            }
+                        }
+                    }
+
                     GhostEvent::FundingTransferObserved(transfer) => {
                         observe_funding_transfer(
                             ctx.session_manager.as_ref(),
@@ -28160,6 +28412,13 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
             }
 
             Some(result) = result_rx.recv() => {
+                if result.bought || result.retain_runtime_pool {
+                    if let Some(mint) = result.base_mint {
+                        oracle_runtime
+                            .token_redistribution_index
+                            .promote_post_buy(&mint);
+                    }
+                }
                 if let Some(handle) = pool_task_handles.remove(&result.pool_id) {
                     if let Err(error) = handle.join_handle.await {
                         warn!(
@@ -28214,6 +28473,11 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         }
                     }
                     snapshot_engine.remove_pool(result.pool_id);
+                    if let Some(mint) = result.base_mint {
+                        oracle_runtime
+                            .token_redistribution_index
+                            .remove_mint(&mint);
+                    }
                     let _ = oracle_runtime
                         .remove_pool_with_reason(result.pool_id, "pool_task_done_cleanup");
                 } else if result.retain_runtime_pool {
