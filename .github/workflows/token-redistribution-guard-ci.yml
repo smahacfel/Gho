@@ -1,0 +1,56 @@
+name: Materialize Token Redistribution Guard
+
+on:
+  push:
+    branches:
+      - agent/token-redistribution-guard
+    paths:
+      - .github/workflows/token-redistribution-guard-ci.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply candidate diff
+        run: |
+          cat ci/token-guard.patch.part* | base64 -d | gzip -d > /tmp/token_guard.patch
+          git apply --check /tmp/token_guard.patch
+          git apply /tmp/token_guard.patch
+          base64 -d ci/token-guard-new-file.patch.gz.b64 | gzip -d > /tmp/token_guard_new_file.patch
+          git apply --check /tmp/token_guard_new_file.patch
+          git apply /tmp/token_guard_new_file.patch
+
+      - name: Format candidate
+        run: |
+          rustup component add rustfmt
+          cargo fmt --all
+
+      - name: Commit materialized implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            config.toml \
+            ghost-brain/src/oracle/reason_code.rs \
+            ghost-launcher/src/components/gatekeeper.rs \
+            ghost-launcher/src/components/post_buy_runtime.rs \
+            ghost-launcher/src/components/seer.rs \
+            ghost-launcher/src/config.rs \
+            ghost-launcher/src/events.rs \
+            ghost-launcher/src/lib.rs \
+            ghost-launcher/src/main.rs \
+            ghost-launcher/src/oracle_runtime.rs \
+            ghost-launcher/src/token_redistribution.rs \
+            off-chain/components/seer/src/ipc.rs \
+            off-chain/components/seer/src/lib.rs
+          git diff --cached --stat
+          git commit -m "feat: add token redistribution guard"
+          git push origin HEAD:agent/token-redistribution-guard

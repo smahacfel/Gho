@@ -1,0 +1,28 @@
+name: Export Token Guard Source
+
+on:
+  push:
+    branches:
+      - agent/token-redistribution-guard
+    paths:
+      - .github/workflows/export-token-guard-source.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Pack source snapshot
+        run: tar --exclude=.git -czf /tmp/ghost-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghost-token-guard-source
+          path: /tmp/ghost-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error

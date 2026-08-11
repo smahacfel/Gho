@@ -35,6 +35,7 @@ use crate::components::live_tx_sender::{
 use crate::components::trigger::safety::{PositionLimitTracker, PositionSlotId, SafetyViolation};
 use crate::events::{
     EventBusReceiver, GhostEvent, PostBuySource, RuntimePlane, ShadowV2EntryBoundaryPayload,
+    TokenRedistributionDetected,
 };
 use crate::rug_scalp_v2::{
     append_rug_scalp_jsonl_record, RugScalpOutcomeRecordV2, RugScalpTerminalOutcomeV2,
@@ -43,6 +44,7 @@ use crate::rug_scalp_v2::{
 use crate::rug_scalp_validation_tape::{
     RugScalpValidationTapeBusV1, RugScalpValidationTapeEventV1, RugScalpValidationTerminalStatusV1,
 };
+use crate::token_redistribution::TokenRedistributionIndex;
 use futures::{stream, StreamExt};
 use ghost_brain::config::ghost_brain_config::ShadowV2BurninConfig;
 use ghost_brain::events::{EventEmitter, EventWriterConfig};
@@ -348,6 +350,9 @@ pub struct PostBuyRuntimeConfig {
     pub rug_scalp_validation_tape_bus: Option<RugScalpValidationTapeBusV1>,
     /// Optional Shadow V2 logging-only validation config. This must never feed decisions.
     pub shadow_v2_burnin: Option<ShadowV2BurninConfig>,
+    /// Shared lifecycle-bounded redistribution state. Used only to release the
+    /// mint after a canonical post-buy close; it never owns SELL execution.
+    pub token_redistribution_index: Option<Arc<TokenRedistributionIndex>>,
 }
 
 impl Default for PostBuyRuntimeConfig {
@@ -377,6 +382,7 @@ impl Default for PostBuyRuntimeConfig {
             rug_scalp_outcome_log_path: None,
             rug_scalp_validation_tape_bus: None,
             shadow_v2_burnin: None,
+            token_redistribution_index: None,
         }
     }
 }
@@ -1571,6 +1577,7 @@ enum LiveExitStatus {
     Monitoring,
     ExitTriggeredTakeProfit,
     ExitTriggeredStopLoss,
+    ExitTriggeredTokenRedistribution,
     ExitSubmitted,
     ExitConfirmed,
     EntryPriceFailed,
@@ -1591,6 +1598,7 @@ impl LiveExitStatus {
             Self::Monitoring => "monitoring",
             Self::ExitTriggeredTakeProfit => "exit_triggered_take_profit",
             Self::ExitTriggeredStopLoss => "exit_triggered_stop_loss",
+            Self::ExitTriggeredTokenRedistribution => "exit_triggered_token_redistribution",
             Self::ExitSubmitted => "exit_submitted",
             Self::ExitConfirmed => "exit_confirmed",
             Self::EntryPriceFailed => "entry_price_failed",
@@ -1608,6 +1616,7 @@ impl LiveExitStatus {
 enum LiveExitTrigger {
     TakeProfit,
     StopLoss,
+    TokenRedistribution,
 }
 
 impl LiveExitTrigger {
@@ -1615,11 +1624,21 @@ impl LiveExitTrigger {
         match self {
             Self::TakeProfit => "take_profit",
             Self::StopLoss => "stop_loss",
+            Self::TokenRedistribution => "token_redistribution",
+        }
+    }
+
+    const fn triggered_status(self) -> LiveExitStatus {
+        match self {
+            Self::TakeProfit => LiveExitStatus::ExitTriggeredTakeProfit,
+            Self::StopLoss => LiveExitStatus::ExitTriggeredStopLoss,
+            Self::TokenRedistribution => LiveExitStatus::ExitTriggeredTokenRedistribution,
         }
     }
 }
 
 type LiveExitResult = std::result::Result<(), (LiveExitStatus, String)>;
+type LiveExitCommandRegistry = Arc<ParkingMutex<HashMap<Pubkey, mpsc::Sender<LiveExitTrigger>>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LiveWalletPosition {
@@ -2923,6 +2942,7 @@ pub async fn run(
 
     let mut shadow_runtime_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut shadow_signal_router_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut shadow_position_book: Option<Arc<RwLock<ShadowPositionBook>>> = None;
     let shadow_monitor = if config.execution_mode == "shadow" {
         match config.shadow_ledger.clone() {
             Some(shadow_ledger) => {
@@ -2931,9 +2951,12 @@ pub async fn run(
                 let exit_replay_enabled = guardian_config.exit_replay_v1.enabled;
                 let (signal_tx, signal_rx) =
                     mpsc::channel(guardian_config.signal_channel_buffer.max(1));
-                let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
-                    RwLock::new(ShadowPositionBook::with_time_stop_ms(wait_for_timestop_ms)),
+                let position_book = Arc::new(RwLock::new(ShadowPositionBook::with_time_stop_ms(
+                    wait_for_timestop_ms,
                 )));
+                shadow_position_book = Some(Arc::clone(&position_book));
+                let runtime_router =
+                    Arc::new(PositionRuntimeRouter::with_shadow_book(position_book));
                 let mut monitoring_engine =
                     match MonitoringEngine::try_new(guardian_config, shadow_ledger, signal_tx) {
                         Ok(engine) => engine,
@@ -3167,6 +3190,7 @@ pub async fn run(
     );
     maybe_emit_shadow_v2_validation_smoke_marker(&shadow_v2_harness, &config);
 
+    let live_exit_commands: LiveExitCommandRegistry = Arc::new(ParkingMutex::new(HashMap::new()));
     let mut epoch_counter: u64 = 1;
     let mut lifecycle_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut draining_shutdown = false;
@@ -3240,6 +3264,8 @@ pub async fn run(
                             &lifecycle,
                             shadow_monitor.as_ref(),
                             probe_monitor.as_ref(),
+                            shadow_position_book.as_ref(),
+                            &live_exit_commands,
                             &mut epoch_counter,
                             &mut lifecycle_handles,
                             &mut recent_handoffs,
@@ -3283,6 +3309,8 @@ pub async fn run(
                                 &lifecycle,
                                 shadow_monitor.as_ref(),
                                 probe_monitor.as_ref(),
+                                shadow_position_book.as_ref(),
+                                &live_exit_commands,
                                 &mut epoch_counter,
                                 &mut lifecycle_handles,
                                 &mut recent_handoffs,
@@ -3492,6 +3520,57 @@ pub async fn run(
     );
 }
 
+async fn request_token_redistribution_exit(
+    signal: &TokenRedistributionDetected,
+    config: &PostBuyRuntimeConfig,
+    shadow_position_book: Option<&Arc<RwLock<ShadowPositionBook>>>,
+    live_exit_commands: &LiveExitCommandRegistry,
+) -> bool {
+    let requested = match config.execution_mode.as_str() {
+        "live" | "dual" => {
+            let sender = live_exit_commands.lock().get(&signal.base_mint).cloned();
+            match sender {
+                Some(sender) => match sender.try_send(LiveExitTrigger::TokenRedistribution) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                },
+                None => false,
+            }
+        }
+        "shadow" => match shadow_position_book {
+            Some(book) => book.write().await.force_exit_all(&signal.base_mint),
+            None => false,
+        },
+        _ => false,
+    };
+
+    ::metrics::counter!(
+        "post_buy_token_redistribution_exit_request_total",
+        1u64,
+        "mode" => config.execution_mode.clone(),
+        "result" => if requested { "accepted" } else { "unavailable" }
+    );
+    if requested {
+        warn!(
+            runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+            pool = %signal.pool_amm_id,
+            base_mint = %signal.base_mint,
+            source_owner = %signal.source_owner,
+            distinct_recipients = signal.distinct_recipient_count,
+            "PostBuyRuntime: token redistribution requested canonical full exit"
+        );
+    } else {
+        warn!(
+            runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+            pool = %signal.pool_amm_id,
+            base_mint = %signal.base_mint,
+            mode = %config.execution_mode,
+            "PostBuyRuntime: token redistribution exit request has no active canonical position"
+        );
+    }
+    requested
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "runtime orchestration keeps independently owned dependencies explicit at the handoff boundary"
@@ -3502,12 +3581,29 @@ async fn handle_post_buy_event(
     lifecycle: &Arc<PaperPositionLifecycle>,
     shadow_monitor: Option<&Arc<MonitoringEngine>>,
     probe_monitor: Option<&Arc<MonitoringEngine>>,
+    shadow_position_book: Option<&Arc<RwLock<ShadowPositionBook>>>,
+    live_exit_commands: &LiveExitCommandRegistry,
     epoch_counter: &mut u64,
     lifecycle_handles: &mut Vec<tokio::task::JoinHandle<()>>,
     recent_handoffs: &mut RecentPostBuyCache,
     shadow_v2_harness: &Option<Arc<ParkingMutex<ShadowV2ValidationHarness>>>,
     admission_writer: Option<&PostBuyAdmissionWriter>,
 ) -> DirectPostBuyHandoffAck {
+    if let GhostEvent::TokenRedistributionDetected(signal) = &event {
+        return if request_token_redistribution_exit(
+            signal.as_ref(),
+            config,
+            shadow_position_book,
+            live_exit_commands,
+        )
+        .await
+        {
+            DirectPostBuyHandoffAck::Accepted
+        } else {
+            DirectPostBuyHandoffAck::Rejected("token_redistribution_exit_unavailable")
+        };
+    }
+
     let GhostEvent::PostBuySubmitted {
         candidate_id,
         pool_amm_id,
@@ -3675,6 +3771,19 @@ async fn handle_post_buy_event(
                 tip_lamports,
                 position_slot_id,
             );
+            let (exit_command_tx, exit_command_rx) = mpsc::channel(1);
+            live_exit_commands
+                .lock()
+                .insert(mint_pubkey, exit_command_tx.clone());
+            if config
+                .token_redistribution_index
+                .as_ref()
+                .and_then(|index| index.signal_for_mint(&mint_pubkey))
+                .is_some()
+            {
+                let _ = exit_command_tx.try_send(LiveExitTrigger::TokenRedistribution);
+            }
+            let live_exit_commands = Arc::clone(live_exit_commands);
             let handle = tokio::spawn(async move {
                 run_live_sell_lifecycle(
                     live,
@@ -3683,6 +3792,8 @@ async fn handle_post_buy_event(
                     position_limit_tracker,
                     sell_slippage_bps,
                     live_position_registry,
+                    exit_command_rx,
+                    live_exit_commands,
                 )
                 .await;
             });
@@ -3812,6 +3923,20 @@ async fn handle_post_buy_event(
             append_post_buy_admission_record(admission_writer, &registered_record);
         }
         if matches!(handoff.ack, DirectPostBuyHandoffAck::Accepted) {
+            if let (Some(index), Ok(mint)) = (
+                config.token_redistribution_index.as_ref(),
+                Pubkey::from_str(&base_mint),
+            ) {
+                if let Some(signal) = index.signal_for_mint(&mint) {
+                    let _ = request_token_redistribution_exit(
+                        &signal,
+                        config,
+                        shadow_position_book,
+                        live_exit_commands,
+                    )
+                    .await;
+                }
+            }
             maybe_emit_shadow_v2_position_created(
                 shadow_v2_harness,
                 config,
@@ -3858,6 +3983,7 @@ async fn handle_post_buy_event(
                             position_epoch: handoff.position_id.as_ref().map(|_| epoch),
                             admission_writer: admission_writer.cloned(),
                         },
+                        config.token_redistribution_index.clone(),
                     ));
                 } else {
                     ::metrics::counter!(
@@ -5033,21 +5159,24 @@ fn spawn_shadow_terminal_watcher(
     position_limit_tracker: PositionLimitTracker,
     slot_id: PositionSlotId,
     admission_context: ShadowTerminalWatcherAdmissionContext,
+    token_redistribution_index: Option<Arc<TokenRedistributionIndex>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let (disposition, action_id, reason) = match terminal_rx.await {
+        let (disposition, action_id, reason, position_closed) = match terminal_rx.await {
             Ok(ShadowTerminalDisposition::SimulatedClosed {
                 action_id, reason, ..
-            }) => ("simulated_closed", Some(action_id), reason),
+            }) => ("simulated_closed", Some(action_id), reason, true),
             Ok(ShadowTerminalDisposition::SimulationBlocked { action_id, reason }) => (
                 "simulation_blocked",
                 Some(action_id),
                 reason.as_label().to_string(),
+                false,
             ),
             Err(_) => (
                 "terminal_channel_dropped",
                 None,
                 "terminal_channel_dropped".to_string(),
+                false,
             ),
         };
         ::metrics::counter!(
@@ -5078,6 +5207,15 @@ fn spawn_shadow_terminal_watcher(
         record.release_status = Some(release_status);
         record.release_reason = Some(reason.clone());
         append_post_buy_admission_record(admission_context.admission_writer.as_ref(), &record);
+
+        if position_closed {
+            if let (Some(index), Ok(mint)) = (
+                token_redistribution_index.as_ref(),
+                Pubkey::from_str(&admission_context.base_mint),
+            ) {
+                index.remove_mint(&mint);
+            }
+        }
 
         if release_status == "already_released" {
             warn!(
@@ -5840,6 +5978,7 @@ async fn monitor_live_exit_session(
     live: &LiveSellHandle,
     session: &mut LiveExitSession,
     sell_slippage_bps: u16,
+    exit_command_rx: &mut mpsc::Receiver<LiveExitTrigger>,
 ) -> LiveExitResult {
     let poll_interval = Duration::from_millis(LIVE_SELL_POLL_MS);
     let snapshot_interval = Duration::from_secs(1);
@@ -5848,8 +5987,18 @@ async fn monitor_live_exit_session(
         .unwrap_or_else(Instant::now);
     let mut unavailable_polls = 0u32;
     let mut execution_retry_count = 0u32;
+    let mut forced_trigger: Option<LiveExitTrigger> = None;
+    let mut exit_command_open = true;
 
     loop {
+        if forced_trigger.is_none() && exit_command_open {
+            match exit_command_rx.try_recv() {
+                Ok(trigger) => forced_trigger = Some(trigger),
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => exit_command_open = false,
+            }
+        }
+
         let price_sample = read_live_price_sample(live, &session.base_mint).await;
 
         if let Some(price_sample) = price_sample {
@@ -5872,12 +6021,11 @@ async fn monitor_live_exit_session(
                 last_snapshot_at = Instant::now();
             }
 
-            if let Some(trigger) = determine_live_exit_trigger(session, price_sample.price) {
+            let trigger =
+                forced_trigger.or_else(|| determine_live_exit_trigger(session, price_sample.price));
+            if let Some(trigger) = trigger {
                 record_live_exit_trigger(trigger);
-                session.transition(match trigger {
-                    LiveExitTrigger::TakeProfit => LiveExitStatus::ExitTriggeredTakeProfit,
-                    LiveExitTrigger::StopLoss => LiveExitStatus::ExitTriggeredStopLoss,
-                });
+                session.transition(trigger.triggered_status());
                 let attempt_number = execution_retry_count as usize + 1;
 
                 let built_transaction = build_full_exit_transaction_with_retry(
@@ -5920,7 +6068,9 @@ async fn monitor_live_exit_session(
             }
         } else {
             unavailable_polls = unavailable_polls.saturating_add(1);
-            if unavailable_polls >= LIVE_EXIT_MONITORING_UNAVAILABLE_MAX_POLLS {
+            if forced_trigger.is_none()
+                && unavailable_polls >= LIVE_EXIT_MONITORING_UNAVAILABLE_MAX_POLLS
+            {
                 return Err((
                     LiveExitStatus::MonitoringUnavailable,
                     format!("price_unavailable_for_{unavailable_polls}_polls"),
@@ -5932,6 +6082,7 @@ async fn monitor_live_exit_session(
                 base_mint = %session.base_mint,
                 unavailable_polls,
                 max_unavailable_polls = LIVE_EXIT_MONITORING_UNAVAILABLE_MAX_POLLS,
+                forced_exit_pending = forced_trigger.is_some(),
                 "LiveExit: no canonical or point-query price available"
             );
             if last_snapshot_at.elapsed() >= snapshot_interval {
@@ -5946,7 +6097,19 @@ async fn monitor_live_exit_session(
             }
         }
 
-        tokio::time::sleep(poll_interval).await;
+        if forced_trigger.is_none() && exit_command_open {
+            tokio::select! {
+                command = exit_command_rx.recv() => {
+                    match command {
+                        Some(trigger) => forced_trigger = Some(trigger),
+                        None => exit_command_open = false,
+                    }
+                }
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+        } else {
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 }
 
@@ -5956,9 +6119,10 @@ async fn run_live_sell_lifecycle_inner(
     config: &PostBuyRuntimeConfig,
     sell_slippage_bps: u16,
     live_position_registry: Option<&LivePositionRegistry>,
+    exit_command_rx: &mut mpsc::Receiver<LiveExitTrigger>,
 ) -> LiveExitResult {
     initialize_live_exit_session(live, session, live_position_registry, config).await?;
-    monitor_live_exit_session(live, session, sell_slippage_bps).await
+    monitor_live_exit_session(live, session, sell_slippage_bps, exit_command_rx).await
 }
 
 async fn run_live_sell_lifecycle(
@@ -5968,6 +6132,8 @@ async fn run_live_sell_lifecycle(
     position_limit_tracker: Option<PositionLimitTracker>,
     sell_slippage_bps: u16,
     live_position_registry: Option<LivePositionRegistry>,
+    mut exit_command_rx: mpsc::Receiver<LiveExitTrigger>,
+    live_exit_commands: LiveExitCommandRegistry,
 ) {
     let mut session = session;
     if let Err((status, reason)) = run_live_sell_lifecycle_inner(
@@ -5976,6 +6142,7 @@ async fn run_live_sell_lifecycle(
         &config,
         sell_slippage_bps,
         live_position_registry.as_ref(),
+        &mut exit_command_rx,
     )
     .await
     {
@@ -6001,6 +6168,14 @@ async fn run_live_sell_lifecycle(
                     "LiveExit: failed to record closed position in recovery registry"
                 );
             }
+        }
+    }
+
+    live_exit_commands.lock().remove(&session.base_mint);
+
+    if session.status == LiveExitStatus::ExitConfirmed {
+        if let Some(index) = config.token_redistribution_index.as_ref() {
+            index.remove_mint(&session.base_mint);
         }
     }
 

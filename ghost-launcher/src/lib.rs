@@ -48,6 +48,7 @@ pub mod rug_reality_capture;
 pub mod rug_scalp_v2;
 pub mod rug_scalp_validation_tape;
 pub mod session;
+pub mod token_redistribution;
 pub mod tx_intelligence;
 pub mod wal_recovery;
 

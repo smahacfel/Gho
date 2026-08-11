@@ -99,6 +99,7 @@ use grpc_connection::{
 use helius_websocket_adapter::HeliusWebSocketAdapter;
 use ipc::{AccountUpdateReplayOrigin, EventPriority, IpcSender, PoolDetectionRuntimeDispositionV1};
 use metrics::SeerMetrics;
+use once_cell::sync::Lazy;
 use paradox_sensor::ParadoxSensor;
 use parking_lot::{Mutex, RwLock};
 use pumpportal_connection::PumpPortalConnection;
@@ -1079,6 +1080,210 @@ pub fn extract_funding_transfer_observations(
                 instruction.stack_height,
             ) {
                 transfers.push(transfer);
+            }
+            if !has_deeper_next {
+                instruction_ordinal = instruction_ordinal.saturating_add(1);
+            }
+        }
+    }
+
+    transfers
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenTransferObservation {
+    pub mint: Pubkey,
+    pub source_token_account: Pubkey,
+    pub destination_token_account: Pubkey,
+    pub source_owner: Pubkey,
+    pub destination_owner: Pubkey,
+    pub raw_amount: u64,
+    pub event_ordinal: Option<u32>,
+    pub outer_instruction_index: Option<u32>,
+    pub inner_group_index: Option<u32>,
+    pub cpi_stack_height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TokenAccountMetadata {
+    mint: Pubkey,
+    owner: Pubkey,
+}
+
+static LEGACY_TOKEN_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        .expect("valid SPL Token program id")
+});
+static TOKEN_2022_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+        .expect("valid SPL Token-2022 program id")
+});
+
+fn is_spl_token_program(program_id: &Pubkey) -> bool {
+    program_id == &*LEGACY_TOKEN_PROGRAM_ID || program_id == &*TOKEN_2022_PROGRAM_ID
+}
+
+fn token_account_metadata(
+    accounts: &[Pubkey],
+    pre_token_balances: &[types::RawTokenBalance],
+    post_token_balances: &[types::RawTokenBalance],
+) -> HashMap<Pubkey, TokenAccountMetadata> {
+    let mut metadata = HashMap::new();
+    for balance in pre_token_balances.iter().chain(post_token_balances.iter()) {
+        let (Ok(mint), Some(owner)) = (
+            Pubkey::from_str(balance.mint.trim()),
+            balance
+                .owner
+                .as_deref()
+                .map(str::trim)
+                .filter(|owner| !owner.is_empty())
+                .and_then(|owner| Pubkey::from_str(owner).ok()),
+        ) else {
+            continue;
+        };
+        let Some(account) = accounts.get(balance.account_index as usize).copied() else {
+            continue;
+        };
+        metadata
+            .entry(account)
+            .or_insert(TokenAccountMetadata { mint, owner });
+    }
+    metadata
+}
+
+fn parse_spl_transfer_instruction(data: &[u8]) -> Option<(u64, bool)> {
+    match data.first().copied()? {
+        // TokenInstruction::Transfer
+        3 if data.len() >= 9 => Some((u64::from_le_bytes(data[1..9].try_into().ok()?), false)),
+        // TokenInstruction::TransferChecked
+        12 if data.len() >= 10 => Some((u64::from_le_bytes(data[1..9].try_into().ok()?), true)),
+        _ => None,
+    }
+}
+
+fn extracted_token_transfer_from_indices(
+    accounts: &[Pubkey],
+    metadata: &HashMap<Pubkey, TokenAccountMetadata>,
+    account_indices: &[u8],
+    raw_amount: u64,
+    transfer_checked: bool,
+    event_ordinal: Option<u32>,
+    outer_instruction_index: Option<u32>,
+    inner_group_index: Option<u32>,
+    cpi_stack_height: Option<u32>,
+) -> Option<TokenTransferObservation> {
+    if raw_amount == 0 {
+        return None;
+    }
+    let source_position = 0usize;
+    let destination_position = if transfer_checked { 2usize } else { 1usize };
+    let source_token_account = *accounts.get(*account_indices.get(source_position)? as usize)?;
+    let destination_token_account =
+        *accounts.get(*account_indices.get(destination_position)? as usize)?;
+    let source = *metadata.get(&source_token_account)?;
+    let destination = *metadata.get(&destination_token_account)?;
+    if source.mint != destination.mint || source.owner == destination.owner {
+        return None;
+    }
+    if transfer_checked {
+        let instruction_mint = *accounts.get(*account_indices.get(1)? as usize)?;
+        if instruction_mint != source.mint {
+            return None;
+        }
+    }
+    Some(TokenTransferObservation {
+        mint: source.mint,
+        source_token_account,
+        destination_token_account,
+        source_owner: source.owner,
+        destination_owner: destination.owner,
+        raw_amount,
+        event_ordinal,
+        outer_instruction_index,
+        inner_group_index,
+        cpi_stack_height,
+    })
+}
+
+/// Extract every real SPL Token / Token-2022 transfer leg while preserving the
+/// same deterministic instruction ordinal semantics used by FSC extraction.
+pub fn extract_token_transfer_observations(
+    event: &types::GeyserEvent,
+) -> Vec<TokenTransferObservation> {
+    let types::GeyserEvent::Transaction {
+        accounts,
+        instructions,
+        inner_instructions,
+        pre_token_balances,
+        post_token_balances,
+        success,
+        ..
+    } = event
+    else {
+        return Vec::new();
+    };
+    if !success {
+        return Vec::new();
+    }
+
+    let metadata = token_account_metadata(accounts, pre_token_balances, post_token_balances);
+    if metadata.is_empty() {
+        return Vec::new();
+    }
+    let mut transfers = Vec::new();
+    let mut instruction_ordinal = 0u32;
+
+    for (outer_instruction_index, instruction) in instructions.iter().enumerate() {
+        if is_spl_token_program(&instruction.program_id) {
+            if let Some((raw_amount, transfer_checked)) =
+                parse_spl_transfer_instruction(&instruction.data)
+            {
+                if let Some(transfer) = extracted_token_transfer_from_indices(
+                    accounts,
+                    &metadata,
+                    &instruction.account_indices,
+                    raw_amount,
+                    transfer_checked,
+                    Some(instruction_ordinal),
+                    Some(outer_instruction_index as u32),
+                    None,
+                    None,
+                ) {
+                    transfers.push(transfer);
+                }
+            }
+        }
+        instruction_ordinal = instruction_ordinal.saturating_add(1);
+    }
+
+    for group in inner_instructions {
+        for (inner_index, instruction) in group.instructions.iter().enumerate() {
+            let current_height = instruction.stack_height;
+            let next_height = group
+                .instructions
+                .get(inner_index + 1)
+                .and_then(|next| next.stack_height);
+            let has_deeper_next = matches!((current_height, next_height), (Some(current), Some(next)) if next > current);
+            if let Some(program_id) = accounts.get(instruction.program_id_index as usize) {
+                if is_spl_token_program(program_id) {
+                    if let Some((raw_amount, transfer_checked)) =
+                        parse_spl_transfer_instruction(&instruction.data)
+                    {
+                        if let Some(transfer) = extracted_token_transfer_from_indices(
+                            accounts,
+                            &metadata,
+                            &instruction.accounts,
+                            raw_amount,
+                            transfer_checked,
+                            Some(instruction_ordinal),
+                            Some(group.index),
+                            Some(group.index),
+                            instruction.stack_height,
+                        ) {
+                            transfers.push(transfer);
+                        }
+                    }
+                }
             }
             if !has_deeper_next {
                 instruction_ordinal = instruction_ordinal.saturating_add(1);
@@ -3125,6 +3330,11 @@ impl Seer {
         watch_started_at_ms: u64,
         source: &'static str,
     ) {
+        if let Some(funding_connection) = &self.funding_grpc_connection {
+            if matches!(self.config.funding_lane_mode, FundingLaneMode::FullChain) {
+                funding_connection.add_watched_mint(mint);
+            }
+        }
         if let Some(grpc_connection) = &self.grpc_connection {
             grpc_connection.add_watched_mint(mint);
             grpc_connection.watch_pool(curve, amm_program, watch_started_at_ms);
@@ -5826,6 +6036,8 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             .inc();
 
         self.maybe_emit_funding_transfer_observations(&event, source_label, is_synthetic)
+            .await?;
+        self.maybe_emit_token_transfer_observations(&event, source_label, is_synthetic)
             .await
     }
 
@@ -5940,6 +6152,87 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 .map_err(|e| SeerError::ChannelSendError(e.to_string()))?;
         }
 
+        Ok(())
+    }
+
+    async fn maybe_emit_token_transfer_observations(
+        &self,
+        event: &types::GeyserEvent,
+        source_label: &str,
+        is_synthetic: bool,
+    ) -> SeerResult<()> {
+        if is_synthetic
+            || source_label != GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL
+            || !matches!(self.config.funding_lane_mode, FundingLaneMode::FullChain)
+            || !matches!(
+                self.config.effective_source_mode(),
+                SeerSourceMode::GeyserGrpc
+            )
+        {
+            return Ok(());
+        }
+        let (Some(ipc_sender), Some(funding_connection)) =
+            (&self.ipc_sender, &self.funding_grpc_connection)
+        else {
+            return Ok(());
+        };
+        let types::GeyserEvent::Transaction {
+            slot,
+            tx_index,
+            event_ts_ms,
+            arrival_ts_ms,
+            event_time,
+            signature,
+            ..
+        } = event
+        else {
+            return Ok(());
+        };
+
+        let semantic = transaction_semantic_from_event(event, source_label, is_synthetic);
+        let resolved_arrival_ts_ms = arrival_ts_ms
+            .or(event_time.ingress_wall_ts_ms)
+            .or(*event_ts_ms)
+            .unwrap_or_default();
+        let provenance = ipc::FundingTransferProvenance::authoritative_full_feed_live();
+        let mut emitted = 0u64;
+        for transfer in extract_token_transfer_observations(event) {
+            // Earliest safe filter: the full-chain connection only admits mints
+            // registered by the existing pool lifecycle mapping.
+            if !funding_connection.is_mint_watched(&transfer.mint) {
+                continue;
+            }
+            ipc_sender
+                .send_token_transfer(
+                    ipc::TokenTransferEvent {
+                        semantic: semantic.clone(),
+                        slot: *slot,
+                        event_ordinal: transfer.event_ordinal,
+                        tx_index: *tx_index,
+                        outer_instruction_index: transfer.outer_instruction_index,
+                        inner_group_index: transfer.inner_group_index,
+                        cpi_stack_height: transfer.cpi_stack_height,
+                        event_time: event_time.clone(),
+                        arrival_ts_ms: resolved_arrival_ts_ms,
+                        signature: *signature,
+                        mint: transfer.mint,
+                        source_token_account: transfer.source_token_account,
+                        destination_token_account: transfer.destination_token_account,
+                        source_owner: transfer.source_owner,
+                        destination_owner: transfer.destination_owner,
+                        raw_amount: transfer.raw_amount,
+                        full_chain_coverage: true,
+                        provenance,
+                    },
+                    EventPriority::High,
+                )
+                .await
+                .map_err(|error| SeerError::ChannelSendError(error.to_string()))?;
+            emitted = emitted.saturating_add(1);
+        }
+        if emitted > 0 {
+            ::metrics::counter!("seer_token_transfer_observations_total", emitted);
+        }
         Ok(())
     }
 
@@ -11337,5 +11630,118 @@ mod tests {
                 .contains_key(&PendingTradeKey::ByCurve(curve.to_bytes())),
             "pending-trades buffer must drain after register_curve_mapping"
         );
+    }
+
+    fn token_transfer_raw_event(
+        token_program: Pubkey,
+        source_owner: Pubkey,
+        destination_owner: Pubkey,
+        transfer_checked: bool,
+    ) -> types::GeyserEvent {
+        let source_token_account = Pubkey::new_unique();
+        let destination_token_account = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let accounts = vec![
+            token_program,
+            source_token_account,
+            destination_token_account,
+            mint,
+        ];
+        let raw_amount = 123_456u64;
+        let mut data = vec![if transfer_checked { 12 } else { 3 }];
+        data.extend_from_slice(&raw_amount.to_le_bytes());
+        if transfer_checked {
+            data.push(6);
+        }
+        let account_indices = if transfer_checked {
+            vec![1, 3, 2, 0]
+        } else {
+            vec![1, 2, 0]
+        };
+        types::GeyserEvent::Transaction {
+            provider_id: Some("nln-primary".to_string()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+            observation_provenance: None,
+            slot: Some(91),
+            tx_index: Some(7),
+            event_ts_ms: Some(1_000),
+            arrival_ts_ms: Some(1_005),
+            event_time: ghost_core::EventTimeMetadata::default(),
+            signature: Signature::new_unique(),
+            accounts,
+            instructions: vec![types::RawInstruction {
+                program_id: token_program,
+                account_indices,
+                data,
+            }],
+            logs: vec![],
+            block_time: None,
+            account_data: HashMap::new(),
+            pre_balances: vec![],
+            post_balances: vec![],
+            success: true,
+            error_code: None,
+            compute_units_consumed: None,
+            synthetic: false,
+            source: grpc_connection::GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL.to_string(),
+            mpcf_payload_bytes: None,
+            mpcf_payload_missing_reason: types::RawBytesMissingReason::Unknown,
+            inner_instructions: vec![],
+            pre_token_balances: vec![
+                types::RawTokenBalance {
+                    account_index: 1,
+                    mint: mint.to_string(),
+                    owner: Some(source_owner.to_string()),
+                    amount: raw_amount,
+                },
+                types::RawTokenBalance {
+                    account_index: 2,
+                    mint: mint.to_string(),
+                    owner: Some(destination_owner.to_string()),
+                    amount: 0,
+                },
+            ],
+            post_token_balances: vec![
+                types::RawTokenBalance {
+                    account_index: 1,
+                    mint: mint.to_string(),
+                    owner: Some(source_owner.to_string()),
+                    amount: 0,
+                },
+                types::RawTokenBalance {
+                    account_index: 2,
+                    mint: mint.to_string(),
+                    owner: Some(destination_owner.to_string()),
+                    amount: raw_amount,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn extracts_owner_resolved_legacy_and_token_2022_transfer_legs() {
+        for (program, checked) in [
+            (*LEGACY_TOKEN_PROGRAM_ID, false),
+            (*TOKEN_2022_PROGRAM_ID, true),
+        ] {
+            let source_owner = Pubkey::new_unique();
+            let destination_owner = Pubkey::new_unique();
+            let event = token_transfer_raw_event(program, source_owner, destination_owner, checked);
+            let transfers = extract_token_transfer_observations(&event);
+            assert_eq!(transfers.len(), 1);
+            let transfer = &transfers[0];
+            assert_eq!(transfer.source_owner, source_owner);
+            assert_eq!(transfer.destination_owner, destination_owner);
+            assert_eq!(transfer.raw_amount, 123_456);
+            assert_eq!(transfer.event_ordinal, Some(0));
+            assert_eq!(transfer.outer_instruction_index, Some(0));
+        }
+    }
+
+    #[test]
+    fn token_transfer_extractor_ignores_same_owner_ata_moves() {
+        let owner = Pubkey::new_unique();
+        let event = token_transfer_raw_event(*LEGACY_TOKEN_PROGRAM_ID, owner, owner, false);
+        assert!(extract_token_transfer_observations(&event).is_empty());
     }
 }

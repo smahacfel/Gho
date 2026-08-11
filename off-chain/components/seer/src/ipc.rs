@@ -39,6 +39,8 @@ pub enum SeerEvent {
     /// filtered `grpc_global_stream` observations cannot be mistaken for a
     /// future authoritative full-feed lane.
     FundingTransfer(DetectedFundingTransferEvent),
+    /// Owner-resolved SPL token transfer for an actively watched mint.
+    TokenTransfer(DetectedTokenTransferEvent),
     /// On-chain AccountUpdate for a tracked pool, ready for reconciliation.
     ///
     /// Emitted every time `handle_account_update` resolves a `base_mint` and
@@ -340,6 +342,43 @@ pub struct FundingTransferEvent {
     pub provenance: FundingTransferProvenance,
 }
 
+/// Owner-resolved SPL transfer payload emitted only for an active watched mint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenTransferEvent {
+    #[serde(default)]
+    pub semantic: EventSemanticEnvelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_ordinal: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_instruction_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_group_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpi_stack_height: Option<u32>,
+    #[serde(default)]
+    pub event_time: EventTimeMetadata,
+    #[serde(default)]
+    pub arrival_ts_ms: u64,
+    pub signature: solana_sdk::signature::Signature,
+    pub mint: Pubkey,
+    pub source_token_account: Pubkey,
+    pub destination_token_account: Pubkey,
+    pub source_owner: Pubkey,
+    pub destination_owner: Pubkey,
+    pub raw_amount: u64,
+    #[serde(default)]
+    pub full_chain_coverage: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "FundingTransferProvenance::is_legacy_default"
+    )]
+    pub provenance: FundingTransferProvenance,
+}
+
 /// Runtime health snapshot for the funding lane that produced an event.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FundingLaneRuntimeHealth {
@@ -384,6 +423,17 @@ pub struct DetectedFundingTransferEvent {
     pub sequence_number: u64,
 
     /// Priority level (for backpressure handling).
+    pub priority: EventPriority,
+}
+
+/// Typed owner-resolved SPL token-transfer event payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedTokenTransferEvent {
+    pub transfer: TokenTransferEvent,
+    #[serde(default, skip_serializing_if = "FundingLaneRuntimeHealth::is_default")]
+    pub lane_health: FundingLaneRuntimeHealth,
+    pub detected_at: std::time::SystemTime,
+    pub sequence_number: u64,
     pub priority: EventPriority,
 }
 
@@ -992,6 +1042,7 @@ fn seer_event_sequence(event: &SeerEvent) -> u64 {
         SeerEvent::PoolDetected(event) => event.sequence_number,
         SeerEvent::Trade(event) => event.sequence_number,
         SeerEvent::FundingTransfer(event) => event.sequence_number,
+        SeerEvent::TokenTransfer(event) => event.sequence_number,
         SeerEvent::AccountUpdate(event) => event.sequence_number,
         SeerEvent::ExecutionAccountEvidence(event) => event.sequence_number,
     }
@@ -1002,6 +1053,7 @@ fn set_seer_event_sequence(event: &mut SeerEvent, sequence: u64) {
         SeerEvent::PoolDetected(event) => event.sequence_number = sequence,
         SeerEvent::Trade(event) => event.sequence_number = sequence,
         SeerEvent::FundingTransfer(event) => event.sequence_number = sequence,
+        SeerEvent::TokenTransfer(event) => event.sequence_number = sequence,
         SeerEvent::AccountUpdate(event) => event.sequence_number = sequence,
         SeerEvent::ExecutionAccountEvidence(event) => event.sequence_number = sequence,
     }
@@ -1192,6 +1244,23 @@ impl IpcSender {
         priority: EventPriority,
     ) -> Result<(), IpcError> {
         let event = SeerEvent::FundingTransfer(DetectedFundingTransferEvent {
+            transfer,
+            lane_health: FundingLaneRuntimeHealth::default(),
+            detected_at: std::time::SystemTime::now(),
+            sequence_number: 0,
+            priority,
+        });
+
+        self.send_event_with_policy(event, priority, BackpressurePolicy::Block)
+            .await
+    }
+
+    pub async fn send_token_transfer(
+        &self,
+        transfer: TokenTransferEvent,
+        priority: EventPriority,
+    ) -> Result<(), IpcError> {
+        let event = SeerEvent::TokenTransfer(DetectedTokenTransferEvent {
             transfer,
             lane_health: FundingLaneRuntimeHealth::default(),
             detected_at: std::time::SystemTime::now(),
@@ -1474,6 +1543,7 @@ fn event_detected_at(event: &SeerEvent) -> &std::time::SystemTime {
         SeerEvent::PoolDetected(e) => &e.detected_at,
         SeerEvent::Trade(e) => &e.detected_at,
         SeerEvent::FundingTransfer(e) => &e.detected_at,
+        SeerEvent::TokenTransfer(e) => &e.detected_at,
         SeerEvent::AccountUpdate(e) => &e.detected_at,
         SeerEvent::ExecutionAccountEvidence(e) => &e.detected_at,
     }
@@ -1504,6 +1574,7 @@ const fn seer_event_kind(event: &SeerEvent) -> &'static str {
         SeerEvent::PoolDetected(_) => "pool_detected",
         SeerEvent::Trade(_) => "trade",
         SeerEvent::FundingTransfer(_) => "funding_transfer",
+        SeerEvent::TokenTransfer(_) => "token_transfer",
         SeerEvent::AccountUpdate(_) => "account_update",
         SeerEvent::ExecutionAccountEvidence(_) => "execution_account_evidence",
     }
