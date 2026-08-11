@@ -6,6 +6,7 @@ on:
       - agent/token-redistribution-guard
     paths:
       - ci/token-guard.patch.part*
+      - ci/token-guard-new-file.patch.gz.b64
       - .github/workflows/token-redistribution-guard-ci.yml
 
 permissions:
@@ -27,6 +28,9 @@ jobs:
           cat ci/token-guard.patch.part* | base64 -d | gzip -d > /tmp/token_guard.patch
           git apply --check /tmp/token_guard.patch
           git apply /tmp/token_guard.patch
+          base64 -d ci/token-guard-new-file.patch.gz.b64 | gzip -d > /tmp/token_guard_new_file.patch
+          git apply --check /tmp/token_guard_new_file.patch
+          git apply /tmp/token_guard_new_file.patch
       - name: Install Rust and protobuf compiler
         run: |
           rustup toolchain install stable --profile minimal
@@ -36,8 +40,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: token-redistribution-guard-v1
-      - name: Formatting
-        run: cargo fmt --all -- --check
+      - name: Format candidate
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
       - name: Targeted detector and parser tests
         run: |
           cargo test -p ghost-launcher token_redistribution --lib
@@ -54,3 +60,27 @@ jobs:
           cargo check -p seer
           cargo check -p ghost-launcher
           cargo check -p ghost-brain
+      - name: Pack formatted candidate
+        if: always()
+        run: |
+          tar -czf /tmp/token-guard-formatted-source.tar.gz \
+            config.toml \
+            ghost-brain/src/oracle/reason_code.rs \
+            ghost-launcher/src/components/gatekeeper.rs \
+            ghost-launcher/src/components/post_buy_runtime.rs \
+            ghost-launcher/src/components/seer.rs \
+            ghost-launcher/src/config.rs \
+            ghost-launcher/src/events.rs \
+            ghost-launcher/src/lib.rs \
+            ghost-launcher/src/main.rs \
+            ghost-launcher/src/oracle_runtime.rs \
+            ghost-launcher/src/token_redistribution.rs \
+            off-chain/components/seer/src/ipc.rs \
+            off-chain/components/seer/src/lib.rs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: token-guard-formatted-source
+          path: /tmp/token-guard-formatted-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
