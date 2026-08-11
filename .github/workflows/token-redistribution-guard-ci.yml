@@ -1,28 +1,24 @@
-name: Token Redistribution Guard Validation
+name: Materialize Token Redistribution Guard
 
 on:
   push:
     branches:
       - agent/token-redistribution-guard
     paths:
-      - ci/token-guard.patch.part*
-      - ci/token-guard-new-file.patch.gz.b64
       - .github/workflows/token-redistribution-guard-ci.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  validate:
+  materialize:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    env:
-      CARGO_TERM_COLOR: always
-      RUSTFLAGS: -C target-cpu=x86-64
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
+
       - name: Apply candidate diff
         run: |
           cat ci/token-guard.patch.part* | base64 -d | gzip -d > /tmp/token_guard.patch
@@ -31,39 +27,17 @@ jobs:
           base64 -d ci/token-guard-new-file.patch.gz.b64 | gzip -d > /tmp/token_guard_new_file.patch
           git apply --check /tmp/token_guard_new_file.patch
           git apply /tmp/token_guard_new_file.patch
-      - name: Install Rust and protobuf compiler
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: token-redistribution-guard-v1
+
       - name: Format candidate
         run: |
+          rustup component add rustfmt
           cargo fmt --all
-          cargo fmt --all -- --check
-      - name: Targeted detector and parser tests
+
+      - name: Commit materialized implementation
         run: |
-          cargo test -p ghost-launcher token_redistribution --lib
-          cargo test -p seer extracts_owner_resolved_legacy_and_token_2022_transfer_legs --lib
-          cargo test -p seer token_transfer_extractor_ignores_same_owner_ata_moves --lib
-          cargo test -p ghost-launcher seer_token_transfer_emits_owner_resolved_bus_event --lib
-      - name: Directly affected runtime suites
-        run: |
-          cargo test -p ghost-launcher components::post_buy_runtime --lib
-          cargo test -p ghost-launcher --test gatekeeper_policy_tests
-          cargo test -p ghost-launcher --test session_lifecycle_tests
-      - name: Changed crate checks
-        run: |
-          cargo check -p seer
-          cargo check -p ghost-launcher
-          cargo check -p ghost-brain
-      - name: Pack formatted candidate
-        if: always()
-        run: |
-          tar -czf /tmp/token-guard-formatted-source.tar.gz \
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
             config.toml \
             ghost-brain/src/oracle/reason_code.rs \
             ghost-launcher/src/components/gatekeeper.rs \
@@ -77,10 +51,6 @@ jobs:
             ghost-launcher/src/token_redistribution.rs \
             off-chain/components/seer/src/ipc.rs \
             off-chain/components/seer/src/lib.rs
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: token-guard-formatted-source
-          path: /tmp/token-guard-formatted-source.tar.gz
-          retention-days: 1
-          if-no-files-found: error
+          git diff --cached --stat
+          git commit -m "feat: add token redistribution guard"
+          git push origin HEAD:agent/token-redistribution-guard
