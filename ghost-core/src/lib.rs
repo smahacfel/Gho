@@ -33,8 +33,10 @@ pub mod market_state;
 pub mod metric_contracts;
 pub mod pipeline_coverage;
 pub mod pool_identity;
+pub mod pump_creation_regime;
 pub mod pump_observation_ledger;
 pub mod pump_quote;
+pub mod pump_research_tape;
 pub mod session;
 pub mod shadow_ledger;
 pub mod shadow_v2_price;
@@ -114,6 +116,10 @@ pub use pipeline_coverage::{
     pipeline_coverage, PipelineCoverage, PipelineCoverageSnapshot, PipelineCoverageStage,
 };
 pub use pool_identity::{BaseMint, BondingCurveKey, PoolId, PoolIdentity, PoolIdentityRegistry};
+pub use pump_creation_regime::{
+    PumpCreationRegimeProvenanceV1, PumpCreationRegimeV1, PumpCreationVariantV1, PumpMayhemModeV1,
+    PumpQuoteRegimeV1,
+};
 pub use pump_observation_ledger::{
     PumpObservationClassificationV1, PumpObservationEvidenceLaneV1,
     PumpObservationEvidenceOverflowV1, PumpObservationLedgerConfigErrorV1,

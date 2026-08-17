@@ -21,6 +21,11 @@ use std::{
 
 use borsh::BorshDeserialize;
 use dashmap::{DashMap, DashSet};
+use ghost_core::pump_research_tape::{PumpInstructionVariantV1, PumpMutationKindV1};
+use ghost_core::{
+    PumpCreationRegimeProvenanceV1, PumpCreationRegimeV1, PumpCreationVariantV1, PumpMayhemModeV1,
+    PumpQuoteRegimeV1,
+};
 use prost::Message as _;
 use smallvec::SmallVec;
 use tracing::{debug, info, trace, warn};
@@ -37,12 +42,13 @@ use crate::types::{record_trade_outcome_metric, InstructionProvenance, TradeOutc
 pub const DISC_INITIALIZE: [u8; 8] = [0xaf, 0xaf, 0x6d, 0x1f, 0x0d, 0x98, 0x9b, 0xed];
 // sha256("global:set_params")[..8]
 pub const DISC_SET_PARAMS: [u8; 8] = [0x1b, 0xea, 0xb2, 0x34, 0x93, 0x02, 0xbb, 0x8d];
-/// SHA256("global:create")[..8] — this is the *theoretical* Anchor discriminator but
-/// Pump.fun does NOT use it on-chain. Kept for completeness; real on-chain disc is below.
-pub const DISC_CREATE_ANCHOR: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
-/// Actual Pump.fun on-chain CREATE discriminator (custom, not SHA256("global:create")).
-/// Observed value: d6 90 4c ec 5f 8b 31 b4 — confirmed in init_pool_parser.rs + pumpfun_collector.rs.
-pub const DISC_CREATE: [u8; 8] = [0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x31, 0xb4];
+/// `sha256("global:create")[..8]`, the legacy Pump `create` instruction.
+pub const DISC_CREATE: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
+/// `sha256("global:create_v2")[..8]`, the current Pump creation instruction.
+///
+/// It must not be decoded using the legacy account layout: its user is account
+/// index 5 (zero based), while the legacy `create` user is index 7.
+pub const DISC_CREATE_V2: [u8; 8] = [0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x31, 0xb4];
 pub const DISC_BUY: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
 pub const DISC_SELL: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
 pub const DISC_WITHDRAW: [u8; 8] = [0xb7, 0x12, 0x46, 0x9c, 0x94, 0x6d, 0xa1, 0x22];
@@ -122,12 +128,14 @@ const PUMP_IDX_BONDING_CURVE_V2: usize = 16;
 const PUMP_BUY_FIXED_ACCOUNT_COUNT: usize = 16;
 const PUMP_BUYBACK_REMAINING_ACCOUNT_COUNT: usize = 2;
 
-// Pump.fun CREATE instruction layout (different from Buy/Sell!):
+// Pump.fun legacy CREATE instruction layout (different from Buy/Sell!):
 //   0=Mint, 1=MintAuthority, 2=BondingCurve, 3=AssocBondingCurve, 4=Global,
 //   5=MPLTokenMetadata, 6=MetadataAccount, 7=Creator/Signer, ...
 const CREATE_IDX_MINT: usize = 0;
 const CREATE_IDX_BONDING_CURVE: usize = 2;
-const CREATE_IDX_USER: usize = 7;
+const CREATE_LEGACY_IDX_USER: usize = 7;
+// Current `create_v2`: 0=Mint, 2=BondingCurve, 5=User/Signer.
+const CREATE_V2_IDX_USER: usize = 5;
 const MIG_IDX_MINT: usize = 1;
 const MIG_IDX_BONDING_CURVE: usize = 2;
 const MIG_IDX_POOL: usize = 7;
@@ -165,6 +173,85 @@ pub struct CreateParams {
     pub name: String,
     pub symbol: String,
     pub uri: String,
+}
+
+/// Post-cashback Pump `create_v2` instruction arguments.  The final bool is
+/// the IDL's `OptionBool` wrapper; it is preserved only to consume the exact
+/// layout and remains a distinct source fact.
+#[derive(Debug, Clone, BorshDeserialize)]
+pub struct CreateV2Params {
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub creator: [u8; 32],
+    pub is_mayhem_mode: bool,
+    pub is_cashback_enabled: bool,
+}
+
+/// Historical `create_v2` layout from before the backwards-compatible
+/// cashback argument was added.  It is not the legacy `create` instruction:
+/// it retains the `create_v2` account layout and its direct Mayhem fact.
+///
+/// The missing field is deliberately represented as `Unknown` at the
+/// research-evidence boundary.  The fact that an old client could not enable
+/// cashback does not authorize us to manufacture a historical `false` flag.
+#[derive(Debug, Clone, BorshDeserialize)]
+struct CreateV2ParamsBeforeCashback {
+    name: String,
+    symbol: String,
+    uri: String,
+    creator: [u8; 32],
+    is_mayhem_mode: bool,
+}
+
+/// Normalized exact prefix of either known `create_v2` argument layout.
+/// `cashback_enabled = None` means the known pre-cashback layout was used;
+/// it never means `false`.
+#[derive(Debug, Clone)]
+struct DecodedCreateV2Params {
+    name: String,
+    symbol: String,
+    uri: String,
+    creator: [u8; 32],
+    is_mayhem_mode: bool,
+    is_cashback_enabled: Option<bool>,
+    consumed_len: usize,
+}
+
+/// Decode a known `create_v2` prefix.  Newer layouts are attempted first so
+/// the cashback byte is not silently reinterpreted as an opaque tail.  The
+/// caller chooses whether a trailing tail is acceptable for its contract.
+fn decode_create_v2_params_with_len(payload: &[u8]) -> Option<DecodedCreateV2Params> {
+    if let Some((params, consumed_len)) = borsh_read_with_len::<CreateV2Params>(payload) {
+        return Some(DecodedCreateV2Params {
+            name: params.name,
+            symbol: params.symbol,
+            uri: params.uri,
+            creator: params.creator,
+            is_mayhem_mode: params.is_mayhem_mode,
+            is_cashback_enabled: Some(params.is_cashback_enabled),
+            consumed_len,
+        });
+    }
+    borsh_read_with_len::<CreateV2ParamsBeforeCashback>(payload).map(|(params, consumed_len)| {
+        DecodedCreateV2Params {
+            name: params.name,
+            symbol: params.symbol,
+            uri: params.uri,
+            creator: params.creator,
+            is_mayhem_mode: params.is_mayhem_mode,
+            is_cashback_enabled: None,
+            consumed_len,
+        }
+    })
+}
+
+/// Research inventory may claim an exact payload only when one frozen known
+/// layout consumes the entire instruction byte vector.  Runtime-compatible
+/// parsing intentionally remains prefix-tolerant elsewhere in this module.
+fn decode_create_v2_params_exact(payload: &[u8]) -> Option<DecodedCreateV2Params> {
+    let decoded = decode_create_v2_params_with_len(payload)?;
+    (decoded.consumed_len == payload.len()).then_some(decoded)
 }
 
 #[derive(Debug, Clone, BorshDeserialize)]
@@ -282,18 +369,16 @@ fn decode_anchor_event_kind_with_len(
     payload: &[u8],
 ) -> Option<(ParsedEventKind, usize)> {
     match disc {
-        DISC_EVENT_TRADE => {
-            borsh_read_with_len::<EventTrade>(payload).map(|(event, consumed_len)| {
-                (
-                    ParsedEventKind::CpiTrade {
-                        event,
-                        canonical_reserves: None,
-                    },
-                    consumed_len,
-                )
-            })
-        }
-        DISC_EVENT_CREATE => borsh_read_with_len::<EventCreate>(payload)
+        DISC_EVENT_TRADE => decode_event_trade_with_len(payload).map(|(event, consumed_len)| {
+            (
+                ParsedEventKind::CpiTrade {
+                    event,
+                    canonical_reserves: None,
+                },
+                consumed_len,
+            )
+        }),
+        DISC_EVENT_CREATE => decode_event_create_with_len(payload)
             .map(|(event, consumed_len)| (ParsedEventKind::CpiCreate(event), consumed_len)),
         DISC_EVENT_COMPLETE => borsh_read_with_len::<EventComplete>(payload)
             .map(|(event, consumed_len)| (ParsedEventKind::CpiComplete(event), consumed_len)),
@@ -1116,8 +1201,14 @@ pub struct CreatePoolParams {
 
 // ─── CPI event log types ──────────────────────────────────────────────────────
 
+/// Legacy-compatible fixed prefix of Pump's Anchor `TradeEvent`.
+///
+/// The current public IDL appends `real_sol_reserves` and
+/// `real_token_reserves` immediately after this prefix.  The prefix remains a
+/// standalone Borsh type so we can distinguish an exact legacy event from a
+/// truncated current event without treating the latter as valid evidence.
 #[derive(Debug, Clone, BorshDeserialize)]
-pub struct EventTrade {
+struct EventTradePrefix {
     pub mint: [u8; 32],
     pub sol_amount: u64,
     pub token_amount: u64,
@@ -1128,7 +1219,101 @@ pub struct EventTrade {
     pub virtual_token_reserves: u64,
 }
 
+/// Normalized Pump Anchor `TradeEvent` required by durable capture evidence.
+///
+/// `None` real reserves are permitted only for an exact legacy event whose
+/// payload ends after the historical virtual-reserve prefix.  A non-empty,
+/// incomplete current reserve tail is rejected by `decode_event_trade_with_len`
+/// rather than silently downgraded to legacy evidence.
+#[derive(Debug, Clone)]
+pub struct EventTrade {
+    pub mint: [u8; 32],
+    pub sol_amount: u64,
+    pub token_amount: u64,
+    pub is_buy: bool,
+    pub user: [u8; 32],
+    pub timestamp: i64,
+    pub virtual_sol_reserves: u64,
+    pub virtual_token_reserves: u64,
+    pub real_sol_reserves: Option<u64>,
+    pub real_token_reserves: Option<u64>,
+}
+
+/// Decode the source-backed, stable `TradeEvent` prefix used by exact research.
+///
+/// The parser intentionally does not hard-code fields after the two real
+/// reserve values.  This keeps future IDL tails opaque while preserving the
+/// fields whose absence previously made a current Pump trade look
+/// non-evaluable.  Exact legacy payloads remain readable; a partially present
+/// current tail fails closed.
+fn decode_event_trade_with_len(payload: &[u8]) -> Option<(EventTrade, usize)> {
+    let (prefix, mut offset) = borsh_read_with_len::<EventTradePrefix>(payload)?;
+    let remaining = payload.len().checked_sub(offset)?;
+    let (real_sol_reserves, real_token_reserves) = match remaining {
+        0 => (None, None),
+        1..=15 => return None,
+        _ => {
+            let real_sol_reserves = read_u64_le(payload, &mut offset)?;
+            let real_token_reserves = read_u64_le(payload, &mut offset)?;
+            (Some(real_sol_reserves), Some(real_token_reserves))
+        }
+    };
+
+    Some((
+        EventTrade {
+            mint: prefix.mint,
+            sol_amount: prefix.sol_amount,
+            token_amount: prefix.token_amount,
+            is_buy: prefix.is_buy,
+            user: prefix.user,
+            timestamp: prefix.timestamp,
+            virtual_sol_reserves: prefix.virtual_sol_reserves,
+            virtual_token_reserves: prefix.virtual_token_reserves,
+            real_sol_reserves,
+            real_token_reserves,
+        },
+        offset,
+    ))
+}
+
 #[derive(Debug, Clone, BorshDeserialize)]
+struct EventCreateLegacy {
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub mint: [u8; 32],
+    pub bonding_curve: [u8; 32],
+    pub user: [u8; 32],
+}
+
+/// Current official Pump `CreateEvent` payload.  It is decoded before the
+/// legacy prefix so a newer event cannot be silently truncated into a false
+/// NativeSOL/non-Mayhem classification.
+#[derive(Debug, Clone, BorshDeserialize)]
+struct EventCreateV2 {
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub mint: [u8; 32],
+    pub bonding_curve: [u8; 32],
+    pub user: [u8; 32],
+    pub creator: [u8; 32],
+    pub timestamp: i64,
+    pub virtual_token_reserves: u64,
+    pub virtual_sol_reserves: u64,
+    pub real_token_reserves: u64,
+    pub token_total_supply: u64,
+    pub token_program: [u8; 32],
+    pub is_mayhem_mode: bool,
+    pub is_cashback_enabled: bool,
+    pub quote_mint: [u8; 32],
+    pub virtual_quote_reserves: u64,
+}
+
+/// Normalized current-or-legacy CreateEvent.  Optional fields are absent only
+/// when the source actually supplied the old prefix; consumers must then use
+/// the durable `Unknown` regime rather than infer a value.
+#[derive(Debug, Clone)]
 pub struct EventCreate {
     pub name: String,
     pub symbol: String,
@@ -1136,6 +1321,125 @@ pub struct EventCreate {
     pub mint: [u8; 32],
     pub bonding_curve: [u8; 32],
     pub user: [u8; 32],
+    pub creator: Option<[u8; 32]>,
+    pub timestamp: Option<i64>,
+    pub virtual_token_reserves: Option<u64>,
+    pub virtual_sol_reserves: Option<u64>,
+    pub real_token_reserves: Option<u64>,
+    pub token_total_supply: Option<u64>,
+    pub quote_mint: Option<[u8; 32]>,
+    pub virtual_quote_reserves: Option<u64>,
+    pub is_mayhem_mode: Option<bool>,
+    /// Cashback is a source-evidence flag.  Its absence means that the
+    /// historical event layout did not prove a value; consumers must not
+    /// silently coerce it to `false`.
+    pub is_cashback_enabled: Option<bool>,
+}
+
+fn decode_event_create_with_len(payload: &[u8]) -> Option<(EventCreate, usize)> {
+    if let Some((event, consumed_len)) = borsh_read_with_len::<EventCreateV2>(payload) {
+        return Some((
+            EventCreate {
+                name: event.name,
+                symbol: event.symbol,
+                uri: event.uri,
+                mint: event.mint,
+                bonding_curve: event.bonding_curve,
+                user: event.user,
+                creator: Some(event.creator),
+                timestamp: Some(event.timestamp),
+                virtual_token_reserves: Some(event.virtual_token_reserves),
+                virtual_sol_reserves: Some(event.virtual_sol_reserves),
+                real_token_reserves: Some(event.real_token_reserves),
+                token_total_supply: Some(event.token_total_supply),
+                quote_mint: Some(event.quote_mint),
+                virtual_quote_reserves: Some(event.virtual_quote_reserves),
+                is_mayhem_mode: Some(event.is_mayhem_mode),
+                is_cashback_enabled: Some(event.is_cashback_enabled),
+            },
+            consumed_len,
+        ));
+    }
+    borsh_read_with_len::<EventCreateLegacy>(payload).map(|(event, consumed_len)| {
+        (
+            EventCreate {
+                name: event.name,
+                symbol: event.symbol,
+                uri: event.uri,
+                mint: event.mint,
+                bonding_curve: event.bonding_curve,
+                user: event.user,
+                creator: None,
+                timestamp: None,
+                virtual_token_reserves: None,
+                virtual_sol_reserves: None,
+                real_token_reserves: None,
+                token_total_supply: None,
+                quote_mint: None,
+                virtual_quote_reserves: None,
+                is_mayhem_mode: None,
+                is_cashback_enabled: None,
+            },
+            consumed_len,
+        )
+    })
+}
+
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+fn source_quote_regime(quote_mint: Pubkey) -> PumpQuoteRegimeV1 {
+    if quote_mint == Pubkey::default() || quote_mint.to_string() == WSOL_MINT {
+        PumpQuoteRegimeV1::NativeSol
+    } else if quote_mint.to_string() == USDC_MINT {
+        PumpQuoteRegimeV1::Usdc
+    } else {
+        PumpQuoteRegimeV1::Other
+    }
+}
+
+/// Build the source-backed birth regime. Both direct and event evidence must
+/// agree; a conflict is retained as `Unknown`, not resolved by precedence.
+fn creation_regime_from_matching_create_v2(
+    direct_mayhem_mode: PumpMayhemModeV1,
+    event: &EventCreate,
+) -> PumpCreationRegimeV1 {
+    let Some(event_mayhem) = event.is_mayhem_mode else {
+        return PumpCreationRegimeV1::unknown(
+            PumpCreationVariantV1::CreateV2,
+            PumpCreationRegimeProvenanceV1::Unknown,
+        );
+    };
+    let Some(raw_quote_mint) = event.quote_mint else {
+        return PumpCreationRegimeV1::unknown(
+            PumpCreationVariantV1::CreateV2,
+            PumpCreationRegimeProvenanceV1::Unknown,
+        );
+    };
+    let Ok(quote_mint) = Pubkey::try_from(raw_quote_mint.as_slice()) else {
+        return PumpCreationRegimeV1::unknown(
+            PumpCreationVariantV1::CreateV2,
+            PumpCreationRegimeProvenanceV1::Unknown,
+        );
+    };
+    let mayhem_mode = if event_mayhem {
+        PumpMayhemModeV1::True
+    } else {
+        PumpMayhemModeV1::False
+    };
+    if direct_mayhem_mode != mayhem_mode {
+        return PumpCreationRegimeV1::unknown(
+            PumpCreationVariantV1::CreateV2,
+            PumpCreationRegimeProvenanceV1::Unknown,
+        );
+    }
+    PumpCreationRegimeV1 {
+        schema_version: PumpCreationRegimeV1::SCHEMA_VERSION,
+        creation_variant: PumpCreationVariantV1::CreateV2,
+        quote_regime: source_quote_regime(quote_mint),
+        quote_mint: Some(quote_mint.to_string()),
+        mayhem_mode,
+        provenance: PumpCreationRegimeProvenanceV1::CreateV2AndCreateEvent,
+    }
 }
 
 #[derive(Debug, Clone, BorshDeserialize)]
@@ -1352,6 +1656,8 @@ pub enum ParsedEventKind {
     SetParams(SetParamsData),
     Create {
         params: CreateParams,
+        creation_variant: PumpCreationVariantV1,
+        direct_mayhem_mode: PumpMayhemModeV1,
         mint: String,
         bonding_curve: String,
         user: String,
@@ -2605,14 +2911,60 @@ impl PumpParser {
                 }
             },
 
-            // Match both the actual on-chain discriminator (DISC_CREATE, real Pump.fun)
-            // and the theoretical Anchor SHA256 discriminator (DISC_CREATE_ANCHOR) as a
-            // belt-and-suspenders fallback. In practice only DISC_CREATE fires on mainnet.
-            DISC_CREATE | DISC_CREATE_ANCHOR => {
+            DISC_CREATE | DISC_CREATE_V2 => {
+                let (creation_variant, user_index, params, direct_mayhem_mode) = match disc {
+                    DISC_CREATE => {
+                        let params = match borsh_read::<CreateParams>(payload) {
+                            Some(params) => params,
+                            None => {
+                                warn!(
+                                    "decode legacy Create: unreadable payload len={}",
+                                    payload.len()
+                                );
+                                return;
+                            }
+                        };
+                        (
+                            PumpCreationVariantV1::Create,
+                            CREATE_LEGACY_IDX_USER,
+                            params,
+                            PumpMayhemModeV1::Unknown,
+                        )
+                    }
+                    DISC_CREATE_V2 => {
+                        let params = match decode_create_v2_params_with_len(payload) {
+                            Some(params) => params,
+                            None => {
+                                warn!("decode CreateV2: unreadable payload len={}", payload.len());
+                                return;
+                            }
+                        };
+                        let prefix = CreateParams {
+                            name: params.name,
+                            symbol: params.symbol,
+                            uri: params.uri,
+                        };
+                        (
+                            PumpCreationVariantV1::CreateV2,
+                            CREATE_V2_IDX_USER,
+                            prefix,
+                            if params.is_mayhem_mode {
+                                PumpMayhemModeV1::True
+                            } else {
+                                PumpMayhemModeV1::False
+                            },
+                        )
+                    }
+                    _ => unreachable!("matched only create discriminators"),
+                };
                 if !has_min_accounts(
                     accounts,
-                    CREATE_IDX_USER + 1,
-                    "create",
+                    user_index + 1,
+                    if creation_variant == PumpCreationVariantV1::CreateV2 {
+                        "create_v2"
+                    } else {
+                        "create"
+                    },
                     program,
                     slot,
                     from_cpi,
@@ -2620,19 +2972,13 @@ impl PumpParser {
                 ) {
                     return;
                 }
-                let p = match borsh_read::<CreateParams>(payload) {
-                    Some(p) => p,
-                    None => {
-                        warn!("decode Create: unreadable payload len={}", payload.len());
-                        return;
-                    }
-                };
-                // Use CREATE-specific account indices (different from Buy/Sell layout):
-                //   CREATE: Mint=0, BondingCurve=2, Creator=7
+                // Use creation-variant-specific account indices (different
+                // from Buy/Sell): legacy Create user=7; current create_v2
+                // user=5.  `mint` and `bonding_curve` retain the same slots.
                 //   BUY/SELL: Mint=2, BondingCurve=3, User=6
                 let mint = acs(accounts, CREATE_IDX_MINT);
                 let bonding_curve = acs(accounts, CREATE_IDX_BONDING_CURVE);
-                let user = acs(accounts, CREATE_IDX_USER);
+                let user = acs(accounts, user_index);
                 if !is_valid_curve_role(&mint, &bonding_curve) {
                     log_drop_role_mismatch(
                         "create",
@@ -2661,7 +3007,9 @@ impl PumpParser {
                 }
 
                 ParsedEventKind::Create {
-                    params: p,
+                    params,
+                    creation_variant,
+                    direct_mayhem_mode,
                     mint,
                     bonding_curve,
                     user,
@@ -4443,6 +4791,612 @@ pub struct ParsedTransactionBundle {
     pub trade_observations: Vec<Option<ObservedPumpMutationV1>>,
 }
 
+/// Research-only, transaction-local inventory emitted by the same structural
+/// walk as the compatibility parser output.
+///
+/// This is deliberately not a replacement for [`ParsedTransactionBundle`]:
+/// the latter remains the active runtime contract.  The inventory preserves
+/// every Pump.fun instruction which can mutate a bonding curve, including an
+/// explicitly typed unknown discriminator.  Offline certification uses this
+/// record to prove that no mutation was silently omitted from a trajectory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpResearchTransactionMutationInventoryV1 {
+    pub signature: solana_sdk::signature::Signature,
+    pub slot: Option<u64>,
+    pub tx_index: Option<u32>,
+    pub mutations: Vec<PumpResearchMutationInventoryEntryV1>,
+    pub inventory_complete: bool,
+    /// An unknown Pump instruction whose curve identity could not be resolved.
+    /// It is intentionally transaction-wide evidence: every trajectory in the
+    /// transaction must fail closed rather than assume the instruction was
+    /// unrelated to a curve.
+    pub has_unattributed_unknown_mutation: bool,
+}
+
+/// One raw Pump.fun curve mutation (or conservative unknown candidate) found
+/// during a transaction-tree walk.  The fields are parser evidence; promotion
+/// into an exact state transition belongs exclusively to the offline PR-B
+/// certifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpResearchMutationInventoryEntryV1 {
+    pub locator: Option<RawPumpMutationLocatorV1>,
+    pub order: Option<CanonicalPumpOrderKeyV1>,
+    pub kind: PumpMutationKindV1,
+    pub instruction_variant: PumpInstructionVariantV1,
+    pub discriminator: Option<[u8; 8]>,
+    pub mint: Option<Pubkey>,
+    pub bonding_curve: Option<Pubkey>,
+    pub participant: Option<Pubkey>,
+    pub participant_token_account: Option<Pubkey>,
+    pub participant_token_account_message_index: Option<u32>,
+    pub participant_token_account_instruction_position: Option<u16>,
+    pub token_program: Option<Pubkey>,
+    pub side: Option<PumpTradeSideV1>,
+    pub token_amount_units: Option<u64>,
+    pub instruction_limit_lamports: Option<u64>,
+    /// Exact curve-quote input is intentionally distinct from an instruction
+    /// wallet limit.  It is absent until a frozen, variant-specific payload
+    /// decoder proves it.
+    pub exact_curve_quote_input_lamports: Option<u64>,
+    pub protocol_creator: Option<Pubkey>,
+    pub create_user: Option<Pubkey>,
+    pub create_mayhem: Option<bool>,
+    pub create_cashback: Option<bool>,
+    pub quote_mint: Option<Pubkey>,
+    pub token_total_supply: Option<u64>,
+    /// `false` means that the known discriminator's raw payload could not be
+    /// decoded with a frozen V1 interpretation, or carried an unsupported
+    /// tail.  Such a mutation remains visible but cannot be certified exact.
+    pub instruction_payload_exact: bool,
+    pub direct_event_state: Option<PumpResearchDirectCurveEventStateV1>,
+    /// A direct self-CPI event existed but could not be joined to exactly one
+    /// instruction-level mutation in this transaction.
+    pub direct_event_ambiguous: bool,
+    /// A direct self-CPI event contradicted already-preserved instruction or
+    /// event evidence.  The materializer maps this to a typed conflict.
+    pub direct_event_conflict: bool,
+}
+
+/// Partial reserve tuple emitted directly by a Pump Anchor self-CPI event.
+/// Optional fields remain optional because legacy/current event layouts do
+/// not all prove the same components.  The materializer compares every known
+/// component and never fills an absent one with a default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpResearchDirectCurveEventStateV1 {
+    pub virtual_quote_reserves: Option<u64>,
+    pub virtual_token_reserves: Option<u64>,
+    pub real_quote_reserves: Option<u64>,
+    pub real_token_reserves: Option<u64>,
+    pub complete: Option<bool>,
+}
+
+/// Additive research result.  Runtime callers keep using
+/// [`ParsedTransactionBundle`]; the standalone materializer is the only
+/// caller of this richer wrapper.
+#[derive(Debug, Clone)]
+pub struct ParsedResearchTransactionBundleV1 {
+    pub runtime_compatible: ParsedTransactionBundle,
+    pub mutation_inventory: PumpResearchTransactionMutationInventoryV1,
+}
+
+/// Mutable accumulator used only by
+/// [`BinaryParser::parse_research_transaction_bundle_v1`].  It is threaded
+/// through the existing outer/inner instruction walk so research inventory
+/// does not introduce a second parser traversal.
+struct PumpResearchInventoryBuilderV1 {
+    inventory: PumpResearchTransactionMutationInventoryV1,
+    pump_program_id: Option<Pubkey>,
+}
+
+impl PumpResearchInventoryBuilderV1 {
+    fn new(
+        signature: solana_sdk::signature::Signature,
+        slot: Option<u64>,
+        tx_index: Option<u32>,
+    ) -> Self {
+        let pump_program_id = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).ok();
+        Self {
+            inventory: PumpResearchTransactionMutationInventoryV1 {
+                signature,
+                slot,
+                tx_index,
+                mutations: Vec::new(),
+                inventory_complete: slot.is_some()
+                    && tx_index.is_some()
+                    && pump_program_id.is_some(),
+                has_unattributed_unknown_mutation: false,
+            },
+            pump_program_id,
+        }
+    }
+
+    fn finish(self) -> PumpResearchTransactionMutationInventoryV1 {
+        self.inventory
+    }
+
+    fn location(
+        &mut self,
+        outer_instruction_index: usize,
+        inner_instruction_path: Option<Vec<u16>>,
+        semantic_event_ordinal: u32,
+    ) -> (
+        Option<RawPumpMutationLocatorV1>,
+        Option<CanonicalPumpOrderKeyV1>,
+    ) {
+        let Ok(outer_instruction_index) = u16::try_from(outer_instruction_index) else {
+            self.inventory.inventory_complete = false;
+            return (None, None);
+        };
+        let Some(inner_instruction_path) = inner_instruction_path else {
+            self.inventory.inventory_complete = false;
+            return (None, None);
+        };
+        let Some(program_id) = self.pump_program_id else {
+            self.inventory.inventory_complete = false;
+            return (None, None);
+        };
+        let locator = RawPumpMutationLocatorV1 {
+            program_id,
+            signature: self.inventory.signature,
+            outer_instruction_index,
+            inner_instruction_path: inner_instruction_path.clone(),
+            semantic_event_ordinal,
+        };
+        let order = match (self.inventory.slot, self.inventory.tx_index) {
+            (Some(slot), Some(tx_index)) => Some(CanonicalPumpOrderKeyV1 {
+                slot,
+                tx_index,
+                outer_instruction_index,
+                inner_instruction_path,
+                semantic_event_ordinal,
+            }),
+            _ => {
+                self.inventory.inventory_complete = false;
+                None
+            }
+        };
+        (Some(locator), order)
+    }
+
+    fn account_at(
+        accounts: &[Pubkey],
+        instruction_accounts: &[u8],
+        position: usize,
+    ) -> (Option<Pubkey>, Option<u32>) {
+        let Some(message_index) = instruction_accounts.get(position).copied() else {
+            return (None, None);
+        };
+        let value = accounts
+            .get(usize::from(message_index))
+            .copied()
+            .filter(|value| *value != Pubkey::default());
+        (value, Some(u32::from(message_index)))
+    }
+
+    fn new_entry(
+        &mut self,
+        outer_instruction_index: usize,
+        inner_instruction_path: Option<Vec<u16>>,
+        semantic_event_ordinal: u32,
+        kind: PumpMutationKindV1,
+        instruction_variant: PumpInstructionVariantV1,
+        discriminator: Option<[u8; 8]>,
+    ) -> PumpResearchMutationInventoryEntryV1 {
+        let (locator, order) = self.location(
+            outer_instruction_index,
+            inner_instruction_path,
+            semantic_event_ordinal,
+        );
+        PumpResearchMutationInventoryEntryV1 {
+            locator,
+            order,
+            kind,
+            instruction_variant,
+            discriminator,
+            mint: None,
+            bonding_curve: None,
+            participant: None,
+            participant_token_account: None,
+            participant_token_account_message_index: None,
+            participant_token_account_instruction_position: None,
+            token_program: None,
+            side: None,
+            token_amount_units: None,
+            instruction_limit_lamports: None,
+            exact_curve_quote_input_lamports: None,
+            protocol_creator: None,
+            create_user: None,
+            create_mayhem: None,
+            create_cashback: None,
+            quote_mint: None,
+            token_total_supply: None,
+            instruction_payload_exact: false,
+            direct_event_state: None,
+            direct_event_ambiguous: false,
+            direct_event_conflict: false,
+        }
+    }
+
+    fn observe_instruction(
+        &mut self,
+        accounts: &[Pubkey],
+        instruction_accounts: &[u8],
+        data: &[u8],
+        outer_instruction_index: usize,
+        inner_instruction_path: Option<Vec<u16>>,
+        semantic_event_ordinal: u32,
+    ) {
+        let discriminator = data.get(..8).and_then(|bytes| bytes.try_into().ok());
+        let payload = data.get(8..).unwrap_or_default();
+
+        // Anchor self-CPI event payloads are evidence attached below, not a
+        // second curve mutation.  Initialize and SetParams affect the global
+        // program configuration rather than a particular BondingCurve.
+        if matches!(
+            discriminator,
+            Some(
+                DISC_EVENT_TRADE
+                    | DISC_EVENT_CREATE
+                    | DISC_EVENT_COMPLETE
+                    | DISC_INITIALIZE
+                    | DISC_SET_PARAMS
+            )
+        ) {
+            return;
+        }
+
+        let mut entry = match discriminator {
+            Some(DISC_CREATE) | Some(DISC_CREATE_V2) => {
+                let (variant, user_position, protocol_creator, mayhem, cashback, exact) =
+                    match discriminator {
+                        Some(DISC_CREATE) => match borsh_read_with_len::<CreateParams>(payload) {
+                            Some((_params, consumed)) => (
+                                PumpInstructionVariantV1::Create,
+                                CREATE_LEGACY_IDX_USER,
+                                None,
+                                None,
+                                None,
+                                consumed == payload.len(),
+                            ),
+                            None => (
+                                PumpInstructionVariantV1::Create,
+                                CREATE_LEGACY_IDX_USER,
+                                None,
+                                None,
+                                None,
+                                false,
+                            ),
+                        },
+                        Some(DISC_CREATE_V2) => match decode_create_v2_params_exact(payload) {
+                            Some(params) => (
+                                PumpInstructionVariantV1::CreateV2,
+                                CREATE_V2_IDX_USER,
+                                Some(Pubkey::new_from_array(params.creator)),
+                                Some(params.is_mayhem_mode),
+                                params.is_cashback_enabled,
+                                true,
+                            ),
+                            None => (
+                                PumpInstructionVariantV1::CreateV2,
+                                CREATE_V2_IDX_USER,
+                                None,
+                                None,
+                                None,
+                                false,
+                            ),
+                        },
+                        _ => unreachable!("create discriminator was matched above"),
+                    };
+                let mut entry = self.new_entry(
+                    outer_instruction_index,
+                    inner_instruction_path,
+                    semantic_event_ordinal,
+                    PumpMutationKindV1::Create,
+                    variant,
+                    discriminator,
+                );
+                entry.mint = Self::account_at(accounts, instruction_accounts, CREATE_IDX_MINT).0;
+                entry.bonding_curve =
+                    Self::account_at(accounts, instruction_accounts, CREATE_IDX_BONDING_CURVE).0;
+                entry.create_user =
+                    Self::account_at(accounts, instruction_accounts, user_position).0;
+                entry.participant = entry.create_user;
+                entry.protocol_creator = protocol_creator;
+                entry.create_mayhem = mayhem;
+                entry.create_cashback = cashback;
+                entry.instruction_payload_exact = exact;
+                entry
+            }
+            Some(DISC_BUY) | Some(DISC_SWAP_BUY_EXACT_QUOTE_IN) | Some(DISC_PUMP_BUY_ROUTED) => {
+                let (variant, exact) = match discriminator {
+                    Some(DISC_BUY) => (PumpInstructionVariantV1::LegacyBuy, true),
+                    Some(DISC_SWAP_BUY_EXACT_QUOTE_IN) | Some(DISC_PUMP_BUY_ROUTED) => {
+                        (PumpInstructionVariantV1::BuyExactQuoteInV2, true)
+                    }
+                    _ => unreachable!("buy discriminator was matched above"),
+                };
+                let decoded = borsh_read_with_len::<TradeParams>(payload);
+                let mut entry = self.new_entry(
+                    outer_instruction_index,
+                    inner_instruction_path,
+                    semantic_event_ordinal,
+                    PumpMutationKindV1::Trade,
+                    variant,
+                    discriminator,
+                );
+                entry.mint = Self::account_at(accounts, instruction_accounts, PUMP_IDX_MINT).0;
+                entry.bonding_curve =
+                    Self::account_at(accounts, instruction_accounts, PUMP_IDX_BONDING_CURVE).0;
+                entry.participant =
+                    Self::account_at(accounts, instruction_accounts, PUMP_IDX_USER).0;
+                let (participant_token_account, participant_token_account_message_index) =
+                    Self::account_at(
+                        accounts,
+                        instruction_accounts,
+                        PUMP_IDX_ASSOCIATED_BONDING_CURVE + 1,
+                    );
+                entry.participant_token_account = participant_token_account;
+                entry.participant_token_account_message_index =
+                    participant_token_account_message_index;
+                entry.participant_token_account_instruction_position =
+                    u16::try_from(PUMP_IDX_ASSOCIATED_BONDING_CURVE + 1).ok();
+                entry.token_program =
+                    Self::account_at(accounts, instruction_accounts, PUMP_IDX_TOKEN_PROGRAM).0;
+                entry.side = Some(PumpTradeSideV1::Buy);
+                if let Some((params, consumed)) = decoded {
+                    entry.token_amount_units = Some(params.amount);
+                    entry.instruction_limit_lamports = Some(params.sol_bound);
+                    entry.instruction_payload_exact = exact && consumed == payload.len();
+                }
+                entry
+            }
+            Some(DISC_SELL) => {
+                let decoded = borsh_read_with_len::<TradeParams>(payload);
+                let mut entry = self.new_entry(
+                    outer_instruction_index,
+                    inner_instruction_path,
+                    semantic_event_ordinal,
+                    PumpMutationKindV1::Trade,
+                    PumpInstructionVariantV1::LegacySell,
+                    discriminator,
+                );
+                entry.mint = Self::account_at(accounts, instruction_accounts, PUMP_IDX_MINT).0;
+                entry.bonding_curve =
+                    Self::account_at(accounts, instruction_accounts, PUMP_IDX_BONDING_CURVE).0;
+                entry.participant =
+                    Self::account_at(accounts, instruction_accounts, PUMP_IDX_USER).0;
+                let (participant_token_account, participant_token_account_message_index) =
+                    Self::account_at(
+                        accounts,
+                        instruction_accounts,
+                        PUMP_IDX_ASSOCIATED_BONDING_CURVE + 1,
+                    );
+                entry.participant_token_account = participant_token_account;
+                entry.participant_token_account_message_index =
+                    participant_token_account_message_index;
+                entry.participant_token_account_instruction_position =
+                    u16::try_from(PUMP_IDX_ASSOCIATED_BONDING_CURVE + 1).ok();
+                entry.token_program =
+                    Self::account_at(accounts, instruction_accounts, PUMP_IDX_TOKEN_PROGRAM).0;
+                entry.side = Some(PumpTradeSideV1::Sell);
+                if let Some((params, consumed)) = decoded {
+                    entry.token_amount_units = Some(params.amount);
+                    entry.instruction_limit_lamports = Some(params.sol_bound);
+                    entry.instruction_payload_exact = consumed == payload.len();
+                }
+                entry
+            }
+            Some(DISC_WITHDRAW) => {
+                let mut entry = self.new_entry(
+                    outer_instruction_index,
+                    inner_instruction_path,
+                    semantic_event_ordinal,
+                    PumpMutationKindV1::Withdraw,
+                    PumpInstructionVariantV1::Withdraw,
+                    discriminator,
+                );
+                entry.mint = Self::account_at(accounts, instruction_accounts, PUMP_IDX_MINT).0;
+                entry.bonding_curve =
+                    Self::account_at(accounts, instruction_accounts, PUMP_IDX_BONDING_CURVE).0;
+                entry.instruction_payload_exact = payload.is_empty();
+                entry
+            }
+            Some(DISC_MIGRATE) => {
+                let mut entry = self.new_entry(
+                    outer_instruction_index,
+                    inner_instruction_path,
+                    semantic_event_ordinal,
+                    PumpMutationKindV1::Migrate,
+                    PumpInstructionVariantV1::Migrate,
+                    discriminator,
+                );
+                entry.mint = Self::account_at(accounts, instruction_accounts, MIG_IDX_MINT).0;
+                entry.bonding_curve =
+                    Self::account_at(accounts, instruction_accounts, MIG_IDX_BONDING_CURVE).0;
+                entry.participant =
+                    Self::account_at(accounts, instruction_accounts, MIG_IDX_USER).0;
+                entry.instruction_payload_exact = borsh_read_with_len::<MigrateParams>(payload)
+                    .is_some_and(|(_params, consumed)| consumed == payload.len());
+                entry
+            }
+            _ => {
+                let mut entry = self.new_entry(
+                    outer_instruction_index,
+                    inner_instruction_path,
+                    semantic_event_ordinal,
+                    PumpMutationKindV1::UnknownMutation,
+                    PumpInstructionVariantV1::Unknown,
+                    discriminator,
+                );
+                entry.mint = Self::account_at(accounts, instruction_accounts, PUMP_IDX_MINT).0;
+                entry.bonding_curve =
+                    Self::account_at(accounts, instruction_accounts, PUMP_IDX_BONDING_CURVE).0;
+                if entry.bonding_curve.is_none() {
+                    self.inventory.has_unattributed_unknown_mutation = true;
+                }
+                entry
+            }
+        };
+
+        if entry.mint.is_none() || entry.bonding_curve.is_none() {
+            // A known instruction without a resolved curve/mint identity is
+            // still preserved, but the per-curve inventory cannot claim to be
+            // complete for exact certification.
+            self.inventory.inventory_complete = false;
+        }
+        if entry.kind == PumpMutationKindV1::UnknownMutation && entry.bonding_curve.is_none() {
+            self.inventory.has_unattributed_unknown_mutation = true;
+        }
+        self.inventory.mutations.push(entry);
+    }
+
+    fn attach_direct_events(&mut self, parsed: &[ParsedPumpEvent]) {
+        for event in parsed {
+            match &event.kind {
+                ParsedEventKind::CpiTrade { event: trade, .. } => {
+                    let mint = Pubkey::new_from_array(trade.mint);
+                    let participant = Pubkey::new_from_array(trade.user);
+                    let side = if trade.is_buy {
+                        PumpTradeSideV1::Buy
+                    } else {
+                        PumpTradeSideV1::Sell
+                    };
+                    let matches: Vec<usize> = self
+                        .inventory
+                        .mutations
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, entry)| {
+                            (entry.kind == PumpMutationKindV1::Trade
+                                && entry.mint == Some(mint)
+                                && entry.participant == Some(participant)
+                                && entry.side == Some(side))
+                            .then_some(index)
+                        })
+                        .collect();
+                    let state = PumpResearchDirectCurveEventStateV1 {
+                        virtual_quote_reserves: Some(trade.virtual_sol_reserves),
+                        virtual_token_reserves: Some(trade.virtual_token_reserves),
+                        real_quote_reserves: trade.real_sol_reserves,
+                        real_token_reserves: trade.real_token_reserves,
+                        complete: None,
+                    };
+                    self.attach_state_to_matches(&matches, state);
+                }
+                ParsedEventKind::CpiCreate(create) => {
+                    let mint = Pubkey::new_from_array(create.mint);
+                    let curve = Pubkey::new_from_array(create.bonding_curve);
+                    let participant = Pubkey::new_from_array(create.user);
+                    let matches: Vec<usize> = self
+                        .inventory
+                        .mutations
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, entry)| {
+                            (entry.kind == PumpMutationKindV1::Create
+                                && entry.mint == Some(mint)
+                                && entry.bonding_curve == Some(curve)
+                                && entry.create_user == Some(participant))
+                            .then_some(index)
+                        })
+                        .collect();
+                    let state = PumpResearchDirectCurveEventStateV1 {
+                        virtual_quote_reserves: create
+                            .virtual_quote_reserves
+                            .or(create.virtual_sol_reserves),
+                        virtual_token_reserves: create.virtual_token_reserves,
+                        real_quote_reserves: None,
+                        real_token_reserves: create.real_token_reserves,
+                        complete: Some(false),
+                    };
+                    self.attach_state_to_matches(&matches, state);
+                    if let [index] = matches.as_slice() {
+                        let entry = &mut self.inventory.mutations[*index];
+                        let event_creator = create.creator.map(Pubkey::new_from_array);
+                        if entry.protocol_creator.is_some()
+                            && event_creator.is_some()
+                            && entry.protocol_creator != event_creator
+                        {
+                            entry.direct_event_conflict = true;
+                        }
+                        if entry.create_mayhem.is_some()
+                            && create.is_mayhem_mode.is_some()
+                            && entry.create_mayhem != create.is_mayhem_mode
+                        {
+                            entry.direct_event_conflict = true;
+                        }
+                        if entry.create_cashback.is_some()
+                            && create.is_cashback_enabled.is_some()
+                            && entry.create_cashback != create.is_cashback_enabled
+                        {
+                            entry.direct_event_conflict = true;
+                        }
+                        entry.protocol_creator = entry.protocol_creator.or(event_creator);
+                        entry.create_mayhem = entry.create_mayhem.or(create.is_mayhem_mode);
+                        entry.create_cashback =
+                            entry.create_cashback.or(create.is_cashback_enabled);
+                        entry.quote_mint = entry
+                            .quote_mint
+                            .or(create.quote_mint.map(Pubkey::new_from_array));
+                        entry.token_total_supply =
+                            entry.token_total_supply.or(create.token_total_supply);
+                    }
+                }
+                ParsedEventKind::CpiComplete(complete) => {
+                    let mint = Pubkey::new_from_array(complete.mint);
+                    let curve = Pubkey::new_from_array(complete.bonding_curve);
+                    let matches: Vec<usize> = self
+                        .inventory
+                        .mutations
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, entry)| {
+                            (entry.mint == Some(mint) && entry.bonding_curve == Some(curve))
+                                .then_some(index)
+                        })
+                        .collect();
+                    self.attach_state_to_matches(
+                        &matches,
+                        PumpResearchDirectCurveEventStateV1 {
+                            virtual_quote_reserves: None,
+                            virtual_token_reserves: None,
+                            real_quote_reserves: None,
+                            real_token_reserves: None,
+                            complete: Some(true),
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn attach_state_to_matches(
+        &mut self,
+        matches: &[usize],
+        state: PumpResearchDirectCurveEventStateV1,
+    ) {
+        match matches {
+            [index] => {
+                let entry = &mut self.inventory.mutations[*index];
+                if let Some(existing) = &entry.direct_event_state {
+                    if existing != &state {
+                        entry.direct_event_conflict = true;
+                    }
+                } else {
+                    entry.direct_event_state = Some(state);
+                }
+            }
+            [] => {}
+            _ => {
+                for index in matches {
+                    self.inventory.mutations[*index].direct_event_ambiguous = true;
+                }
+            }
+        }
+    }
+}
+
 impl BinaryParser {
     pub fn new(verbose: bool) -> Self {
         Self::with_account_registry_and_bcv2_hydration(verbose, AccountRegistry::new(), None)
@@ -4513,10 +5467,10 @@ impl BinaryParser {
             GeyserEvent::Transaction { tx_index, .. } => *tx_index,
             _ => None,
         };
-        // Priority: CpiCreate (Borsh event log, ec.user is always correct) >
-        //           Create (direct instruction, account index may shift across Pump.fun versions) >
-        //           SwapPoolCreated.
-        // Collect all events first, then pick the highest-priority one.
+        // Keep direct creation and its CreateEvent together.  The direct
+        // instruction establishes the creation variant/account layout, while
+        // the full event carries quote mint and reserve evidence.  Picking the
+        // event unconditionally used to discard the direct `create_v2` fact.
         let mut direct_create: Option<ParsedPumpEvent> = None;
         let mut cpi_create: Option<ParsedPumpEvent> = None;
         let mut swap_pool_created: Option<ParsedPumpEvent> = None;
@@ -4538,139 +5492,227 @@ impl BinaryParser {
                 _ => {}
             }
         }
-        let chosen = cpi_create.or(direct_create).or(swap_pool_created);
-        if let Some(p) = chosen {
-            let event_ordinal = p.event_ordinal;
-            let provenance = p.provenance.clone();
-            match p.kind {
-                ParsedEventKind::Create {
-                    params: _params,
-                    mint,
-                    bonding_curve,
-                    user,
-                } => {
-                    let sig = if let GeyserEvent::Transaction { ref signature, .. } = event {
-                        *signature
-                    } else {
-                        solana_sdk::signature::Signature::default()
-                    };
+        // Before CreateV2 existed, the runtime used the matching CPI CreateEvent as
+        // the authoritative legacy birth source.  Preserve that established
+        // compatibility contract only for the legacy `Create` layout.  CreateV2
+        // deliberately remains direct-instruction-led because its distinct account
+        // layout supplies source-backed variant and Mayhem evidence that the legacy
+        // CPI event cannot recover on its own.
+        let direct_create = direct_create.filter(|direct| {
+            let ParsedEventKind::Create {
+                mint,
+                bonding_curve,
+                creation_variant,
+                ..
+            } = &direct.kind
+            else {
+                return true;
+            };
 
-                    return Ok(Some(InitializePoolEvent {
-                        provider_id: provider_id.clone(),
-                        provider_role,
-                        slot: Some(p.slot),
-                        event_ordinal,
-                        tx_index,
-                        provenance: provenance.clone(),
-                        event_ts_ms,
-                        event_time,
-                        signature: sig,
-                        amm_program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap_or_default(),
-                        pool_amm_id: Pubkey::from_str(&bonding_curve).unwrap_or_default(),
-                        base_mint: Pubkey::from_str(&mint).unwrap_or_default(),
-                        quote_mint: solana_sdk::pubkey!(
-                            "So11111111111111111111111111111111111111112"
-                        ),
-                        bonding_curve: Pubkey::from_str(&bonding_curve).unwrap_or_default(),
-                        creator: sanitize_creator_pubkey(
-                            Pubkey::from_str(&user).unwrap_or_default(),
-                        ),
-                        initial_virtual_token_reserves: None,
-                        initial_virtual_sol_reserves: None,
-                        initial_real_token_reserves: None,
-                        initial_real_sol_reserves: None,
-                        token_total_supply: None,
-                        block_time: None,
-                        raw_data: vec![],
-                    }));
-                }
-                ParsedEventKind::CpiCreate(ref ec) => {
-                    let sig = if let GeyserEvent::Transaction { ref signature, .. } = event {
-                        *signature
-                    } else {
-                        solana_sdk::signature::Signature::default()
-                    };
+            if *creation_variant != PumpCreationVariantV1::Create {
+                return true;
+            }
 
-                    return Ok(Some(InitializePoolEvent {
-                        provider_id: provider_id.clone(),
-                        provider_role,
-                        slot: Some(p.slot),
-                        event_ordinal,
-                        tx_index,
-                        provenance: provenance.clone(),
-                        event_ts_ms,
-                        event_time,
-                        signature: sig,
-                        amm_program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap_or_default(),
-                        pool_amm_id: Pubkey::try_from(ec.bonding_curve.as_slice())
+            !cpi_create.as_ref().is_some_and(|candidate| {
+                let ParsedEventKind::CpiCreate(event) = &candidate.kind else {
+                    return false;
+                };
+                let Ok(event_mint) = Pubkey::try_from(event.mint.as_slice()) else {
+                    return false;
+                };
+                let Ok(event_curve) = Pubkey::try_from(event.bonding_curve.as_slice()) else {
+                    return false;
+                };
+
+                event_mint.to_string() == *mint && event_curve.to_string() == *bonding_curve
+            })
+        });
+
+        let sig = if let GeyserEvent::Transaction { signature, .. } = event {
+            *signature
+        } else {
+            solana_sdk::signature::Signature::default()
+        };
+
+        if let Some(direct) = direct_create.as_ref() {
+            if let ParsedEventKind::Create {
+                mint,
+                bonding_curve,
+                user,
+                creation_variant,
+                direct_mayhem_mode,
+                ..
+            } = &direct.kind
+            {
+                let matching_event = cpi_create.as_ref().and_then(|candidate| {
+                    let ParsedEventKind::CpiCreate(event) = &candidate.kind else {
+                        return None;
+                    };
+                    let event_mint = Pubkey::try_from(event.mint.as_slice()).ok()?.to_string();
+                    let event_curve = Pubkey::try_from(event.bonding_curve.as_slice())
+                        .ok()?
+                        .to_string();
+                    (event_mint == *mint && event_curve == *bonding_curve).then_some(event)
+                });
+                let regime = match matching_event {
+                    Some(event) if *creation_variant == PumpCreationVariantV1::CreateV2 => {
+                        creation_regime_from_matching_create_v2(*direct_mayhem_mode, event)
+                    }
+                    Some(_) if *creation_variant == PumpCreationVariantV1::Create => {
+                        PumpCreationRegimeV1::unknown(
+                            PumpCreationVariantV1::Create,
+                            PumpCreationRegimeProvenanceV1::LegacyCreateInstruction,
+                        )
+                    }
+                    None if *creation_variant == PumpCreationVariantV1::CreateV2 => {
+                        PumpCreationRegimeV1 {
+                            schema_version: PumpCreationRegimeV1::SCHEMA_VERSION,
+                            creation_variant: PumpCreationVariantV1::CreateV2,
+                            quote_regime: PumpQuoteRegimeV1::Unknown,
+                            quote_mint: None,
+                            mayhem_mode: *direct_mayhem_mode,
+                            provenance: PumpCreationRegimeProvenanceV1::CreateV2InstructionOnly,
+                        }
+                    }
+                    _ => PumpCreationRegimeV1::unknown(
+                        *creation_variant,
+                        PumpCreationRegimeProvenanceV1::Unknown,
+                    ),
+                };
+                let quote_mint = if *creation_variant == PumpCreationVariantV1::Create {
+                    // The legacy runtime contract treated legacy bonding curves as
+                    // native-SOL quoted.  The new research tape preserves raw source
+                    // evidence separately, so this compatibility value is never
+                    // promoted into an on-chain protocol classification.
+                    Pubkey::from_str(WSOL_MINT).unwrap_or_default()
+                } else {
+                    matching_event
+                        .and_then(|event| event.quote_mint)
+                        .and_then(|value| Pubkey::try_from(value.as_slice()).ok())
+                        .unwrap_or_default()
+                };
+                let creator = matching_event
+                    .and_then(|event| event.creator.or(Some(event.user)))
+                    .and_then(|value| Pubkey::try_from(value.as_slice()).ok())
+                    .unwrap_or_else(|| Pubkey::from_str(user).unwrap_or_default());
+                return Ok(Some(InitializePoolEvent {
+                    provider_id,
+                    provider_role,
+                    slot: Some(direct.slot),
+                    event_ordinal: direct.event_ordinal,
+                    tx_index,
+                    provenance: direct.provenance.clone(),
+                    event_ts_ms,
+                    event_time,
+                    signature: sig,
+                    amm_program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap_or_default(),
+                    pool_amm_id: Pubkey::from_str(bonding_curve).unwrap_or_default(),
+                    base_mint: Pubkey::from_str(mint).unwrap_or_default(),
+                    quote_mint,
+                    creation_regime: regime,
+                    bonding_curve: Pubkey::from_str(bonding_curve).unwrap_or_default(),
+                    creator: sanitize_creator_pubkey(creator),
+                    initial_virtual_token_reserves: matching_event
+                        .and_then(|event| event.virtual_token_reserves),
+                    initial_virtual_sol_reserves: matching_event
+                        .and_then(|event| event.virtual_sol_reserves),
+                    initial_virtual_quote_reserves: matching_event
+                        .and_then(|event| event.virtual_quote_reserves),
+                    initial_real_token_reserves: matching_event
+                        .and_then(|event| event.real_token_reserves),
+                    initial_real_sol_reserves: None,
+                    token_total_supply: matching_event.and_then(|event| event.token_total_supply),
+                    block_time: matching_event.and_then(|event| event.timestamp),
+                    raw_data: vec![],
+                }));
+            }
+        }
+
+        if let Some(cpi) = cpi_create.as_ref() {
+            if let ParsedEventKind::CpiCreate(event) = &cpi.kind {
+                let quote_mint = event
+                    .quote_mint
+                    .and_then(|value| Pubkey::try_from(value.as_slice()).ok())
+                    .unwrap_or_else(|| Pubkey::from_str(WSOL_MINT).unwrap_or_default());
+                return Ok(Some(InitializePoolEvent {
+                    provider_id,
+                    provider_role,
+                    slot: Some(cpi.slot),
+                    event_ordinal: cpi.event_ordinal,
+                    tx_index,
+                    provenance: cpi.provenance.clone(),
+                    event_ts_ms,
+                    event_time,
+                    signature: sig,
+                    amm_program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap_or_default(),
+                    pool_amm_id: Pubkey::try_from(event.bonding_curve.as_slice())
+                        .unwrap_or_default(),
+                    base_mint: Pubkey::try_from(event.mint.as_slice()).unwrap_or_default(),
+                    quote_mint,
+                    creation_regime: PumpCreationRegimeV1::unknown(
+                        PumpCreationVariantV1::Unknown,
+                        PumpCreationRegimeProvenanceV1::CreateEventOnly,
+                    ),
+                    bonding_curve: Pubkey::try_from(event.bonding_curve.as_slice())
+                        .unwrap_or_default(),
+                    creator: sanitize_creator_pubkey(
+                        event
+                            .creator
+                            .or(Some(event.user))
+                            .and_then(|value| Pubkey::try_from(value.as_slice()).ok())
                             .unwrap_or_default(),
-                        base_mint: Pubkey::try_from(ec.mint.as_slice()).unwrap_or_default(),
-                        quote_mint: solana_sdk::pubkey!(
-                            "So11111111111111111111111111111111111111112"
-                        ),
-                        bonding_curve: Pubkey::try_from(ec.bonding_curve.as_slice())
-                            .unwrap_or_default(),
-                        creator: sanitize_creator_pubkey(
-                            Pubkey::try_from(ec.user.as_slice()).unwrap_or_default(),
-                        ),
-                        initial_virtual_token_reserves: None,
-                        initial_virtual_sol_reserves: None,
-                        initial_real_token_reserves: None,
-                        initial_real_sol_reserves: None,
-                        token_total_supply: None,
-                        block_time: None,
-                        raw_data: vec![],
-                    }));
-                }
-                ParsedEventKind::SwapPoolCreated {
-                    ref pool,
-                    ref base_mint,
-                    ref quote_mint,
-                    ref creator,
-                    ..
-                } => {
-                    let sig = if let GeyserEvent::Transaction { ref signature, .. } = event {
-                        *signature
-                    } else {
-                        solana_sdk::signature::Signature::default()
-                    };
+                    ),
+                    initial_virtual_token_reserves: event.virtual_token_reserves,
+                    initial_virtual_sol_reserves: event.virtual_sol_reserves,
+                    initial_virtual_quote_reserves: event.virtual_quote_reserves,
+                    initial_real_token_reserves: event.real_token_reserves,
+                    initial_real_sol_reserves: None,
+                    token_total_supply: event.token_total_supply,
+                    block_time: event.timestamp,
+                    raw_data: vec![],
+                }));
+            }
+        }
 
-                    // For PumpSwap pools there is no bonding_curve account.
-                    // lib.rs uses bonding_curve as the key for curve→mint registry
-                    // (CURVE_MAP_SET / CURVE_SUBSCRIBED).  Setting it to Pubkey::default()
-                    // causes curve=11111...1111 (SystemProgram) to be registered, which then
-                    // triggers CURVE_SEED_RPC_FAIL.
-                    // Fix: use pool_amm_id as the bonding_curve key so the registry maps
-                    // pool→mint correctly for PumpSwap.
-                    let pool_pk = Pubkey::from_str(pool).unwrap_or_default();
-                    return Ok(Some(InitializePoolEvent {
-                        provider_id: provider_id.clone(),
-                        provider_role,
-                        slot: Some(p.slot),
-                        event_ordinal,
-                        tx_index,
-                        provenance: provenance.clone(),
-                        event_ts_ms,
-                        event_time,
-                        signature: sig,
-                        amm_program_id: Pubkey::from_str(PUMP_SWAP_PROGRAM_ID).unwrap_or_default(),
-                        pool_amm_id: pool_pk,
-                        base_mint: Pubkey::from_str(base_mint).unwrap_or_default(),
-                        quote_mint: Pubkey::from_str(quote_mint).unwrap_or_default(),
-                        bonding_curve: pool_pk,
-                        creator: sanitize_creator_pubkey(
-                            Pubkey::from_str(creator).unwrap_or_default(),
-                        ),
-                        initial_virtual_token_reserves: None,
-                        initial_virtual_sol_reserves: None,
-                        initial_real_token_reserves: None,
-                        initial_real_sol_reserves: None,
-                        token_total_supply: None,
-                        block_time: None,
-                        raw_data: vec![],
-                    }));
-                }
-                _ => {}
+        if let Some(p) = swap_pool_created.as_ref() {
+            if let ParsedEventKind::SwapPoolCreated {
+                pool,
+                base_mint,
+                quote_mint,
+                creator,
+                ..
+            } = &p.kind
+            {
+                // PumpSwap has no Pump creation birth contract. Preserve its
+                // existing detection path while retaining an explicit Unknown
+                // Pump creation regime.
+                let pool_pk = Pubkey::from_str(pool).unwrap_or_default();
+                return Ok(Some(InitializePoolEvent {
+                    provider_id,
+                    provider_role,
+                    slot: Some(p.slot),
+                    event_ordinal: p.event_ordinal,
+                    tx_index,
+                    provenance: p.provenance.clone(),
+                    event_ts_ms,
+                    event_time,
+                    signature: sig,
+                    amm_program_id: Pubkey::from_str(PUMP_SWAP_PROGRAM_ID).unwrap_or_default(),
+                    pool_amm_id: pool_pk,
+                    base_mint: Pubkey::from_str(base_mint).unwrap_or_default(),
+                    quote_mint: Pubkey::from_str(quote_mint).unwrap_or_default(),
+                    creation_regime: PumpCreationRegimeV1::default(),
+                    bonding_curve: pool_pk,
+                    creator: sanitize_creator_pubkey(Pubkey::from_str(creator).unwrap_or_default()),
+                    initial_virtual_token_reserves: None,
+                    initial_virtual_sol_reserves: None,
+                    initial_virtual_quote_reserves: None,
+                    initial_real_token_reserves: None,
+                    initial_real_sol_reserves: None,
+                    token_total_supply: None,
+                    block_time: None,
+                    raw_data: vec![],
+                }));
             }
         }
         Ok(None)
@@ -4687,6 +5729,69 @@ impl BinaryParser {
         event: &GeyserEvent,
     ) -> SeerResult<ParsedTransactionBundle> {
         let parsed = self.parse_pump_events(event);
+        self.transaction_bundle_from_parsed(event, parsed)
+    }
+
+    /// Parse one transaction through the established structural walk while
+    /// also retaining the research-only complete mutation inventory.
+    ///
+    /// This API is intentionally standalone/offline-facing.  It does not
+    /// alter the active `parse_transaction_bundle` contract, does not publish
+    /// runtime events and does not make the inventory a live authority.
+    pub fn parse_research_transaction_bundle_v1(
+        &self,
+        event: &GeyserEvent,
+    ) -> SeerResult<ParsedResearchTransactionBundleV1> {
+        let GeyserEvent::Transaction {
+            signature,
+            slot,
+            tx_index,
+            ..
+        } = event
+        else {
+            return Err(SeerError::ParseError(
+                "research mutation inventory requires a transaction event".to_string(),
+            ));
+        };
+        let mut inventory = PumpResearchInventoryBuilderV1::new(*signature, *slot, *tx_index);
+        let parsed = self.parse_pump_events_with_inventory(event, Some(&mut inventory));
+        let runtime_compatible = self.transaction_bundle_from_parsed(event, parsed)?;
+        Ok(ParsedResearchTransactionBundleV1 {
+            runtime_compatible,
+            mutation_inventory: inventory.finish(),
+        })
+    }
+
+    /// Parse only the research mutation inventory through the established
+    /// single structural walk. Offline certification needs this authority,
+    /// not compatibility-trade enrichment, route hydration, IPC publication
+    /// or its per-trade operational logging. Keeping this narrow prevents a
+    /// closed historical replay from inheriting active-runtime side effects.
+    pub fn parse_research_mutation_inventory_v1(
+        &self,
+        event: &GeyserEvent,
+    ) -> SeerResult<PumpResearchTransactionMutationInventoryV1> {
+        let GeyserEvent::Transaction {
+            signature,
+            slot,
+            tx_index,
+            ..
+        } = event
+        else {
+            return Err(SeerError::ParseError(
+                "research mutation inventory requires a transaction event".to_string(),
+            ));
+        };
+        let mut inventory = PumpResearchInventoryBuilderV1::new(*signature, *slot, *tx_index);
+        let _ = self.parse_pump_events_with_inventory(event, Some(&mut inventory));
+        Ok(inventory.finish())
+    }
+
+    fn transaction_bundle_from_parsed(
+        &self,
+        event: &GeyserEvent,
+        parsed: Vec<ParsedPumpEvent>,
+    ) -> SeerResult<ParsedTransactionBundle> {
         let initialize_pool = self.initialize_pool_from_parsed(event, parsed.clone())?;
         let trades = self.trades_from_parsed(event, parsed)?;
         let raw_transaction_mutation_count = u32::try_from(
@@ -4935,9 +6040,17 @@ impl BinaryParser {
                         virtual_token_reserves: canonical_reserves
                             .map(|state| state.virtual_token_reserves)
                             .or(Some(et.virtual_token_reserves)),
-                        real_sol_reserves: canonical_reserves.map(|state| state.real_sol_reserves),
+                        // A same-mutation PrimaryAuthority reserve state is
+                        // the stronger source when present.  Otherwise retain
+                        // the raw current Pump `TradeEvent` reserve tail; it
+                        // is source-attached evidence, not a later state
+                        // reconstruction.
+                        real_sol_reserves: canonical_reserves
+                            .map(|state| state.real_sol_reserves)
+                            .or(et.real_sol_reserves),
                         real_token_reserves: canonical_reserves
-                            .map(|state| state.real_token_reserves),
+                            .map(|state| state.real_token_reserves)
+                            .or(et.real_token_reserves),
                         complete: canonical_reserves.map(|state| state.complete),
                         market_cap_sol: None,
                         global_config: None,
@@ -5568,6 +6681,7 @@ impl BinaryParser {
         post_balances: &[u64],
         pre_token_balances: &[crate::types::RawTokenBalance],
         post_token_balances: &[crate::types::RawTokenBalance],
+        mut research_inventory: Option<&mut PumpResearchInventoryBuilderV1>,
     ) -> Vec<ParsedPumpEvent> {
         let slot = slot.unwrap_or_default();
         let received_at = Instant::now();
@@ -5582,6 +6696,19 @@ impl BinaryParser {
             if !is_pump_program(&prog) {
                 instruction_ordinal = instruction_ordinal.saturating_add(1);
                 continue;
+            }
+
+            if prog == PUMP_FUN_PROGRAM_ID {
+                if let Some(inventory) = research_inventory.as_deref_mut() {
+                    inventory.observe_instruction(
+                        accounts,
+                        &ix.account_indices,
+                        &ix.data,
+                        outer_instruction_index,
+                        Some(Vec::new()),
+                        instruction_ordinal,
+                    );
+                }
             }
 
             let ix_accounts = resolve_accounts(&ix.account_indices, &all_keys);
@@ -5650,6 +6777,19 @@ impl BinaryParser {
                         instruction_ordinal = instruction_ordinal.saturating_add(1);
                     }
                     continue;
+                }
+
+                if prog == PUMP_FUN_PROGRAM_ID {
+                    if let Some(inventory) = research_inventory.as_deref_mut() {
+                        inventory.observe_instruction(
+                            accounts,
+                            &inner_ix.accounts,
+                            &inner_ix.data,
+                            group.index as usize,
+                            inner_instruction_path.clone(),
+                            instruction_ordinal,
+                        );
+                    }
                 }
 
                 record_missing_inner_provenance(
@@ -5728,6 +6868,10 @@ impl BinaryParser {
             }
         }
 
+        if let Some(inventory) = research_inventory.as_deref_mut() {
+            inventory.attach_direct_events(&out);
+        }
+
         dedup_trade_events(&mut out, &self.curve_mint_reg);
 
         out
@@ -5739,6 +6883,14 @@ impl BinaryParser {
     /// deliberately not a parser transport and is never decoded by the live
     /// transaction parser.
     fn parse_pump_events(&self, event: &GeyserEvent) -> Vec<ParsedPumpEvent> {
+        self.parse_pump_events_with_inventory(event, None)
+    }
+
+    fn parse_pump_events_with_inventory(
+        &self,
+        event: &GeyserEvent,
+        inventory: Option<&mut PumpResearchInventoryBuilderV1>,
+    ) -> Vec<ParsedPumpEvent> {
         #[cfg(test)]
         crate::hot_path_metrics::record_full_instruction_tree_scan();
         match event {
@@ -5763,6 +6915,7 @@ impl BinaryParser {
                 post_balances,
                 pre_token_balances,
                 post_token_balances,
+                inventory,
             ),
             _ => vec![],
         }
@@ -7553,6 +8706,75 @@ mod tests {
         d
     }
 
+    fn create_v2_data(
+        name: &str,
+        sym: &str,
+        uri: &str,
+        creator: Pubkey,
+        is_mayhem_mode: bool,
+    ) -> Vec<u8> {
+        let mut d = DISC_CREATE_V2.to_vec();
+        for s in [name, sym, uri] {
+            let bytes = s.as_bytes();
+            d.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            d.extend_from_slice(bytes);
+        }
+        d.extend_from_slice(creator.as_ref());
+        d.push(u8::from(is_mayhem_mode));
+        // `OptionBool` in the current IDL is serialized as its contained bool.
+        d.push(0);
+        d
+    }
+
+    fn create_v2_pre_cashback_data(
+        name: &str,
+        sym: &str,
+        uri: &str,
+        creator: Pubkey,
+        is_mayhem_mode: bool,
+    ) -> Vec<u8> {
+        let mut d = DISC_CREATE_V2.to_vec();
+        for s in [name, sym, uri] {
+            let bytes = s.as_bytes();
+            d.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            d.extend_from_slice(bytes);
+        }
+        d.extend_from_slice(creator.as_ref());
+        d.push(u8::from(is_mayhem_mode));
+        d
+    }
+
+    fn create_event_v2_payload(
+        mint: Pubkey,
+        curve: Pubkey,
+        user: Pubkey,
+        creator: Pubkey,
+        quote_mint: Pubkey,
+        is_mayhem_mode: bool,
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        for value in ["Fixture", "FIX", "https://example.invalid/fixture"] {
+            let bytes = value.as_bytes();
+            data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            data.extend_from_slice(bytes);
+        }
+        data.extend_from_slice(mint.as_ref());
+        data.extend_from_slice(curve.as_ref());
+        data.extend_from_slice(user.as_ref());
+        data.extend_from_slice(creator.as_ref());
+        data.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        data.extend_from_slice(&1_000_000_000_000u64.to_le_bytes());
+        data.extend_from_slice(&30_000_000_000u64.to_le_bytes());
+        data.extend_from_slice(&793_100_000_000_000u64.to_le_bytes());
+        data.extend_from_slice(&1_000_000_000_000_000u64.to_le_bytes());
+        data.extend_from_slice(Pubkey::new_unique().as_ref());
+        data.push(u8::from(is_mayhem_mode));
+        data.push(0);
+        data.extend_from_slice(quote_mint.as_ref());
+        data.extend_from_slice(&30_000_000_000u64.to_le_bytes());
+        data
+    }
+
     fn cpi_trade_payload(mint: Pubkey, user: Pubkey, is_buy: bool) -> Vec<u8> {
         let mut data = DISC_EVENT_TRADE.to_vec();
         data.extend_from_slice(mint.as_ref());
@@ -7979,6 +9201,435 @@ mod tests {
         assert!(cm.curve_for_mint(&mint_key).is_some());
         let snap = ar.snapshot();
         assert!(snap.contains(&curve_key));
+    }
+
+    #[test]
+    fn create_v2_uses_current_user_layout_and_preserves_direct_mayhem_fact() {
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let current_user = Pubkey::new_unique();
+        let legacy_user = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let mut accounts = dummy_accs(16);
+        accounts[CREATE_IDX_MINT] = mint.to_string();
+        accounts[CREATE_IDX_BONDING_CURVE] = curve.to_string();
+        accounts[CREATE_V2_IDX_USER] = current_user.to_string();
+        accounts[CREATE_LEGACY_IDX_USER] = legacy_user.to_string();
+
+        let events = decode(
+            &create_v2_data("Current", "CUR", "https://example.invalid", creator, true),
+            &accounts,
+            PUMP_FUN_PROGRAM_ID,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            ParsedEventKind::Create {
+                creation_variant,
+                direct_mayhem_mode,
+                mint: decoded_mint,
+                bonding_curve,
+                user,
+                ..
+            } => {
+                assert_eq!(*creation_variant, PumpCreationVariantV1::CreateV2);
+                assert_eq!(*direct_mayhem_mode, PumpMayhemModeV1::True);
+                assert_eq!(decoded_mint, &mint.to_string());
+                assert_eq!(bonding_curve, &curve.to_string());
+                assert_eq!(user, &current_user.to_string());
+                assert_ne!(user, &legacy_user.to_string());
+            }
+            other => panic!("expected create_v2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn research_inventory_keeps_create_v2_and_every_ordered_trade_mutation() {
+        let parser = BinaryParser::new(false);
+        let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let protocol_creator = Pubkey::new_unique();
+        let mut create_accounts = vec![Pubkey::new_unique(); 12];
+        create_accounts[CREATE_IDX_MINT] = mint;
+        create_accounts[CREATE_IDX_BONDING_CURVE] = curve;
+        create_accounts[CREATE_V2_IDX_USER] = user;
+        let create_indices: Vec<u8> = (0..create_accounts.len())
+            .map(|index| u8::try_from(index).expect("fixture account index"))
+            .collect();
+        let mut create_event = make_decoded_tx_event(
+            create_accounts,
+            vec![crate::types::RawInstruction {
+                program_id: pump_program,
+                account_indices: create_indices,
+                data: create_v2_data(
+                    "Fixture",
+                    "FIX",
+                    "https://example.invalid/fixture",
+                    protocol_creator,
+                    true,
+                ),
+            }],
+        );
+        if let GeyserEvent::Transaction { tx_index, .. } = &mut create_event {
+            *tx_index = Some(0);
+        }
+        let create_inventory = parser
+            .parse_research_mutation_inventory_v1(&create_event)
+            .expect("research CreateV2 inventory");
+        assert!(create_inventory.inventory_complete);
+        assert_eq!(create_inventory.mutations.len(), 1);
+        let create = &create_inventory.mutations[0];
+        assert_eq!(create.kind, PumpMutationKindV1::Create);
+        assert_eq!(
+            create.instruction_variant,
+            PumpInstructionVariantV1::CreateV2
+        );
+        assert_eq!(create.mint, Some(mint));
+        assert_eq!(create.bonding_curve, Some(curve));
+        assert_eq!(create.create_user, Some(user));
+        assert_eq!(create.protocol_creator, Some(protocol_creator));
+        assert_eq!(create.create_mayhem, Some(true));
+        assert_eq!(create.create_cashback, Some(false));
+
+        let mut trade_accounts = vec![Pubkey::new_unique(); 10];
+        trade_accounts[PUMP_IDX_MINT] = mint;
+        trade_accounts[PUMP_IDX_BONDING_CURVE] = curve;
+        trade_accounts[PUMP_IDX_USER] = user;
+        trade_accounts[PUMP_IDX_TOKEN_PROGRAM] =
+            Pubkey::from_str(ProgramIds::TOKEN_PROGRAM).expect("Token program");
+        let trade_indices: Vec<u8> = (0..trade_accounts.len())
+            .map(|index| u8::try_from(index).expect("fixture account index"))
+            .collect();
+        let mut trade_event = make_decoded_tx_event(
+            trade_accounts,
+            vec![
+                crate::types::RawInstruction {
+                    program_id: pump_program,
+                    account_indices: trade_indices.clone(),
+                    data: trade_data(DISC_BUY, 11, 12),
+                },
+                crate::types::RawInstruction {
+                    program_id: pump_program,
+                    account_indices: trade_indices.clone(),
+                    data: trade_data(DISC_BUY, 13, 14),
+                },
+                crate::types::RawInstruction {
+                    program_id: pump_program,
+                    account_indices: trade_indices,
+                    data: trade_data(DISC_SELL, 7, 8),
+                },
+            ],
+        );
+        if let GeyserEvent::Transaction { tx_index, .. } = &mut trade_event {
+            *tx_index = Some(0);
+        }
+        let trade_inventory = parser
+            .parse_research_mutation_inventory_v1(&trade_event)
+            .expect("research multi-trade inventory");
+        assert!(trade_inventory.inventory_complete);
+        assert_eq!(trade_inventory.mutations.len(), 3);
+        assert!(trade_inventory
+            .mutations
+            .iter()
+            .all(|entry| entry.kind == PumpMutationKindV1::Trade));
+        assert_eq!(
+            trade_inventory
+                .mutations
+                .iter()
+                .map(|entry| entry.locator.clone().expect("research locator"))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "same transaction needs a distinct locator per curve mutation"
+        );
+        assert_eq!(
+            trade_inventory.mutations[0].side,
+            Some(PumpTradeSideV1::Buy)
+        );
+        assert_eq!(
+            trade_inventory.mutations[1].side,
+            Some(PumpTradeSideV1::Buy)
+        );
+        assert_eq!(
+            trade_inventory.mutations[2].side,
+            Some(PumpTradeSideV1::Sell)
+        );
+    }
+
+    #[test]
+    fn pre_cashback_create_v2_keeps_variant_and_never_invents_cashback_false() {
+        let parser = BinaryParser::new(false);
+        let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let mut accounts = vec![Pubkey::new_unique(); 12];
+        accounts[CREATE_IDX_MINT] = mint;
+        accounts[CREATE_IDX_BONDING_CURVE] = curve;
+        accounts[CREATE_V2_IDX_USER] = user;
+        let account_indices: Vec<u8> = (0..accounts.len())
+            .map(|index| u8::try_from(index).expect("fixture account index"))
+            .collect();
+
+        // This known old layout intentionally has a 133-byte payload: three
+        // Borsh strings (8 + 3 + 77 bytes), creator and Mayhem, but no
+        // cashback OptionBool.  It mirrors the real raw shape that caused the
+        // first offline replay to stop rather than guess a flag.
+        let uri = "u".repeat(77);
+        let data = create_v2_pre_cashback_data("LegacyV2", "OLD", &uri, creator, true);
+        assert_eq!(data.len() - DISC_CREATE_V2.len(), 133);
+        let mut event = make_decoded_tx_event(
+            accounts,
+            vec![crate::types::RawInstruction {
+                program_id: pump_program,
+                account_indices,
+                data,
+            }],
+        );
+        if let GeyserEvent::Transaction { tx_index, .. } = &mut event {
+            *tx_index = Some(0);
+        }
+
+        let inventory = parser
+            .parse_research_mutation_inventory_v1(&event)
+            .expect("pre-cashback CreateV2 inventory");
+        assert!(inventory.inventory_complete);
+        let [create] = inventory.mutations.as_slice() else {
+            panic!("expected one CreateV2 mutation")
+        };
+        assert_eq!(create.kind, PumpMutationKindV1::Create);
+        assert_eq!(
+            create.instruction_variant,
+            PumpInstructionVariantV1::CreateV2
+        );
+        assert_eq!(create.mint, Some(mint));
+        assert_eq!(create.bonding_curve, Some(curve));
+        assert_eq!(create.create_user, Some(user));
+        assert_eq!(create.protocol_creator, Some(creator));
+        assert_eq!(create.create_mayhem, Some(true));
+        assert_eq!(create.create_cashback, None);
+        assert!(create.instruction_payload_exact);
+
+        let decoded = decode(
+            &create_v2_pre_cashback_data("LegacyV2", "OLD", &uri, creator, true),
+            &dummy_accs(16),
+            PUMP_FUN_PROGRAM_ID,
+        );
+        assert!(
+            matches!(
+                decoded.as_slice(),
+                [ParsedPumpEvent {
+                    kind: ParsedEventKind::Create {
+                        creation_variant: PumpCreationVariantV1::CreateV2,
+                        direct_mayhem_mode: PumpMayhemModeV1::True,
+                        ..
+                    },
+                    ..
+                }]
+            ),
+            "runtime-compatible parser must retain the known pre-cashback CreateV2 layout"
+        );
+    }
+
+    #[test]
+    fn research_inventory_preserves_unknown_curve_mutation_instead_of_dropping_it() {
+        let parser = BinaryParser::new(false);
+        let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let mut accounts = vec![Pubkey::new_unique(); 10];
+        accounts[PUMP_IDX_MINT] = mint;
+        accounts[PUMP_IDX_BONDING_CURVE] = curve;
+        let account_indices: Vec<u8> = (0..accounts.len())
+            .map(|index| u8::try_from(index).expect("fixture account index"))
+            .collect();
+        let mut event = make_decoded_tx_event(
+            accounts,
+            vec![crate::types::RawInstruction {
+                program_id: pump_program,
+                account_indices,
+                data: vec![0xA5; 8],
+            }],
+        );
+        if let GeyserEvent::Transaction { tx_index, .. } = &mut event {
+            *tx_index = Some(0);
+        }
+        let inventory = parser
+            .parse_research_mutation_inventory_v1(&event)
+            .expect("research unknown inventory");
+        assert_eq!(inventory.mutations.len(), 1);
+        assert_eq!(
+            inventory.mutations[0].kind,
+            PumpMutationKindV1::UnknownMutation
+        );
+        assert_eq!(inventory.mutations[0].mint, Some(mint));
+        assert_eq!(inventory.mutations[0].bonding_curve, Some(curve));
+        assert!(!inventory.has_unattributed_unknown_mutation);
+    }
+
+    #[test]
+    fn malformed_create_v2_never_falls_back_to_legacy_create_layout() {
+        let mut malformed = create_data("Legacy", "LGC", "https://example.invalid/legacy");
+        malformed[..8].copy_from_slice(&DISC_CREATE_V2);
+
+        let events = decode(&malformed, &dummy_accs(16), PUMP_FUN_PROGRAM_ID);
+        assert!(
+            events.is_empty(),
+            "a CreateV2 discriminator with only a legacy payload must fail closed rather than use the legacy account layout"
+        );
+    }
+
+    #[test]
+    fn matching_legacy_cpi_create_preserves_pre_createv2_source_precedence() {
+        let parser = BinaryParser::new(false);
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let direct_user = Pubkey::new_unique();
+        let cpi_user = Pubkey::new_unique();
+        let event = make_decoded_tx_event(vec![], vec![]);
+        let direct = ParsedPumpEvent {
+            received_at: Instant::now(),
+            slot: 42,
+            signature: None,
+            event_ordinal: Some(0),
+            provenance: Some(crate::types::InstructionProvenance {
+                outer_instruction_index: Some(0),
+                inner_group_index: None,
+                outer_program_id: None,
+                invoked_program_id: PUMP_FUN_PROGRAM_ID.to_string(),
+                stack_height: None,
+                inner_instruction_path: Some(vec![]),
+                from_cpi: false,
+            }),
+            kind: ParsedEventKind::Create {
+                params: CreateParams {
+                    name: "Legacy".to_string(),
+                    symbol: "LGC".to_string(),
+                    uri: "https://example.invalid/legacy".to_string(),
+                },
+                creation_variant: PumpCreationVariantV1::Create,
+                direct_mayhem_mode: PumpMayhemModeV1::Unknown,
+                mint: mint.to_string(),
+                bonding_curve: curve.to_string(),
+                user: direct_user.to_string(),
+            },
+            from_cpi: false,
+            is_backfill: false,
+        };
+        let cpi = ParsedPumpEvent {
+            received_at: Instant::now(),
+            slot: 42,
+            signature: None,
+            event_ordinal: Some(1),
+            provenance: Some(crate::types::InstructionProvenance {
+                outer_instruction_index: Some(0),
+                inner_group_index: Some(0),
+                outer_program_id: Some(PUMP_FUN_PROGRAM_ID.to_string()),
+                invoked_program_id: PUMP_FUN_PROGRAM_ID.to_string(),
+                stack_height: Some(2),
+                inner_instruction_path: Some(vec![0]),
+                from_cpi: true,
+            }),
+            kind: ParsedEventKind::CpiCreate(EventCreate {
+                name: "Legacy".to_string(),
+                symbol: "LGC".to_string(),
+                uri: "https://example.invalid/legacy".to_string(),
+                mint: mint.to_bytes(),
+                bonding_curve: curve.to_bytes(),
+                user: cpi_user.to_bytes(),
+                creator: None,
+                timestamp: None,
+                virtual_token_reserves: None,
+                virtual_sol_reserves: None,
+                real_token_reserves: None,
+                token_total_supply: None,
+                quote_mint: None,
+                virtual_quote_reserves: None,
+                is_mayhem_mode: None,
+                is_cashback_enabled: None,
+            }),
+            from_cpi: true,
+            is_backfill: false,
+        };
+
+        let pool = parser
+            .initialize_pool_from_parsed(&event, vec![direct, cpi])
+            .expect("legacy create source selection")
+            .expect("matching legacy create must emit a pool");
+
+        assert_eq!(pool.event_ordinal, Some(1));
+        assert_eq!(pool.creator, cpi_user);
+        assert!(pool.provenance.expect("CPI provenance").from_cpi);
+        assert_eq!(pool.quote_mint, Pubkey::from_str(WSOL_MINT).unwrap());
+    }
+
+    #[test]
+    fn current_create_v2_birth_regime_fixtures_are_source_backed() {
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let decode = |quote_mint: Pubkey, is_mayhem_mode: bool| {
+            let bytes =
+                create_event_v2_payload(mint, curve, user, creator, quote_mint, is_mayhem_mode);
+            let (event, consumed) =
+                decode_event_create_with_len(&bytes).expect("current CreateEvent fixture");
+            assert_eq!(consumed, bytes.len());
+            creation_regime_from_matching_create_v2(
+                if is_mayhem_mode {
+                    PumpMayhemModeV1::True
+                } else {
+                    PumpMayhemModeV1::False
+                },
+                &event,
+            )
+        };
+
+        let regular = decode(Pubkey::default(), false);
+        assert_eq!(regular.quote_regime, PumpQuoteRegimeV1::NativeSol);
+        assert_eq!(regular.mayhem_mode, PumpMayhemModeV1::False);
+        assert_eq!(
+            regular.provenance,
+            PumpCreationRegimeProvenanceV1::CreateV2AndCreateEvent
+        );
+
+        let mayhem = decode(Pubkey::default(), true);
+        assert_eq!(mayhem.quote_regime, PumpQuoteRegimeV1::NativeSol);
+        assert_eq!(mayhem.mayhem_mode, PumpMayhemModeV1::True);
+
+        let usdc = decode(
+            Pubkey::from_str(USDC_MINT).expect("canonical USDC mint"),
+            false,
+        );
+        assert_eq!(usdc.quote_regime, PumpQuoteRegimeV1::Usdc);
+        assert_eq!(usdc.mayhem_mode, PumpMayhemModeV1::False);
+    }
+
+    #[test]
+    fn incomplete_or_conflicting_create_v2_birth_evidence_is_unknown_and_non_evaluable() {
+        assert!(
+            decode_event_create_with_len(&[1, 2, 3]).is_none(),
+            "malformed CreateEvent must not fabricate a regime"
+        );
+
+        let bytes = create_event_v2_payload(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::default(),
+            true,
+        );
+        let (event, _) = decode_event_create_with_len(&bytes).expect("fixture event");
+        let conflicting = creation_regime_from_matching_create_v2(PumpMayhemModeV1::False, &event);
+        assert_eq!(conflicting.quote_regime, PumpQuoteRegimeV1::Unknown);
+        assert_eq!(conflicting.mayhem_mode, PumpMayhemModeV1::Unknown);
+        assert_eq!(
+            conflicting.provenance,
+            PumpCreationRegimeProvenanceV1::Unknown
+        );
     }
 
     // ── Buy / Sell ────────────────────────────────────────────────────────────
@@ -8460,7 +10111,7 @@ mod tests {
         let mut accounts = vec![Pubkey::new_unique(); 12];
         accounts[CREATE_IDX_MINT] = mint;
         accounts[CREATE_IDX_BONDING_CURVE] = curve;
-        accounts[CREATE_IDX_USER] = creator;
+        accounts[CREATE_LEGACY_IDX_USER] = creator;
         let event = make_decoded_tx_event(
             accounts,
             vec![crate::types::RawInstruction {
@@ -8489,7 +10140,7 @@ mod tests {
         let mut accounts = vec![Pubkey::new_unique(); 12];
         accounts[CREATE_IDX_MINT] = mint;
         accounts[CREATE_IDX_BONDING_CURVE] = curve;
-        accounts[CREATE_IDX_USER] = token_2022;
+        accounts[CREATE_LEGACY_IDX_USER] = token_2022;
         let event = make_decoded_tx_event(
             accounts,
             vec![crate::types::RawInstruction {
@@ -8520,7 +10171,7 @@ mod tests {
         let mut accounts = vec![Pubkey::new_unique(); 12];
         accounts[CREATE_IDX_MINT] = mint;
         accounts[CREATE_IDX_BONDING_CURVE] = curve;
-        accounts[CREATE_IDX_USER] = creator;
+        accounts[CREATE_LEGACY_IDX_USER] = creator;
         let mut event = make_decoded_tx_event(
             accounts,
             vec![crate::types::RawInstruction {
@@ -10328,6 +11979,8 @@ mod tests {
                         timestamp: 1,
                         virtual_sol_reserves: 1,
                         virtual_token_reserves: 1,
+                        real_sol_reserves: None,
+                        real_token_reserves: None,
                     },
                     canonical_reserves: None,
                 },
@@ -10407,6 +12060,8 @@ mod tests {
                         timestamp: 1,
                         virtual_sol_reserves: 31_000_000_000,
                         virtual_token_reserves: 1_000_000_000_000_000,
+                        real_sol_reserves: None,
+                        real_token_reserves: None,
                     },
                     canonical_reserves: None,
                 },
@@ -10485,6 +12140,8 @@ mod tests {
                         timestamp: 1,
                         virtual_sol_reserves: 1,
                         virtual_token_reserves: 1,
+                        real_sol_reserves: None,
+                        real_token_reserves: None,
                     },
                     canonical_reserves: None,
                 },
@@ -13247,6 +14904,51 @@ mod tests {
         let ev = PumpParser::try_decode_cpi_event(&p, 1, None, Instant::now(), false);
         assert!(ev.is_some());
         assert!(ev.unwrap().from_cpi);
+    }
+
+    #[test]
+    fn cpi_trade_decodes_current_real_reserve_prefix_and_ignores_future_tail() {
+        let mut p = DISC_EVENT_TRADE.to_vec();
+        p.extend([1u8; 32]);
+        p.extend_from_slice(&100_000_000u64.to_le_bytes());
+        p.extend_from_slice(&1_000_000u64.to_le_bytes());
+        p.push(1u8);
+        p.extend([2u8; 32]);
+        p.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        p.extend_from_slice(&30_000_000_000u64.to_le_bytes());
+        p.extend_from_slice(&1_000_000_000_000u64.to_le_bytes());
+        p.extend_from_slice(&123_000_000u64.to_le_bytes());
+        p.extend_from_slice(&456_000_000u64.to_le_bytes());
+        p.extend([0xA5, 0x5A, 0x01]); // deliberately opaque future tail
+
+        let event = PumpParser::try_decode_cpi_event(&p, 1, None, Instant::now(), false)
+            .expect("current Pump trade event should decode");
+        match event.kind {
+            ParsedEventKind::CpiTrade { event, .. } => {
+                assert_eq!(event.real_sol_reserves, Some(123_000_000));
+                assert_eq!(event.real_token_reserves, Some(456_000_000));
+            }
+            other => panic!("expected CpiTrade, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cpi_trade_rejects_truncated_current_real_reserve_prefix() {
+        let mut p = DISC_EVENT_TRADE.to_vec();
+        p.extend([1u8; 32]);
+        p.extend_from_slice(&100_000_000u64.to_le_bytes());
+        p.extend_from_slice(&1_000_000u64.to_le_bytes());
+        p.push(1u8);
+        p.extend([2u8; 32]);
+        p.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        p.extend_from_slice(&30_000_000_000u64.to_le_bytes());
+        p.extend_from_slice(&1_000_000_000_000u64.to_le_bytes());
+        p.extend([0xFF; 7]);
+
+        assert!(
+            PumpParser::try_decode_cpi_event(&p, 1, None, Instant::now(), false).is_none(),
+            "a non-empty but incomplete real-reserve tail must fail closed"
+        );
     }
 
     #[test]

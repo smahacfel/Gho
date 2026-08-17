@@ -19,7 +19,8 @@ use yellowstone_grpc_proto::prelude::{
 
 use crate::{
     binary_parser::{
-        BinaryParser, ParsedTransactionBundle, DISC_BUY, DISC_CREATE, DISC_SELL, DISC_SWAP_BUY,
+        BinaryParser, ParsedTransactionBundle, DISC_BUY, DISC_CREATE, DISC_CREATE_V2, DISC_SELL,
+        DISC_SWAP_BUY,
     },
     config::SeerConfig,
     grpc_connection::{
@@ -30,7 +31,9 @@ use crate::{
     },
     hot_path_metrics,
     ipc::{create_ipc_channel, BackpressurePolicy, EventPriority, IpcChannelConfig, IpcError},
-    types::{GeyserEvent, InitializePoolEvent, RawBytesMissingReason, TradeEvent},
+    types::{
+        GeyserEvent, InitializePoolEvent, InstructionProvenance, RawBytesMissingReason, TradeEvent,
+    },
     Seer,
 };
 
@@ -45,10 +48,22 @@ const QUEUE_OLDEST_EVENT_SLA_NS: u64 = 500_000_000;
 const BASELINE_LEGACY_CANONICAL_PARITY_DIGEST_V1: &str =
     "549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202";
 /// Frozen full PR1D parser snapshot, including locator/order/provenance and
-/// raw transaction inventory evidence.  Captured from the deterministic
-/// release harness after the V1 projection proved parent parity.
+/// raw transaction inventory evidence.
+///
+/// Its source receipt was corrected in CS0: the former fixture built bytes
+/// through the mutable `DISC_CREATE` alias while that alias incorrectly named
+/// `d6…` as legacy Create.  The fixture now owns the canonical legacy bytes
+/// below, and this digest is the one immutable receipt for that corrected,
+/// source-valid fixture.  The V1 semantic digest above remains unchanged.
 const BASELINE_FULL_PR1D_PARSER_SNAPSHOT_DIGEST_V2: &str =
-    "507b13704d5b90c3f724a395acbf0d0cc55fdc37a83fcb95cf67cceb6247569f";
+    "02136d691e399dace85b112cc5b6d50c79323a2f24adcb3e7569ac68b40654a6";
+
+/// Immutable raw source bytes for the legacy `global:create` fixture used by
+/// the pre-existing PR1D corpus.  Keep this literal rather than deriving it
+/// from a parser alias so a future instruction-name correction cannot silently
+/// change the captured protobuf payload or its provenance hash.
+const FROZEN_LEGACY_CREATE_FIXTURE_DISCRIMINATOR: [u8; 8] =
+    [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
 
 #[derive(Clone, Copy, Debug)]
 enum FixtureKind {
@@ -75,7 +90,7 @@ fn trade_data(discriminator: [u8; 8], amount: u64, sol_bound: u64) -> Vec<u8> {
 }
 
 fn create_data() -> Vec<u8> {
-    let mut data = DISC_CREATE.to_vec();
+    let mut data = FROZEN_LEGACY_CREATE_FIXTURE_DISCRIMINATOR.to_vec();
     for text in ["PR1B", "P1B", "https://example.invalid/pr1b.json"] {
         data.extend_from_slice(&(text.len() as u32).to_le_bytes());
         data.extend_from_slice(text.as_bytes());
@@ -276,8 +291,125 @@ fn steady_state_rss_kib() -> Option<u64> {
 struct LegacyCanonicalParserProjectionV1 {
     schema: &'static str,
     fixture: String,
-    initialize_pool: Option<InitializePoolEvent>,
+    initialize_pool: Option<LegacyInitializePoolProjectionV1>,
     trades: Vec<TradeEvent>,
+}
+
+/// Exact serialized `InitializePoolEvent` shape from the pre-PR1D parity
+/// contract. New evidence fields must be projected away here rather than
+/// weakening their normal runtime/research serialization semantics.
+#[derive(Clone, Debug, Serialize)]
+struct LegacyInitializePoolProjectionV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_role: Option<RawProviderRoleV1>,
+    slot: Option<u64>,
+    event_ts_ms: Option<u64>,
+    event_time: ghost_core::EventTimeMetadata,
+    signature: Signature,
+    amm_program_id: Pubkey,
+    pool_amm_id: Pubkey,
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    bonding_curve: Pubkey,
+    creator: Pubkey,
+    initial_virtual_token_reserves: Option<u64>,
+    initial_virtual_sol_reserves: Option<u64>,
+    initial_real_token_reserves: Option<u64>,
+    initial_real_sol_reserves: Option<u64>,
+    token_total_supply: Option<u64>,
+    block_time: Option<i64>,
+    raw_data: Vec<u8>,
+}
+
+/// Exact serialized `InitializePoolEvent` shape from the frozen full PR1D
+/// snapshot. It retains PR1D order/provenance fields but intentionally omits
+/// later creation-regime and initial-quote evidence.
+#[derive(Clone, Debug, Serialize)]
+struct FullPr1dInitializePoolProjectionV2 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_role: Option<RawProviderRoleV1>,
+    slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_ordinal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<InstructionProvenance>,
+    event_ts_ms: Option<u64>,
+    event_time: ghost_core::EventTimeMetadata,
+    signature: Signature,
+    amm_program_id: Pubkey,
+    pool_amm_id: Pubkey,
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    bonding_curve: Pubkey,
+    creator: Pubkey,
+    initial_virtual_token_reserves: Option<u64>,
+    initial_virtual_sol_reserves: Option<u64>,
+    initial_real_token_reserves: Option<u64>,
+    initial_real_sol_reserves: Option<u64>,
+    token_total_supply: Option<u64>,
+    block_time: Option<i64>,
+    raw_data: Vec<u8>,
+}
+
+impl From<InitializePoolEvent> for LegacyInitializePoolProjectionV1 {
+    fn from(pool: InitializePoolEvent) -> Self {
+        Self {
+            provider_id: pool.provider_id,
+            provider_role: pool.provider_role,
+            slot: pool.slot,
+            event_ts_ms: pool.event_ts_ms,
+            event_time: pool.event_time,
+            signature: pool.signature,
+            amm_program_id: pool.amm_program_id,
+            pool_amm_id: pool.pool_amm_id,
+            base_mint: pool.base_mint,
+            quote_mint: pool.quote_mint,
+            bonding_curve: pool.bonding_curve,
+            creator: pool.creator,
+            initial_virtual_token_reserves: pool.initial_virtual_token_reserves,
+            initial_virtual_sol_reserves: pool.initial_virtual_sol_reserves,
+            initial_real_token_reserves: pool.initial_real_token_reserves,
+            initial_real_sol_reserves: pool.initial_real_sol_reserves,
+            token_total_supply: pool.token_total_supply,
+            block_time: pool.block_time,
+            raw_data: pool.raw_data,
+        }
+    }
+}
+
+impl From<InitializePoolEvent> for FullPr1dInitializePoolProjectionV2 {
+    fn from(pool: InitializePoolEvent) -> Self {
+        Self {
+            provider_id: pool.provider_id,
+            provider_role: pool.provider_role,
+            slot: pool.slot,
+            event_ordinal: pool.event_ordinal,
+            tx_index: pool.tx_index,
+            provenance: pool.provenance,
+            event_ts_ms: pool.event_ts_ms,
+            event_time: pool.event_time,
+            signature: pool.signature,
+            amm_program_id: pool.amm_program_id,
+            pool_amm_id: pool.pool_amm_id,
+            base_mint: pool.base_mint,
+            quote_mint: pool.quote_mint,
+            bonding_curve: pool.bonding_curve,
+            creator: pool.creator,
+            initial_virtual_token_reserves: pool.initial_virtual_token_reserves,
+            initial_virtual_sol_reserves: pool.initial_virtual_sol_reserves,
+            initial_real_token_reserves: pool.initial_real_token_reserves,
+            initial_real_sol_reserves: pool.initial_real_sol_reserves,
+            token_total_supply: pool.token_total_supply,
+            block_time: pool.block_time,
+            raw_data: pool.raw_data,
+        }
+    }
 }
 
 /// PR1D snapshots must not depend on locally observed arrival clocks.
@@ -309,14 +441,7 @@ fn legacy_canonical_parser_projection_v1(
     name: &str,
     bundle: &ParsedTransactionBundle,
 ) -> LegacyCanonicalParserProjectionV1 {
-    let (mut initialize_pool, mut trades) = normalized_parity_events(bundle);
-    if let Some(pool) = initialize_pool.as_mut() {
-        // These fields did not exist in the PR1C parent schema.  `None` skips
-        // their serde output and restores the exact V1 field order/shape.
-        pool.event_ordinal = None;
-        pool.tx_index = None;
-        pool.provenance = None;
-    }
+    let (initialize_pool, mut trades) = normalized_parity_events(bundle);
     for trade in &mut trades {
         if let Some(provenance) = trade.provenance.as_mut() {
             // `inner_instruction_path` is the PR1D addition to the existing
@@ -328,7 +453,7 @@ fn legacy_canonical_parser_projection_v1(
     LegacyCanonicalParserProjectionV1 {
         schema: "canonical_parser_parity_snapshot_v1",
         fixture: name.to_string(),
-        initialize_pool,
+        initialize_pool: initialize_pool.map(Into::into),
         trades,
     }
 }
@@ -337,7 +462,7 @@ fn legacy_canonical_parser_projection_v1(
 struct FullPr1dParserSnapshotV2 {
     schema: &'static str,
     fixture: String,
-    initialize_pool: Option<InitializePoolEvent>,
+    initialize_pool: Option<FullPr1dInitializePoolProjectionV2>,
     initialize_pool_observation: Option<ObservedPumpMutationV1>,
     trades: Vec<TradeEvent>,
     trade_observations: Vec<Option<ObservedPumpMutationV1>>,
@@ -369,7 +494,7 @@ fn full_pr1d_parser_snapshot_v2(
     FullPr1dParserSnapshotV2 {
         schema: "canonical_parser_full_pr1d_snapshot_v2",
         fixture: name.to_string(),
-        initialize_pool,
+        initialize_pool: initialize_pool.map(Into::into),
         initialize_pool_observation,
         trades,
         trade_observations,
@@ -677,6 +802,43 @@ fn canonical_parity_snapshot_detects_economic_and_state_drift() {
         observation.provenance.received_at_monotonic_ns, 0,
         "diagnostic arrival time must not make the PR1D digest nondeterministic"
     );
+}
+
+#[test]
+fn frozen_v1_v2_pool_projections_exclude_later_birth_evidence() {
+    let parser = BinaryParser::new(false);
+    let mut bundle = parser
+        .parse_transaction_bundle(&normalize_transaction(8, FixtureKind::CreateAndInitialBuy))
+        .expect("creation fixture bundle");
+
+    let legacy_before = legacy_canonical_parser_projection_v1("create", &bundle);
+    let full_before = full_pr1d_parser_snapshot_v2("create", &bundle);
+
+    let pool = bundle
+        .initialize_pool
+        .as_mut()
+        .expect("creation fixture has an initialize pool event");
+    pool.creation_regime.quote_mint = Some("research-only-quote".to_owned());
+    pool.initial_virtual_quote_reserves = Some(30_000_000_000);
+
+    let legacy_after = legacy_canonical_parser_projection_v1("create", &bundle);
+    let full_after = full_pr1d_parser_snapshot_v2("create", &bundle);
+    assert_eq!(
+        canonical_parity_digest(std::slice::from_ref(&legacy_before)),
+        canonical_parity_digest(std::slice::from_ref(&legacy_after)),
+        "V1 projection must remain insensitive to later birth evidence"
+    );
+    assert_eq!(
+        canonical_parity_digest(std::slice::from_ref(&full_before)),
+        canonical_parity_digest(std::slice::from_ref(&full_after)),
+        "frozen PR1D V2 projection must remain insensitive to later birth evidence"
+    );
+}
+
+#[test]
+fn frozen_legacy_create_fixture_owns_its_canonical_source_discriminator() {
+    assert_eq!(FROZEN_LEGACY_CREATE_FIXTURE_DISCRIMINATOR, DISC_CREATE);
+    assert_ne!(FROZEN_LEGACY_CREATE_FIXTURE_DISCRIMINATOR, DISC_CREATE_V2);
 }
 
 #[test]
