@@ -3,8 +3,8 @@
 //! This module defines the data structures used for event processing and candidate creation.
 
 use ghost_core::{
-    CurveFinality, EventSemanticEnvelope, EventTimeMetadata, ObservationProvenanceV1,
-    RawProviderRoleV1, SourceKind,
+    CanonicalPumpOrderKeyV1, CurveFinality, EventSemanticEnvelope, EventTimeMetadata,
+    ObservationProvenanceV1, PumpCreationRegimeV1, RawProviderRoleV1, SourceKind,
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -545,6 +545,12 @@ pub struct InitializePoolEvent {
     /// Quote token mint (SOL, USDC, or BONK)
     pub quote_mint: Pubkey,
 
+    /// Immutable source-backed creation regime. `Unknown` is retained rather
+    /// than inferred from later trades so regime-sensitive offline studies can
+    /// classify the birth as non-evaluable.
+    #[serde(default)]
+    pub creation_regime: PumpCreationRegimeV1,
+
     /// Bonding curve account (PDA derived from mint)
     pub bonding_curve: Pubkey,
 
@@ -556,6 +562,12 @@ pub struct InitializePoolEvent {
 
     /// Optional: Initial virtual SOL reserves
     pub initial_virtual_sol_reserves: Option<u64>,
+
+    /// Optional exact initial virtual quote reserves from the source Create
+    /// event. For NativeSOL births this is the integer `x` baseline used by
+    /// source-exact validation; it is never reconstructed from a later trade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_virtual_quote_reserves: Option<u64>,
 
     /// Optional: Initial real token reserves
     pub initial_real_token_reserves: Option<u64>,
@@ -904,6 +916,13 @@ pub struct CandidatePool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_index: Option<u32>,
 
+    /// Exact source-backed canonical order of the birth mutation.  This is
+    /// additive capture evidence for offline research; it has no Gatekeeper,
+    /// admission or execution authority.  Missing source coordinates remain
+    /// explicit rather than being inferred from wall/arrival timestamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birth_canonical_order: Option<CanonicalPumpOrderKeyV1>,
+
     /// Effective event timestamp in milliseconds, derived via provenance helpers.
     pub event_ts_ms: Option<u64>,
 
@@ -926,6 +945,11 @@ pub struct CandidatePool {
     /// Quote token mint
     pub quote_mint: Pubkey,
 
+    /// Immutable birth regime inherited only from the matching creation
+    /// observation; it has no Gatekeeper or execution authority.
+    #[serde(default)]
+    pub creation_regime: PumpCreationRegimeV1,
+
     /// Bonding curve account
     pub bonding_curve: Pubkey,
 
@@ -942,6 +966,11 @@ pub struct CandidatePool {
 
     /// Optional: Initial liquidity in SOL
     pub initial_liquidity_sol: Option<f64>,
+
+    /// Exact source value retained separately from display-oriented floating
+    /// point liquidity for future source-exact validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_virtual_quote_reserves: Option<u64>,
 
     /// Optional: Token total supply
     pub token_total_supply: Option<u64>,
@@ -983,12 +1012,15 @@ impl From<InitializePoolEvent> for CandidatePool {
             .or(event.initial_real_sol_reserves)
             .map(|lamports| lamports as f64 / 1_000_000_000.0);
 
+        let birth_canonical_order = event.canonical_order();
+
         Self {
             semantic: EventSemanticEnvelope::default(),
             provider_id: event.provider_id,
             provider_role: event.provider_role,
             slot: event.slot,
             tx_index: event.tx_index,
+            birth_canonical_order,
             event_ts_ms: event
                 .event_ts_ms
                 .or_else(|| event_ts_from_block_time(event.block_time)),
@@ -998,11 +1030,13 @@ impl From<InitializePoolEvent> for CandidatePool {
             pool_amm_id: event.pool_amm_id,
             base_mint: event.base_mint,
             quote_mint: event.quote_mint,
+            creation_regime: event.creation_regime,
             bonding_curve: event.bonding_curve,
             creator: event.creator,
             timestamp,
             bonding_curve_progress: None, // Will be calculated from on-chain data if needed
             initial_liquidity_sol,
+            initial_virtual_quote_reserves: event.initial_virtual_quote_reserves,
             token_total_supply: event.token_total_supply,
             block_time: event.block_time,
         }
@@ -1012,6 +1046,20 @@ impl From<InitializePoolEvent> for CandidatePool {
 impl InitializePoolEvent {
     pub fn compat_event_ts_ms(&self) -> Option<u64> {
         self.event_time.compat_event_ts_ms(self.event_ts_ms)
+    }
+
+    /// Reconstruct the exact order key from the source coordinates already
+    /// attached to this initialize mutation.  All fields are required: a
+    /// partial locator is not promoted to an order authority.
+    pub fn canonical_order(&self) -> Option<CanonicalPumpOrderKeyV1> {
+        let provenance = self.provenance.as_ref()?;
+        Some(CanonicalPumpOrderKeyV1 {
+            slot: self.slot?,
+            tx_index: self.tx_index?,
+            outer_instruction_index: u16::try_from(provenance.outer_instruction_index?).ok()?,
+            inner_instruction_path: provenance.inner_instruction_path.clone()?,
+            semantic_event_ordinal: self.event_ordinal?,
+        })
     }
 }
 
@@ -1085,6 +1133,43 @@ impl AmmProgram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn initialize_pool_event_with_source_order() -> InitializePoolEvent {
+        InitializePoolEvent {
+            provider_id: None,
+            provider_role: None,
+            slot: Some(42),
+            event_ordinal: Some(5),
+            tx_index: Some(7),
+            provenance: Some(InstructionProvenance {
+                outer_instruction_index: Some(3),
+                inner_group_index: Some(3),
+                outer_program_id: None,
+                invoked_program_id: AmmProgram::PumpFun.program_id().to_string(),
+                stack_height: Some(3),
+                inner_instruction_path: Some(vec![1, 2]),
+                from_cpi: true,
+            }),
+            event_ts_ms: None,
+            event_time: EventTimeMetadata::default(),
+            signature: Signature::new_unique(),
+            amm_program_id: AmmProgram::PumpFun.program_id(),
+            pool_amm_id: Pubkey::new_unique(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            creation_regime: PumpCreationRegimeV1::default(),
+            bonding_curve: Pubkey::new_unique(),
+            creator: Pubkey::new_unique(),
+            initial_virtual_token_reserves: None,
+            initial_virtual_sol_reserves: None,
+            initial_virtual_quote_reserves: None,
+            initial_real_token_reserves: None,
+            initial_real_sol_reserves: None,
+            token_total_supply: None,
+            block_time: None,
+            raw_data: vec![],
+        }
+    }
 
     fn grpc_transaction_event(event_ts_ms: Option<u64>, block_time: Option<i64>) -> GeyserEvent {
         GeyserEvent::Transaction {
@@ -1189,6 +1274,58 @@ mod tests {
             .expect("externally tagged entry anchor payload");
         assert!(!payload.contains_key("provider_id"));
         assert!(!payload.contains_key("provider_role"));
+    }
+
+    #[test]
+    fn initialize_pool_canonical_order_requires_every_source_coordinate() {
+        let complete = initialize_pool_event_with_source_order();
+        assert_eq!(
+            complete.canonical_order(),
+            Some(CanonicalPumpOrderKeyV1 {
+                slot: 42,
+                tx_index: 7,
+                outer_instruction_index: 3,
+                inner_instruction_path: vec![1, 2],
+                semantic_event_ordinal: 5,
+            })
+        );
+
+        let mut incomplete_cases = Vec::new();
+
+        let mut missing_slot = complete.clone();
+        missing_slot.slot = None;
+        incomplete_cases.push(missing_slot);
+
+        let mut missing_tx_index = complete.clone();
+        missing_tx_index.tx_index = None;
+        incomplete_cases.push(missing_tx_index);
+
+        let mut missing_outer_index = complete.clone();
+        missing_outer_index
+            .provenance
+            .as_mut()
+            .expect("fixture provenance")
+            .outer_instruction_index = None;
+        incomplete_cases.push(missing_outer_index);
+
+        let mut missing_inner_path = complete.clone();
+        missing_inner_path
+            .provenance
+            .as_mut()
+            .expect("fixture provenance")
+            .inner_instruction_path = None;
+        incomplete_cases.push(missing_inner_path);
+
+        let mut missing_ordinal = complete;
+        missing_ordinal.event_ordinal = None;
+        incomplete_cases.push(missing_ordinal);
+
+        assert!(
+            incomplete_cases
+                .iter()
+                .all(|event| event.canonical_order().is_none()),
+            "partial source coordinates must never become canonical order authority"
+        );
     }
 
     #[test]

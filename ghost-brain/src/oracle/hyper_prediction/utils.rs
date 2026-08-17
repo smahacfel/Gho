@@ -151,6 +151,7 @@ pub fn convert_enhanced_to_candidate_pool(
         provider_role: None,
         slot: candidate.slot,
         tx_index: None,
+        birth_canonical_order: None,
         event_ts_ms: Some(candidate.timestamp.saturating_mul(1000)),
         event_time: ghost_core::EventTimeMetadata::default(),
         signature: candidate.signature.clone(),
@@ -158,6 +159,7 @@ pub fn convert_enhanced_to_candidate_pool(
         pool_amm_id: candidate.pool_amm_id,
         base_mint: candidate.base_mint,
         quote_mint: candidate.quote_mint,
+        creation_regime: ghost_core::PumpCreationRegimeV1::default(),
         bonding_curve: candidate.bonding_curve,
         // Note: EnhancedCandidate doesn't store creator, using placeholder
         // This field is not used in scoring/analysis decisions
@@ -165,6 +167,7 @@ pub fn convert_enhanced_to_candidate_pool(
         timestamp: candidate.timestamp,
         bonding_curve_progress: candidate.bonding_curve_progress,
         initial_liquidity_sol: Some(candidate.initial_liquidity_sol),
+        initial_virtual_quote_reserves: None,
         token_total_supply: candidate.token_total_supply,
         block_time: None,
     }
