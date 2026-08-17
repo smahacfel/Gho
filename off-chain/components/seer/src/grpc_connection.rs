@@ -44,12 +44,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use dashmap::{DashMap, DashSet};
 use futures::{Sink, SinkExt, StreamExt};
 use parking_lot::Mutex;
+use prost::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -67,8 +68,8 @@ use yellowstone_grpc_proto::prelude::{
     subscribe_request_filter_accounts_filter_memcmp, subscribe_update::UpdateOneof,
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
     SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterMemcmp,
-    SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterEntry,
-    SubscribeRequestFilterTransactions, SubscribeRequestPing,
+    SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterEntry, SubscribeRequestFilterSlots,
+    SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
 };
 
 // ─── Program / account constants ─────────────────────────────────────────────
@@ -79,6 +80,7 @@ pub const PUMP_FUN_FEE_ACCOUNT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4x
 pub const GRPC_GLOBAL_STREAM_SOURCE_LABEL: &str = "grpc_global_stream";
 pub const GRPC_FUNDING_LANE_PUMP_FILTERED_SOURCE_LABEL: &str = "grpc_funding_lane_pump_filtered";
 pub const GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL: &str = "grpc_funding_lane_full_chain";
+pub const GRPC_PUMP_RESEARCH_GLOBAL_V1_SOURCE_LABEL: &str = "grpc_pump_research_global_v1";
 const DEFAULT_GRPC_AUTH_HEADER: &str = "x-token";
 const YELLOWSTONE_TRANSACTION_PAYLOAD_SCHEMA_ID: &str =
     "yellowstone_subscribe_update_transaction.prost.v1";
@@ -1786,6 +1788,13 @@ impl RegistryResubscribeMode {
 pub enum GrpcSubscriptionProfile {
     #[default]
     PrimaryGlobal,
+    /// Standalone Pump Research Evidence Tape source profile.
+    ///
+    /// This path deliberately receives decoded Yellowstone source messages
+    /// before they are projected into `GeyserEvent` or seen by the parser.  It
+    /// is not selectable through `SeerConfig` and therefore cannot alter the
+    /// active Seer runtime subscription.
+    PumpResearchGlobalV1,
     FundingLanePumpFiltered,
     FundingLaneFullChain,
 }
@@ -1794,6 +1803,7 @@ impl GrpcSubscriptionProfile {
     pub const fn as_str(self) -> &'static str {
         match self {
             GrpcSubscriptionProfile::PrimaryGlobal => "primary_global",
+            GrpcSubscriptionProfile::PumpResearchGlobalV1 => "pump_research_global_v1",
             GrpcSubscriptionProfile::FundingLanePumpFiltered => "funding_lane_pump_filtered",
             GrpcSubscriptionProfile::FundingLaneFullChain => "funding_lane_full_chain",
         }
@@ -1802,6 +1812,9 @@ impl GrpcSubscriptionProfile {
     pub const fn source_label(self) -> &'static str {
         match self {
             GrpcSubscriptionProfile::PrimaryGlobal => GRPC_GLOBAL_STREAM_SOURCE_LABEL,
+            GrpcSubscriptionProfile::PumpResearchGlobalV1 => {
+                GRPC_PUMP_RESEARCH_GLOBAL_V1_SOURCE_LABEL
+            }
             GrpcSubscriptionProfile::FundingLanePumpFiltered => {
                 GRPC_FUNDING_LANE_PUMP_FILTERED_SOURCE_LABEL
             }
@@ -1818,6 +1831,7 @@ impl GrpcSubscriptionProfile {
     pub const fn transaction_filter_name(self) -> &'static str {
         match self {
             GrpcSubscriptionProfile::FundingLaneFullChain => "all_txs",
+            GrpcSubscriptionProfile::PumpResearchGlobalV1 => "pump_research_transactions",
             GrpcSubscriptionProfile::PrimaryGlobal
             | GrpcSubscriptionProfile::FundingLanePumpFiltered => "pump_txs",
         }
@@ -1825,6 +1839,9 @@ impl GrpcSubscriptionProfile {
 
     pub fn transaction_account_include(self) -> Vec<String> {
         match self {
+            GrpcSubscriptionProfile::PumpResearchGlobalV1 => {
+                vec![PUMP_FUN_PROGRAM_ID.to_string()]
+            }
             GrpcSubscriptionProfile::PrimaryGlobal
             | GrpcSubscriptionProfile::FundingLanePumpFiltered => vec![
                 PUMP_FUN_PROGRAM_ID.to_string(),
@@ -1833,6 +1850,58 @@ impl GrpcSubscriptionProfile {
             GrpcSubscriptionProfile::FundingLaneFullChain => vec![],
         }
     }
+
+    const fn transaction_failed_filter(self) -> Option<bool> {
+        match self {
+            // `None` is intentional: V1 raw capture keeps both successful and
+            // failed Pump transactions.  Failure classification belongs to the
+            // offline materializer, never to the provider-side source filter.
+            GrpcSubscriptionProfile::PumpResearchGlobalV1 => None,
+            Self::PrimaryGlobal | Self::FundingLanePumpFiltered | Self::FundingLaneFullChain => {
+                Some(false)
+            }
+        }
+    }
+}
+
+/// One decoded Yellowstone message admitted by the research-only source tap.
+///
+/// The receive task transfers ownership of the already decoded protobuf and
+/// does not serialize, hash, parse, or perform filesystem I/O.  The tape
+/// writer owns deterministic `prost` re-encoding and durable framing.
+pub(crate) struct PumpResearchSourceUpdateV1 {
+    pub provider_id: String,
+    pub stream_epoch: u64,
+    pub ingress_wall_ts_ms: u64,
+    pub ingress_monotonic_ts_ms: u64,
+    pub update: SubscribeUpdate,
+}
+
+/// Research-only ownership hand-off from Yellowstone receive to the immutable
+/// raw-tape writer.  Implementations must be nonblocking: a full capture queue
+/// is represented as typed local coverage loss rather than backpressuring the
+/// gRPC receive loop.
+pub(crate) trait PumpResearchSourceSinkV1: Send + Sync {
+    /// The immutable source subscription was established successfully.  This
+    /// is deliberately separate from receiving a source update: a connected
+    /// but silent stream is not sufficient evidence for a complete capture.
+    fn source_stream_established(&self, stream_epoch: u64);
+
+    fn try_capture(&self, update: PumpResearchSourceUpdateV1);
+
+    /// The standalone connector observed an abnormal worker/supervisor exit.
+    /// This is research-only lifecycle evidence and must make the capture
+    /// fail closed rather than being collapsed into a clean shutdown.
+    fn source_worker_failed(&self, error: String);
+
+    /// Called only after every standalone source worker joined without a
+    /// panic/error and after an explicit source shutdown request.
+    fn source_workers_stopped_cleanly(&self);
+
+    /// Called exactly once after every source worker has stopped.  It lets the
+    /// tape side close an open saturation episode at the truthful process
+    /// boundary before the writer is drained.
+    fn finish_source(&self);
 }
 
 // ─── Connector ────────────────────────────────────────────────────────────────
@@ -1854,6 +1923,10 @@ struct YellowstoneConnector {
     /// event_ts_ms anchoring so observation windows start at block time
     /// rather than our local ingress wall-clock.
     latest_block_time_secs: Arc<AtomicI64>,
+    /// Optional research-only decoded-source hand-off.  When installed the
+    /// connector does not project updates into `PumpEvent`/`GeyserEvent`; it
+    /// feeds the immutable tape input boundary instead.
+    research_capture_sink: Option<Arc<dyn PumpResearchSourceSinkV1>>,
 }
 
 #[derive(Default)]
@@ -1940,6 +2013,7 @@ impl YellowstoneConnector {
             availability_tracker,
             delayed_queue: DelayedAccountQueue::new(),
             latest_block_time_secs: Arc::new(AtomicI64::new(0)),
+            research_capture_sink: None,
         };
         (c, rx, gap_rx)
     }
@@ -1963,6 +2037,10 @@ impl YellowstoneConnector {
 
     fn injector(&self) -> DualLaneChannel {
         self.channel.clone()
+    }
+
+    fn install_pump_research_capture_sink(&mut self, sink: Arc<dyn PumpResearchSourceSinkV1>) {
+        self.research_capture_sink = Some(sink);
     }
 
     /// [FIX-5] Returns the shared delayed-account queue.
@@ -1994,6 +2072,13 @@ impl YellowstoneConnector {
     /// Run all provider workers.  Returns when shutdown is signalled.
     async fn run(self) -> Result<()> {
         self.config.validate_provider_roles()?;
+
+        // The legacy/active connector intentionally keeps its historical
+        // "workers are best-effort" behavior.  The standalone research source
+        // has a stricter evidence contract: a panic, worker error, or worker
+        // exit before explicit shutdown is a failed source, never a clean
+        // capture completion.
+        let strict_research_supervision = self.research_capture_sink.is_some();
 
         let n_providers = self.config.providers.len();
         let n_streams = self.config.streams_per_provider.max(1);
@@ -2045,6 +2130,7 @@ impl YellowstoneConnector {
                 let availability_tracker = Arc::clone(&self.availability_tracker);
                 let breaker = Arc::clone(&breaker);
                 let latest_block_time_secs = Arc::clone(&self.latest_block_time_secs);
+                let research_capture_sink = self.research_capture_sink.clone();
 
                 handles.push(tokio::spawn(async move {
                     connection_loop(
@@ -2063,21 +2149,155 @@ impl YellowstoneConnector {
                         shutdown,
                         shutdown_token,
                         latest_block_time_secs,
+                        research_capture_sink,
                     )
-                    .await;
+                    .await
                 }));
             }
         }
 
-        for h in handles {
-            let _ = h.await;
-        }
+        supervise_connector_workers(handles, strict_research_supervision, &self.shutdown).await?;
         info!(
             "Ghost/Pump transport profile={} source_label={}: all workers exited",
             self.config.subscription_profile.as_str(),
             self.config.subscription_profile.source_label()
         );
         Ok(())
+    }
+}
+
+async fn supervise_connector_workers(
+    handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+    strict_research_supervision: bool,
+    shutdown: &AtomicBool,
+) -> Result<()> {
+    // Preserve the active connector's historical behavior byte-for-byte at
+    // the lifecycle boundary: it deliberately treats workers as best-effort
+    // and discards their terminal result.  Only the standalone research
+    // source is allowed to turn an individual worker result into an evidence
+    // validity outcome.
+    if !strict_research_supervision {
+        for handle in handles {
+            let _ = handle.await;
+        }
+        return Ok(());
+    }
+
+    let mut worker_failure = None;
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                worker_failure
+                    .get_or_insert_with(|| format!("research source worker failed: {error:#}"));
+            }
+            Err(error) => {
+                worker_failure
+                    .get_or_insert_with(|| format!("research source worker panicked: {error}"));
+            }
+        }
+    }
+    if let Some(error) = worker_failure {
+        return Err(anyhow::anyhow!(error));
+    }
+    if !shutdown.load(Ordering::Acquire) {
+        bail!("Pump Research source worker exited before an explicit shutdown request");
+    }
+    Ok(())
+}
+
+/// Dedicated, standalone raw-source connection for Pump Research Evidence Tape
+/// V1.  It reuses YellowstoneConnector's authenticated connection, reconnect,
+/// ping/pong and watchdog machinery, but installs a research source tap before
+/// the active runtime projection boundary.
+///
+/// It is intentionally not exposed through `SeerConfig` and it never returns
+/// `GeyserEvent`, starts manual RPC backfill, touches AccountStateCore, or
+/// emits into the Event Bus.
+pub(crate) struct PumpResearchSourceConnectionV1 {
+    connector: Mutex<Option<YellowstoneConnector>>,
+    shutdown: Arc<AtomicBool>,
+    shutdown_token: Arc<CancellationToken>,
+    capture_abort: CancellationToken,
+    sink: Arc<dyn PumpResearchSourceSinkV1>,
+}
+
+impl PumpResearchSourceConnectionV1 {
+    pub(crate) fn new(
+        endpoint: String,
+        auth_token: Option<String>,
+        auth_header: String,
+        provider_id: String,
+        ingress_queue_capacity: usize,
+        sink: Arc<dyn PumpResearchSourceSinkV1>,
+        capture_abort: CancellationToken,
+    ) -> Result<Self> {
+        let config = GrpcConfig {
+            providers: vec![Provider::primary_with_auth_header(
+                endpoint,
+                auth_token,
+                provider_id.clone(),
+                auth_header,
+            )],
+            provider_role_config: Some(RawProviderRoleConfigV1::new(provider_id, Vec::new())),
+            streams_per_provider: 1,
+            commitment: CommitmentLevel::Processed,
+            stall_timeout_secs: DEFAULT_SILENT_STALL_SECS,
+            resub_debounce_ms: DEFAULT_RESUB_DEBOUNCE_MS,
+            max_stalls_before_open: DEFAULT_PROVIDER_MAX_STALLS_BEFORE_OPEN,
+            circuit_breaker_cooldown_ms: DEFAULT_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS,
+            subscription_profile: GrpcSubscriptionProfile::PumpResearchGlobalV1,
+            registry_resubscribe_mode: RegistryResubscribeMode::HealthTickOnly,
+            // The primary runtime FIFO is unused in capture-only mode.  Keep
+            // it bounded and sized from the standalone capture config so no
+            // hidden unbounded transport buffer is introduced.
+            ingress_queue_capacity: ingress_queue_capacity.max(1),
+            scope_primary_global_account_updates_to_registry: false,
+        };
+        config.validate_provider_roles()?;
+
+        let (mut connector, _unused_rx, _unused_gap_rx) = YellowstoneConnector::new(config);
+        let shutdown = connector.shutdown_handle();
+        let shutdown_token = connector.shutdown_token_handle();
+        connector.install_pump_research_capture_sink(Arc::clone(&sink));
+
+        Ok(Self {
+            connector: Mutex::new(Some(connector)),
+            shutdown,
+            shutdown_token,
+            capture_abort,
+            sink,
+        })
+    }
+
+    /// Runs until `request_shutdown` is called.  The source sink receives its
+    /// terminal notification only after all connector workers have exited, so
+    /// the capture coordinator can drain accepted records without a race.
+    pub(crate) async fn run(&self) -> Result<()> {
+        let connector =
+            self.connector.lock().take().ok_or_else(|| {
+                anyhow::anyhow!("pump research source connection already started")
+            })?;
+        let connector_future = connector.run();
+        tokio::pin!(connector_future);
+        let result = tokio::select! {
+            result = &mut connector_future => result,
+            _ = self.capture_abort.cancelled() => {
+                self.request_shutdown();
+                connector_future.await
+            }
+        };
+        match &result {
+            Ok(()) => self.sink.source_workers_stopped_cleanly(),
+            Err(error) => self.sink.source_worker_failed(format!("{error:#}")),
+        }
+        self.sink.finish_source();
+        result
+    }
+
+    pub(crate) fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.shutdown_token.cancel();
     }
 }
 
@@ -2099,7 +2319,8 @@ async fn connection_loop(
     shutdown: Arc<AtomicBool>,
     shutdown_token: Arc<CancellationToken>,
     latest_block_time_secs: Arc<AtomicI64>,
-) {
+    research_capture_sink: Option<Arc<dyn PumpResearchSourceSinkV1>>,
+) -> Result<()> {
     let mut backoff = ExponentialBackoffBuilder::new()
         .with_initial_interval(Duration::from_millis(BACKOFF_INIT_MS))
         .with_max_interval(Duration::from_millis(BACKOFF_MAX_MS))
@@ -2139,7 +2360,7 @@ async fn connection_loop(
         first_attempt = false;
 
         stats.bump_recon_with_source(cfg.subscription_profile.source_label());
-        channel.stream_epoch.fetch_add(1, Ordering::AcqRel);
+        let stream_epoch = channel.stream_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         // `from_slot` is tracked for diagnostics. Current proto 1.14 request
         // shape does not encode replay from this value.
         let from_slot = slots.last_slot();
@@ -2196,6 +2417,8 @@ async fn connection_loop(
             &shutdown,
             &shutdown_token,
             &latest_block_time_secs,
+            stream_epoch,
+            research_capture_sink.clone(),
         )
         .await;
 
@@ -2229,6 +2452,7 @@ async fn connection_loop(
             GRPC_STATE_FAILED
         });
     }
+    Ok(())
 }
 
 async fn sleep_before_reconnect(
@@ -2351,7 +2575,8 @@ fn tracked_exact_accounts_for_profile(
         GrpcSubscriptionProfile::PrimaryGlobal => {
             registry.snapshot_primary_global_exact_accounts(budget)
         }
-        GrpcSubscriptionProfile::FundingLanePumpFiltered
+        GrpcSubscriptionProfile::PumpResearchGlobalV1
+        | GrpcSubscriptionProfile::FundingLanePumpFiltered
         | GrpcSubscriptionProfile::FundingLaneFullChain => Vec::new(),
     }
 }
@@ -2364,7 +2589,8 @@ fn tracked_exact_total_for_profile(
         GrpcSubscriptionProfile::PrimaryGlobal => {
             lanes.bcv2_accounts.len() + lanes.generic_accounts.len()
         }
-        GrpcSubscriptionProfile::FundingLanePumpFiltered
+        GrpcSubscriptionProfile::PumpResearchGlobalV1
+        | GrpcSubscriptionProfile::FundingLanePumpFiltered
         | GrpcSubscriptionProfile::FundingLaneFullChain => 0,
     }
 }
@@ -2389,7 +2615,8 @@ fn exact_account_selection_counts_for_profile(
     let tracked_dropped = exact_total.saturating_sub(tracked_sent);
     let tracked_bcv2 = match subscription_profile {
         GrpcSubscriptionProfile::PrimaryGlobal => lanes.bcv2_accounts.len(),
-        GrpcSubscriptionProfile::FundingLanePumpFiltered
+        GrpcSubscriptionProfile::PumpResearchGlobalV1
+        | GrpcSubscriptionProfile::FundingLanePumpFiltered
         | GrpcSubscriptionProfile::FundingLaneFullChain => 0,
     };
     let selected: HashSet<&str> = tracked_accounts.iter().map(String::as_str).collect();
@@ -2419,6 +2646,130 @@ fn subscribe_request_fingerprint_for_profile(
     hasher.finish()
 }
 
+/// Build the immutable standalone source request used by Pump Research Tape
+/// capture.  It intentionally has no registry, candidate, or watched-pool
+/// input; every eligible Pump transaction and global curve update is admitted
+/// by the provider-side source boundary.
+///
+/// This is the one request constructor used both by the live standalone
+/// source and by the manifest fingerprint.  Do not introduce a parallel
+/// request description here: provenance requires the two to remain coupled.
+pub(crate) fn pump_research_subscribe_request_v1() -> SubscribeRequest {
+    build_subscribe_request_for_profile(
+        CommitmentLevel::Processed,
+        GrpcSubscriptionProfile::PumpResearchGlobalV1,
+        &AccountRegistry::new(),
+        0,
+    )
+}
+
+fn append_canonical_request_field(bytes: &mut Vec<u8>, label: &str, value: &[u8]) {
+    bytes.extend_from_slice(&(label.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(label.as_bytes());
+    bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(value);
+}
+
+/// Canonicalize one protobuf map directly from the `SubscribeRequest` object
+/// which will be sent to Yellowstone.  `prost` deliberately does not make
+/// `HashMap` iteration order a durable encoding contract, so we sort map
+/// entries by their actual key and their actual prost-encoded value.
+fn append_canonical_request_map<M: prost::Message>(
+    bytes: &mut Vec<u8>,
+    label: &str,
+    values: &HashMap<String, M>,
+) {
+    let mut entries: Vec<(&str, Vec<u8>)> = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.encode_to_vec()))
+        .collect();
+    entries.sort_unstable_by(|(left_key, left_value), (right_key, right_value)| {
+        left_key
+            .cmp(right_key)
+            .then_with(|| left_value.cmp(right_value))
+    });
+    append_canonical_request_field(
+        bytes,
+        &format!("{label}.len"),
+        &(entries.len() as u32).to_le_bytes(),
+    );
+    for (index, (key, value)) in entries.into_iter().enumerate() {
+        append_canonical_request_field(bytes, &format!("{label}.{index}.key"), key.as_bytes());
+        append_canonical_request_field(bytes, &format!("{label}.{index}.value"), &value);
+    }
+}
+
+fn append_canonical_request_messages<M: prost::Message>(
+    bytes: &mut Vec<u8>,
+    label: &str,
+    values: &[M],
+) {
+    append_canonical_request_field(
+        bytes,
+        &format!("{label}.len"),
+        &(values.len() as u32).to_le_bytes(),
+    );
+    for (index, value) in values.iter().enumerate() {
+        append_canonical_request_field(bytes, &format!("{label}.{index}"), &value.encode_to_vec());
+    }
+}
+
+/// Canonical BLAKE3 identity of the complete `SubscribeRequest` object.
+///
+/// The representation is deterministic across Rust `HashMap` iteration but
+/// is derived only from the concrete request fields.  Every request field is
+/// represented, including empty maps, empty account data slices and the
+/// optional ping field, so a source-request drift cannot leave the manifest
+/// fingerprint unchanged.
+pub(crate) fn subscribe_request_fingerprint_blake3_v1(request: &SubscribeRequest) -> [u8; 32] {
+    let mut canonical = Vec::with_capacity(1_024);
+    append_canonical_request_field(
+        &mut canonical,
+        "schema",
+        b"pump_research_subscribe_request_canonical_v1",
+    );
+    append_canonical_request_map(&mut canonical, "accounts", &request.accounts);
+    append_canonical_request_map(&mut canonical, "slots", &request.slots);
+    append_canonical_request_map(&mut canonical, "transactions", &request.transactions);
+    append_canonical_request_map(
+        &mut canonical,
+        "transactions_status",
+        &request.transactions_status,
+    );
+    append_canonical_request_map(&mut canonical, "blocks", &request.blocks);
+    append_canonical_request_map(&mut canonical, "blocks_meta", &request.blocks_meta);
+    append_canonical_request_map(&mut canonical, "entry", &request.entry);
+    match request.commitment {
+        Some(commitment) => {
+            append_canonical_request_field(&mut canonical, "commitment.present", &[1]);
+            append_canonical_request_field(
+                &mut canonical,
+                "commitment.value",
+                &commitment.to_le_bytes(),
+            );
+        }
+        None => append_canonical_request_field(&mut canonical, "commitment.present", &[0]),
+    }
+    append_canonical_request_messages(
+        &mut canonical,
+        "accounts_data_slice",
+        &request.accounts_data_slice,
+    );
+    match request.ping.as_ref() {
+        Some(ping) => {
+            append_canonical_request_field(&mut canonical, "ping.present", &[1]);
+            append_canonical_request_field(&mut canonical, "ping.value", &ping.encode_to_vec());
+        }
+        None => append_canonical_request_field(&mut canonical, "ping.present", &[0]),
+    }
+    *blake3::hash(&canonical).as_bytes()
+}
+
+/// BLAKE3 identity of the actual frozen standalone research request.
+pub(crate) fn pump_research_subscription_request_fingerprint_blake3_v1() -> [u8; 32] {
+    subscribe_request_fingerprint_blake3_v1(&pump_research_subscribe_request_v1())
+}
+
 fn build_subscribe_request_for_profile(
     commitment: CommitmentLevel,
     subscription_profile: GrpcSubscriptionProfile,
@@ -2433,7 +2784,7 @@ fn build_subscribe_request_for_profile(
         subscription_profile.transaction_filter_name().into(),
         SubscribeRequestFilterTransactions {
             vote: Some(false),
-            failed: Some(false),
+            failed: subscription_profile.transaction_failed_filter(),
             account_include: tx_account_include,
             account_exclude: vec![],
             account_required: vec![],
@@ -2571,6 +2922,41 @@ fn build_subscribe_request_for_profile(
             counts.bcv2_sent,
             counts.bcv2_dropped,
         )
+    } else if matches!(
+        subscription_profile,
+        GrpcSubscriptionProfile::PumpResearchGlobalV1
+    ) {
+        let mut acc_filters = HashMap::new();
+        acc_filters.insert(
+            "pump_research_bonding_curves".into(),
+            SubscribeRequestFilterAccounts {
+                account: vec![],
+                owner: vec![PUMP_FUN_PROGRAM_ID.to_string()],
+                filters: vec![SubscribeRequestFilterAccountsFilter {
+                    filter: Some(subscribe_request_filter_accounts_filter::Filter::Memcmp(
+                        SubscribeRequestFilterAccountsFilterMemcmp {
+                            offset: 0,
+                            data: Some(
+                                subscribe_request_filter_accounts_filter_memcmp::Data::Bytes(
+                                    BONDING_CURVE_DISC.to_vec(),
+                                ),
+                            ),
+                        },
+                    )),
+                }],
+            },
+        );
+        acc_filters.insert(
+            "pump_research_global".into(),
+            SubscribeRequestFilterAccounts {
+                account: vec![
+                    ghost_core::pump_research_tape::PUMP_RESEARCH_PUMP_GLOBAL_BASE58_V1.to_string(),
+                ],
+                owner: vec![],
+                filters: vec![],
+            },
+        );
+        (acc_filters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     } else {
         (HashMap::new(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     };
@@ -2589,13 +2975,34 @@ fn build_subscribe_request_for_profile(
     // the on-chain block time rather than our local ingress wall-clock.
     let mut blocks_meta_filters = HashMap::new();
     blocks_meta_filters.insert(
-        "ghost_blocks_meta".into(),
+        match subscription_profile {
+            GrpcSubscriptionProfile::PumpResearchGlobalV1 => "pump_research_blocks_meta",
+            _ => "ghost_blocks_meta",
+        }
+        .into(),
         SubscribeRequestFilterBlocksMeta {},
     );
 
+    // The research profile is the only raw-capture profile that needs slot
+    // parent/status evidence for offline canonicality.  `false` deliberately
+    // retains Processed/Confirmed/Finalized updates; canonicality is derived
+    // later from the tape and never pre-classified by the provider filter.
+    let mut slot_filters = HashMap::new();
+    if matches!(
+        subscription_profile,
+        GrpcSubscriptionProfile::PumpResearchGlobalV1
+    ) {
+        slot_filters.insert(
+            "pump_research_slots".into(),
+            SubscribeRequestFilterSlots {
+                filter_by_commitment: Some(false),
+            },
+        );
+    }
+
     let req = SubscribeRequest {
         accounts: acc_filters,
-        slots: HashMap::new(),
+        slots: slot_filters,
         transactions: tx_filters,
         transactions_status: HashMap::new(),
         blocks: HashMap::new(),
@@ -2607,6 +3014,7 @@ fn build_subscribe_request_for_profile(
     };
 
     let total_filter_branches = req.accounts.len()
+        + req.slots.len()
         + req.transactions.len()
         + req.blocks_meta.len()
         + req.entry.len()
@@ -2617,7 +3025,8 @@ fn build_subscribe_request_for_profile(
         "SUBSCRIBE_SENT profile={} source_label={} tx_filter={} \
          programs={} \
          accounts={} \
-         blocks_meta=ghost_blocks_meta \
+         blocks_meta={} \
+         slots={} \
          entry=DISABLED \
          tracked_curves={} tracked_pools={} tracked_mints={} tracked_generic={} tracked_bcv2={} \
          exact_total={} tracked_sent={} tracked_dropped={} bcv2_sent={} bcv2_dropped={} \
@@ -2630,6 +3039,7 @@ fn build_subscribe_request_for_profile(
         subscription_profile.transaction_filter_name(),
         match subscription_profile {
             GrpcSubscriptionProfile::FundingLaneFullChain => "[ALL_TRANSACTIONS]",
+            GrpcSubscriptionProfile::PumpResearchGlobalV1 => "[PumpFun]",
             GrpcSubscriptionProfile::PrimaryGlobal
             | GrpcSubscriptionProfile::FundingLanePumpFiltered => "[PumpFun,PumpSwap]",
         },
@@ -2637,8 +3047,27 @@ fn build_subscribe_request_for_profile(
             GrpcSubscriptionProfile::PrimaryGlobal => {
                 "[global_curve_layouts,global_pool_layouts,generic_exact_only]"
             }
+            GrpcSubscriptionProfile::PumpResearchGlobalV1 => {
+                "[pump_owned_bonding_curve_discriminator,canonical_pump_global]"
+            }
             GrpcSubscriptionProfile::FundingLanePumpFiltered
             | GrpcSubscriptionProfile::FundingLaneFullChain => "[DISABLED]",
+        },
+        if matches!(
+            subscription_profile,
+            GrpcSubscriptionProfile::PumpResearchGlobalV1
+        ) {
+            "pump_research_blocks_meta"
+        } else {
+            "ghost_blocks_meta"
+        },
+        if matches!(
+            subscription_profile,
+            GrpcSubscriptionProfile::PumpResearchGlobalV1
+        ) {
+            "pump_research_slots(filter_by_commitment=false)"
+        } else {
+            "DISABLED"
         },
         tracked_curve_count,
         tracked_pool_count,
@@ -2659,6 +3088,9 @@ fn build_subscribe_request_for_profile(
             }
             GrpcSubscriptionProfile::FundingLaneFullChain => {
                 "dedicated_full_chain_funding_lane_no_account_updates"
+            }
+            GrpcSubscriptionProfile::PumpResearchGlobalV1 => {
+                "standalone_decoded_source_capture_before_projection"
             }
         },
         total_filter_branches,
@@ -2808,13 +3240,24 @@ async fn stream_loop(
     shutdown: &Arc<AtomicBool>,
     shutdown_token: &Arc<CancellationToken>,
     latest_block_time_secs: &Arc<AtomicI64>,
+    stream_epoch: u64,
+    research_capture_sink: Option<Arc<dyn PumpResearchSourceSinkV1>>,
 ) -> Result<()> {
-    let req = build_subscribe_request_for_profile(
-        cfg.commitment,
+    let req = if matches!(
         cfg.subscription_profile,
-        registry,
-        from_slot,
-    );
+        GrpcSubscriptionProfile::PumpResearchGlobalV1
+    ) {
+        // The standalone research source must send the exact request whose
+        // canonical identity is recorded in the immutable run manifest.
+        pump_research_subscribe_request_v1()
+    } else {
+        build_subscribe_request_for_profile(
+            cfg.commitment,
+            cfg.subscription_profile,
+            registry,
+            from_slot,
+        )
+    };
     if let Some(ref h) = health {
         h.set_grpc_state(GRPC_STATE_SUBSCRIBING);
         h.mark_grpc_subscribe_sent();
@@ -2845,6 +3288,9 @@ async fn stream_loop(
 
     let _availability_guard = availability_tracker.connected_guard();
     info!("[{id}] Stream established");
+    if let Some(research_capture_sink) = research_capture_sink.as_ref() {
+        research_capture_sink.source_stream_established(stream_epoch);
+    }
 
     let mut health_ticker = tokio::time::interval(Duration::from_secs(HEALTH_TICK_SECS));
     let mut ping_ticker = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
@@ -2902,6 +3348,33 @@ async fn stream_loop(
                             last_pong = p.id;
                             stats.bump_pong();
                             debug!("[{id}] ← pong {}", p.id);
+                        } else if is_server_transport_control_update(&msg) {
+                            // A server-originated Yellowstone Ping is a
+                            // transport-control update, not raw market
+                            // evidence.  Keep it on the transport-control
+                            // path, not raw market evidence.  The
+                            // frozen generated schema's server Ping carries
+                            // no response identifier, so it is deliberately
+                            // filtered rather than guessed or persisted as a
+                            // V1 market record.
+                            breaker.record_message_progress();
+                            debug!("[{id}] ← server ping (filtered from research tape)");
+                        } else if let Some(research_capture_sink) = research_capture_sink.as_ref() {
+                            // This is the standalone research source tap.  It
+                            // must retain the decoded protobuf before any
+                            // lossy `PumpEvent`/`GeyserEvent` projection,
+                            // parser route selection, candidate filtering, or
+                            // account-registry scoping.  `try_capture` is
+                            // explicitly nonblocking and owns the local-gap
+                            // semantics when its bounded queue is full.
+                            breaker.record_message_progress();
+                            research_capture_sink.try_capture(PumpResearchSourceUpdateV1 {
+                                provider_id: provider_id.to_string(),
+                                stream_epoch,
+                                ingress_wall_ts_ms: last_msg_wall_ms,
+                                ingress_monotonic_ts_ms: crate::types::arrival_time_ms(),
+                                update: msg,
+                            });
                         } else {
                             breaker.record_message_progress();
                             route_update(
@@ -3109,6 +3582,17 @@ async fn stream_loop(
             }
         }
     }
+}
+
+/// Yellowstone transport-control messages are not source-market evidence.
+/// `Pong` is handled before this predicate so this branch represents an
+/// unsolicited server Ping in the live loop; keeping the classification in a
+/// helper makes the raw-tape exclusion directly regression-testable.
+fn is_server_transport_control_update(update: &SubscribeUpdate) -> bool {
+    matches!(
+        update.update_oneof.as_ref(),
+        Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_))
+    )
 }
 
 // ─── Message router ───────────────────────────────────────────────────────────
@@ -4754,6 +5238,85 @@ fn tx_update_to_geyser_event(
     })
 }
 
+/// Decode a frozen PR-A transaction payload for the offline research
+/// materializer without routing it through the active connector.
+///
+/// The raw V1 tape stores the deterministic prost payload of
+/// `SubscribeUpdateTransaction`.  Reusing the existing normalized
+/// transaction conversion prevents a second interpretation of account keys,
+/// loaded addresses, instruction trees and transaction metadata.  The caller
+/// supplies the captured event-time axes; no local wall/monotonic clock is
+/// used as historical evidence.
+pub(crate) fn decode_research_raw_transaction_v1(
+    source_payload: &[u8],
+    expected_slot: u64,
+    block_time: Option<i64>,
+    provider_id: &str,
+    captured_event_time: ghost_core::pump_research_tape::PumpResearchEventTimeV1,
+) -> SeerResult<GeyserEvent> {
+    use yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction;
+
+    let update = SubscribeUpdateTransaction::decode(source_payload)
+        .map_err(|error| SeerError::ParseError(format!("research raw tx proto decode: {error}")))?;
+    if update.slot != expected_slot {
+        return Err(SeerError::ParseError(format!(
+            "research raw tx slot {} differs from record slot {expected_slot}",
+            update.slot
+        )));
+    }
+    let transaction = update.transaction.as_ref().ok_or_else(|| {
+        SeerError::ParseError("research raw tx lacks transaction info".to_string())
+    })?;
+    let signature = Signature::try_from(transaction.signature.as_slice()).map_err(|_| {
+        SeerError::ParseError("research raw tx has non-64-byte signature".to_string())
+    })?;
+    let observed_time = ghost_core::EventTimeMetadata::new(
+        captured_event_time.chain_event_ts_ms.or_else(|| {
+            block_time
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .and_then(|seconds| seconds.checked_mul(1_000))
+        }),
+        captured_event_time.ingress_wall_ts_ms,
+        captured_event_time.ingress_monotonic_ts_ms,
+    );
+    let observation_provenance = Some(ghost_core::ObservationProvenanceV1 {
+        source_family: ghost_core::ObservationSourceFamilyV1::RawYellowstone,
+        source_id: "pump_research_tape_v1_offline_replay".to_string(),
+        provider_id: provider_id.to_string(),
+        schema_id: YELLOWSTONE_TRANSACTION_PAYLOAD_SCHEMA_ID.to_string(),
+        payload_hash_blake3:
+            ghost_core::ObservationProvenanceV1::payload_hash_for_captured_provider_payload(
+                source_payload,
+            ),
+        // This is diagnostic provenance only.  The true captured monotonic
+        // axis remains in `event_time` above and is never reinterpreted as ns.
+        received_at_monotonic_ns: 0,
+    });
+    let mut event = tx_update_to_geyser_event(
+        update,
+        &signature.to_string(),
+        expected_slot,
+        "pump_research_tape_v1_offline_replay",
+        source_payload.to_vec(),
+        block_time,
+        Some(provider_id.to_string()),
+        Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+        observation_provenance,
+    )?;
+    if let GeyserEvent::Transaction {
+        event_time,
+        event_ts_ms,
+        arrival_ts_ms,
+        ..
+    } = &mut event
+    {
+        *event_time = observed_time;
+        *event_ts_ms = observed_time.effective_event_ts_ms();
+        *arrival_ts_ms = captured_event_time.ingress_wall_ts_ms;
+    }
+    Ok(event)
+}
+
 fn yellowstone_transaction_observation_provenance(
     provider_id: Option<&str>,
     source_id: &str,
@@ -6197,6 +6760,226 @@ mod tests {
         let tf = req.transactions.get("pump_txs").unwrap();
         assert_eq!(tf.vote, Some(false));
         assert_eq!(tf.failed, Some(false));
+    }
+
+    #[test]
+    fn pump_research_profile_is_source_global_without_touching_primary_profile() {
+        let research = pump_research_subscribe_request_v1();
+        let research_tx = research
+            .transactions
+            .get("pump_research_transactions")
+            .expect("research transaction filter");
+        assert_eq!(
+            research_tx.account_include,
+            vec![PUMP_FUN_PROGRAM_ID.to_owned()]
+        );
+        assert_eq!(research_tx.vote, Some(false));
+        assert_eq!(
+            research_tx.failed, None,
+            "raw research capture must retain failed transactions"
+        );
+        assert!(
+            research.entry.is_empty(),
+            "Entry remains deliberately disabled"
+        );
+        assert!(research.blocks.is_empty());
+        assert!(research
+            .blocks_meta
+            .contains_key("pump_research_blocks_meta"));
+        assert_eq!(
+            research
+                .slots
+                .get("pump_research_slots")
+                .and_then(|filter| filter.filter_by_commitment),
+            Some(false),
+            "slot raw evidence must retain processed/confirmed/finalized updates"
+        );
+        let bonding_curve = research
+            .accounts
+            .get("pump_research_bonding_curves")
+            .expect("Pump-owned BondingCurve filter");
+        assert_eq!(bonding_curve.owner, vec![PUMP_FUN_PROGRAM_ID.to_owned()]);
+        let global = research
+            .accounts
+            .get("pump_research_global")
+            .expect("canonical Pump Global exact account filter");
+        assert_eq!(
+            global.account,
+            vec![ghost_core::pump_research_tape::PUMP_RESEARCH_PUMP_GLOBAL_BASE58_V1.to_owned()]
+        );
+
+        let primary = build_subscribe_request_for_profile(
+            CommitmentLevel::Processed,
+            GrpcSubscriptionProfile::PrimaryGlobal,
+            &AccountRegistry::new(),
+            0,
+        );
+        let primary_tx = primary
+            .transactions
+            .get("pump_txs")
+            .expect("existing primary transaction filter");
+        assert_eq!(primary_tx.failed, Some(false));
+        assert!(primary_tx
+            .account_include
+            .contains(&PUMP_SWAP_PROGRAM_ID.to_owned()));
+        assert!(
+            primary.slots.is_empty(),
+            "active primary profile remains unchanged"
+        );
+    }
+
+    #[test]
+    fn pump_research_manifest_fingerprint_is_derived_from_the_actual_request() {
+        let request = pump_research_subscribe_request_v1();
+        let frozen = pump_research_subscription_request_fingerprint_blake3_v1();
+        assert_eq!(
+            frozen,
+            subscribe_request_fingerprint_blake3_v1(&request),
+            "the manifest helper must fingerprint the exact request constructor used by the stream"
+        );
+
+        // Every top-level request field must be bound into the canonical
+        // identity, including fields that are intentionally empty in V1.
+        let mut mutations = Vec::new();
+        let mut accounts = request.clone();
+        accounts
+            .accounts
+            .insert("fingerprint-drift-accounts".to_owned(), Default::default());
+        mutations.push(accounts);
+
+        let mut slots = request.clone();
+        slots
+            .slots
+            .insert("fingerprint-drift-slots".to_owned(), Default::default());
+        mutations.push(slots);
+
+        let mut transactions = request.clone();
+        transactions.transactions.insert(
+            "fingerprint-drift-transactions".to_owned(),
+            Default::default(),
+        );
+        mutations.push(transactions);
+
+        let mut transaction_status = request.clone();
+        transaction_status.transactions_status.insert(
+            "fingerprint-drift-transaction-status".to_owned(),
+            Default::default(),
+        );
+        mutations.push(transaction_status);
+
+        let mut blocks = request.clone();
+        blocks
+            .blocks
+            .insert("fingerprint-drift-blocks".to_owned(), Default::default());
+        mutations.push(blocks);
+
+        let mut block_meta = request.clone();
+        block_meta.blocks_meta.insert(
+            "fingerprint-drift-block-meta".to_owned(),
+            Default::default(),
+        );
+        mutations.push(block_meta);
+
+        let mut entry = request.clone();
+        entry
+            .entry
+            .insert("fingerprint-drift-entry".to_owned(), Default::default());
+        mutations.push(entry);
+
+        let mut commitment = request.clone();
+        commitment.commitment = Some(CommitmentLevel::Finalized as i32);
+        mutations.push(commitment);
+
+        let mut account_slice = request.clone();
+        account_slice.accounts_data_slice.push(Default::default());
+        mutations.push(account_slice);
+
+        let mut ping = request.clone();
+        ping.ping = Some(SubscribeRequestPing { id: 7 });
+        mutations.push(ping);
+
+        for changed in mutations {
+            assert_ne!(
+                frozen,
+                subscribe_request_fingerprint_blake3_v1(&changed),
+                "a real SubscribeRequest change must change the immutable manifest fingerprint"
+            );
+        }
+
+        // Map insertion order is not source identity.  Re-inserting real
+        // entries in the opposite order must preserve the canonical hash.
+        let mut reordered = request.clone();
+        let account_entries: Vec<_> = reordered.accounts.drain().collect();
+        for (name, filter) in account_entries.into_iter().rev() {
+            reordered.accounts.insert(name, filter);
+        }
+        assert_eq!(
+            frozen,
+            subscribe_request_fingerprint_blake3_v1(&reordered),
+            "canonical fingerprint must not depend on HashMap iteration order"
+        );
+    }
+
+    #[test]
+    fn server_ping_is_transport_control_not_research_raw_evidence() {
+        let ping = SubscribeUpdate {
+            filters: Vec::new(),
+            update_oneof: Some(UpdateOneof::Ping(
+                yellowstone_grpc_proto::prelude::SubscribeUpdatePing {},
+            )),
+        };
+        let pong = SubscribeUpdate {
+            filters: Vec::new(),
+            update_oneof: Some(UpdateOneof::Pong(
+                yellowstone_grpc_proto::prelude::SubscribeUpdatePong { id: 1 },
+            )),
+        };
+        let market = SubscribeUpdate {
+            filters: Vec::new(),
+            update_oneof: Some(UpdateOneof::Slot(
+                yellowstone_grpc_proto::prelude::SubscribeUpdateSlot {
+                    slot: 1,
+                    parent: None,
+                    status: CommitmentLevel::Processed as i32,
+                },
+            )),
+        };
+        assert!(is_server_transport_control_update(&ping));
+        assert!(is_server_transport_control_update(&pong));
+        assert!(!is_server_transport_control_update(&market));
+    }
+
+    #[tokio::test]
+    async fn research_worker_supervision_propagates_panic_and_early_exit() {
+        let shutdown_after_panic = AtomicBool::new(true);
+        let panic_worker = tokio::spawn(async {
+            panic!("injected Pump Research worker panic");
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        });
+        let panic_error =
+            supervise_connector_workers(vec![panic_worker], true, &shutdown_after_panic)
+                .await
+                .expect_err("research worker panic must fail source supervision");
+        assert!(format!("{panic_error:#}").contains("panicked"));
+
+        let shutdown_not_requested = AtomicBool::new(false);
+        let clean_early_worker = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        let early_exit_error =
+            supervise_connector_workers(vec![clean_early_worker], true, &shutdown_not_requested)
+                .await
+                .expect_err("research worker clean exit before shutdown must fail capture");
+        assert!(format!("{early_exit_error:#}").contains("before an explicit shutdown"));
+
+        let active_path_worker = tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("legacy worker failure"))
+        });
+        assert!(
+            supervise_connector_workers(vec![active_path_worker], false, &shutdown_not_requested,)
+                .await
+                .is_ok(),
+            "active connector keeps its pre-existing best-effort worker semantics"
+        );
     }
 
     #[test]

@@ -1,0 +1,13 @@
+{
+  "schema_version": "pump_research_go_d_source_authority_v1",
+  "source_run_id": "pump-research-1786909252793-3799414",
+  "source_storage_format_version": 1,
+  "go_d_source_authority": "VERIFIED",
+  "external_go_e_audit": "RETIRED_NOT_A_GATE",
+  "raw_provenance_binding_sha256": "e59eb3928e9cf8c2e70bf1da47ccd22d3b580926600ed95edfd31add8519559a",
+  "raw_start_manifest_sha256": "8a38a98e86a9e5fe869e41ba1e78eab62902fa8fcbab65b30b75e6f7e8358cbf",
+  "raw_completion_receipt_sha256": "cad3feb700db879e36c41277ab286bd3a4d17d44642447932937879fbc556e34",
+  "raw_segment_set_blake3": "658214f002dec05749fa8d645cecdf37f04254bf8236843b314c9a53d6228a63",
+  "operator_decision": "GO-D is the final verified historical source authority. GO-E external audit is retired and is not a source, qualification, promotion, export, or strategy gate.",
+  "created_wall_ms": 1786997983169
+}
