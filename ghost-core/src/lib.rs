@@ -36,6 +36,7 @@ pub mod pool_identity;
 pub mod pump_creation_regime;
 pub mod pump_observation_ledger;
 pub mod pump_quote;
+pub mod pump_research_exact_tape_v2;
 pub mod pump_research_tape;
 pub mod session;
 pub mod shadow_ledger;

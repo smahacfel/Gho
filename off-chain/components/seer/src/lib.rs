@@ -73,6 +73,9 @@ pub mod metrics;
 pub mod nln_program_streams;
 pub mod paradox_sensor;
 pub mod pumpportal_connection;
+/// Standalone prospective V2 raw capture.  It is independent from the frozen
+/// GO-D V1 tape and cannot alter active Seer runtime subscription behavior.
+pub mod research_exact_tape_v2;
 pub mod research_tape;
 /// Offline-only PR-B replay and exact-tape materialisation.  Kept separate
 /// from the PR-A capture writer so importing it cannot alter the active Seer

@@ -3525,7 +3525,11 @@ fn program_data_receipt_rpc_client(
     }
 }
 
-async fn observe_program_data_receipt(
+/// Read a finalized Pump Program/ProgramData receipt through the standalone,
+/// explicitly configured source-client authorization path.  This helper is
+/// shared with the prospective Exact-State Tape V2 capture; it is not GO-E
+/// audit I/O and does not consult legacy process-global credentials.
+pub(crate) async fn observe_program_data_receipt(
     rpc_endpoint: &str,
     rpc_auth_token: Option<&str>,
     rpc_auth_header: &str,

@@ -68,8 +68,9 @@ use yellowstone_grpc_proto::prelude::{
     subscribe_request_filter_accounts_filter_memcmp, subscribe_update::UpdateOneof,
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
     SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterMemcmp,
-    SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterEntry, SubscribeRequestFilterSlots,
-    SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
+    SubscribeRequestFilterBlocks, SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterEntry,
+    SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions, SubscribeRequestPing,
+    SubscribeUpdate,
 };
 
 // ─── Program / account constants ─────────────────────────────────────────────
@@ -81,6 +82,12 @@ pub const GRPC_GLOBAL_STREAM_SOURCE_LABEL: &str = "grpc_global_stream";
 pub const GRPC_FUNDING_LANE_PUMP_FILTERED_SOURCE_LABEL: &str = "grpc_funding_lane_pump_filtered";
 pub const GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL: &str = "grpc_funding_lane_full_chain";
 pub const GRPC_PUMP_RESEARCH_GLOBAL_V1_SOURCE_LABEL: &str = "grpc_pump_research_global_v1";
+pub const GRPC_PUMP_RESEARCH_EXACT_STATE_V2_SOURCE_LABEL: &str =
+    "grpc_pump_research_exact_state_v2";
+/// V2 receives unfiltered full block messages only in its standalone
+/// completeness-evidence lane.  This cap is explicit: it avoids inheriting
+/// tonic's small default while keeping the decoded source object bounded.
+pub(crate) const PUMP_RESEARCH_EXACT_STATE_V2_MAX_DECODED_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_GRPC_AUTH_HEADER: &str = "x-token";
 const YELLOWSTONE_TRANSACTION_PAYLOAD_SCHEMA_ID: &str =
     "yellowstone_subscribe_update_transaction.prost.v1";
@@ -1795,6 +1802,12 @@ pub enum GrpcSubscriptionProfile {
     /// is not selectable through `SeerConfig` and therefore cannot alter the
     /// active Seer runtime subscription.
     PumpResearchGlobalV1,
+    /// Prospective exact-state research capture.  Unlike V1, it receives all
+    /// Pump-program-owned AccountUpdates, preserving unknown state-bearing
+    /// dependencies as raw evidence rather than filtering them out by one
+    /// account discriminator.  It remains standalone and cannot be selected
+    /// through `SeerConfig`.
+    PumpResearchExactStateV2,
     FundingLanePumpFiltered,
     FundingLaneFullChain,
 }
@@ -1804,6 +1817,7 @@ impl GrpcSubscriptionProfile {
         match self {
             GrpcSubscriptionProfile::PrimaryGlobal => "primary_global",
             GrpcSubscriptionProfile::PumpResearchGlobalV1 => "pump_research_global_v1",
+            GrpcSubscriptionProfile::PumpResearchExactStateV2 => "pump_research_exact_state_v2",
             GrpcSubscriptionProfile::FundingLanePumpFiltered => "funding_lane_pump_filtered",
             GrpcSubscriptionProfile::FundingLaneFullChain => "funding_lane_full_chain",
         }
@@ -1814,6 +1828,9 @@ impl GrpcSubscriptionProfile {
             GrpcSubscriptionProfile::PrimaryGlobal => GRPC_GLOBAL_STREAM_SOURCE_LABEL,
             GrpcSubscriptionProfile::PumpResearchGlobalV1 => {
                 GRPC_PUMP_RESEARCH_GLOBAL_V1_SOURCE_LABEL
+            }
+            GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
+                GRPC_PUMP_RESEARCH_EXACT_STATE_V2_SOURCE_LABEL
             }
             GrpcSubscriptionProfile::FundingLanePumpFiltered => {
                 GRPC_FUNDING_LANE_PUMP_FILTERED_SOURCE_LABEL
@@ -1832,6 +1849,9 @@ impl GrpcSubscriptionProfile {
         match self {
             GrpcSubscriptionProfile::FundingLaneFullChain => "all_txs",
             GrpcSubscriptionProfile::PumpResearchGlobalV1 => "pump_research_transactions",
+            GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
+                "pump_research_exact_state_v2_transactions"
+            }
             GrpcSubscriptionProfile::PrimaryGlobal
             | GrpcSubscriptionProfile::FundingLanePumpFiltered => "pump_txs",
         }
@@ -1839,7 +1859,8 @@ impl GrpcSubscriptionProfile {
 
     pub fn transaction_account_include(self) -> Vec<String> {
         match self {
-            GrpcSubscriptionProfile::PumpResearchGlobalV1 => {
+            GrpcSubscriptionProfile::PumpResearchGlobalV1
+            | GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
                 vec![PUMP_FUN_PROGRAM_ID.to_string()]
             }
             GrpcSubscriptionProfile::PrimaryGlobal
@@ -1853,10 +1874,12 @@ impl GrpcSubscriptionProfile {
 
     const fn transaction_failed_filter(self) -> Option<bool> {
         match self {
-            // `None` is intentional: V1 raw capture keeps both successful and
-            // failed Pump transactions.  Failure classification belongs to the
-            // offline materializer, never to the provider-side source filter.
-            GrpcSubscriptionProfile::PumpResearchGlobalV1 => None,
+            // `None` is intentional: standalone raw captures keep both
+            // successful and failed Pump transactions.  Failure
+            // classification belongs to the offline materializer, never to
+            // the provider-side source filter.
+            GrpcSubscriptionProfile::PumpResearchGlobalV1
+            | GrpcSubscriptionProfile::PumpResearchExactStateV2 => None,
             Self::PrimaryGlobal | Self::FundingLanePumpFiltered | Self::FundingLaneFullChain => {
                 Some(false)
             }
@@ -1886,6 +1909,13 @@ pub(crate) trait PumpResearchSourceSinkV1: Send + Sync {
     /// is deliberately separate from receiving a source update: a connected
     /// but silent stream is not sufficient evidence for a complete capture.
     fn source_stream_established(&self, stream_epoch: u64);
+
+    /// Called when an already-established standalone research stream ends
+    /// abnormally before the connector considers a retry.  Historical V1
+    /// implementations may retain their existing reconnect lifecycle, but a
+    /// prospective capture can override this hook to fail closed immediately
+    /// instead of waiting for a later successful reconnect/epoch change.
+    fn source_stream_interrupted(&self, _stream_epoch: u64, _error: String) {}
 
     fn try_capture(&self, update: PumpResearchSourceUpdateV1);
 
@@ -2223,6 +2253,9 @@ pub(crate) struct PumpResearchSourceConnectionV1 {
 }
 
 impl PumpResearchSourceConnectionV1 {
+    /// Construct the historical V1 source connection.  Kept as the explicit
+    /// compatibility entry point so existing GO-D capture code cannot
+    /// accidentally switch request contracts.
     pub(crate) fn new(
         endpoint: String,
         auth_token: Option<String>,
@@ -2231,6 +2264,52 @@ impl PumpResearchSourceConnectionV1 {
         ingress_queue_capacity: usize,
         sink: Arc<dyn PumpResearchSourceSinkV1>,
         capture_abort: CancellationToken,
+    ) -> Result<Self> {
+        Self::new_for_subscription_profile(
+            endpoint,
+            auth_token,
+            auth_header,
+            provider_id,
+            ingress_queue_capacity,
+            sink,
+            capture_abort,
+            GrpcSubscriptionProfile::PumpResearchGlobalV1,
+        )
+    }
+
+    /// Construct the standalone prospective Exact-State Tape V2 source.
+    /// This is intentionally not configurable through active `SeerConfig`;
+    /// callers must opt into the V2 capture contract explicitly.
+    pub(crate) fn new_exact_state_v2(
+        endpoint: String,
+        auth_token: Option<String>,
+        auth_header: String,
+        provider_id: String,
+        ingress_queue_capacity: usize,
+        sink: Arc<dyn PumpResearchSourceSinkV1>,
+        capture_abort: CancellationToken,
+    ) -> Result<Self> {
+        Self::new_for_subscription_profile(
+            endpoint,
+            auth_token,
+            auth_header,
+            provider_id,
+            ingress_queue_capacity,
+            sink,
+            capture_abort,
+            GrpcSubscriptionProfile::PumpResearchExactStateV2,
+        )
+    }
+
+    fn new_for_subscription_profile(
+        endpoint: String,
+        auth_token: Option<String>,
+        auth_header: String,
+        provider_id: String,
+        ingress_queue_capacity: usize,
+        sink: Arc<dyn PumpResearchSourceSinkV1>,
+        capture_abort: CancellationToken,
+        subscription_profile: GrpcSubscriptionProfile,
     ) -> Result<Self> {
         let config = GrpcConfig {
             providers: vec![Provider::primary_with_auth_header(
@@ -2246,7 +2325,7 @@ impl PumpResearchSourceConnectionV1 {
             resub_debounce_ms: DEFAULT_RESUB_DEBOUNCE_MS,
             max_stalls_before_open: DEFAULT_PROVIDER_MAX_STALLS_BEFORE_OPEN,
             circuit_breaker_cooldown_ms: DEFAULT_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS,
-            subscription_profile: GrpcSubscriptionProfile::PumpResearchGlobalV1,
+            subscription_profile,
             registry_resubscribe_mode: RegistryResubscribeMode::HealthTickOnly,
             // The primary runtime FIFO is unused in capture-only mode.  Keep
             // it bounded and sized from the standalone capture config so no
@@ -2377,7 +2456,7 @@ async fn connection_loop(
                 }
                 break;
             }
-            result = build_client(&prov) => {
+            result = build_client(&prov, cfg.subscription_profile) => {
                 match result {
                     Ok(client) => client,
                     Err(e) => {
@@ -2397,6 +2476,7 @@ async fn connection_loop(
             }
         };
 
+        let mut research_stream_established = false;
         let result = stream_loop(
             &id,
             client,
@@ -2419,16 +2499,23 @@ async fn connection_loop(
             &latest_block_time_secs,
             stream_epoch,
             research_capture_sink.clone(),
+            &mut research_stream_established,
         )
         .await;
 
         match result {
             Ok(()) => break,
-            Err(err) if shutdown.load(Ordering::Relaxed) => {
-                debug!("[{id}] stream ended during shutdown: {err:#}");
-                break;
-            }
             Err(err) => {
+                if research_stream_established {
+                    if let Some(research_capture_sink) = research_capture_sink.as_ref() {
+                        research_capture_sink
+                            .source_stream_interrupted(stream_epoch, format!("{err:#}"));
+                    }
+                }
+                if shutdown.load(Ordering::Relaxed) {
+                    debug!("[{id}] stream ended during shutdown: {err:#}");
+                    break;
+                }
                 if permit.half_open_probe
                     && breaker.snapshot().state == ProviderCircuitState::HalfOpen
                 {
@@ -2523,6 +2610,7 @@ impl Interceptor for AuthHeaderInterceptor {
 
 async fn build_client(
     prov: &Provider,
+    subscription_profile: GrpcSubscriptionProfile,
 ) -> Result<GeyserGrpcClient<impl tonic::service::Interceptor>> {
     let uri = normalise_endpoint(&prov.endpoint);
     let endpoint = Endpoint::from_shared(uri.clone())?
@@ -2542,7 +2630,15 @@ async fn build_client(
         .with_context(|| format!("gRPC connect to {uri}"))?;
     let interceptor = AuthHeaderInterceptor::new(&prov.auth_header, prov.x_token.as_deref())?;
     let health = HealthClient::with_interceptor(channel.clone(), interceptor.clone());
-    let geyser = GeyserClient::with_interceptor(channel, interceptor);
+    let geyser = if matches!(
+        subscription_profile,
+        GrpcSubscriptionProfile::PumpResearchExactStateV2
+    ) {
+        GeyserClient::with_interceptor(channel, interceptor)
+            .max_decoding_message_size(PUMP_RESEARCH_EXACT_STATE_V2_MAX_DECODED_MESSAGE_BYTES)
+    } else {
+        GeyserClient::with_interceptor(channel, interceptor)
+    };
     Ok(GeyserGrpcClient::new(health, geyser))
 }
 
@@ -2576,6 +2672,7 @@ fn tracked_exact_accounts_for_profile(
             registry.snapshot_primary_global_exact_accounts(budget)
         }
         GrpcSubscriptionProfile::PumpResearchGlobalV1
+        | GrpcSubscriptionProfile::PumpResearchExactStateV2
         | GrpcSubscriptionProfile::FundingLanePumpFiltered
         | GrpcSubscriptionProfile::FundingLaneFullChain => Vec::new(),
     }
@@ -2590,6 +2687,7 @@ fn tracked_exact_total_for_profile(
             lanes.bcv2_accounts.len() + lanes.generic_accounts.len()
         }
         GrpcSubscriptionProfile::PumpResearchGlobalV1
+        | GrpcSubscriptionProfile::PumpResearchExactStateV2
         | GrpcSubscriptionProfile::FundingLanePumpFiltered
         | GrpcSubscriptionProfile::FundingLaneFullChain => 0,
     }
@@ -2616,6 +2714,7 @@ fn exact_account_selection_counts_for_profile(
     let tracked_bcv2 = match subscription_profile {
         GrpcSubscriptionProfile::PrimaryGlobal => lanes.bcv2_accounts.len(),
         GrpcSubscriptionProfile::PumpResearchGlobalV1
+        | GrpcSubscriptionProfile::PumpResearchExactStateV2
         | GrpcSubscriptionProfile::FundingLanePumpFiltered
         | GrpcSubscriptionProfile::FundingLaneFullChain => 0,
     };
@@ -2658,6 +2757,21 @@ pub(crate) fn pump_research_subscribe_request_v1() -> SubscribeRequest {
     build_subscribe_request_for_profile(
         CommitmentLevel::Processed,
         GrpcSubscriptionProfile::PumpResearchGlobalV1,
+        &AccountRegistry::new(),
+        0,
+    )
+}
+
+/// Build the immutable standalone source request for prospective Exact-State
+/// Tape V2.  V2 deliberately retains every Pump-program-owned AccountUpdate:
+/// its raw account class is determined offline, after the source record is
+/// frozen.  Do not add discriminator filtering here, because that would make
+/// an unknown future state dependency disappear before qualification can
+/// classify it fail-closed.
+pub(crate) fn pump_research_exact_state_v2_subscribe_request() -> SubscribeRequest {
+    build_subscribe_request_for_profile(
+        CommitmentLevel::Processed,
+        GrpcSubscriptionProfile::PumpResearchExactStateV2,
         &AccountRegistry::new(),
         0,
     )
@@ -2768,6 +2882,13 @@ pub(crate) fn subscribe_request_fingerprint_blake3_v1(request: &SubscribeRequest
 /// BLAKE3 identity of the actual frozen standalone research request.
 pub(crate) fn pump_research_subscription_request_fingerprint_blake3_v1() -> [u8; 32] {
     subscribe_request_fingerprint_blake3_v1(&pump_research_subscribe_request_v1())
+}
+
+/// BLAKE3 identity of the actual standalone prospective Exact-State V2
+/// request.  The existing canonicalization format is request-generic even
+/// though its historical function name carries the V1 suffix.
+pub(crate) fn pump_research_exact_state_v2_subscription_request_fingerprint_blake3() -> [u8; 32] {
+    subscribe_request_fingerprint_blake3_v1(&pump_research_exact_state_v2_subscribe_request())
 }
 
 fn build_subscribe_request_for_profile(
@@ -2957,6 +3078,20 @@ fn build_subscribe_request_for_profile(
             },
         );
         (acc_filters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    } else if matches!(
+        subscription_profile,
+        GrpcSubscriptionProfile::PumpResearchExactStateV2
+    ) {
+        let mut acc_filters = HashMap::new();
+        acc_filters.insert(
+            "pump_research_exact_state_v2_all_pump_owned".into(),
+            SubscribeRequestFilterAccounts {
+                account: vec![],
+                owner: vec![PUMP_FUN_PROGRAM_ID.to_string()],
+                filters: vec![],
+            },
+        );
+        (acc_filters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     } else {
         (HashMap::new(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     };
@@ -2977,11 +3112,35 @@ fn build_subscribe_request_for_profile(
     blocks_meta_filters.insert(
         match subscription_profile {
             GrpcSubscriptionProfile::PumpResearchGlobalV1 => "pump_research_blocks_meta",
+            GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
+                "pump_research_exact_state_v2_blocks_meta"
+            }
             _ => "ghost_blocks_meta",
         }
         .into(),
         SubscribeRequestFilterBlocksMeta {},
     );
+
+    // V2 keeps a second, unfiltered block evidence lane.  The standalone
+    // materializer later scans each captured block's full transaction list and
+    // compares every Pump invocation against the filtered transaction tap.
+    // This is deliberately not a provider-side Pump filter: a filter cannot
+    // prove that it did not omit an inner-CPI or loaded-address invocation.
+    let mut block_filters = HashMap::new();
+    if matches!(
+        subscription_profile,
+        GrpcSubscriptionProfile::PumpResearchExactStateV2
+    ) {
+        block_filters.insert(
+            "pump_research_exact_state_v2_full_blocks".into(),
+            SubscribeRequestFilterBlocks {
+                account_include: vec![],
+                include_transactions: Some(true),
+                include_accounts: Some(false),
+                include_entries: Some(false),
+            },
+        );
+    }
 
     // The research profile is the only raw-capture profile that needs slot
     // parent/status evidence for offline canonicality.  `false` deliberately
@@ -2991,9 +3150,17 @@ fn build_subscribe_request_for_profile(
     if matches!(
         subscription_profile,
         GrpcSubscriptionProfile::PumpResearchGlobalV1
+            | GrpcSubscriptionProfile::PumpResearchExactStateV2
     ) {
         slot_filters.insert(
-            "pump_research_slots".into(),
+            match subscription_profile {
+                GrpcSubscriptionProfile::PumpResearchGlobalV1 => "pump_research_slots",
+                GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
+                    "pump_research_exact_state_v2_slots"
+                }
+                _ => unreachable!("only standalone research profiles reach this branch"),
+            }
+            .into(),
             SubscribeRequestFilterSlots {
                 filter_by_commitment: Some(false),
             },
@@ -3005,7 +3172,7 @@ fn build_subscribe_request_for_profile(
         slots: slot_filters,
         transactions: tx_filters,
         transactions_status: HashMap::new(),
-        blocks: HashMap::new(),
+        blocks: block_filters,
         blocks_meta: blocks_meta_filters,
         entry: entry_filters,
         commitment: Some(commitment as i32),
@@ -3016,6 +3183,7 @@ fn build_subscribe_request_for_profile(
     let total_filter_branches = req.accounts.len()
         + req.slots.len()
         + req.transactions.len()
+        + req.blocks.len()
         + req.blocks_meta.len()
         + req.entry.len()
         + req.accounts_data_slice.len();
@@ -3025,6 +3193,7 @@ fn build_subscribe_request_for_profile(
         "SUBSCRIBE_SENT profile={} source_label={} tx_filter={} \
          programs={} \
          accounts={} \
+         blocks={} \
          blocks_meta={} \
          slots={} \
          entry=DISABLED \
@@ -3039,7 +3208,8 @@ fn build_subscribe_request_for_profile(
         subscription_profile.transaction_filter_name(),
         match subscription_profile {
             GrpcSubscriptionProfile::FundingLaneFullChain => "[ALL_TRANSACTIONS]",
-            GrpcSubscriptionProfile::PumpResearchGlobalV1 => "[PumpFun]",
+            GrpcSubscriptionProfile::PumpResearchGlobalV1
+            | GrpcSubscriptionProfile::PumpResearchExactStateV2 => "[PumpFun]",
             GrpcSubscriptionProfile::PrimaryGlobal
             | GrpcSubscriptionProfile::FundingLanePumpFiltered => "[PumpFun,PumpSwap]",
         },
@@ -3050,24 +3220,33 @@ fn build_subscribe_request_for_profile(
             GrpcSubscriptionProfile::PumpResearchGlobalV1 => {
                 "[pump_owned_bonding_curve_discriminator,canonical_pump_global]"
             }
+            GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
+                "[all_pump_program_owned_accounts]"
+            }
             GrpcSubscriptionProfile::FundingLanePumpFiltered
             | GrpcSubscriptionProfile::FundingLaneFullChain => "[DISABLED]",
         },
-        if matches!(
-            subscription_profile,
-            GrpcSubscriptionProfile::PumpResearchGlobalV1
-        ) {
-            "pump_research_blocks_meta"
-        } else {
-            "ghost_blocks_meta"
+        match subscription_profile {
+            GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
+                "[unfiltered_full_blocks_with_transactions]"
+            }
+            _ => "[DISABLED]",
         },
-        if matches!(
-            subscription_profile,
-            GrpcSubscriptionProfile::PumpResearchGlobalV1
-        ) {
-            "pump_research_slots(filter_by_commitment=false)"
-        } else {
-            "DISABLED"
+        match subscription_profile {
+            GrpcSubscriptionProfile::PumpResearchGlobalV1 => "pump_research_blocks_meta",
+            GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
+                "pump_research_exact_state_v2_blocks_meta"
+            }
+            _ => "ghost_blocks_meta",
+        },
+        match subscription_profile {
+            GrpcSubscriptionProfile::PumpResearchGlobalV1 => {
+                "pump_research_slots(filter_by_commitment=false)"
+            }
+            GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
+                "pump_research_exact_state_v2_slots(filter_by_commitment=false)"
+            }
+            _ => "DISABLED",
         },
         tracked_curve_count,
         tracked_pool_count,
@@ -3091,6 +3270,9 @@ fn build_subscribe_request_for_profile(
             }
             GrpcSubscriptionProfile::PumpResearchGlobalV1 => {
                 "standalone_decoded_source_capture_before_projection"
+            }
+            GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
+                "standalone_full_pump_owned_raw_source_capture_before_projection"
             }
         },
         total_filter_branches,
@@ -3242,21 +3424,22 @@ async fn stream_loop(
     latest_block_time_secs: &Arc<AtomicI64>,
     stream_epoch: u64,
     research_capture_sink: Option<Arc<dyn PumpResearchSourceSinkV1>>,
+    research_stream_established: &mut bool,
 ) -> Result<()> {
-    let req = if matches!(
-        cfg.subscription_profile,
-        GrpcSubscriptionProfile::PumpResearchGlobalV1
-    ) {
-        // The standalone research source must send the exact request whose
-        // canonical identity is recorded in the immutable run manifest.
-        pump_research_subscribe_request_v1()
-    } else {
-        build_subscribe_request_for_profile(
+    let req = match cfg.subscription_profile {
+        // Each standalone research source must send the exact request whose
+        // canonical identity is recorded in its immutable run manifest.  Do
+        // not reconstruct either request from mutable runtime registry state.
+        GrpcSubscriptionProfile::PumpResearchGlobalV1 => pump_research_subscribe_request_v1(),
+        GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
+            pump_research_exact_state_v2_subscribe_request()
+        }
+        _ => build_subscribe_request_for_profile(
             cfg.commitment,
             cfg.subscription_profile,
             registry,
             from_slot,
-        )
+        ),
     };
     if let Some(ref h) = health {
         h.set_grpc_state(GRPC_STATE_SUBSCRIBING);
@@ -3290,6 +3473,7 @@ async fn stream_loop(
     info!("[{id}] Stream established");
     if let Some(research_capture_sink) = research_capture_sink.as_ref() {
         research_capture_sink.source_stream_established(stream_epoch);
+        *research_stream_established = true;
     }
 
     let mut health_ticker = tokio::time::interval(Duration::from_secs(HEALTH_TICK_SECS));
@@ -6825,6 +7009,71 @@ mod tests {
         assert!(
             primary.slots.is_empty(),
             "active primary profile remains unchanged"
+        );
+    }
+
+    #[test]
+    fn pump_research_exact_state_v2_profile_captures_all_pump_owned_accounts() {
+        let request = pump_research_exact_state_v2_subscribe_request();
+        let transaction = request
+            .transactions
+            .get("pump_research_exact_state_v2_transactions")
+            .expect("V2 transaction filter");
+        assert_eq!(transaction.vote, Some(false));
+        assert_eq!(transaction.failed, None);
+        assert_eq!(
+            transaction.account_include,
+            vec![PUMP_FUN_PROGRAM_ID.to_owned()],
+            "V2 must retain every Pump transaction, including failed ones"
+        );
+
+        let account = request
+            .accounts
+            .get("pump_research_exact_state_v2_all_pump_owned")
+            .expect("all Pump-owned account filter");
+        assert!(
+            account.account.is_empty(),
+            "V2 must not preselect individual accounts"
+        );
+        assert_eq!(account.owner, vec![PUMP_FUN_PROGRAM_ID.to_owned()]);
+        assert!(
+            account.filters.is_empty(),
+            "V2 must not use discriminator filtering that could erase an unknown dependency"
+        );
+
+        assert!(request.entry.is_empty());
+        let full_blocks = request
+            .blocks
+            .get("pump_research_exact_state_v2_full_blocks")
+            .expect("V2 unfiltered full-block completeness lane");
+        assert!(
+            full_blocks.account_include.is_empty(),
+            "V2 block completeness evidence must not repeat the Pump transaction filter"
+        );
+        assert_eq!(full_blocks.include_transactions, Some(true));
+        assert_eq!(full_blocks.include_accounts, Some(false));
+        assert_eq!(full_blocks.include_entries, Some(false));
+        assert!(request
+            .blocks_meta
+            .contains_key("pump_research_exact_state_v2_blocks_meta"));
+        assert_eq!(
+            request
+                .slots
+                .get("pump_research_exact_state_v2_slots")
+                .and_then(|filter| filter.filter_by_commitment),
+            Some(false),
+            "V2 must retain processed/confirmed/finalized slot evidence"
+        );
+
+        assert_eq!(
+            pump_research_exact_state_v2_subscription_request_fingerprint_blake3(),
+            subscribe_request_fingerprint_blake3_v1(&request),
+            "V2 manifest identity must fingerprint the exact source request"
+        );
+        assert_ne!(
+            pump_research_exact_state_v2_subscription_request_fingerprint_blake3(),
+            pump_research_subscription_request_fingerprint_blake3_v1(),
+            "V2 must not silently reuse the narrower V1 source-request identity"
         );
     }
 

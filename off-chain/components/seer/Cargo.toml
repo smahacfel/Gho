@@ -58,6 +58,7 @@ borsh = "0.10"
 smallvec = "1.11"
 futures = "0.3"
 libc = "0.2"
+tempfile = "3.8"
 
 # FFT for Phase Lock Detection
 rustfft = "6.1"
@@ -74,7 +75,6 @@ ghost-core = { path = "../../../ghost-core" }
 
 [dev-dependencies]
 trigger = { path = "../trigger" }
-tempfile = "3.8"
 
 [lib]
 name = "seer"
@@ -87,6 +87,10 @@ path = "src/main.rs"
 [[bin]]
 name = "pump-research-tape"
 path = "src/bin/pump_research_tape.rs"
+
+[[bin]]
+name = "pump-exact-state-tape-v2"
+path = "src/bin/pump_exact_state_tape_v2.rs"
 
 [[example]]
 name = "seer_trigger_integration"
