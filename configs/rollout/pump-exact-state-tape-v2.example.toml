@@ -14,12 +14,12 @@ grpc_endpoint = "https://replace-grpc-endpoint.invalid"
 grpc_auth_token_env = "PUMP_EXACT_STATE_TAPE_V2_GRPC_TOKEN"
 grpc_auth_header = "x-token"
 
-# The same prospective source operator must provide a finalized,
-# source-provider bootstrap snapshot.  This is not GO-E and cannot backfill
-# or repair a historical tape.
-bootstrap_rpc_endpoint = "https://replace-finalized-bootstrap-rpc.invalid"
-bootstrap_rpc_auth_token_env = "PUMP_EXACT_STATE_TAPE_V2_BOOTSTRAP_RPC_TOKEN"
-bootstrap_rpc_auth_header = "x-api-key"
+# RPC has one deliberately narrow job: finalized start/end receipts for the
+# Pump Program and ProgramData accounts.  It never scans or reconstructs the
+# Pump account universe.
+program_data_rpc_endpoint = "https://replace-program-data-rpc.invalid"
+program_data_rpc_auth_token_env = "PUMP_EXACT_STATE_TAPE_V2_PROGRAM_DATA_RPC_TOKEN"
+program_data_rpc_auth_header = "x-api-key"
 
 # Exact compiled Pump program ID.  The binary rejects a substituted value.
 pump_program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -37,19 +37,16 @@ output_dir = "/protected/operator/pump-exact-state-tape-v2-runs"
 required_for_run = true
 
 # Bounded source ingress.  V2 receives unfiltered full blocks in addition to
-# the Pump-filtered transaction and all-Pump-owned account lanes, so both item
-# and serialized-protobuf-byte limits are authority inputs.
+# the Pump-filtered transaction and the canonical BondingCurve/Global account
+# lanes, so both item and serialized-protobuf-byte limits are authority inputs.
 source_queue_capacity = 8192
 source_queue_max_bytes = 536870912
-bootstrap_queue_capacity = 4096
-bootstrap_enqueue_timeout_ms = 30000
-stream_establish_timeout_ms = 30000
-bootstrap_rpc_timeout_ms = 300000
-bootstrap_response_max_bytes = 536870912
+source_readiness_timeout_ms = 30000
 
-# A finite prospective cohort begins only after the finalized bootstrap and
-# sealed readiness boundary.  Deadline expiry is a deliberate normal stop;
-# an unexpected source exit, source epoch change, gap, queue overflow, raw
+# A finite prospective cohort begins only after all five live lanes have
+# supplied their first accepted record and the one stream-readiness boundary
+# has been durably flushed.  Deadline expiry is a deliberate normal stop; an
+# unexpected source exit, source epoch change, gap, queue overflow, raw
 # byte-budget breach, or storage-reserve breach makes the run incomplete.
 cohort_capture_wall_ms = 3600000
 

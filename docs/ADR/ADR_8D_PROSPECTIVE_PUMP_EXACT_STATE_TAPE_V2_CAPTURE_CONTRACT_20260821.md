@@ -2,9 +2,17 @@
 
 **Data:** 2026-08-21
 
-**Status:** IMPLEMENTED LOCALLY / REAL SOURCE CAPTURE NOT STARTED / V2 QUALIFICATION AUTHORITY NOW DOCUMENTED SEPARATELY
+**Status:** HISTORICAL / SUPERSEDED IN PART BY PRXTAPE3 STREAM-ONLY V1.1 / REAL SOURCE CAPTURE NOT STARTED
 
 **Task:** `PROSPECTIVE_PUMP_EXACT_STATE_TAPE_V2_CAPTURE_CONTRACT`
+
+> **Zakresowe zastąpienie, 2026-08-23:**
+> `ADR_8D_PROSPECTIVE_PUMP_EXACT_STATE_TAPE_V2_STREAM_ONLY_V1_1_READINESS_20260823.md`
+> zastępuje ten ADR **wyłącznie** w obszarze all-owner Pump account subscription
+> oraz bootstrapu `getProgramAccounts(Pump)`. PRXTAPE3 nie wykonuje snapshotu
+> kont ani RPC backfillu: account lane obejmuje tylko BondingCurve i canonical
+> Global ze streamu Yellowstone. Pozostałe historyczne granice capture'u z tego
+> ADR-u nie są przez tę adnotację zmieniane.
 
 ## D0. Problem i rozdzielenie authority
 

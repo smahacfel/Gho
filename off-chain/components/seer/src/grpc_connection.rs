@@ -1791,6 +1791,11 @@ impl RegistryResubscribeMode {
     }
 }
 
+const PUMP_RESEARCH_EXACT_STATE_V2_ACCOUNT_FILTER_LOG_SCOPE: &str =
+    "[pump_owned_bonding_curve_discriminator,canonical_pump_global]";
+const PUMP_RESEARCH_EXACT_STATE_V2_SOURCE_CAPTURE_LOG_NOTE: &str =
+    "standalone_stream_only_bonding_curve_global_raw_source_capture_before_projection";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GrpcSubscriptionProfile {
     #[default]
@@ -1802,11 +1807,10 @@ pub enum GrpcSubscriptionProfile {
     /// is not selectable through `SeerConfig` and therefore cannot alter the
     /// active Seer runtime subscription.
     PumpResearchGlobalV1,
-    /// Prospective exact-state research capture.  Unlike V1, it receives all
-    /// Pump-program-owned AccountUpdates, preserving unknown state-bearing
-    /// dependencies as raw evidence rather than filtering them out by one
-    /// account discriminator.  It remains standalone and cannot be selected
-    /// through `SeerConfig`.
+    /// Prospective exact-state research capture.  Its stream-only V1.1 account
+    /// contract receives Pump-owner BondingCurve updates and the exact
+    /// canonical Pump Global account only.  It remains standalone and cannot
+    /// be selected through `SeerConfig`.
     PumpResearchExactStateV2,
     FundingLanePumpFiltered,
     FundingLaneFullChain,
@@ -2763,11 +2767,11 @@ pub(crate) fn pump_research_subscribe_request_v1() -> SubscribeRequest {
 }
 
 /// Build the immutable standalone source request for prospective Exact-State
-/// Tape V2.  V2 deliberately retains every Pump-program-owned AccountUpdate:
-/// its raw account class is determined offline, after the source record is
-/// frozen.  Do not add discriminator filtering here, because that would make
-/// an unknown future state dependency disappear before qualification can
-/// classify it fail-closed.
+/// Tape V2. Its stream-only V1.1 account contract is deliberately closed to
+/// Pump-owner BondingCurve updates plus the canonical Pump Global account.
+/// Do not widen this request into an all-owner scan: accounts outside those
+/// two classes are a fail-closed source-contract error, not retained state
+/// authority.
 pub(crate) fn pump_research_exact_state_v2_subscribe_request() -> SubscribeRequest {
     build_subscribe_request_for_profile(
         CommitmentLevel::Processed,
@@ -3084,10 +3088,31 @@ fn build_subscribe_request_for_profile(
     ) {
         let mut acc_filters = HashMap::new();
         acc_filters.insert(
-            "pump_research_exact_state_v2_all_pump_owned".into(),
+            "pump_research_exact_state_v2_bonding_curves".into(),
             SubscribeRequestFilterAccounts {
                 account: vec![],
                 owner: vec![PUMP_FUN_PROGRAM_ID.to_string()],
+                filters: vec![SubscribeRequestFilterAccountsFilter {
+                    filter: Some(subscribe_request_filter_accounts_filter::Filter::Memcmp(
+                        SubscribeRequestFilterAccountsFilterMemcmp {
+                            offset: 0,
+                            data: Some(
+                                subscribe_request_filter_accounts_filter_memcmp::Data::Bytes(
+                                    BONDING_CURVE_DISC.to_vec(),
+                                ),
+                            ),
+                        },
+                    )),
+                }],
+            },
+        );
+        acc_filters.insert(
+            "pump_research_exact_state_v2_global".into(),
+            SubscribeRequestFilterAccounts {
+                account: vec![
+                    ghost_core::pump_research_tape::PUMP_RESEARCH_PUMP_GLOBAL_BASE58_V1.to_string(),
+                ],
+                owner: vec![],
                 filters: vec![],
             },
         );
@@ -3221,7 +3246,7 @@ fn build_subscribe_request_for_profile(
                 "[pump_owned_bonding_curve_discriminator,canonical_pump_global]"
             }
             GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
-                "[all_pump_program_owned_accounts]"
+                PUMP_RESEARCH_EXACT_STATE_V2_ACCOUNT_FILTER_LOG_SCOPE
             }
             GrpcSubscriptionProfile::FundingLanePumpFiltered
             | GrpcSubscriptionProfile::FundingLaneFullChain => "[DISABLED]",
@@ -3272,7 +3297,7 @@ fn build_subscribe_request_for_profile(
                 "standalone_decoded_source_capture_before_projection"
             }
             GrpcSubscriptionProfile::PumpResearchExactStateV2 => {
-                "standalone_full_pump_owned_raw_source_capture_before_projection"
+                PUMP_RESEARCH_EXACT_STATE_V2_SOURCE_CAPTURE_LOG_NOTE
             }
         },
         total_filter_branches,
@@ -7013,7 +7038,7 @@ mod tests {
     }
 
     #[test]
-    fn pump_research_exact_state_v2_profile_captures_all_pump_owned_accounts() {
+    fn pump_research_exact_state_v2_profile_captures_only_bonding_curves_and_global() {
         let request = pump_research_exact_state_v2_subscribe_request();
         let transaction = request
             .transactions
@@ -7027,18 +7052,46 @@ mod tests {
             "V2 must retain every Pump transaction, including failed ones"
         );
 
+        assert_eq!(
+            request.accounts.len(),
+            2,
+            "V2 stream-only source contract has exactly two account filters"
+        );
         let account = request
             .accounts
-            .get("pump_research_exact_state_v2_all_pump_owned")
-            .expect("all Pump-owned account filter");
+            .get("pump_research_exact_state_v2_bonding_curves")
+            .expect("Pump-owned BondingCurve filter");
         assert!(
             account.account.is_empty(),
-            "V2 must not preselect individual accounts"
+            "BondingCurve subscription is owner-plus-discriminator scoped"
         );
         assert_eq!(account.owner, vec![PUMP_FUN_PROGRAM_ID.to_owned()]);
+        assert_eq!(account.filters.len(), 1);
+        let global = request
+            .accounts
+            .get("pump_research_exact_state_v2_global")
+            .expect("canonical Pump Global exact account filter");
+        assert_eq!(
+            global.account,
+            vec![ghost_core::pump_research_tape::PUMP_RESEARCH_PUMP_GLOBAL_BASE58_V1.to_owned()]
+        );
+        assert!(global.owner.is_empty());
+        assert!(global.filters.is_empty());
         assert!(
-            account.filters.is_empty(),
-            "V2 must not use discriminator filtering that could erase an unknown dependency"
+            !request
+                .accounts
+                .contains_key("pump_research_exact_state_v2_all_pump_owned"),
+            "V2 must not retain an unbounded all-Pump-owner filter"
+        );
+        assert_eq!(
+            PUMP_RESEARCH_EXACT_STATE_V2_ACCOUNT_FILTER_LOG_SCOPE,
+            "[pump_owned_bonding_curve_discriminator,canonical_pump_global]",
+            "the durable subscription diagnostic must describe the same two V1.1 account filters"
+        );
+        assert_eq!(
+            PUMP_RESEARCH_EXACT_STATE_V2_SOURCE_CAPTURE_LOG_NOTE,
+            "standalone_stream_only_bonding_curve_global_raw_source_capture_before_projection",
+            "the durable subscription diagnostic must not claim an all-owner raw capture"
         );
 
         assert!(request.entry.is_empty());

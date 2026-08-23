@@ -19,12 +19,9 @@ use crate::research_exact_tape_v2_semantics::{
     PumpExactStateSemanticsAuthorityV2,
 };
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use ghost_core::{
     pump_research_exact_tape_v2::{
-        PumpExactStateBlockMetaEvidenceV2, PumpExactStateBootstrapProgramOwnedAccountV2,
-        PumpExactStateBootstrapResponseChunkV2, PumpExactStateBootstrapSnapshotCompletedV2,
-        PumpExactStateBootstrapSnapshotStartedV2, PumpExactStateFullBlockPayloadChunkV2,
+        PumpExactStateBlockMetaEvidenceV2, PumpExactStateFullBlockPayloadChunkV2,
         PumpExactStateFullBlockPayloadCompletedV2, PumpExactStateFullBlockPayloadStartedV2,
         PumpExactStatePumpOwnedAccountUpdateV2, PumpExactStateRawCodecV2,
         PumpExactStateRawRecordV2, PumpExactStateSlotEvidenceV2,
@@ -35,7 +32,6 @@ use ghost_core::{
 };
 use prost::Message;
 use serde::Serialize;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use solana_sdk::pubkey::Pubkey;
 use std::{
@@ -59,7 +55,6 @@ use std::os::unix::{
 };
 
 const V2_RAW_CONTROL_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const V2_BOOTSTRAP_RESPONSE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const V2_WINDOW_EXPORT_MAX_BIRTHS: usize = 1_000_000;
 const V2_WINDOW_EXPORT_MAX_RELEVANT_COVERAGE_EVENTS: usize = 8_000_000;
 const V2_WINDOW_EXPORT_MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -74,9 +69,11 @@ const PUMP_EXACT_STATE_WINDOW_FORWARD_MS_V2: u64 = 90_000;
 /// sized from the immutable receipt set rather than from a mutable directory
 /// walk or the capture-time maximum budget.
 const V2_QUALIFICATION_METADATA_ALLOWANCE_BYTES: u64 = 64 * 1024 * 1024;
-const PUMP_EXACT_STATE_CAPABILITY_SCHEMA_VERSION_V2: u16 = 2;
+const PUMP_EXACT_STATE_CAPABILITY_SCHEMA_VERSION_V2: u16 = 3;
 const PUMP_EXACT_STATE_EXACT_OUTPUT_SCHEMA_VERSION_V2: u16 = 2;
 const PUMP_EXACT_STATE_REQUIRED_COVERAGE_PPM_V2: u64 = 999_000;
+const PUMP_EXACT_STATE_MIN_QUALIFICATION_COHORT_ELAPSED_MS_V2: u64 = 1_800_000;
+const PUMP_EXACT_STATE_MIN_QUALIFICATION_MUTATION_DENOMINATOR_V2: u64 = 10_000;
 
 /// The result of the pre-semantic V2 raw authority check.  It is intentionally
 /// narrow: exact-state qualification will add account, mutation, and coverage
@@ -118,6 +115,7 @@ pub enum PumpExactStateCapabilityBlockerV2 {
     NoSuccessfulRootedTradeWithBothStates,
     NoExactBirth,
     CanonicalSlotEvidenceMissing,
+    QualificationRunBelowMinimum,
     RawAuthorityRevalidationFailed,
 }
 
@@ -249,7 +247,6 @@ struct PumpExactStateCapabilityReceiptV2 {
     filtered_pump_transaction_count: u64,
     full_block_pump_transaction_count: u64,
     pump_owned_account_update_count: u64,
-    bootstrap_pump_owned_account_count: u64,
     bonding_curve_account_count: u64,
     bonding_curve_decoded_count: u64,
     global_account_count: u64,
@@ -268,6 +265,7 @@ struct PumpExactStateCapabilityReceiptV2 {
     explicit_non_exact_mutation_count: u64,
     denominator_reconciled: bool,
     exact_rooted_coverage_ppm: u64,
+    qualification_run_below_minimum: bool,
     required_exact_rooted_coverage_ppm: u64,
     exact_trajectory_count: u64,
     successful_rooted_exact_trade_with_both_states_count: u64,
@@ -1416,8 +1414,9 @@ pub struct PumpExactStateIndexedTransactionV2 {
     pub signature: [u8; 64],
 }
 
-/// Minimal index entry for one all-Pump-owned account update.  The raw account
-/// bytes are read only after the complete V2 segment-set contract has passed.
+/// Minimal index entry for one canonical BondingCurve or Global account
+/// update.  The raw account bytes are read only after the complete V2
+/// segment-set contract has passed.
 #[derive(Clone, Debug)]
 pub struct PumpExactStateIndexedAccountUpdateV2 {
     pointer: PumpExactStateRawRecordPointerV2,
@@ -1510,7 +1509,8 @@ struct PumpExactStateSourceAvailabilityBoundsV2 {
 /// Verified raw V2 authority for the future offline qualifier.  Construct it
 /// only with [`index_prospective_exact_state_raw_run_v2`]; all indexed source
 /// records were checked against their framed payload, footer, whole-file
-/// receipt, segment chain, bootstrap boundary and full-block reconciliation.
+/// receipt, segment chain, stream-readiness boundary and full-block
+/// reconciliation.
 #[derive(Clone, Debug)]
 pub struct PumpExactStateRawTapeIndexV2 {
     raw_dir: std::path::PathBuf,
@@ -1519,7 +1519,6 @@ pub struct PumpExactStateRawTapeIndexV2 {
     segments: Vec<PumpExactStateIndexedSegmentV2>,
     transactions: Vec<PumpExactStateIndexedTransactionV2>,
     account_updates: Vec<PumpExactStateIndexedAccountUpdateV2>,
-    bootstrap_accounts: Vec<PumpExactStateRawRecordPointerV2>,
     slot_ledger: BTreeMap<u64, PumpExactStatePerSlotLedgerV2>,
     full_block_pump_transaction_count: u64,
     source_availability_bounds: PumpExactStateSourceAvailabilityBoundsV2,
@@ -1533,8 +1532,8 @@ impl PumpExactStateRawTapeIndexV2 {
             run_id: self.start_manifest.run_id.clone(),
             cohort_slots_strictly_after: self
                 .completion_receipt
-                .bootstrap_finalized_context_slot
-                .expect("verified V2 completion receipt has finalized bootstrap slot"),
+                .cohort_slots_strictly_after
+                .expect("verified V2 completion receipt has stream-readiness boundary"),
             segment_count: u64::try_from(self.segments.len()).unwrap_or(u64::MAX),
             source_update_count: self.completion_receipt.writer.accepted_source_records,
             filtered_transaction_count: u64::try_from(self.transactions.len()).unwrap_or(u64::MAX),
@@ -1692,18 +1691,6 @@ impl PumpExactStateRawTapeIndexV2 {
         }
         Ok(update)
     }
-
-    fn read_bootstrap_account(
-        &self,
-        pointer: PumpExactStateRawRecordPointerV2,
-    ) -> Result<PumpExactStateBootstrapProgramOwnedAccountV2> {
-        let PumpExactStateRawRecordV2::BootstrapProgramOwnedAccount(account) =
-            self.read_record(pointer)?
-        else {
-            bail!("V2 bootstrap index points to a non-bootstrap-account record");
-        };
-        Ok(account)
-    }
 }
 
 impl PumpExactStateAnchorIndexV2 {
@@ -1724,23 +1711,6 @@ impl PumpExactStateAnchorIndexV2 {
             {
                 bail!("V2 filtered transaction lane has duplicate signature authority");
             }
-        }
-
-        for pointer in &raw.bootstrap_accounts {
-            let account = raw.read_bootstrap_account(*pointer)?;
-            index.observe_account(
-                semantics,
-                account.account_pubkey.into_inner(),
-                &account.raw_account_data,
-                raw.completion_receipt
-                    .bootstrap_finalized_context_slot
-                    .ok_or_else(|| anyhow::anyhow!("verified V2 raw run lacks bootstrap slot"))?,
-                0,
-                None,
-                None,
-                None,
-                true,
-            )?;
         }
 
         let mut updates = raw.account_updates.clone();
@@ -1777,7 +1747,6 @@ impl PumpExactStateAnchorIndexV2 {
                 update.txn_signature.map(|signature| signature.into_inner()),
                 transaction_index,
                 Some(update.source.capture_sequence),
-                false,
             )?;
         }
 
@@ -1801,7 +1770,6 @@ impl PumpExactStateAnchorIndexV2 {
         transaction_signature: Option<[u8; 64]>,
         transaction_index: Option<u32>,
         source_capture_sequence: Option<u64>,
-        bootstrap: bool,
     ) -> Result<()> {
         let Some(class) = semantics.account_class(data) else {
             self.unknown_account_count = self
@@ -1838,10 +1806,9 @@ impl PumpExactStateAnchorIndexV2 {
                     write_version,
                     transaction_index,
                     source_capture_sequence,
-                    bootstrap,
-                    // Bootstrap is finalized by the source-readiness
-                    // contract. Non-bootstrap updates reach this point only
-                    // after `build` has admitted a rooted canonical slot.
+                    // Streamed updates reach this point only after `build`
+                    // admitted a rooted canonical slot. There is no snapshot
+                    // or historical baseline anchor in PRXTAPE3.
                     canonical: true,
                 };
                 self.by_curve.entry(curve).or_default().push(anchor.clone());
@@ -1886,8 +1853,7 @@ impl PumpExactStateAnchorIndexV2 {
             .iter()
             .filter(|anchor| {
                 anchor.canonical
-                    && (anchor.bootstrap
-                        || anchor.slot < transaction_slot
+                    && (anchor.slot < transaction_slot
                         || (anchor.slot == transaction_slot
                             && anchor
                                 .transaction_index
@@ -1917,7 +1883,6 @@ impl PumpExactStateAnchorIndexV2 {
             .iter()
             .filter(|anchor| {
                 anchor.canonical
-                    && !anchor.bootstrap
                     && anchor.slot == transaction_slot
                     && anchor.transaction_index == Some(transaction_index)
             })
@@ -2473,7 +2438,6 @@ struct PumpExactStateCurveAnchorV2 {
     write_version: u64,
     transaction_index: Option<u32>,
     source_capture_sequence: Option<u64>,
-    bootstrap: bool,
     canonical: bool,
 }
 
@@ -2498,28 +2462,14 @@ struct PumpExactStateFullBlockAccumulatorV2 {
 }
 
 #[derive(Default)]
-struct PumpExactStateBootstrapCollectorV2 {
-    started: Option<PumpExactStateBootstrapSnapshotStartedV2>,
-    next_chunk_index: u64,
-    response_bytes: Vec<u8>,
-    response_sha256: Sha256,
-    response_blake3: blake3::Hasher,
-    accounts: BTreeMap<u64, PumpExactStateBootstrapProgramOwnedAccountV2>,
-    account_set_blake3: blake3::Hasher,
-    completed: Option<PumpExactStateBootstrapSnapshotCompletedV2>,
-    readiness_slot: Option<u64>,
-}
-
-#[derive(Default)]
 struct PumpExactStateRawRecordCollectorV2 {
     expected_pump_program_id: [u8; 32],
     previous_source_capture_sequence: Option<u64>,
     source_capture_sequences: BTreeSet<u64>,
+    source_stream_epoch: Option<u64>,
     filtered_transactions: BTreeMap<PumpExactStateTransactionKeyV2, [u8; 32]>,
     full_block_pump_transactions: BTreeMap<PumpExactStateTransactionKeyV2, [u8; 32]>,
     open_full_block: Option<PumpExactStateFullBlockAccumulatorV2>,
-    bootstrap: PumpExactStateBootstrapCollectorV2,
-    bootstrap_record_count: u64,
     slot_update_count: u64,
     block_meta_count: u64,
     full_block_started_count: u64,
@@ -2527,7 +2477,8 @@ struct PumpExactStateRawRecordCollectorV2 {
     full_block_count: u64,
     block_lanes_by_slot: BTreeMap<u64, PumpExactStateBlockLaneSlotLedgerV2>,
     pump_owned_account_update_count: u64,
-    readiness_boundaries: Vec<u64>,
+    readiness_boundary:
+        Option<ghost_core::pump_research_exact_tape_v2::PumpExactStateProspectiveStreamBoundaryV2>,
     first_observed_ingress: Option<PumpExactStateIngressTimestampV2>,
     previous_source_ingress_monotonic_ms: Option<u64>,
 }
@@ -2538,7 +2489,6 @@ struct PumpExactStateRawIndexBuilderV2 {
     collector: PumpExactStateRawRecordCollectorV2,
     transactions: Vec<PumpExactStateIndexedTransactionV2>,
     account_updates: Vec<PumpExactStateIndexedAccountUpdateV2>,
-    bootstrap_accounts: Vec<PumpExactStateRawRecordPointerV2>,
     slots: BTreeMap<u64, PumpExactStateSlotNodeV2>,
 }
 
@@ -2657,7 +2607,6 @@ pub fn index_prospective_exact_state_raw_run_v2(
         segments,
         transactions: index_builder.transactions,
         account_updates: index_builder.account_updates,
-        bootstrap_accounts: index_builder.bootstrap_accounts,
         slot_ledger,
         full_block_pump_transaction_count,
         source_availability_bounds,
@@ -2698,16 +2647,15 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
     )?;
     let raw = unsealed_raw.seal_anonymous_snapshot_v2(snapshot_parent)?;
     let rooted_slots = raw.rooted_slots();
-    // An all-Pump-owned account update is source evidence, not canonical
-    // state authority by itself. The prospective lane can retain updates
-    // from slots which later fail to become the unique finalized
-    // full-block/Slot/BlockMeta view. Keep those bytes in raw and in its
-    // immutable census, but never let one supply an exact before/after
-    // anchor for a rooted transaction.
+    // The stream-only BondingCurve/Global updates are source evidence, not
+    // canonical state authority by themselves. The prospective lane retains
+    // updates from slots which later fail to become the unique finalized
+    // full-block/Slot/BlockMeta view, but never lets one supply an exact
+    // before/after anchor for a rooted transaction.
     let anchors = PumpExactStateAnchorIndexV2::build(&raw, &semantics, &rooted_slots)?;
     let cohort_slots_strictly_after = raw
         .completion_receipt
-        .bootstrap_finalized_context_slot
+        .cohort_slots_strictly_after
         .ok_or_else(|| anyhow::anyhow!("verified V2 raw run lacks cohort boundary"))?;
 
     let mut writer = PumpExactStateExactOutputWriterV2::create(raw_dir, output_dir)?;
@@ -2990,6 +2938,10 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
         counters.exact_rooted_mutation_count,
         counters.successful_rooted_mutation_denominator,
     )?;
+    counters.qualification_run_below_minimum = qualification_run_below_minimum_v2(
+        raw.completion_receipt.cohort_capture_elapsed_ms,
+        counters.successful_rooted_mutation_denominator,
+    );
 
     let blockers = capability_blockers_v2(&counters);
     let status = if blockers.is_empty() {
@@ -3045,8 +2997,6 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                 full_block_pump_transaction_count: raw.full_block_pump_transaction_count,
                 pump_owned_account_update_count: u64::try_from(raw.account_updates.len())
                     .unwrap_or(u64::MAX),
-                bootstrap_pump_owned_account_count: u64::try_from(raw.bootstrap_accounts.len())
-                    .unwrap_or(u64::MAX),
                 bonding_curve_account_count: counters.bonding_curve_account_count,
                 bonding_curve_decoded_count: counters.bonding_curve_decoded_count,
                 global_account_count: counters.global_account_count,
@@ -3071,6 +3021,7 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                 explicit_non_exact_mutation_count: counters.explicit_non_exact_mutation_count,
                 denominator_reconciled: counters.denominator_reconciled,
                 exact_rooted_coverage_ppm: counters.exact_rooted_coverage_ppm,
+                qualification_run_below_minimum: counters.qualification_run_below_minimum,
                 required_exact_rooted_coverage_ppm: PUMP_EXACT_STATE_REQUIRED_COVERAGE_PPM_V2,
                 exact_trajectory_count: counters.exact_trajectory_count,
                 successful_rooted_exact_trade_with_both_states_count: counters
@@ -3173,6 +3124,7 @@ struct PumpExactStateQualificationCountersV2 {
     explicit_non_exact_mutation_count: u64,
     denominator_reconciled: bool,
     exact_rooted_coverage_ppm: u64,
+    qualification_run_below_minimum: bool,
     exact_trajectory_count: u64,
     successful_rooted_exact_trade_with_both_states_count: u64,
     exact_birth_count: u64,
@@ -3284,6 +3236,18 @@ fn coverage_ppm_v2(numerator: u64, denominator: u64) -> Result<u64> {
         .map(|value| value / denominator)
 }
 
+/// A prospective run is usable only after a full V1.1 minimum cohort: either
+/// thirty minutes of sealed cohort time or ten thousand successful rooted
+/// mutations.  A missing elapsed value is deliberately below minimum.
+fn qualification_run_below_minimum_v2(
+    cohort_capture_elapsed_ms: Option<u64>,
+    successful_rooted_mutation_denominator: u64,
+) -> bool {
+    cohort_capture_elapsed_ms.unwrap_or(0) < PUMP_EXACT_STATE_MIN_QUALIFICATION_COHORT_ELAPSED_MS_V2
+        && successful_rooted_mutation_denominator
+            < PUMP_EXACT_STATE_MIN_QUALIFICATION_MUTATION_DENOMINATOR_V2
+}
+
 fn capability_blockers_v2(
     counters: &PumpExactStateQualificationCountersV2,
 ) -> Vec<PumpExactStateCapabilityBlockerV2> {
@@ -3303,6 +3267,9 @@ fn capability_blockers_v2(
     }
     if counters.successful_rooted_mutation_denominator == 0 {
         blockers.insert(PumpExactStateCapabilityBlockerV2::NoRootedCandidateMutation);
+    }
+    if counters.qualification_run_below_minimum {
+        blockers.insert(PumpExactStateCapabilityBlockerV2::QualificationRunBelowMinimum);
     }
     if !counters.denominator_reconciled {
         blockers.insert(PumpExactStateCapabilityBlockerV2::MutationInventoryIncomplete);
@@ -3419,8 +3386,8 @@ fn validate_v2_controls(
             PumpExactStateCaptureRunStatusV2::Complete
         )
         || !completion.clean_shutdown
-        || !completion.bootstrap_completed
-        || !completion.bootstrap_source_overlap_proven
+        || !completion.readiness_completed
+        || !completion.readiness_boundary_persisted
         || !completion.required_source_lanes_observed
         || !completion.storage_reserve_maintained
         || !completion.raw_byte_budget_respected
@@ -3434,18 +3401,19 @@ fn validate_v2_controls(
         || completion.source_lifecycle.admitted_source_updates == 0
         || completion.source_lifecycle.dropped_source_updates != 0
         || completion.source_lifecycle.source_queue_bytes_at_close != 0
-        || completion.source_lifecycle.bootstrap_status != "complete"
+        || completion.source_lifecycle.source_readiness_status != "complete"
         || completion.source_lifecycle.fatal_capture_error.is_some()
         || completion.source_lifecycle.source_worker_error.is_some()
         || completion.writer.gap_count != 0
         || !completion.writer.clean_shutdown
         || completion.writer.error.is_some()
+        || completion.writer.accepted_readiness_boundary_records != 1
         || completion.segment_list.is_empty()
     {
         bail!("V2 raw run does not satisfy the complete prospective capture contract");
     }
     let readiness = completion
-        .bootstrap_source_readiness
+        .source_readiness
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("V2 complete receipt lacks source readiness"))?;
     let expected_readiness = [
@@ -3459,11 +3427,9 @@ fn validate_v2_controls(
     .max()
     .ok_or_else(|| anyhow::anyhow!("V2 source readiness has no lane slots"))?;
     if readiness.source_readiness_slot != expected_readiness
-        || completion
-            .bootstrap_finalized_context_slot
-            .is_none_or(|slot| slot < readiness.source_readiness_slot)
+        || completion.cohort_slots_strictly_after != Some(readiness.source_readiness_slot)
     {
-        bail!("V2 completed bootstrap does not cover all required source lanes");
+        bail!("V2 stream-readiness boundary does not cover all required source lanes");
     }
     if completion
         .source_lifecycle
@@ -3471,7 +3437,7 @@ fn validate_v2_controls(
         .as_ref()
         != Some(readiness)
     {
-        bail!("V2 source lifecycle readiness differs from bootstrap receipt");
+        bail!("V2 source lifecycle readiness differs from stream boundary receipt");
     }
     let census = &completion.writer.required_lane_census;
     if census.transaction_messages == 0
@@ -3493,7 +3459,10 @@ impl PumpExactStateRawRecordCollectorV2 {
     fn observe(&mut self, record: &PumpExactStateRawRecordV2) -> Result<()> {
         match record {
             PumpExactStateRawRecordV2::PrimaryTransaction(transaction) => {
-                self.observe_source_sequence(transaction.source.capture_sequence)?;
+                self.observe_source_sequence(
+                    transaction.source.capture_sequence,
+                    transaction.source.stream_epoch,
+                )?;
                 self.observe_source_ingress_time(
                     &transaction.event_time,
                     "filtered Pump transaction",
@@ -3517,7 +3486,10 @@ impl PumpExactStateRawRecordCollectorV2 {
                 }
             }
             PumpExactStateRawRecordV2::PumpOwnedAccountUpdate(update) => {
-                self.observe_source_sequence(update.source.capture_sequence)?;
+                self.observe_source_sequence(
+                    update.source.capture_sequence,
+                    update.source.stream_epoch,
+                )?;
                 self.observe_source_ingress_time(&update.event_time, "Pump-owned account update")?;
                 validate_source_payload(
                     update.source.capture_sequence,
@@ -3543,7 +3515,10 @@ impl PumpExactStateRawRecordCollectorV2 {
                     .ok_or_else(|| anyhow::anyhow!("V2 account update count overflow"))?;
             }
             PumpExactStateRawRecordV2::PrimarySlotUpdate(update) => {
-                self.observe_source_sequence(update.source.capture_sequence)?;
+                self.observe_source_sequence(
+                    update.source.capture_sequence,
+                    update.source.stream_epoch,
+                )?;
                 self.observe_source_ingress_time(&update.event_time, "Slot update")?;
                 validate_source_payload(
                     update.source.capture_sequence,
@@ -3557,7 +3532,10 @@ impl PumpExactStateRawRecordCollectorV2 {
                     .ok_or_else(|| anyhow::anyhow!("V2 slot update count overflow"))?;
             }
             PumpExactStateRawRecordV2::PrimaryBlockMeta(update) => {
-                self.observe_source_sequence(update.source.capture_sequence)?;
+                self.observe_source_sequence(
+                    update.source.capture_sequence,
+                    update.source.stream_epoch,
+                )?;
                 let ingress =
                     self.observe_source_ingress_time(&update.event_time, "BlockMeta update")?;
                 validate_source_payload(
@@ -3587,7 +3565,10 @@ impl PumpExactStateRawRecordCollectorV2 {
                 }
             }
             PumpExactStateRawRecordV2::FullBlockPayloadStarted(started) => {
-                self.observe_source_sequence(started.source.capture_sequence)?;
+                self.observe_source_sequence(
+                    started.source.capture_sequence,
+                    started.source.stream_epoch,
+                )?;
                 self.observe_source_ingress_time(&started.event_time, "full-block payload")?;
                 if self.open_full_block.is_some()
                     || started.source_payload_bytes == 0
@@ -3617,49 +3598,51 @@ impl PumpExactStateRawRecordCollectorV2 {
             PumpExactStateRawRecordV2::FullBlockPayloadCompleted(completed) => {
                 self.complete_full_block(completed)?;
             }
-            PumpExactStateRawRecordV2::BootstrapSnapshotStarted(started) => {
-                self.bootstrap.observe_started(started)?;
-                self.bootstrap_record_count = self
-                    .bootstrap_record_count
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("V2 bootstrap record count overflow"))?;
-            }
-            PumpExactStateRawRecordV2::BootstrapResponseChunk(chunk) => {
-                self.bootstrap.observe_chunk(chunk)?;
-                self.bootstrap_record_count = self
-                    .bootstrap_record_count
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("V2 bootstrap record count overflow"))?;
-            }
-            PumpExactStateRawRecordV2::BootstrapProgramOwnedAccount(account) => {
-                self.bootstrap.observe_account(account)?;
-                self.bootstrap_record_count = self
-                    .bootstrap_record_count
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("V2 bootstrap record count overflow"))?;
-            }
-            PumpExactStateRawRecordV2::BootstrapSnapshotCompleted(completed) => {
-                self.bootstrap.observe_completed(completed)?;
-                self.bootstrap_record_count = self
-                    .bootstrap_record_count
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("V2 bootstrap record count overflow"))?;
-            }
-            PumpExactStateRawRecordV2::ProspectiveReadinessBoundary(boundary) => {
-                if !boundary.finalized_context_slot_covers_source_readiness
-                    || boundary.finalized_context_slot
-                        < boundary.source_readiness.source_readiness_slot
-                    || boundary.cohort_slots_strictly_after != boundary.finalized_context_slot
+            PumpExactStateRawRecordV2::ProspectiveStreamBoundary(boundary) => {
+                let readiness = &boundary.source_readiness;
+                let expected_readiness_slot = [
+                    readiness.first_transaction_slot,
+                    readiness.first_account_update_slot,
+                    readiness.first_slot_update_slot,
+                    readiness.first_block_meta_slot,
+                    readiness.first_full_block_slot,
+                ]
+                .into_iter()
+                .max()
+                .ok_or_else(|| anyhow::anyhow!("V2 stream readiness has no lane slots"))?;
+                if boundary.source_stream_epoch == 0
+                    || boundary.source_capture_sequence_exclusive == 0
+                    || readiness.source_readiness_slot != expected_readiness_slot
+                    || boundary.cohort_slots_strictly_after != expected_readiness_slot
                 {
-                    bail!("V2 prospective readiness boundary is not self-consistent");
+                    bail!("V2 prospective stream boundary is not self-consistent");
                 }
-                self.readiness_boundaries
-                    .push(boundary.finalized_context_slot);
-                self.bootstrap.observe_boundary(boundary)?;
-                self.bootstrap_record_count = self
-                    .bootstrap_record_count
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("V2 bootstrap record count overflow"))?;
+                // The raw record order itself must prove the writer-side
+                // guarantee: the boundary follows every admitted source
+                // update whose capture sequence belongs to its exclusive
+                // prefix. A completion receipt cannot repair a boundary
+                // placed before that warm-up evidence, nor may a boundary
+                // split the started/chunks/completed representation of one
+                // full-block source update.
+                let expected_last = boundary
+                    .source_capture_sequence_exclusive
+                    .checked_sub(1)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("V2 stream boundary exclusive source sequence underflowed")
+                    })?;
+                if self.open_full_block.is_some()
+                    || u64::try_from(self.source_capture_sequences.len()).unwrap_or(u64::MAX)
+                        != boundary.source_capture_sequence_exclusive
+                    || self.source_capture_sequences.first().copied() != Some(0)
+                    || self.source_capture_sequences.last().copied() != Some(expected_last)
+                {
+                    bail!(
+                        "V2 stream-readiness boundary does not follow its complete exclusive source capture prefix"
+                    );
+                }
+                if self.readiness_boundary.replace(boundary.clone()).is_some() {
+                    bail!("V2 raw run retains more than one stream-readiness boundary");
+                }
             }
             PumpExactStateRawRecordV2::CoverageGap(_) => {
                 bail!("V2 complete raw run retains a coverage gap record");
@@ -3669,8 +3652,41 @@ impl PumpExactStateRawRecordCollectorV2 {
         Ok(())
     }
 
-    fn observe_source_sequence(&mut self, capture_sequence: u64) -> Result<()> {
-        if self
+    fn observe_source_sequence(&mut self, capture_sequence: u64, stream_epoch: u64) -> Result<()> {
+        if stream_epoch == 0 {
+            bail!("V2 source record has zero stream epoch");
+        }
+        match self.source_stream_epoch {
+            Some(expected) if expected != stream_epoch => {
+                bail!("V2 raw source stream epoch changed within one prospective run");
+            }
+            Some(_) => {}
+            None => self.source_stream_epoch = Some(stream_epoch),
+        }
+        if let Some(boundary) = self.readiness_boundary.as_ref() {
+            let previous = self.previous_source_capture_sequence.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "V2 source record followed a stream-readiness boundary without a warm-up prefix"
+                )
+            })?;
+            let next = previous
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("V2 source capture sequence overflow"))?;
+            let expected_capture_sequence = if next == boundary.source_capture_sequence_exclusive {
+                next.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!("V2 readiness boundary ordering marker overflow")
+                })?
+            } else {
+                next
+            };
+            if capture_sequence != expected_capture_sequence {
+                bail!(
+                    "V2 source capture sequence {} is not contiguous with expected {} after the readiness boundary",
+                    capture_sequence,
+                    expected_capture_sequence
+                );
+            }
+        } else if self
             .previous_source_capture_sequence
             .is_some_and(|previous| capture_sequence <= previous)
         {
@@ -3715,9 +3731,10 @@ impl PumpExactStateRawRecordCollectorV2 {
         let first_observed_ingress = self.first_observed_ingress.ok_or_else(|| {
             anyhow::anyhow!("V2 raw record stream lacks any observed ingress timestamp pair")
         })?;
-        let cohort_slots_strictly_after = completion
-            .bootstrap_finalized_context_slot
-            .ok_or_else(|| anyhow::anyhow!("V2 completion receipt lacks bootstrap cohort slot"))?;
+        let cohort_slots_strictly_after =
+            completion.cohort_slots_strictly_after.ok_or_else(|| {
+                anyhow::anyhow!("V2 completion receipt lacks stream-readiness cohort slot")
+            })?;
         let (reconciled_full_block_frontier_slot, reconciled_full_block_frontier_ingress) =
             self.reconciled_full_block_frontier(cohort_slots_strictly_after, slots)?;
         if reconciled_full_block_frontier_ingress.monotonic_ms < first_observed_ingress.monotonic_ms
@@ -3742,7 +3759,8 @@ impl PumpExactStateRawRecordCollectorV2 {
         slots: &BTreeMap<u64, PumpExactStateSlotNodeV2>,
     ) -> Result<(u64, PumpExactStateIngressTimestampV2)> {
         // The first accepted produced block may have a parent at or before
-        // the finalized bootstrap boundary because bootstrap does not retain
+        // the stream-readiness boundary because the new prospective stream
+        // intentionally does not retain
         // a full historical blockhash chain.  Every later retained block must
         // extend the immediately preceding retained produced block.  This
         // deliberately uses `parent_slot`, never `slot - 1`: Solana can skip
@@ -3822,7 +3840,7 @@ impl PumpExactStateRawRecordCollectorV2 {
                 }
             } else if chain_tip_slot.is_some() {
                 bail!(
-                    "V2 accepted cohort BlockMeta/full-block slot {slot} reconnects below the bootstrap boundary instead of extending the complete parent-linked chain"
+                    "V2 accepted cohort BlockMeta/full-block slot {slot} reconnects below the stream-readiness boundary instead of extending the complete parent-linked chain"
                 );
             }
             // The availability frontier begins only when the second member of
@@ -3979,7 +3997,11 @@ impl PumpExactStateRawRecordCollectorV2 {
         completion: &PumpExactStateRunCompletionReceiptV2,
         slots: &BTreeMap<u64, PumpExactStateSlotNodeV2>,
     ) -> Result<()> {
-        if self.open_full_block.is_some() || self.readiness_boundaries.len() != 1 {
+        let boundary = self
+            .readiness_boundary
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("V2 raw run lacks its stream-readiness boundary"))?;
+        if self.open_full_block.is_some() {
             bail!("V2 raw record stream has unfinished full block or invalid readiness boundary count");
         }
         if self.full_block_count != completion.writer.required_lane_census.full_blocks_completed
@@ -3989,7 +4011,7 @@ impl PumpExactStateRawRecordCollectorV2 {
                 != completion.writer.required_lane_census.full_block_chunks
             || u64::try_from(self.source_capture_sequences.len()).unwrap_or(u64::MAX)
                 != completion.writer.accepted_source_records
-            || self.bootstrap_record_count != completion.writer.accepted_bootstrap_records
+            || completion.writer.accepted_readiness_boundary_records != 1
             || u64::try_from(self.filtered_transactions.len()).unwrap_or(u64::MAX)
                 != completion.writer.required_lane_census.transaction_messages
             || self.pump_owned_account_update_count
@@ -3999,18 +4021,43 @@ impl PumpExactStateRawRecordCollectorV2 {
         {
             bail!("V2 raw record census differs from its completion receipt");
         }
+        let source_count = u64::try_from(self.source_capture_sequences.len())
+            .context("V2 source capture sequence count does not fit u64")?;
+        let expected_last_source_sequence = if source_count
+            == boundary.source_capture_sequence_exclusive
+        {
+            boundary
+                .source_capture_sequence_exclusive
+                .checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("V2 readiness boundary has empty source prefix"))?
+        } else {
+            // PRXTAPE3 reserves the boundary's own ordering position.  Once
+            // a post-boundary source update exists, it starts immediately
+            // after that marker, so the one omitted sequence value is both
+            // deliberate and auditable rather than an unaccounted source
+            // loss.
+            source_count
+        };
+        if self.source_capture_sequences.first().copied() != Some(0)
+            || self.source_capture_sequences.last().copied() != Some(expected_last_source_sequence)
+            || boundary.source_capture_sequence_exclusive > source_count
+            || self.source_stream_epoch != Some(boundary.source_stream_epoch)
+        {
+            bail!(
+                "V2 stream-readiness boundary does not bind its complete source prefix and reserved ordering marker"
+            );
+        }
         reconcile_filtered_and_full_block_transactions(
             &self.filtered_transactions,
             &self.full_block_pump_transactions,
         )?;
-        if self.readiness_boundaries[0]
-            != completion
-                .bootstrap_finalized_context_slot
-                .unwrap_or_default()
+        if completion.source_readiness.as_ref() != Some(&boundary.source_readiness)
+            || completion.cohort_slots_strictly_after != Some(boundary.cohort_slots_strictly_after)
+            || !completion.readiness_boundary_persisted
+            || !completion.readiness_completed
         {
             bail!("V2 raw readiness boundary differs from completion receipt");
         }
-        self.bootstrap.finish(completion)?;
         let _ = self.source_availability_bounds(completion, slots)?;
         Ok(())
     }
@@ -4084,12 +4131,6 @@ impl PumpExactStateRawIndexBuilderV2 {
                         txn_signature: update.txn_signature.map(|value| value.into_inner()),
                     });
             }
-            PumpExactStateRawRecordV2::BootstrapProgramOwnedAccount(account) => {
-                if account.owner_program.into_inner() != self.expected_pump_program_id {
-                    bail!("V2 bootstrap Pump-owned account has a non-Pump owner");
-                }
-                self.bootstrap_accounts.push(pointer);
-            }
             PumpExactStateRawRecordV2::PrimarySlotUpdate(update) => {
                 if update.source_status == CommitmentLevel::Finalized as i32 {
                     self.slots
@@ -4115,282 +4156,6 @@ fn reconcile_filtered_and_full_block_transactions(
 ) -> Result<()> {
     if filtered.len() != full_block.len() || filtered != full_block {
         bail!("V2 filtered Pump transaction lane differs from full-block Pump inventory");
-    }
-    Ok(())
-}
-
-impl PumpExactStateBootstrapCollectorV2 {
-    fn observe_started(
-        &mut self,
-        started: &PumpExactStateBootstrapSnapshotStartedV2,
-    ) -> Result<()> {
-        if self.started.replace(started.clone()).is_some() || self.completed.is_some() {
-            bail!("V2 raw run contains more than one bootstrap snapshot start");
-        }
-        if !matches!(
-            started.commitment,
-            ghost_core::pump_research_exact_tape_v2::PumpExactStateBootstrapCommitmentV2::Finalized
-        ) || started.source_stream_epoch_at_start == 0
-        {
-            bail!("V2 bootstrap start does not prove finalized source authority");
-        }
-        Ok(())
-    }
-
-    fn observe_chunk(&mut self, chunk: &PumpExactStateBootstrapResponseChunkV2) -> Result<()> {
-        let started = self
-            .started
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap response chunk precedes start"))?;
-        if self.completed.is_some()
-            || chunk.snapshot_id_blake3 != started.snapshot_id_blake3
-            || chunk.chunk_index != self.next_chunk_index
-        {
-            bail!("V2 bootstrap response chunk identity/order is invalid");
-        }
-        let next_len = self
-            .response_bytes
-            .len()
-            .checked_add(chunk.bytes.len())
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap response byte count overflow"))?;
-        if u64::try_from(next_len).unwrap_or(u64::MAX) > V2_BOOTSTRAP_RESPONSE_MAX_BYTES {
-            bail!("V2 bootstrap response exceeds its frozen maximum size");
-        }
-        self.response_sha256.update(&chunk.bytes);
-        self.response_blake3.update(&chunk.bytes);
-        self.response_bytes.extend_from_slice(&chunk.bytes);
-        self.next_chunk_index = self
-            .next_chunk_index
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap chunk index overflow"))?;
-        Ok(())
-    }
-
-    fn observe_account(
-        &mut self,
-        account: &PumpExactStateBootstrapProgramOwnedAccountV2,
-    ) -> Result<()> {
-        let started = self
-            .started
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap account precedes start"))?;
-        if self.completed.is_some()
-            || account.snapshot_id_blake3 != started.snapshot_id_blake3
-            || account.response_account_index
-                != u64::try_from(self.accounts.len())
-                    .context("V2 bootstrap account count does not fit u64")?
-        {
-            bail!("V2 bootstrap account ordering/identity is invalid");
-        }
-        let data_hash =
-            PumpResearchStorageHashV1::from(*blake3::hash(&account.raw_account_data).as_bytes());
-        if data_hash != account.raw_account_data_hash_blake3 {
-            bail!("V2 bootstrap account data hash mismatch");
-        }
-        self.account_set_blake3
-            .update(&account.response_account_index.to_le_bytes());
-        self.account_set_blake3
-            .update(account.account_pubkey.as_array());
-        self.account_set_blake3
-            .update(account.owner_program.as_array());
-        self.account_set_blake3
-            .update(&account.lamports.to_le_bytes());
-        self.account_set_blake3
-            .update(&[u8::from(account.executable)]);
-        self.account_set_blake3
-            .update(&account.rent_epoch.to_le_bytes());
-        self.account_set_blake3
-            .update(account.raw_account_data_hash_blake3.as_array());
-        self.account_set_blake3.update(
-            &u64::try_from(account.raw_account_data.len())
-                .context("V2 bootstrap account data length does not fit u64")?
-                .to_le_bytes(),
-        );
-        if self
-            .accounts
-            .insert(account.response_account_index, account.clone())
-            .is_some()
-        {
-            bail!("V2 bootstrap account index appears more than once");
-        }
-        Ok(())
-    }
-
-    fn observe_completed(
-        &mut self,
-        completed: &PumpExactStateBootstrapSnapshotCompletedV2,
-    ) -> Result<()> {
-        let started = self
-            .started
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap completion precedes start"))?;
-        if self.completed.is_some()
-            || completed.snapshot_id_blake3 != started.snapshot_id_blake3
-            || completed.source_stream_epoch_at_completion != started.source_stream_epoch_at_start
-            || completed.response_chunk_count != self.next_chunk_index
-            || completed.response_bytes
-                != u64::try_from(self.response_bytes.len()).unwrap_or(u64::MAX)
-            || completed.account_count != u64::try_from(self.accounts.len()).unwrap_or(u64::MAX)
-        {
-            bail!("V2 bootstrap completion does not match its retained records");
-        }
-        let sha256 = PumpResearchStorageHashV1::from(<[u8; 32]>::from(
-            self.response_sha256.clone().finalize(),
-        ));
-        let blake3 =
-            PumpResearchStorageHashV1::from(*self.response_blake3.clone().finalize().as_bytes());
-        let account_set =
-            PumpResearchStorageHashV1::from(*self.account_set_blake3.clone().finalize().as_bytes());
-        if sha256 != completed.response_sha256
-            || blake3 != completed.response_blake3
-            || blake3 != completed.snapshot_id_blake3
-            || account_set != completed.account_set_blake3
-        {
-            bail!("V2 bootstrap digest reconciliation failed");
-        }
-        self.completed = Some(completed.clone());
-        Ok(())
-    }
-
-    fn observe_boundary(
-        &mut self,
-        boundary: &ghost_core::pump_research_exact_tape_v2::PumpExactStateProspectiveReadinessBoundaryV2,
-    ) -> Result<()> {
-        let completed = self.completed.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("V2 readiness boundary precedes bootstrap completion")
-        })?;
-        if self
-            .readiness_slot
-            .replace(boundary.finalized_context_slot)
-            .is_some()
-            || boundary.snapshot_id_blake3 != completed.snapshot_id_blake3
-            || boundary.finalized_context_slot != completed.finalized_context_slot
-            || boundary.source_stream_epoch != completed.source_stream_epoch_at_completion
-        {
-            bail!("V2 readiness boundary is not bound to its bootstrap snapshot");
-        }
-        Ok(())
-    }
-
-    fn finish(&self, completion: &PumpExactStateRunCompletionReceiptV2) -> Result<()> {
-        let started = self
-            .started
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("V2 raw run lacks bootstrap start evidence"))?;
-        let completed = self
-            .completed
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("V2 raw run lacks bootstrap completion evidence"))?;
-        if self.readiness_slot != Some(completed.finalized_context_slot)
-            || completion.bootstrap_finalized_context_slot != Some(completed.finalized_context_slot)
-            || completion
-                .bootstrap_source_readiness
-                .as_ref()
-                .is_none_or(|readiness| {
-                    readiness.source_readiness_slot > completed.finalized_context_slot
-                })
-        {
-            bail!("V2 bootstrap control receipt differs from raw bootstrap evidence");
-        }
-        validate_bootstrap_response_against_accounts(
-            &self.response_bytes,
-            started,
-            completed,
-            &self.accounts,
-        )
-    }
-}
-
-fn validate_bootstrap_response_against_accounts(
-    response_bytes: &[u8],
-    started: &PumpExactStateBootstrapSnapshotStartedV2,
-    completed: &PumpExactStateBootstrapSnapshotCompletedV2,
-    accounts: &BTreeMap<u64, PumpExactStateBootstrapProgramOwnedAccountV2>,
-) -> Result<()> {
-    let response: Value = serde_json::from_slice(response_bytes)
-        .context("parse retained V2 finalized bootstrap response")?;
-    if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
-        || response.get("id").and_then(Value::as_str) != Some("pump_exact_state_v2_bootstrap")
-        || response.get("error").is_some()
-    {
-        bail!("V2 retained bootstrap response is not the requested successful JSON-RPC result");
-    }
-    let result = response
-        .get("result")
-        .ok_or_else(|| anyhow::anyhow!("V2 retained bootstrap response lacks result"))?;
-    if result
-        .get("context")
-        .and_then(|context| context.get("slot"))
-        .and_then(Value::as_u64)
-        != Some(completed.finalized_context_slot)
-    {
-        bail!("V2 retained bootstrap response context slot differs from completion evidence");
-    }
-    let values = result
-        .get("value")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("V2 retained bootstrap result.value is not an array"))?;
-    if values.len() != accounts.len() {
-        bail!("V2 retained bootstrap account array count differs from framed account evidence");
-    }
-    let pump_program = started.pump_program_id.as_array();
-    for (index, value) in values.iter().enumerate() {
-        let index =
-            u64::try_from(index).context("V2 bootstrap JSON account index does not fit u64")?;
-        let retained = accounts
-            .get(&index)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap framed account index is missing"))?;
-        let pubkey = value
-            .get("pubkey")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap JSON account lacks pubkey"))?
-            .parse::<solana_sdk::pubkey::Pubkey>()
-            .context("parse V2 bootstrap JSON pubkey")?;
-        let account = value
-            .get("account")
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap JSON account lacks account object"))?;
-        let owner = account
-            .get("owner")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap JSON account lacks owner"))?
-            .parse::<solana_sdk::pubkey::Pubkey>()
-            .context("parse V2 bootstrap JSON owner")?;
-        let data = account
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap JSON account data is not an array"))?;
-        if data.len() != 2 || data[1].as_str() != Some("base64") {
-            bail!("V2 bootstrap JSON account data is not an exact base64 tuple");
-        }
-        let raw_data = BASE64_STANDARD
-            .decode(
-                data[0]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("V2 bootstrap JSON account data is not text"))?,
-            )
-            .context("decode V2 bootstrap JSON account base64 data")?;
-        let lamports = account
-            .get("lamports")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap JSON account lacks lamports"))?;
-        let executable = account
-            .get("executable")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap JSON account lacks executable"))?;
-        let rent_epoch = account
-            .get("rentEpoch")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap JSON account lacks rentEpoch"))?;
-        if pubkey.to_bytes() != *retained.account_pubkey.as_array()
-            || owner.to_bytes() != *retained.owner_program.as_array()
-            || owner.to_bytes() != *pump_program
-            || lamports != retained.lamports
-            || executable != retained.executable
-            || rent_epoch != retained.rent_epoch
-            || raw_data != retained.raw_account_data
-        {
-            bail!("V2 bootstrap JSON account differs from framed account evidence");
-        }
     }
     Ok(())
 }
@@ -5694,12 +5459,14 @@ mod tests {
     use super::*;
     use ghost_core::{
         pump_research_exact_tape_v2::{
-            PumpExactStateProviderRoleV2, PumpExactStateSegmentClosedV2,
-            PumpExactStateSegmentHeaderV2, PumpExactStateSourceEnvelopeV2,
+            PumpExactStateProspectiveStreamBoundaryV2, PumpExactStateProviderRoleV2,
+            PumpExactStateSegmentClosedV2, PumpExactStateSegmentHeaderV2,
+            PumpExactStateSourceEnvelopeV2, PumpExactStateSourceReadinessV2,
             PumpExactStateTransactionEvidenceV2,
         },
         pump_research_tape::{PumpResearchEventTimeV1, PumpResearchStorageSignatureV1},
     };
+    use serde_json::Value;
     use yellowstone_grpc_proto::prelude::{
         CompiledInstruction, InnerInstruction, InnerInstructions, Message as ProtoMessage,
         SubscribeUpdateBlock, SubscribeUpdateTransaction, Transaction, TransactionStatusMeta,
@@ -6105,7 +5872,6 @@ mod tests {
             write_version: 1,
             transaction_index: None,
             source_capture_sequence: Some(1),
-            bootstrap: true,
             canonical: true,
         };
         let final_anchor = PumpExactStateCurveAnchorV2 {
@@ -6118,7 +5884,6 @@ mod tests {
             write_version: 2,
             transaction_index: Some(0),
             source_capture_sequence: Some(2),
-            bootstrap: false,
             canonical: true,
         };
         let anchors = PumpExactStateAnchorIndexV2 {
@@ -6159,12 +5924,100 @@ mod tests {
     }
 
     #[test]
+    fn first_streamed_trade_without_predecessor_is_typed_non_exact_without_repair() {
+        let curve = Pubkey::new_from_array([7; 32]);
+        let signature = [9; 64];
+        let final_anchor = PumpExactStateCurveAnchorV2 {
+            curve,
+            state: test_curve_state(),
+            slot: 11,
+            write_version: 2,
+            transaction_index: Some(0),
+            source_capture_sequence: Some(2),
+            canonical: true,
+        };
+        let anchors = PumpExactStateAnchorIndexV2 {
+            by_curve: BTreeMap::from([(curve, vec![final_anchor.clone()])]),
+            final_by_signature: BTreeMap::from([((signature, curve), vec![final_anchor])]),
+            ..PumpExactStateAnchorIndexV2::default()
+        };
+        let evaluation = evaluate_candidate_exactness_v2(
+            PumpExactStateInstructionEffectV2::SupportedExactTrade,
+            true,
+            true,
+            Some(curve),
+            signature,
+            11,
+            0,
+            1,
+            false,
+            &anchors,
+        );
+        assert!(!evaluation.exact);
+        assert_eq!(
+            evaluation.non_exact_reason.as_deref(),
+            Some("missing_exact_pre_anchor"),
+            "the first observed trade of an older curve cannot borrow state from RPC or an implicit baseline"
+        );
+        assert!(evaluation.state_before.is_none());
+        assert!(evaluation.state_after.is_none());
+    }
+
+    #[test]
     fn coverage_threshold_is_literal_and_does_not_round_up() {
         assert_eq!(
             coverage_ppm_v2(998_999, 1_000_000).expect("coverage"),
             998_999
         );
         assert_eq!(coverage_ppm_v2(999, 1_000).expect("coverage"), 999_000);
+    }
+
+    #[test]
+    fn qualification_run_minimum_is_literal_for_time_or_mutation_denominator() {
+        assert!(
+            qualification_run_below_minimum_v2(Some(1_799_999), 9_999),
+            "9,999 mutations below thirty minutes must remain blocked"
+        );
+        assert!(
+            !qualification_run_below_minimum_v2(Some(1_799_999), 10_000),
+            "10,000 mutations satisfies the alternative V1.1 minimum"
+        );
+        assert!(
+            !qualification_run_below_minimum_v2(Some(1_800_000), 0),
+            "thirty minutes satisfies the alternative V1.1 minimum"
+        );
+        assert!(
+            qualification_run_below_minimum_v2(None, 9_999),
+            "missing elapsed cohort evidence cannot silently satisfy the minimum"
+        );
+    }
+
+    #[test]
+    fn stream_boundary_cannot_precede_its_exclusive_source_prefix() {
+        let mut collector = PumpExactStateRawRecordCollectorV2::default();
+        let boundary = PumpExactStateProspectiveStreamBoundaryV2 {
+            source_readiness: PumpExactStateSourceReadinessV2 {
+                first_transaction_slot: 101,
+                first_account_update_slot: 102,
+                first_slot_update_slot: 103,
+                first_block_meta_slot: 104,
+                first_full_block_slot: 105,
+                source_readiness_slot: 105,
+            },
+            source_stream_epoch: 1,
+            source_capture_sequence_exclusive: 5,
+            cohort_slots_strictly_after: 105,
+            sealed_wall_ts_ms: 10,
+            sealed_monotonic_ts_ms: 10,
+        };
+        let error = collector
+            .observe(&PumpExactStateRawRecordV2::ProspectiveStreamBoundary(
+                boundary,
+            ))
+            .expect_err("a raw boundary cannot claim an unwritten warm-up prefix");
+        assert!(error
+            .to_string()
+            .contains("complete exclusive source capture prefix"));
     }
 
     #[test]
@@ -6244,7 +6097,7 @@ mod tests {
             filtered_pump_transaction_count: 2,
             full_block_pump_transaction_count: 2,
             pump_owned_account_update_count: 1,
-            bootstrap_pump_owned_account_count: 1,
+            qualification_run_below_minimum: false,
             bonding_curve_account_count: 1,
             bonding_curve_decoded_count: 1,
             global_account_count: 1,
@@ -6330,7 +6183,6 @@ mod tests {
             write_version: 2,
             transaction_index: Some(3),
             source_capture_sequence: Some(3),
-            bootstrap: false,
             canonical: true,
         };
         let unbound_same_slot = PumpExactStateCurveAnchorV2 {
@@ -6343,7 +6195,6 @@ mod tests {
             write_version: 3,
             transaction_index: None,
             source_capture_sequence: Some(4),
-            bootstrap: false,
             canonical: true,
         };
         let later = PumpExactStateCurveAnchorV2 {
@@ -6356,7 +6207,6 @@ mod tests {
             write_version: 4,
             transaction_index: Some(5),
             source_capture_sequence: Some(5),
-            bootstrap: false,
             canonical: true,
         };
         let noncanonical_lower_slot = PumpExactStateCurveAnchorV2 {
@@ -6369,7 +6219,6 @@ mod tests {
             write_version: u64::MAX,
             transaction_index: Some(0),
             source_capture_sequence: Some(u64::MAX),
-            bootstrap: false,
             canonical: false,
         };
         let final_anchor = PumpExactStateCurveAnchorV2 {
@@ -6382,7 +6231,6 @@ mod tests {
             write_version: 5,
             transaction_index: Some(4),
             source_capture_sequence: Some(6),
-            bootstrap: false,
             canonical: true,
         };
         let anchors = PumpExactStateAnchorIndexV2 {
@@ -6749,7 +6597,7 @@ mod tests {
                         filtered_pump_transaction_count: 1,
                         full_block_pump_transaction_count: 1,
                         pump_owned_account_update_count: 0,
-                        bootstrap_pump_owned_account_count: 0,
+                        qualification_run_below_minimum: false,
                         bonding_curve_account_count: 0,
                         bonding_curve_decoded_count: 0,
                         global_account_count: 0,
@@ -6958,7 +6806,7 @@ mod tests {
                         filtered_pump_transaction_count: 2,
                         full_block_pump_transaction_count: 1,
                         pump_owned_account_update_count: 1,
-                        bootstrap_pump_owned_account_count: 1,
+                        qualification_run_below_minimum: false,
                         bonding_curve_account_count: 1,
                         bonding_curve_decoded_count: 1,
                         global_account_count: 1,

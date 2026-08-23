@@ -2,10 +2,11 @@
 //! Tape V2.
 //!
 //! This module is deliberately independent from the frozen GO-D V1 tape.
-//! V2 exists because a future exact-state capture must preserve every
-//! Pump-owned account update that could later prove to be a state dependency;
-//! it must not label an unknown Pump-owned account as a BondingCurve merely to
-//! fit the V1 storage schema.
+//! V2 exists because a future exact-state capture must preserve the bounded,
+//! prospective Pump stream needed for exact-state qualification.  Its account
+//! source is deliberately limited to canonical BondingCurve updates plus the
+//! canonical Global account; it does not claim a historical or global
+//! Pump-owned-account snapshot or global account-universe scan.
 //!
 //! The module remains data-only.  It does not connect to Yellowstone, make an
 //! RPC request, interpret Pump instruction semantics, or become an active
@@ -21,20 +22,15 @@ use thiserror::Error;
 
 /// A new V2 run never reuses the V1 storage declaration.  The two artifact
 /// directories and their decoders remain intentionally disjoint.
-pub const PUMP_EXACT_STATE_TAPE_STORAGE_FORMAT_VERSION_V2: u16 = 2;
+pub const PUMP_EXACT_STATE_TAPE_STORAGE_FORMAT_VERSION_V2: u16 = 3;
 
 /// Magic preceding every framed V2 segment header.
-pub const PUMP_EXACT_STATE_TAPE_SEGMENT_MAGIC_V2: [u8; 8] = *b"PRXTAPE2";
+pub const PUMP_EXACT_STATE_TAPE_SEGMENT_MAGIC_V2: [u8; 8] = *b"PRXTAPE3";
 
 /// The source-record payload limit remains intentionally bounded.  V2 gains
-/// coverage through a wider account universe, not through an unbounded frame.
+/// coverage through its prospective source lanes, not through an unbounded
+/// frame.
 pub const PUMP_EXACT_STATE_TAPE_RECORD_MAX_BYTES_V2: usize = 16 * 1024 * 1024;
-
-/// A raw JSON-RPC bootstrap response is preserved in independently framed
-/// chunks.  The chunk bound leaves substantial headroom for its V2 framing
-/// and prevents a large `getProgramAccounts` response from weakening the raw
-/// record-size contract.
-pub const PUMP_EXACT_STATE_TAPE_BOOTSTRAP_RESPONSE_CHUNK_BYTES_V2: usize = 4 * 1024 * 1024;
 
 /// A full Yellowstone `SubscribeUpdateBlock` may be substantially larger than
 /// a single transaction/account source update.  V2 retains it in bounded
@@ -45,12 +41,11 @@ pub const PUMP_EXACT_STATE_TAPE_FULL_BLOCK_CHUNK_BYTES_V2: usize = 4 * 1024 * 10
 /// Exact source semantics: deterministic re-encoding of the decoded
 /// Yellowstone protobuf update, not a claimed original HTTP/2 wire frame.
 ///
-/// Revision `v3` additionally records the ingress timestamp on the first
-/// full-block frame and the block identity/count carried by BlockMeta.  V2
-/// has not admitted a real raw run yet, so this is a prospective contract
-/// correction rather than a migration of an existing archive.
+/// Revision `v4` is the stream-only V1.1 contract: lossless decoded protobuf
+/// records for canonical BondingCurve/Global account updates and full blocks,
+/// with no account-universe snapshot or historical state repair.
 pub const PUMP_EXACT_STATE_TAPE_SOURCE_CAPTURE_SEMANTICS_V2: &str =
-    "decoded_protobuf_schema_lossless_full_pump_owner_and_full_blocks_v3";
+    "decoded_protobuf_schema_lossless_bonding_curve_global_and_full_blocks_v4";
 
 /// The one source authority admitted to a prospective V2 raw run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,8 +54,10 @@ pub enum PumpExactStateProviderRoleV2 {
 }
 
 /// Per-record origin.  `capture_sequence` is allocated before bounded-ingress
-/// admission, so an omitted sequence is represented by an explicit coverage
-/// gap record rather than silently disappearing.
+/// admission, so an omitted source sequence is represented by an explicit
+/// coverage gap record rather than silently disappearing. The only deliberate
+/// exception is the one sequence reserved for
+/// `ProspectiveStreamBoundary`, documented on that boundary type.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PumpExactStateSourceEnvelopeV2 {
     pub provider_id: String,
@@ -70,16 +67,13 @@ pub struct PumpExactStateSourceEnvelopeV2 {
     pub payload_hash_blake3: PumpResearchStorageHashV1,
 }
 
-/// Capture-time classification is deliberately about subscription scope, not
-/// Pump semantics.  Only the first two classes are recognised by stable
-/// identity.  Every other account owned by the Pump program remains retained
-/// as `OtherPumpOwned`; a later materializer must either prove its semantic
-/// role from a pinned revision manifest or block qualification.
+/// Capture-time classification is deliberately about the exact, closed
+/// account-subscription scope.  A raw V3 run cannot retain an unscoped
+/// Pump-owned account merely because an earlier physical format allowed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PumpExactStateAccountEvidenceClassV2 {
     CanonicalBondingCurve,
     CanonicalGlobal,
-    OtherPumpOwned,
 }
 
 /// Source-lossless Pump transaction evidence.  The deterministic protobuf
@@ -97,8 +91,9 @@ pub struct PumpExactStateTransactionEvidenceV2 {
     pub source_payload: Vec<u8>,
 }
 
-/// Source-lossless update for every account selected by the V2 all-Pump-owner
-/// subscription.  This is intentionally not a normalized curve state.
+/// Source-lossless update for one account admitted by the V2 closed
+/// BondingCurve-or-canonical-Global subscription.  This is intentionally not
+/// a normalized curve state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PumpExactStatePumpOwnedAccountUpdateV2 {
     pub source: PumpExactStateSourceEnvelopeV2,
@@ -185,87 +180,10 @@ pub struct PumpExactStateFullBlockPayloadCompletedV2 {
     pub source_payload_chunk_count: u64,
 }
 
-/// The only bootstrap snapshot commitment accepted by V2.  A prospective
-/// cohort starts strictly after its sealed finalized snapshot boundary; it is
-/// never reconstructed from a later RPC backfill.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PumpExactStateBootstrapCommitmentV2 {
-    Finalized,
-}
-
-/// First record of a source-provider bootstrap snapshot.  This is emitted
-/// only after the gRPC source stream has established, so a successful capture
-/// can distinguish "snapshot before source" from a coherent prospective
-/// readiness boundary.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PumpExactStateBootstrapSnapshotStartedV2 {
-    pub snapshot_id_blake3: PumpResearchStorageHashV1,
-    pub provider_id: String,
-    pub pump_program_id: PumpResearchStoragePubkeyV1,
-    pub commitment: PumpExactStateBootstrapCommitmentV2,
-    /// The established gRPC epoch immediately before the source-provider
-    /// snapshot request begins.  A capture is ineligible if this differs from
-    /// the completion epoch; a reconnect must never be hidden by a later
-    /// baseline record.
-    pub source_stream_epoch_at_start: u64,
-    pub started_wall_ts_ms: u64,
-    pub started_monotonic_ts_ms: u64,
-}
-
-/// One contiguous range from the raw JSON-RPC `getProgramAccounts` response.
-/// V2 stores every byte, not merely a parsed projection, so an offline
-/// qualifier can reassemble and independently validate the source response.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PumpExactStateBootstrapResponseChunkV2 {
-    pub snapshot_id_blake3: PumpResearchStorageHashV1,
-    pub chunk_index: u64,
-    pub bytes: Vec<u8>,
-}
-
-/// A decoded account from the same raw JSON-RPC bootstrap response.  The
-/// structured representation is deliberately duplicated with the raw body:
-/// readers can index exact account state without granting a parser authority
-/// to silently rewrite the source response.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PumpExactStateBootstrapProgramOwnedAccountV2 {
-    pub snapshot_id_blake3: PumpResearchStorageHashV1,
-    pub response_account_index: u64,
-    pub account_pubkey: PumpResearchStoragePubkeyV1,
-    pub owner_program: PumpResearchStoragePubkeyV1,
-    pub lamports: u64,
-    pub executable: bool,
-    pub rent_epoch: u64,
-    pub raw_account_data: Vec<u8>,
-    pub raw_account_data_hash_blake3: PumpResearchStorageHashV1,
-}
-
-/// Terminal bootstrap receipt.  It binds the whole raw response and the
-/// independently serialized account set to a single finalized context slot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PumpExactStateBootstrapSnapshotCompletedV2 {
-    pub snapshot_id_blake3: PumpResearchStorageHashV1,
-    pub finalized_context_slot: u64,
-    pub response_sha256: PumpResearchStorageHashV1,
-    pub response_blake3: PumpResearchStorageHashV1,
-    pub response_bytes: u64,
-    pub response_chunk_count: u64,
-    pub account_count: u64,
-    pub account_set_blake3: PumpResearchStorageHashV1,
-    pub source_stream_epoch_at_completion: u64,
-    pub completed_wall_ts_ms: u64,
-    pub completed_monotonic_ts_ms: u64,
-}
-
 /// The first admitted slot from each source lane required to establish a
 /// prospective Exact-State V2 cohort.  These are *source-start* facts, not
 /// canonicality claims: a later offline qualifier still derives canonical
 /// slots from the frozen Slot/BlockMeta/full-block evidence.
-///
-/// The V2 bootstrap snapshot is admissible only when its finalized context
-/// slot is at or above `source_readiness_slot`.  Otherwise a provider could
-/// establish a stream, return an older finalized snapshot, and leave an
-/// uncovered interval between that snapshot and the first evidence actually
-/// observed from one required lane.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PumpExactStateSourceReadinessV2 {
     pub first_transaction_slot: u64,
@@ -277,26 +195,22 @@ pub struct PumpExactStateSourceReadinessV2 {
 }
 
 /// The only boundary at which an offline V2 materializer may begin a
-/// prospective cohort.  It is emitted after the complete finalized snapshot
-/// has been durably queued in the same raw segment chain as the continuous
-/// source stream.  A qualifier must treat every candidate slot at or below
-/// `cohort_slots_strictly_after` as warm-up evidence, never as a prospectively
-/// complete outcome cohort.
+/// prospective cohort.  It is emitted exactly once after all five source
+/// lanes have admitted one record and the writer has durably flushed the
+/// boundary in the same raw segment chain as the continuous source stream.
+/// A qualifier must treat every candidate slot at or below
+/// `cohort_slots_strictly_after` as warm-up evidence, never as a
+/// prospectively complete outcome cohort.
 ///
 /// `source_capture_sequence_exclusive` is diagnostic provenance for the
-/// concurrent stream: it is the first capture sequence not yet allocated when
-/// the capture control plane sealed the snapshot.  Slot/canonicality evidence,
-/// not this concurrent counter alone, remains the authority for later replay
-/// ordering.
+/// concurrent stream. Its numeric position is reserved for the durable
+/// boundary control record itself: source records below it are warm-up, no
+/// source record receives that marker, and later source records have strictly
+/// larger values. Slot/canonicality evidence, not this concurrent counter
+/// alone, remains the authority for later replay ordering.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PumpExactStateProspectiveReadinessBoundaryV2 {
-    pub snapshot_id_blake3: PumpResearchStorageHashV1,
-    pub finalized_context_slot: u64,
+pub struct PumpExactStateProspectiveStreamBoundaryV2 {
     pub source_readiness: PumpExactStateSourceReadinessV2,
-    /// This is stored explicitly rather than inferred by readers so the
-    /// receipt can prove that the recorder enforced the overlap condition at
-    /// capture time.
-    pub finalized_context_slot_covers_source_readiness: bool,
     pub source_stream_epoch: u64,
     pub source_capture_sequence_exclusive: u64,
     pub cohort_slots_strictly_after: u64,
@@ -354,9 +268,9 @@ pub struct PumpExactStateSegmentClosedV2 {
     pub clean_shutdown: bool,
 }
 
-/// The only V2 raw record declaration.  Its variant order is V2 physical
-/// storage layout and must be treated as frozen once the first V2 run is
-/// admitted.
+/// The only V3 raw record declaration.  Its variant order is V3 physical
+/// storage layout and must be treated as frozen once the first V3 run is
+/// admitted.  There is deliberately no account-snapshot record family.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PumpExactStateRawRecordV2 {
     PrimaryTransaction(PumpExactStateTransactionEvidenceV2),
@@ -366,11 +280,7 @@ pub enum PumpExactStateRawRecordV2 {
     FullBlockPayloadStarted(PumpExactStateFullBlockPayloadStartedV2),
     FullBlockPayloadChunk(PumpExactStateFullBlockPayloadChunkV2),
     FullBlockPayloadCompleted(PumpExactStateFullBlockPayloadCompletedV2),
-    BootstrapSnapshotStarted(PumpExactStateBootstrapSnapshotStartedV2),
-    BootstrapResponseChunk(PumpExactStateBootstrapResponseChunkV2),
-    BootstrapProgramOwnedAccount(PumpExactStateBootstrapProgramOwnedAccountV2),
-    BootstrapSnapshotCompleted(PumpExactStateBootstrapSnapshotCompletedV2),
-    ProspectiveReadinessBoundary(PumpExactStateProspectiveReadinessBoundaryV2),
+    ProspectiveStreamBoundary(PumpExactStateProspectiveStreamBoundaryV2),
     CoverageGap(PumpExactStateCoverageGapV2),
     SegmentClosed(PumpExactStateSegmentClosedV2),
 }
@@ -582,7 +492,7 @@ mod tests {
     fn representative_record() -> PumpExactStateRawRecordV2 {
         PumpExactStateRawRecordV2::PumpOwnedAccountUpdate(PumpExactStatePumpOwnedAccountUpdateV2 {
             source: source(4),
-            evidence_class: PumpExactStateAccountEvidenceClassV2::OtherPumpOwned,
+            evidence_class: PumpExactStateAccountEvidenceClassV2::CanonicalBondingCurve,
             is_startup: false,
             account_pubkey: PumpResearchFixedBytesV1::new([1; 32]),
             owner_program: PumpResearchFixedBytesV1::new([2; 32]),
@@ -614,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_round_trips_other_pump_owned_account_without_mislabeling_it_as_curve() {
+    fn v3_round_trips_closed_scope_bonding_curve_account() {
         let record = representative_record();
         let frame = PumpExactStateRawCodecV2::encode_record(&record).expect("encode V2 record");
         assert_eq!(PumpExactStateRawCodecV2::decode_record(&frame), Ok(record));
@@ -665,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_round_trips_readiness_boundary_with_all_required_lane_slots() {
+    fn v3_round_trips_stream_boundary_with_all_required_lane_slots() {
         let readiness = PumpExactStateSourceReadinessV2 {
             first_transaction_slot: 101,
             first_account_update_slot: 102,
@@ -674,12 +584,9 @@ mod tests {
             first_full_block_slot: 105,
             source_readiness_slot: 105,
         };
-        let record = PumpExactStateRawRecordV2::ProspectiveReadinessBoundary(
-            PumpExactStateProspectiveReadinessBoundaryV2 {
-                snapshot_id_blake3: PumpResearchFixedBytesV1::new([13; 32]),
-                finalized_context_slot: 105,
+        let record = PumpExactStateRawRecordV2::ProspectiveStreamBoundary(
+            PumpExactStateProspectiveStreamBoundaryV2 {
                 source_readiness: readiness.clone(),
-                finalized_context_slot_covers_source_readiness: true,
                 source_stream_epoch: 1,
                 source_capture_sequence_exclusive: 42,
                 cohort_slots_strictly_after: 105,
@@ -692,31 +599,7 @@ mod tests {
         assert_eq!(
             PumpExactStateRawCodecV2::decode_record(&frame),
             Ok(record),
-            "every lane slot and the overlap result are frozen V2 raw evidence"
-        );
-    }
-
-    #[test]
-    fn v2_round_trips_bootstrap_response_chunks_under_the_frozen_record_bound() {
-        assert!(
-            PUMP_EXACT_STATE_TAPE_BOOTSTRAP_RESPONSE_CHUNK_BYTES_V2
-                < PUMP_EXACT_STATE_TAPE_RECORD_MAX_BYTES_V2,
-            "bootstrap chunks must leave framing headroom below the raw record maximum"
-        );
-        let record = PumpExactStateRawRecordV2::BootstrapResponseChunk(
-            PumpExactStateBootstrapResponseChunkV2 {
-                snapshot_id_blake3: PumpResearchFixedBytesV1::new([12; 32]),
-                chunk_index: 3,
-                bytes: vec![4; 1_024],
-            },
-        );
-        let encoded = PumpExactStateRawCodecV2::encode_record(&record)
-            .expect("encode bounded bootstrap response chunk");
-        assert!(encoded.len() < PUMP_EXACT_STATE_TAPE_RECORD_MAX_BYTES_V2);
-        assert_eq!(
-            PumpExactStateRawCodecV2::decode_record(&encoded),
-            Ok(record),
-            "bootstrap raw-response bytes must survive the V2 frozen codec"
+            "every lane slot is frozen stream-only V3 raw evidence"
         );
     }
 

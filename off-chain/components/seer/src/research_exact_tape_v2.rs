@@ -22,39 +22,38 @@ use crate::{
         load_pump_exact_state_semantics_authority_v2, PumpExactStateSemanticsAuthorityV2,
         PumpExactStateSemanticsDigestV2,
     },
-    research_tape::observe_program_data_receipt,
 };
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use ghost_core::{
     pump_research_exact_tape_v2::{
         PumpExactStateAccountEvidenceClassV2, PumpExactStateBlockMetaEvidenceV2,
-        PumpExactStateBootstrapCommitmentV2, PumpExactStateBootstrapProgramOwnedAccountV2,
-        PumpExactStateBootstrapResponseChunkV2, PumpExactStateBootstrapSnapshotCompletedV2,
-        PumpExactStateBootstrapSnapshotStartedV2, PumpExactStateCoverageBoundaryV2,
-        PumpExactStateCoverageGapReasonV2, PumpExactStateCoverageGapV2,
-        PumpExactStateFullBlockPayloadChunkV2, PumpExactStateFullBlockPayloadCompletedV2,
-        PumpExactStateFullBlockPayloadStartedV2, PumpExactStateProspectiveReadinessBoundaryV2,
-        PumpExactStateProviderRoleV2, PumpExactStatePumpOwnedAccountUpdateV2,
-        PumpExactStateRawRecordV2, PumpExactStateSlotEvidenceV2, PumpExactStateSourceEnvelopeV2,
+        PumpExactStateCoverageBoundaryV2, PumpExactStateCoverageGapReasonV2,
+        PumpExactStateCoverageGapV2, PumpExactStateFullBlockPayloadChunkV2,
+        PumpExactStateFullBlockPayloadCompletedV2, PumpExactStateFullBlockPayloadStartedV2,
+        PumpExactStateProspectiveStreamBoundaryV2, PumpExactStateProviderRoleV2,
+        PumpExactStatePumpOwnedAccountUpdateV2, PumpExactStateRawRecordV2,
+        PumpExactStateSlotEvidenceV2, PumpExactStateSourceEnvelopeV2,
         PumpExactStateSourceReadinessV2, PumpExactStateTransactionEvidenceV2,
     },
     pump_research_tape::{
         PumpProgramDataReceiptV1, PumpResearchEventTimeV1, PumpResearchStoragePubkeyV1,
-        PumpResearchStorageSignatureV1, PUMP_RESEARCH_PUMP_GLOBAL_BASE58_V1,
+        PumpResearchStorageSignatureV1, PUMP_RESEARCH_PROGRAM_DATA_HASH_ALGORITHM_V1,
+        PUMP_RESEARCH_PUMP_GLOBAL_BASE58_V1,
     },
     LocalCoverageBoundaryV1, LocalCoverageGapReasonV1, LocalCoverageGapV1,
 };
 use parking_lot::Mutex;
 use prost::Message;
-use reqwest::{
-    header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, USER_AGENT},
-    Url,
-};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use solana_sdk::{pubkey::Pubkey, signature::Signature};
+use solana_client::rpc_config::RpcAccountInfoConfig;
+use solana_sdk::{
+    bpf_loader_upgradeable::{self, UpgradeableLoaderState},
+    commitment_config::CommitmentConfig,
+    pubkey::Pubkey,
+    signature::Signature,
+};
 use std::{
     collections::BTreeMap,
     env,
@@ -81,8 +80,8 @@ use std::os::unix::{
     fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 
-pub(crate) const EXACT_STATE_TAPE_V2_CONFIG_SCHEMA_VERSION: u16 = 2;
-pub(crate) const EXACT_STATE_TAPE_V2_RUN_SCHEMA_VERSION: u16 = 2;
+pub(crate) const EXACT_STATE_TAPE_V2_CONFIG_SCHEMA_VERSION: u16 = 3;
+pub(crate) const EXACT_STATE_TAPE_V2_RUN_SCHEMA_VERSION: u16 = 3;
 const DEFAULT_V2_SOURCE_QUEUE_CAPACITY: usize = 8_192;
 const DEFAULT_V2_SOURCE_QUEUE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const MIN_V2_SOURCE_QUEUE_MAX_BYTES: u64 =
@@ -117,17 +116,12 @@ const MIN_V2_SEGMENT_MAX_BYTES: u64 =
         + 64 * 1024;
 const V2_STORAGE_FLOOR_CHECK_INTERVAL_MS: u64 = 1_000;
 /// A writer turn drains a finite number of source/control entries before it
-/// gives the finalized-bootstrap control plane a chance to persist one record.
+/// gives the stream-readiness control plane a chance to persist one record.
 /// Without this fairness bound a permanently busy source channel could starve
-/// the bootstrap boundary indefinitely.
+/// the readiness boundary indefinitely.
 const V2_WRITER_INGRESS_DRAIN_BUDGET_PER_LANE: usize = 256;
-const DEFAULT_V2_BOOTSTRAP_QUEUE_CAPACITY: usize = 4_096;
-const DEFAULT_V2_BOOTSTRAP_ENQUEUE_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_V2_STREAM_ESTABLISH_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_V2_BOOTSTRAP_RPC_TIMEOUT_MS: u64 = 300_000;
-const DEFAULT_V2_BOOTSTRAP_RESPONSE_MAX_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_V2_BOOTSTRAP_RPC_TIMEOUT_MS: u64 = 600_000;
-const MAX_V2_BOOTSTRAP_RESPONSE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_V2_SOURCE_READINESS_TIMEOUT_MS: u64 = 30_000;
+const MAX_V2_SOURCE_READINESS_TIMEOUT_MS: u64 = 600_000;
 const MAX_V2_SOURCE_QUEUE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_V2_FLUSH_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_V2_SEGMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -137,13 +131,20 @@ const V2_CAPTURE_CONFIG_MAX_BYTES: u64 = 128 * 1024;
 /// update.  Slot `u64::MAX` is rejected as malformed source evidence, so the
 /// sentinel cannot be confused with an observed lane slot.
 const V2_REQUIRED_LANE_SLOT_UNSET: u64 = u64::MAX;
+/// High-bit lock used only while the control plane reserves the one
+/// stream-readiness marker in the shared capture-order domain.  Normal source
+/// sequence values are always below this bit, so the writer can distinguish a
+/// transient reservation from a real source sequence without a mutex on the
+/// Yellowstone receive path.
+const V2_CAPTURE_SEQUENCE_RESERVING_BIT: u64 = 1_u64 << 63;
+const V2_READINESS_BOUNDARY_SEQUENCE_UNSET: u64 = u64::MAX;
 
 /// Dedicated configuration for a prospective Exact-State Tape V2 run.
 ///
 /// It is deliberately not embedded in `SeerConfig`: no active Ghost runtime
-/// source, candidate, or execution behavior can select it.  The optional
-/// bootstrap RPC is a *source-provider initial-state snapshot*, not GO-E,
-/// audit, historic backfill, or a source of repairs for GO-D.
+/// source, candidate, or execution behavior can select it.  The small
+/// ProgramData RPC is used only for start/end program-data receipts; it is
+/// never an account-state snapshot, a backfill source, or a repair path.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PumpExactStateCaptureConfigV2 {
@@ -153,11 +154,11 @@ pub struct PumpExactStateCaptureConfigV2 {
     pub grpc_auth_token_env: Option<String>,
     #[serde(default = "default_v2_grpc_auth_header")]
     pub grpc_auth_header: String,
-    pub bootstrap_rpc_endpoint: String,
+    pub program_data_rpc_endpoint: String,
     #[serde(default)]
-    pub bootstrap_rpc_auth_token_env: Option<String>,
+    pub program_data_rpc_auth_token_env: Option<String>,
     #[serde(default = "default_v2_rpc_auth_header")]
-    pub bootstrap_rpc_auth_header: String,
+    pub program_data_rpc_auth_header: String,
     #[serde(default = "default_v2_pump_program_id")]
     pub pump_program_id: String,
     /// Create-time semantic authority for this prospective capture.  The
@@ -177,8 +178,8 @@ pub struct PumpExactStateCaptureConfigV2 {
     /// item count alone is not a memory-safety contract.
     #[serde(default = "default_v2_source_queue_max_bytes")]
     pub source_queue_max_bytes: u64,
-    /// Maximum duration of the prospective cohort after the finalized
-    /// bootstrap/readiness boundary has been sealed.  A wall-deadline is a
+    /// Maximum duration of the prospective cohort after the stream-readiness
+    /// boundary has been durably sealed.  A wall-deadline is a
     /// deliberate clean stop; an unexpected source exit is not.
     #[serde(default = "default_v2_cohort_capture_wall_ms")]
     pub cohort_capture_wall_ms: u64,
@@ -191,16 +192,10 @@ pub struct PumpExactStateCaptureConfigV2 {
     /// checked before the provider is contacted and enforced by the writer.
     #[serde(default = "default_v2_max_raw_bytes")]
     pub max_raw_bytes: u64,
-    #[serde(default = "default_v2_bootstrap_queue_capacity")]
-    pub bootstrap_queue_capacity: usize,
-    #[serde(default = "default_v2_bootstrap_enqueue_timeout_ms")]
-    pub bootstrap_enqueue_timeout_ms: u64,
-    #[serde(default = "default_v2_stream_establish_timeout_ms")]
-    pub stream_establish_timeout_ms: u64,
-    #[serde(default = "default_v2_bootstrap_rpc_timeout_ms")]
-    pub bootstrap_rpc_timeout_ms: u64,
-    #[serde(default = "default_v2_bootstrap_response_max_bytes")]
-    pub bootstrap_response_max_bytes: u64,
+    /// Bound on waiting for all five persisted source lanes before the one
+    /// stream-only cohort boundary is accepted.
+    #[serde(default = "default_v2_source_readiness_timeout_ms")]
+    pub source_readiness_timeout_ms: u64,
     #[serde(default = "default_v2_flush_interval_ms")]
     pub flush_interval_ms: u64,
     #[serde(default = "default_v2_segment_max_bytes")]
@@ -228,13 +223,16 @@ impl PumpExactStateCaptureConfigV2 {
         validate_v2_identifier("primary_provider_id", &self.primary_provider_id, 256)?;
         validate_v2_endpoint("grpc_endpoint", &self.grpc_endpoint)?;
         validate_v2_trimmed("grpc_auth_header", &self.grpc_auth_header)?;
-        validate_v2_endpoint("bootstrap_rpc_endpoint", &self.bootstrap_rpc_endpoint)?;
-        validate_v2_trimmed("bootstrap_rpc_auth_header", &self.bootstrap_rpc_auth_header)?;
+        validate_v2_endpoint("program_data_rpc_endpoint", &self.program_data_rpc_endpoint)?;
+        validate_v2_trimmed(
+            "program_data_rpc_auth_header",
+            &self.program_data_rpc_auth_header,
+        )?;
         if let Some(name) = &self.grpc_auth_token_env {
             validate_v2_trimmed("grpc_auth_token_env", name)?;
         }
-        if let Some(name) = &self.bootstrap_rpc_auth_token_env {
-            validate_v2_trimmed("bootstrap_rpc_auth_token_env", name)?;
+        if let Some(name) = &self.program_data_rpc_auth_token_env {
+            validate_v2_trimmed("program_data_rpc_auth_token_env", name)?;
         }
         if self.output_dir.as_os_str().is_empty() {
             bail!("V2 output_dir must not be empty");
@@ -250,8 +248,8 @@ impl PumpExactStateCaptureConfigV2 {
             );
         }
         validate_v2_output_root_isolated(&self.output_dir)?;
-        if self.source_queue_capacity == 0 || self.bootstrap_queue_capacity == 0 {
-            bail!("V2 queue capacities must be greater than zero");
+        if self.source_queue_capacity == 0 {
+            bail!("V2 source_queue_capacity must be greater than zero");
         }
         if self.source_queue_max_bytes < MIN_V2_SOURCE_QUEUE_MAX_BYTES
             || self.source_queue_max_bytes > MAX_V2_SOURCE_QUEUE_MAX_BYTES
@@ -296,14 +294,9 @@ impl PumpExactStateCaptureConfigV2 {
         }
         for (name, value) in [
             (
-                "bootstrap_enqueue_timeout_ms",
-                self.bootstrap_enqueue_timeout_ms,
+                "source_readiness_timeout_ms",
+                self.source_readiness_timeout_ms,
             ),
-            (
-                "stream_establish_timeout_ms",
-                self.stream_establish_timeout_ms,
-            ),
-            ("bootstrap_rpc_timeout_ms", self.bootstrap_rpc_timeout_ms),
             ("flush_interval_ms", self.flush_interval_ms),
             ("segment_max_duration_ms", self.segment_max_duration_ms),
         ] {
@@ -311,20 +304,11 @@ impl PumpExactStateCaptureConfigV2 {
                 bail!("V2 {name} must be greater than zero");
             }
         }
-        if self.bootstrap_rpc_timeout_ms > MAX_V2_BOOTSTRAP_RPC_TIMEOUT_MS {
+        if self.source_readiness_timeout_ms > MAX_V2_SOURCE_READINESS_TIMEOUT_MS {
             bail!(
-                "V2 bootstrap_rpc_timeout_ms {} exceeds hard maximum {}",
-                self.bootstrap_rpc_timeout_ms,
-                MAX_V2_BOOTSTRAP_RPC_TIMEOUT_MS
-            );
-        }
-        if self.bootstrap_response_max_bytes == 0
-            || self.bootstrap_response_max_bytes > MAX_V2_BOOTSTRAP_RESPONSE_MAX_BYTES
-        {
-            bail!(
-                "V2 bootstrap_response_max_bytes must be in 1..={}, got {}",
-                MAX_V2_BOOTSTRAP_RESPONSE_MAX_BYTES,
-                self.bootstrap_response_max_bytes
+                "V2 source_readiness_timeout_ms {} exceeds hard maximum {}",
+                self.source_readiness_timeout_ms,
+                MAX_V2_SOURCE_READINESS_TIMEOUT_MS
             );
         }
         if self.segment_max_bytes < MIN_V2_SEGMENT_MAX_BYTES
@@ -358,15 +342,15 @@ impl PumpExactStateCaptureConfigV2 {
         resolve_v2_optional_env("gRPC", self.grpc_auth_token_env.as_deref())
     }
 
-    fn resolve_bootstrap_rpc_auth_token(&self) -> Result<Option<String>> {
+    fn resolve_program_data_rpc_auth_token(&self) -> Result<Option<String>> {
         resolve_v2_optional_env(
-            "bootstrap RPC",
-            self.bootstrap_rpc_auth_token_env.as_deref(),
+            "ProgramData RPC",
+            self.program_data_rpc_auth_token_env.as_deref(),
         )
     }
 }
 
-const V2_OPERATOR_PREFLIGHT_SCHEMA_VERSION: u16 = 3;
+const V2_OPERATOR_PREFLIGHT_SCHEMA_VERSION: u16 = 4;
 const V2_OPERATOR_PREFLIGHT_RECEIPT_FILE: &str = "operator_preflight_receipt_v2.json";
 const V2_OPERATOR_PREFLIGHT_RECEIPT_MAX_BYTES: u64 = 64 * 1024;
 const V2_OPERATOR_PREFLIGHT_RELEASE_DIR: &str = "release";
@@ -435,7 +419,7 @@ pub fn preflight_prospective_exact_state_capture_v2_from_config_path(
 
 /// Fresh offline build evidence retained inside one create-new preflight
 /// bundle.  It intentionally claims a clean-commit locked offline build, not
-/// a broader sealed-source-snapshot contract owned by the historical V1 flow.
+/// a broader sealed-source contract owned by the historical V1 flow.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PumpExactStateFreshBuildReceiptV2 {
@@ -452,7 +436,7 @@ struct PumpExactStateFreshBuildReceiptV2 {
 /// Hash-pinned local authority required before a V2 capture may start.  It
 /// binds the clean repository commit, config bytes, concrete V2 request and a
 /// fresh offline release binary copied into this immutable preflight bundle.
-/// Capture must execute that copied binary; the bootstrap executable that
+/// Capture must execute that copied binary; the preflight executable that
 /// created the bundle has no capture authority by itself.  No field contains
 /// endpoint or credential bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,7 +449,7 @@ struct PumpExactStateOperatorPreflightReceiptV2 {
     git_status_digest: PumpExactStateDigestV2,
     git_status_entry_count: u64,
     capture_config_digest: PumpExactStateDigestV2,
-    bootstrap_executable_digest: PumpExactStateDigestV2,
+    preflight_executable_digest: PumpExactStateDigestV2,
     release_binary_file: String,
     release_binary_digest: PumpExactStateDigestV2,
     build_log_file: String,
@@ -525,7 +509,7 @@ pub fn create_operator_preflight_v2_from_config_path(
         config.max_raw_bytes,
     )?;
     let repository_commit = repository_commit_at_v2(&repository_root)?;
-    let bootstrap_executable_digest = digest_running_executable_v2()?;
+    let preflight_executable_digest = digest_running_executable_v2()?;
     validate_v2_new_operator_artifact_path(output_dir, "V2 operator preflight output")?;
     let bundle_dir = output_dir;
     create_private_directory_v2(bundle_dir).with_context(|| {
@@ -548,7 +532,7 @@ pub fn create_operator_preflight_v2_from_config_path(
         git_status_entry_count: git_status_entry_count_v2(&git_status),
         git_status_digest: digest_bytes_v2(&git_status),
         capture_config_digest: digest_bytes_v2(&config_bytes),
-        bootstrap_executable_digest,
+        preflight_executable_digest,
         release_binary_file: V2_OPERATOR_PREFLIGHT_RELEASE_BINARY_FILE.to_owned(),
         release_binary_digest: fresh_build.release_binary_digest.clone(),
         build_log_file: V2_OPERATOR_PREFLIGHT_BUILD_LOG_FILE.to_owned(),
@@ -726,7 +710,7 @@ fn build_fresh_release_into_preflight_bundle_v2(
         .env("CARGO_TARGET_DIR", &target_dir);
     for name in [
         config.grpc_auth_token_env.as_deref(),
-        config.bootstrap_rpc_auth_token_env.as_deref(),
+        config.program_data_rpc_auth_token_env.as_deref(),
         Some("GHOST_PUMP_RESEARCH_GRPC_TOKEN"),
         Some("GHOST_PUMP_RESEARCH_RPC_TOKEN"),
         Some("GHOST_PUMP_RESEARCH_AUDIT_RPC_TOKEN"),
@@ -1291,24 +1275,8 @@ const fn default_v2_max_raw_bytes() -> u64 {
     DEFAULT_V2_MAX_RAW_BYTES
 }
 
-const fn default_v2_bootstrap_queue_capacity() -> usize {
-    DEFAULT_V2_BOOTSTRAP_QUEUE_CAPACITY
-}
-
-const fn default_v2_bootstrap_enqueue_timeout_ms() -> u64 {
-    DEFAULT_V2_BOOTSTRAP_ENQUEUE_TIMEOUT_MS
-}
-
-const fn default_v2_stream_establish_timeout_ms() -> u64 {
-    DEFAULT_V2_STREAM_ESTABLISH_TIMEOUT_MS
-}
-
-const fn default_v2_bootstrap_rpc_timeout_ms() -> u64 {
-    DEFAULT_V2_BOOTSTRAP_RPC_TIMEOUT_MS
-}
-
-const fn default_v2_bootstrap_response_max_bytes() -> u64 {
-    DEFAULT_V2_BOOTSTRAP_RESPONSE_MAX_BYTES
+const fn default_v2_source_readiness_timeout_ms() -> u64 {
+    DEFAULT_V2_SOURCE_READINESS_TIMEOUT_MS
 }
 
 const fn default_v2_flush_interval_ms() -> u64 {
@@ -1357,453 +1325,45 @@ fn hex_bytes_v2(bytes: &[u8]) -> String {
     value
 }
 
-#[derive(Debug)]
-struct PumpExactStateBootstrapSnapshotV2 {
-    snapshot_id_blake3: ghost_core::pump_research_tape::PumpResearchStorageHashV1,
-    started_wall_ts_ms: u64,
-    started_monotonic_ts_ms: u64,
-    finalized_context_slot: u64,
-    response_bytes: Vec<u8>,
-    response_sha256: ghost_core::pump_research_tape::PumpResearchStorageHashV1,
-    response_blake3: ghost_core::pump_research_tape::PumpResearchStorageHashV1,
-    accounts: Vec<PumpExactStateBootstrapProgramOwnedAccountV2>,
-    account_set_blake3: ghost_core::pump_research_tape::PumpResearchStorageHashV1,
-}
-
-/// Bootstrap result accepted by the capture control plane.  The snapshot and
-/// source readiness are paired before persistence so a later caller cannot
-/// accidentally seal a finalized GPA response that predates a required
-/// Yellowstone lane.
-struct PumpExactStateBootstrapOverlapV2 {
-    snapshot: PumpExactStateBootstrapSnapshotV2,
-    source_readiness: PumpExactStateSourceReadinessV2,
-    snapshot_attempt_count: u64,
-}
-
 #[derive(Clone, Debug)]
-struct PumpExactStateBootstrapSealV2 {
-    finalized_context_slot: u64,
+struct PumpExactStateReadinessSealV2 {
     source_readiness: PumpExactStateSourceReadinessV2,
-    snapshot_attempt_count: u64,
+    cohort_slots_strictly_after: u64,
 }
 
-fn exact_state_bootstrap_http_client_v2(
-    endpoint: &str,
-    auth_token: Option<&str>,
-    auth_header: &str,
-    timeout: Duration,
-) -> Result<reqwest::Client> {
-    validate_v2_endpoint("bootstrap_rpc_endpoint", endpoint)?;
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static("ghost-pump-exact-state-tape-v2/1"),
-    );
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if let Some(token) = auth_token {
-        let name = HeaderName::from_bytes(auth_header.as_bytes())
-            .context("V2 bootstrap RPC auth header is invalid")?;
-        let value = HeaderValue::from_str(token)
-            .context("V2 bootstrap RPC auth token is not a valid HTTP header value")?;
-        headers.insert(name, value);
-    }
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .timeout(timeout)
-        .pool_idle_timeout(timeout)
-        .build()
-        .context("build V2 standalone bootstrap RPC client")
-}
-
-/// Fetch one bounded, finalized, source-provider `getProgramAccounts` snapshot
-/// while the V2 gRPC stream is already established.  The raw JSON response is
-/// retained byte-for-byte in V2 bootstrap chunk records; its parsed account
-/// projection is merely an indexed convenience view tied to the same digest.
-async fn fetch_finalized_program_accounts_snapshot_v2(
-    endpoint: &str,
-    auth_token: Option<&str>,
-    auth_header: &str,
-    pump_program_id: Pubkey,
-    timeout: Duration,
-    response_max_bytes: u64,
-) -> Result<PumpExactStateBootstrapSnapshotV2> {
-    let started_wall_ts_ms = wall_clock_ms_v2();
-    let started_monotonic_ts_ms = crate::types::arrival_time_ms();
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": "pump_exact_state_v2_bootstrap",
-        "method": "getProgramAccounts",
-        "params": [
-            pump_program_id.to_string(),
-            {
-                "commitment": "finalized",
-                "encoding": "base64",
-                "withContext": true
-            }
-        ]
-    });
-    let client = exact_state_bootstrap_http_client_v2(endpoint, auth_token, auth_header, timeout)?;
-    let mut response = client
-        .post(endpoint)
-        .body(serde_json::to_vec(&request).context("encode V2 bootstrap JSON-RPC request")?)
-        .send()
-        .await
-        .context("send V2 finalized getProgramAccounts bootstrap request")?;
-    let status = response.status();
-    if !status.is_success() {
-        bail!("V2 finalized getProgramAccounts bootstrap returned HTTP status {status}");
-    }
-    if let Some(content_length) = response.content_length() {
-        if content_length > response_max_bytes {
-            bail!(
-                "V2 bootstrap response Content-Length {} exceeds configured maximum {}",
-                content_length,
-                response_max_bytes
-            );
-        }
-    }
-    let mut response_bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("read V2 bootstrap response body")?
-    {
-        let new_len = response_bytes
-            .len()
-            .checked_add(chunk.len())
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap response length overflow"))?;
-        if u64::try_from(new_len).unwrap_or(u64::MAX) > response_max_bytes {
-            bail!(
-                "V2 bootstrap response exceeded configured maximum {} bytes",
-                response_max_bytes
-            );
-        }
-        response_bytes.extend_from_slice(&chunk);
-    }
-    if response_bytes.is_empty() {
-        bail!("V2 bootstrap response body is empty");
-    }
-    parse_finalized_program_accounts_snapshot_v2(
-        response_bytes,
-        pump_program_id,
-        started_wall_ts_ms,
-        started_monotonic_ts_ms,
-    )
-}
-
-fn remaining_bootstrap_budget_v2(deadline: Instant) -> Result<Duration> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or_else(|| {
-            anyhow::anyhow!("V2 finalized bootstrap exhausted its configured timeout budget")
-        })?;
-    if remaining.is_zero() {
-        bail!("V2 finalized bootstrap exhausted its configured timeout budget");
-    }
-    Ok(remaining)
-}
-
-/// Wait for each required Yellowstone lane, then obtain a finalized
-/// getProgramAccounts snapshot whose context is no older than the latest
-/// first-observed lane slot.  A stale finalized response is not a usable
-/// baseline: retry only within the already hash-pinned bootstrap timeout.
-async fn fetch_bootstrap_with_source_overlap_v2(
+/// Persist the only prospective cohort boundary.  It is deliberately derived
+/// exclusively from accepted Yellowstone evidence: neither an RPC account
+/// snapshot nor any historical account universe participates in this proof.
+async fn persist_stream_readiness_boundary_v2(
     coordinator: &PumpExactStateCaptureCoordinatorV2,
-    endpoint: &str,
-    auth_token: Option<&str>,
-    auth_header: &str,
-    pump_program_id: Pubkey,
     timeout: Duration,
-    response_max_bytes: u64,
-) -> Result<PumpExactStateBootstrapOverlapV2> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| anyhow::anyhow!("V2 bootstrap deadline overflow"))?;
-    let source_readiness = coordinator
-        .wait_for_required_source_lanes(remaining_bootstrap_budget_v2(deadline)?)
-        .await?;
-    let mut snapshot_attempt_count = 0u64;
-    loop {
-        let request_timeout = remaining_bootstrap_budget_v2(deadline)?;
-        snapshot_attempt_count = snapshot_attempt_count
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap snapshot attempt counter overflow"))?;
-        let snapshot = fetch_finalized_program_accounts_snapshot_v2(
-            endpoint,
-            auth_token,
-            auth_header,
-            pump_program_id,
-            request_timeout,
-            response_max_bytes,
-        )
-        .await?;
-        if snapshot.finalized_context_slot >= source_readiness.source_readiness_slot {
-            return Ok(PumpExactStateBootstrapOverlapV2 {
-                snapshot,
-                source_readiness: source_readiness.clone(),
-                snapshot_attempt_count,
-            });
-        }
-
-        let remaining = remaining_bootstrap_budget_v2(deadline)?;
-        // A finalized RPC can lag the established processed stream.  Do not
-        // reinterpret its older snapshot as an overlap: wait briefly, bounded
-        // by the original bootstrap deadline, then fetch a new finalized
-        // response from the same source provider.
-        tokio::time::sleep(remaining.min(Duration::from_millis(250))).await;
-    }
-}
-
-fn parse_finalized_program_accounts_snapshot_v2(
-    response_bytes: Vec<u8>,
-    pump_program_id: Pubkey,
-    started_wall_ts_ms: u64,
-    started_monotonic_ts_ms: u64,
-) -> Result<PumpExactStateBootstrapSnapshotV2> {
-    let response: Value =
-        serde_json::from_slice(&response_bytes).context("parse V2 bootstrap JSON-RPC response")?;
-    if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        bail!("V2 bootstrap response has no JSON-RPC 2.0 marker");
-    }
-    if response.get("id").and_then(Value::as_str) != Some("pump_exact_state_v2_bootstrap") {
-        bail!("V2 bootstrap response JSON-RPC id is not the requested bootstrap id");
-    }
-    if let Some(error) = response.get("error") {
-        bail!("V2 bootstrap JSON-RPC error: {error}");
-    }
-    let result = response
-        .get("result")
-        .ok_or_else(|| anyhow::anyhow!("V2 bootstrap response has no result"))?;
-    let finalized_context_slot = result
-        .get("context")
-        .and_then(|context| context.get("slot"))
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow::anyhow!("V2 bootstrap response has no finalized context.slot"))?;
-    let values = result
-        .get("value")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            anyhow::anyhow!("V2 bootstrap response result.value is not an account array")
-        })?;
-    if values.is_empty() {
-        bail!("V2 bootstrap response contains no Pump-program-owned accounts");
-    }
-    let response_blake3 = hash_bytes_v2(&response_bytes);
-    let response_sha256 = sha256_storage_hash_v2(&response_bytes);
-    let mut accounts = Vec::with_capacity(values.len());
-    let mut account_set_hasher = blake3::Hasher::new();
-    for (index, value) in values.iter().enumerate() {
-        let pubkey = value
-            .get("pubkey")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap account {index} lacks pubkey"))?
-            .parse::<Pubkey>()
-            .with_context(|| format!("V2 bootstrap account {index} has invalid pubkey"))?;
-        let account = value
-            .get("account")
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap account {index} lacks account object"))?;
-        let owner = account
-            .get("owner")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap account {index} lacks owner"))?
-            .parse::<Pubkey>()
-            .with_context(|| format!("V2 bootstrap account {index} has invalid owner"))?;
-        if owner != pump_program_id {
-            bail!(
-                "V2 bootstrap account {} owner {} differs from Pump program {}",
-                pubkey,
-                owner,
-                pump_program_id
-            );
-        }
-        let lamports = account
-            .get("lamports")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap account {index} lacks lamports"))?;
-        let executable = account
-            .get("executable")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap account {index} lacks executable"))?;
-        let rent_epoch = account
-            .get("rentEpoch")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap account {index} lacks rentEpoch"))?;
-        let data = account
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("V2 bootstrap account {index} data is not an array"))?;
-        if data.len() != 2 || data[1].as_str() != Some("base64") {
-            bail!(
-                "V2 bootstrap account {index} data must be exactly [base64, base64] without compression"
-            );
-        }
-        let encoded = data[0].as_str().ok_or_else(|| {
-            anyhow::anyhow!("V2 bootstrap account {index} base64 data is not a string")
-        })?;
-        let raw_account_data = BASE64_STANDARD
-            .decode(encoded)
-            .with_context(|| format!("decode V2 bootstrap account {index} base64 data"))?;
-        let response_account_index = u64::try_from(index)
-            .map_err(|_| anyhow::anyhow!("V2 bootstrap account index overflow"))?;
-        let raw_account_data_hash_blake3 = hash_bytes_v2(&raw_account_data);
-        account_set_hasher.update(&response_account_index.to_le_bytes());
-        account_set_hasher.update(&pubkey.to_bytes());
-        account_set_hasher.update(&owner.to_bytes());
-        account_set_hasher.update(&lamports.to_le_bytes());
-        account_set_hasher.update(&[u8::from(executable)]);
-        account_set_hasher.update(&rent_epoch.to_le_bytes());
-        account_set_hasher.update(&raw_account_data_hash_blake3.into_inner());
-        account_set_hasher.update(
-            &u64::try_from(raw_account_data.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        accounts.push(PumpExactStateBootstrapProgramOwnedAccountV2 {
-            snapshot_id_blake3: response_blake3,
-            response_account_index,
-            account_pubkey: PumpResearchStoragePubkeyV1::from(pubkey.to_bytes()),
-            owner_program: PumpResearchStoragePubkeyV1::from(owner.to_bytes()),
-            lamports,
-            executable,
-            rent_epoch,
-            raw_account_data,
-            raw_account_data_hash_blake3,
-        });
-    }
-    Ok(PumpExactStateBootstrapSnapshotV2 {
-        snapshot_id_blake3: response_blake3,
-        started_wall_ts_ms,
-        started_monotonic_ts_ms,
-        finalized_context_slot,
-        response_bytes,
-        response_sha256,
-        response_blake3,
-        accounts,
-        account_set_blake3: ghost_core::pump_research_tape::PumpResearchStorageHashV1::from(
-            *account_set_hasher.finalize().as_bytes(),
-        ),
-    })
-}
-
-fn persist_bootstrap_snapshot_v2(
-    coordinator: &PumpExactStateCaptureCoordinatorV2,
-    provider_id: &str,
-    pump_program_id: Pubkey,
-    source_stream_epoch: u64,
-    bootstrap: PumpExactStateBootstrapOverlapV2,
-    enqueue_timeout: Duration,
-) -> Result<PumpExactStateBootstrapSealV2> {
-    if source_stream_epoch == 0 {
-        bail!("V2 bootstrap cannot be written without an established source stream epoch");
-    }
-    let PumpExactStateBootstrapOverlapV2 {
-        snapshot,
-        source_readiness,
-        snapshot_attempt_count,
-    } = bootstrap;
+) -> Result<PumpExactStateReadinessSealV2> {
+    let source_readiness = coordinator.wait_for_required_source_lanes(timeout).await?;
     validate_source_readiness_v2(&source_readiness)?;
-    if snapshot.finalized_context_slot < source_readiness.source_readiness_slot {
-        bail!(
-            "V2 finalized bootstrap context slot {} predates required source readiness slot {}",
-            snapshot.finalized_context_slot,
-            source_readiness.source_readiness_slot,
-        );
-    }
-    let response_chunk_count = u64::try_from(
-        snapshot
-            .response_bytes
-            .chunks(
-                ghost_core::pump_research_exact_tape_v2::PUMP_EXACT_STATE_TAPE_BOOTSTRAP_RESPONSE_CHUNK_BYTES_V2,
-            )
-            .len(),
-    )
-    .map_err(|_| anyhow::anyhow!("V2 bootstrap response chunk count overflow"))?;
-    let source_capture_sequence_exclusive = coordinator.next_capture_sequence_exclusive();
-    coordinator.enqueue_bootstrap_record(
+    let source_stream_epoch = coordinator.established_stream_epoch().ok_or_else(|| {
+        anyhow::anyhow!("V2 source stream disappeared before stream readiness could be sealed")
+    })?;
+    let source_capture_sequence_exclusive = coordinator.arm_stream_boundary()?;
+    let cohort_slots_strictly_after = source_readiness.source_readiness_slot;
+    let boundary = PumpExactStateProspectiveStreamBoundaryV2 {
+        source_readiness: source_readiness.clone(),
         source_stream_epoch,
-        PumpExactStateRawRecordV2::BootstrapSnapshotStarted(
-            PumpExactStateBootstrapSnapshotStartedV2 {
-                snapshot_id_blake3: snapshot.snapshot_id_blake3,
-                provider_id: provider_id.to_owned(),
-                pump_program_id: PumpResearchStoragePubkeyV1::from(pump_program_id.to_bytes()),
-                commitment: PumpExactStateBootstrapCommitmentV2::Finalized,
-                source_stream_epoch_at_start: source_stream_epoch,
-                started_wall_ts_ms: snapshot.started_wall_ts_ms,
-                started_monotonic_ts_ms: snapshot.started_monotonic_ts_ms,
-            },
-        ),
-        enqueue_timeout,
+        source_capture_sequence_exclusive,
+        cohort_slots_strictly_after,
+        sealed_wall_ts_ms: wall_clock_ms_v2(),
+        sealed_monotonic_ts_ms: crate::types::arrival_time_ms(),
+    };
+    coordinator.persist_armed_stream_boundary(
+        source_capture_sequence_exclusive,
+        boundary,
+        timeout,
     )?;
-    for (index, bytes) in snapshot
-        .response_bytes
-        .chunks(
-            ghost_core::pump_research_exact_tape_v2::PUMP_EXACT_STATE_TAPE_BOOTSTRAP_RESPONSE_CHUNK_BYTES_V2,
-        )
-        .enumerate()
-    {
-        coordinator.enqueue_bootstrap_record(
-            source_stream_epoch,
-            PumpExactStateRawRecordV2::BootstrapResponseChunk(
-                PumpExactStateBootstrapResponseChunkV2 {
-                    snapshot_id_blake3: snapshot.snapshot_id_blake3,
-                    chunk_index: u64::try_from(index)
-                        .map_err(|_| anyhow::anyhow!("V2 bootstrap chunk index overflow"))?,
-                    bytes: bytes.to_vec(),
-                },
-            ),
-            enqueue_timeout,
-        )?;
+    if coordinator.established_stream_epoch() != Some(source_stream_epoch) {
+        bail!("V2 source stream changed epoch before the readiness boundary was durably confirmed");
     }
-    let account_count = u64::try_from(snapshot.accounts.len())
-        .map_err(|_| anyhow::anyhow!("V2 bootstrap account count overflow"))?;
-    for account in snapshot.accounts {
-        coordinator.enqueue_bootstrap_record(
-            source_stream_epoch,
-            PumpExactStateRawRecordV2::BootstrapProgramOwnedAccount(account),
-            enqueue_timeout,
-        )?;
-    }
-    coordinator.enqueue_bootstrap_record(
-        source_stream_epoch,
-        PumpExactStateRawRecordV2::BootstrapSnapshotCompleted(
-            PumpExactStateBootstrapSnapshotCompletedV2 {
-                snapshot_id_blake3: snapshot.snapshot_id_blake3,
-                finalized_context_slot: snapshot.finalized_context_slot,
-                response_sha256: snapshot.response_sha256,
-                response_blake3: snapshot.response_blake3,
-                response_bytes: u64::try_from(snapshot.response_bytes.len()).unwrap_or(u64::MAX),
-                response_chunk_count,
-                account_count,
-                account_set_blake3: snapshot.account_set_blake3,
-                source_stream_epoch_at_completion: source_stream_epoch,
-                completed_wall_ts_ms: wall_clock_ms_v2(),
-                completed_monotonic_ts_ms: crate::types::arrival_time_ms(),
-            },
-        ),
-        enqueue_timeout,
-    )?;
-    coordinator.enqueue_bootstrap_record(
-        source_stream_epoch,
-        PumpExactStateRawRecordV2::ProspectiveReadinessBoundary(
-            PumpExactStateProspectiveReadinessBoundaryV2 {
-                snapshot_id_blake3: snapshot.snapshot_id_blake3,
-                finalized_context_slot: snapshot.finalized_context_slot,
-                source_readiness: source_readiness.clone(),
-                finalized_context_slot_covers_source_readiness: true,
-                source_stream_epoch,
-                source_capture_sequence_exclusive,
-                cohort_slots_strictly_after: snapshot.finalized_context_slot,
-                sealed_wall_ts_ms: wall_clock_ms_v2(),
-                sealed_monotonic_ts_ms: crate::types::arrival_time_ms(),
-            },
-        ),
-        enqueue_timeout,
-    )?;
-    coordinator.seal_bootstrap_complete()?;
-    Ok(PumpExactStateBootstrapSealV2 {
-        finalized_context_slot: snapshot.finalized_context_slot,
+    Ok(PumpExactStateReadinessSealV2 {
         source_readiness,
-        snapshot_attempt_count,
+        cohort_slots_strictly_after,
     })
 }
 
@@ -1811,7 +1371,7 @@ fn persist_bootstrap_snapshot_v2(
 /// it becomes frozen raw evidence.  The normal ingress path constructs this
 /// value from atomics, but treating the derived maximum as a checked invariant
 /// here prevents any future caller from lowering the declared readiness slot
-/// and accepting an older finalized bootstrap snapshot.
+/// and admitting a cohort before all five lanes are represented.
 fn validate_source_readiness_v2(readiness: &PumpExactStateSourceReadinessV2) -> Result<()> {
     let slots = [
         readiness.first_transaction_slot,
@@ -1870,8 +1430,8 @@ pub(crate) struct PumpExactStateRunStartManifestV2 {
     pub(crate) expected_program_data_hash_blake3: String,
     pub(crate) primary_provider_id: String,
     pub(crate) grpc_endpoint_digest: PumpExactStateDigestV2,
-    pub(crate) bootstrap_rpc_endpoint_digest: PumpExactStateDigestV2,
-    pub(crate) bootstrap_rpc_auth_mode: String,
+    pub(crate) program_data_rpc_endpoint_digest: PumpExactStateDigestV2,
+    pub(crate) program_data_rpc_auth_mode: String,
     pub(crate) pump_program_id: String,
     pub(crate) program_data_at_start: PumpProgramDataReceiptV1,
     pub(crate) cohort_capture_wall_ms: u64,
@@ -1902,11 +1462,10 @@ pub(crate) struct PumpExactStateRunCompletionReceiptV2 {
     pub(crate) run_id: String,
     pub(crate) status: PumpExactStateCaptureRunStatusV2,
     pub(crate) clean_shutdown: bool,
-    pub(crate) bootstrap_finalized_context_slot: Option<u64>,
-    pub(crate) bootstrap_source_readiness: Option<PumpExactStateSourceReadinessV2>,
-    pub(crate) bootstrap_source_overlap_proven: bool,
-    pub(crate) bootstrap_snapshot_attempt_count: u64,
-    pub(crate) bootstrap_completed: bool,
+    pub(crate) source_readiness: Option<PumpExactStateSourceReadinessV2>,
+    pub(crate) readiness_boundary_persisted: bool,
+    pub(crate) cohort_slots_strictly_after: Option<u64>,
+    pub(crate) readiness_completed: bool,
     pub(crate) running_executable_at_completion: Option<PumpExactStateDigestV2>,
     pub(crate) running_executable_unchanged: bool,
     pub(crate) program_data_at_start: PumpProgramDataReceiptV1,
@@ -2130,6 +1689,91 @@ fn program_data_receipts_match_v2(
         && start.commitment == completion.commitment
 }
 
+/// Read the two finalized accounts needed to pin V2 semantics, without the
+/// Solana client's compatibility `getVersion` probe.  The V2 operator RPC
+/// contract is intentionally literal: its only account reads are the Pump
+/// Program and the ProgramData account named by that Program.  This local
+/// reader is separate from V1 so GO-D's historical capture path is unchanged.
+async fn observe_program_data_receipt_v2(
+    rpc_endpoint: &str,
+    rpc_auth_token: Option<&str>,
+    rpc_auth_header: &str,
+    pump_program_id: Pubkey,
+) -> Result<PumpProgramDataReceiptV1> {
+    let client = match rpc_auth_token {
+        Some(token) => crate::rpc_http_client::new_async_rpc_client_with_explicit_auth(
+            rpc_endpoint.to_owned(),
+            rpc_auth_header,
+            token,
+        )
+        .map_err(anyhow::Error::msg)?,
+        None => crate::rpc_http_client::new_async_rpc_client_without_legacy_auth(
+            rpc_endpoint.to_owned(),
+        )
+        .map_err(anyhow::Error::msg)?,
+    };
+    let account_config = RpcAccountInfoConfig {
+        commitment: Some(CommitmentConfig::finalized()),
+        ..RpcAccountInfoConfig::default()
+    };
+    let program_response = client
+        .get_account_with_config(&pump_program_id, account_config.clone())
+        .await
+        .context("read finalized Pump Program account")?;
+    let program_account = program_response
+        .value
+        .ok_or_else(|| anyhow::anyhow!("Pump Program account {pump_program_id} is missing"))?;
+    if program_account.owner != bpf_loader_upgradeable::id() {
+        bail!(
+            "Pump Program account owner {} is not upgradeable loader {}",
+            program_account.owner,
+            bpf_loader_upgradeable::id()
+        );
+    }
+    let program_state: UpgradeableLoaderState = bincode::deserialize(&program_account.data)
+        .context("decode UpgradeableLoaderState for Pump Program")?;
+    let programdata_pubkey = match program_state {
+        UpgradeableLoaderState::Program {
+            programdata_address,
+        } => programdata_address,
+        other => bail!("Pump Program account has unexpected upgradeable-loader state {other:?}"),
+    };
+    let programdata_response = client
+        .get_account_with_config(&programdata_pubkey, account_config)
+        .await
+        .context("read finalized Pump ProgramData account")?;
+    let programdata_account = programdata_response.value.ok_or_else(|| {
+        anyhow::anyhow!("Pump ProgramData account {programdata_pubkey} is missing")
+    })?;
+    if programdata_account.owner != bpf_loader_upgradeable::id() {
+        bail!(
+            "Pump ProgramData owner {} is not upgradeable loader {}",
+            programdata_account.owner,
+            bpf_loader_upgradeable::id()
+        );
+    }
+    let programdata_state: UpgradeableLoaderState = bincode::deserialize(&programdata_account.data)
+        .context("decode UpgradeableLoaderState for Pump ProgramData")?;
+    let deployment_slot = match programdata_state {
+        UpgradeableLoaderState::ProgramData { slot, .. } => Some(slot),
+        other => bail!("Pump ProgramData account has unexpected state {other:?}"),
+    };
+
+    Ok(PumpProgramDataReceiptV1 {
+        pump_program_id: PumpResearchStoragePubkeyV1::from(pump_program_id.to_bytes()),
+        pump_program_account_owner: PumpResearchStoragePubkeyV1::from(
+            program_account.owner.to_bytes(),
+        ),
+        pump_programdata_pubkey: PumpResearchStoragePubkeyV1::from(programdata_pubkey.to_bytes()),
+        program_data_owner: PumpResearchStoragePubkeyV1::from(programdata_account.owner.to_bytes()),
+        program_data_hash_algorithm: PUMP_RESEARCH_PROGRAM_DATA_HASH_ALGORITHM_V1.to_owned(),
+        program_data_hash_blake3: hash_bytes_v2(&programdata_account.data),
+        program_deployment_slot: deployment_slot,
+        observed_context_slot: programdata_response.context.slot,
+        commitment: "finalized".to_owned(),
+    })
+}
+
 /// Run a standalone prospective Exact-State Tape V2 capture from an operator
 /// TOML.  This entry point is intentionally separate from the V1 CLI: it can
 /// create only a new `raw-v2` run and does not reinterpret or touch GO-D.
@@ -2140,8 +1784,8 @@ fn program_data_receipts_match_v2(
 /// local config validation
 /// -> finalized ProgramData start receipt
 /// -> create-new raw-v2 run
-/// -> established all-Pump-owned gRPC stream
-/// -> bounded finalized getProgramAccounts bootstrap
+/// -> established stream-only Yellowstone source
+/// -> durable five-lane stream-readiness boundary
 /// -> prospective source capture until explicit shutdown
 /// -> ProgramData completion receipt + immutable completion receipt
 /// ```
@@ -2175,11 +1819,11 @@ async fn run_prospective_exact_state_capture_v2(
         .parse::<Pubkey>()
         .context("validated V2 pump_program_id unexpectedly failed to parse")?;
     let grpc_auth_token = config.resolve_grpc_auth_token()?;
-    let bootstrap_rpc_auth_token = config.resolve_bootstrap_rpc_auth_token()?;
-    let program_data_at_start = observe_program_data_receipt(
-        &config.bootstrap_rpc_endpoint,
-        bootstrap_rpc_auth_token.as_deref(),
-        &config.bootstrap_rpc_auth_header,
+    let program_data_rpc_auth_token = config.resolve_program_data_rpc_auth_token()?;
+    let program_data_at_start = observe_program_data_receipt_v2(
+        &config.program_data_rpc_endpoint,
+        program_data_rpc_auth_token.as_deref(),
+        &config.program_data_rpc_auth_header,
         pump_program_id,
     )
     .await
@@ -2228,8 +1872,10 @@ async fn run_prospective_exact_state_capture_v2(
             .clone(),
         primary_provider_id: config.primary_provider_id.clone(),
         grpc_endpoint_digest: digest_bytes_v2(config.grpc_endpoint.as_bytes()),
-        bootstrap_rpc_endpoint_digest: digest_bytes_v2(config.bootstrap_rpc_endpoint.as_bytes()),
-        bootstrap_rpc_auth_mode: if config.bootstrap_rpc_auth_token_env.is_some() {
+        program_data_rpc_endpoint_digest: digest_bytes_v2(
+            config.program_data_rpc_endpoint.as_bytes(),
+        ),
+        program_data_rpc_auth_mode: if config.program_data_rpc_auth_token_env.is_some() {
             "explicit_standalone_auth".to_owned()
         } else {
             "standalone_no_auth_no_legacy_fallback".to_owned()
@@ -2256,7 +1902,6 @@ async fn run_prospective_exact_state_capture_v2(
         capture_contract_sha256,
         config.source_queue_capacity,
         config.source_queue_max_bytes,
-        config.bootstrap_queue_capacity,
         Duration::from_millis(config.flush_interval_ms),
         config.segment_max_bytes,
         Duration::from_millis(config.segment_max_duration_ms),
@@ -2304,7 +1949,7 @@ async fn run_prospective_exact_state_capture_v2(
     ) {
         Ok(source) => Arc::new(source),
         Err(error) => {
-            coordinator.fail_bootstrap();
+            coordinator.fail_readiness();
             coordinator.finish_source();
             let writer = coordinator.finish_and_join();
             let receipt = incomplete_completion_receipt_v2(
@@ -2333,46 +1978,15 @@ async fn run_prospective_exact_state_capture_v2(
 
     let source_for_task = Arc::clone(&source);
     let mut source_task = tokio::spawn(async move { source_for_task.run().await });
-    let bootstrap_result = async {
-        let start_epoch = coordinator
-            .wait_for_stream_established(Duration::from_millis(
-                config.stream_establish_timeout_ms,
-            ))
-            .await?;
-        let bootstrap = fetch_bootstrap_with_source_overlap_v2(
-            &coordinator,
-            &config.bootstrap_rpc_endpoint,
-            bootstrap_rpc_auth_token.as_deref(),
-            &config.bootstrap_rpc_auth_header,
-            pump_program_id,
-            Duration::from_millis(config.bootstrap_rpc_timeout_ms),
-            config.bootstrap_response_max_bytes,
-        )
-        .await?;
-        let completion_epoch = coordinator.established_stream_epoch().ok_or_else(|| {
-            anyhow::anyhow!("V2 source stream disappeared while finalized bootstrap was in flight")
-        })?;
-        if completion_epoch != start_epoch {
-            bail!(
-                "V2 source stream reconnected from epoch {} to {} while finalized bootstrap was in flight",
-                start_epoch,
-                completion_epoch
-            );
-        }
-        persist_bootstrap_snapshot_v2(
-            &coordinator,
-            &config.primary_provider_id,
-            pump_program_id,
-            completion_epoch,
-            bootstrap,
-            Duration::from_millis(config.bootstrap_enqueue_timeout_ms),
-        )
-    }
+    let readiness_result = persist_stream_readiness_boundary_v2(
+        &coordinator,
+        Duration::from_millis(config.source_readiness_timeout_ms),
+    )
     .await;
 
     let mut cohort_capture_termination = None;
     let mut cohort_capture_elapsed_ms = None;
-    let (source_result, bootstrap_seal) = match bootstrap_result {
+    let (source_result, readiness_seal) = match readiness_result {
         Ok(seal) => {
             let cohort_started = Instant::now();
             let result = await_source_until_signal_v2(
@@ -2392,16 +2006,18 @@ async fn run_prospective_exact_state_capture_v2(
             }
         }
         Err(error) => {
-            coordinator.fail_bootstrap();
+            coordinator.fail_readiness();
             source.request_shutdown();
             let task_result = source_task
                 .await
                 .map_err(|join| anyhow::anyhow!("V2 source task join failure: {join}"))
                 .and_then(|result| result);
             let message = match task_result {
-                Ok(()) => format!("V2 bootstrap failed: {error:#}"),
+                Ok(()) => format!("V2 stream readiness failed: {error:#}"),
                 Err(source_error) => {
-                    format!("V2 bootstrap failed: {error:#}; source also ended: {source_error:#}")
+                    format!(
+                        "V2 stream readiness failed: {error:#}; source also ended: {source_error:#}"
+                    )
                 }
             };
             (Err(anyhow::anyhow!(message)), None)
@@ -2410,10 +2026,10 @@ async fn run_prospective_exact_state_capture_v2(
     coordinator.finish_source();
     let writer = coordinator.finish_and_join();
     let source_lifecycle = coordinator.source_lifecycle();
-    let program_data_completion_result = observe_program_data_receipt(
-        &config.bootstrap_rpc_endpoint,
-        bootstrap_rpc_auth_token.as_deref(),
-        &config.bootstrap_rpc_auth_header,
+    let program_data_completion_result = observe_program_data_receipt_v2(
+        &config.program_data_rpc_endpoint,
+        program_data_rpc_auth_token.as_deref(),
+        &config.program_data_rpc_auth_header,
         pump_program_id,
     )
     .await;
@@ -2437,19 +2053,16 @@ async fn run_prospective_exact_state_capture_v2(
         .is_some_and(|available| available >= config.min_free_bytes);
     let raw_byte_budget_respected = writer.raw_bytes_written <= config.max_raw_bytes;
     let required_source_lanes_observed = writer.required_lane_census.all_required_lanes_observed();
-    let bootstrap_context_slot = bootstrap_seal
-        .as_ref()
-        .map(|seal| seal.finalized_context_slot);
-    let bootstrap_source_readiness = bootstrap_seal
+    let source_readiness = readiness_seal
         .as_ref()
         .map(|seal| seal.source_readiness.clone());
-    let bootstrap_source_overlap_proven = bootstrap_seal.as_ref().is_some_and(|seal| {
-        seal.finalized_context_slot >= seal.source_readiness.source_readiness_slot
-    });
-    let bootstrap_snapshot_attempt_count = bootstrap_seal
+    let readiness_boundary_persisted = readiness_seal.is_some()
+        && source_lifecycle.source_readiness_status == "complete"
+        && writer.accepted_readiness_boundary_records == 1;
+    let cohort_slots_strictly_after = readiness_seal
         .as_ref()
-        .map_or(0, |seal| seal.snapshot_attempt_count);
-    let bootstrap_completed = source_lifecycle.bootstrap_status == "complete";
+        .map(|seal| seal.cohort_slots_strictly_after);
+    let readiness_completed = source_lifecycle.source_readiness_status == "complete";
     let clean_shutdown = source_result.is_ok()
         && writer.clean_shutdown
         && source_lifecycle.stream_established
@@ -2458,9 +2071,9 @@ async fn run_prospective_exact_state_capture_v2(
         && source_lifecycle.source_queue_bytes_at_close == 0
         && source_lifecycle.fatal_capture_error.is_none()
         && source_lifecycle.source_worker_error.is_none()
-        && bootstrap_completed
-        && bootstrap_context_slot.is_some()
-        && bootstrap_source_overlap_proven
+        && readiness_completed
+        && readiness_boundary_persisted
+        && cohort_slots_strictly_after.is_some()
         && cohort_capture_termination.is_some()
         && storage_reserve_maintained
         && raw_byte_budget_respected
@@ -2479,11 +2092,10 @@ async fn run_prospective_exact_state_capture_v2(
         run_id: paths.run_id.clone(),
         status,
         clean_shutdown,
-        bootstrap_finalized_context_slot: bootstrap_context_slot,
-        bootstrap_source_readiness,
-        bootstrap_source_overlap_proven,
-        bootstrap_snapshot_attempt_count,
-        bootstrap_completed,
+        source_readiness,
+        readiness_boundary_persisted,
+        cohort_slots_strictly_after,
+        readiness_completed,
         running_executable_at_completion: executable_completion,
         running_executable_unchanged,
         program_data_at_start,
@@ -2547,7 +2159,7 @@ async fn await_source_until_signal_v2(
 
 fn coordinatorless_lifecycle_v2() -> PumpExactStateCaptureSourceLifecycleV2 {
     PumpExactStateCaptureSourceLifecycleV2 {
-        bootstrap_status: "failed".to_owned(),
+        source_readiness_status: "failed".to_owned(),
         ..PumpExactStateCaptureSourceLifecycleV2::default()
     }
 }
@@ -2574,11 +2186,10 @@ fn incomplete_completion_receipt_v2(
         run_id: run_id.to_owned(),
         status: PumpExactStateCaptureRunStatusV2::Incomplete,
         clean_shutdown: false,
-        bootstrap_finalized_context_slot: None,
-        bootstrap_source_readiness: None,
-        bootstrap_source_overlap_proven: false,
-        bootstrap_snapshot_attempt_count: 0,
-        bootstrap_completed: false,
+        source_readiness: None,
+        readiness_boundary_persisted: false,
+        cohort_slots_strictly_after: None,
+        readiness_completed: false,
         running_executable_at_completion,
         running_executable_unchanged,
         program_data_at_start: program_data_at_start.clone(),
@@ -2686,7 +2297,7 @@ fn raw_records_from_source_payload_v2(
                 .context("compile-time Pump program ID is invalid")?;
             if owner_program.into_inner() != expected_owner.to_bytes() {
                 bail!(
-                    "V2 all-Pump-owned account source emitted account {} with non-Pump owner {}",
+                    "V2 stream-only account source emitted account {} with non-Pump owner {}",
                     Pubkey::new_from_array(account_pubkey.into_inner()),
                     Pubkey::new_from_array(owner_program.into_inner()),
                 );
@@ -2832,24 +2443,26 @@ fn fixed_signature_v2(bytes: &[u8]) -> Result<PumpResearchStorageSignatureV1> {
     Ok(PumpResearchStorageSignatureV1::from(fixed))
 }
 
-/// Derive the bounded raw-account evidence class directly from the retained
-/// Pump-owned account payload.  The offline raw validator reuses this exact
-/// classifier when it binds a convenient raw projection back to the complete
-/// retained `SubscribeUpdate`, so neither layer can silently drift into a
-/// competing account-authority rule.
+/// Derive the closed stream-only account evidence class directly from the
+/// retained Pump-owned account payload.  The offline raw validator reuses
+/// this exact classifier when it binds a convenient raw projection back to
+/// the complete retained `SubscribeUpdate`; any account outside the two
+/// subscription classes is a source-contract failure, never retained noise.
 pub(crate) fn classify_pump_owned_account_evidence_v2(
     account_pubkey: [u8; 32],
     raw_account_data: &[u8],
 ) -> Result<PumpExactStateAccountEvidenceClassV2> {
     let canonical_global = Pubkey::from_str(PUMP_RESEARCH_PUMP_GLOBAL_BASE58_V1)
         .context("canonical Pump Global pubkey is invalid")?;
-    Ok(if account_pubkey == canonical_global.to_bytes() {
-        PumpExactStateAccountEvidenceClassV2::CanonicalGlobal
-    } else if raw_account_data.starts_with(&BONDING_CURVE_DISC) {
-        PumpExactStateAccountEvidenceClassV2::CanonicalBondingCurve
-    } else {
-        PumpExactStateAccountEvidenceClassV2::OtherPumpOwned
-    })
+    if account_pubkey == canonical_global.to_bytes() {
+        return Ok(PumpExactStateAccountEvidenceClassV2::CanonicalGlobal);
+    }
+    if raw_account_data.starts_with(&BONDING_CURVE_DISC) {
+        return Ok(PumpExactStateAccountEvidenceClassV2::CanonicalBondingCurve);
+    }
+    bail!(
+        "V2 stream-only account source emitted a Pump account outside canonical Global/BondingCurve scope"
+    )
 }
 
 fn hash_bytes_v2(bytes: &[u8]) -> ghost_core::pump_research_tape::PumpResearchStorageHashV1 {
@@ -3090,8 +2703,8 @@ impl PumpExactStateFullBlockReconciliationV2 {
 
 /// Isolated V2 raw segment writer.  It is intentionally not a general
 /// runtime writer: all callers are the standalone prospective capture path,
-/// and all data must first satisfy `raw_records_from_source_v2` or a dedicated
-/// bootstrap record contract.
+/// and all data must first satisfy `raw_records_from_source_v2` or the one
+/// stream-readiness boundary contract.
 struct PumpExactStateRawSegmentWriterV2 {
     raw_dir: PathBuf,
     run_id: String,
@@ -3249,19 +2862,56 @@ impl PumpExactStateRawSegmentWriterV2 {
         Ok(())
     }
 
-    /// Bootstrap records are written through the same segment chain but have
-    /// no gRPC capture sequence.  The caller must supply the established
-    /// source epoch so a bootstrap cannot be silently blended across a
-    /// reconnect boundary.
-    fn write_bootstrap_record(
+    /// The stream-readiness boundary is written through the same segment chain
+    /// but deliberately has no gRPC capture sequence of its own.  It binds a
+    /// single established epoch and an exclusive source sequence frontier.
+    fn write_stream_boundary(
         &mut self,
         stream_epoch: u64,
-        record: PumpExactStateRawRecordV2,
+        boundary: PumpExactStateProspectiveStreamBoundaryV2,
     ) -> Result<()> {
-        if source_stream_epoch_v2(&record).is_some() {
-            bail!("V2 bootstrap writer received a source record");
+        if boundary.source_stream_epoch != stream_epoch {
+            bail!(
+                "V2 stream-readiness boundary epoch {} differs from writer epoch {}",
+                boundary.source_stream_epoch,
+                stream_epoch
+            );
         }
-        self.write_record(stream_epoch, None, &record)
+        validate_source_readiness_v2(&boundary.source_readiness)?;
+        if boundary.cohort_slots_strictly_after != boundary.source_readiness.source_readiness_slot {
+            bail!(
+                "V2 stream-readiness boundary cohort slot {} differs from source readiness slot {}",
+                boundary.cohort_slots_strictly_after,
+                boundary.source_readiness.source_readiness_slot
+            );
+        }
+        self.write_record(
+            stream_epoch,
+            None,
+            &PumpExactStateRawRecordV2::ProspectiveStreamBoundary(boundary),
+        )
+    }
+
+    /// The readiness control-plane receives its acknowledgement only after
+    /// the boundary frame has reached the active segment's buffered writer and
+    /// been synchronised to the filesystem.  Cohort timing must never begin
+    /// before this succeeds.
+    fn flush_active_and_sync(&mut self) -> Result<()> {
+        let current = self
+            .current
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("V2 stream boundary did not open a raw segment"))?;
+        current
+            .writer
+            .flush()
+            .with_context(|| format!("flush V2 raw segment {}", current.partial_path.display()))?;
+        current
+            .writer
+            .get_ref()
+            .sync_data()
+            .with_context(|| format!("sync V2 raw segment {}", current.partial_path.display()))?;
+        self.last_flush = Instant::now();
+        Ok(())
     }
 
     fn full_block_census(&self, fully_reconciled: bool) -> PumpExactStateRequiredLaneCensusV2 {
@@ -3563,27 +3213,6 @@ impl PumpExactStateRawSegmentWriterV2 {
     }
 }
 
-fn source_stream_epoch_v2(record: &PumpExactStateRawRecordV2) -> Option<u64> {
-    match record {
-        PumpExactStateRawRecordV2::PrimaryTransaction(value) => Some(value.source.stream_epoch),
-        PumpExactStateRawRecordV2::PumpOwnedAccountUpdate(value) => Some(value.source.stream_epoch),
-        PumpExactStateRawRecordV2::PrimarySlotUpdate(value) => Some(value.source.stream_epoch),
-        PumpExactStateRawRecordV2::PrimaryBlockMeta(value) => Some(value.source.stream_epoch),
-        PumpExactStateRawRecordV2::FullBlockPayloadStarted(value) => {
-            Some(value.source.stream_epoch)
-        }
-        PumpExactStateRawRecordV2::CoverageGap(value) => Some(value.stream_epoch),
-        PumpExactStateRawRecordV2::FullBlockPayloadChunk(_)
-        | PumpExactStateRawRecordV2::FullBlockPayloadCompleted(_)
-        | PumpExactStateRawRecordV2::BootstrapSnapshotStarted(_)
-        | PumpExactStateRawRecordV2::BootstrapResponseChunk(_)
-        | PumpExactStateRawRecordV2::BootstrapProgramOwnedAccount(_)
-        | PumpExactStateRawRecordV2::BootstrapSnapshotCompleted(_)
-        | PumpExactStateRawRecordV2::ProspectiveReadinessBoundary(_)
-        | PumpExactStateRawRecordV2::SegmentClosed(_) => None,
-    }
-}
-
 fn sync_directory_v2(path: &Path) -> Result<()> {
     let directory = File::open(path)
         .with_context(|| format!("open V2 raw directory {} for sync", path.display()))?;
@@ -3599,12 +3228,12 @@ enum PumpExactStateCaptureFatalReasonV2 {
     DropControlLaneSaturated = 1,
     DropControlLaneDisconnected = 2,
     DataLaneDisconnected = 3,
-    BootstrapQueueDisconnected = 4,
-    BootstrapQueueTimeout = 5,
+    ReadinessQueueDisconnected = 4,
+    ReadinessQueueTimeout = 5,
     WriterFailure = 6,
     WriterPanic = 7,
     WriterJoinPanic = 8,
-    BootstrapNotSealed = 9,
+    ReadinessNotSealed = 9,
     SourceStreamEpochChanged = 10,
     SourceUpdateEpochMismatch = 11,
     SourceQueueByteBudgetExceeded = 12,
@@ -3619,12 +3248,12 @@ impl PumpExactStateCaptureFatalReasonV2 {
             1 => Self::DropControlLaneSaturated,
             2 => Self::DropControlLaneDisconnected,
             3 => Self::DataLaneDisconnected,
-            4 => Self::BootstrapQueueDisconnected,
-            5 => Self::BootstrapQueueTimeout,
+            4 => Self::ReadinessQueueDisconnected,
+            5 => Self::ReadinessQueueTimeout,
             6 => Self::WriterFailure,
             7 => Self::WriterPanic,
             8 => Self::WriterJoinPanic,
-            9 => Self::BootstrapNotSealed,
+            9 => Self::ReadinessNotSealed,
             10 => Self::SourceStreamEpochChanged,
             11 => Self::SourceUpdateEpochMismatch,
             12 => Self::SourceQueueByteBudgetExceeded,
@@ -3646,19 +3275,19 @@ impl PumpExactStateCaptureFatalReasonV2 {
             Self::DataLaneDisconnected => {
                 Some("V2 source data lane disconnected while source updates were arriving")
             }
-            Self::BootstrapQueueDisconnected => {
-                Some("V2 bootstrap queue disconnected before snapshot evidence was persisted")
+            Self::ReadinessQueueDisconnected => {
+                Some("V2 readiness queue disconnected before the stream boundary was persisted")
             }
-            Self::BootstrapQueueTimeout => {
-                Some("V2 bootstrap queue did not drain within its bounded enqueue deadline")
+            Self::ReadinessQueueTimeout => {
+                Some("V2 readiness queue did not drain within its bounded persistence deadline")
             }
             Self::WriterFailure => Some("V2 raw writer failed"),
             Self::WriterPanic => Some("V2 raw writer thread panicked"),
             Self::WriterJoinPanic => {
                 Some("V2 raw writer thread panicked before reporting a failure")
             }
-            Self::BootstrapNotSealed => {
-                Some("V2 capture ended without one complete finalized bootstrap snapshot")
+            Self::ReadinessNotSealed => {
+                Some("V2 capture ended without exactly one durable stream-readiness boundary")
             }
             Self::SourceStreamEpochChanged => Some(
                 "V2 Yellowstone source reconnected or changed stream epoch; a prospective run cannot claim continuous source coverage across that boundary",
@@ -3681,18 +3310,20 @@ impl PumpExactStateCaptureFatalReasonV2 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-enum PumpExactStateBootstrapStatusV2 {
+enum PumpExactStateReadinessStatusV2 {
     Pending = 0,
-    Complete = 1,
-    Failed = 2,
+    Persisting = 1,
+    Complete = 2,
+    Failed = 3,
 }
 
-impl PumpExactStateBootstrapStatusV2 {
+impl PumpExactStateReadinessStatusV2 {
     fn from_raw(raw: u8) -> Self {
         match raw {
             0 => Self::Pending,
-            1 => Self::Complete,
-            2 => Self::Failed,
+            1 => Self::Persisting,
+            2 => Self::Complete,
+            3 => Self::Failed,
             _ => Self::Failed,
         }
     }
@@ -3709,7 +3340,7 @@ pub(crate) struct PumpExactStateCaptureSourceLifecycleV2 {
     pub(crate) source_queue_bytes_at_close: u64,
     pub(crate) source_workers_cleanly_stopped: bool,
     pub(crate) required_lane_first_slots: Option<PumpExactStateSourceReadinessV2>,
-    pub(crate) bootstrap_status: String,
+    pub(crate) source_readiness_status: String,
     pub(crate) fatal_capture_error: Option<String>,
     pub(crate) source_worker_error: Option<String>,
 }
@@ -3717,7 +3348,7 @@ pub(crate) struct PumpExactStateCaptureSourceLifecycleV2 {
 /// Persisted source-lane census.  This is writer-owned: a lane is counted
 /// only after its decoded `SubscribeUpdate` has been converted and durably
 /// written into the V2 segment chain.  It is therefore independent from the
-/// ingress admission counters used to establish the bootstrap overlap.
+/// ingress admission counters used to establish the stream boundary.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PumpExactStateRequiredLaneCensusV2 {
     pub(crate) transaction_messages: u64,
@@ -3778,7 +3409,7 @@ pub(crate) struct PumpExactStateWriterSummaryV2 {
     pub(crate) segments: Vec<PumpExactStateSegmentReceiptV2>,
     pub(crate) raw_bytes_written: u64,
     pub(crate) accepted_source_records: u64,
-    pub(crate) accepted_bootstrap_records: u64,
+    pub(crate) accepted_readiness_boundary_records: u64,
     pub(crate) required_lane_census: PumpExactStateRequiredLaneCensusV2,
     pub(crate) persisted_ingress_gap_missing_events: u64,
     pub(crate) persisted_ingress_gap_episodes: u64,
@@ -3846,14 +3477,23 @@ enum CaptureControlV2 {
     DroppedSource(DroppedSourceUpdateV2),
 }
 
-struct QueuedBootstrapRecordV2 {
+struct QueuedStreamBoundaryV2 {
+    /// A reserved position in the global ordered-ingress sequence.  It is not
+    /// a Yellowstone source update: every source update before it belongs to
+    /// the warm-up prefix, and the next source update is assigned the
+    /// following sequence value.  Reserving this position prevents a writer
+    /// race in which a post-boundary source frame could otherwise be written
+    /// before the durable boundary control frame arrives on its own lane.
+    ordering_sequence: u64,
     stream_epoch: u64,
-    record: PumpExactStateRawRecordV2,
+    boundary: PumpExactStateProspectiveStreamBoundaryV2,
+    acknowledgement: crossbeam_channel::Sender<std::result::Result<(), String>>,
 }
 
 enum OrderedIngressEventV2 {
     Source(QueuedSourceUpdateV2),
     Dropped(DroppedSourceUpdateV2),
+    ReadinessBoundary(QueuedStreamBoundaryV2),
 }
 
 /// Bounded capture ingress used directly by the standalone V2 Yellowstone
@@ -3867,6 +3507,7 @@ struct PumpExactStateCaptureIngressV2 {
     queued_source_bytes: AtomicU64,
     peak_queued_source_bytes: AtomicU64,
     next_capture_sequence: AtomicU64,
+    readiness_boundary_sequence: AtomicU64,
     final_capture_sequence: AtomicU64,
     accepting: AtomicBool,
     active_capture_calls: AtomicUsize,
@@ -3916,6 +3557,7 @@ impl PumpExactStateCaptureIngressV2 {
             queued_source_bytes: AtomicU64::new(0),
             peak_queued_source_bytes: AtomicU64::new(0),
             next_capture_sequence: AtomicU64::new(0),
+            readiness_boundary_sequence: AtomicU64::new(V2_READINESS_BOUNDARY_SEQUENCE_UNSET),
             final_capture_sequence: AtomicU64::new(0),
             accepting: AtomicBool::new(true),
             active_capture_calls: AtomicUsize::new(0),
@@ -4113,7 +3755,7 @@ impl PumpExactStateCaptureIngressV2 {
 
     fn lifecycle(
         &self,
-        bootstrap_status: PumpExactStateBootstrapStatusV2,
+        readiness_status: PumpExactStateReadinessStatusV2,
     ) -> PumpExactStateCaptureSourceLifecycleV2 {
         let epoch = self.established_stream_epoch.load(Ordering::Acquire);
         PumpExactStateCaptureSourceLifecycleV2 {
@@ -4128,10 +3770,11 @@ impl PumpExactStateCaptureIngressV2 {
                 .source_workers_cleanly_stopped
                 .load(Ordering::Acquire),
             required_lane_first_slots: self.required_lane_readiness(),
-            bootstrap_status: match bootstrap_status {
-                PumpExactStateBootstrapStatusV2::Pending => "pending",
-                PumpExactStateBootstrapStatusV2::Complete => "complete",
-                PumpExactStateBootstrapStatusV2::Failed => "failed",
+            source_readiness_status: match readiness_status {
+                PumpExactStateReadinessStatusV2::Pending => "pending",
+                PumpExactStateReadinessStatusV2::Persisting => "persisting",
+                PumpExactStateReadinessStatusV2::Complete => "complete",
+                PumpExactStateReadinessStatusV2::Failed => "failed",
             }
             .to_owned(),
             fatal_capture_error: self.fatal_capture_reason().message().map(str::to_owned),
@@ -4147,15 +3790,84 @@ impl PumpExactStateCaptureIngressV2 {
         while self.active_capture_calls.load(Ordering::Acquire) != 0 {
             std::thread::yield_now();
         }
-        self.final_capture_sequence.store(
-            self.next_capture_sequence.load(Ordering::Acquire),
-            Ordering::Release,
-        );
+        self.final_capture_sequence
+            .store(self.current_capture_sequence_exclusive(), Ordering::Release);
         self.source_finished.store(true, Ordering::Release);
     }
 
-    fn next_capture_sequence_exclusive(&self) -> u64 {
-        self.next_capture_sequence.load(Ordering::Acquire)
+    fn current_capture_sequence_exclusive(&self) -> u64 {
+        loop {
+            let current = self.next_capture_sequence.load(Ordering::Acquire);
+            if current & V2_CAPTURE_SEQUENCE_RESERVING_BIT == 0 {
+                return current;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    fn allocate_source_capture_sequence(&self) -> Option<u64> {
+        loop {
+            let current = self.next_capture_sequence.load(Ordering::Acquire);
+            if current & V2_CAPTURE_SEQUENCE_RESERVING_BIT != 0 {
+                // The one-time control-plane reservation is only a pair of
+                // atomic stores.  Waiting here preserves lossless ordering;
+                // silently dropping an update during that interval would
+                // instead violate the prospective source contract.
+                std::hint::spin_loop();
+                continue;
+            }
+            if current >= V2_CAPTURE_SEQUENCE_RESERVING_BIT - 1 {
+                return None;
+            }
+            if self
+                .next_capture_sequence
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(current);
+            }
+        }
+    }
+
+    /// Reserve one position in the globally ordered ingress sequence for the
+    /// durable stream-readiness control record.  The returned value is the
+    /// exclusive source prefix bound into the raw record; source updates after
+    /// it receive strictly larger sequence numbers.
+    fn reserve_readiness_boundary_sequence(&self) -> u64 {
+        loop {
+            let current = self.next_capture_sequence.load(Ordering::Acquire);
+            if current & V2_CAPTURE_SEQUENCE_RESERVING_BIT != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            if current >= V2_CAPTURE_SEQUENCE_RESERVING_BIT - 1 {
+                // This cannot recover into a valid ordering domain.  The
+                // caller treats a zero/invalid boundary as a fail-closed
+                // capture error before a receipt can claim Complete.
+                return V2_READINESS_BOUNDARY_SEQUENCE_UNSET;
+            }
+            if self
+                .next_capture_sequence
+                .compare_exchange(
+                    current,
+                    current | V2_CAPTURE_SEQUENCE_RESERVING_BIT,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.readiness_boundary_sequence
+                    .store(current, Ordering::Release);
+                self.next_capture_sequence
+                    .store(current + 1, Ordering::Release);
+                return current;
+            }
+        }
+    }
+
+    fn readiness_boundary_sequence(&self) -> Option<u64> {
+        let sequence = self.readiness_boundary_sequence.load(Ordering::Acquire);
+        (sequence != V2_READINESS_BOUNDARY_SEQUENCE_UNSET).then_some(sequence)
     }
 
     fn try_begin_capture(&self) -> Option<PumpExactStateCaptureAdmissionGuardV2<'_>> {
@@ -4170,21 +3882,6 @@ impl PumpExactStateCaptureIngressV2 {
         Some(PumpExactStateCaptureAdmissionGuardV2 {
             active_capture_calls: &self.active_capture_calls,
         })
-    }
-
-    async fn wait_for_stream_established(&self, timeout: Duration) -> Result<u64> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let epoch = self.established_stream_epoch.load(Ordering::Acquire);
-            if self.stream_established.load(Ordering::Acquire) && epoch != 0 {
-                return Ok(epoch);
-            }
-            tokio::time::timeout_at(deadline, self.stream_ready.notified())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("V2 source stream did not establish before bootstrap deadline")
-                })?;
-        }
     }
 
     async fn wait_for_required_source_lanes(
@@ -4207,7 +3904,7 @@ impl PumpExactStateCaptureIngressV2 {
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!(
-                        "V2 source did not admit transaction/account/slot/block-meta/full-block evidence before bootstrap deadline"
+                        "V2 source did not admit transaction/account/slot/block-meta/full-block evidence before readiness deadline"
                     )
                 })?;
         }
@@ -4279,7 +3976,14 @@ impl PumpResearchSourceSinkV1 for PumpExactStateCaptureIngressV2 {
                 return;
             }
         };
-        let capture_sequence = self.next_capture_sequence.fetch_add(1, Ordering::AcqRel);
+        let Some(capture_sequence) = self.allocate_source_capture_sequence() else {
+            self.record_fatal_capture_error(PumpExactStateCaptureFatalReasonV2::WriterFailure);
+            self.source_worker_failed(
+                "V2 source capture sequence exhausted its reserved ordering domain".to_owned(),
+            );
+            self.cancel_source_from_writer_if_fatal();
+            return;
+        };
         self.source_updates_received.fetch_add(1, Ordering::Relaxed);
         let dropped = DroppedSourceUpdateV2 {
             capture_sequence,
@@ -4359,15 +4063,15 @@ impl PumpResearchSourceSinkV1 for PumpExactStateCaptureIngressV2 {
     }
 }
 
-/// V2 writer/coordinator.  The bootstrap has a separate bounded queue because
-/// a large initial snapshot must never block the Yellowstone receive task.
-/// A bootstrap producer may wait on its own queue outside the hot path; if the
-/// source queue overflows while that happens, the run records a gap and fails
-/// closed rather than silently dropping source data.
+/// V2 writer/coordinator.  The stream-readiness boundary has a one-item
+/// control lane so the Yellowstone receive task never blocks on persistence.
+/// The control plane waits for a durable acknowledgement before it starts the
+/// cohort timer; any queue failure, timeout, second boundary, or missing seal
+/// fails the capture closed.
 pub(crate) struct PumpExactStateCaptureCoordinatorV2 {
     ingress: Arc<PumpExactStateCaptureIngressV2>,
-    bootstrap_tx: crossbeam_channel::Sender<QueuedBootstrapRecordV2>,
-    bootstrap_status: Arc<AtomicU8>,
+    readiness_tx: crossbeam_channel::Sender<QueuedStreamBoundaryV2>,
+    readiness_status: Arc<AtomicU8>,
     join: Mutex<Option<JoinHandle<()>>>,
     progress: Arc<Mutex<PumpExactStateWriterSummaryV2>>,
 }
@@ -4379,14 +4083,13 @@ impl PumpExactStateCaptureCoordinatorV2 {
         capture_contract_sha256: ghost_core::pump_research_tape::PumpResearchStorageHashV1,
         queue_capacity: usize,
         source_queue_max_bytes: u64,
-        bootstrap_queue_capacity: usize,
         flush_interval: Duration,
         segment_max_bytes: u64,
         segment_max_duration: Duration,
         max_raw_bytes: u64,
         min_free_bytes: u64,
     ) -> Result<Self> {
-        if queue_capacity == 0 || bootstrap_queue_capacity == 0 || source_queue_max_bytes == 0 {
+        if queue_capacity == 0 || source_queue_max_bytes == 0 {
             bail!("V2 capture queue capacities and source byte capacity must be greater than zero");
         }
         if max_raw_bytes == 0 || min_free_bytes == 0 {
@@ -4394,7 +4097,7 @@ impl PumpExactStateCaptureCoordinatorV2 {
         }
         let (data_tx, data_rx) = crossbeam_channel::bounded(queue_capacity);
         let (control_tx, control_rx) = crossbeam_channel::bounded(queue_capacity);
-        let (bootstrap_tx, bootstrap_rx) = crossbeam_channel::bounded(bootstrap_queue_capacity);
+        let (readiness_tx, readiness_rx) = crossbeam_channel::bounded(1);
         let capture_abort = CancellationToken::new();
         let ingress = Arc::new(PumpExactStateCaptureIngressV2::new(
             data_tx,
@@ -4404,12 +4107,12 @@ impl PumpExactStateCaptureCoordinatorV2 {
             capture_abort,
         ));
         let progress = Arc::new(Mutex::new(PumpExactStateWriterSummaryV2::default()));
-        let bootstrap_status = Arc::new(AtomicU8::new(
-            PumpExactStateBootstrapStatusV2::Pending as u8,
+        let readiness_status = Arc::new(AtomicU8::new(
+            PumpExactStateReadinessStatusV2::Pending as u8,
         ));
         let writer_ingress = Arc::clone(&ingress);
         let writer_progress = Arc::clone(&progress);
-        let writer_bootstrap_status = Arc::clone(&bootstrap_status);
+        let writer_readiness_status = Arc::clone(&readiness_status);
         let writer_raw_dir = raw_dir.to_path_buf();
         let join = thread::Builder::new()
             .name("pump-exact-state-tape-v2-writer".to_owned())
@@ -4421,10 +4124,10 @@ impl PumpExactStateCaptureCoordinatorV2 {
                         capture_contract_sha256,
                         data_rx,
                         control_rx,
-                        bootstrap_rx,
+                        readiness_rx,
                         Arc::clone(&writer_ingress),
                         Arc::clone(&writer_progress),
-                        Arc::clone(&writer_bootstrap_status),
+                        Arc::clone(&writer_readiness_status),
                         flush_interval,
                         segment_max_bytes,
                         segment_max_duration,
@@ -4462,8 +4165,8 @@ impl PumpExactStateCaptureCoordinatorV2 {
             .context("spawn bounded V2 raw writer thread")?;
         Ok(Self {
             ingress,
-            bootstrap_tx,
-            bootstrap_status,
+            readiness_tx,
+            readiness_status,
             join: Mutex::new(Some(join)),
             progress,
         })
@@ -4481,14 +4184,6 @@ impl PumpExactStateCaptureCoordinatorV2 {
         self.ingress.established_stream_epoch()
     }
 
-    pub(crate) fn next_capture_sequence_exclusive(&self) -> u64 {
-        self.ingress.next_capture_sequence_exclusive()
-    }
-
-    pub(crate) async fn wait_for_stream_established(&self, timeout: Duration) -> Result<u64> {
-        self.ingress.wait_for_stream_established(timeout).await
-    }
-
     pub(crate) async fn wait_for_required_source_lanes(
         &self,
         timeout: Duration,
@@ -4496,71 +4191,129 @@ impl PumpExactStateCaptureCoordinatorV2 {
         self.ingress.wait_for_required_source_lanes(timeout).await
     }
 
-    /// Queue one source-bootstrap record from the capture control plane.  This
-    /// method is forbidden after the snapshot has been sealed and uses a
-    /// bounded wait; it is never invoked by a Yellowstone receive task.
-    pub(crate) fn enqueue_bootstrap_record(
+    /// Persist the exactly-one source boundary and wait until the writer has
+    /// flushed and synchronised it.  This is control-plane work and is never
+    /// called on the gRPC receive task.
+    /// Arm the exactly-once readiness barrier before reserving its ordered
+    /// control position.  This keeps the marker out of the source-record
+    /// census while making its placement deterministic relative to every
+    /// source update admitted before or after it.
+    pub(crate) fn arm_stream_boundary(&self) -> Result<u64> {
+        self.readiness_status
+            .compare_exchange(
+                PumpExactStateReadinessStatusV2::Pending as u8,
+                PumpExactStateReadinessStatusV2::Persisting as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| anyhow::anyhow!("V2 stream-readiness boundary must occur exactly once"))?;
+        let sequence = self.ingress.reserve_readiness_boundary_sequence();
+        if sequence == V2_READINESS_BOUNDARY_SEQUENCE_UNSET {
+            self.fail_readiness();
+            bail!("V2 stream-readiness boundary exhausted its ordering domain");
+        }
+        Ok(sequence)
+    }
+
+    /// Queue an already armed stream boundary at its reserved global ordering
+    /// position and wait until it is durably written.  The caller must bind
+    /// that same position as `source_capture_sequence_exclusive`.
+    pub(crate) fn persist_armed_stream_boundary(
         &self,
-        stream_epoch: u64,
-        record: PumpExactStateRawRecordV2,
+        ordering_sequence: u64,
+        boundary: PumpExactStateProspectiveStreamBoundaryV2,
         timeout: Duration,
     ) -> Result<()> {
-        if !matches!(
-            PumpExactStateBootstrapStatusV2::from_raw(
-                self.bootstrap_status.load(Ordering::Acquire)
-            ),
-            PumpExactStateBootstrapStatusV2::Pending
-        ) {
-            bail!("V2 bootstrap records cannot be queued after the snapshot is sealed");
+        if timeout.is_zero() {
+            bail!("V2 stream-readiness persistence timeout must be greater than zero");
         }
-        self.bootstrap_tx
+        if PumpExactStateReadinessStatusV2::from_raw(self.readiness_status.load(Ordering::Acquire))
+            != PumpExactStateReadinessStatusV2::Persisting
+        {
+            bail!("V2 stream-readiness boundary was not armed before persistence");
+        }
+        if ordering_sequence != boundary.source_capture_sequence_exclusive {
+            self.fail_readiness();
+            bail!(
+                "V2 stream-readiness ordering sequence {} differs from exclusive source prefix {}",
+                ordering_sequence,
+                boundary.source_capture_sequence_exclusive
+            );
+        }
+        let (acknowledgement_tx, acknowledgement_rx) = crossbeam_channel::bounded(1);
+        self.readiness_tx
             .send_timeout(
-                QueuedBootstrapRecordV2 {
-                    stream_epoch,
-                    record,
+                QueuedStreamBoundaryV2 {
+                    ordering_sequence,
+                    stream_epoch: boundary.source_stream_epoch,
+                    boundary,
+                    acknowledgement: acknowledgement_tx,
                 },
                 timeout,
             )
             .map_err(|error| {
                 let reason = match error {
                     crossbeam_channel::SendTimeoutError::Timeout(_) => {
-                        PumpExactStateCaptureFatalReasonV2::BootstrapQueueTimeout
+                        PumpExactStateCaptureFatalReasonV2::ReadinessQueueTimeout
                     }
                     crossbeam_channel::SendTimeoutError::Disconnected(_) => {
-                        PumpExactStateCaptureFatalReasonV2::BootstrapQueueDisconnected
+                        PumpExactStateCaptureFatalReasonV2::ReadinessQueueDisconnected
                     }
                 };
-                self.ingress.record_fatal_capture_error(reason);
+                self.fail_readiness();
+                anyhow::anyhow!("V2 stream-readiness boundary enqueue failed: {reason:?}")
+            })?;
+        match acknowledgement_rx.recv_timeout(timeout) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.fail_readiness();
+                bail!("V2 stream-readiness boundary persistence failed: {error}");
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                self.ingress.record_fatal_capture_error(
+                    PumpExactStateCaptureFatalReasonV2::ReadinessQueueTimeout,
+                );
+                self.fail_readiness();
+                bail!("V2 stream-readiness boundary was not durably confirmed before timeout");
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                self.ingress.record_fatal_capture_error(
+                    PumpExactStateCaptureFatalReasonV2::ReadinessQueueDisconnected,
+                );
+                self.fail_readiness();
+                bail!("V2 stream-readiness acknowledgement lane disconnected");
+            }
+        }
+    }
+
+    pub(crate) fn fail_readiness(&self) {
+        loop {
+            let current = PumpExactStateReadinessStatusV2::from_raw(
+                self.readiness_status.load(Ordering::Acquire),
+            );
+            if matches!(
+                current,
+                PumpExactStateReadinessStatusV2::Complete | PumpExactStateReadinessStatusV2::Failed
+            ) {
+                break;
+            }
+            if self
+                .readiness_status
+                .compare_exchange(
+                    current as u8,
+                    PumpExactStateReadinessStatusV2::Failed as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.ingress.record_fatal_capture_error(
+                    PumpExactStateCaptureFatalReasonV2::ReadinessNotSealed,
+                );
                 self.ingress.cancel_source_from_writer_if_fatal();
-                anyhow::anyhow!("V2 bootstrap record enqueue failed: {reason:?}")
-            })
-    }
-
-    /// Seal a complete bootstrap only after its terminal receipt record was
-    /// enqueued.  The writer drains the already queued records before it can
-    /// declare a clean run.
-    pub(crate) fn seal_bootstrap_complete(&self) -> Result<()> {
-        self.bootstrap_status
-            .compare_exchange(
-                PumpExactStateBootstrapStatusV2::Pending as u8,
-                PumpExactStateBootstrapStatusV2::Complete as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_| anyhow::anyhow!("V2 bootstrap cannot transition to complete"))?;
-        Ok(())
-    }
-
-    pub(crate) fn fail_bootstrap(&self) {
-        let _ = self.bootstrap_status.compare_exchange(
-            PumpExactStateBootstrapStatusV2::Pending as u8,
-            PumpExactStateBootstrapStatusV2::Failed as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.ingress
-            .record_fatal_capture_error(PumpExactStateCaptureFatalReasonV2::BootstrapNotSealed);
-        self.ingress.cancel_source_from_writer_if_fatal();
+                break;
+            }
+        }
     }
 
     pub(crate) fn finish_source(&self) {
@@ -4569,20 +4322,20 @@ impl PumpExactStateCaptureCoordinatorV2 {
 
     pub(crate) fn source_lifecycle(&self) -> PumpExactStateCaptureSourceLifecycleV2 {
         self.ingress
-            .lifecycle(PumpExactStateBootstrapStatusV2::from_raw(
-                self.bootstrap_status.load(Ordering::Acquire),
+            .lifecycle(PumpExactStateReadinessStatusV2::from_raw(
+                self.readiness_status.load(Ordering::Acquire),
             ))
     }
 
     #[must_use]
     pub(crate) fn finish_and_join(&self) -> PumpExactStateWriterSummaryV2 {
         if matches!(
-            PumpExactStateBootstrapStatusV2::from_raw(
-                self.bootstrap_status.load(Ordering::Acquire)
+            PumpExactStateReadinessStatusV2::from_raw(
+                self.readiness_status.load(Ordering::Acquire)
             ),
-            PumpExactStateBootstrapStatusV2::Pending
+            PumpExactStateReadinessStatusV2::Pending | PumpExactStateReadinessStatusV2::Persisting
         ) {
-            self.fail_bootstrap();
+            self.fail_readiness();
         }
         self.ingress.finish();
         if let Some(handle) = self.join.lock().take() {
@@ -4631,10 +4384,10 @@ fn raw_writer_main_v2(
     capture_contract_sha256: ghost_core::pump_research_tape::PumpResearchStorageHashV1,
     data_rx: crossbeam_channel::Receiver<QueuedSourceUpdateV2>,
     control_rx: crossbeam_channel::Receiver<CaptureControlV2>,
-    bootstrap_rx: crossbeam_channel::Receiver<QueuedBootstrapRecordV2>,
+    readiness_rx: crossbeam_channel::Receiver<QueuedStreamBoundaryV2>,
     ingress: Arc<PumpExactStateCaptureIngressV2>,
     progress: Arc<Mutex<PumpExactStateWriterSummaryV2>>,
-    bootstrap_status: Arc<AtomicU8>,
+    readiness_status: Arc<AtomicU8>,
     flush_interval: Duration,
     segment_max_bytes: u64,
     segment_max_duration: Duration,
@@ -4655,6 +4408,7 @@ fn raw_writer_main_v2(
         LocalGapTracker::new(LocalCoverageGapReasonV1::IngressQueueSaturated);
     let mut pending = BTreeMap::<u64, OrderedIngressEventV2>::new();
     let mut next_capture_sequence = 0u64;
+    let mut received_stream_boundary = false;
 
     loop {
         ingress.cancel_source_from_writer_if_fatal();
@@ -4683,41 +4437,127 @@ fn raw_writer_main_v2(
             made_progress = true;
         }
         while let Some(event) = pending.remove(&next_capture_sequence) {
-            process_ordered_ingress_event_v2(
-                event,
-                &mut writer,
-                &mut local_gap_tracker,
-                &progress,
-                &ingress,
-            )?;
+            match event {
+                OrderedIngressEventV2::Source(source) => {
+                    process_ordered_ingress_event_v2(
+                        OrderedIngressEventV2::Source(source),
+                        &mut writer,
+                        &mut local_gap_tracker,
+                        &progress,
+                        &ingress,
+                    )?;
+                }
+                OrderedIngressEventV2::Dropped(dropped) => {
+                    process_ordered_ingress_event_v2(
+                        OrderedIngressEventV2::Dropped(dropped),
+                        &mut writer,
+                        &mut local_gap_tracker,
+                        &progress,
+                        &ingress,
+                    )?;
+                }
+                OrderedIngressEventV2::ReadinessBoundary(boundary) => {
+                    let result = (|| -> Result<()> {
+                        if boundary.ordering_sequence != next_capture_sequence
+                            || boundary.ordering_sequence
+                                != boundary.boundary.source_capture_sequence_exclusive
+                            || ingress.readiness_boundary_sequence()
+                                != Some(boundary.ordering_sequence)
+                        {
+                            bail!(
+                                "V2 stream-readiness boundary ordering marker does not match its exclusive source prefix"
+                            );
+                        }
+                        if ingress.established_stream_epoch() != Some(boundary.stream_epoch) {
+                            bail!(
+                                "V2 source stream epoch changed before stream-readiness boundary persistence"
+                            );
+                        }
+                        writer.write_stream_boundary(
+                            boundary.stream_epoch,
+                            boundary.boundary.clone(),
+                        )?;
+                        writer.flush_active_and_sync()?;
+                        readiness_status
+                            .compare_exchange(
+                                PumpExactStateReadinessStatusV2::Persisting as u8,
+                                PumpExactStateReadinessStatusV2::Complete as u8,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .map_err(|_| {
+                                anyhow::anyhow!(
+                                    "V2 writer cannot complete an unarmed stream-readiness boundary"
+                                )
+                            })?;
+                        let mut summary = progress.lock();
+                        summary.raw_bytes_written = writer.raw_bytes_written();
+                        summary.accepted_readiness_boundary_records = summary
+                            .accepted_readiness_boundary_records
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("V2 readiness boundary counter overflow")
+                            })?;
+                        if summary.accepted_readiness_boundary_records != 1 {
+                            bail!("V2 writer accepted more than one stream-readiness boundary");
+                        }
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            let _ = boundary.acknowledgement.send(Ok(()));
+                        }
+                        Err(error) => {
+                            readiness_status.store(
+                                PumpExactStateReadinessStatusV2::Failed as u8,
+                                Ordering::Release,
+                            );
+                            ingress.record_fatal_capture_error(
+                                PumpExactStateCaptureFatalReasonV2::ReadinessNotSealed,
+                            );
+                            ingress.cancel_source_from_writer_if_fatal();
+                            let message = format!("{error:#}");
+                            let _ = boundary.acknowledgement.send(Err(message.clone()));
+                            return Err(anyhow::anyhow!(message));
+                        }
+                    }
+                }
+            }
             next_capture_sequence = next_capture_sequence
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("V2 capture sequence overflow"))?;
             made_progress = true;
         }
-        // Admit at most one bootstrap item per loop after source sequencing,
-        // so a large snapshot cannot starve the primary source evidence path.
-        if let Ok(bootstrap) = bootstrap_rx.try_recv() {
-            writer.write_bootstrap_record(bootstrap.stream_epoch, bootstrap.record)?;
-            let mut summary = progress.lock();
-            summary.raw_bytes_written = writer.raw_bytes_written();
-            summary.accepted_bootstrap_records =
-                summary.accepted_bootstrap_records.saturating_add(1);
+        if let Ok(boundary) = readiness_rx.try_recv() {
+            if received_stream_boundary {
+                bail!("V2 writer received more than one stream-readiness boundary");
+            }
+            if boundary.ordering_sequence != boundary.boundary.source_capture_sequence_exclusive {
+                bail!(
+                    "V2 queued stream-readiness boundary ordering marker differs from its exclusive source prefix"
+                );
+            }
+            insert_ordered_ingress_event_v2(
+                &mut pending,
+                boundary.ordering_sequence,
+                OrderedIngressEventV2::ReadinessBoundary(boundary),
+            )?;
+            received_stream_boundary = true;
             made_progress = true;
         }
 
         if ingress.source_finished.load(Ordering::Acquire) {
             let status =
-                PumpExactStateBootstrapStatusV2::from_raw(bootstrap_status.load(Ordering::Acquire));
-            if matches!(status, PumpExactStateBootstrapStatusV2::Failed) {
-                bail!("V2 bootstrap failed before source closure");
+                PumpExactStateReadinessStatusV2::from_raw(readiness_status.load(Ordering::Acquire));
+            if matches!(status, PumpExactStateReadinessStatusV2::Failed) {
+                bail!("V2 stream readiness failed before source closure");
             }
-            if matches!(status, PumpExactStateBootstrapStatusV2::Complete)
+            if matches!(status, PumpExactStateReadinessStatusV2::Complete)
                 && next_capture_sequence == ingress.final_capture_sequence.load(Ordering::Acquire)
                 && pending.is_empty()
                 && data_rx.is_empty()
                 && control_rx.is_empty()
-                && bootstrap_rx.is_empty()
+                && readiness_rx.is_empty()
             {
                 local_gap_tracker.close_open_without_after();
                 persist_completed_local_gaps_v2(&mut local_gap_tracker, &mut writer, &progress)?;
@@ -4764,19 +4604,20 @@ fn raw_writer_main_v2(
             }
             if data_rx.is_empty() && control_rx.is_empty() && pending.is_empty() {
                 match status {
-                    PumpExactStateBootstrapStatusV2::Pending => {
-                        // The coordinator will mark the bootstrap failed or
-                        // complete before joining.  Do not spin: wait below.
+                    PumpExactStateReadinessStatusV2::Pending
+                    | PumpExactStateReadinessStatusV2::Persisting => {
+                        // The coordinator will confirm or fail the one
+                        // readiness boundary before joining.  Do not spin.
                     }
-                    PumpExactStateBootstrapStatusV2::Complete if bootstrap_rx.is_empty() => {
+                    PumpExactStateReadinessStatusV2::Complete if readiness_rx.is_empty() => {
                         bail!(
                             "V2 source finished at capture sequence {} but writer did not reach sequence {}",
                             ingress.final_capture_sequence.load(Ordering::Acquire),
                             next_capture_sequence
                         );
                     }
-                    PumpExactStateBootstrapStatusV2::Complete
-                    | PumpExactStateBootstrapStatusV2::Failed => {}
+                    PumpExactStateReadinessStatusV2::Complete
+                    | PumpExactStateReadinessStatusV2::Failed => {}
                 }
             }
         }
@@ -4810,12 +4651,24 @@ fn raw_writer_main_v2(
                     }
                     Err(_) => {}
                 },
-                recv(bootstrap_rx) -> bootstrap => match bootstrap {
-                    Ok(bootstrap) => {
-                        writer.write_bootstrap_record(bootstrap.stream_epoch, bootstrap.record)?;
-                        let mut summary = progress.lock();
-                        summary.raw_bytes_written = writer.raw_bytes_written();
-                        summary.accepted_bootstrap_records = summary.accepted_bootstrap_records.saturating_add(1);
+                recv(readiness_rx) -> boundary => match boundary {
+                    Ok(boundary) => {
+                        if received_stream_boundary {
+                            bail!("V2 writer received more than one stream-readiness boundary");
+                        }
+                        if boundary.ordering_sequence
+                            != boundary.boundary.source_capture_sequence_exclusive
+                        {
+                            bail!(
+                                "V2 queued stream-readiness boundary ordering marker differs from its exclusive source prefix"
+                            );
+                        }
+                        insert_ordered_ingress_event_v2(
+                            &mut pending,
+                            boundary.ordering_sequence,
+                            OrderedIngressEventV2::ReadinessBoundary(boundary),
+                        )?;
+                        received_stream_boundary = true;
                     }
                     Err(_) => {}
                 },
@@ -4886,6 +4739,9 @@ fn process_ordered_ingress_event_v2(
                 local_boundary_from_raw_v2(&dropped.boundary),
                 dropped.queue_high_water,
             );
+        }
+        OrderedIngressEventV2::ReadinessBoundary(_) => {
+            bail!("V2 stream-readiness boundary reached the source-event writer path")
         }
     }
     Ok(())
@@ -4958,7 +4814,7 @@ fn source_raw_boundary_v2(update: &PumpResearchSourceUpdateV1) -> PumpExactState
 
 /// Every V2 source update must belong to exactly one required lane.  A
 /// provider-side subscription that silently omits a lane is detected by the
-/// bootstrap readiness/census gates; an unexpected message shape is rejected
+/// stream-readiness/census gates; an unexpected message shape is rejected
 /// immediately rather than being treated as a harmless control message.
 fn required_source_lane_observation_v2(
     update: &PumpResearchSourceUpdateV1,
@@ -5085,10 +4941,12 @@ mod tests {
         export_prospective_exact_state_outcome_blind_windows_v2,
         qualify_prospective_exact_state_raw_run_v2, PumpExactStateCapabilityStatusV2,
     };
+    use base64::{engine::general_purpose, Engine as _};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use yellowstone_grpc_proto::prelude::{
         subscribe_update::UpdateOneof, CommitmentLevel, CompiledInstruction, InnerInstruction,
         InnerInstructions, Message as ProtoMessage, SubscribeUpdate, SubscribeUpdateAccount,
@@ -5100,6 +4958,78 @@ mod tests {
     const TEST_V2_MAX_RAW_BYTES: u64 = 64 * 1024 * 1024;
     const TEST_V2_MIN_FREE_BYTES: u64 = 1;
 
+    fn v2_http_header_end(bytes: &[u8]) -> Option<usize> {
+        bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+    }
+
+    async fn read_v2_mock_rpc_request(socket: &mut tokio::net::TcpStream) -> serde_json::Value {
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            if let Some(header_end) = v2_http_header_end(&bytes) {
+                let headers = std::str::from_utf8(&bytes[..header_end])
+                    .expect("mock RPC request headers must be UTF-8");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("valid content length"))
+                    })
+                    .expect("mock RPC request must have Content-Length");
+                if bytes.len() >= header_end + content_length {
+                    return serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                        .expect("mock RPC body must be JSON");
+                }
+            }
+            let read = socket
+                .read(&mut buffer)
+                .await
+                .expect("read mock ProgramData RPC request");
+            assert_ne!(read, 0, "mock ProgramData RPC peer closed before a request");
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+    }
+
+    async fn write_v2_mock_rpc_response(
+        socket: &mut tokio::net::TcpStream,
+        request_id: serde_json::Value,
+        context_slot: u64,
+        account_data: &[u8],
+    ) {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "context": { "slot": context_slot },
+                "value": {
+                    "lamports": 1u64,
+                    "data": [general_purpose::STANDARD.encode(account_data), "base64"],
+                    "owner": bpf_loader_upgradeable::id().to_string(),
+                    "executable": false,
+                    "rentEpoch": 0u64,
+                },
+            },
+            "id": request_id,
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write mock ProgramData RPC response");
+        socket
+            .shutdown()
+            .await
+            .expect("close mock ProgramData RPC response");
+    }
+
     fn source_update(account: SubscribeUpdateAccount) -> PumpResearchSourceUpdateV1 {
         PumpResearchSourceUpdateV1 {
             provider_id: "primary-test".to_owned(),
@@ -5107,7 +5037,7 @@ mod tests {
             ingress_wall_ts_ms: 1_700_000_000_000,
             ingress_monotonic_ts_ms: 42,
             update: SubscribeUpdate {
-                filters: vec!["pump_research_exact_state_v2_all_pump_owned".to_owned()],
+                filters: vec!["pump_research_exact_state_v2_bonding_curves".to_owned()],
                 update_oneof: Some(UpdateOneof::Account(account)),
             },
         }
@@ -5160,26 +5090,6 @@ mod tests {
             .into_iter()
             .max()
             .expect("non-empty required lane slot set"),
-        }
-    }
-
-    fn bootstrap_snapshot_for_test(
-        finalized_context_slot: u64,
-    ) -> PumpExactStateBootstrapSnapshotV2 {
-        let response_bytes = b"{\"jsonrpc\":\"2.0\"}".to_vec();
-        let response_blake3 = hash_bytes_v2(&response_bytes);
-        PumpExactStateBootstrapSnapshotV2 {
-            snapshot_id_blake3: response_blake3,
-            started_wall_ts_ms: 10,
-            started_monotonic_ts_ms: 11,
-            finalized_context_slot,
-            response_sha256: sha256_storage_hash_v2(&response_bytes),
-            response_blake3,
-            response_bytes,
-            accounts: Vec::new(),
-            account_set_blake3: ghost_core::pump_research_tape::PumpResearchStorageHashV1::from(
-                [7; 32],
-            ),
         }
     }
 
@@ -5262,6 +5172,17 @@ mod tests {
     }
 
     fn pump_owned_account(pubkey: Pubkey, owner: Pubkey, data: Vec<u8>) -> SubscribeUpdateAccount {
+        let data = if pubkey
+            == Pubkey::from_str(PUMP_RESEARCH_PUMP_GLOBAL_BASE58_V1)
+                .expect("canonical Pump Global test pubkey")
+            || data.starts_with(&BONDING_CURVE_DISC)
+        {
+            data
+        } else {
+            let mut canonical = BONDING_CURVE_DISC.to_vec();
+            canonical.extend_from_slice(&data);
+            canonical
+        };
         SubscribeUpdateAccount {
             account: Some(SubscribeUpdateAccountInfo {
                 pubkey: pubkey.to_bytes().to_vec(),
@@ -5495,7 +5416,7 @@ mod tests {
                     FixtureProjectionCorruptionV2::AccountEvidenceClass,
                     PumpExactStateRawRecordV2::PumpOwnedAccountUpdate(update),
                 ) if update.slot == 103 => {
-                    update.evidence_class = PumpExactStateAccountEvidenceClassV2::OtherPumpOwned;
+                    update.evidence_class = PumpExactStateAccountEvidenceClassV2::CanonicalGlobal;
                     applied = true;
                 }
                 (
@@ -5909,7 +5830,7 @@ mod tests {
         let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("pinned Pump program");
         fixture_source_update_v2(
             SubscribeUpdate {
-                filters: vec!["pump_research_exact_state_v2_all_pump_owned".to_owned()],
+                filters: vec!["pump_research_exact_state_v2_bonding_curves".to_owned()],
                 update_oneof: Some(UpdateOneof::Account(SubscribeUpdateAccount {
                     account: Some(SubscribeUpdateAccountInfo {
                         pubkey: bonding_curve.to_bytes().to_vec(),
@@ -6071,88 +5992,22 @@ mod tests {
         )
     }
 
-    fn write_bootstrap_boundary_for_qualified_export_fixture_v2(
+    fn write_stream_boundary_for_qualified_export_fixture_v2(
         writer: &mut PumpExactStateRawSegmentWriterV2,
-        semantics: &PumpExactStateSemanticsAuthorityV2,
         readiness: PumpExactStateSourceReadinessV2,
         source_capture_sequence_exclusive: u64,
     ) {
-        let finalized_context_slot = readiness.source_readiness_slot;
-        let response_bytes = serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "pump_exact_state_v2_bootstrap",
-            "result": {"context": {"slot": finalized_context_slot}, "value": []}
-        }))
-        .expect("serialize fixture bootstrap response");
-        let response_blake3 = hash_bytes_v2(&response_bytes);
-        let empty_account_set = hash_bytes_v2(&[]);
         writer
-            .write_bootstrap_record(
+            .write_stream_boundary(
                 1,
-                PumpExactStateRawRecordV2::BootstrapSnapshotStarted(
-                    PumpExactStateBootstrapSnapshotStartedV2 {
-                        snapshot_id_blake3: response_blake3,
-                        provider_id: "qualified-export-fixture".to_owned(),
-                        pump_program_id: PumpResearchStoragePubkeyV1::from(
-                            semantics.program_id.to_bytes(),
-                        ),
-                        commitment: PumpExactStateBootstrapCommitmentV2::Finalized,
-                        source_stream_epoch_at_start: 1,
-                        started_wall_ts_ms: 1_000,
-                        started_monotonic_ts_ms: 1_000,
-                    },
-                ),
-            )
-            .expect("write fixture bootstrap start");
-        writer
-            .write_bootstrap_record(
-                1,
-                PumpExactStateRawRecordV2::BootstrapResponseChunk(
-                    PumpExactStateBootstrapResponseChunkV2 {
-                        snapshot_id_blake3: response_blake3,
-                        chunk_index: 0,
-                        bytes: response_bytes.clone(),
-                    },
-                ),
-            )
-            .expect("write fixture bootstrap response");
-        writer
-            .write_bootstrap_record(
-                1,
-                PumpExactStateRawRecordV2::BootstrapSnapshotCompleted(
-                    PumpExactStateBootstrapSnapshotCompletedV2 {
-                        snapshot_id_blake3: response_blake3,
-                        finalized_context_slot,
-                        response_sha256: sha256_storage_hash_v2(&response_bytes),
-                        response_blake3,
-                        response_bytes: u64::try_from(response_bytes.len())
-                            .expect("fixture bootstrap bytes fit u64"),
-                        response_chunk_count: 1,
-                        account_count: 0,
-                        account_set_blake3: empty_account_set,
-                        source_stream_epoch_at_completion: 1,
-                        completed_wall_ts_ms: 1_001,
-                        completed_monotonic_ts_ms: 1_001,
-                    },
-                ),
-            )
-            .expect("write fixture bootstrap completion");
-        writer
-            .write_bootstrap_record(
-                1,
-                PumpExactStateRawRecordV2::ProspectiveReadinessBoundary(
-                    PumpExactStateProspectiveReadinessBoundaryV2 {
-                        snapshot_id_blake3: response_blake3,
-                        finalized_context_slot,
-                        source_readiness: readiness,
-                        finalized_context_slot_covers_source_readiness: true,
-                        source_stream_epoch: 1,
-                        source_capture_sequence_exclusive,
-                        cohort_slots_strictly_after: finalized_context_slot,
-                        sealed_wall_ts_ms: 1_002,
-                        sealed_monotonic_ts_ms: 1_002,
-                    },
-                ),
+                PumpExactStateProspectiveStreamBoundaryV2 {
+                    cohort_slots_strictly_after: readiness.source_readiness_slot,
+                    source_readiness: readiness,
+                    source_stream_epoch: 1,
+                    source_capture_sequence_exclusive,
+                    sealed_wall_ts_ms: 1_002,
+                    sealed_monotonic_ts_ms: 1_002,
+                },
             )
             .expect("write fixture readiness boundary");
     }
@@ -6259,47 +6114,47 @@ mod tests {
 
         writer
             .write_source(
-                1,
-                fixture_apply_time_variant_v2(fixture_slot_source_v2(102, 101, 1_000), variant, 1),
+                0,
+                fixture_apply_time_variant_v2(fixture_slot_source_v2(102, 101, 1_000), variant, 0),
             )
             .expect("write fixture first Slot lane");
         writer
             .write_source(
-                2,
+                1,
                 fixture_apply_time_variant_v2(
                     fixture_block_meta_source_v2(102, 101, 1_000),
                     variant,
-                    2,
+                    1,
                 ),
             )
             .expect("write fixture first BlockMeta lane");
         writer
             .write_source(
-                3,
+                2,
                 fixture_apply_time_variant_v2(
                     fixture_full_block_source_v2(102, 101, pre_cohort_buy.clone(), 1_000),
                     variant,
-                    3,
+                    2,
                 ),
             )
             .expect("write fixture first full block");
         writer
             .write_source(
-                4,
+                3,
                 fixture_apply_time_variant_v2(
                     fixture_account_source_v2(curve, pre_state, 102, 1, None, 1_000),
                     variant,
-                    4,
+                    3,
                 ),
             )
             .expect("write fixture first account lane");
         writer
             .write_source(
-                5,
+                4,
                 fixture_apply_time_variant_v2(
                     fixture_transaction_source_v2(pre_cohort_buy, 102, 1_000),
                     variant,
-                    5,
+                    4,
                 ),
             )
             .expect("write fixture first transaction lane");
@@ -6312,12 +6167,7 @@ mod tests {
             first_full_block_slot: 102,
             source_readiness_slot: 102,
         };
-        write_bootstrap_boundary_for_qualified_export_fixture_v2(
-            &mut writer,
-            semantics,
-            readiness.clone(),
-            6,
-        );
+        write_stream_boundary_for_qualified_export_fixture_v2(&mut writer, readiness.clone(), 5);
 
         let omit_whole_buy_block =
             matches!(variant, QualifiedExportFixtureVariantV2::OmitWholeBuyBlock);
@@ -6349,6 +6199,8 @@ mod tests {
         } else {
             (104, 103, 105, 104)
         };
+        // PRXTAPE3 reserves the boundary's own ordering position (5), so the
+        // first source record in the prospective cohort begins at 6.
         let mut next_sequence = 6u64;
         let mut projection_corruption_applied = false;
         macro_rules! write_fixture_source {
@@ -6522,7 +6374,9 @@ mod tests {
             .close_current(true)
             .expect("close complete local V2 raw fixture");
 
-        let source_update_count = next_sequence - 1;
+        let source_update_count = next_sequence
+            .checked_sub(1)
+            .expect("fixture boundary ordering marker must be reserved");
         let mut required_lane_census = writer.full_block_census(true);
         required_lane_census.transaction_messages = if omit_whole_buy_block { 2 } else { 3 };
         required_lane_census.account_updates = if omit_whole_buy_block || omit_buy_final_anchor {
@@ -6570,11 +6424,11 @@ mod tests {
             expected_program_data_hash_blake3: hex_bytes_v2(&semantics.expected_program_data_hash_blake3()),
             primary_provider_id: "qualified-export-fixture".to_owned(),
             grpc_endpoint_digest: digest_bytes_v2(b"fixture-grpc"),
-            bootstrap_rpc_endpoint_digest: digest_bytes_v2(b"fixture-bootstrap"),
-            bootstrap_rpc_auth_mode: "fixture-no-auth".to_owned(),
+            program_data_rpc_endpoint_digest: digest_bytes_v2(b"fixture-program-data-rpc"),
+            program_data_rpc_auth_mode: "fixture-no-auth".to_owned(),
             pump_program_id: semantics.program_id.to_string(),
             program_data_at_start: program_data.clone(),
-            cohort_capture_wall_ms: 240_000,
+            cohort_capture_wall_ms: 1_800_000,
             min_free_bytes: TEST_V2_MIN_FREE_BYTES,
             max_raw_bytes: TEST_V2_MAX_RAW_BYTES,
             required_storage_bytes: TEST_V2_MIN_FREE_BYTES,
@@ -6591,18 +6445,17 @@ mod tests {
             run_id: run_id.to_owned(),
             status: PumpExactStateCaptureRunStatusV2::Complete,
             clean_shutdown: true,
-            bootstrap_finalized_context_slot: Some(102),
-            bootstrap_source_readiness: Some(readiness.clone()),
-            bootstrap_source_overlap_proven: true,
-            bootstrap_snapshot_attempt_count: 1,
-            bootstrap_completed: true,
+            source_readiness: Some(readiness.clone()),
+            readiness_boundary_persisted: true,
+            cohort_slots_strictly_after: Some(102),
+            readiness_completed: true,
             running_executable_at_completion: Some(running_executable),
             running_executable_unchanged: true,
             program_data_at_start: program_data.clone(),
             program_data_at_completion: Some(program_data),
             program_data_unchanged: true,
             cohort_capture_termination: Some(PumpExactStateCaptureTerminationV2::CohortWallDeadline),
-            cohort_capture_elapsed_ms: Some(240_000),
+            cohort_capture_elapsed_ms: Some(1_800_000),
             min_free_bytes: TEST_V2_MIN_FREE_BYTES,
             max_raw_bytes: TEST_V2_MAX_RAW_BYTES,
             output_filesystem_available_bytes_at_completion: Some(TEST_V2_MIN_FREE_BYTES),
@@ -6619,7 +6472,7 @@ mod tests {
                 source_queue_bytes_at_close: 0,
                 source_workers_cleanly_stopped: true,
                 required_lane_first_slots: Some(readiness),
-                bootstrap_status: "complete".to_owned(),
+                source_readiness_status: "complete".to_owned(),
                 fatal_capture_error: None,
                 source_worker_error: None,
             },
@@ -6627,7 +6480,7 @@ mod tests {
                 segments: writer.receipts().to_vec(),
                 raw_bytes_written: writer.raw_bytes_written(),
                 accepted_source_records: source_update_count,
-                accepted_bootstrap_records: 4,
+                accepted_readiness_boundary_records: 1,
                 required_lane_census,
                 persisted_ingress_gap_missing_events: 0,
                 persisted_ingress_gap_episodes: 0,
@@ -6636,7 +6489,7 @@ mod tests {
                 error: None,
             },
             segment_list: writer.receipts().to_vec(),
-            completion_wall_ms: 241_000,
+            completion_wall_ms: 1_801_000,
         };
         write_json_create_new_v2(&raw_dir.join("run_completion_receipt_v2.json"), &completion)
             .expect("write local V2 completion receipt");
@@ -6737,7 +6590,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn public_qualified_v2_raw_fixture_exports_a_complete_outcome_blind_window() {
+    fn public_prxtape3_complete_qualifies_and_exports_a_complete_outcome_blind_window() {
         let temporary = tempdir().expect("temporary V2 public-export fixture root");
         let semantics_path = prospective_v2_semantics_manifest_path_for_test();
         let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
@@ -6749,6 +6602,27 @@ mod tests {
             "qualified-public-export-fixture",
             &semantics,
             QualifiedExportFixtureVariantV2::Qualified,
+        );
+        let segment = fs::read(qualified_raw.join("segment_00000.bin"))
+            .expect("read PRXTAPE3 public fixture segment");
+        assert_eq!(
+            &segment
+                [..ghost_core::pump_research_exact_tape_v2::PUMP_EXACT_STATE_TAPE_SEGMENT_MAGIC_V2
+                    .len()],
+            &ghost_core::pump_research_exact_tape_v2::PUMP_EXACT_STATE_TAPE_SEGMENT_MAGIC_V2,
+            "public E2E must exercise the revised PRXTAPE3 storage contract"
+        );
+        let (_, raw_records) = decode_v2_segment(&qualified_raw.join("segment_00000.bin"));
+        assert_eq!(
+            raw_records
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    PumpExactStateRawRecordV2::ProspectiveStreamBoundary(_)
+                ))
+                .count(),
+            1,
+            "public E2E must retain exactly one five-lane readiness boundary"
         );
         let qualified_exact = temporary.path().join("qualified-exact");
         let qualified_summary = qualify_prospective_exact_state_raw_run_v2(
@@ -6775,6 +6649,15 @@ mod tests {
             qualified_receipt["successful_rooted_validated_event_transport_count"],
             serde_json::json!(2u64),
             "the public fixture must prove both real inner CreateEvent and TradeEvent transports"
+        );
+        assert_eq!(
+            qualified_receipt["exact_birth_count"],
+            serde_json::json!(1u64)
+        );
+        assert_eq!(
+            qualified_receipt["successful_rooted_exact_trade_with_both_states_count"],
+            serde_json::json!(1u64),
+            "the post-boundary Create anchor must serve as the streamed predecessor for Buy"
         );
 
         let qualified_windows = temporary.path().join("qualified-windows");
@@ -6876,6 +6759,48 @@ mod tests {
         );
         assert!(!unscoped_windows.exists());
         assert!(!temporary.path().join(".unscoped-windows.partial").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_schema_two_incomplete_run_is_rejected_before_exact_output_creation() {
+        let temporary = tempdir().expect("temporary schema-two raw fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for schema test");
+        let raw_dir = temporary.path().join("schema-two-incomplete-raw");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "schema-two-incomplete-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::Qualified,
+        );
+
+        let start_path = raw_dir.join("run_start_manifest_v2.json");
+        let mut start: serde_json::Value =
+            serde_json::from_slice(&fs::read(&start_path).expect("read PRXTAPE3 start manifest"))
+                .expect("parse PRXTAPE3 start manifest");
+        start["storage_format_version"] = serde_json::json!(2u16);
+        start["schema_version"] = serde_json::json!(2u16);
+        rewrite_private_fixture_json_v2(&start_path, &start);
+
+        let completion_path = raw_dir.join("run_completion_receipt_v2.json");
+        let mut completion: serde_json::Value = serde_json::from_slice(
+            &fs::read(&completion_path).expect("read PRXTAPE3 completion receipt"),
+        )
+        .expect("parse PRXTAPE3 completion receipt");
+        completion["storage_format_version"] = serde_json::json!(2u16);
+        completion["schema_version"] = serde_json::json!(2u16);
+        completion["status"] = serde_json::json!("incomplete");
+        rewrite_private_fixture_json_v2(&completion_path, &completion);
+
+        let exact_dir = temporary.path().join("schema-two-exact");
+        let error =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect_err("new qualifier must reject a historical PRXTAPE2 control contract");
+        assert!(format!("{error:#}").contains("schema/version is not accepted"));
+        assert!(!exact_dir.exists());
+        assert!(!temporary.path().join(".schema-two-exact.partial").exists());
     }
 
     #[cfg(unix)]
@@ -7370,25 +7295,25 @@ mod tests {
     }
 
     #[test]
-    fn v2_retains_unknown_pump_owned_account_as_raw_other_evidence() {
+    fn v2_rejects_pump_owned_account_outside_bonding_curve_or_global_contract() {
         let pump = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
-        let account = pump_owned_account(Pubkey::new_unique(), pump, vec![0xde, 0xad]);
-        let record = one_source_record(11, source_update(account))
-            .expect("convert all-Pump-owned source record");
-        let PumpExactStateRawRecordV2::PumpOwnedAccountUpdate(update) = record else {
-            panic!("expected Pump-owned account update");
+        let account = SubscribeUpdateAccount {
+            account: Some(SubscribeUpdateAccountInfo {
+                pubkey: Pubkey::new_unique().to_bytes().to_vec(),
+                lamports: 123,
+                owner: pump.to_bytes().to_vec(),
+                executable: false,
+                rent_epoch: 7,
+                data: vec![0xde, 0xad],
+                write_version: 9,
+                txn_signature: None,
+            }),
+            slot: 88,
+            is_startup: false,
         };
-        assert_eq!(
-            update.evidence_class,
-            PumpExactStateAccountEvidenceClassV2::OtherPumpOwned
-        );
-        assert_eq!(update.source.capture_sequence, 11);
-        assert_eq!(update.source.stream_epoch, 4);
-        assert_eq!(update.raw_account_data, vec![0xde, 0xad]);
-        assert_eq!(
-            update.raw_account_data_hash_blake3,
-            hash_bytes_v2(&[0xde, 0xad])
-        );
+        let error = one_source_record(11, source_update(account))
+            .expect_err("out-of-scope Pump account must fail the source contract");
+        assert!(format!("{error:#}").contains("outside canonical Global/BondingCurve scope"));
     }
 
     #[test]
@@ -7416,7 +7341,7 @@ mod tests {
             .expect("stored V2 source payload is a complete SubscribeUpdate");
         assert_eq!(
             decoded.filters,
-            vec!["pump_research_exact_state_v2_all_pump_owned".to_owned()]
+            vec!["pump_research_exact_state_v2_bonding_curves".to_owned()]
         );
         assert!(matches!(
             decoded.update_oneof,
@@ -7566,7 +7491,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_writer_publishes_an_independent_segment_with_other_pump_owned_evidence() {
+    fn v2_writer_publishes_an_independent_segment_with_canonical_curve_evidence() {
         let temporary = tempdir().expect("temporary raw root");
         let raw_dir = temporary.path().join("raw-v2");
         let mut writer = PumpExactStateRawSegmentWriterV2::new(
@@ -7607,7 +7532,7 @@ mod tests {
         assert!(matches!(
             &records[0],
             PumpExactStateRawRecordV2::PumpOwnedAccountUpdate(update)
-                if update.evidence_class == PumpExactStateAccountEvidenceClassV2::OtherPumpOwned
+                if update.evidence_class == PumpExactStateAccountEvidenceClassV2::CanonicalBondingCurve
         ));
         assert!(matches!(
             &records[1],
@@ -7876,465 +7801,137 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn v2_writer_keeps_bootstrap_records_in_the_same_epoch_chain_without_source_sequence() {
-        let temporary = tempdir().expect("temporary raw root");
-        let raw_dir = temporary.path().join("raw-v2");
-        let mut writer = PumpExactStateRawSegmentWriterV2::new(
-            raw_dir.clone(),
-            "prospective-exact-test".to_owned(),
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([5; 32]),
-            Duration::from_secs(60),
-            1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("create V2 writer");
-        writer
-            .write_bootstrap_record(
-                9,
-                PumpExactStateRawRecordV2::BootstrapSnapshotStarted(
-                    ghost_core::pump_research_exact_tape_v2::PumpExactStateBootstrapSnapshotStartedV2 {
-                        snapshot_id_blake3: ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([8; 32]),
-                        provider_id: "primary-test".to_owned(),
-                        pump_program_id: ghost_core::pump_research_tape::PumpResearchStoragePubkeyV1::from([7; 32]),
-                        commitment: ghost_core::pump_research_exact_tape_v2::PumpExactStateBootstrapCommitmentV2::Finalized,
-                        source_stream_epoch_at_start: 9,
-                        started_wall_ts_ms: 1,
-                        started_monotonic_ts_ms: 2,
-                    },
-                ),
-            )
-            .expect("write bootstrap boundary");
-        writer.close_current(true).expect("close V2 segment");
-        let (_, records) = decode_v2_segment(&raw_dir.join("segment_00000.bin"));
-        assert!(matches!(
-            records.first(),
-            Some(PumpExactStateRawRecordV2::BootstrapSnapshotStarted(_))
-        ));
-        assert_eq!(writer.receipts()[0].first_capture_sequence, None);
-        assert_eq!(writer.receipts()[0].last_capture_sequence, None);
-    }
-
-    fn bootstrap_started_record(epoch: u64) -> PumpExactStateRawRecordV2 {
-        PumpExactStateRawRecordV2::BootstrapSnapshotStarted(
-            ghost_core::pump_research_exact_tape_v2::PumpExactStateBootstrapSnapshotStartedV2 {
-                snapshot_id_blake3: ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([9; 32]),
-                provider_id: "primary-test".to_owned(),
-                pump_program_id: ghost_core::pump_research_tape::PumpResearchStoragePubkeyV1::from([7; 32]),
-                commitment: ghost_core::pump_research_exact_tape_v2::PumpExactStateBootstrapCommitmentV2::Finalized,
-                source_stream_epoch_at_start: epoch,
-                started_wall_ts_ms: 1,
-                started_monotonic_ts_ms: 2,
-            },
-        )
-    }
-
-    #[test]
-    fn v2_coordinator_requires_a_sealed_bootstrap_before_clean_completion() {
-        let temporary = tempdir().expect("temporary raw root");
-        let coordinator = PumpExactStateCaptureCoordinatorV2::start(
-            &temporary.path().join("raw-v2"),
+    fn start_test_capture_coordinator_v3(raw_dir: &Path) -> PumpExactStateCaptureCoordinatorV2 {
+        PumpExactStateCaptureCoordinatorV2::start(
+            raw_dir,
             "prospective-exact-test".to_owned(),
             ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([6; 32]),
             16,
             1024 * 1024,
-            16,
             Duration::from_millis(1),
             1024 * 1024,
             Duration::from_secs(60),
             TEST_V2_MAX_RAW_BYTES,
             TEST_V2_MIN_FREE_BYTES,
         )
-        .expect("start V2 coordinator");
-        let sink = coordinator.source_sink();
-        sink.source_stream_established(4);
+        .expect("start bounded PRXTAPE3 coordinator")
+    }
+
+    #[test]
+    fn v3_readiness_requires_all_lanes_and_one_durable_boundary_before_clean_close() {
+        let temporary = tempdir().expect("temporary PRXTAPE3 root");
+        let missing = start_test_capture_coordinator_v3(&temporary.path().join("missing-lane"));
+        let missing_sink = missing.source_sink();
+        missing_sink.source_stream_established(4);
         let pump = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
-        sink.try_capture(source_update(pump_owned_account(
+        missing_sink.try_capture(source_transaction_update(90, 1));
+        missing_sink.try_capture(source_update(pump_owned_account(
             Pubkey::new_unique(),
             pump,
             vec![1],
         )));
-        coordinator.finish_source();
-        let summary = coordinator.finish_and_join();
-        assert!(!summary.clean_shutdown);
-        assert!(summary
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("bootstrap")));
-        assert_eq!(coordinator.source_lifecycle().bootstrap_status, "failed");
-    }
+        missing_sink.try_capture(source_slot_update(90));
+        missing_sink.try_capture(source_block_meta_update(90));
+        missing.finish_source();
+        let missing_summary = missing.finish_and_join();
+        assert!(
+            !missing_summary.clean_shutdown,
+            "a source lacking any required lane must be incomplete"
+        );
+        assert_eq!(
+            missing.source_lifecycle().source_readiness_status,
+            "failed",
+            "the missing lane must prevent a clean cohort from starting"
+        );
 
-    #[test]
-    fn v2_coordinator_drains_source_and_bootstrap_records_before_clean_close() {
-        let temporary = tempdir().expect("temporary raw root");
-        let raw_dir = temporary.path().join("raw-v2");
-        let coordinator = PumpExactStateCaptureCoordinatorV2::start(
-            &raw_dir,
-            "prospective-exact-test".to_owned(),
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([6; 32]),
-            16,
-            1024 * 1024,
-            16,
-            Duration::from_millis(1),
-            1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("start V2 coordinator");
+        let raw_dir = temporary.path().join("complete-five-lane");
+        let coordinator = start_test_capture_coordinator_v3(&raw_dir);
         let sink = coordinator.source_sink();
         sink.source_stream_established(4);
-        let pump = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
-        sink.try_capture(source_transaction_update(101, 0x11));
-        let mut account = pump_owned_account(Pubkey::new_unique(), pump, vec![2]);
-        account.slot = 102;
-        sink.try_capture(source_update(account));
-        sink.try_capture(source_slot_update(103));
-        sink.try_capture(source_block_meta_update(104));
-        sink.try_capture(source_full_block_update(105));
-        coordinator
-            .enqueue_bootstrap_record(4, bootstrap_started_record(4), Duration::from_secs(1))
-            .expect("queue bootstrap record");
-        coordinator
-            .seal_bootstrap_complete()
-            .expect("seal bootstrap");
-        coordinator.finish_source();
-        let summary = coordinator.finish_and_join();
-        assert!(summary.clean_shutdown, "{summary:?}");
-        assert_eq!(summary.accepted_source_records, 5);
-        assert_eq!(summary.accepted_bootstrap_records, 1);
-        assert!(summary.required_lane_census.all_required_lanes_observed());
-        assert_eq!(summary.required_lane_census.transaction_messages, 1);
-        assert_eq!(summary.required_lane_census.account_updates, 1);
-        assert_eq!(summary.required_lane_census.slot_updates, 1);
-        assert_eq!(summary.required_lane_census.block_meta_updates, 1);
-        assert_eq!(summary.required_lane_census.full_blocks_started, 1);
-        assert_eq!(summary.required_lane_census.full_blocks_completed, 1);
-        assert_eq!(summary.segments.len(), 1);
-        assert!(raw_dir.join("segment_00000.bin").exists());
-        assert_eq!(coordinator.source_lifecycle().bootstrap_status, "complete");
-    }
+        sink.try_capture(source_transaction_update(91, 2));
+        sink.try_capture(source_update(pump_owned_account(
+            Pubkey::new_unique(),
+            pump,
+            vec![2],
+        )));
+        sink.try_capture(source_slot_update(91));
+        sink.try_capture(source_block_meta_update(91));
+        sink.try_capture(source_full_block_update(91));
 
-    #[test]
-    fn v2_coordinator_marks_a_run_unclean_when_a_required_lane_is_missing() {
-        let temporary = tempdir().expect("temporary raw root");
-        let raw_dir = temporary.path().join("raw-v2");
-        let coordinator = PumpExactStateCaptureCoordinatorV2::start(
-            &raw_dir,
-            "prospective-exact-test".to_owned(),
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([6; 32]),
-            16,
-            1024 * 1024,
-            16,
-            Duration::from_millis(1),
-            1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("start V2 coordinator");
-        let sink = coordinator.source_sink();
-        sink.source_stream_established(4);
-        let pump = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
-        sink.try_capture(source_transaction_update(101, 0x12));
-        let mut account = pump_owned_account(Pubkey::new_unique(), pump, vec![3]);
-        account.slot = 102;
-        sink.try_capture(source_update(account));
-        sink.try_capture(source_slot_update(103));
-        sink.try_capture(source_block_meta_update(104));
-        coordinator
-            .enqueue_bootstrap_record(4, bootstrap_started_record(4), Duration::from_secs(1))
-            .expect("queue bootstrap record");
-        coordinator
-            .seal_bootstrap_complete()
-            .expect("seal bootstrap");
-        coordinator.finish_source();
-
-        let summary = coordinator.finish_and_join();
-        assert!(!summary.clean_shutdown, "{summary:?}");
-        assert!(!summary.required_lane_census.all_required_lanes_observed());
-        assert_eq!(summary.required_lane_census.full_blocks_started, 0);
-        assert_eq!(summary.required_lane_census.full_blocks_completed, 0);
-        assert!(summary
-            .error
-            .as_deref()
-            .is_some_and(|error| { error.contains("required source lane census is incomplete") }));
-        let (_, records) = decode_v2_segment(&raw_dir.join("segment_00000.bin"));
-        assert!(matches!(
-            records.last(),
-            Some(PumpExactStateRawRecordV2::SegmentClosed(footer)) if !footer.clean_shutdown
-        ));
-    }
-
-    #[test]
-    fn v2_source_readiness_requires_every_lane_and_uses_the_latest_first_slot() {
-        let temporary = tempdir().expect("temporary raw root");
-        let coordinator = PumpExactStateCaptureCoordinatorV2::start(
-            &temporary.path().join("raw-v2"),
-            "prospective-exact-test".to_owned(),
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([6; 32]),
-            16,
-            1024 * 1024,
-            16,
-            Duration::from_millis(1),
-            1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("start V2 coordinator");
-        let sink = coordinator.source_sink();
-        sink.source_stream_established(4);
-        let pump = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
-        sink.try_capture(source_transaction_update(101, 0x13));
-        let mut account = pump_owned_account(Pubkey::new_unique(), pump, vec![4]);
-        account.slot = 102;
-        sink.try_capture(source_update(account));
-        sink.try_capture(source_slot_update(103));
-        sink.try_capture(source_block_meta_update(104));
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("build current-thread Tokio runtime");
-        let error = runtime
-            .block_on(coordinator.wait_for_required_source_lanes(Duration::from_millis(10)))
-            .expect_err("missing full-block lane must not establish source readiness");
-        assert!(error
-            .to_string()
-            .contains("transaction/account/slot/block-meta/full-block"));
-
-        sink.try_capture(source_full_block_update(105));
-        let readiness = runtime
-            .block_on(coordinator.wait_for_required_source_lanes(Duration::from_secs(1)))
-            .expect("every required lane establishes readiness");
-        assert_eq!(readiness.first_transaction_slot, 101);
-        assert_eq!(readiness.first_account_update_slot, 102);
-        assert_eq!(readiness.first_slot_update_slot, 103);
-        assert_eq!(readiness.first_block_meta_slot, 104);
-        assert_eq!(readiness.first_full_block_slot, 105);
-        assert_eq!(readiness.source_readiness_slot, 105);
-
-        coordinator.fail_bootstrap();
-        coordinator.finish_source();
-        let summary = coordinator.finish_and_join();
-        assert!(!summary.clean_shutdown);
-    }
-
-    #[test]
-    fn v2_bootstrap_retries_a_stale_finalized_snapshot_within_the_original_budget() {
-        let temporary = tempdir().expect("temporary raw root");
-        let coordinator = PumpExactStateCaptureCoordinatorV2::start(
-            &temporary.path().join("raw-v2"),
-            "prospective-exact-test".to_owned(),
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([6; 32]),
-            16,
-            1024 * 1024,
-            16,
-            Duration::from_millis(1),
-            1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("start V2 coordinator");
-        let sink = coordinator.source_sink();
-        sink.source_stream_established(4);
-        let pump = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
-        sink.try_capture(source_transaction_update(101, 0x14));
-        let mut account = pump_owned_account(Pubkey::new_unique(), pump, vec![5]);
-        account.slot = 102;
-        sink.try_capture(source_update(account));
-        sink.try_capture(source_slot_update(103));
-        sink.try_capture(source_block_meta_update(104));
-        sink.try_capture(source_full_block_update(105));
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build Tokio runtime with local TCP support");
-        let bootstrap = runtime.block_on(async {
-            use tokio::io::AsyncWriteExt as _;
-
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind local bootstrap fixture listener");
-            let endpoint = format!(
-                "http://{}",
-                listener
-                    .local_addr()
-                    .expect("read local bootstrap fixture address")
-            );
-            let stale = bootstrap_response_bytes_at_slot(PUMP_FUN_PROGRAM_ID, "base64", 104);
-            let overlapping =
-                bootstrap_response_bytes_at_slot(PUMP_FUN_PROGRAM_ID, "base64", 105);
-            let server = tokio::spawn(async move {
-                for body in [stale, overlapping] {
-                    let (mut stream, _) = listener
-                        .accept()
-                        .await
-                        .expect("accept local bootstrap request");
-                    let response_head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len(),
-                    );
-                    stream
-                        .write_all(response_head.as_bytes())
-                        .await
-                        .expect("write local bootstrap response head");
-                    stream
-                        .write_all(&body)
-                        .await
-                        .expect("write local bootstrap response body");
-                    stream
-                        .shutdown()
-                        .await
-                        .expect("close local bootstrap response");
-                }
-            });
-
-            let bootstrap = fetch_bootstrap_with_source_overlap_v2(
+        let runtime = tokio::runtime::Runtime::new().expect("test Tokio runtime");
+        let seal = runtime
+            .block_on(persist_stream_readiness_boundary_v2(
                 &coordinator,
-                &endpoint,
-                None,
-                "x-test-token",
-                Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID"),
-                Duration::from_secs(2),
-                1024 * 1024,
-            )
-            .await
-            .expect("retry stale finalized response until source overlap exists");
-            server.await.expect("join local bootstrap fixture server");
-            bootstrap
-        });
-        assert_eq!(bootstrap.snapshot_attempt_count, 2);
-        assert_eq!(bootstrap.snapshot.finalized_context_slot, 105);
-        assert_eq!(bootstrap.source_readiness.source_readiness_slot, 105);
+                Duration::from_secs(1),
+            ))
+            .expect("five accepted lanes must seal one durable readiness boundary");
+        assert_eq!(seal.cohort_slots_strictly_after, 91);
+        assert_eq!(
+            seal.source_readiness,
+            source_readiness_for_test(91, 88, 91, 91, 91)
+        );
 
-        coordinator.fail_bootstrap();
+        let duplicate = coordinator.arm_stream_boundary();
+        assert!(duplicate
+            .expect_err("a second stream boundary must be rejected")
+            .to_string()
+            .contains("exactly once"));
+
+        // A source update admitted after the durable acknowledgement must be
+        // ordered after the reserved boundary marker, never physically ahead
+        // of it on the data lane.
+        sink.try_capture(source_slot_update(92));
         coordinator.finish_source();
-        assert!(!coordinator.finish_and_join().clean_shutdown);
-    }
-
-    #[test]
-    fn v2_writer_admits_bootstrap_during_a_busy_source_backlog() {
-        const SOURCE_BACKLOG: usize = V2_WRITER_INGRESS_DRAIN_BUDGET_PER_LANE * 2;
-        let temporary = tempdir().expect("temporary raw root");
-        let raw_dir = temporary.path().join("raw-v2");
-        let (data_tx, data_rx) = crossbeam_channel::bounded(SOURCE_BACKLOG + 1);
-        let (control_tx, control_rx) = crossbeam_channel::bounded(SOURCE_BACKLOG + 1);
-        let (bootstrap_tx, bootstrap_rx) = crossbeam_channel::bounded(1);
-        let ingress = Arc::new(PumpExactStateCaptureIngressV2::new(
-            data_tx,
-            control_tx,
-            SOURCE_BACKLOG + 1,
-            64 * 1024 * 1024,
-            CancellationToken::new(),
-        ));
-        let pump = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
-        for sequence in 0..SOURCE_BACKLOG {
-            let source = source_update(pump_owned_account(
-                Pubkey::new_unique(),
-                pump,
-                vec![u8::try_from(sequence % 256).expect("test byte")],
-            ));
-            let required_lane = required_source_lane_observation_v2(&source)
-                .expect("source fixture belongs to required account lane");
-            let queued = queued_source_update_v2(
-                u64::try_from(sequence).expect("sequence fits u64"),
-                source,
-                required_lane,
-            )
-            .expect("serialize bounded V2 source update");
-            assert!(
-                ingress.try_reserve_source_bytes(queued.byte_cost),
-                "test source update must fit the explicit byte budget"
-            );
-            ingress
-                .data_tx
-                .send(queued)
-                .expect("preload bounded source backlog");
-        }
-        bootstrap_tx
-            .send(QueuedBootstrapRecordV2 {
-                stream_epoch: 4,
-                record: bootstrap_started_record(4),
-            })
-            .expect("preload bootstrap record");
-        let bootstrap_status = Arc::new(AtomicU8::new(
-            PumpExactStateBootstrapStatusV2::Complete as u8,
-        ));
-        ingress
-            .final_capture_sequence
-            .store(SOURCE_BACKLOG as u64, Ordering::Release);
-        ingress.source_finished.store(true, Ordering::Release);
-        let progress = Arc::new(Mutex::new(PumpExactStateWriterSummaryV2::default()));
-        raw_writer_main_v2(
-            &raw_dir,
-            "prospective-exact-test",
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([34; 32]),
-            data_rx,
-            control_rx,
-            bootstrap_rx,
-            Arc::clone(&ingress),
-            Arc::clone(&progress),
-            bootstrap_status,
-            Duration::from_millis(1),
-            2 * 1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("writer processes bounded source backlog and bootstrap fairly");
-
+        let summary = coordinator.finish_and_join();
+        assert!(
+            summary.clean_shutdown,
+            "five-lane stream must close cleanly: {summary:?}"
+        );
+        assert_eq!(summary.accepted_readiness_boundary_records, 1);
         let (_, records) = decode_v2_segment(&raw_dir.join("segment_00000.bin"));
-        let bootstrap_position = records
+        let boundary_index = records
             .iter()
             .position(|record| {
                 matches!(
                     record,
-                    PumpExactStateRawRecordV2::BootstrapSnapshotStarted(_)
+                    PumpExactStateRawRecordV2::ProspectiveStreamBoundary(_)
                 )
             })
-            .expect("bootstrap record persisted in the source segment chain");
+            .expect("the writer must flush one persisted readiness boundary");
         assert_eq!(
-            bootstrap_position,
-            V2_WRITER_INGRESS_DRAIN_BUDGET_PER_LANE,
-            "the writer must service bootstrap after one finite source batch, not after draining the whole busy backlog"
-        );
-        assert_eq!(
-            progress.lock().accepted_bootstrap_records,
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    PumpExactStateRawRecordV2::ProspectiveStreamBoundary(_)
+                ))
+                .count(),
             1,
-            "bootstrap record was accepted before source closure"
+            "the writer must flush exactly one persisted readiness boundary"
         );
+        let post_boundary_slot_sequence = records
+            .iter()
+            .skip(boundary_index + 1)
+            .find_map(|record| match record {
+                PumpExactStateRawRecordV2::PrimarySlotUpdate(slot) if slot.slot == 92 => {
+                    Some(slot.source.capture_sequence)
+                }
+                _ => None,
+            })
+            .expect("post-boundary Slot source must follow the raw boundary frame");
+        assert_eq!(post_boundary_slot_sequence, 6);
     }
 
     #[test]
-    fn v2_coordinator_fails_closed_on_a_source_epoch_change() {
-        let temporary = tempdir().expect("temporary raw root");
-        let coordinator = PumpExactStateCaptureCoordinatorV2::start(
-            &temporary.path().join("raw-v2"),
-            "prospective-exact-test".to_owned(),
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([6; 32]),
-            16,
-            1024 * 1024,
-            16,
-            Duration::from_millis(1),
-            1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("start V2 coordinator");
+    fn v3_source_epoch_change_fails_closed_before_a_boundary_can_be_sealed() {
+        let temporary = tempdir().expect("temporary PRXTAPE3 root");
+        let coordinator = start_test_capture_coordinator_v3(&temporary.path().join("epoch-change"));
         let sink = coordinator.source_sink();
         sink.source_stream_established(4);
         sink.source_stream_established(5);
-
         assert!(
             coordinator.capture_abort().is_cancelled(),
-            "an epoch change must cancel the source before it can blend two source lifecycles"
+            "a reconnect/epoch change must stop the source rather than combine epochs"
         );
         coordinator.finish_source();
         let summary = coordinator.finish_and_join();
@@ -8347,287 +7944,92 @@ mod tests {
     }
 
     #[test]
-    fn v2_coordinator_fails_closed_when_an_established_stream_interrupts_before_reconnect() {
-        let temporary = tempdir().expect("temporary raw root");
-        let coordinator = PumpExactStateCaptureCoordinatorV2::start(
-            &temporary.path().join("raw-v2"),
-            "prospective-exact-test".to_owned(),
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([6; 32]),
-            16,
-            1024 * 1024,
-            16,
-            Duration::from_millis(1),
-            1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("start V2 coordinator");
-        let sink = coordinator.source_sink();
-        sink.source_stream_established(4);
-        sink.source_stream_interrupted(4, "transport closed before reconnect".to_owned());
-
-        assert!(
-            coordinator.capture_abort().is_cancelled(),
-            "an established-stream interruption must stop V2 before retry can hide the gap"
-        );
-        coordinator.finish_source();
-        let summary = coordinator.finish_and_join();
-        assert!(!summary.clean_shutdown);
-        let lifecycle = coordinator.source_lifecycle();
-        assert!(lifecycle
-            .fatal_capture_error
-            .as_deref()
-            .is_some_and(|reason| reason.contains("stream was interrupted")));
-        assert!(lifecycle
-            .source_worker_error
-            .as_deref()
-            .is_some_and(|reason| reason.contains("transport closed before reconnect")));
-    }
-
-    #[test]
-    fn v2_coordinator_fails_closed_when_one_source_update_exceeds_byte_budget() {
-        let temporary = tempdir().expect("temporary raw root");
-        let coordinator = PumpExactStateCaptureCoordinatorV2::start(
-            &temporary.path().join("raw-v2"),
-            "prospective-exact-test".to_owned(),
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([6; 32]),
-            16,
-            1,
-            16,
-            Duration::from_millis(1),
-            1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("start V2 coordinator");
-        let sink = coordinator.source_sink();
-        sink.source_stream_established(4);
-        let pump = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
-        sink.try_capture(source_update(pump_owned_account(
-            Pubkey::new_unique(),
-            pump,
-            vec![1],
-        )));
-
-        assert!(
-            coordinator.capture_abort().is_cancelled(),
-            "an oversized decoded source update must stop capture before unbounded queue growth"
-        );
-        coordinator.finish_source();
-        let summary = coordinator.finish_and_join();
-        assert!(!summary.clean_shutdown);
-        let lifecycle = coordinator.source_lifecycle();
-        assert_eq!(lifecycle.source_queue_peak_bytes, 0);
-        assert_eq!(lifecycle.source_queue_bytes_at_close, 0);
-        assert_eq!(lifecycle.dropped_source_updates, 1);
-        assert!(lifecycle
-            .fatal_capture_error
-            .as_deref()
-            .is_some_and(|reason| reason.contains("byte budget")));
-    }
-
-    #[test]
-    fn v2_bootstrap_persistence_seals_an_explicit_prospective_readiness_boundary() {
-        let temporary = tempdir().expect("temporary raw root");
-        let raw_dir = temporary.path().join("raw-v2");
-        let coordinator = PumpExactStateCaptureCoordinatorV2::start(
-            &raw_dir,
-            "prospective-exact-test".to_owned(),
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([6; 32]),
-            16,
-            1024 * 1024,
-            16,
-            Duration::from_millis(1),
-            1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("start V2 coordinator");
-        coordinator.source_sink().source_stream_established(4);
-        let source_readiness = source_readiness_for_test(119, 120, 121, 122, 123);
-        let seal = persist_bootstrap_snapshot_v2(
-            &coordinator,
-            "primary-test",
-            Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID"),
-            4,
-            PumpExactStateBootstrapOverlapV2 {
-                snapshot: bootstrap_snapshot_for_test(123),
-                source_readiness: source_readiness.clone(),
-                snapshot_attempt_count: 2,
-            },
-            Duration::from_secs(1),
-        )
-        .expect("persist bounded V2 bootstrap");
-        assert_eq!(seal.finalized_context_slot, 123);
-        assert_eq!(seal.source_readiness, source_readiness);
-        assert_eq!(seal.snapshot_attempt_count, 2);
-        coordinator.finish_source();
-        let summary = coordinator.finish_and_join();
-        assert!(
-            !summary.clean_shutdown,
-            "no required source lanes were durably written"
-        );
-        let (_, records) = decode_v2_segment(&raw_dir.join("segment_00000.bin"));
-        assert!(matches!(
-            records.as_slice(),
-            [
-                PumpExactStateRawRecordV2::BootstrapSnapshotStarted(_),
-                PumpExactStateRawRecordV2::BootstrapResponseChunk(_),
-                PumpExactStateRawRecordV2::BootstrapSnapshotCompleted(_),
-                PumpExactStateRawRecordV2::ProspectiveReadinessBoundary(boundary),
-                PumpExactStateRawRecordV2::SegmentClosed(_),
-            ] if boundary.finalized_context_slot == 123
-                && boundary.cohort_slots_strictly_after == 123
-                && boundary.source_stream_epoch == 4
-                && boundary.source_capture_sequence_exclusive == 0
-                && boundary.source_readiness == source_readiness
-                && boundary.finalized_context_slot_covers_source_readiness
-        ));
-    }
-
-    #[test]
-    fn v2_bootstrap_persistence_rejects_a_snapshot_before_source_readiness() {
-        let temporary = tempdir().expect("temporary raw root");
-        let coordinator = PumpExactStateCaptureCoordinatorV2::start(
-            &temporary.path().join("raw-v2"),
-            "prospective-exact-test".to_owned(),
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([6; 32]),
-            16,
-            1024 * 1024,
-            16,
-            Duration::from_millis(1),
-            1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("start V2 coordinator");
-        coordinator.source_sink().source_stream_established(4);
-        let source_readiness = source_readiness_for_test(119, 120, 121, 122, 123);
-        let error = persist_bootstrap_snapshot_v2(
-            &coordinator,
-            "primary-test",
-            Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID"),
-            4,
-            PumpExactStateBootstrapOverlapV2 {
-                snapshot: bootstrap_snapshot_for_test(122),
-                source_readiness,
-                snapshot_attempt_count: 1,
-            },
-            Duration::from_secs(1),
-        )
-        .expect_err("a finalized snapshot before source readiness must fail closed");
+    fn v3_config_rejects_retired_bootstrap_fields() {
+        let source = r#"
+primary_provider_id = "primary"
+grpc_endpoint = "https://grpc.example.invalid"
+program_data_rpc_endpoint = "https://rpc.example.invalid"
+semantics_manifest_path = "/protected/operator/semantics.json"
+output_dir = "/protected/research/prxtape3"
+bootstrap_queue_capacity = 1
+"#;
+        let error = toml::from_str::<PumpExactStateCaptureConfigV2>(source)
+            .expect_err("retired bootstrap fields must not silently load");
         assert!(error
             .to_string()
-            .contains("predates required source readiness slot"));
-        coordinator.fail_bootstrap();
-        coordinator.finish_source();
-        assert!(!coordinator.finish_and_join().clean_shutdown);
+            .contains("unknown field `bootstrap_queue_capacity`"));
     }
 
-    #[test]
-    fn v2_bootstrap_persistence_rejects_a_forged_source_readiness_maximum() {
-        let temporary = tempdir().expect("temporary raw root");
-        let coordinator = PumpExactStateCaptureCoordinatorV2::start(
-            &temporary.path().join("raw-v2"),
-            "prospective-exact-test".to_owned(),
-            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([6; 32]),
-            16,
-            1024 * 1024,
-            16,
-            Duration::from_millis(1),
-            1024 * 1024,
-            Duration::from_secs(60),
-            TEST_V2_MAX_RAW_BYTES,
-            TEST_V2_MIN_FREE_BYTES,
-        )
-        .expect("start V2 coordinator");
-        coordinator.source_sink().source_stream_established(4);
-        let mut source_readiness = source_readiness_for_test(119, 120, 121, 122, 123);
-        source_readiness.source_readiness_slot = 122;
-        let error = persist_bootstrap_snapshot_v2(
-            &coordinator,
-            "primary-test",
-            Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID"),
-            4,
-            PumpExactStateBootstrapOverlapV2 {
-                snapshot: bootstrap_snapshot_for_test(123),
-                source_readiness,
-                snapshot_attempt_count: 1,
-            },
-            Duration::from_secs(1),
-        )
-        .expect_err("a lowered source readiness maximum must fail closed");
-        assert!(error
-            .to_string()
-            .contains("differs from required-lane maximum"));
-        coordinator.fail_bootstrap();
-        coordinator.finish_source();
-        assert!(!coordinator.finish_and_join().clean_shutdown);
-    }
-
-    fn bootstrap_response_bytes_at_slot(owner: &str, encoding: &str, slot: u64) -> Vec<u8> {
-        let account = Pubkey::new_unique();
-        serde_json::to_vec(&json!({
-            "jsonrpc": "2.0",
-            "id": "pump_exact_state_v2_bootstrap",
-            "result": {
-                "context": { "slot": slot },
-                "value": [{
-                    "pubkey": account.to_string(),
-                    "account": {
-                        "lamports": 42,
-                        "owner": owner,
-                        "executable": false,
-                        "rentEpoch": 9,
-                        "data": ["AQID", encoding]
-                    }
-                }]
+    #[tokio::test]
+    async fn v3_program_data_receipt_rpc_reads_only_program_and_programdata_accounts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local ProgramData RPC mock");
+        let endpoint = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("local ProgramData RPC address")
+        );
+        let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
+        let program_data = Pubkey::new_unique();
+        let program_account_data = bincode::serialize(&UpgradeableLoaderState::Program {
+            programdata_address: program_data,
+        })
+        .expect("encode mock Program account");
+        let program_data_account_data = bincode::serialize(&UpgradeableLoaderState::ProgramData {
+            slot: 77,
+            upgrade_authority_address: None,
+        })
+        .expect("encode mock ProgramData account");
+        let server = tokio::spawn(async move {
+            let mut observed_methods = Vec::new();
+            let mut observed_accounts = Vec::new();
+            for (expected_account, account_data) in [
+                (pump_program, program_account_data),
+                (program_data, program_data_account_data),
+            ] {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept ProgramData RPC read");
+                let request = read_v2_mock_rpc_request(&mut socket).await;
+                observed_methods.push(request["method"].as_str().expect("RPC method").to_owned());
+                observed_accounts.push(
+                    request["params"]
+                        .as_array()
+                        .and_then(|params| params.first())
+                        .and_then(serde_json::Value::as_str)
+                        .expect("getAccountInfo account parameter")
+                        .to_owned(),
+                );
+                assert_eq!(
+                    observed_accounts.last(),
+                    Some(&expected_account.to_string()),
+                    "ProgramData receipt may read only its expected account"
+                );
+                write_v2_mock_rpc_response(&mut socket, request["id"].clone(), 900, &account_data)
+                    .await;
             }
-        }))
-        .expect("serialize bootstrap response fixture")
-    }
+            (observed_methods, observed_accounts)
+        });
 
-    fn bootstrap_response_bytes(owner: &str, encoding: &str) -> Vec<u8> {
-        bootstrap_response_bytes_at_slot(owner, encoding, 1234)
-    }
-
-    #[test]
-    fn v2_bootstrap_parser_preserves_raw_response_and_requires_pump_ownership() {
-        let pump = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
-        let response = bootstrap_response_bytes(PUMP_FUN_PROGRAM_ID, "base64");
-        let snapshot = parse_finalized_program_accounts_snapshot_v2(response.clone(), pump, 1, 2)
-            .expect("parse valid finalized V2 bootstrap response");
-        assert_eq!(snapshot.finalized_context_slot, 1234);
-        assert_eq!(snapshot.response_bytes, response);
-        assert_eq!(snapshot.accounts.len(), 1);
-        assert_eq!(snapshot.accounts[0].raw_account_data, vec![1, 2, 3]);
+        let receipt = observe_program_data_receipt_v2(&endpoint, None, "x-test", pump_program)
+            .await
+            .expect("ProgramData receipt from local mock");
+        let (methods, accounts) = server.await.expect("ProgramData RPC mock task");
+        assert_eq!(methods, vec!["getAccountInfo", "getAccountInfo"]);
         assert_eq!(
-            snapshot.accounts[0].raw_account_data_hash_blake3,
-            hash_bytes_v2(&[1, 2, 3])
+            accounts,
+            vec![pump_program.to_string(), program_data.to_string()]
         );
-
-        let non_pump = bootstrap_response_bytes(&Pubkey::new_unique().to_string(), "base64");
-        assert!(
-            parse_finalized_program_accounts_snapshot_v2(non_pump, pump, 1, 2)
-                .expect_err("non-Pump snapshot account must fail closed")
-                .to_string()
-                .contains("differs from Pump program")
+        assert_eq!(
+            receipt.pump_programdata_pubkey.into_inner(),
+            program_data.to_bytes()
         );
-    }
-
-    #[test]
-    fn v2_bootstrap_parser_rejects_nonliteral_base64_account_encoding() {
-        let pump = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
-        let response = bootstrap_response_bytes(PUMP_FUN_PROGRAM_ID, "base64+zstd");
         assert!(
-            parse_finalized_program_accounts_snapshot_v2(response, pump, 1, 2)
-                .expect_err("compressed/bootstrap-normalized account data is not source-lossless")
-                .to_string()
-                .contains("exactly [base64, base64]")
+            !methods.iter().any(|method| method == "getProgramAccounts"),
+            "stream-only V3 receipt RPC must never scan the Pump account universe"
         );
     }
 
@@ -8641,9 +8043,9 @@ mod tests {
             grpc_endpoint: "https://grpc.example.invalid".to_owned(),
             grpc_auth_token_env: None,
             grpc_auth_header: "x-token".to_owned(),
-            bootstrap_rpc_endpoint: "https://rpc.example.invalid".to_owned(),
-            bootstrap_rpc_auth_token_env: None,
-            bootstrap_rpc_auth_header: "x-api-key".to_owned(),
+            program_data_rpc_endpoint: "https://rpc.example.invalid".to_owned(),
+            program_data_rpc_auth_token_env: None,
+            program_data_rpc_auth_header: "x-api-key".to_owned(),
             pump_program_id: PUMP_FUN_PROGRAM_ID.to_owned(),
             semantics_manifest_path: temporary.path().join("semantics.json"),
             output_dir: PathBuf::from("datasets/pump-research/raw"),
@@ -8653,11 +8055,7 @@ mod tests {
             cohort_capture_wall_ms: MIN_V2_COHORT_CAPTURE_WALL_MS,
             min_free_bytes: MIN_V2_MIN_FREE_BYTES,
             max_raw_bytes: MIN_V2_MAX_RAW_BYTES,
-            bootstrap_queue_capacity: 1,
-            bootstrap_enqueue_timeout_ms: 1,
-            stream_establish_timeout_ms: 1,
-            bootstrap_rpc_timeout_ms: 1,
-            bootstrap_response_max_bytes: 1,
+            source_readiness_timeout_ms: 1,
             flush_interval_ms: 1,
             segment_max_bytes: MIN_V2_SEGMENT_MAX_BYTES,
             segment_max_duration_ms: 1,
@@ -8766,7 +8164,7 @@ mod tests {
             git_status_digest: digest_bytes_v2(b""),
             git_status_entry_count: 0,
             capture_config_digest: digest_bytes_v2(b"fixture-config"),
-            bootstrap_executable_digest: release_binary_digest.clone(),
+            preflight_executable_digest: release_binary_digest.clone(),
             release_binary_file: V2_OPERATOR_PREFLIGHT_RELEASE_BINARY_FILE.to_owned(),
             release_binary_digest,
             build_log_file: V2_OPERATOR_PREFLIGHT_BUILD_LOG_FILE.to_owned(),
