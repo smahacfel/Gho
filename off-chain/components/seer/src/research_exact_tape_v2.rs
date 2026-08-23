@@ -4939,7 +4939,8 @@ mod tests {
     use super::*;
     use crate::research_exact_tape_v2_materializer::{
         export_prospective_exact_state_outcome_blind_windows_v2,
-        qualify_prospective_exact_state_raw_run_v2, PumpExactStateCapabilityStatusV2,
+        qualify_prospective_exact_state_raw_run_v2,
+        validate_prospective_exact_state_strategy_input_v2, PumpExactStateCapabilityStatusV2,
     };
     use base64::{engine::general_purpose, Engine as _};
     use std::fs;
@@ -6519,6 +6520,39 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn fixture_runtime_digest_json_v2(path: &Path) -> serde_json::Value {
+        let digest = fixture_exact_artifact_digest_json_v2(path);
+        serde_json::json!({
+            "sha256": digest["sha256"].clone(),
+            "blake3": digest["blake3"].clone(),
+            "bytes": digest["bytes"].clone(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn write_qualified_exact_fixture_for_strategy_input_v2(
+        root: &Path,
+        run_id: &str,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for strategy-input fixture");
+        let raw_dir = root.join("qualified-raw-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            run_id,
+            &semantics,
+            QualifiedExportFixtureVariantV2::Qualified,
+        );
+        let exact_dir = root.join("qualified-exact-v2");
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect("Qualified raw fixture must materialize an exact artifact");
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+        (raw_dir, semantics_path, exact_dir)
+    }
+
+    #[cfg(unix)]
     fn clone_and_inject_unscoped_candidate_into_qualified_exact_fixture_v2(
         source_dir: &Path,
         target_dir: &Path,
@@ -6759,6 +6793,109 @@ mod tests {
         );
         assert!(!unscoped_windows.exists());
         assert!(!temporary.path().join(".unscoped-windows.partial").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_qualified_receipt_below_minimum_is_not_strategy_input_authority() {
+        let temporary = tempdir().expect("temporary V2 minimum-flag fixture root");
+        let (raw_dir, semantics_path, exact_dir) =
+            write_qualified_exact_fixture_for_strategy_input_v2(
+                temporary.path(),
+                "qualified-minimum-flag-fixture",
+            );
+
+        let receipt_path = exact_dir.join("exact_state_capability_v2.json");
+        let mut receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(&receipt_path).expect("read Qualified minimum-flag receipt"),
+        )
+        .expect("parse Qualified minimum-flag receipt");
+        receipt["qualification_run_below_minimum"] = serde_json::json!(true);
+        rewrite_private_fixture_json_v2(&receipt_path, &receipt);
+        let receipt_digest = fixture_exact_artifact_digest_json_v2(&receipt_path);
+
+        let manifest_path = exact_dir.join("manifest_v2.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(&manifest_path).expect("read Qualified minimum-flag manifest"),
+        )
+        .expect("parse Qualified minimum-flag manifest");
+        manifest["exact_state_capability_artifact"] = receipt_digest;
+        rewrite_private_fixture_json_v2(&manifest_path, &manifest);
+
+        let error = match validate_prospective_exact_state_strategy_input_v2(
+            &raw_dir,
+            &semantics_path,
+            &exact_dir,
+        ) {
+            Ok(_) => panic!(
+                "a Qualified receipt marked below the qualification minimum is not authority"
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("not a Qualified capability authority"),
+            "unexpected minimum-flag authority error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_strategy_input_recomputes_minimum_from_raw_cohort_authority() {
+        let temporary = tempdir().expect("temporary V2 minimum-binding fixture root");
+        let (raw_dir, semantics_path, exact_dir) =
+            write_qualified_exact_fixture_for_strategy_input_v2(
+                temporary.path(),
+                "qualified-minimum-binding-fixture",
+            );
+
+        let completion_path = raw_dir.join("run_completion_receipt_v2.json");
+        let mut completion: serde_json::Value = serde_json::from_slice(
+            &fs::read(&completion_path).expect("read raw completion receipt"),
+        )
+        .expect("parse raw completion receipt");
+        completion["cohort_capture_termination"] = serde_json::json!("operator_signal");
+        completion["cohort_capture_elapsed_ms"] = serde_json::json!(1_799_999u64);
+        rewrite_private_fixture_json_v2(&completion_path, &completion);
+        let completion_digest = fixture_runtime_digest_json_v2(&completion_path);
+
+        let receipt_path = exact_dir.join("exact_state_capability_v2.json");
+        let mut receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(&receipt_path).expect("read Qualified minimum-binding receipt"),
+        )
+        .expect("parse Qualified minimum-binding receipt");
+        assert_eq!(
+            receipt["qualification_run_below_minimum"],
+            serde_json::json!(false),
+            "fixture must begin with a Qualified minimum flag"
+        );
+        receipt["source_completion_receipt_digest"] = completion_digest;
+        rewrite_private_fixture_json_v2(&receipt_path, &receipt);
+        let receipt_digest = fixture_exact_artifact_digest_json_v2(&receipt_path);
+
+        let manifest_path = exact_dir.join("manifest_v2.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(&manifest_path).expect("read Qualified minimum-binding manifest"),
+        )
+        .expect("parse Qualified minimum-binding manifest");
+        manifest["exact_state_capability_artifact"] = receipt_digest;
+        rewrite_private_fixture_json_v2(&manifest_path, &manifest);
+
+        let error = match validate_prospective_exact_state_strategy_input_v2(
+            &raw_dir,
+            &semantics_path,
+            &exact_dir,
+        ) {
+            Ok(_) => panic!("strategy input must recompute the minimum gate from raw authority"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("qualification-run minimum flag differs from raw cohort authority"),
+            "unexpected raw-minimum binding error: {error:#}"
+        );
     }
 
     #[cfg(unix)]

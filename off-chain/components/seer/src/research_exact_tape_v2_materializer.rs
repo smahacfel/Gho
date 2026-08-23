@@ -1208,6 +1208,16 @@ fn validate_qualified_exact_output_binding_v2(
     {
         bail!("V2 exact output source control binding differs from current raw authority");
     }
+    let expected_qualification_run_below_minimum = qualification_run_below_minimum_v2(
+        raw.completion_receipt.cohort_capture_elapsed_ms,
+        exact.receipt.successful_rooted_mutation_denominator,
+    );
+    if exact.receipt.qualification_run_below_minimum != expected_qualification_run_below_minimum {
+        bail!("V2 exact receipt qualification-run minimum flag differs from raw cohort authority");
+    }
+    if expected_qualification_run_below_minimum {
+        bail!("V2 raw authority remains below the literal qualification-run minimum");
+    }
     Ok(())
 }
 
@@ -1322,6 +1332,7 @@ fn validate_exact_output_receipt_v2(
             PumpExactStateCapabilityStatusV2::Qualified
         )
         || !receipt.blockers.is_empty()
+        || receipt.qualification_run_below_minimum
     {
         bail!("V2 exact output is not a Qualified capability authority");
     }
