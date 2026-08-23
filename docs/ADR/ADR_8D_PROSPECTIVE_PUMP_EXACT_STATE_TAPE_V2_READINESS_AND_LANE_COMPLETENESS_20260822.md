@@ -1,7 +1,7 @@
 # ADR-8D: Prospective Pump Exact-State Tape V2 — bootstrap/source overlap i wymagane lane'y
 
 **Data:** 2026-08-22
-**Status:** IMPLEMENTED LOCALLY / REVIEW PENDING / FINAL CAPTURE NOT STARTED
+**Status:** REVISED LOCALLY / INDEPENDENT CODE REVIEW PASS / FINAL CAPTURE NOT STARTED / QUALIFIER AUTHORITY DOCUMENTED SEPARATELY / ALLOWLIST-ONLY COMMIT AUTHORIZED
 **Typ:** ADR-8D / prospective raw-capture integrity / fail-closed recorder correction
 
 ## D0. Powód korekty
@@ -94,6 +94,14 @@ writer kończy się błędem fail-closed (może pozostać wyłącznie `.partial`
 również nie może utworzyć `Complete`. Żaden semantycznie cichy provider ani
 częściowy subscription branch nie może otrzymać statusu raw `Complete`.
 
+Ten census jest warunkiem koniecznym, lecz nie samodzielnym dowodem
+per-slot completeness. `ADR_8D_PROSPECTIVE_PUMP_EXACT_STATE_TAPE_V2_P0_EVIDENCE_FRONTIER_AND_EVENT_CPI_20260823.md`
+dodaje późniejszy, obowiązkowy offline contract: każdy BlockMeta/FullBlock w
+akceptowanej kohorcie musi mieć dokładnie jednego partnera z tym samym
+slot/parent/hash/count, a forward availability może pochodzić wyłącznie z
+ostatniej takiej pary. Sama równość dwóch Pump transaction maps ani późny Slot
+nie są wystarczające.
+
 ## D3. Zakres i brak operacji
 
 Korekta nie:
@@ -102,7 +110,10 @@ Korekta nie:
 - nie łączy się z RPC, Yellowstone ani GO-E;
 - nie usuwa `/tmp` diagnostics;
 - nie zmienia GO-D raw V1, jego hashy ani artefaktów;
-- nie implementuje jeszcze V2 materializera, qualifiera, exportu lub strategii;
+- w chwili tej korekty nie implementowała jeszcze V2 materializera ani
+  qualifiera; ten historyczny punkt zastępuje wyłącznie
+  `ADR_8D_PROSPECTIVE_PUMP_EXACT_STATE_TAPE_V2_QUALIFICATION_AUTHORITY_20260822.md`;
+- nadal nie implementuje exportu lub strategii;
 - nie zmienia aktywnego Ghost runtime'u, Gatekeepera ani execution.
 
 V2 nadal nie jest Research Tape gotową do strategii. Po tej korekcie jest tylko

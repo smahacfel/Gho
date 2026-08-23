@@ -2,7 +2,7 @@
 
 **Data:** 2026-08-21
 
-**Status:** IMPLEMENTED LOCALLY / REAL SOURCE CAPTURE NOT STARTED / OFFLINE QUALIFICATION PENDING
+**Status:** IMPLEMENTED LOCALLY / REAL SOURCE CAPTURE NOT STARTED / V2 QUALIFICATION AUTHORITY NOW DOCUMENTED SEPARATELY
 
 **Task:** `PROSPECTIVE_PUMP_EXACT_STATE_TAPE_V2_CAPTURE_CONTRACT`
 
@@ -184,16 +184,21 @@ technicznie zakończył się bez błędu.
 `ExactStateCapability = Qualified`, nie otwiera strategii, exportu ani live
 promotion.
 
-## D4. Zakres wyłączony
+## D4. Historyczny zakres wyłączony
 
-Ta zmiana nie:
+W chwili utworzenia tego ADR V2 materializer/qualifier nie istniał. To
+historyczne ograniczenie zostało zastąpione wyłącznie przez
+`ADR_8D_PROSPECTIVE_PUMP_EXACT_STATE_TAPE_V2_QUALIFICATION_AUTHORITY_20260822.md`.
+Nowy qualifier pozostaje offline-only i nie zmienia żadnego z pozostałych
+granic capture opisanych tutaj.
+
+Ówczesna korekta capture nie:
 
 - zmienia GO-D raw V1, jego segmentów, hashy, manifestów ani receipts;
 - wykonuje RPC, Yellowstone, GO-E, backfill, capture lub strategy run;
 - wprowadza V2 do aktywnego Ghost runtime;
 - zmienia Gatekeepera, MFS, execution, parsera runtime ani existing V1 codec;
-- wykonuje offline exact-state materializera V2 ani nie obniża przyszłych
-  qualification gates.
+- obniża przyszłych qualification gates.
 
 Osobny operator GO jest nadal wymagany przed source compatibility probe,
 preflight i jednym rzeczywistym V2 capture. Dopiero po jego immutable raw

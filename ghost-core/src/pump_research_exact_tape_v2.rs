@@ -44,8 +44,13 @@ pub const PUMP_EXACT_STATE_TAPE_FULL_BLOCK_CHUNK_BYTES_V2: usize = 4 * 1024 * 10
 
 /// Exact source semantics: deterministic re-encoding of the decoded
 /// Yellowstone protobuf update, not a claimed original HTTP/2 wire frame.
+///
+/// Revision `v3` additionally records the ingress timestamp on the first
+/// full-block frame and the block identity/count carried by BlockMeta.  V2
+/// has not admitted a real raw run yet, so this is a prospective contract
+/// correction rather than a migration of an existing archive.
 pub const PUMP_EXACT_STATE_TAPE_SOURCE_CAPTURE_SEMANTICS_V2: &str =
-    "decoded_protobuf_schema_lossless_full_pump_owner_and_full_blocks_v2";
+    "decoded_protobuf_schema_lossless_full_pump_owner_and_full_blocks_v3";
 
 /// The one source authority admitted to a prospective V2 raw run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,12 +126,19 @@ pub struct PumpExactStateSlotEvidenceV2 {
     pub source_payload: Vec<u8>,
 }
 
-/// Source-lossless block metadata retained for stream-boundary and time proof.
+/// Source-lossless block metadata retained for per-slot full-block
+/// reconciliation, stream-boundary and time proof.  These identity fields
+/// are deliberately duplicated from the matching full-block payload: two
+/// lanes agreeing only on their observed Pump transactions would not prove
+/// that either lane was complete.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PumpExactStateBlockMetaEvidenceV2 {
     pub source: PumpExactStateSourceEnvelopeV2,
     pub slot: u64,
     pub parent_slot: u64,
+    pub blockhash: String,
+    pub parent_blockhash: String,
+    pub executed_transaction_count: u64,
     pub block_time: Option<i64>,
     pub event_time: PumpResearchEventTimeV1,
     pub source_payload: Vec<u8>,
@@ -145,6 +157,10 @@ pub struct PumpExactStateFullBlockPayloadStartedV2 {
     pub blockhash: String,
     pub parent_blockhash: String,
     pub executed_transaction_count: u64,
+    /// Timestamp from the same source update as the complete block payload.
+    /// The offline qualifier uses the monotonic half for duration/cutoff
+    /// authority and retains the wall-clock half solely as an audit label.
+    pub event_time: PumpResearchEventTimeV1,
     pub source_payload_sha256: PumpResearchStorageHashV1,
     pub source_payload_bytes: u64,
     pub source_payload_chunk_count: u64,

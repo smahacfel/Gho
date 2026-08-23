@@ -1,0 +1,230 @@
+{
+  "schema_version": 7,
+  "semantics_id": "pump_public_docs_3c6721a67c0b206b39130b454c8ba22a83ce972e_v8",
+  "source_repository": "https://github.com/pump-fun/pump-public-docs",
+  "source_commit": "3c6721a67c0b206b39130b454c8ba22a83ce972e",
+  "vendored_idl_relative_path": "vendor/pump-public-docs/3c6721a67c0b206b39130b454c8ba22a83ce972e/idl/pump.json",
+  "vendored_idl_sha256": "b90bc471327f671449271d5d1d42354d1fae6f5a06502f5834459a3108138e49",
+  "vendored_idl_blake3": "39a3f16e46898548447126445d354f48335b7a99392b5ba04c938250c5d1eb0c",
+  "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "program_data_hash_blake3": "23dec267aa4434df833197985882d8ae51f91062fa86620f5159ca21527e1e09",
+  "instruction_effects": {
+    "add_quote_mint": "global_dependency_mutation",
+    "admin_set_creator": "known_reserve_or_dependency_unsupported",
+    "admin_set_idl_authority": "proven_non_reserve",
+    "admin_update_token_incentives": "proven_non_reserve",
+    "buy": "supported_exact_trade",
+    "buy_exact_quote_in_v2": "supported_exact_trade",
+    "buy_exact_sol_in": "supported_exact_trade",
+    "buy_v2": "supported_exact_trade",
+    "claim_cashback": "proven_non_reserve",
+    "claim_cashback_v2": "proven_non_reserve",
+    "claim_token_incentives": "proven_non_reserve",
+    "close_user_volume_accumulator": "proven_non_reserve",
+    "collect_creator_fee": "proven_non_reserve",
+    "collect_creator_fee_v2": "proven_non_reserve",
+    "create": "supported_exact_create",
+    "create_v2": "supported_exact_create",
+    "distribute_creator_fees": "proven_non_reserve",
+    "distribute_creator_fees_v2": "proven_non_reserve",
+    "extend_account": "proven_non_reserve",
+    "get_minimum_distributable_fee": "proven_non_reserve",
+    "init_user_volume_accumulator": "proven_non_reserve",
+    "initialize": "global_dependency_mutation",
+    "migrate": "known_reserve_or_dependency_unsupported",
+    "migrate_bonding_curve_creator": "known_reserve_or_dependency_unsupported",
+    "migrate_v2": "known_reserve_or_dependency_unsupported",
+    "remove_quote_mint": "global_dependency_mutation",
+    "sell": "supported_exact_trade",
+    "sell_v2": "supported_exact_trade",
+    "set_creator": "known_reserve_or_dependency_unsupported",
+    "set_mayhem_virtual_params": "known_reserve_or_dependency_unsupported",
+    "set_metaplex_creator": "known_reserve_or_dependency_unsupported",
+    "set_params": "global_dependency_mutation",
+    "set_reserved_fee_recipients": "global_dependency_mutation",
+    "set_virtual_quote_reserves": "global_dependency_mutation",
+    "sync_user_volume_accumulator": "proven_non_reserve",
+    "toggle_cashback_enabled": "global_dependency_mutation",
+    "toggle_create_v2": "global_dependency_mutation",
+    "toggle_mayhem_mode": "global_dependency_mutation",
+    "update_buyback_config": "global_dependency_mutation",
+    "update_global_authority": "global_dependency_mutation"
+  },
+  "instruction_state_roles": {
+    "buy": {"bonding_curve_role": "bonding_curve", "mint_role": "mint"},
+    "buy_exact_quote_in_v2": {"bonding_curve_role": "bonding_curve", "mint_role": "base_mint"},
+    "buy_exact_sol_in": {"bonding_curve_role": "bonding_curve", "mint_role": "mint"},
+    "buy_v2": {"bonding_curve_role": "bonding_curve", "mint_role": "base_mint"},
+    "create": {"bonding_curve_role": "bonding_curve", "mint_role": "mint"},
+    "create_v2": {"bonding_curve_role": "bonding_curve", "mint_role": "mint"},
+    "sell": {"bonding_curve_role": "bonding_curve", "mint_role": "mint"},
+    "sell_v2": {"bonding_curve_role": "bonding_curve", "mint_role": "base_mint"}
+  },
+  "event_parent_contracts": {
+    "AdminSetCreatorEvent": [{"parent_instruction": "admin_set_creator", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "AdminSetIdlAuthorityEvent": [{"parent_instruction": "admin_set_idl_authority", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "AdminUpdateTokenIncentivesEvent": [{"parent_instruction": "admin_update_token_incentives", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "ClaimCashbackEvent": [
+      {"parent_instruction": "claim_cashback", "strict_decode_only_unbound_fields": true, "field_bindings": []},
+      {"parent_instruction": "claim_cashback_v2", "strict_decode_only_unbound_fields": true, "field_bindings": []}
+    ],
+    "ClaimTokenIncentivesEvent": [{"parent_instruction": "claim_token_incentives", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "CloseUserVolumeAccumulatorEvent": [{"parent_instruction": "close_user_volume_accumulator", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "CollectCreatorFeeEvent": [
+      {"parent_instruction": "collect_creator_fee", "strict_decode_only_unbound_fields": true, "field_bindings": []},
+      {"parent_instruction": "collect_creator_fee_v2", "strict_decode_only_unbound_fields": true, "field_bindings": []}
+    ],
+    "CompleteEvent": [
+      {"parent_instruction": "buy", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "mint"},
+        {"event_field": "bonding_curve", "parent_account_role": "bonding_curve"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"}
+      ]},
+      {"parent_instruction": "buy_exact_sol_in", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "mint"},
+        {"event_field": "bonding_curve", "parent_account_role": "bonding_curve"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"}
+      ]},
+      {"parent_instruction": "buy_v2", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "base_mint"},
+        {"event_field": "bonding_curve", "parent_account_role": "bonding_curve"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"}
+      ]},
+      {"parent_instruction": "buy_exact_quote_in_v2", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "base_mint"},
+        {"event_field": "bonding_curve", "parent_account_role": "bonding_curve"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"}
+      ]}
+    ],
+    "CompletePumpAmmMigrationEvent": [{"parent_instruction": "migrate_v2", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "CreateEvent": [
+      {"parent_instruction": "create", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "mint"},
+        {"event_field": "bonding_curve", "parent_account_role": "bonding_curve"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "creator", "parent_instruction_argument": "creator"},
+        {"event_field": "token_program", "parent_account_role": "token_program"},
+        {"event_field": "is_mayhem_mode", "final_curve_state_field": "is_mayhem_mode"},
+        {"event_field": "is_cashback_enabled", "final_curve_state_field": "is_cashback_coin"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"},
+        {"event_field": "virtual_token_reserves", "final_curve_state_field": "virtual_token_reserves"},
+        {"event_field": "real_token_reserves", "final_curve_state_field": "real_token_reserves"},
+        {"event_field": "token_total_supply", "final_curve_state_field": "token_total_supply"}
+      ]},
+      {"parent_instruction": "create_v2", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "mint"},
+        {"event_field": "bonding_curve", "parent_account_role": "bonding_curve"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "creator", "parent_instruction_argument": "creator"},
+        {"event_field": "token_program", "parent_account_role": "token_program"},
+        {"event_field": "is_mayhem_mode", "final_curve_state_field": "is_mayhem_mode"},
+        {"event_field": "is_cashback_enabled", "final_curve_state_field": "is_cashback_coin"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"},
+        {"event_field": "virtual_token_reserves", "final_curve_state_field": "virtual_token_reserves"},
+        {"event_field": "real_token_reserves", "final_curve_state_field": "real_token_reserves"},
+        {"event_field": "token_total_supply", "final_curve_state_field": "token_total_supply"}
+      ]}
+    ],
+    "DistributeCreatorFeesEvent": [
+      {"parent_instruction": "distribute_creator_fees", "strict_decode_only_unbound_fields": true, "field_bindings": []},
+      {"parent_instruction": "distribute_creator_fees_v2", "strict_decode_only_unbound_fields": true, "field_bindings": []}
+    ],
+    "ExtendAccountEvent": [{"parent_instruction": "extend_account", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "InitUserVolumeAccumulatorEvent": [{"parent_instruction": "init_user_volume_accumulator", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "MigrateBondingCurveCreatorEvent": [{"parent_instruction": "migrate_bonding_curve_creator", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "MinimumDistributableFeeEvent": [{"parent_instruction": "get_minimum_distributable_fee", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "ReservedFeeRecipientsEvent": [{"parent_instruction": "set_reserved_fee_recipients", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "SetCreatorEvent": [{"parent_instruction": "set_creator", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "SetMetaplexCreatorEvent": [{"parent_instruction": "set_metaplex_creator", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "SetParamsEvent": [{"parent_instruction": "set_params", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "SyncUserVolumeAccumulatorEvent": [{"parent_instruction": "sync_user_volume_accumulator", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "TradeEvent": [
+      {"parent_instruction": "buy", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "mint"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "is_buy", "expected_borsh_hex": "01"},
+        {"event_field": "ix_name", "expected_borsh_hex": "03000000627579"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"},
+        {"event_field": "virtual_token_reserves", "final_curve_state_field": "virtual_token_reserves"},
+        {"event_field": "real_token_reserves", "final_curve_state_field": "real_token_reserves"}
+      ]},
+      {"parent_instruction": "sell", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "mint"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "is_buy", "expected_borsh_hex": "00"},
+        {"event_field": "ix_name", "expected_borsh_hex": "0400000073656c6c"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"},
+        {"event_field": "virtual_token_reserves", "final_curve_state_field": "virtual_token_reserves"},
+        {"event_field": "real_token_reserves", "final_curve_state_field": "real_token_reserves"}
+      ]},
+      {"parent_instruction": "buy_exact_sol_in", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "mint"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "is_buy", "expected_borsh_hex": "01"},
+        {"event_field": "ix_name", "expected_borsh_hex": "100000006275795f65786163745f736f6c5f696e"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"},
+        {"event_field": "virtual_token_reserves", "final_curve_state_field": "virtual_token_reserves"},
+        {"event_field": "real_token_reserves", "final_curve_state_field": "real_token_reserves"}
+      ]},
+      {"parent_instruction": "buy_v2", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "base_mint"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "is_buy", "expected_borsh_hex": "01"},
+        {"event_field": "ix_name", "expected_borsh_hex": "03000000627579"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"},
+        {"event_field": "virtual_token_reserves", "final_curve_state_field": "virtual_token_reserves"},
+        {"event_field": "real_token_reserves", "final_curve_state_field": "real_token_reserves"}
+      ]},
+      {"parent_instruction": "buy_exact_quote_in_v2", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "base_mint"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "is_buy", "expected_borsh_hex": "01"},
+        {"event_field": "ix_name", "expected_borsh_hex": "120000006275795f65786163745f71756f74655f696e"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"},
+        {"event_field": "virtual_token_reserves", "final_curve_state_field": "virtual_token_reserves"},
+        {"event_field": "real_token_reserves", "final_curve_state_field": "real_token_reserves"}
+      ]},
+      {"parent_instruction": "sell_v2", "strict_decode_only_unbound_fields": true, "field_bindings": [
+        {"event_field": "mint", "parent_account_role": "base_mint"},
+        {"event_field": "user", "parent_account_role": "user"},
+        {"event_field": "is_buy", "expected_borsh_hex": "00"},
+        {"event_field": "ix_name", "expected_borsh_hex": "0400000073656c6c"},
+        {"event_field": "quote_mint", "final_curve_state_field": "quote_mint"},
+        {"event_field": "virtual_token_reserves", "final_curve_state_field": "virtual_token_reserves"},
+        {"event_field": "real_token_reserves", "final_curve_state_field": "real_token_reserves"}
+      ]}
+    ],
+    "UpdateGlobalAuthorityEvent": [{"parent_instruction": "update_global_authority", "strict_decode_only_unbound_fields": true, "field_bindings": []}],
+    "UpdateMayhemVirtualParamsEvent": [{"parent_instruction": "set_mayhem_virtual_params", "strict_decode_only_unbound_fields": true, "field_bindings": []}]
+  },
+  "account_classes": {
+    "BondingCurve": "exact_bonding_curve",
+    "FeeConfig": "known_non_state",
+    "Global": "known_global_dependency",
+    "GlobalVolumeAccumulator": "known_non_state",
+    "SharingConfig": "known_non_state",
+    "UserVolumeAccumulator": "known_non_state"
+  },
+  "account_layouts": [
+    {
+      "account": "BondingCurve",
+      "discriminator": "17b7f83760d8ac60",
+      "allowed_serialized_bytes": [115],
+      "prefix_bytes": 115,
+      "field_layout_sha256": "34202cbbed66bce67534cd0efc90bfc9b283d5fa0af3a923980f223b2bddd8ed",
+      "field_layout_blake3": "703dcbb1bfd85152dcaef5f5478d203758ae587e2194f4022ac78efb5d74980a"
+    },
+    {
+      "account": "Global",
+      "discriminator": "a7e8e8b1c86c727f",
+      "allowed_serialized_bytes": [1045],
+      "prefix_bytes": 1045,
+      "field_layout_sha256": "7e50b199a1f18cce751c819588f03f8d8b0147a352888065eca7761ad35264c7",
+      "field_layout_blake3": "efdf38cb69bdd09bb58517cbc090bf48e1d18b2625238b36d9b4a50460c52c78"
+    }
+  ]
+}

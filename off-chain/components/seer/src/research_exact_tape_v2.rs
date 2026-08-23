@@ -18,6 +18,10 @@ use crate::{
         PUMP_RESEARCH_EXACT_STATE_V2_MAX_DECODED_MESSAGE_BYTES,
     },
     local_gap::LocalGapTracker,
+    research_exact_tape_v2_semantics::{
+        load_pump_exact_state_semantics_authority_v2, PumpExactStateSemanticsAuthorityV2,
+        PumpExactStateSemanticsDigestV2,
+    },
     research_tape::observe_program_data_receipt,
 };
 use anyhow::{bail, Context, Result};
@@ -77,8 +81,8 @@ use std::os::unix::{
     fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 
-const EXACT_STATE_TAPE_V2_CONFIG_SCHEMA_VERSION: u16 = 1;
-const EXACT_STATE_TAPE_V2_RUN_SCHEMA_VERSION: u16 = 1;
+pub(crate) const EXACT_STATE_TAPE_V2_CONFIG_SCHEMA_VERSION: u16 = 2;
+pub(crate) const EXACT_STATE_TAPE_V2_RUN_SCHEMA_VERSION: u16 = 2;
 const DEFAULT_V2_SOURCE_QUEUE_CAPACITY: usize = 8_192;
 const DEFAULT_V2_SOURCE_QUEUE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const MIN_V2_SOURCE_QUEUE_MAX_BYTES: u64 =
@@ -156,6 +160,11 @@ pub struct PumpExactStateCaptureConfigV2 {
     pub bootstrap_rpc_auth_header: String,
     #[serde(default = "default_v2_pump_program_id")]
     pub pump_program_id: String,
+    /// Create-time semantic authority for this prospective capture.  The
+    /// preflight hashes this manifest and its vendored IDL, and capture checks
+    /// its ProgramData selection before it creates a raw V2 directory.  It is
+    /// deliberately outside the active runtime and contains no credentials.
+    pub semantics_manifest_path: PathBuf,
     /// Dedicated parent directory for create-new V2 runs.  It must not be a
     /// raw directory from GO-D or any other frozen tape.
     pub output_dir: PathBuf,
@@ -229,6 +238,9 @@ impl PumpExactStateCaptureConfigV2 {
         }
         if self.output_dir.as_os_str().is_empty() {
             bail!("V2 output_dir must not be empty");
+        }
+        if self.semantics_manifest_path.as_os_str().is_empty() {
+            bail!("V2 semantics_manifest_path must not be empty");
         }
         if self.output_dir.components().any(|component| {
             matches!(component, std::path::Component::Normal(name) if name == "raw" || name == "raw-v2")
@@ -354,7 +366,7 @@ impl PumpExactStateCaptureConfigV2 {
     }
 }
 
-const V2_OPERATOR_PREFLIGHT_SCHEMA_VERSION: u16 = 2;
+const V2_OPERATOR_PREFLIGHT_SCHEMA_VERSION: u16 = 3;
 const V2_OPERATOR_PREFLIGHT_RECEIPT_FILE: &str = "operator_preflight_receipt_v2.json";
 const V2_OPERATOR_PREFLIGHT_RECEIPT_MAX_BYTES: u64 = 64 * 1024;
 const V2_OPERATOR_PREFLIGHT_RELEASE_DIR: &str = "release";
@@ -386,12 +398,18 @@ pub struct PumpExactStateCapturePreflightSummaryV2 {
     pub running_executable_digest: PumpExactStateDigestV2,
     pub source_request_fingerprint_blake3: String,
     pub source_capture_semantics: String,
+    pub semantics_id: String,
+    pub semantics_manifest_digest: PumpExactStateDigestV2,
+    pub vendored_idl_digest: PumpExactStateDigestV2,
+    pub expected_program_data_hash_blake3: String,
 }
 
 pub fn preflight_prospective_exact_state_capture_v2_from_config_path(
     config_path: &Path,
 ) -> Result<PumpExactStateCapturePreflightSummaryV2> {
     let (config, config_bytes) = PumpExactStateCaptureConfigV2::load(config_path)?;
+    let semantics = load_pump_exact_state_semantics_authority_v2(&config.semantics_manifest_path)
+        .context("load V2 semantics authority during local-only preflight")?;
     require_v2_capture_storage_budget(
         &config.output_dir,
         config.min_free_bytes,
@@ -406,6 +424,12 @@ pub fn preflight_prospective_exact_state_capture_v2_from_config_path(
         source_capture_semantics:
             ghost_core::pump_research_exact_tape_v2::PUMP_EXACT_STATE_TAPE_SOURCE_CAPTURE_SEMANTICS_V2
                 .to_owned(),
+        semantics_id: semantics.semantics_id.clone(),
+        semantics_manifest_digest: semantics_digest_to_capture_v2(&semantics.manifest_digest),
+        vendored_idl_digest: semantics_digest_to_capture_v2(&semantics.idl_digest),
+        expected_program_data_hash_blake3: hex_bytes_v2(
+            &semantics.expected_program_data_hash_blake3(),
+        ),
     })
 }
 
@@ -452,6 +476,10 @@ struct PumpExactStateOperatorPreflightReceiptV2 {
     source_request_fingerprint_blake3: String,
     source_capture_semantics: String,
     source_max_decoded_message_bytes: u64,
+    semantics_id: String,
+    semantics_manifest_digest: PumpExactStateDigestV2,
+    vendored_idl_digest: PumpExactStateDigestV2,
+    expected_program_data_hash_blake3: String,
     cohort_capture_wall_ms: u64,
     min_free_bytes: u64,
     max_raw_bytes: u64,
@@ -471,10 +499,11 @@ pub struct PumpExactStateOperatorPreflightSummaryV2 {
 /// read through the bounded no-follow reader and tied to the kernel-bound
 /// image of this process.  A capture consumes this value rather than reading
 /// Git state or `target/release` again.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct PumpExactStateValidatedOperatorPreflightV2 {
     receipt: PumpExactStateOperatorPreflightReceiptV2,
     receipt_digest: PumpExactStateDigestV2,
+    semantics: PumpExactStateSemanticsAuthorityV2,
 }
 
 /// Create a new local V2 preflight authority bundle.  A prospective capture
@@ -486,6 +515,8 @@ pub fn create_operator_preflight_v2_from_config_path(
 ) -> Result<PumpExactStateOperatorPreflightSummaryV2> {
     require_release_v2_operator_binary()?;
     let (config, config_bytes) = PumpExactStateCaptureConfigV2::load(config_path)?;
+    let semantics = load_pump_exact_state_semantics_authority_v2(&config.semantics_manifest_path)
+        .context("load V2 semantics authority for operator preflight")?;
     let repository_root = repository_root_v2()?;
     let git_status = require_clean_repository_at_v2(&repository_root)?;
     let output_filesystem_available_bytes_at_preflight = require_v2_capture_storage_budget(
@@ -533,6 +564,12 @@ pub fn create_operator_preflight_v2_from_config_path(
                 .to_owned(),
         source_max_decoded_message_bytes:
             PUMP_RESEARCH_EXACT_STATE_V2_MAX_DECODED_MESSAGE_BYTES as u64,
+        semantics_id: semantics.semantics_id.clone(),
+        semantics_manifest_digest: semantics_digest_to_capture_v2(&semantics.manifest_digest),
+        vendored_idl_digest: semantics_digest_to_capture_v2(&semantics.idl_digest),
+        expected_program_data_hash_blake3: hex_bytes_v2(
+            &semantics.expected_program_data_hash_blake3(),
+        ),
         cohort_capture_wall_ms: config.cohort_capture_wall_ms,
         min_free_bytes: config.min_free_bytes,
         max_raw_bytes: config.max_raw_bytes,
@@ -813,6 +850,9 @@ fn validate_operator_preflight_v2(
     if receipt.capture_config_digest != digest_bytes_v2(config_bytes) {
         bail!("V2 operator preflight capture config digest does not match current config bytes");
     }
+    let semantics = load_pump_exact_state_semantics_authority_v2(&config.semantics_manifest_path)
+        .context("reload V2 semantics authority before capture")?;
+    validate_preflight_semantics_binding_v2(&receipt, &semantics)?;
     let required_storage_bytes =
         required_v2_storage_bytes(config.min_free_bytes, config.max_raw_bytes)?;
     if receipt.cohort_capture_wall_ms != config.cohort_capture_wall_ms
@@ -843,7 +883,38 @@ fn validate_operator_preflight_v2(
     Ok(PumpExactStateValidatedOperatorPreflightV2 {
         receipt,
         receipt_digest: digest_bytes_v2(&receipt_bytes),
+        semantics,
     })
+}
+
+/// Compare the one semantics authority loaded from the operator config with
+/// the values sealed into a preflight receipt.  Capture retains that validated
+/// authority object through the ProgramData gate instead of resolving a
+/// mutable manifest path a second time after provider I/O has begun.
+fn validate_preflight_semantics_binding_v2(
+    receipt: &PumpExactStateOperatorPreflightReceiptV2,
+    semantics: &PumpExactStateSemanticsAuthorityV2,
+) -> Result<()> {
+    if receipt.semantics_id != semantics.semantics_id
+        || receipt.semantics_manifest_digest
+            != semantics_digest_to_capture_v2(&semantics.manifest_digest)
+        || receipt.vendored_idl_digest != semantics_digest_to_capture_v2(&semantics.idl_digest)
+        || receipt.expected_program_data_hash_blake3
+            != hex_bytes_v2(&semantics.expected_program_data_hash_blake3())
+    {
+        bail!("V2 operator preflight semantics authority differs from the current config manifest");
+    }
+    Ok(())
+}
+
+fn semantics_digest_to_capture_v2(
+    digest: &PumpExactStateSemanticsDigestV2,
+) -> PumpExactStateDigestV2 {
+    PumpExactStateDigestV2 {
+        sha256: digest.sha256.clone(),
+        blake3: digest.blake3.clone(),
+        bytes: digest.bytes,
+    }
 }
 
 /// Validate every immutable file retained in the preflight bundle.  It is
@@ -1777,36 +1848,40 @@ pub enum PumpExactStateCaptureRunStatusV2 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct PumpExactStateRunStartManifestV2 {
-    storage_format_version: u16,
-    schema_version: u16,
-    capture_config_schema_version: u16,
-    run_id: String,
-    repository_commit: String,
-    running_executable_digest: PumpExactStateDigestV2,
-    operator_preflight_receipt_digest: PumpExactStateDigestV2,
-    sealed_release_binary_digest: PumpExactStateDigestV2,
-    sealed_fresh_build_receipt_digest: PumpExactStateDigestV2,
-    sealed_build_semantics: String,
-    capture_config_digest: PumpExactStateDigestV2,
-    capture_contract_sha256: String,
-    source_request_fingerprint_blake3: String,
-    source_capture_semantics: String,
-    source_max_decoded_message_bytes: u64,
-    primary_provider_id: String,
-    grpc_endpoint_digest: PumpExactStateDigestV2,
-    bootstrap_rpc_endpoint_digest: PumpExactStateDigestV2,
-    bootstrap_rpc_auth_mode: String,
-    pump_program_id: String,
-    program_data_at_start: PumpProgramDataReceiptV1,
-    cohort_capture_wall_ms: u64,
-    min_free_bytes: u64,
-    max_raw_bytes: u64,
-    required_storage_bytes: u64,
-    output_filesystem_available_bytes_at_start: u64,
-    capture_started_wall_ms: u64,
-    capture_started_monotonic_ms: u64,
-    required_for_run: bool,
+pub(crate) struct PumpExactStateRunStartManifestV2 {
+    pub(crate) storage_format_version: u16,
+    pub(crate) schema_version: u16,
+    pub(crate) capture_config_schema_version: u16,
+    pub(crate) run_id: String,
+    pub(crate) repository_commit: String,
+    pub(crate) running_executable_digest: PumpExactStateDigestV2,
+    pub(crate) operator_preflight_receipt_digest: PumpExactStateDigestV2,
+    pub(crate) sealed_release_binary_digest: PumpExactStateDigestV2,
+    pub(crate) sealed_fresh_build_receipt_digest: PumpExactStateDigestV2,
+    pub(crate) sealed_build_semantics: String,
+    pub(crate) capture_config_digest: PumpExactStateDigestV2,
+    pub(crate) capture_contract_sha256: String,
+    pub(crate) source_request_fingerprint_blake3: String,
+    pub(crate) source_capture_semantics: String,
+    pub(crate) source_max_decoded_message_bytes: u64,
+    pub(crate) semantics_id: String,
+    pub(crate) semantics_manifest_digest: PumpExactStateDigestV2,
+    pub(crate) vendored_idl_digest: PumpExactStateDigestV2,
+    pub(crate) expected_program_data_hash_blake3: String,
+    pub(crate) primary_provider_id: String,
+    pub(crate) grpc_endpoint_digest: PumpExactStateDigestV2,
+    pub(crate) bootstrap_rpc_endpoint_digest: PumpExactStateDigestV2,
+    pub(crate) bootstrap_rpc_auth_mode: String,
+    pub(crate) pump_program_id: String,
+    pub(crate) program_data_at_start: PumpProgramDataReceiptV1,
+    pub(crate) cohort_capture_wall_ms: u64,
+    pub(crate) min_free_bytes: u64,
+    pub(crate) max_raw_bytes: u64,
+    pub(crate) required_storage_bytes: u64,
+    pub(crate) output_filesystem_available_bytes_at_start: u64,
+    pub(crate) capture_started_wall_ms: u64,
+    pub(crate) capture_started_monotonic_ms: u64,
+    pub(crate) required_for_run: bool,
 }
 
 /// An explicit normal boundary for the raw prospective cohort.  A raw V2 run
@@ -1815,40 +1890,40 @@ struct PumpExactStateRunStartManifestV2 {
 /// acquires one of these normal termination values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum PumpExactStateCaptureTerminationV2 {
+pub(crate) enum PumpExactStateCaptureTerminationV2 {
     OperatorSignal,
     CohortWallDeadline,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct PumpExactStateRunCompletionReceiptV2 {
-    storage_format_version: u16,
-    schema_version: u16,
-    run_id: String,
-    status: PumpExactStateCaptureRunStatusV2,
-    clean_shutdown: bool,
-    bootstrap_finalized_context_slot: Option<u64>,
-    bootstrap_source_readiness: Option<PumpExactStateSourceReadinessV2>,
-    bootstrap_source_overlap_proven: bool,
-    bootstrap_snapshot_attempt_count: u64,
-    bootstrap_completed: bool,
-    running_executable_at_completion: Option<PumpExactStateDigestV2>,
-    running_executable_unchanged: bool,
-    program_data_at_start: PumpProgramDataReceiptV1,
-    program_data_at_completion: Option<PumpProgramDataReceiptV1>,
-    program_data_unchanged: bool,
-    cohort_capture_termination: Option<PumpExactStateCaptureTerminationV2>,
-    cohort_capture_elapsed_ms: Option<u64>,
-    min_free_bytes: u64,
-    max_raw_bytes: u64,
-    output_filesystem_available_bytes_at_completion: Option<u64>,
-    storage_reserve_maintained: bool,
-    raw_byte_budget_respected: bool,
-    required_source_lanes_observed: bool,
-    source_lifecycle: PumpExactStateCaptureSourceLifecycleV2,
-    writer: PumpExactStateWriterSummaryV2,
-    segment_list: Vec<PumpExactStateSegmentReceiptV2>,
-    completion_wall_ms: u64,
+pub(crate) struct PumpExactStateRunCompletionReceiptV2 {
+    pub(crate) storage_format_version: u16,
+    pub(crate) schema_version: u16,
+    pub(crate) run_id: String,
+    pub(crate) status: PumpExactStateCaptureRunStatusV2,
+    pub(crate) clean_shutdown: bool,
+    pub(crate) bootstrap_finalized_context_slot: Option<u64>,
+    pub(crate) bootstrap_source_readiness: Option<PumpExactStateSourceReadinessV2>,
+    pub(crate) bootstrap_source_overlap_proven: bool,
+    pub(crate) bootstrap_snapshot_attempt_count: u64,
+    pub(crate) bootstrap_completed: bool,
+    pub(crate) running_executable_at_completion: Option<PumpExactStateDigestV2>,
+    pub(crate) running_executable_unchanged: bool,
+    pub(crate) program_data_at_start: PumpProgramDataReceiptV1,
+    pub(crate) program_data_at_completion: Option<PumpProgramDataReceiptV1>,
+    pub(crate) program_data_unchanged: bool,
+    pub(crate) cohort_capture_termination: Option<PumpExactStateCaptureTerminationV2>,
+    pub(crate) cohort_capture_elapsed_ms: Option<u64>,
+    pub(crate) min_free_bytes: u64,
+    pub(crate) max_raw_bytes: u64,
+    pub(crate) output_filesystem_available_bytes_at_completion: Option<u64>,
+    pub(crate) storage_reserve_maintained: bool,
+    pub(crate) raw_byte_budget_respected: bool,
+    pub(crate) required_source_lanes_observed: bool,
+    pub(crate) source_lifecycle: PumpExactStateCaptureSourceLifecycleV2,
+    pub(crate) writer: PumpExactStateWriterSummaryV2,
+    pub(crate) segment_list: Vec<PumpExactStateSegmentReceiptV2>,
+    pub(crate) completion_wall_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2109,6 +2184,12 @@ async fn run_prospective_exact_state_capture_v2(
     )
     .await
     .context("V2 requires finalized Pump ProgramData before opening its source stream")?;
+    preflight
+        .semantics
+        .validate_program_data(&program_data_at_start)
+        .context(
+            "V2 finalized Pump ProgramData does not match the semantics manifest pinned before capture",
+        )?;
     let running_executable_digest = digest_running_executable_v2()?;
     if running_executable_digest != preflight.receipt.release_binary_digest {
         bail!("V2 running executable drifted after preflight validation and before run allocation");
@@ -2138,6 +2219,13 @@ async fn run_prospective_exact_state_capture_v2(
                 .to_owned(),
         source_max_decoded_message_bytes:
             PUMP_RESEARCH_EXACT_STATE_V2_MAX_DECODED_MESSAGE_BYTES as u64,
+        semantics_id: preflight.receipt.semantics_id.clone(),
+        semantics_manifest_digest: preflight.receipt.semantics_manifest_digest.clone(),
+        vendored_idl_digest: preflight.receipt.vendored_idl_digest.clone(),
+        expected_program_data_hash_blake3: preflight
+            .receipt
+            .expected_program_data_hash_blake3
+            .clone(),
         primary_provider_id: config.primary_provider_id.clone(),
         grpc_endpoint_digest: digest_bytes_v2(config.grpc_endpoint.as_bytes()),
         bootstrap_rpc_endpoint_digest: digest_bytes_v2(config.bootstrap_rpc_endpoint.as_bytes()),
@@ -2610,15 +2698,10 @@ fn raw_records_from_source_payload_v2(
                 ),
                 None => None,
             };
-            let canonical_global = Pubkey::from_str(PUMP_RESEARCH_PUMP_GLOBAL_BASE58_V1)
-                .context("canonical Pump Global pubkey is invalid")?;
-            let evidence_class = if account_pubkey.into_inner() == canonical_global.to_bytes() {
-                PumpExactStateAccountEvidenceClassV2::CanonicalGlobal
-            } else if account.data.starts_with(&BONDING_CURVE_DISC) {
-                PumpExactStateAccountEvidenceClassV2::CanonicalBondingCurve
-            } else {
-                PumpExactStateAccountEvidenceClassV2::OtherPumpOwned
-            };
+            let evidence_class = classify_pump_owned_account_evidence_v2(
+                account_pubkey.into_inner(),
+                &account.data,
+            )?;
             let raw_account_data_hash_blake3 = hash_bytes_v2(&account.data);
             Ok(vec![PumpExactStateRawRecordV2::PumpOwnedAccountUpdate(
                 PumpExactStatePumpOwnedAccountUpdateV2 {
@@ -2655,6 +2738,9 @@ fn raw_records_from_source_payload_v2(
                     source: source(&source_payload),
                     slot: block_meta.slot,
                     parent_slot: block_meta.parent_slot,
+                    blockhash: block_meta.blockhash,
+                    parent_blockhash: block_meta.parent_blockhash,
+                    executed_transaction_count: block_meta.executed_transaction_count,
                     block_time: block_meta.block_time.map(|time| time.timestamp),
                     event_time,
                     source_payload,
@@ -2689,6 +2775,7 @@ fn raw_records_from_source_payload_v2(
                     blockhash: block.blockhash,
                     parent_blockhash: block.parent_blockhash,
                     executed_transaction_count: block.executed_transaction_count,
+                    event_time,
                     source_payload_sha256,
                     source_payload_bytes,
                     source_payload_chunk_count,
@@ -2743,6 +2830,26 @@ fn fixed_signature_v2(bytes: &[u8]) -> Result<PumpResearchStorageSignatureV1> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("expected 64 bytes, got {}", bytes.len()))?;
     Ok(PumpResearchStorageSignatureV1::from(fixed))
+}
+
+/// Derive the bounded raw-account evidence class directly from the retained
+/// Pump-owned account payload.  The offline raw validator reuses this exact
+/// classifier when it binds a convenient raw projection back to the complete
+/// retained `SubscribeUpdate`, so neither layer can silently drift into a
+/// competing account-authority rule.
+pub(crate) fn classify_pump_owned_account_evidence_v2(
+    account_pubkey: [u8; 32],
+    raw_account_data: &[u8],
+) -> Result<PumpExactStateAccountEvidenceClassV2> {
+    let canonical_global = Pubkey::from_str(PUMP_RESEARCH_PUMP_GLOBAL_BASE58_V1)
+        .context("canonical Pump Global pubkey is invalid")?;
+    Ok(if account_pubkey == canonical_global.to_bytes() {
+        PumpExactStateAccountEvidenceClassV2::CanonicalGlobal
+    } else if raw_account_data.starts_with(&BONDING_CURVE_DISC) {
+        PumpExactStateAccountEvidenceClassV2::CanonicalBondingCurve
+    } else {
+        PumpExactStateAccountEvidenceClassV2::OtherPumpOwned
+    })
 }
 
 fn hash_bytes_v2(bytes: &[u8]) -> ghost_core::pump_research_tape::PumpResearchStorageHashV1 {
@@ -3314,9 +3421,13 @@ impl PumpExactStateRawSegmentWriterV2 {
             u64::try_from(header_bytes.len()).context("V2 header length does not fit u64")?,
             "V2 raw segment header",
         )?;
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let file = options
             .open(&partial_path)
             .with_context(|| format!("create V2 raw segment {}", partial_path.display()))?;
         let mut writer = BufWriter::new(file);
@@ -3589,18 +3700,18 @@ impl PumpExactStateBootstrapStatusV2 {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PumpExactStateCaptureSourceLifecycleV2 {
-    pub stream_established: bool,
-    pub established_stream_epoch: Option<u64>,
-    pub source_updates_received: u64,
-    pub admitted_source_updates: u64,
-    pub dropped_source_updates: u64,
-    pub source_queue_peak_bytes: u64,
-    pub source_queue_bytes_at_close: u64,
-    pub source_workers_cleanly_stopped: bool,
-    pub required_lane_first_slots: Option<PumpExactStateSourceReadinessV2>,
-    pub bootstrap_status: String,
-    pub fatal_capture_error: Option<String>,
-    pub source_worker_error: Option<String>,
+    pub(crate) stream_established: bool,
+    pub(crate) established_stream_epoch: Option<u64>,
+    pub(crate) source_updates_received: u64,
+    pub(crate) admitted_source_updates: u64,
+    pub(crate) dropped_source_updates: u64,
+    pub(crate) source_queue_peak_bytes: u64,
+    pub(crate) source_queue_bytes_at_close: u64,
+    pub(crate) source_workers_cleanly_stopped: bool,
+    pub(crate) required_lane_first_slots: Option<PumpExactStateSourceReadinessV2>,
+    pub(crate) bootstrap_status: String,
+    pub(crate) fatal_capture_error: Option<String>,
+    pub(crate) source_worker_error: Option<String>,
 }
 
 /// Persisted source-lane census.  This is writer-owned: a lane is counted
@@ -3609,16 +3720,16 @@ pub(crate) struct PumpExactStateCaptureSourceLifecycleV2 {
 /// ingress admission counters used to establish the bootstrap overlap.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PumpExactStateRequiredLaneCensusV2 {
-    pub transaction_messages: u64,
-    pub account_updates: u64,
-    pub slot_updates: u64,
-    pub block_meta_updates: u64,
-    pub full_blocks_started: u64,
-    pub full_block_chunks: u64,
-    pub full_blocks_completed: u64,
-    pub incomplete_full_block_payloads: u64,
-    pub unbound_full_block_chunks: u64,
-    pub full_block_payloads_reconciled: bool,
+    pub(crate) transaction_messages: u64,
+    pub(crate) account_updates: u64,
+    pub(crate) slot_updates: u64,
+    pub(crate) block_meta_updates: u64,
+    pub(crate) full_blocks_started: u64,
+    pub(crate) full_block_chunks: u64,
+    pub(crate) full_blocks_completed: u64,
+    pub(crate) incomplete_full_block_payloads: u64,
+    pub(crate) unbound_full_block_chunks: u64,
+    pub(crate) full_block_payloads_reconciled: bool,
 }
 
 impl PumpExactStateRequiredLaneCensusV2 {
@@ -3664,16 +3775,16 @@ impl PumpExactStateRequiredLaneCensusV2 {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PumpExactStateWriterSummaryV2 {
-    pub segments: Vec<PumpExactStateSegmentReceiptV2>,
-    pub raw_bytes_written: u64,
-    pub accepted_source_records: u64,
-    pub accepted_bootstrap_records: u64,
-    pub required_lane_census: PumpExactStateRequiredLaneCensusV2,
-    pub persisted_ingress_gap_missing_events: u64,
-    pub persisted_ingress_gap_episodes: u64,
-    pub gap_count: u64,
-    pub clean_shutdown: bool,
-    pub error: Option<String>,
+    pub(crate) segments: Vec<PumpExactStateSegmentReceiptV2>,
+    pub(crate) raw_bytes_written: u64,
+    pub(crate) accepted_source_records: u64,
+    pub(crate) accepted_bootstrap_records: u64,
+    pub(crate) required_lane_census: PumpExactStateRequiredLaneCensusV2,
+    pub(crate) persisted_ingress_gap_missing_events: u64,
+    pub(crate) persisted_ingress_gap_episodes: u64,
+    pub(crate) gap_count: u64,
+    pub(crate) clean_shutdown: bool,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4970,12 +5081,20 @@ fn raw_boundary_from_local_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::research_exact_tape_v2_materializer::{
+        export_prospective_exact_state_outcome_blind_windows_v2,
+        qualify_prospective_exact_state_raw_run_v2, PumpExactStateCapabilityStatusV2,
+    };
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
     use yellowstone_grpc_proto::prelude::{
-        SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
-        SubscribeUpdateBlockMeta, SubscribeUpdateSlot, SubscribeUpdateTransaction,
-        SubscribeUpdateTransactionInfo,
+        subscribe_update::UpdateOneof, CommitmentLevel, CompiledInstruction, InnerInstruction,
+        InnerInstructions, Message as ProtoMessage, SubscribeUpdate, SubscribeUpdateAccount,
+        SubscribeUpdateAccountInfo, SubscribeUpdateBlock, SubscribeUpdateBlockMeta,
+        SubscribeUpdateSlot, SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
+        Transaction, TransactionStatusMeta,
     };
 
     const TEST_V2_MAX_RAW_BYTES: u64 = 64 * 1024 * 1024;
@@ -5159,6 +5278,2097 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum QualifiedExportFixtureVariantV2 {
+        Qualified,
+        BlockedWithoutTradeFinalAnchor,
+        SlotOnlyForwardWatermark,
+        BlockMetaWithoutForwardFullBlock,
+        ReconciledBlockPairWithoutFinalizedSlot,
+        OmitWholeBuyBlock,
+        ParentBlockhashMismatch,
+        SkippedNumericSlot,
+        FinalizedSlotParentNone,
+        ProcessedParentThenFinalizedParentNone,
+        ConflictingFinalizedSlotParents,
+        AccountProjectionMismatch,
+        SlotProjectionMismatch,
+        BlockMetaProjectionMismatch,
+        WallClockStepCannotCreateWindow,
+        WrongEventMint,
+        WrongEventUser,
+        WrongEventIxName,
+        WrongEventQuoteMint,
+        WrongEventCanonicalReserve,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FixtureEventCorruptionV2 {
+        Mint,
+        User,
+        IxName,
+        QuoteMint,
+        CanonicalReserve,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FixtureProjectionCorruptionV2 {
+        AccountEvidenceClass,
+        SlotParent,
+        BlockMetaBlockhash,
+    }
+
+    fn fixture_event_corruption_for_variant_v2(
+        variant: QualifiedExportFixtureVariantV2,
+    ) -> Option<FixtureEventCorruptionV2> {
+        match variant {
+            QualifiedExportFixtureVariantV2::WrongEventMint => Some(FixtureEventCorruptionV2::Mint),
+            QualifiedExportFixtureVariantV2::WrongEventUser => Some(FixtureEventCorruptionV2::User),
+            QualifiedExportFixtureVariantV2::WrongEventIxName => {
+                Some(FixtureEventCorruptionV2::IxName)
+            }
+            QualifiedExportFixtureVariantV2::WrongEventQuoteMint => {
+                Some(FixtureEventCorruptionV2::QuoteMint)
+            }
+            QualifiedExportFixtureVariantV2::WrongEventCanonicalReserve => {
+                Some(FixtureEventCorruptionV2::CanonicalReserve)
+            }
+            _ => None,
+        }
+    }
+
+    fn fixture_projection_corruption_for_variant_v2(
+        variant: QualifiedExportFixtureVariantV2,
+    ) -> Option<FixtureProjectionCorruptionV2> {
+        match variant {
+            QualifiedExportFixtureVariantV2::AccountProjectionMismatch => {
+                Some(FixtureProjectionCorruptionV2::AccountEvidenceClass)
+            }
+            QualifiedExportFixtureVariantV2::SlotProjectionMismatch => {
+                Some(FixtureProjectionCorruptionV2::SlotParent)
+            }
+            QualifiedExportFixtureVariantV2::BlockMetaProjectionMismatch => {
+                Some(FixtureProjectionCorruptionV2::BlockMetaBlockhash)
+            }
+            _ => None,
+        }
+    }
+
+    fn prospective_v2_semantics_manifest_path_for_test() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repository root from seer manifest directory")
+            .join("configs/research/pump_exact_state_semantics_manifest_v2.json")
+    }
+
+    fn runtime_digest_from_semantics_manifest_for_test(
+        digest: &PumpExactStateSemanticsDigestV2,
+    ) -> PumpExactStateDigestV2 {
+        PumpExactStateDigestV2 {
+            sha256: digest.sha256.clone(),
+            blake3: digest.blake3.clone(),
+            bytes: digest.bytes,
+        }
+    }
+
+    fn fixture_program_data_receipt_v2(
+        semantics: &PumpExactStateSemanticsAuthorityV2,
+        observed_context_slot: u64,
+    ) -> PumpProgramDataReceiptV1 {
+        let pump_program_id = PumpResearchStoragePubkeyV1::from(semantics.program_id.to_bytes());
+        PumpProgramDataReceiptV1 {
+            pump_program_id,
+            pump_program_account_owner: PumpResearchStoragePubkeyV1::from([31; 32]),
+            pump_programdata_pubkey: PumpResearchStoragePubkeyV1::from([32; 32]),
+            program_data_owner: PumpResearchStoragePubkeyV1::from([33; 32]),
+            program_data_hash_algorithm: "blake3-256".to_owned(),
+            program_data_hash_blake3:
+                ghost_core::pump_research_tape::PumpResearchStorageHashV1::from(
+                    semantics.expected_program_data_hash_blake3(),
+                ),
+            program_deployment_slot: Some(1),
+            observed_context_slot,
+            commitment: "finalized".to_owned(),
+        }
+    }
+
+    fn fixture_curve_account_data_v2(
+        virtual_token_reserves: u64,
+        virtual_quote_reserves: u64,
+        real_token_reserves: u64,
+        real_quote_reserves: u64,
+        token_total_supply: u64,
+        creator: Pubkey,
+        quote_mint: Pubkey,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0x17, 0xb7, 0xf8, 0x37, 0x60, 0xd8, 0xac, 0x60];
+        for value in [
+            virtual_token_reserves,
+            virtual_quote_reserves,
+            real_token_reserves,
+            real_quote_reserves,
+            token_total_supply,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.push(0); // complete = false
+        bytes.extend_from_slice(&creator.to_bytes());
+        bytes.push(0); // is_mayhem_mode = false
+        bytes.push(0); // is_cashback_coin = false
+        bytes.extend_from_slice(&quote_mint.to_bytes());
+        assert_eq!(
+            bytes.len(),
+            115,
+            "fixture must use the selected V2 curve layout"
+        );
+        bytes
+    }
+
+    fn fixture_source_update_v2(
+        update: SubscribeUpdate,
+        ingress_wall_ts_ms: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        PumpResearchSourceUpdateV1 {
+            provider_id: "qualified-export-fixture".to_owned(),
+            stream_epoch: 1,
+            ingress_wall_ts_ms,
+            ingress_monotonic_ts_ms: ingress_wall_ts_ms,
+            update,
+        }
+    }
+
+    fn fixture_with_ingress_monotonic_v2(
+        mut update: PumpResearchSourceUpdateV1,
+        ingress_monotonic_ts_ms: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        update.ingress_monotonic_ts_ms = ingress_monotonic_ts_ms;
+        update
+    }
+
+    fn fixture_apply_time_variant_v2(
+        update: PumpResearchSourceUpdateV1,
+        variant: QualifiedExportFixtureVariantV2,
+        source_capture_sequence: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        if matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::WallClockStepCannotCreateWindow
+        ) {
+            // The wall labels still jump from 1s to 150999ms and 241000ms,
+            // while the actual process duration remains only a few ms.
+            // This fixture would be falsely Complete under wall-clock-only
+            // cutoff authority.
+            let monotonic_ms = match source_capture_sequence {
+                0..=10 => 1_000,
+                11..=15 => 1_001,
+                _ => 1_002,
+            };
+            return fixture_with_ingress_monotonic_v2(update, monotonic_ms);
+        }
+        update
+    }
+
+    /// Test-only corruption path: retain the original complete protobuf and
+    /// its source hash, then alter only the convenient raw projection before
+    /// it is framed and receipted.  This proves the offline qualifier binds
+    /// index/canonicality inputs to retained source bytes instead of merely
+    /// trusting a self-consistent outer record hash.
+    #[cfg(unix)]
+    fn write_fixture_source_with_projection_corruption_v2(
+        writer: &mut PumpExactStateRawSegmentWriterV2,
+        capture_sequence: u64,
+        source: PumpResearchSourceUpdateV1,
+        variant: QualifiedExportFixtureVariantV2,
+    ) -> Result<bool> {
+        let source = fixture_apply_time_variant_v2(source, variant, capture_sequence);
+        let Some(corruption) = fixture_projection_corruption_for_variant_v2(variant) else {
+            writer.write_source(capture_sequence, source)?;
+            return Ok(false);
+        };
+        let stream_epoch = source.stream_epoch;
+        let mut records = raw_records_from_source_v2(capture_sequence, source)?;
+        let mut applied = false;
+        for record in &mut records {
+            match (corruption, record) {
+                (
+                    FixtureProjectionCorruptionV2::AccountEvidenceClass,
+                    PumpExactStateRawRecordV2::PumpOwnedAccountUpdate(update),
+                ) if update.slot == 103 => {
+                    update.evidence_class = PumpExactStateAccountEvidenceClassV2::OtherPumpOwned;
+                    applied = true;
+                }
+                (
+                    FixtureProjectionCorruptionV2::SlotParent,
+                    PumpExactStateRawRecordV2::PrimarySlotUpdate(update),
+                ) if update.slot == 103 => {
+                    update.parent = Some(101);
+                    applied = true;
+                }
+                (
+                    FixtureProjectionCorruptionV2::BlockMetaBlockhash,
+                    PumpExactStateRawRecordV2::PrimaryBlockMeta(update),
+                ) if update.slot == 103 => {
+                    update.blockhash = "fixture-projection-blockhash-drift".to_owned();
+                    applied = true;
+                }
+                _ => {}
+            }
+        }
+        for record in &records {
+            writer.write_record(stream_epoch, Some(capture_sequence), record)?;
+            writer
+                .full_block_reconciliation
+                .observe_written_record(record)?;
+        }
+        Ok(applied)
+    }
+
+    fn fixture_role_pubkey_v2(instruction: &str, role: &str, ordinal: usize) -> Pubkey {
+        let digest = blake3::hash(format!("v2-fixture:{instruction}:{role}:{ordinal}").as_bytes());
+        Pubkey::new_from_array(*digest.as_bytes())
+    }
+
+    fn fixture_exact_instruction_info_v2(
+        semantics: &PumpExactStateSemanticsAuthorityV2,
+        instruction_name: &str,
+        discriminator: [u8; 8],
+        argument_bytes: Vec<u8>,
+        signature_byte: u8,
+        tx_index: u64,
+        bonding_curve: Pubkey,
+        mint: Pubkey,
+        user: Pubkey,
+    ) -> SubscribeUpdateTransactionInfo {
+        let contract = semantics
+            .instruction(&discriminator)
+            .expect("fixture instruction must be present in the real vendored semantics");
+        assert_eq!(contract.name, instruction_name);
+
+        #[derive(Clone)]
+        struct DeclaredAccount {
+            original_position: usize,
+            pubkey: Pubkey,
+            signer: bool,
+            writable: bool,
+            name: String,
+        }
+
+        let pump_program = semantics.program_id;
+        let declared = contract
+            .accounts
+            .iter()
+            .enumerate()
+            .map(|(ordinal, account)| {
+                let pubkey = account
+                    .address
+                    .unwrap_or_else(|| match account.name.as_str() {
+                        "bonding_curve" => bonding_curve,
+                        "mint" | "base_mint" => mint,
+                        "user" => user,
+                        "program" => pump_program,
+                        _ => fixture_role_pubkey_v2(instruction_name, &account.name, ordinal),
+                    });
+                DeclaredAccount {
+                    original_position: ordinal,
+                    pubkey,
+                    signer: account.signer,
+                    writable: account.writable,
+                    name: account.name.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut signer_writable = Vec::new();
+        let mut signer_readonly = Vec::new();
+        let mut unsigned_writable = Vec::new();
+        let mut unsigned_readonly = Vec::new();
+        for account in &declared {
+            match (account.signer, account.writable) {
+                (true, true) => signer_writable.push(account.clone()),
+                (true, false) => signer_readonly.push(account.clone()),
+                (false, true) => unsigned_writable.push(account.clone()),
+                (false, false) => unsigned_readonly.push(account.clone()),
+            }
+        }
+        let required_signatures = signer_writable
+            .len()
+            .checked_add(signer_readonly.len())
+            .expect("fixture signer count overflow");
+        let mut ordered = signer_writable;
+        ordered.extend(signer_readonly);
+        ordered.extend(unsigned_writable);
+        ordered.extend(unsigned_readonly);
+        let mut instruction_account_indices = vec![0u8; declared.len()];
+        let mut program_id_index = None;
+        for (index, account) in ordered.iter().enumerate() {
+            let index = u8::try_from(index).expect("fixture account index fits u8");
+            instruction_account_indices[account.original_position] = index;
+            if account.name == "program" {
+                program_id_index = Some(u32::from(index));
+            }
+        }
+        let mut instruction_data = discriminator.to_vec();
+        instruction_data.extend_from_slice(&argument_bytes);
+        let mut message = ProtoMessage {
+            header: Some(Default::default()),
+            account_keys: ordered
+                .iter()
+                .map(|account| account.pubkey.to_bytes().to_vec())
+                .collect(),
+            recent_blockhash: Vec::new(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: program_id_index.expect("fixture Pump program account"),
+                accounts: instruction_account_indices,
+                data: instruction_data,
+            }],
+            versioned: false,
+            address_table_lookups: Vec::new(),
+        };
+        let header = message.header.as_mut().expect("fixture message header");
+        header.num_required_signatures =
+            u32::try_from(required_signatures).expect("fixture signer count fits u32");
+        header.num_readonly_signed_accounts = u32::try_from(
+            ordered[..required_signatures]
+                .iter()
+                .filter(|account| !account.writable)
+                .count(),
+        )
+        .expect("fixture readonly signer count fits u32");
+        header.num_readonly_unsigned_accounts = u32::try_from(
+            ordered[required_signatures..]
+                .iter()
+                .filter(|account| !account.writable)
+                .count(),
+        )
+        .expect("fixture readonly unsigned count fits u32");
+        SubscribeUpdateTransactionInfo {
+            signature: vec![signature_byte; 64],
+            is_vote: false,
+            transaction: Some(Transaction {
+                signatures: vec![vec![signature_byte; 64]; required_signatures],
+                message: Some(message),
+            }),
+            meta: Some(TransactionStatusMeta::default()),
+            index: tx_index,
+        }
+    }
+
+    fn fixture_create_payload_v2(creator: Pubkey) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for value in ["fixture", "FX", "https://fixture.invalid"] {
+            payload.extend_from_slice(
+                &u32::try_from(value.len())
+                    .expect("fixture string length fits u32")
+                    .to_le_bytes(),
+            );
+            payload.extend_from_slice(value.as_bytes());
+        }
+        payload.extend_from_slice(&creator.to_bytes());
+        payload
+    }
+
+    fn fixture_buy_payload_v2() -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&2u64.to_le_bytes());
+        payload.push(0); // OptionBool { bool: false }
+        payload
+    }
+
+    fn fixture_push_borsh_string_v2(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(
+            &u32::try_from(value.len())
+                .expect("fixture Borsh string length fits u32")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn fixture_parent_account_role_pubkey_v2(
+        transaction: &SubscribeUpdateTransactionInfo,
+        semantics: &PumpExactStateSemanticsAuthorityV2,
+        parent_discriminator: [u8; 8],
+        role: &str,
+    ) -> Pubkey {
+        let contract = semantics
+            .instruction(&parent_discriminator)
+            .expect("fixture parent instruction exists in pinned semantics");
+        let position = contract
+            .accounts
+            .iter()
+            .position(|account| account.name == role)
+            .expect("fixture parent role exists in pinned instruction");
+        let message = transaction
+            .transaction
+            .as_ref()
+            .and_then(|body| body.message.as_ref())
+            .expect("fixture parent has message");
+        let account_index = message.instructions[0].accounts[position];
+        Pubkey::new_from_array(
+            message.account_keys[usize::from(account_index)]
+                .as_slice()
+                .try_into()
+                .expect("fixture parent account key is a Pubkey"),
+        )
+    }
+
+    fn fixture_create_event_payload_v2(
+        mint: Pubkey,
+        bonding_curve: Pubkey,
+        user: Pubkey,
+        creator: Pubkey,
+        token_program: Pubkey,
+        quote_mint: Pubkey,
+        virtual_token_reserves: u64,
+        real_token_reserves: u64,
+        token_total_supply: u64,
+        corruption: Option<FixtureEventCorruptionV2>,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for value in ["fixture", "FX", "https://fixture.invalid"] {
+            fixture_push_borsh_string_v2(&mut payload, value);
+        }
+        let event_mint = if matches!(corruption, Some(FixtureEventCorruptionV2::Mint)) {
+            Pubkey::new_from_array([72; 32])
+        } else {
+            mint
+        };
+        let event_user = if matches!(corruption, Some(FixtureEventCorruptionV2::User)) {
+            Pubkey::new_from_array([73; 32])
+        } else {
+            user
+        };
+        let event_quote_mint = if matches!(corruption, Some(FixtureEventCorruptionV2::QuoteMint)) {
+            Pubkey::new_from_array([74; 32])
+        } else {
+            quote_mint
+        };
+        for key in [event_mint, bonding_curve, event_user, creator] {
+            payload.extend_from_slice(&key.to_bytes());
+        }
+        payload.extend_from_slice(&17i64.to_le_bytes());
+        payload.extend_from_slice(&virtual_token_reserves.to_le_bytes());
+        payload.extend_from_slice(&777u64.to_le_bytes()); // legacy/native-SOL label only
+        payload.extend_from_slice(&real_token_reserves.to_le_bytes());
+        payload.extend_from_slice(&token_total_supply.to_le_bytes());
+        payload.extend_from_slice(&token_program.to_bytes());
+        payload.push(0); // is_mayhem_mode
+        payload.push(0); // is_cashback_enabled
+        payload.extend_from_slice(&event_quote_mint.to_bytes());
+        payload.extend_from_slice(&100u64.to_le_bytes()); // deliberately != virtual_sol
+        payload
+    }
+
+    fn fixture_trade_event_payload_v2(
+        mint: Pubkey,
+        user: Pubkey,
+        quote_mint: Pubkey,
+        virtual_token_reserves: u64,
+        real_token_reserves: u64,
+        corruption: Option<FixtureEventCorruptionV2>,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&mint.to_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes()); // sol_amount
+        payload.extend_from_slice(&2u64.to_le_bytes()); // token_amount
+        payload.push(1); // is_buy
+        payload.extend_from_slice(&user.to_bytes());
+        payload.extend_from_slice(&18i64.to_le_bytes());
+        payload.extend_from_slice(&777u64.to_le_bytes()); // virtual_sol_reserves
+        let event_virtual_token_reserves =
+            if matches!(corruption, Some(FixtureEventCorruptionV2::CanonicalReserve)) {
+                virtual_token_reserves
+                    .checked_add(1)
+                    .expect("fixture canonical reserve does not overflow")
+            } else {
+                virtual_token_reserves
+            };
+        payload.extend_from_slice(&event_virtual_token_reserves.to_le_bytes());
+        payload.extend_from_slice(&666u64.to_le_bytes()); // real_sol_reserves
+        payload.extend_from_slice(&real_token_reserves.to_le_bytes());
+        payload.extend_from_slice(&Pubkey::new_from_array([70; 32]).to_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes()); // fee basis points
+        payload.extend_from_slice(&0u64.to_le_bytes()); // fee
+        payload.extend_from_slice(&Pubkey::new_from_array([71; 32]).to_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes()); // creator fee basis points
+        payload.extend_from_slice(&0u64.to_le_bytes()); // creator fee
+        payload.push(0); // track_volume
+        payload.extend_from_slice(&0u64.to_le_bytes()); // total_unclaimed_tokens
+        payload.extend_from_slice(&0u64.to_le_bytes()); // total_claimed_tokens
+        payload.extend_from_slice(&0u64.to_le_bytes()); // current_sol_volume
+        payload.extend_from_slice(&19i64.to_le_bytes());
+        fixture_push_borsh_string_v2(
+            &mut payload,
+            if matches!(corruption, Some(FixtureEventCorruptionV2::IxName)) {
+                "sell"
+            } else {
+                "buy"
+            },
+        );
+        payload.push(0); // mayhem_mode
+        payload.extend_from_slice(&0u64.to_le_bytes()); // cashback fee basis points
+        payload.extend_from_slice(&0u64.to_le_bytes()); // cashback
+        payload.extend_from_slice(&0u64.to_le_bytes()); // buyback fee basis points
+        payload.extend_from_slice(&0u64.to_le_bytes()); // buyback
+        payload.extend_from_slice(&0u32.to_le_bytes()); // shareholders vec length
+        payload.extend_from_slice(&quote_mint.to_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes()); // quote amount
+        payload.extend_from_slice(&100u64.to_le_bytes()); // deliberately != virtual_sol
+        payload.extend_from_slice(&101u64.to_le_bytes()); // deliberately != real_sol
+        payload
+    }
+
+    fn fixture_attach_anchor_event_cpi_v2(
+        transaction: &mut SubscribeUpdateTransactionInfo,
+        semantics: &PumpExactStateSemanticsAuthorityV2,
+        event_discriminator: [u8; 8],
+        event_payload: Vec<u8>,
+    ) {
+        let transaction_body = transaction
+            .transaction
+            .as_mut()
+            .expect("fixture Event-CPI parent has transaction body");
+        let message = transaction_body
+            .message
+            .as_mut()
+            .expect("fixture Event-CPI parent has message");
+        let outer = message
+            .instructions
+            .first()
+            .expect("fixture Event-CPI parent has outer Pump instruction");
+        let pump_program_index = outer.program_id_index;
+        assert_eq!(
+            message.account_keys[usize::try_from(pump_program_index).expect("Pump index fits")],
+            semantics.program_id.to_bytes().to_vec(),
+            "fixture outer instruction must be a real Pump parent"
+        );
+        let event_authority =
+            Pubkey::find_program_address(&[b"__event_authority"], &semantics.program_id).0;
+        let event_authority_index = u8::try_from(message.account_keys.len())
+            .expect("fixture Event-CPI account index fits u8");
+        message
+            .account_keys
+            .push(event_authority.to_bytes().to_vec());
+        let header = message
+            .header
+            .as_mut()
+            .expect("fixture Event-CPI message header");
+        header.num_readonly_unsigned_accounts = header
+            .num_readonly_unsigned_accounts
+            .checked_add(1)
+            .expect("fixture readonly unsigned count fits u32");
+
+        let mut data = vec![0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
+        data.extend_from_slice(&event_discriminator);
+        data.extend_from_slice(&event_payload);
+        let meta = transaction
+            .meta
+            .as_mut()
+            .expect("fixture Event-CPI parent has metadata");
+        assert!(
+            meta.inner_instructions.is_empty(),
+            "fixture Event-CPI must own the only inner-instruction group"
+        );
+        meta.inner_instructions.push(InnerInstructions {
+            index: 0,
+            instructions: vec![InnerInstruction {
+                program_id_index: pump_program_index,
+                accounts: vec![event_authority_index],
+                data,
+                stack_height: Some(2),
+            }],
+        });
+    }
+
+    fn fixture_transaction_source_v2(
+        transaction: SubscribeUpdateTransactionInfo,
+        slot: u64,
+        ingress_wall_ts_ms: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        fixture_source_update_v2(
+            SubscribeUpdate {
+                filters: vec!["pump_research_exact_state_v2_transactions".to_owned()],
+                update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                    transaction: Some(transaction),
+                    slot,
+                })),
+            },
+            ingress_wall_ts_ms,
+        )
+    }
+
+    fn fixture_account_source_v2(
+        bonding_curve: Pubkey,
+        data: Vec<u8>,
+        slot: u64,
+        write_version: u64,
+        txn_signature: Option<u8>,
+        ingress_wall_ts_ms: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("pinned Pump program");
+        fixture_source_update_v2(
+            SubscribeUpdate {
+                filters: vec!["pump_research_exact_state_v2_all_pump_owned".to_owned()],
+                update_oneof: Some(UpdateOneof::Account(SubscribeUpdateAccount {
+                    account: Some(SubscribeUpdateAccountInfo {
+                        pubkey: bonding_curve.to_bytes().to_vec(),
+                        lamports: 1,
+                        owner: pump_program.to_bytes().to_vec(),
+                        executable: false,
+                        rent_epoch: 0,
+                        data,
+                        write_version,
+                        txn_signature: txn_signature.map(|value| vec![value; 64]),
+                    }),
+                    slot,
+                    is_startup: false,
+                })),
+            },
+            ingress_wall_ts_ms,
+        )
+    }
+
+    fn fixture_slot_source_v2(
+        slot: u64,
+        parent: u64,
+        ingress_wall_ts_ms: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        fixture_slot_source_with_parent_and_status_v2(
+            slot,
+            Some(parent),
+            CommitmentLevel::Finalized as i32,
+            ingress_wall_ts_ms,
+        )
+    }
+
+    fn fixture_slot_source_with_parent_and_status_v2(
+        slot: u64,
+        parent: Option<u64>,
+        status: i32,
+        ingress_wall_ts_ms: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        fixture_source_update_v2(
+            SubscribeUpdate {
+                filters: vec!["pump_research_exact_state_v2_slots".to_owned()],
+                update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot,
+                    parent,
+                    status,
+                })),
+            },
+            ingress_wall_ts_ms,
+        )
+    }
+
+    fn fixture_block_meta_source_v2(
+        slot: u64,
+        parent_slot: u64,
+        ingress_wall_ts_ms: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        fixture_block_meta_source_with_transaction_count_v2(
+            slot,
+            parent_slot,
+            1,
+            ingress_wall_ts_ms,
+        )
+    }
+
+    fn fixture_parent_blockhash_v2(parent_slot: u64) -> String {
+        format!("fixture-blockhash-{parent_slot}")
+    }
+
+    fn fixture_with_parent_blockhash_v2(
+        mut source: PumpResearchSourceUpdateV1,
+        parent_blockhash: &str,
+    ) -> PumpResearchSourceUpdateV1 {
+        match source.update.update_oneof.as_mut() {
+            Some(UpdateOneof::BlockMeta(block_meta)) => {
+                block_meta.parent_blockhash = parent_blockhash.to_owned();
+            }
+            Some(UpdateOneof::Block(block)) => {
+                block.parent_blockhash = parent_blockhash.to_owned();
+            }
+            _ => panic!("fixture parent-blockhash override requires BlockMeta or Block"),
+        }
+        source
+    }
+
+    fn fixture_block_meta_source_with_transaction_count_v2(
+        slot: u64,
+        parent_slot: u64,
+        executed_transaction_count: u64,
+        ingress_wall_ts_ms: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        fixture_source_update_v2(
+            SubscribeUpdate {
+                filters: vec!["pump_research_exact_state_v2_blocks_meta".to_owned()],
+                update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                    slot,
+                    blockhash: format!("fixture-blockhash-{slot}"),
+                    rewards: None,
+                    block_time: None,
+                    block_height: None,
+                    parent_slot,
+                    parent_blockhash: fixture_parent_blockhash_v2(parent_slot),
+                    executed_transaction_count,
+                    entries_count: 0,
+                })),
+            },
+            ingress_wall_ts_ms,
+        )
+    }
+
+    fn fixture_full_block_source_v2(
+        slot: u64,
+        parent_slot: u64,
+        transaction: SubscribeUpdateTransactionInfo,
+        ingress_wall_ts_ms: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        fixture_full_block_source_with_transactions_v2(
+            slot,
+            parent_slot,
+            vec![transaction],
+            ingress_wall_ts_ms,
+        )
+    }
+
+    fn fixture_empty_full_block_source_v2(
+        slot: u64,
+        parent_slot: u64,
+        ingress_wall_ts_ms: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        fixture_full_block_source_with_transactions_v2(
+            slot,
+            parent_slot,
+            Vec::new(),
+            ingress_wall_ts_ms,
+        )
+    }
+
+    fn fixture_full_block_source_with_transactions_v2(
+        slot: u64,
+        parent_slot: u64,
+        transactions: Vec<SubscribeUpdateTransactionInfo>,
+        ingress_wall_ts_ms: u64,
+    ) -> PumpResearchSourceUpdateV1 {
+        let executed_transaction_count =
+            u64::try_from(transactions.len()).expect("fixture full-block count fits u64");
+        fixture_source_update_v2(
+            SubscribeUpdate {
+                filters: vec!["pump_research_exact_state_v2_full_blocks".to_owned()],
+                update_oneof: Some(UpdateOneof::Block(SubscribeUpdateBlock {
+                    slot,
+                    parent_slot,
+                    blockhash: format!("fixture-blockhash-{slot}"),
+                    parent_blockhash: fixture_parent_blockhash_v2(parent_slot),
+                    executed_transaction_count,
+                    transactions,
+                    ..SubscribeUpdateBlock::default()
+                })),
+            },
+            ingress_wall_ts_ms,
+        )
+    }
+
+    fn write_bootstrap_boundary_for_qualified_export_fixture_v2(
+        writer: &mut PumpExactStateRawSegmentWriterV2,
+        semantics: &PumpExactStateSemanticsAuthorityV2,
+        readiness: PumpExactStateSourceReadinessV2,
+        source_capture_sequence_exclusive: u64,
+    ) {
+        let finalized_context_slot = readiness.source_readiness_slot;
+        let response_bytes = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "pump_exact_state_v2_bootstrap",
+            "result": {"context": {"slot": finalized_context_slot}, "value": []}
+        }))
+        .expect("serialize fixture bootstrap response");
+        let response_blake3 = hash_bytes_v2(&response_bytes);
+        let empty_account_set = hash_bytes_v2(&[]);
+        writer
+            .write_bootstrap_record(
+                1,
+                PumpExactStateRawRecordV2::BootstrapSnapshotStarted(
+                    PumpExactStateBootstrapSnapshotStartedV2 {
+                        snapshot_id_blake3: response_blake3,
+                        provider_id: "qualified-export-fixture".to_owned(),
+                        pump_program_id: PumpResearchStoragePubkeyV1::from(
+                            semantics.program_id.to_bytes(),
+                        ),
+                        commitment: PumpExactStateBootstrapCommitmentV2::Finalized,
+                        source_stream_epoch_at_start: 1,
+                        started_wall_ts_ms: 1_000,
+                        started_monotonic_ts_ms: 1_000,
+                    },
+                ),
+            )
+            .expect("write fixture bootstrap start");
+        writer
+            .write_bootstrap_record(
+                1,
+                PumpExactStateRawRecordV2::BootstrapResponseChunk(
+                    PumpExactStateBootstrapResponseChunkV2 {
+                        snapshot_id_blake3: response_blake3,
+                        chunk_index: 0,
+                        bytes: response_bytes.clone(),
+                    },
+                ),
+            )
+            .expect("write fixture bootstrap response");
+        writer
+            .write_bootstrap_record(
+                1,
+                PumpExactStateRawRecordV2::BootstrapSnapshotCompleted(
+                    PumpExactStateBootstrapSnapshotCompletedV2 {
+                        snapshot_id_blake3: response_blake3,
+                        finalized_context_slot,
+                        response_sha256: sha256_storage_hash_v2(&response_bytes),
+                        response_blake3,
+                        response_bytes: u64::try_from(response_bytes.len())
+                            .expect("fixture bootstrap bytes fit u64"),
+                        response_chunk_count: 1,
+                        account_count: 0,
+                        account_set_blake3: empty_account_set,
+                        source_stream_epoch_at_completion: 1,
+                        completed_wall_ts_ms: 1_001,
+                        completed_monotonic_ts_ms: 1_001,
+                    },
+                ),
+            )
+            .expect("write fixture bootstrap completion");
+        writer
+            .write_bootstrap_record(
+                1,
+                PumpExactStateRawRecordV2::ProspectiveReadinessBoundary(
+                    PumpExactStateProspectiveReadinessBoundaryV2 {
+                        snapshot_id_blake3: response_blake3,
+                        finalized_context_slot,
+                        source_readiness: readiness,
+                        finalized_context_slot_covers_source_readiness: true,
+                        source_stream_epoch: 1,
+                        source_capture_sequence_exclusive,
+                        cohort_slots_strictly_after: finalized_context_slot,
+                        sealed_wall_ts_ms: 1_002,
+                        sealed_monotonic_ts_ms: 1_002,
+                    },
+                ),
+            )
+            .expect("write fixture readiness boundary");
+    }
+
+    #[cfg(unix)]
+    fn write_complete_raw_fixture_for_qualified_export_v2(
+        raw_dir: &Path,
+        run_id: &str,
+        semantics: &PumpExactStateSemanticsAuthorityV2,
+        variant: QualifiedExportFixtureVariantV2,
+    ) {
+        let capture_contract =
+            ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([41; 32]);
+        let mut writer = PumpExactStateRawSegmentWriterV2::new(
+            raw_dir.to_path_buf(),
+            run_id.to_owned(),
+            capture_contract,
+            Duration::from_secs(60),
+            16 * 1024 * 1024,
+            Duration::from_secs(60),
+            TEST_V2_MAX_RAW_BYTES,
+            TEST_V2_MIN_FREE_BYTES,
+        )
+        .expect("create local V2 raw fixture writer");
+        fs::set_permissions(raw_dir, fs::Permissions::from_mode(0o700))
+            .expect("make local raw fixture authority-private");
+
+        let curve = Pubkey::new_from_array([61; 32]);
+        let mint = Pubkey::new_from_array([62; 32]);
+        let user = Pubkey::new_from_array([63; 32]);
+        let creator = Pubkey::new_from_array([64; 32]);
+        let quote_mint = Pubkey::default();
+        let pre_state =
+            fixture_curve_account_data_v2(1_000, 1_001, 1_002, 1_003, 1_004, creator, quote_mint);
+        let create_state =
+            fixture_curve_account_data_v2(900, 1_100, 800, 1_090, 1_004, creator, quote_mint);
+        let buy_state =
+            fixture_curve_account_data_v2(800, 1_200, 700, 1_180, 1_004, creator, quote_mint);
+        let create_discriminator = [24, 30, 200, 40, 5, 28, 7, 119];
+        let buy_discriminator = [102, 6, 61, 18, 1, 218, 235, 234];
+        let pre_cohort_buy = fixture_exact_instruction_info_v2(
+            semantics,
+            "buy",
+            buy_discriminator,
+            fixture_buy_payload_v2(),
+            1,
+            0,
+            curve,
+            mint,
+            user,
+        );
+        let mut create = fixture_exact_instruction_info_v2(
+            semantics,
+            "create",
+            create_discriminator,
+            fixture_create_payload_v2(creator),
+            2,
+            0,
+            curve,
+            mint,
+            user,
+        );
+        let mut buy = fixture_exact_instruction_info_v2(
+            semantics,
+            "buy",
+            buy_discriminator,
+            fixture_buy_payload_v2(),
+            3,
+            0,
+            curve,
+            mint,
+            user,
+        );
+        let create_token_program = fixture_parent_account_role_pubkey_v2(
+            &create,
+            semantics,
+            create_discriminator,
+            "token_program",
+        );
+        let event_corruption = fixture_event_corruption_for_variant_v2(variant);
+        fixture_attach_anchor_event_cpi_v2(
+            &mut create,
+            semantics,
+            [27, 114, 169, 77, 222, 235, 99, 118],
+            fixture_create_event_payload_v2(
+                mint,
+                curve,
+                user,
+                creator,
+                create_token_program,
+                quote_mint,
+                900,
+                800,
+                1_004,
+                event_corruption,
+            ),
+        );
+        fixture_attach_anchor_event_cpi_v2(
+            &mut buy,
+            semantics,
+            [189, 219, 127, 211, 78, 230, 97, 238],
+            fixture_trade_event_payload_v2(mint, user, quote_mint, 800, 700, event_corruption),
+        );
+
+        writer
+            .write_source(
+                1,
+                fixture_apply_time_variant_v2(fixture_slot_source_v2(102, 101, 1_000), variant, 1),
+            )
+            .expect("write fixture first Slot lane");
+        writer
+            .write_source(
+                2,
+                fixture_apply_time_variant_v2(
+                    fixture_block_meta_source_v2(102, 101, 1_000),
+                    variant,
+                    2,
+                ),
+            )
+            .expect("write fixture first BlockMeta lane");
+        writer
+            .write_source(
+                3,
+                fixture_apply_time_variant_v2(
+                    fixture_full_block_source_v2(102, 101, pre_cohort_buy.clone(), 1_000),
+                    variant,
+                    3,
+                ),
+            )
+            .expect("write fixture first full block");
+        writer
+            .write_source(
+                4,
+                fixture_apply_time_variant_v2(
+                    fixture_account_source_v2(curve, pre_state, 102, 1, None, 1_000),
+                    variant,
+                    4,
+                ),
+            )
+            .expect("write fixture first account lane");
+        writer
+            .write_source(
+                5,
+                fixture_apply_time_variant_v2(
+                    fixture_transaction_source_v2(pre_cohort_buy, 102, 1_000),
+                    variant,
+                    5,
+                ),
+            )
+            .expect("write fixture first transaction lane");
+
+        let readiness = PumpExactStateSourceReadinessV2 {
+            first_transaction_slot: 102,
+            first_account_update_slot: 102,
+            first_slot_update_slot: 102,
+            first_block_meta_slot: 102,
+            first_full_block_slot: 102,
+            source_readiness_slot: 102,
+        };
+        write_bootstrap_boundary_for_qualified_export_fixture_v2(
+            &mut writer,
+            semantics,
+            readiness.clone(),
+            6,
+        );
+
+        let omit_whole_buy_block =
+            matches!(variant, QualifiedExportFixtureVariantV2::OmitWholeBuyBlock);
+        let omit_buy_final_anchor = matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::BlockedWithoutTradeFinalAnchor
+        );
+        let skipped_numeric_slot =
+            matches!(variant, QualifiedExportFixtureVariantV2::SkippedNumericSlot);
+        let finalized_slot_parent_is_none = matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::FinalizedSlotParentNone
+                | QualifiedExportFixtureVariantV2::ProcessedParentThenFinalizedParentNone
+                | QualifiedExportFixtureVariantV2::ConflictingFinalizedSlotParents
+        );
+        let processed_parent_precedes_finalized_none = matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::ProcessedParentThenFinalizedParentNone
+        );
+        let conflicting_finalized_slot_parents = matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::ConflictingFinalizedSlotParents
+        );
+        let (buy_slot, buy_parent_slot, forward_slot, forward_parent_slot) = if skipped_numeric_slot
+        {
+            // Numeric slot 104 is deliberately skipped.  The real
+            // parent relation, not `slot - 1`, remains the authority.
+            (105, 103, 106, 105)
+        } else {
+            (104, 103, 105, 104)
+        };
+        let mut next_sequence = 6u64;
+        let mut projection_corruption_applied = false;
+        macro_rules! write_fixture_source {
+            ($source:expr, $label:literal) => {{
+                projection_corruption_applied |=
+                    write_fixture_source_with_projection_corruption_v2(
+                        &mut writer,
+                        next_sequence,
+                        $source,
+                        variant,
+                    )
+                    .expect($label);
+                next_sequence = next_sequence
+                    .checked_add(1)
+                    .expect("fixture source sequence overflow");
+            }};
+        }
+
+        write_fixture_source!(
+            fixture_transaction_source_v2(create.clone(), 103, 1_000),
+            "write fixture Create transaction"
+        );
+        write_fixture_source!(
+            fixture_account_source_v2(curve, create_state, 103, 2, Some(2), 1_000),
+            "write fixture Create final anchor"
+        );
+        write_fixture_source!(
+            fixture_slot_source_v2(103, 102, 1_000),
+            "write fixture Create Slot evidence"
+        );
+        write_fixture_source!(
+            fixture_block_meta_source_v2(103, 102, 1_000),
+            "write fixture Create BlockMeta evidence"
+        );
+        write_fixture_source!(
+            fixture_full_block_source_v2(103, 102, create, 1_000),
+            "write fixture Create full block"
+        );
+        if !omit_whole_buy_block {
+            write_fixture_source!(
+                fixture_transaction_source_v2(buy.clone(), buy_slot, 150_999),
+                "write fixture Buy transaction"
+            );
+            if !omit_buy_final_anchor {
+                write_fixture_source!(
+                    fixture_account_source_v2(curve, buy_state, buy_slot, 3, Some(3), 150_999,),
+                    "write fixture Buy final anchor"
+                );
+            }
+            if processed_parent_precedes_finalized_none {
+                // The retained protobuf is internally consistent: only a
+                // nonfinal Slot reports the true parent.  The following
+                // Finalized Slot deliberately reports None, so the qualifier
+                // must reject instead of stitching fields across updates.
+                write_fixture_source!(
+                    fixture_slot_source_with_parent_and_status_v2(
+                        buy_slot,
+                        Some(buy_parent_slot),
+                        CommitmentLevel::Processed as i32,
+                        150_999,
+                    ),
+                    "write fixture Processed Slot parent before parentless Finalized Slot"
+                );
+            }
+            if conflicting_finalized_slot_parents {
+                write_fixture_source!(
+                    fixture_slot_source_v2(buy_slot, buy_parent_slot, 150_999),
+                    "write fixture first conflicting Finalized Slot parent"
+                );
+            }
+            write_fixture_source!(
+                if finalized_slot_parent_is_none {
+                    fixture_slot_source_with_parent_and_status_v2(
+                        buy_slot,
+                        None,
+                        CommitmentLevel::Finalized as i32,
+                        150_999,
+                    )
+                } else {
+                    fixture_slot_source_v2(buy_slot, buy_parent_slot, 150_999)
+                },
+                "write fixture Buy finalized Slot evidence"
+            );
+            write_fixture_source!(
+                fixture_block_meta_source_v2(buy_slot, buy_parent_slot, 150_999),
+                "write fixture Buy BlockMeta evidence"
+            );
+            write_fixture_source!(
+                fixture_full_block_source_v2(buy_slot, buy_parent_slot, buy, 150_999),
+                "write fixture Buy full block"
+            );
+        }
+
+        match variant {
+            QualifiedExportFixtureVariantV2::SlotOnlyForwardWatermark => {
+                write_fixture_source!(
+                    fixture_slot_source_v2(forward_slot, forward_parent_slot, 241_000),
+                    "write fixture unpaired forward Slot evidence"
+                );
+            }
+            QualifiedExportFixtureVariantV2::BlockMetaWithoutForwardFullBlock => {
+                write_fixture_source!(
+                    fixture_slot_source_v2(forward_slot, forward_parent_slot, 241_000),
+                    "write fixture incomplete forward Slot evidence"
+                );
+                write_fixture_source!(
+                    fixture_block_meta_source_with_transaction_count_v2(
+                        forward_slot,
+                        forward_parent_slot,
+                        0,
+                        241_000,
+                    ),
+                    "write fixture unmatched forward BlockMeta evidence"
+                );
+            }
+            QualifiedExportFixtureVariantV2::ReconciledBlockPairWithoutFinalizedSlot => {
+                write_fixture_source!(
+                    fixture_block_meta_source_with_transaction_count_v2(
+                        forward_slot,
+                        forward_parent_slot,
+                        0,
+                        241_000,
+                    ),
+                    "write fixture reconciled BlockMeta without finalized Slot evidence"
+                );
+                write_fixture_source!(
+                    fixture_empty_full_block_source_v2(forward_slot, forward_parent_slot, 241_000,),
+                    "write fixture reconciled full block without finalized Slot evidence"
+                );
+            }
+            _ => {
+                let mut forward_block_meta = fixture_block_meta_source_with_transaction_count_v2(
+                    forward_slot,
+                    forward_parent_slot,
+                    0,
+                    241_000,
+                );
+                let mut forward_full_block =
+                    fixture_empty_full_block_source_v2(forward_slot, forward_parent_slot, 241_000);
+                if matches!(
+                    variant,
+                    QualifiedExportFixtureVariantV2::ParentBlockhashMismatch
+                ) {
+                    let drift = "fixture-parent-blockhash-drift";
+                    forward_block_meta =
+                        fixture_with_parent_blockhash_v2(forward_block_meta, drift);
+                    forward_full_block =
+                        fixture_with_parent_blockhash_v2(forward_full_block, drift);
+                }
+                write_fixture_source!(
+                    fixture_slot_source_v2(forward_slot, forward_parent_slot, 241_000),
+                    "write fixture reconciled forward Slot evidence"
+                );
+                write_fixture_source!(
+                    forward_block_meta,
+                    "write fixture reconciled forward BlockMeta evidence"
+                );
+                write_fixture_source!(
+                    forward_full_block,
+                    "write fixture reconciled empty forward full block"
+                );
+            }
+        }
+        if fixture_projection_corruption_for_variant_v2(variant).is_some() {
+            assert!(
+                projection_corruption_applied,
+                "requested fixture projection corruption was not applied"
+            );
+        }
+        writer
+            .close_current(true)
+            .expect("close complete local V2 raw fixture");
+
+        let source_update_count = next_sequence - 1;
+        let mut required_lane_census = writer.full_block_census(true);
+        required_lane_census.transaction_messages = if omit_whole_buy_block { 2 } else { 3 };
+        required_lane_census.account_updates = if omit_whole_buy_block || omit_buy_final_anchor {
+            2
+        } else {
+            3
+        };
+        required_lane_census.slot_updates = match variant {
+            QualifiedExportFixtureVariantV2::ReconciledBlockPairWithoutFinalizedSlot
+            | QualifiedExportFixtureVariantV2::OmitWholeBuyBlock => 3,
+            QualifiedExportFixtureVariantV2::ProcessedParentThenFinalizedParentNone
+            | QualifiedExportFixtureVariantV2::ConflictingFinalizedSlotParents => 5,
+            _ => 4,
+        };
+        required_lane_census.block_meta_updates = match variant {
+            QualifiedExportFixtureVariantV2::SlotOnlyForwardWatermark
+            | QualifiedExportFixtureVariantV2::OmitWholeBuyBlock => 3,
+            _ => 4,
+        };
+        let program_data = fixture_program_data_receipt_v2(semantics, 102);
+        let running_executable = digest_running_executable_v2().expect("fixture running image");
+        let semantics_manifest_digest =
+            runtime_digest_from_semantics_manifest_for_test(&semantics.manifest_digest);
+        let vendored_idl_digest =
+            runtime_digest_from_semantics_manifest_for_test(&semantics.idl_digest);
+        let start = PumpExactStateRunStartManifestV2 {
+            storage_format_version: ghost_core::pump_research_exact_tape_v2::PUMP_EXACT_STATE_TAPE_STORAGE_FORMAT_VERSION_V2,
+            schema_version: EXACT_STATE_TAPE_V2_RUN_SCHEMA_VERSION,
+            capture_config_schema_version: EXACT_STATE_TAPE_V2_CONFIG_SCHEMA_VERSION,
+            run_id: run_id.to_owned(),
+            repository_commit: "fixture-local-only".to_owned(),
+            running_executable_digest: running_executable.clone(),
+            operator_preflight_receipt_digest: digest_bytes_v2(b"fixture-preflight"),
+            sealed_release_binary_digest: running_executable.clone(),
+            sealed_fresh_build_receipt_digest: digest_bytes_v2(b"fixture-build"),
+            sealed_build_semantics: "fixture-local-only".to_owned(),
+            capture_config_digest: digest_bytes_v2(b"fixture-config"),
+            capture_contract_sha256: hex_bytes_v2(&capture_contract.into_inner()),
+            source_request_fingerprint_blake3: "42".repeat(32),
+            source_capture_semantics: ghost_core::pump_research_exact_tape_v2::PUMP_EXACT_STATE_TAPE_SOURCE_CAPTURE_SEMANTICS_V2.to_owned(),
+            source_max_decoded_message_bytes: 16 * 1024 * 1024,
+            semantics_id: semantics.semantics_id.clone(),
+            semantics_manifest_digest,
+            vendored_idl_digest,
+            expected_program_data_hash_blake3: hex_bytes_v2(&semantics.expected_program_data_hash_blake3()),
+            primary_provider_id: "qualified-export-fixture".to_owned(),
+            grpc_endpoint_digest: digest_bytes_v2(b"fixture-grpc"),
+            bootstrap_rpc_endpoint_digest: digest_bytes_v2(b"fixture-bootstrap"),
+            bootstrap_rpc_auth_mode: "fixture-no-auth".to_owned(),
+            pump_program_id: semantics.program_id.to_string(),
+            program_data_at_start: program_data.clone(),
+            cohort_capture_wall_ms: 240_000,
+            min_free_bytes: TEST_V2_MIN_FREE_BYTES,
+            max_raw_bytes: TEST_V2_MAX_RAW_BYTES,
+            required_storage_bytes: TEST_V2_MIN_FREE_BYTES,
+            output_filesystem_available_bytes_at_start: TEST_V2_MIN_FREE_BYTES,
+            capture_started_wall_ms: 1_000,
+            capture_started_monotonic_ms: 1_000,
+            required_for_run: true,
+        };
+        write_json_create_new_v2(&raw_dir.join("run_start_manifest_v2.json"), &start)
+            .expect("write local V2 start manifest");
+        let completion = PumpExactStateRunCompletionReceiptV2 {
+            storage_format_version: ghost_core::pump_research_exact_tape_v2::PUMP_EXACT_STATE_TAPE_STORAGE_FORMAT_VERSION_V2,
+            schema_version: EXACT_STATE_TAPE_V2_RUN_SCHEMA_VERSION,
+            run_id: run_id.to_owned(),
+            status: PumpExactStateCaptureRunStatusV2::Complete,
+            clean_shutdown: true,
+            bootstrap_finalized_context_slot: Some(102),
+            bootstrap_source_readiness: Some(readiness.clone()),
+            bootstrap_source_overlap_proven: true,
+            bootstrap_snapshot_attempt_count: 1,
+            bootstrap_completed: true,
+            running_executable_at_completion: Some(running_executable),
+            running_executable_unchanged: true,
+            program_data_at_start: program_data.clone(),
+            program_data_at_completion: Some(program_data),
+            program_data_unchanged: true,
+            cohort_capture_termination: Some(PumpExactStateCaptureTerminationV2::CohortWallDeadline),
+            cohort_capture_elapsed_ms: Some(240_000),
+            min_free_bytes: TEST_V2_MIN_FREE_BYTES,
+            max_raw_bytes: TEST_V2_MAX_RAW_BYTES,
+            output_filesystem_available_bytes_at_completion: Some(TEST_V2_MIN_FREE_BYTES),
+            storage_reserve_maintained: true,
+            raw_byte_budget_respected: true,
+            required_source_lanes_observed: true,
+            source_lifecycle: PumpExactStateCaptureSourceLifecycleV2 {
+                stream_established: true,
+                established_stream_epoch: Some(1),
+                source_updates_received: source_update_count,
+                admitted_source_updates: source_update_count,
+                dropped_source_updates: 0,
+                source_queue_peak_bytes: 1,
+                source_queue_bytes_at_close: 0,
+                source_workers_cleanly_stopped: true,
+                required_lane_first_slots: Some(readiness),
+                bootstrap_status: "complete".to_owned(),
+                fatal_capture_error: None,
+                source_worker_error: None,
+            },
+            writer: PumpExactStateWriterSummaryV2 {
+                segments: writer.receipts().to_vec(),
+                raw_bytes_written: writer.raw_bytes_written(),
+                accepted_source_records: source_update_count,
+                accepted_bootstrap_records: 4,
+                required_lane_census,
+                persisted_ingress_gap_missing_events: 0,
+                persisted_ingress_gap_episodes: 0,
+                gap_count: 0,
+                clean_shutdown: true,
+                error: None,
+            },
+            segment_list: writer.receipts().to_vec(),
+            completion_wall_ms: 241_000,
+        };
+        write_json_create_new_v2(&raw_dir.join("run_completion_receipt_v2.json"), &completion)
+            .expect("write local V2 completion receipt");
+    }
+
+    #[cfg(unix)]
+    fn fixture_exact_artifact_digest_json_v2(path: &Path) -> serde_json::Value {
+        let bytes = fs::read(path).expect("read fixture exact artifact");
+        let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+        serde_json::json!({
+            "sha256": hex_bytes_v2(&sha256),
+            "blake3": hex_bytes_v2(blake3::hash(&bytes).as_bytes()),
+            "bytes": u64::try_from(bytes.len()).expect("fixture artifact byte count fits u64"),
+            "line_count": u64::try_from(bytes.iter().filter(|byte| **byte == b'\n').count())
+                .expect("fixture artifact line count fits u64"),
+            "newline_complete": bytes.last() == Some(&b'\n'),
+        })
+    }
+
+    #[cfg(unix)]
+    fn rewrite_private_fixture_json_v2(path: &Path, value: &serde_json::Value) {
+        let mut bytes = serde_json::to_vec_pretty(value).expect("serialize fixture JSON");
+        bytes.push(b'\n');
+        fs::write(path, bytes).expect("rewrite fixture JSON");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("restore fixture JSON private mode");
+    }
+
+    #[cfg(unix)]
+    fn clone_and_inject_unscoped_candidate_into_qualified_exact_fixture_v2(
+        source_dir: &Path,
+        target_dir: &Path,
+    ) {
+        fs::create_dir(target_dir).expect("create cloned exact fixture directory");
+        fs::set_permissions(target_dir, fs::Permissions::from_mode(0o700))
+            .expect("make cloned exact fixture directory private");
+        for filename in [
+            "births_v2.jsonl",
+            "trajectories_v2.jsonl",
+            "coverage_v2.jsonl",
+            "exact_state_capability_v2.json",
+            "manifest_v2.json",
+        ] {
+            let target = target_dir.join(filename);
+            fs::copy(source_dir.join(filename), &target).expect("clone exact fixture artifact");
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+                .expect("make cloned exact fixture artifact private");
+        }
+
+        let coverage_path = target_dir.join("coverage_v2.jsonl");
+        let mut coverage_rows = fs::read_to_string(&coverage_path)
+            .expect("read cloned coverage JSONL")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("parse coverage row")
+            })
+            .collect::<Vec<_>>();
+        let pre_cohort = coverage_rows
+            .first_mut()
+            .expect("fixture coverage has a pre-cohort row");
+        pre_cohort["candidate_count"] = serde_json::json!(1u32);
+        pre_cohort["candidates"] = serde_json::json!([{
+            "bonding_curve": null,
+            "mint": null,
+            "effect": "known_reserve_or_dependency_unsupported",
+            "exact": false,
+            "non_exact_reason": "fixture_unscoped_candidate"
+        }]);
+        let mut coverage_bytes = Vec::new();
+        for row in &coverage_rows {
+            coverage_bytes.extend_from_slice(
+                &serde_json::to_vec(row).expect("serialize modified coverage row"),
+            );
+            coverage_bytes.push(b'\n');
+        }
+        fs::write(&coverage_path, coverage_bytes).expect("rewrite modified coverage JSONL");
+        fs::set_permissions(&coverage_path, fs::Permissions::from_mode(0o600))
+            .expect("restore modified coverage private mode");
+        let coverage_digest = fixture_exact_artifact_digest_json_v2(&coverage_path);
+
+        let receipt_path = target_dir.join("exact_state_capability_v2.json");
+        let mut receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(&receipt_path).expect("read cloned capability receipt"),
+        )
+        .expect("parse cloned capability receipt");
+        receipt["coverage_artifact"] = coverage_digest.clone();
+        rewrite_private_fixture_json_v2(&receipt_path, &receipt);
+        let receipt_digest = fixture_exact_artifact_digest_json_v2(&receipt_path);
+
+        let manifest_path = target_dir.join("manifest_v2.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("read cloned exact manifest"))
+                .expect("parse cloned exact manifest");
+        manifest["coverage_artifact"] = coverage_digest;
+        manifest["exact_state_capability_artifact"] = receipt_digest;
+        rewrite_private_fixture_json_v2(&manifest_path, &manifest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_qualified_v2_raw_fixture_exports_a_complete_outcome_blind_window() {
+        let temporary = tempdir().expect("temporary V2 public-export fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for public fixture");
+
+        let qualified_raw = temporary.path().join("qualified-raw-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &qualified_raw,
+            "qualified-public-export-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::Qualified,
+        );
+        let qualified_exact = temporary.path().join("qualified-exact");
+        let qualified_summary = qualify_prospective_exact_state_raw_run_v2(
+            &qualified_raw,
+            &semantics_path,
+            &qualified_exact,
+        )
+        .expect("public raw Complete fixture must qualify offline");
+        assert_eq!(
+            qualified_summary.status,
+            PumpExactStateCapabilityStatusV2::Qualified,
+            "Qualified raw fixture blockers: {:?}",
+            qualified_summary.blockers
+        );
+        assert_eq!(qualified_summary.exact_rooted_mutation_count, 2);
+        assert_eq!(qualified_summary.successful_rooted_mutation_denominator, 2);
+        assert_eq!(qualified_summary.exact_rooted_coverage_ppm, 1_000_000);
+        let qualified_receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(qualified_exact.join("exact_state_capability_v2.json"))
+                .expect("read Qualified Event-CPI receipt"),
+        )
+        .expect("parse Qualified Event-CPI receipt");
+        assert_eq!(
+            qualified_receipt["successful_rooted_validated_event_transport_count"],
+            serde_json::json!(2u64),
+            "the public fixture must prove both real inner CreateEvent and TradeEvent transports"
+        );
+
+        let qualified_windows = temporary.path().join("qualified-windows");
+        let exported = export_prospective_exact_state_outcome_blind_windows_v2(
+            &qualified_raw,
+            &semantics_path,
+            &qualified_exact,
+            &qualified_windows,
+        )
+        .expect("Qualified V2 fixture must export outcome-blind windows");
+        assert_eq!(exported.exported_birth_count, 1);
+        assert_eq!(exported.complete_window_count, 1);
+        let windows = fs::read_to_string(qualified_windows.join("outcome_blind_windows_v2.jsonl"))
+            .expect("read published V2 outcome-blind windows");
+        let rows = windows
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse window"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], "complete");
+        assert_eq!(
+            rows[0]["time_axis"],
+            serde_json::json!("observed_ingress_monotonic_ms"),
+            "duration/cutoff authority must be monotonic ingress time"
+        );
+        assert_eq!(
+            rows[0]["source_reconciled_full_block_frontier_ingress_monotonic_ms"],
+            serde_json::json!(241_000u64),
+            "only the reconciled empty BlockMeta/full-block slot, not a bare Slot update or the final filtered Pump transaction at 150999ms, proves the 90-second forward source availability"
+        );
+        assert_eq!(
+            rows[0]["source_reconciled_full_block_frontier_slot"],
+            serde_json::json!(105u64)
+        );
+        let export_manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(qualified_windows.join("manifest_v2.json"))
+                .expect("read published V2 outcome-blind manifest"),
+        )
+        .expect("parse published V2 outcome-blind manifest");
+        assert_eq!(export_manifest["complete_window_count"], 1);
+        assert_eq!(export_manifest["windows_artifact"]["line_count"], 1);
+        assert!(
+            !temporary.path().join(".qualified-windows.partial").exists(),
+            "successful outcome-blind export must atomically remove its partial directory"
+        );
+
+        let blocked_raw = temporary.path().join("blocked-raw-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &blocked_raw,
+            "blocked-public-export-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::BlockedWithoutTradeFinalAnchor,
+        );
+        let blocked_exact = temporary.path().join("blocked-exact");
+        let blocked_summary = qualify_prospective_exact_state_raw_run_v2(
+            &blocked_raw,
+            &semantics_path,
+            &blocked_exact,
+        )
+        .expect("a diagnostic V2 raw fixture may publish a Blocked receipt");
+        assert_eq!(
+            blocked_summary.status,
+            PumpExactStateCapabilityStatusV2::Blocked
+        );
+        let blocked_windows = temporary.path().join("blocked-windows");
+        assert!(
+            export_prospective_exact_state_outcome_blind_windows_v2(
+                &blocked_raw,
+                &semantics_path,
+                &blocked_exact,
+                &blocked_windows,
+            )
+            .is_err(),
+            "a Blocked exact artifact must never be exported as strategy-window input"
+        );
+        assert!(!blocked_windows.exists());
+        assert!(!temporary.path().join(".blocked-windows.partial").exists());
+
+        // A Qualified receipt may carry a bounded explicit non-exact candidate
+        // in a real large denominator. The exporter must not silently scope
+        // such a row to an arbitrary curve. This cloned artifact keeps every
+        // raw/semantics/exact digest binding internally consistent while
+        // injecting the one evidence shape the exporter must reject.
+        let unscoped_exact = temporary.path().join("unscoped-exact");
+        clone_and_inject_unscoped_candidate_into_qualified_exact_fixture_v2(
+            &qualified_exact,
+            &unscoped_exact,
+        );
+        let unscoped_windows = temporary.path().join("unscoped-windows");
+        assert!(
+            export_prospective_exact_state_outcome_blind_windows_v2(
+                &qualified_raw,
+                &semantics_path,
+                &unscoped_exact,
+                &unscoped_windows,
+            )
+            .is_err(),
+            "an unscoped candidate in an otherwise Qualified exact artifact must fail closed before publication"
+        );
+        assert!(!unscoped_windows.exists());
+        assert!(!temporary.path().join(".unscoped-windows.partial").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_slot_only_forward_watermark_cannot_complete_outcome_window() {
+        let temporary = tempdir().expect("temporary V2 Slot-only fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for Slot-only fixture");
+        let raw_dir = temporary.path().join("slot-only-raw-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "slot-only-forward-watermark",
+            &semantics,
+            QualifiedExportFixtureVariantV2::SlotOnlyForwardWatermark,
+        );
+        let exact_dir = temporary.path().join("slot-only-exact-v2");
+        let summary = qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+            .expect("a late Slot without a BlockMeta/full-block pair does not rewrite the prior valid raw cohort");
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+
+        let windows_dir = temporary.path().join("slot-only-windows-v2");
+        let exported = export_prospective_exact_state_outcome_blind_windows_v2(
+            &raw_dir,
+            &semantics_path,
+            &exact_dir,
+            &windows_dir,
+        )
+        .expect("the outcome-blind exporter must retain a truncated diagnostic window");
+        assert_eq!(exported.complete_window_count, 0);
+        let rows = fs::read_to_string(windows_dir.join("outcome_blind_windows_v2.jsonl"))
+            .expect("read Slot-only diagnostic window");
+        let row: serde_json::Value = serde_json::from_str(
+            rows.lines()
+                .next()
+                .expect("one Slot-only diagnostic window"),
+        )
+        .expect("parse Slot-only diagnostic window");
+        assert_eq!(row["status"], "truncated_at_run_end");
+        assert_eq!(
+            row["source_reconciled_full_block_frontier_slot"],
+            serde_json::json!(104u64),
+            "the naked Slot 105 must not advance source availability"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_wall_clock_step_cannot_create_outcome_window_coverage() {
+        let temporary = tempdir().expect("temporary V2 wall-step fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for wall-step fixture");
+        let raw_dir = temporary.path().join("wall-step-raw-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "wall-clock-step-cannot-create-window",
+            &semantics,
+            QualifiedExportFixtureVariantV2::WallClockStepCannotCreateWindow,
+        );
+        let exact_dir = temporary.path().join("wall-step-exact-v2");
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect("wall-label movement must not invalidate otherwise complete raw evidence");
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+        let windows_dir = temporary.path().join("wall-step-windows-v2");
+        let exported = export_prospective_exact_state_outcome_blind_windows_v2(
+            &raw_dir,
+            &semantics_path,
+            &exact_dir,
+            &windows_dir,
+        )
+        .expect("wall-step fixture must emit a diagnostic outcome-blind window");
+        assert_eq!(exported.complete_window_count, 0);
+        let row: serde_json::Value =
+            fs::read_to_string(windows_dir.join("outcome_blind_windows_v2.jsonl"))
+                .expect("read wall-step diagnostic window")
+                .lines()
+                .next()
+                .map(|line| serde_json::from_str(line).expect("parse wall-step diagnostic window"))
+                .expect("one wall-step diagnostic window");
+        assert_eq!(row["status"], "truncated_at_run_end");
+        assert_eq!(
+            row["source_reconciled_full_block_frontier_ingress_wall_ms"],
+            serde_json::json!(241_000u64),
+            "wall time remains an audit label"
+        );
+        assert_eq!(
+            row["source_reconciled_full_block_frontier_ingress_monotonic_ms"],
+            serde_json::json!(1_002u64),
+            "the monotonic domain, not the 241000ms wall label, is cutoff authority"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_block_meta_without_full_block_fails_raw_qualification() {
+        let temporary = tempdir().expect("temporary V2 unmatched-BlockMeta fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for unmatched-BlockMeta fixture");
+        let raw_dir = temporary
+            .path()
+            .join("block-meta-without-full-block-raw-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "block-meta-without-full-block",
+            &semantics,
+            QualifiedExportFixtureVariantV2::BlockMetaWithoutForwardFullBlock,
+        );
+        let exact_dir = temporary
+            .path()
+            .join("block-meta-without-full-block-exact-v2");
+        let error =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect_err(
+                "accepted-cohort BlockMeta without a full-block payload must fail raw authority",
+            );
+        assert!(
+            error
+                .to_string()
+                .contains("BlockMeta slot 105 lacks matching full-block payload"),
+            "unexpected raw-authority error: {error:#}"
+        );
+        assert!(
+            !exact_dir.exists(),
+            "raw authority failure must not publish exact output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_reconciled_block_pair_without_finalized_slot_fails_raw_qualification() {
+        let temporary = tempdir().expect("temporary V2 pair-without-Slot fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for pair-without-Slot fixture");
+        let raw_dir = temporary.path().join("pair-without-finalized-slot-raw-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "reconciled-block-pair-without-finalized-slot",
+            &semantics,
+            QualifiedExportFixtureVariantV2::ReconciledBlockPairWithoutFinalizedSlot,
+        );
+        let exact_dir = temporary
+            .path()
+            .join("pair-without-finalized-slot-exact-v2");
+        let error =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect_err(
+                    "a known executed block without a finalized Slot must not shrink the rooted denominator",
+                );
+        assert!(
+            error
+                .to_string()
+                .contains("BlockMeta/full-block slot 105 lacks finalized Slot evidence"),
+            "unexpected raw-authority error: {error:#}"
+        );
+        assert!(
+            !exact_dir.exists(),
+            "raw authority failure must not publish exact output"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_v2_finalized_slot_parent_authority_fails_raw_qualification(
+        label: &str,
+        variant: QualifiedExportFixtureVariantV2,
+        expected_error: &str,
+    ) {
+        let temporary = tempdir().expect("temporary V2 finalized-Slot-parent fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for finalized-Slot-parent fixture");
+        let raw_dir = temporary.path().join(format!("{label}-raw-v2"));
+        let exact_dir = temporary.path().join(format!("{label}-exact-v2"));
+
+        // This uses the public source writer without projection corruption:
+        // every retained SubscribeUpdate and its raw projection agree.  The
+        // only inconsistency is that finalized Slot parent authority is None
+        // while the independently retained BlockMeta/full-block pair names a
+        // concrete parent.
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            &format!("finalized-slot-parent-authority-{label}"),
+            &semantics,
+            variant,
+        );
+        let error =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect_err(
+                "a finalized Slot parent must not be supplied by another Slot status or BlockMeta",
+            );
+        assert!(
+            error.to_string().contains(expected_error),
+            "finalized Slot parent authority must be the failing contract: {error:#}"
+        );
+        assert!(
+            !exact_dir.exists(),
+            "finalized Slot parent authority failure must not publish exact output"
+        );
+        assert!(
+            !temporary
+                .path()
+                .join(format!(".{label}-exact-v2.partial"))
+                .exists(),
+            "finalized Slot parent authority failure must happen before an exact partial directory exists"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_finalized_slot_parent_none_cannot_be_repaired_by_block_meta() {
+        assert_v2_finalized_slot_parent_authority_fails_raw_qualification(
+            "finalized-slot-parent-none",
+            QualifiedExportFixtureVariantV2::FinalizedSlotParentNone,
+            "finalized Slot parent differs from BlockMeta/full-block identity for accepted cohort slot 104",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_processed_slot_parent_cannot_be_stitched_with_parentless_finalized_slot() {
+        assert_v2_finalized_slot_parent_authority_fails_raw_qualification(
+            "processed-parent-then-finalized-none",
+            QualifiedExportFixtureVariantV2::ProcessedParentThenFinalizedParentNone,
+            "finalized Slot parent differs from BlockMeta/full-block identity for accepted cohort slot 104",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_conflicting_finalized_slot_parents_fail_raw_qualification() {
+        assert_v2_finalized_slot_parent_authority_fails_raw_qualification(
+            "conflicting-finalized-slot-parents",
+            QualifiedExportFixtureVariantV2::ConflictingFinalizedSlotParents,
+            "finalized Slot evidence assigns more than one parent to a slot",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_jointly_omitted_whole_parent_block_fails_raw_qualification() {
+        let temporary = tempdir().expect("temporary V2 jointly-omitted fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for jointly-omitted fixture");
+        let raw_dir = temporary.path().join("jointly-omitted-raw-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "jointly-omitted-whole-parent-block",
+            &semantics,
+            QualifiedExportFixtureVariantV2::OmitWholeBuyBlock,
+        );
+        let exact_dir = temporary.path().join("jointly-omitted-exact-v2");
+        let error = qualify_prospective_exact_state_raw_run_v2(
+            &raw_dir,
+            &semantics_path,
+            &exact_dir,
+        )
+        .expect_err(
+            "equal filtered/full Pump maps with a jointly omitted produced parent block must fail",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("references missing or unreconciled parent slot 104"),
+            "the parent-linked ledger, rather than equality of two incomplete Pump maps, must explain failure: {error:#}"
+        );
+        assert!(
+            !exact_dir.exists(),
+            "raw authority failure must not publish exact output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_parent_blockhash_mismatch_fails_raw_qualification() {
+        let temporary = tempdir().expect("temporary V2 parent-blockhash mismatch fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for parent-blockhash mismatch fixture");
+        let raw_dir = temporary.path().join("parent-blockhash-mismatch-raw-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "parent-blockhash-mismatch",
+            &semantics,
+            QualifiedExportFixtureVariantV2::ParentBlockhashMismatch,
+        );
+        let exact_dir = temporary.path().join("parent-blockhash-mismatch-exact-v2");
+        let error =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect_err(
+                    "a child whose retained parent_blockhash differs from the retained parent block must fail raw authority",
+                );
+        assert!(
+            error
+                .to_string()
+                .contains("parent blockhash differs from retained parent slot 104"),
+            "cross-slot parent blockhash mismatch must be the failure: {error:#}"
+        );
+        assert!(
+            !exact_dir.exists(),
+            "parent-chain raw authority failure must not publish exact output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_skipped_numeric_slot_with_retained_parent_chain_qualifies() {
+        let temporary = tempdir().expect("temporary V2 skipped-slot fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for skipped-slot fixture");
+        let raw_dir = temporary.path().join("skipped-numeric-slot-raw-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "skipped-numeric-slot",
+            &semantics,
+            QualifiedExportFixtureVariantV2::SkippedNumericSlot,
+        );
+        let exact_dir = temporary.path().join("skipped-numeric-slot-exact-v2");
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect(
+                    "a valid 103 -> 105 parent edge must not be confused with a provider omission",
+                );
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+
+        let windows_dir = temporary.path().join("skipped-numeric-slot-windows-v2");
+        let exported = export_prospective_exact_state_outcome_blind_windows_v2(
+            &raw_dir,
+            &semantics_path,
+            &exact_dir,
+            &windows_dir,
+        )
+        .expect("a parent-linked chain across a skipped numeric slot must remain exportable");
+        assert_eq!(exported.complete_window_count, 1);
+        let rows = fs::read_to_string(windows_dir.join("outcome_blind_windows_v2.jsonl"))
+            .expect("read skipped-slot outcome window");
+        let row: serde_json::Value = serde_json::from_str(
+            rows.lines()
+                .next()
+                .expect("one skipped-slot outcome window"),
+        )
+        .expect("parse skipped-slot outcome window");
+        assert_eq!(
+            row["source_reconciled_full_block_frontier_slot"],
+            serde_json::json!(106u64),
+            "frontier must be the linked chain tip, not a numerically contiguous slot"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_v2_projection_corruption_fails_raw_qualification(
+        label: &str,
+        variant: QualifiedExportFixtureVariantV2,
+        expected_error: &str,
+    ) {
+        let temporary = tempdir().expect("temporary V2 projection-corruption fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for projection-corruption fixture");
+        let raw_dir = temporary.path().join(format!("{label}-raw-v2"));
+        let exact_dir = temporary.path().join(format!("{label}-exact-v2"));
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            &format!("projection-corruption-{label}"),
+            &semantics,
+            variant,
+        );
+        let error =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect_err(
+                    "a rewrapped raw record whose projection drifts from its retained protobuf must fail raw authority",
+                );
+        assert!(
+            error.to_string().contains(expected_error),
+            "projection corruption {label} must fail at retained-payload binding: {error:#}"
+        );
+        assert!(
+            !exact_dir.exists(),
+            "projection binding failure must not publish exact output"
+        );
+        assert!(
+            !temporary
+                .path()
+                .join(format!(".{label}-exact-v2.partial"))
+                .exists(),
+            "projection binding failure must happen before an exact partial directory exists"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_account_projection_mismatch_fails_raw_qualification() {
+        assert_v2_projection_corruption_fails_raw_qualification(
+            "account-projection-mismatch",
+            QualifiedExportFixtureVariantV2::AccountProjectionMismatch,
+            "Pump-owned account update projection differs from retained protobuf",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_slot_projection_mismatch_fails_raw_qualification() {
+        assert_v2_projection_corruption_fails_raw_qualification(
+            "slot-projection-mismatch",
+            QualifiedExportFixtureVariantV2::SlotProjectionMismatch,
+            "Slot update projection differs from retained protobuf",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_block_meta_projection_mismatch_fails_raw_qualification() {
+        assert_v2_projection_corruption_fails_raw_qualification(
+            "block-meta-projection-mismatch",
+            QualifiedExportFixtureVariantV2::BlockMetaProjectionMismatch,
+            "BlockMeta projection differs from retained protobuf",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_event_cpi_identity_and_canonical_state_mismatches_block_qualification() {
+        let temporary = tempdir().expect("temporary V2 Event-CPI negative fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for Event-CPI negative fixtures");
+        for (label, variant) in [
+            (
+                "wrong-mint",
+                QualifiedExportFixtureVariantV2::WrongEventMint,
+            ),
+            (
+                "wrong-user",
+                QualifiedExportFixtureVariantV2::WrongEventUser,
+            ),
+            (
+                "wrong-ix-name",
+                QualifiedExportFixtureVariantV2::WrongEventIxName,
+            ),
+            (
+                "wrong-quote-mint",
+                QualifiedExportFixtureVariantV2::WrongEventQuoteMint,
+            ),
+            (
+                "wrong-canonical-reserve",
+                QualifiedExportFixtureVariantV2::WrongEventCanonicalReserve,
+            ),
+        ] {
+            let raw_dir = temporary.path().join(format!("{label}-raw-v2"));
+            let exact_dir = temporary.path().join(format!("{label}-exact-v2"));
+            write_complete_raw_fixture_for_qualified_export_v2(
+                &raw_dir,
+                &format!("event-cpi-{label}"),
+                &semantics,
+                variant,
+            );
+            let summary =
+                qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                    .expect(
+                    "malformed Event-CPI remains a durable blocked diagnostic, not a raw I/O error",
+                );
+            assert_eq!(
+                summary.status,
+                PumpExactStateCapabilityStatusV2::Blocked,
+                "Event-CPI {label} must not qualify"
+            );
+            let receipt: serde_json::Value = serde_json::from_slice(
+                &fs::read(exact_dir.join("exact_state_capability_v2.json"))
+                    .expect("read blocked Event-CPI receipt"),
+            )
+            .expect("parse blocked Event-CPI receipt");
+            assert!(
+                receipt["successful_rooted_unknown_occurrence_count"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 1),
+                "Event-CPI {label} must become an explicit Unknown occurrence: {receipt}"
+            );
+            assert!(
+                receipt["blockers"]
+                    .as_array()
+                    .is_some_and(|blockers| blockers.iter().any(|value| {
+                        value == "mutation_inventory_incomplete"
+                            || value == "exact_coverage_below_threshold"
+                    })),
+                "Event-CPI {label} must remain fail-closed: {receipt}"
+            );
+        }
+    }
+
     #[test]
     fn v2_retains_unknown_pump_owned_account_as_raw_other_evidence() {
         let pump = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("Pump program ID");
@@ -5244,6 +7454,11 @@ mod tests {
         assert_eq!(started.slot, 91);
         assert_eq!(started.parent_slot, 90);
         assert_eq!(started.executed_transaction_count, 17);
+        assert_eq!(
+            started.event_time.ingress_wall_ts_ms,
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(started.event_time.ingress_monotonic_ts_ms, Some(42));
         assert!(
             started.source_payload_bytes
                 <= ghost_core::pump_research_exact_tape_v2::PUMP_EXACT_STATE_TAPE_FULL_BLOCK_CHUNK_BYTES_V2
@@ -5406,6 +7621,20 @@ mod tests {
                 .len()
         );
         assert_eq!(writer.raw_bytes_written(), receipt.file_bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(raw_dir.join(&receipt.filename))
+                    .expect("segment metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "published V2 raw segments must not depend on process umask for authority privacy"
+            );
+        }
     }
 
     #[test]
@@ -6416,6 +8645,7 @@ mod tests {
             bootstrap_rpc_auth_token_env: None,
             bootstrap_rpc_auth_header: "x-api-key".to_owned(),
             pump_program_id: PUMP_FUN_PROGRAM_ID.to_owned(),
+            semantics_manifest_path: temporary.path().join("semantics.json"),
             output_dir: PathBuf::from("datasets/pump-research/raw"),
             required_for_run: true,
             source_queue_capacity: 1,
@@ -6547,6 +8777,10 @@ mod tests {
             source_request_fingerprint_blake3: "fixture-request-fingerprint".to_owned(),
             source_capture_semantics: "fixture-source-semantics".to_owned(),
             source_max_decoded_message_bytes: 1,
+            semantics_id: "fixture-semantics".to_owned(),
+            semantics_manifest_digest: digest_bytes_v2(b"fixture-semantics-manifest"),
+            vendored_idl_digest: digest_bytes_v2(b"fixture-vendored-idl"),
+            expected_program_data_hash_blake3: "11".repeat(32),
             cohort_capture_wall_ms: MIN_V2_COHORT_CAPTURE_WALL_MS,
             min_free_bytes: MIN_V2_MIN_FREE_BYTES,
             max_raw_bytes: MIN_V2_MAX_RAW_BYTES,

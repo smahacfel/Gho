@@ -24,6 +24,13 @@ bootstrap_rpc_auth_header = "x-api-key"
 # Exact compiled Pump program ID.  The binary rejects a substituted value.
 pump_program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
+# Required, hash-pinned offline semantics authority for this prospective run.
+# It must name one vendored public Pump IDL and the expected finalized
+# ProgramData BLAKE3 before capture starts. Preflight binds its manifest/IDL
+# digests, and capture refuses to allocate raw-v2 if observed ProgramData does
+# not match. This template path is intentionally non-operational.
+semantics_manifest_path = "/protected/operator/pump-exact-state-semantics-v2.json"
+
 # Must exist before preflight, be a private non-symlink directory (0700), and
 # be outside every V1/V2 raw run.  The capture creates a new child run only.
 output_dir = "/protected/operator/pump-exact-state-tape-v2-runs"

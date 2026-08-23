@@ -9,6 +9,10 @@ use seer::research_exact_tape_v2::{
     create_operator_preflight_v2_from_config_path,
     run_prospective_exact_state_capture_v2_from_config_path,
 };
+use seer::research_exact_tape_v2_materializer::{
+    export_prospective_exact_state_outcome_blind_windows_v2,
+    qualify_prospective_exact_state_raw_run_v2, validate_prospective_exact_state_strategy_input_v2,
+};
 use std::{collections::BTreeMap, env, ffi::OsString, path::PathBuf};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -86,6 +90,97 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        "qualify" => {
+            let paths = parse_named_paths(
+                arguments,
+                "qualify",
+                &["--raw-dir", "--semantics-manifest", "--output"],
+            )?;
+            let summary =
+                qualify_prospective_exact_state_raw_run_v2(&paths[0], &paths[1], &paths[2])?;
+            if !summary.is_qualified() {
+                error!(
+                    source_run_id = %summary.source_run_id,
+                    output_dir = %summary.output_dir.display(),
+                    receipt_path = %summary.receipt_path.display(),
+                    blockers = ?summary.blockers,
+                    exact_rooted_coverage_ppm = summary.exact_rooted_coverage_ppm,
+                    exact_rooted_mutation_count = summary.exact_rooted_mutation_count,
+                    successful_rooted_mutation_denominator = summary.successful_rooted_mutation_denominator,
+                    "prospective Exact-State Tape V2 qualification published a blocked diagnostic artifact; strategy export remains forbidden"
+                );
+                bail!(
+                    "prospective Exact-State Tape V2 is not qualified; inspect {}",
+                    summary.receipt_path.display()
+                );
+            }
+            info!(
+                source_run_id = %summary.source_run_id,
+                output_dir = %summary.output_dir.display(),
+                receipt_path = %summary.receipt_path.display(),
+                exact_rooted_coverage_ppm = summary.exact_rooted_coverage_ppm,
+                exact_rooted_mutation_count = summary.exact_rooted_mutation_count,
+                successful_rooted_mutation_denominator = summary.successful_rooted_mutation_denominator,
+                "prospective Exact-State Tape V2 has passed its offline exact-state capability gate; strategy export remains a separate review gate"
+            );
+            Ok(())
+        }
+        "verify-strategy-input" => {
+            let paths = parse_named_paths(
+                arguments,
+                "verify-strategy-input",
+                &["--raw-dir", "--semantics-manifest", "--exact-dir"],
+            )?;
+            let authority = validate_prospective_exact_state_strategy_input_v2(
+                &paths[0], &paths[1], &paths[2],
+            )?;
+            authority.revalidate_before_strategy_export_v2()?;
+            info!(
+                source_run_id = %authority.source_run_id,
+                exact_dir = %authority.exact_dir.display(),
+                exact_rooted_coverage_ppm = authority.exact_rooted_coverage_ppm,
+                "prospective Exact-State Tape V2 exact artifact is a descriptor-pinned Qualified strategy-input authority; strategy export/outcomes remain separate review gates"
+            );
+            Ok(())
+        }
+        "export-window" => {
+            let paths = parse_named_paths(
+                arguments,
+                "export-window",
+                &[
+                    "--raw-dir",
+                    "--semantics-manifest",
+                    "--exact-dir",
+                    "--output",
+                ],
+            )?;
+            let summary = export_prospective_exact_state_outcome_blind_windows_v2(
+                &paths[0], &paths[1], &paths[2], &paths[3],
+            )?;
+            if !summary.has_complete_window() {
+                error!(
+                    source_run_id = %summary.source_run_id,
+                    output_dir = %summary.output_dir.display(),
+                    exported_birth_count = summary.exported_birth_count,
+                    "prospective Exact-State Tape V2 published an outcome-blind window diagnostic with zero complete windows; strategy outcomes remain forbidden"
+                );
+                bail!(
+                    "prospective Exact-State Tape V2 outcome-blind export has no complete windows; inspect {}",
+                    summary.output_dir.display()
+                );
+            }
+            info!(
+                source_run_id = %summary.source_run_id,
+                output_dir = %summary.output_dir.display(),
+                exported_birth_count = summary.exported_birth_count,
+                complete_window_count = summary.complete_window_count,
+                time_axis = "observed_ingress_monotonic_ms",
+                observation_ms = 150_000u64,
+                forward_ms = 90_000u64,
+                "prospective Exact-State Tape V2 created only outcome-blind windows; outcomes, strategy selection, Gatekeeper, and execution remain separate gates"
+            );
+            Ok(())
+        }
         _ => {
             print_usage(&executable);
             bail!("unknown prospective Exact-State Tape V2 command {command:?}")
@@ -144,8 +239,14 @@ fn parse_named_paths(
 
 fn print_usage(executable: &OsString) {
     eprintln!(
-        "Usage:\n  {} preflight --config /protected/operator/pump-exact-state-tape-v2.toml --output /protected/operator/pump-exact-state-v2-preflight-<id>\n  /protected/operator/pump-exact-state-v2-preflight-<id>/release/pump-exact-state-tape-v2 capture --config /protected/operator/pump-exact-state-tape-v2.toml --preflight-receipt /protected/operator/pump-exact-state-v2-preflight-<id>/operator_preflight_receipt_v2.json\n\n`preflight` is local-only: it requires a clean repository, a release bootstrap binary, private isolated V2 output root, and enough filesystem capacity for max_raw_bytes + min_free_bytes + V2 metadata allowance. It builds the V2 binary anew with Cargo locked/offline into an isolated target, retains the build log and receipt, then copies the resulting release executable into a sealed bundle. The later `capture` command must be launched from that copied bundle executable; it rejects a mismatched process image before any provider I/O. After this local authority gate, `capture` opens the all-Pump-owned Yellowstone source stream plus unfiltered full-block evidence lane, persists a bounded finalized source-provider bootstrap snapshot, and writes one new raw-v2 run. The cohort ends only by SIGINT or the hash-pinned wall deadline; source gaps, reconnects, queue/byte-budget breaches, or storage-floor breaches fail closed. It never reads or repairs GO-D, invokes GO-E, exports outcomes, or changes the active Ghost runtime. A raw-complete V2 run is not itself an ExactStateCapability=Qualified result; qualification and strategy use remain separate offline gates.",
+        "Usage:\n  {} preflight --config /protected/operator/pump-exact-state-tape-v2.toml --output /protected/operator/pump-exact-state-v2-preflight-<id>\n  /protected/operator/pump-exact-state-v2-preflight-<id>/release/pump-exact-state-tape-v2 capture --config /protected/operator/pump-exact-state-tape-v2.toml --preflight-receipt /protected/operator/pump-exact-state-v2-preflight-<id>/operator_preflight_receipt_v2.json\n  {} qualify --raw-dir /protected/research/raw-v2/<run-id> --semantics-manifest /protected/research/pump_exact_state_semantics_v2.json --output /protected/research/exact-v2/<run-id>\n  {} verify-strategy-input --raw-dir /protected/research/raw-v2/<run-id> --semantics-manifest /protected/research/pump_exact_state_semantics_v2.json --exact-dir /protected/research/exact-v2/<run-id>\n  {} export-window --raw-dir /protected/research/raw-v2/<run-id> --semantics-manifest /protected/research/pump_exact_state_semantics_v2.json --exact-dir /protected/research/exact-v2/<run-id> --output /protected/research/outcome-blind-v2/<run-id>\n\n`preflight` is local-only: it requires a clean repository, a release bootstrap binary, private isolated V2 output root, one hash-pinned Pump semantics manifest, and enough filesystem capacity for max_raw_bytes + min_free_bytes + V2 metadata allowance. It builds the V2 binary anew with Cargo locked/offline into an isolated target, retains the build log and receipt, then copies the resulting release executable into a sealed bundle. The later `capture` command must be launched from that copied bundle executable; it rejects a mismatched process image before any provider I/O. After this local authority gate, `capture` observes finalized ProgramData and refuses to allocate raw-v2 unless it matches the semantics manifest selected at preflight. It then opens the all-Pump-owned Yellowstone source stream plus unfiltered full-block evidence lane, persists a bounded finalized source-provider bootstrap snapshot, and writes one new raw-v2 run. The cohort ends only by SIGINT or the hash-pinned capture deadline; source gaps, reconnects, queue/byte-budget breaches, or storage-floor breaches fail closed. `qualify` is offline-only: it validates the complete V2 raw chain, bootstrap overlap, full-block-versus-filtered-Pump reconciliation, pinned semantics, account anchors and occurrence conservation before writing an atomic exact-state artifact. A Blocked receipt is diagnostic only and returns non-zero. `verify-strategy-input` is read-only authority validation. `export-window` accepts only that same Qualified descriptor-pinned authority and emits fixed ingress-monotonic-time 150000ms observation / 90000ms forward-availability windows. It emits no outcome, strategy score, selection, Gatekeeper decision, or active-runtime change.",
+        executable.to_string_lossy(),
+        executable.to_string_lossy(),
+        executable.to_string_lossy(),
         executable.to_string_lossy()
+    );
+    eprintln!(
+        "V2 authority note: `qualify` requires a finalized parent-linked chain of per-slot BlockMeta/full-block identity pairs. `export-window` measures the 150000ms/90000ms gates on ingress-monotonic time and bounds forward availability only at that complete chain's tip after every required parent pair is reconciled; ingress wall time is audit-only."
     );
 }
 
@@ -187,5 +288,73 @@ mod tests {
             &["--config", "--preflight-receipt"],
         )
         .is_err());
+        assert_eq!(
+            parse_named_paths(
+                vec![
+                    "--output".into(),
+                    "exact".into(),
+                    "--raw-dir".into(),
+                    "raw".into(),
+                    "--semantics-manifest".into(),
+                    "semantics.json".into(),
+                ],
+                "qualify",
+                &["--raw-dir", "--semantics-manifest", "--output"],
+            )
+            .expect("valid V2 qualification paths"),
+            vec![
+                PathBuf::from("raw"),
+                PathBuf::from("semantics.json"),
+                PathBuf::from("exact"),
+            ]
+        );
+        assert_eq!(
+            parse_named_paths(
+                vec![
+                    "--output".into(),
+                    "windows".into(),
+                    "--exact-dir".into(),
+                    "exact".into(),
+                    "--semantics-manifest".into(),
+                    "semantics.json".into(),
+                    "--raw-dir".into(),
+                    "raw".into(),
+                ],
+                "export-window",
+                &[
+                    "--raw-dir",
+                    "--semantics-manifest",
+                    "--exact-dir",
+                    "--output"
+                ],
+            )
+            .expect("valid V2 outcome-blind export paths"),
+            vec![
+                PathBuf::from("raw"),
+                PathBuf::from("semantics.json"),
+                PathBuf::from("exact"),
+                PathBuf::from("windows"),
+            ]
+        );
+        assert_eq!(
+            parse_named_paths(
+                vec![
+                    "--exact-dir".into(),
+                    "exact".into(),
+                    "--semantics-manifest".into(),
+                    "semantics.json".into(),
+                    "--raw-dir".into(),
+                    "raw".into(),
+                ],
+                "verify-strategy-input",
+                &["--raw-dir", "--semantics-manifest", "--exact-dir"],
+            )
+            .expect("valid V2 strategy-input authority paths"),
+            vec![
+                PathBuf::from("raw"),
+                PathBuf::from("semantics.json"),
+                PathBuf::from("exact"),
+            ]
+        );
     }
 }

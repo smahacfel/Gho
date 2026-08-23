@@ -76,6 +76,12 @@ pub mod pumpportal_connection;
 /// Standalone prospective V2 raw capture.  It is independent from the frozen
 /// GO-D V1 tape and cannot alter active Seer runtime subscription behavior.
 pub mod research_exact_tape_v2;
+/// Offline-only V2 raw-contract inspection and later exact-state qualification.
+/// It consumes only frozen V2 artifacts and is not connected to active Seer.
+pub mod research_exact_tape_v2_materializer;
+/// Hash-pinned offline semantics selection for prospective Exact-State Tape
+/// V2. It is deliberately separate from the active parser/runtime path.
+pub mod research_exact_tape_v2_semantics;
 pub mod research_tape;
 /// Offline-only PR-B replay and exact-tape materialisation.  Kept separate
 /// from the PR-A capture writer so importing it cannot alter the active Seer
