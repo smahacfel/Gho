@@ -5233,6 +5233,7 @@ mod tests {
         WrongEventCanonicalReserve,
         WarmupAndUnreconciledTailInvocationSkew,
         ProvisionalFinalityTail,
+        QualifiedWithBuyRemainingAccount,
     }
 
     #[derive(Clone, Copy)]
@@ -5355,6 +5356,11 @@ mod tests {
             115,
             "fixture must use the selected V2 curve layout"
         );
+        // Real Pump-owned BondingCurve updates can retain a larger account
+        // allocation than the 115-byte Borsh struct.  Exercise the same
+        // zero-filled allocation padding through the public PRXTAPE3 writer
+        // and offline qualifier rather than testing only an idealized prefix.
+        bytes.resize(151, 0);
         bytes
     }
 
@@ -5472,6 +5478,7 @@ mod tests {
         bonding_curve: Pubkey,
         mint: Pubkey,
         user: Pubkey,
+        include_remaining_account: bool,
     ) -> SubscribeUpdateTransactionInfo {
         let contract = semantics
             .instruction(&discriminator)
@@ -5540,6 +5547,22 @@ mod tests {
             if account.name == "program" {
                 program_id_index = Some(u32::from(index));
             }
+        }
+        if include_remaining_account {
+            // Pump documents variant-specific `remaining_accounts`. It is an
+            // unsigned readonly message key deliberately appended after the
+            // fully pinned account prefix; the public fixture proves that the
+            // raw writer and qualifier retain it without granting it a role.
+            let remaining_index =
+                u8::try_from(ordered.len()).expect("fixture remaining account index fits u8");
+            ordered.push(DeclaredAccount {
+                original_position: usize::MAX,
+                pubkey: fixture_role_pubkey_v2(instruction_name, "remaining_account", 255),
+                signer: false,
+                writable: false,
+                name: "remaining_account".to_owned(),
+            });
+            instruction_account_indices.push(remaining_index);
         }
         let mut instruction_data = discriminator.to_vec();
         instruction_data.extend_from_slice(&argument_bytes);
@@ -6092,6 +6115,10 @@ mod tests {
             fixture_curve_account_data_v2(800, 1_200, 700, 1_180, 1_004, creator, quote_mint);
         let create_discriminator = [24, 30, 200, 40, 5, 28, 7, 119];
         let buy_discriminator = [102, 6, 61, 18, 1, 218, 235, 234];
+        let buy_has_remaining_account = matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::QualifiedWithBuyRemainingAccount
+        );
         let pre_cohort_buy = fixture_exact_instruction_info_v2(
             semantics,
             "buy",
@@ -6102,6 +6129,7 @@ mod tests {
             curve,
             mint,
             user,
+            false,
         );
         let mut create = fixture_exact_instruction_info_v2(
             semantics,
@@ -6113,6 +6141,7 @@ mod tests {
             curve,
             mint,
             user,
+            false,
         );
         let mut buy = fixture_exact_instruction_info_v2(
             semantics,
@@ -6124,6 +6153,7 @@ mod tests {
             curve,
             mint,
             user,
+            buy_has_remaining_account,
         );
         let skew_warmup_and_tail_invocations = matches!(
             variant,
@@ -6149,6 +6179,7 @@ mod tests {
                 curve,
                 mint,
                 user,
+                false,
             )
         });
         let create_token_program = fixture_parent_account_role_pubkey_v2(
@@ -7013,6 +7044,40 @@ mod tests {
         );
         assert!(!unscoped_windows.exists());
         assert!(!temporary.path().join(".unscoped-windows.partial").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_prxtape3_qualifies_with_a_resolved_pump_remaining_account_after_the_pinned_prefix() {
+        let temporary = tempdir().expect("temporary V2 remaining-account fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for remaining-account fixture");
+        let raw_dir = temporary.path().join("remaining-account-raw-v2");
+        let exact_dir = temporary.path().join("remaining-account-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "remaining-account-public-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::QualifiedWithBuyRemainingAccount,
+        );
+
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect(
+                    "a resolved Pump remaining account must not invalidate a PRXTAPE3 raw fixture",
+                );
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+        assert_eq!(summary.exact_rooted_mutation_count, 2);
+        assert_eq!(summary.successful_rooted_mutation_denominator, 2);
+        assert_eq!(summary.exact_rooted_coverage_ppm, 1_000_000);
+        assert!(
+            !temporary
+                .path()
+                .join(".remaining-account-exact-v2.partial")
+                .exists(),
+            "the public qualifier must atomically publish, not retain a partial output"
+        );
     }
 
     #[cfg(unix)]

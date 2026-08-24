@@ -1441,15 +1441,14 @@ fn validate_account_layout(
     data: &[u8],
     defined_types: &BTreeMap<String, Value>,
 ) -> Result<()> {
-    if !layout.allowed_serialized_bytes.contains(&data.len())
-        || data.get(..8).and_then(|value| value.try_into().ok()) != Some(layout.discriminator)
-    {
+    if data.get(..8).and_then(|value| value.try_into().ok()) != Some(layout.discriminator) {
         bail!(
-            "V2 {} account has an unsupported discriminator or allocation envelope",
+            "V2 {} account has an unsupported discriminator",
             layout.name
         );
     }
-    if layout.prefix_bytes > data.len() {
+    let selected_serialized_bytes = selected_account_serialized_bytes_v2(layout, data)?;
+    if layout.prefix_bytes > selected_serialized_bytes {
         bail!(
             "V2 {} account is shorter than its selected layout prefix",
             layout.name
@@ -1474,6 +1473,44 @@ fn validate_account_layout(
         );
     }
     Ok(())
+}
+
+/// Select the one manifest-pinned Borsh serialization extent represented by
+/// an account allocation.  Pump accounts may be allocated to a larger size
+/// than their serialized Anchor struct; the extra allocation bytes are not a
+/// second state layout and therefore may be admitted only when they are all
+/// literal zeroes.  A nonzero suffix, no compatible selected layout, or an
+/// ambiguous future multi-layout envelope remains fail-closed.
+fn selected_account_serialized_bytes_v2(
+    layout: &PumpExactStateAccountLayoutV2,
+    data: &[u8],
+) -> Result<usize> {
+    if layout.allowed_serialized_bytes.contains(&data.len()) {
+        // Preserve the existing exact-envelope contract for a literal listed
+        // serialized size.  The manifest, rather than an inferred prefix,
+        // remains the authority for any such distinct layout.
+        return Ok(data.len());
+    }
+    let compatible = layout
+        .allowed_serialized_bytes
+        .iter()
+        .copied()
+        .filter(|serialized_bytes| {
+            *serialized_bytes <= data.len()
+                && data[*serialized_bytes..].iter().all(|byte| *byte == 0)
+        })
+        .collect::<Vec<_>>();
+    match compatible.as_slice() {
+        [serialized_bytes] => Ok(*serialized_bytes),
+        [] => bail!(
+            "V2 {} account has an unsupported serialized size or nonzero allocation padding",
+            layout.name
+        ),
+        _ => bail!(
+            "V2 {} account allocation matches more than one pinned serialized layout",
+            layout.name
+        ),
+    }
 }
 
 fn read_named_u64(
@@ -2427,6 +2464,77 @@ mod tests {
                 .validate_instruction_payload(buy, &payload)
                 .is_err(),
             "invalid bool values remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn real_vendored_curve_layout_accepts_only_zero_filled_allocation_padding() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repository root from seer manifest directory");
+        let manifest_path =
+            repository_root.join("configs/research/pump_exact_state_semantics_manifest_v2.json");
+        let authority = load_pump_exact_state_semantics_authority_v2(&manifest_path)
+            .expect("real vendored Pump semantics manifest must load");
+
+        let creator = Pubkey::new_from_array([91; 32]);
+        let quote_mint = Pubkey::new_from_array([92; 32]);
+        let mut serialized = vec![0x17, 0xb7, 0xf8, 0x37, 0x60, 0xd8, 0xac, 0x60];
+        for value in [101u64, 102, 103, 104, 105] {
+            serialized.extend_from_slice(&value.to_le_bytes());
+        }
+        serialized.push(0); // complete = false
+        serialized.extend_from_slice(&creator.to_bytes());
+        serialized.push(0); // is_mayhem_mode = false
+        serialized.push(1); // is_cashback_coin = true
+        serialized.extend_from_slice(&quote_mint.to_bytes());
+        assert_eq!(
+            serialized.len(),
+            115,
+            "pinned serialized BondingCurve bytes"
+        );
+
+        let expected = authority
+            .decode_curve_state(&serialized)
+            .expect("exact selected serialized bytes must decode");
+        assert_eq!(expected.creator, creator);
+        assert_eq!(expected.quote_mint, quote_mint);
+        assert!(expected.is_cashback_coin);
+
+        for allocation_bytes in [150usize, 151, 256] {
+            let mut padded = serialized.clone();
+            padded.resize(allocation_bytes, 0);
+            assert_eq!(
+                authority
+                    .decode_curve_state(&padded)
+                    .expect("zero-filled allocation padding must preserve the selected layout"),
+                expected,
+                "allocation size {allocation_bytes}"
+            );
+        }
+
+        let mut nonzero_padded = serialized;
+        nonzero_padded.resize(151, 0);
+        nonzero_padded[115] = 1;
+        assert!(
+            authority.decode_curve_state(&nonzero_padded).is_err(),
+            "nonzero bytes past the selected serialized extent must not be reclassified as padding"
+        );
+    }
+
+    #[test]
+    fn zero_padded_account_allocation_rejects_ambiguous_pinned_extents() {
+        let layout = PumpExactStateAccountLayoutV2 {
+            name: "future_fixture".to_owned(),
+            discriminator: [0; 8],
+            allowed_serialized_bytes: BTreeSet::from([8usize, 9]),
+            prefix_bytes: 8,
+            fields: Vec::new(),
+        };
+        assert!(
+            selected_account_serialized_bytes_v2(&layout, &[0; 10]).is_err(),
+            "a zero-filled allocation compatible with more than one manifest extent must not choose one heuristically"
         );
     }
 

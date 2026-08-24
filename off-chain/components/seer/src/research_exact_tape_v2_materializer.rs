@@ -2447,6 +2447,18 @@ struct PumpExactStateTransactionContextV2 {
     inner: BTreeMap<u32, Vec<yellowstone_grpc_proto::prelude::InnerInstruction>>,
 }
 
+/// The retained transaction protobuf provides different privilege evidence for
+/// an outer compiled instruction and an inner CPI.  The transaction message
+/// header is a valid lower-bound authority for an outer instruction.  An
+/// `InnerInstruction` carries account indexes but not invocation-local signer
+/// or writable flags, so those flags must not be reconstructed from the
+/// message-wide privilege union for a CPI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PumpExactStateInvocationPrivilegeEvidenceV2 {
+    OuterTransactionMessageHeader,
+    InnerInstructionPrivilegesUnavailable,
+}
+
 #[derive(Clone, Debug)]
 struct PumpExactStateCurveAnchorV2 {
     curve: Pubkey,
@@ -4604,7 +4616,17 @@ fn classify_pump_instruction_occurrence_v2(
             },
         });
     };
-    let accounts = validate_instruction_account_vector_v2(context, contract, account_indices);
+    let privilege_evidence = if outer_group.is_some() {
+        PumpExactStateInvocationPrivilegeEvidenceV2::InnerInstructionPrivilegesUnavailable
+    } else {
+        PumpExactStateInvocationPrivilegeEvidenceV2::OuterTransactionMessageHeader
+    };
+    let accounts = validate_instruction_account_vector_v2(
+        context,
+        contract,
+        account_indices,
+        privilege_evidence,
+    );
     let payload = semantics.instruction_argument_fields(contract, &data[8..]);
     match contract.effect {
         PumpExactStateInstructionEffectV2::ProvenNonReserve => match (accounts, payload) {
@@ -4680,10 +4702,11 @@ fn validate_instruction_account_vector_v2(
     context: &PumpExactStateTransactionContextV2,
     contract: &crate::research_exact_tape_v2_semantics::PumpExactStateInstructionContractV2,
     account_indices: &[u8],
+    privilege_evidence: PumpExactStateInvocationPrivilegeEvidenceV2,
 ) -> Result<BTreeMap<String, Pubkey>> {
-    if account_indices.len() != contract.accounts.len() {
+    if account_indices.len() < contract.accounts.len() {
         bail!(
-            "V2 Pump instruction {} account count {} differs from pinned {}",
+            "V2 Pump instruction {} account count {} is shorter than pinned required prefix {}",
             contract.name,
             account_indices.len(),
             contract.accounts.len()
@@ -4699,12 +4722,28 @@ fn validate_instruction_account_vector_v2(
                 position
             )
         })?;
-        if actual.signer != expected.signer || actual.writable != expected.writable {
-            bail!(
-                "V2 Pump instruction {} account {} signer/writable contract differs",
-                contract.name,
-                expected.name
-            );
+        if matches!(
+            privilege_evidence,
+            PumpExactStateInvocationPrivilegeEvidenceV2::OuterTransactionMessageHeader
+        ) {
+            // Message privileges are a transaction-wide upper bound.  For an
+            // outer Pump instruction they can prove every *required* IDL
+            // privilege, but an observed writable/signer superset may arise
+            // because another outer instruction uses the same message key.
+            if expected.signer && !actual.signer {
+                bail!(
+                    "V2 outer Pump instruction {} account {} lacks required signer authority",
+                    contract.name,
+                    expected.name
+                );
+            }
+            if expected.writable && !actual.writable {
+                bail!(
+                    "V2 outer Pump instruction {} account {} lacks required writable authority",
+                    contract.name,
+                    expected.name
+                );
+            }
         }
         if expected
             .address
@@ -4724,6 +4763,23 @@ fn validate_instruction_account_vector_v2(
                 "V2 Pump instruction {} repeats pinned account role {}",
                 contract.name,
                 expected.name
+            );
+        }
+    }
+    // The vetted IDL list is the mandatory ordered prefix.  Anchor documents
+    // variant-specific `remaining_accounts` for Pump instructions; retain
+    // their raw protobuf evidence, but do not derive canonical roles or state
+    // authority from them.  Every trailing index must still resolve so a
+    // malformed vector cannot disappear behind this compatibility boundary.
+    for (trailing_position, account_index) in account_indices[contract.accounts.len()..]
+        .iter()
+        .enumerate()
+    {
+        if context.accounts.get(usize::from(*account_index)).is_none() {
+            bail!(
+                "V2 Pump instruction {} trailing account position {} references missing message account",
+                contract.name,
+                contract.accounts.len() + trailing_position
             );
         }
     }
@@ -6387,6 +6443,171 @@ mod tests {
         assert!(
             qualification_run_below_minimum_v2(None, 9_999),
             "missing elapsed cohort evidence cannot silently satisfy the minimum"
+        );
+    }
+
+    fn real_vendored_buy_account_vector_context_v2() -> (
+        PumpExactStateSemanticsAuthorityV2,
+        PumpExactStateTransactionContextV2,
+        Vec<u8>,
+    ) {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repository root from seer manifest directory");
+        let manifest_path =
+            repository_root.join("configs/research/pump_exact_state_semantics_manifest_v2.json");
+        let authority = load_pump_exact_state_semantics_authority_v2(&manifest_path)
+            .expect("real vendored Pump semantics manifest must load");
+        let contract = authority
+            .instruction(&[102, 6, 61, 18, 1, 218, 235, 234])
+            .expect("real vendored buy contract");
+        let accounts = contract
+            .accounts
+            .iter()
+            .enumerate()
+            .map(|(position, expected)| {
+                let mut dynamic_key = [0u8; 32];
+                dynamic_key[0] = u8::try_from(position + 1)
+                    .expect("fixture account position fits a Pubkey byte");
+                PumpExactStateAccountMetaV2 {
+                    pubkey: expected
+                        .address
+                        .unwrap_or_else(|| Pubkey::new_from_array(dynamic_key)),
+                    signer: expected.signer,
+                    writable: expected.writable,
+                }
+            })
+            .collect();
+        let account_indices = (0..contract.accounts.len())
+            .map(|position| u8::try_from(position).expect("fixture account index fits u8"))
+            .collect();
+        (
+            authority,
+            PumpExactStateTransactionContextV2 {
+                signature: [77; 64],
+                slot: 7,
+                tx_index: 3,
+                success: true,
+                accounts,
+                outer: Vec::new(),
+                inner: BTreeMap::new(),
+            },
+            account_indices,
+        )
+    }
+
+    #[test]
+    fn outer_pump_account_prefix_accepts_message_privilege_superset_and_valid_remaining_accounts() {
+        let (authority, mut context, mut account_indices) =
+            real_vendored_buy_account_vector_context_v2();
+        let contract = authority
+            .instruction(&[102, 6, 61, 18, 1, 218, 235, 234])
+            .expect("real vendored buy contract");
+        let global_position = contract
+            .accounts
+            .iter()
+            .position(|account| account.name == "global" && !account.writable)
+            .expect("real vendored buy has a readonly global prefix role");
+        context.accounts[global_position].writable = true;
+        let trailing_index =
+            u8::try_from(context.accounts.len()).expect("fixture trailing account index fits u8");
+        context.accounts.push(PumpExactStateAccountMetaV2 {
+            pubkey: Pubkey::new_from_array([201; 32]),
+            signer: false,
+            writable: false,
+        });
+        account_indices.push(trailing_index);
+
+        let roles = validate_instruction_account_vector_v2(
+            &context,
+            contract,
+            &account_indices,
+            PumpExactStateInvocationPrivilegeEvidenceV2::OuterTransactionMessageHeader,
+        )
+        .expect("outer message privilege supersets and a resolved remaining account are valid");
+        assert_eq!(
+            roles.get("bonding_curve"),
+            Some(&context.accounts[3].pubkey),
+            "only the pinned required prefix may establish semantic roles"
+        );
+
+        let static_position = contract
+            .accounts
+            .iter()
+            .position(|account| account.address.is_some())
+            .expect("real vendored buy has a pinned static account");
+        let mut static_drift = context.clone();
+        let mut wrong_static = static_drift.accounts[static_position].pubkey.to_bytes();
+        wrong_static[0] ^= 1;
+        static_drift.accounts[static_position].pubkey = Pubkey::new_from_array(wrong_static);
+        assert!(
+            validate_instruction_account_vector_v2(
+                &static_drift,
+                contract,
+                &account_indices,
+                PumpExactStateInvocationPrivilegeEvidenceV2::OuterTransactionMessageHeader,
+            )
+            .is_err(),
+            "a wrong pinned static prefix account must remain fail-closed"
+        );
+        assert!(
+            validate_instruction_account_vector_v2(
+                &context,
+                contract,
+                &account_indices[..contract.accounts.len() - 1],
+                PumpExactStateInvocationPrivilegeEvidenceV2::OuterTransactionMessageHeader,
+            )
+            .is_err(),
+            "a truncated required account prefix must remain fail-closed"
+        );
+        let mut invalid_trailing = account_indices.clone();
+        invalid_trailing[contract.accounts.len()] = u8::MAX;
+        assert!(
+            validate_instruction_account_vector_v2(
+                &context,
+                contract,
+                &invalid_trailing,
+                PumpExactStateInvocationPrivilegeEvidenceV2::OuterTransactionMessageHeader,
+            )
+            .is_err(),
+            "a remaining account index outside the retained message must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn inner_pump_cpi_does_not_invent_privileges_absent_from_retained_protobuf() {
+        let (authority, mut context, account_indices) =
+            real_vendored_buy_account_vector_context_v2();
+        let contract = authority
+            .instruction(&[102, 6, 61, 18, 1, 218, 235, 234])
+            .expect("real vendored buy contract");
+        let user_position = contract
+            .accounts
+            .iter()
+            .position(|account| account.name == "user" && account.signer)
+            .expect("real vendored buy requires a user signer");
+        context.accounts[user_position].signer = false;
+
+        assert!(
+            validate_instruction_account_vector_v2(
+                &context,
+                contract,
+                &account_indices,
+                PumpExactStateInvocationPrivilegeEvidenceV2::InnerInstructionPrivilegesUnavailable,
+            )
+            .is_ok(),
+            "inner CPI account indexes do not carry invocation-local signer flags; a PDA invoke_signed must not be falsely rejected"
+        );
+        assert!(
+            validate_instruction_account_vector_v2(
+                &context,
+                contract,
+                &account_indices,
+                PumpExactStateInvocationPrivilegeEvidenceV2::OuterTransactionMessageHeader,
+            )
+            .is_err(),
+            "the same missing signer evidence is invalid when the outer transaction header is the authority"
         );
     }
 
