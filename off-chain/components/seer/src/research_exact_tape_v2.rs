@@ -6029,6 +6029,19 @@ mod tests {
         semantics: &PumpExactStateSemanticsAuthorityV2,
         variant: QualifiedExportFixtureVariantV2,
     ) {
+        write_complete_raw_fixture_for_qualified_export_with_intermediate_rollover_v2(
+            raw_dir, run_id, semantics, variant, false,
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_complete_raw_fixture_for_qualified_export_with_intermediate_rollover_v2(
+        raw_dir: &Path,
+        run_id: &str,
+        semantics: &PumpExactStateSemanticsAuthorityV2,
+        variant: QualifiedExportFixtureVariantV2,
+        force_intermediate_rollover: bool,
+    ) {
         let capture_contract =
             ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([41; 32]);
         let mut writer = PumpExactStateRawSegmentWriterV2::new(
@@ -6178,6 +6191,15 @@ mod tests {
             source_readiness_slot: 102,
         };
         write_stream_boundary_for_qualified_export_fixture_v2(&mut writer, readiness.clone(), 5);
+        if force_intermediate_rollover {
+            // The production writer uses this same false footer when it
+            // rotates a bounded segment.  Keep it as a physical writer test:
+            // the next source record opens the parent-linked successor, while
+            // only the final close may assert clean shutdown.
+            writer
+                .close_current(false)
+                .expect("close intermediate local V2 raw fixture segment");
+        }
 
         let omit_whole_buy_block =
             matches!(variant, QualifiedExportFixtureVariantV2::OmitWholeBuyBlock);
@@ -6890,6 +6912,63 @@ mod tests {
         );
         assert!(!unscoped_windows.exists());
         assert!(!temporary.path().join(".unscoped-windows.partial").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_prxtape3_intermediate_rollover_footer_qualifies_as_a_complete_chain() {
+        let temporary = tempdir().expect("temporary V2 rollover-chain fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for rollover-chain fixture");
+        let raw_dir = temporary.path().join("rollover-chain-raw-v2");
+        let exact_dir = temporary.path().join("rollover-chain-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_with_intermediate_rollover_v2(
+            &raw_dir,
+            "rollover-chain-public-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::Qualified,
+            true,
+        );
+
+        let completion: serde_json::Value = serde_json::from_slice(
+            &fs::read(raw_dir.join("run_completion_receipt_v2.json"))
+                .expect("read rollover-chain completion receipt"),
+        )
+        .expect("parse rollover-chain completion receipt");
+        assert_eq!(
+            completion["segment_list"].as_array().map(Vec::len),
+            Some(2),
+            "fixture must contain one normal rollover plus one terminal segment"
+        );
+        let (_, first_records) = decode_v2_segment(&raw_dir.join("segment_00000.bin"));
+        let (_, terminal_records) = decode_v2_segment(&raw_dir.join("segment_00001.bin"));
+        assert!(matches!(
+            first_records.last(),
+            Some(PumpExactStateRawRecordV2::SegmentClosed(footer)) if !footer.clean_shutdown
+        ));
+        assert!(matches!(
+            terminal_records.last(),
+            Some(PumpExactStateRawRecordV2::SegmentClosed(footer)) if footer.clean_shutdown
+        ));
+
+        let summary = qualify_prospective_exact_state_raw_run_v2(
+            &raw_dir,
+            &semantics_path,
+            &exact_dir,
+        )
+        .expect(
+            "a genuine intermediate rollover footer must be accepted before the terminal clean close",
+        );
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+        assert!(exact_dir.exists());
+        assert!(
+            !temporary
+                .path()
+                .join(".rollover-chain-exact-v2.partial")
+                .exists(),
+            "a valid multi-segment raw chain must atomically publish its exact artifact"
+        );
     }
 
     #[cfg(unix)]

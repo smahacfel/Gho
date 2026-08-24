@@ -2559,11 +2559,22 @@ pub fn index_prospective_exact_state_raw_run_v2(
         let path = raw_dir.join(filename);
         require_private_authority_file_v2(&path, "V2 raw segment")?;
         let segment_position = segments.len();
+        // A rollover is an intentionally non-terminal close.  It must retain
+        // `clean_shutdown = false`; only the final segment proves that the
+        // recorder reached its planned clean close.  Do not accept either
+        // value indiscriminately: the receipt order freezes which segment is
+        // terminal.
+        let expected_clean_shutdown = completion_receipt
+            .segment_list
+            .len()
+            .checked_sub(1)
+            .is_some_and(|last_segment_position| segment_position == last_segment_position);
         let prefix_hash = scan_v2_segment(
             &path,
             receipt,
             &start_manifest.run_id,
             expected_previous_prefix_hash,
+            expected_clean_shutdown,
             true,
             |frame_offset, record| index_builder.observe(segment_position, frame_offset, record),
         )?;
@@ -4943,6 +4954,7 @@ fn scan_v2_segment<F>(
     receipt: &PumpExactStateSegmentReceiptV2,
     expected_run_id: &str,
     expected_previous_prefix_hash: Option<PumpResearchStorageHashV1>,
+    expected_clean_shutdown: bool,
     require_private_mode: bool,
     mut on_record: F,
 ) -> Result<PumpResearchStorageHashV1>
@@ -5037,7 +5049,7 @@ where
     let prefix_hash = PumpResearchStorageHashV1::from(*prefix_hasher.finalize().as_bytes());
     if footer.storage_format_version != PUMP_EXACT_STATE_TAPE_STORAGE_FORMAT_VERSION_V2
         || footer.segment_index != receipt.segment_index
-        || !footer.clean_shutdown
+        || footer.clean_shutdown != expected_clean_shutdown
         || footer.accepted_record_count != accepted_record_count
         || footer.data_bytes != data_bytes
         || footer.segment_blake3 != prefix_hash
@@ -5805,7 +5817,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_v2_segment_scan_requires_footer_and_whole_file_receipt_match() {
+    fn frozen_v2_segment_scan_requires_positioned_footer_and_whole_file_receipt_match() {
         let temporary = tempfile::tempdir().expect("temporary raw directory");
         let path = temporary.path().join("segment_00000.bin");
         let header = PumpExactStateSegmentHeaderV2 {
@@ -5833,7 +5845,7 @@ mod tests {
             }),
         )
         .expect("encode V2 footer");
-        let mut bytes = header_bytes;
+        let mut bytes = header_bytes.clone();
         bytes.extend_from_slice(&footer);
         fs::write(&path, &bytes).expect("write frozen V2 fixture segment");
         let receipt = PumpExactStateSegmentReceiptV2 {
@@ -5847,15 +5859,85 @@ mod tests {
             accepted_record_count: 0,
         };
         assert_eq!(
-            scan_v2_segment(&path, &receipt, "fixture-v2", None, false, |_, _| Ok(()))
-                .expect("scan V2 fixture"),
+            scan_v2_segment(&path, &receipt, "fixture-v2", None, true, false, |_, _| Ok(
+                ()
+            ))
+            .expect("scan terminal V2 fixture"),
             prefix
         );
-        let mut corrupted = receipt.clone();
-        corrupted.file_sha256 = PumpResearchStorageHashV1::from([9; 32]);
         assert!(
-            scan_v2_segment(&path, &corrupted, "fixture-v2", None, false, |_, _| Ok(())).is_err()
+            scan_v2_segment(
+                &path,
+                &receipt,
+                "fixture-v2",
+                None,
+                false,
+                false,
+                |_, _| Ok(())
+            )
+            .is_err(),
+            "a terminal footer must not masquerade as an intermediate rollover"
         );
+
+        let rollover_footer = PumpExactStateRawCodecV2::encode_record(
+            &PumpExactStateRawRecordV2::SegmentClosed(PumpExactStateSegmentClosedV2 {
+                storage_format_version: PUMP_EXACT_STATE_TAPE_STORAGE_FORMAT_VERSION_V2,
+                segment_index: 0,
+                accepted_record_count: 0,
+                data_bytes: u64::try_from(header_bytes.len()).expect("header length"),
+                segment_blake3: prefix,
+                closed_wall_ts_ms: 2,
+                clean_shutdown: false,
+            }),
+        )
+        .expect("encode intermediate rollover footer");
+        let mut rollover_bytes = header_bytes;
+        rollover_bytes.extend_from_slice(&rollover_footer);
+        fs::write(&path, &rollover_bytes).expect("write intermediate V2 fixture segment");
+        let rollover_receipt = PumpExactStateSegmentReceiptV2 {
+            file_bytes: u64::try_from(rollover_bytes.len()).expect("rollover file length"),
+            file_sha256: sha256_hash(&rollover_bytes),
+            file_blake3: storage_hash(&rollover_bytes),
+            ..receipt.clone()
+        };
+        assert_eq!(
+            scan_v2_segment(
+                &path,
+                &rollover_receipt,
+                "fixture-v2",
+                None,
+                false,
+                false,
+                |_, _| Ok(()),
+            )
+            .expect("scan intermediate rollover V2 fixture"),
+            prefix
+        );
+        assert!(
+            scan_v2_segment(
+                &path,
+                &rollover_receipt,
+                "fixture-v2",
+                None,
+                true,
+                false,
+                |_, _| Ok(()),
+            )
+            .is_err(),
+            "an intermediate rollover footer must not masquerade as the terminal segment"
+        );
+        let mut corrupted = rollover_receipt.clone();
+        corrupted.file_sha256 = PumpResearchStorageHashV1::from([9; 32]);
+        assert!(scan_v2_segment(
+            &path,
+            &corrupted,
+            "fixture-v2",
+            None,
+            false,
+            false,
+            |_, _| Ok(())
+        )
+        .is_err());
     }
 
     fn test_digest() -> PumpExactStateDigestV2 {
