@@ -54,6 +54,22 @@ const VENDORED_IDL_MAX_BYTES_V2: u64 = 16 * 1024 * 1024;
 const MAX_BORSH_RECURSION_DEPTH_V2: usize = 32;
 const MAX_BORSH_COLLECTION_ITEMS_V2: usize = 1_000_000;
 
+/// The deployed Pump compatibility ABI accepts the legacy `buy` and
+/// `buy_exact_sol_in` discriminator with the two canonical `u64` arguments
+/// followed by zero, one, or two boolean feature bytes.  The current public
+/// IDL models the one-byte spelling as `track_volume: OptionBool`; it does
+/// not express the observed backwards-compatible zero-byte spelling or the
+/// bounded two-byte extension.
+///
+/// This is deliberately a closed decoder exception, not a general relaxation
+/// of IDL Borsh consumption.  The optional bytes are fully consumed and each
+/// must be a literal Borsh boolean.  They are never emitted as semantic
+/// authority unless the unambiguous one-byte IDL spelling is present.
+const LEGACY_BUY_OPTIONAL_BOOLEAN_COMPATIBILITY_INSTRUCTIONS_V2: &[&str] =
+    &["buy", "buy_exact_sol_in"];
+const LEGACY_BUY_OPTIONAL_BOOLEAN_COMPATIBILITY_PREFIX_BYTES_V2: usize = 16;
+const LEGACY_BUY_OPTIONAL_BOOLEAN_COMPATIBILITY_MAX_TRAILING_BYTES_V2: usize = 2;
+
 /// The only offline behavior classes accepted for a Pump instruction in a
 /// prospective V2 qualifier.  Every instruction in the vendored IDL must
 /// appear in the manifest exactly once; absent or extra names are authority
@@ -1138,13 +1154,17 @@ impl PumpExactStateSemanticsAuthorityV2 {
     }
 
     /// Verify full Borsh consumption for an instruction payload that follows
-    /// an Anchor eight-byte discriminator.
+    /// an Anchor eight-byte discriminator.  The closed legacy-buy ABI
+    /// compatibility grammar is shared with semantic field decoding so a
+    /// caller cannot label a payload valid while later semantic evidence
+    /// rejects the same immutable bytes.
     pub fn validate_instruction_payload(
         &self,
         contract: &PumpExactStateInstructionContractV2,
         payload: &[u8],
     ) -> Result<()> {
-        validate_borsh_fields_exact(&contract.args, payload, &self.defined_types)
+        self.instruction_argument_fields(contract, payload)
+            .map(|_| ())
     }
 
     /// Verify full Borsh consumption for the payload after an Anchor event
@@ -1180,12 +1200,21 @@ impl PumpExactStateSemanticsAuthorityV2 {
         contract: &PumpExactStateInstructionContractV2,
         payload: &[u8],
     ) -> Result<BTreeMap<String, Vec<u8>>> {
-        decode_named_borsh_fields_exact_v2(
+        let strict = decode_named_borsh_fields_exact_v2(
             &contract.args,
             payload,
             &self.defined_types,
             "V2 instruction payload",
-        )
+        );
+        match strict {
+            Ok(fields) => Ok(fields),
+            Err(strict_error) => legacy_buy_optional_boolean_argument_fields_v2(
+                contract,
+                payload,
+                &self.defined_types,
+            )
+            .unwrap_or(Err(strict_error)),
+        }
     }
 
     /// Return the only curve/mint identity permitted for an exact candidate.
@@ -1356,6 +1385,101 @@ fn decode_named_borsh_fields_exact_v2(
         bail!("{label} has trailing bytes");
     }
     Ok(result)
+}
+
+/// Decode the one closed, execution-observed Pump compatibility grammar that
+/// the current public IDL cannot spell: legacy `buy` / `buy_exact_sol_in`
+/// calls with their two canonical `u64` arguments followed by zero, one, or
+/// two boolean feature bytes.  No other instruction, field layout, trailing
+/// byte count, or boolean value is admitted here.
+///
+/// The zero-byte spelling cannot establish `track_volume`, because the raw
+/// payload did not retain that value.  The two-byte spelling is likewise not
+/// mapped to the IDL's single field: the extra feature byte is only strict
+/// decode evidence, and assigning either position to `track_volume` would be
+/// an inference.  A future semantics manifest that binds that argument will
+/// therefore fail closed for either ambiguous spelling.
+fn legacy_buy_optional_boolean_argument_fields_v2(
+    contract: &PumpExactStateInstructionContractV2,
+    payload: &[u8],
+    defined_types: &BTreeMap<String, Value>,
+) -> Option<Result<BTreeMap<String, Vec<u8>>>> {
+    if !LEGACY_BUY_OPTIONAL_BOOLEAN_COMPATIBILITY_INSTRUCTIONS_V2.contains(&contract.name.as_str())
+        || !legacy_buy_optional_boolean_idl_shape_v2(contract)
+    {
+        return None;
+    }
+
+    let prefix_bytes = LEGACY_BUY_OPTIONAL_BOOLEAN_COMPATIBILITY_PREFIX_BYTES_V2;
+    let max_bytes = prefix_bytes
+        .checked_add(LEGACY_BUY_OPTIONAL_BOOLEAN_COMPATIBILITY_MAX_TRAILING_BYTES_V2)?;
+    if payload.len() < prefix_bytes || payload.len() > max_bytes {
+        return None;
+    }
+
+    Some((|| {
+        let mut fields = decode_named_borsh_fields_exact_v2(
+            &contract.args[..2],
+            &payload[..prefix_bytes],
+            defined_types,
+            "V2 legacy Pump buy instruction prefix",
+        )?;
+        let extension = &payload[prefix_bytes..];
+        if extension.iter().any(|value| !matches!(*value, 0 | 1)) {
+            bail!("V2 legacy Pump buy optional boolean has an invalid value");
+        }
+        if let [track_volume] = extension {
+            if fields
+                .insert("track_volume".to_owned(), vec![*track_volume])
+                .is_some()
+            {
+                bail!("V2 legacy Pump buy prefix repeats track_volume");
+            }
+        }
+        Ok(fields)
+    })())
+}
+
+/// Guard the compatibility grammar against a future vendored-IDL drift.  It
+/// is valid only for the literal current two-`u64` + `track_volume: OptionBool`
+/// declaration.  If Pump changes that declaration, the normal strict decoder
+/// remains the only accepted path until a separately reviewed revision adds a
+/// new explicit compatibility contract.
+fn legacy_buy_optional_boolean_idl_shape_v2(
+    contract: &PumpExactStateInstructionContractV2,
+) -> bool {
+    let [first, second, track_volume] = contract.args.as_slice() else {
+        return false;
+    };
+    first
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| {
+            matches!(
+                (contract.name.as_str(), name),
+                ("buy", "amount") | ("buy_exact_sol_in", "spendable_sol_in")
+            )
+        })
+        && first.get("type").and_then(Value::as_str) == Some("u64")
+        && second
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| {
+                matches!(
+                    (contract.name.as_str(), name),
+                    ("buy", "max_sol_cost") | ("buy_exact_sol_in", "min_tokens_out")
+                )
+            })
+        && second.get("type").and_then(Value::as_str) == Some("u64")
+        && track_volume.get("name").and_then(Value::as_str) == Some("track_volume")
+        && track_volume
+            .get("type")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("defined"))
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("name"))
+            .and_then(Value::as_str)
+            == Some("OptionBool")
 }
 
 fn load_account_layout(
@@ -2430,7 +2554,7 @@ mod tests {
     }
 
     #[test]
-    fn real_vendored_option_bool_instruction_argument_is_decoded_exactly() {
+    fn real_vendored_legacy_buy_optional_boolean_compatibility_is_closed_and_unbound() {
         let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(3)
@@ -2442,30 +2566,109 @@ mod tests {
         let buy = authority
             .instruction(&[102, 6, 61, 18, 1, 218, 235, 234])
             .expect("real vendored buy contract");
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&1u64.to_le_bytes());
-        payload.extend_from_slice(&2u64.to_le_bytes());
-        payload.push(0); // Pump OptionBool is a one-field struct with shorthand "bool".
+        let buy_exact_sol_in = authority
+            .instruction(&[56, 252, 116, 8, 158, 223, 205, 95])
+            .expect("real vendored buy_exact_sol_in contract");
+        let buy_v2 = authority
+            .instruction(&[184, 23, 238, 97, 103, 197, 211, 61])
+            .expect("real vendored buy_v2 contract");
+        let prefix = || {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u64.to_le_bytes());
+            payload.extend_from_slice(&2u64.to_le_bytes());
+            payload
+        };
+
+        let no_flag = prefix();
+        let no_flag_fields = authority
+            .instruction_argument_fields(buy, &no_flag)
+            .expect("a successful legacy buy spelling may omit unbound feature bytes");
+        assert_eq!(
+            no_flag_fields.get("amount"),
+            Some(&1u64.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            no_flag_fields.get("max_sol_cost"),
+            Some(&2u64.to_le_bytes().to_vec())
+        );
+        assert!(
+            !no_flag_fields.contains_key("track_volume"),
+            "a byte absent from immutable raw must not be invented as parent authority"
+        );
+        assert!(
+            authority.validate_instruction_payload(buy, &no_flag).is_ok(),
+            "payload validation and semantic evidence must share the same closed compatibility grammar"
+        );
+
+        let mut one_flag = prefix();
+        one_flag.push(0); // IDL spelling: OptionBool { bool: false }.
         assert!(
             authority
-                .validate_instruction_payload(buy, &payload)
+                .validate_instruction_payload(buy, &one_flag)
                 .is_ok(),
             "the real vendored OptionBool shorthand must not falsely taint buy inventory"
         );
-        payload.push(0);
-        assert!(
+        assert_eq!(
             authority
-                .validate_instruction_payload(buy, &payload)
-                .is_err(),
-            "a correctly decoded OptionBool still may not hide trailing bytes"
+                .instruction_argument_fields(buy, &one_flag)
+                .expect("one-byte IDL spelling")
+                .get("track_volume"),
+            Some(&vec![0]),
+            "the one-byte spelling is the only unambiguous declared argument value"
         );
-        payload.pop();
-        payload[16] = 2;
+
+        let mut two_flags = prefix();
+        two_flags.extend_from_slice(&[1, 0]);
         assert!(
             authority
-                .validate_instruction_payload(buy, &payload)
+                .validate_instruction_payload(buy, &two_flags)
+                .is_ok(),
+            "the observed two-byte legacy extension must be fully consumed as booleans"
+        );
+        assert!(
+            !authority
+                .instruction_argument_fields(buy, &two_flags)
+                .expect("two-byte legacy extension")
+                .contains_key("track_volume"),
+            "an ambiguous extension byte may never be guessed as the IDL field"
+        );
+
+        assert!(
+            authority
+                .validate_instruction_payload(buy_exact_sol_in, &no_flag)
+                .is_ok(),
+            "the second observed compatibility discriminator has the same literal two-u64 prefix"
+        );
+        assert!(
+            authority
+                .validate_instruction_payload(buy_v2, &no_flag)
+                .is_ok(),
+            "unrelated exact-buy variants retain their ordinary pinned-IDL payload grammar"
+        );
+
+        let mut invalid_boolean = prefix();
+        invalid_boolean.push(2);
+        assert!(
+            authority
+                .validate_instruction_payload(buy, &invalid_boolean)
                 .is_err(),
-            "invalid bool values remain fail-closed"
+            "invalid feature bytes remain fail-closed"
+        );
+        let mut too_many_extension_bytes = prefix();
+        too_many_extension_bytes.extend_from_slice(&[1, 0, 1]);
+        assert!(
+            authority
+                .validate_instruction_payload(buy, &too_many_extension_bytes)
+                .is_err(),
+            "the compatibility grammar remains bounded to the observed zero, one, or two-byte forms"
+        );
+        let mut unrelated_trailing_byte = prefix();
+        unrelated_trailing_byte.push(0);
+        assert!(
+            authority
+                .validate_instruction_payload(buy_v2, &unrelated_trailing_byte)
+                .is_err(),
+            "no other instruction may inherit the legacy-buy exception"
         );
     }
 

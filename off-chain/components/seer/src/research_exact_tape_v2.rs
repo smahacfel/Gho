@@ -5241,6 +5241,7 @@ mod tests {
         PostBoundaryCurveWithoutObservedCreate,
         PreExistingCurveTradeWithUnknownPumpOccurrence,
         GlobalDependencyMutation,
+        QualifiedWithLegacyBuyWithoutTrackVolume,
     }
 
     #[derive(Clone, Copy)]
@@ -6223,6 +6224,21 @@ mod tests {
             variant,
             QualifiedExportFixtureVariantV2::QualifiedWithBuyRemainingAccount
         );
+        let buy_payload = if matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::QualifiedWithLegacyBuyWithoutTrackVolume
+        ) {
+            let mut payload = fixture_buy_payload_v2();
+            let removed = payload.pop();
+            assert_eq!(
+                removed,
+                Some(0),
+                "fixture legacy buy must remove only the unbound OptionBool byte"
+            );
+            payload
+        } else {
+            fixture_buy_payload_v2()
+        };
         let pre_cohort_buy = fixture_exact_instruction_info_v2(
             semantics,
             "buy",
@@ -6251,7 +6267,7 @@ mod tests {
             semantics,
             "buy",
             buy_discriminator,
-            fixture_buy_payload_v2(),
+            buy_payload,
             3,
             0,
             curve,
@@ -7427,6 +7443,53 @@ mod tests {
         );
         assert!(!unscoped_windows.exists());
         assert!(!temporary.path().join(".unscoped-windows.partial").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_prxtape3_legacy_buy_without_track_volume_remains_exact() {
+        let temporary = tempdir().expect("temporary V2 legacy-buy compatibility fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for legacy-buy fixture");
+        let raw_dir = temporary
+            .path()
+            .join("legacy-buy-without-track-volume-raw-v2");
+        let exact_dir = temporary
+            .path()
+            .join("legacy-buy-without-track-volume-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "legacy-buy-without-track-volume-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::QualifiedWithLegacyBuyWithoutTrackVolume,
+        );
+
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect("the closed legacy-buy payload form must remain offline-qualifiable");
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+        assert_eq!(summary.successful_rooted_mutation_denominator, 2);
+        assert_eq!(summary.exact_rooted_mutation_count, 2);
+        assert_eq!(summary.exact_rooted_coverage_ppm, 1_000_000);
+
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(exact_dir.join("exact_state_capability_v2.json"))
+                .expect("read legacy-buy exact receipt"),
+        )
+        .expect("parse legacy-buy exact receipt");
+        assert_eq!(
+            receipt["successful_rooted_validated_event_transport_count"],
+            serde_json::json!(2u64),
+            "the Buy Event-CPI must retain its exact parent and canonical final-state bindings"
+        );
+        assert!(
+            !temporary
+                .path()
+                .join(".legacy-buy-without-track-volume-exact-v2.partial")
+                .exists(),
+            "the compatibility path must retain atomic exact-output publication"
+        );
     }
 
     #[cfg(unix)]
