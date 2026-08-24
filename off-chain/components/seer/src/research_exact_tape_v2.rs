@@ -1676,7 +1676,11 @@ fn digest_running_executable_v2() -> Result<PumpExactStateDigestV2> {
     }
 }
 
-fn program_data_receipts_match_v2(
+/// Compares the immutable ProgramData authority observed at capture start and
+/// completion. `observed_context_slot` deliberately remains an audit label:
+/// a later finalized RPC observation normally has a later context slot without
+/// implying any Program or ProgramData change.
+pub(crate) fn program_data_receipts_match_v2(
     start: &PumpProgramDataReceiptV1,
     completion: &PumpProgramDataReceiptV1,
 ) -> bool {
@@ -6525,6 +6529,94 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn rewrite_completion_receipt_for_program_data_control_fixture_v2(
+        raw_dir: &Path,
+        rewrite: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let completion_path = raw_dir.join("run_completion_receipt_v2.json");
+        let mut completion: serde_json::Value = serde_json::from_slice(
+            &fs::read(&completion_path).expect("read ProgramData control fixture receipt"),
+        )
+        .expect("parse ProgramData control fixture receipt");
+        rewrite(&mut completion);
+        rewrite_private_fixture_json_v2(&completion_path, &completion);
+    }
+
+    #[cfg(unix)]
+    fn assert_v2_program_data_control_fails_raw_qualification(
+        label: &str,
+        rewrite: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let temporary = tempdir().expect("temporary V2 ProgramData control fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for ProgramData control fixture");
+        let raw_dir = temporary.path().join(format!("{label}-raw-v2"));
+        let exact_dir = temporary.path().join(format!("{label}-exact-v2"));
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            &format!("program-data-control-{label}"),
+            &semantics,
+            QualifiedExportFixtureVariantV2::Qualified,
+        );
+        rewrite_completion_receipt_for_program_data_control_fixture_v2(&raw_dir, rewrite);
+
+        let error =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect_err(
+                    "ProgramData completion control drift must fail before exact output creation",
+                );
+        assert!(
+            error
+                .to_string()
+                .contains("V2 raw run does not satisfy the complete prospective capture contract"),
+            "ProgramData control {label} must fail raw authority: {error:#}"
+        );
+        assert!(
+            !exact_dir.exists(),
+            "ProgramData control {label} must not publish exact output"
+        );
+        assert!(
+            !temporary
+                .path()
+                .join(format!(".{label}-exact-v2.partial"))
+                .exists(),
+            "ProgramData control {label} must fail before exact partial creation"
+        );
+    }
+
+    #[cfg(unix)]
+    fn corrupt_program_data_completion_identity_field_v2(
+        completion: &mut serde_json::Value,
+        field: &str,
+    ) {
+        let target = completion
+            .get_mut("program_data_at_completion")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|receipt| receipt.get_mut(field))
+            .unwrap_or_else(|| panic!("fixture ProgramData completion lacks {field}"));
+        match target {
+            serde_json::Value::Array(values) => {
+                let first = values
+                    .first()
+                    .and_then(serde_json::Value::as_u64)
+                    .expect("fixture ProgramData byte array has a first byte");
+                values[0] = serde_json::json!(first ^ 1);
+            }
+            serde_json::Value::String(value) => value.push_str("-drift"),
+            serde_json::Value::Number(value) => {
+                let current = value
+                    .as_u64()
+                    .expect("fixture ProgramData numeric identity field is u64");
+                *target = serde_json::json!(current.saturating_add(1));
+            }
+            other => {
+                panic!("fixture ProgramData identity field {field} has unsupported shape {other}")
+            }
+        }
+    }
+
+    #[cfg(unix)]
     fn fixture_runtime_digest_json_v2(path: &Path) -> serde_json::Value {
         let digest = fixture_exact_artifact_digest_json_v2(path);
         serde_json::json!({
@@ -6798,6 +6890,89 @@ mod tests {
         );
         assert!(!unscoped_windows.exists());
         assert!(!temporary.path().join(".unscoped-windows.partial").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_later_finalized_program_data_context_slot_preserves_raw_authority() {
+        let temporary = tempdir().expect("temporary V2 ProgramData context-slot fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for ProgramData context-slot fixture");
+        let raw_dir = temporary.path().join("program-data-context-slot-raw-v2");
+        let exact_dir = temporary.path().join("program-data-context-slot-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "program-data-context-slot",
+            &semantics,
+            QualifiedExportFixtureVariantV2::Qualified,
+        );
+        rewrite_completion_receipt_for_program_data_control_fixture_v2(&raw_dir, |completion| {
+            completion["program_data_at_completion"]["observed_context_slot"] =
+                serde_json::json!(103u64);
+        });
+
+        let summary = qualify_prospective_exact_state_raw_run_v2(
+            &raw_dir,
+            &semantics_path,
+            &exact_dir,
+        )
+        .expect(
+            "a later finalized ProgramData context slot is audit evidence, not immutable identity drift",
+        );
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+        assert!(exact_dir.exists());
+        assert!(
+            !temporary
+                .path()
+                .join(".program-data-context-slot-exact-v2.partial")
+                .exists(),
+            "a successful exact output must atomically remove its partial directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_program_data_completion_semantic_identity_drift_fails_raw_authority() {
+        for field in [
+            "pump_program_id",
+            "pump_program_account_owner",
+            "pump_programdata_pubkey",
+            "program_data_owner",
+            "program_data_hash_algorithm",
+            "program_data_hash_blake3",
+            "program_deployment_slot",
+            "commitment",
+        ] {
+            let label = format!("program-data-completion-{field}");
+            assert_v2_program_data_control_fails_raw_qualification(&label, |completion| {
+                corrupt_program_data_completion_identity_field_v2(completion, field);
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_program_data_completion_control_fields_remain_fail_closed() {
+        assert_v2_program_data_control_fails_raw_qualification(
+            "program-data-start-copy-drift",
+            |completion| {
+                completion["program_data_at_start"]["observed_context_slot"] =
+                    serde_json::json!(103u64);
+            },
+        );
+        assert_v2_program_data_control_fails_raw_qualification(
+            "program-data-completion-missing",
+            |completion| {
+                completion["program_data_at_completion"] = serde_json::Value::Null;
+            },
+        );
+        assert_v2_program_data_control_fails_raw_qualification(
+            "program-data-unchanged-false",
+            |completion| {
+                completion["program_data_unchanged"] = serde_json::json!(false);
+            },
+        );
     }
 
     #[cfg(unix)]

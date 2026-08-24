@@ -7,10 +7,10 @@
 //! runtime.
 
 use crate::research_exact_tape_v2::{
-    classify_pump_owned_account_evidence_v2, PumpExactStateCaptureRunStatusV2,
-    PumpExactStateDigestV2, PumpExactStateRunCompletionReceiptV2, PumpExactStateRunStartManifestV2,
-    PumpExactStateSegmentReceiptV2, EXACT_STATE_TAPE_V2_CONFIG_SCHEMA_VERSION,
-    EXACT_STATE_TAPE_V2_RUN_SCHEMA_VERSION,
+    classify_pump_owned_account_evidence_v2, program_data_receipts_match_v2,
+    PumpExactStateCaptureRunStatusV2, PumpExactStateDigestV2, PumpExactStateRunCompletionReceiptV2,
+    PumpExactStateRunStartManifestV2, PumpExactStateSegmentReceiptV2,
+    EXACT_STATE_TAPE_V2_CONFIG_SCHEMA_VERSION, EXACT_STATE_TAPE_V2_RUN_SCHEMA_VERSION,
 };
 use crate::research_exact_tape_v2_semantics::{
     load_pump_exact_state_semantics_authority_v2, PumpExactStateAccountClassV2,
@@ -3405,7 +3405,16 @@ fn validate_v2_controls(
         || !completion.running_executable_unchanged
         || !completion.program_data_unchanged
         || completion.program_data_at_start != start.program_data_at_start
-        || completion.program_data_at_completion.as_ref() != Some(&start.program_data_at_start)
+        // The start receipt is copied verbatim into completion for authority
+        // binding. The independently observed completion receipt uses the
+        // same semantic comparator as the recorder: its finalized RPC context
+        // slot is an audit label and may legitimately advance during capture.
+        || !completion
+            .program_data_at_completion
+            .as_ref()
+            .is_some_and(|observed| {
+                program_data_receipts_match_v2(&start.program_data_at_start, observed)
+            })
         || !completion.source_lifecycle.stream_established
         || !completion.source_lifecycle.source_workers_cleanly_stopped
         || completion.source_lifecycle.source_updates_received == 0
