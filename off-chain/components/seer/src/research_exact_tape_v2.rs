@@ -5234,6 +5234,7 @@ mod tests {
         WarmupAndUnreconciledTailInvocationSkew,
         ProvisionalFinalityTail,
         QualifiedWithBuyRemainingAccount,
+        QualifiedWithMessageWritableEventAuthority,
     }
 
     #[derive(Clone, Copy)]
@@ -5780,6 +5781,7 @@ mod tests {
         semantics: &PumpExactStateSemanticsAuthorityV2,
         event_discriminator: [u8; 8],
         event_payload: Vec<u8>,
+        message_event_authority_writable: bool,
     ) {
         let transaction_body = transaction
             .transaction
@@ -5789,11 +5791,11 @@ mod tests {
             .message
             .as_mut()
             .expect("fixture Event-CPI parent has message");
-        let outer = message
+        let pump_program_index = message
             .instructions
             .first()
-            .expect("fixture Event-CPI parent has outer Pump instruction");
-        let pump_program_index = outer.program_id_index;
+            .expect("fixture Event-CPI parent has outer Pump instruction")
+            .program_id_index;
         assert_eq!(
             message.account_keys[usize::try_from(pump_program_index).expect("Pump index fits")],
             semantics.program_id.to_bytes().to_vec(),
@@ -5801,19 +5803,70 @@ mod tests {
         );
         let event_authority =
             Pubkey::find_program_address(&[b"__event_authority"], &semantics.program_id).0;
-        let event_authority_index = u8::try_from(message.account_keys.len())
-            .expect("fixture Event-CPI account index fits u8");
-        message
-            .account_keys
-            .push(event_authority.to_bytes().to_vec());
-        let header = message
-            .header
-            .as_mut()
-            .expect("fixture Event-CPI message header");
-        header.num_readonly_unsigned_accounts = header
-            .num_readonly_unsigned_accounts
-            .checked_add(1)
-            .expect("fixture readonly unsigned count fits u32");
+        let event_authority_index = if message_event_authority_writable {
+            // Insert at the boundary before the readonly unsigned partition,
+            // so the retained transaction header marks this otherwise
+            // canonical Event-CPI PDA writable.  An inner instruction has no
+            // invocation-local flags in Yellowstone, which is exactly the
+            // regression this public fixture exercises.
+            let readonly_unsigned = usize::try_from(
+                message
+                    .header
+                    .as_ref()
+                    .expect("fixture Event-CPI message header")
+                    .num_readonly_unsigned_accounts,
+            )
+            .expect("fixture readonly unsigned count fits usize");
+            let insertion_index = message
+                .account_keys
+                .len()
+                .checked_sub(readonly_unsigned)
+                .expect("fixture readonly unsigned partition fits account keys");
+            let insertion_index_u8 =
+                u8::try_from(insertion_index).expect("fixture Event-CPI account index fits u8");
+            message
+                .account_keys
+                .insert(insertion_index, event_authority.to_bytes().to_vec());
+            for instruction in &mut message.instructions {
+                if usize::try_from(instruction.program_id_index)
+                    .expect("fixture program index fits usize")
+                    >= insertion_index
+                {
+                    instruction.program_id_index = instruction
+                        .program_id_index
+                        .checked_add(1)
+                        .expect("fixture shifted program index fits u32");
+                }
+                for account_index in &mut instruction.accounts {
+                    if usize::from(*account_index) >= insertion_index {
+                        *account_index = account_index
+                            .checked_add(1)
+                            .expect("fixture shifted account index fits u8");
+                    }
+                }
+            }
+            insertion_index_u8
+        } else {
+            let event_authority_index = u8::try_from(message.account_keys.len())
+                .expect("fixture Event-CPI account index fits u8");
+            message
+                .account_keys
+                .push(event_authority.to_bytes().to_vec());
+            let header = message
+                .header
+                .as_mut()
+                .expect("fixture Event-CPI message header");
+            header.num_readonly_unsigned_accounts = header
+                .num_readonly_unsigned_accounts
+                .checked_add(1)
+                .expect("fixture readonly unsigned count fits u32");
+            event_authority_index
+        };
+        let pump_program_index = message
+            .instructions
+            .first()
+            .expect("fixture Event-CPI parent has shifted outer Pump instruction")
+            .program_id_index;
 
         let mut data = vec![0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
         data.extend_from_slice(&event_discriminator);
@@ -6189,6 +6242,10 @@ mod tests {
             "token_program",
         );
         let event_corruption = fixture_event_corruption_for_variant_v2(variant);
+        let message_event_authority_writable = matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::QualifiedWithMessageWritableEventAuthority
+        );
         fixture_attach_anchor_event_cpi_v2(
             &mut create,
             semantics,
@@ -6205,12 +6262,14 @@ mod tests {
                 1_004,
                 event_corruption,
             ),
+            message_event_authority_writable,
         );
         fixture_attach_anchor_event_cpi_v2(
             &mut buy,
             semantics,
             [189, 219, 127, 211, 78, 230, 97, 238],
             fixture_trade_event_payload_v2(mint, user, quote_mint, 800, 700, event_corruption),
+            message_event_authority_writable,
         );
 
         writer
@@ -7797,6 +7856,48 @@ mod tests {
             row["source_reconciled_full_block_frontier_slot"],
             serde_json::json!(106u64),
             "frontier must be the linked chain tip, not a numerically contiguous slot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_v2_inner_event_cpi_does_not_infer_message_writable_privilege() {
+        let temporary = tempdir().expect("temporary V2 writable Event-CPI fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for writable Event-CPI fixture");
+        let raw_dir = temporary.path().join("writable-event-cpi-raw-v2");
+        let exact_dir = temporary.path().join("writable-event-cpi-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "writable-event-cpi-public-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::QualifiedWithMessageWritableEventAuthority,
+        );
+
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect("inner Event-CPI fixture must materialize an offline artifact");
+        assert_eq!(
+            summary.status,
+            PumpExactStateCapabilityStatusV2::Qualified,
+            "a transaction-header writable superset is not invocation-local Event-CPI authority: {:?}",
+            summary.blockers
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(exact_dir.join("exact_state_capability_v2.json"))
+                .expect("read writable Event-CPI capability receipt"),
+        )
+        .expect("parse writable Event-CPI capability receipt");
+        assert_eq!(
+            receipt["successful_rooted_validated_event_transport_count"],
+            serde_json::json!(2u64),
+            "both real inner Event-CPI envelopes must remain visible and validated"
+        );
+        assert_eq!(
+            receipt["successful_rooted_unknown_occurrence_count"],
+            serde_json::json!(0u64),
+            "transaction-wide writable evidence must not manufacture an unknown inner Event-CPI"
         );
     }
 

@@ -1241,9 +1241,11 @@ impl PumpExactStateSemanticsAuthorityV2 {
 
     /// Validate the hash-pinned semantic relation between a decoded Anchor
     /// event and its immediate Pump parent.  The returned bindings must still
-    /// be compared with the final anchored curve state for that exact parent
-    /// transaction; keeping that last comparison explicit prevents an event
-    /// payload from becoming state authority by itself.
+    /// be compared with a final anchored curve state only when that anchor can
+    /// represent this parent's post-state; a later same-curve mutation in the
+    /// same signature makes that comparison unavailable.  Keeping the final
+    /// comparison explicit prevents an event payload from becoming state
+    /// authority by itself.
     pub fn validate_event_parent_semantics(
         &self,
         event: &PumpExactStateEventContractV2,

@@ -4828,12 +4828,12 @@ fn classify_anchor_event_transport_v2(
             }
         }
     };
-    // An Anchor `emit_cpi!` self-CPI is encoded as a Pump instruction whose
-    // program id is the Pump program and whose only account meta is the
-    // readonly, non-signer `__event_authority` PDA.  The program itself is
-    // the compiled instruction's program_id, not a second account meta.  Do
-    // not accept a superset here: an arbitrary remaining account must not be
-    // silently reclassified as event transport.
+    // An Anchor `emit_cpi!` self-CPI has one local account meta for the
+    // `__event_authority` PDA.  Yellowstone does not retain that invocation's
+    // local signer/writable flags; the program itself is the compiled
+    // instruction's program_id, not a second account meta.  Do not accept an
+    // account-vector superset here: an arbitrary remaining account must not
+    // be silently reclassified as event transport.
     if account_indices.len() != 1 || outer_group >= u32::MAX {
         return PumpExactStateOccurrenceClassV2::Unknown {
             reason: "anchor_event_transport_account_vector_not_exact".to_owned(),
@@ -4846,7 +4846,13 @@ fn classify_anchor_event_transport_v2(
             reason: "anchor_event_transport_account_index_invalid".to_owned(),
         };
     };
-    if account.pubkey != event_authority || account.signer || account.writable {
+    // This is necessarily an inner Pump self-CPI: direct transport was
+    // rejected above.  Yellowstone retains only the transaction-message
+    // privilege union, not this invocation's AccountMeta flags.  The exact
+    // one-account vector and the canonical event-authority PDA remain the
+    // complete retained structural authority; rejecting a message-level
+    // signer/writable superset here would invent unavailable CPI evidence.
+    if account.pubkey != event_authority {
         return PumpExactStateOccurrenceClassV2::Unknown {
             reason: "anchor_event_transport_authority_contract_invalid".to_owned(),
         };
@@ -4961,8 +4967,11 @@ fn validate_event_transport_parent_links_v2(
 
 /// Validate the semantic half of an Anchor Event-CPI only after the full
 /// occurrence ledger exists.  The structural pass above proves the immediate
-/// stack parent; this pass proves that the event variant, every declared field
-/// relation, and every declared final-state value match that very parent.
+/// stack parent; this pass proves the event variant and every declared field
+/// relation.  It additionally proves final-state bindings only when the
+/// retained same-signature curve anchor can still represent that parent's
+/// post-state rather than the post-state of a later mutation in the same
+/// transaction.
 /// A bad event becomes an `Unknown` occurrence, therefore taints the complete
 /// successful rooted transaction and cannot be hidden by a high coverage
 /// numerator.
@@ -4988,6 +4997,16 @@ fn validate_event_transport_parent_semantics_v2(
             Some((occurrence.key.clone(), evidence.clone()))
         })
         .collect::<BTreeMap<_, _>>();
+    let candidate_curves_by_key = occurrences
+        .iter()
+        .filter_map(|occurrence| match &occurrence.class {
+            PumpExactStateOccurrenceClassV2::Candidate {
+                bonding_curve: Some(curve),
+                ..
+            } => Some((occurrence.key.clone(), *curve)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
 
     for occurrence in occurrences {
         let (immediate_parent, event_discriminator, event_fields) = match &occurrence.class {
@@ -5032,6 +5051,19 @@ fn validate_event_transport_parent_semantics_v2(
             let curve = curve.ok_or_else(|| {
                 anyhow::anyhow!("anchor_event_transport_parent_curve_role_absent")
             })?;
+            if has_later_same_curve_candidate_v2(&candidate_curves_by_key, &immediate_parent, curve)
+            {
+                // The retained account update is a final state after the
+                // entire transaction.  It cannot validate the post-state
+                // emitted by an earlier same-curve Pump mutation when a
+                // later candidate can overwrite that curve in the same
+                // signature.  The event has still passed strict Borsh,
+                // immediate-parent, and all non-final-state semantic
+                // bindings.  Keep it visible as validated transport, while
+                // candidate exactness independently remains non-exact due to
+                // the transaction's multiple reserve/dependency candidates.
+                return Ok(Vec::new());
+            }
             let final_anchor = anchors
                 .unique_final_anchor(context.signature, curve, context.slot, context.tx_index)
                 .ok_or_else(|| anyhow::anyhow!("anchor_event_transport_final_anchor_missing"))?;
@@ -5055,6 +5087,31 @@ fn validate_event_transport_parent_semantics_v2(
             }
         }
     }
+}
+
+/// The Yellowstone inner-instruction list is ordered within each outer
+/// instruction.  A later outer instruction, or a later retained inner path
+/// under the same outer instruction, executes after the parent whose event is
+/// being checked.  This helper intentionally ignores message-wide
+/// signer/writable flags: it answers only whether the final same-signature
+/// account anchor can still represent that parent's post-state.
+fn has_later_same_curve_candidate_v2(
+    candidate_curves_by_key: &[(PumpExactStateInstructionOccurrenceKeyV2, Pubkey)],
+    parent: &PumpExactStateInstructionOccurrenceKeyV2,
+    curve: Pubkey,
+) -> bool {
+    candidate_curves_by_key
+        .iter()
+        .any(|(candidate, candidate_curve)| {
+            *candidate_curve == curve
+                && (
+                    candidate.outer_instruction_index,
+                    &candidate.inner_instruction_path,
+                ) > (
+                    parent.outer_instruction_index,
+                    &parent.inner_instruction_path,
+                )
+        })
 }
 
 fn validate_event_final_state_bindings_v2(
@@ -7127,6 +7184,54 @@ mod tests {
         assert!(outer_parent.inner_instruction_path.is_empty());
         assert_eq!(outer_parent.stack_height, None);
         assert_eq!(outer_parent.discriminator, parent_discriminator);
+    }
+
+    #[test]
+    fn later_same_curve_candidate_prevents_final_anchor_from_being_assigned_backwards() {
+        let curve = Pubkey::new_from_array([7; 32]);
+        let other_curve = Pubkey::new_from_array([8; 32]);
+        let key = |outer_instruction_index, inner_instruction_path: Vec<u16>| {
+            PumpExactStateInstructionOccurrenceKeyV2 {
+                signature: [1; 64],
+                outer_instruction_index,
+                inner_instruction_path,
+                stack_height: None,
+                program_id: Pubkey::new_from_array([3; 32]),
+                discriminator: [4; 8],
+            }
+        };
+        let parent = key(2, Vec::new());
+        let later_outer = key(3, Vec::new());
+        let later_inner = key(2, vec![1]);
+        let candidates = vec![
+            (parent.clone(), curve),
+            (later_outer.clone(), curve),
+            (key(4, Vec::new()), other_curve),
+        ];
+
+        assert!(
+            has_later_same_curve_candidate_v2(&candidates, &parent, curve),
+            "a later outer mutation can overwrite the signature-final curve anchor"
+        );
+        assert!(
+            !has_later_same_curve_candidate_v2(&candidates, &later_outer, curve),
+            "the latest same-curve outer candidate still owns the final-state comparison"
+        );
+        let unrelated_curve_candidates =
+            vec![(parent.clone(), curve), (key(4, Vec::new()), other_curve)];
+        assert!(
+            !has_later_same_curve_candidate_v2(&unrelated_curve_candidates, &parent, curve),
+            "a later mutation of another curve cannot suppress this curve's final-state validation"
+        );
+        let same_outer_candidates = vec![(parent.clone(), curve), (later_inner.clone(), curve)];
+        assert!(
+            has_later_same_curve_candidate_v2(&same_outer_candidates, &parent, curve),
+            "a later retained inner instruction can overwrite the signature-final curve anchor"
+        );
+        assert!(
+            !has_later_same_curve_candidate_v2(&same_outer_candidates, &later_inner, curve),
+            "the last retained inner candidate still owns the final-state comparison"
+        );
     }
 
     #[cfg(target_os = "linux")]
