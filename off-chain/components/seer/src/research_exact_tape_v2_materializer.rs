@@ -2478,6 +2478,14 @@ struct PumpExactStateRawRecordCollectorV2 {
     previous_source_capture_sequence: Option<u64>,
     source_capture_sequences: BTreeSet<u64>,
     source_stream_epoch: Option<u64>,
+    // The Yellowstone account-include request intentionally admits every
+    // non-vote transaction that references the Pump key, including account
+    // references that do not execute Pump.  Preserve its complete lane census
+    // independently from the narrower mutation-completeness inventory below.
+    filtered_transaction_message_count: u64,
+    // This is the comparable universe: non-vote transactions that actually
+    // invoke Pump in an outer or inner instruction.  It is deliberately not
+    // the raw account-include ingress count.
     filtered_transactions: BTreeMap<PumpExactStateTransactionKeyV2, [u8; 32]>,
     full_block_pump_transactions: BTreeMap<PumpExactStateTransactionKeyV2, [u8; 32]>,
     open_full_block: Option<PumpExactStateFullBlockAccumulatorV2>,
@@ -3503,17 +3511,24 @@ impl PumpExactStateRawRecordCollectorV2 {
                     &transaction.source.payload_hash_blake3,
                     &transaction.source_payload,
                 )?;
-                let (key, digest) = filtered_transaction_identity(transaction)?;
-                if self
-                    .filtered_transactions
-                    .insert(key.clone(), digest)
-                    .is_some()
+                self.filtered_transaction_message_count = self
+                    .filtered_transaction_message_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("V2 filtered transaction count overflow"))?;
+                if let Some((key, digest)) =
+                    filtered_transaction_identity(transaction, self.expected_pump_program_id)?
                 {
-                    bail!(
-                        "V2 filtered transaction {}:{} appears more than once",
-                        key.slot,
-                        key.tx_index
-                    );
+                    if self
+                        .filtered_transactions
+                        .insert(key.clone(), digest)
+                        .is_some()
+                    {
+                        bail!(
+                            "V2 filtered Pump invocation {}:{} appears more than once",
+                            key.slot,
+                            key.tx_index
+                        );
+                    }
                 }
             }
             PumpExactStateRawRecordV2::PumpOwnedAccountUpdate(update) => {
@@ -3996,7 +4011,10 @@ impl PumpExactStateRawRecordCollectorV2 {
             bail!("V2 raw run retains more than one full-block payload for a slot");
         }
         for transaction in block.transactions {
-            if transaction_invokes_pump(&transaction, self.expected_pump_program_id)? {
+            if transaction_matches_filtered_pump_transaction_contract_v2(
+                &transaction,
+                self.expected_pump_program_id,
+            )? {
                 let key = PumpExactStateTransactionKeyV2 {
                     slot: block.slot,
                     tx_index: transaction.index,
@@ -4043,7 +4061,7 @@ impl PumpExactStateRawRecordCollectorV2 {
             || u64::try_from(self.source_capture_sequences.len()).unwrap_or(u64::MAX)
                 != completion.writer.accepted_source_records
             || completion.writer.accepted_readiness_boundary_records != 1
-            || u64::try_from(self.filtered_transactions.len()).unwrap_or(u64::MAX)
+            || self.filtered_transaction_message_count
                 != completion.writer.required_lane_census.transaction_messages
             || self.pump_owned_account_update_count
                 != completion.writer.required_lane_census.account_updates
@@ -4078,10 +4096,6 @@ impl PumpExactStateRawRecordCollectorV2 {
                 "V2 stream-readiness boundary does not bind its complete source prefix and reserved ordering marker"
             );
         }
-        reconcile_filtered_and_full_block_transactions(
-            &self.filtered_transactions,
-            &self.full_block_pump_transactions,
-        )?;
         if completion.source_readiness.as_ref() != Some(&boundary.source_readiness)
             || completion.cohort_slots_strictly_after != Some(boundary.cohort_slots_strictly_after)
             || !completion.readiness_boundary_persisted
@@ -4089,6 +4103,26 @@ impl PumpExactStateRawRecordCollectorV2 {
         {
             bail!("V2 raw readiness boundary differs from completion receipt");
         }
+        // Validate the entire accepted parent-linked chain before selecting
+        // its transaction scope.  Warm-up records at the readiness slot and
+        // a tail slot that has not yet reached a complete block-pair frontier
+        // remain immutable raw evidence, but neither can supply a rooted
+        // prospective mutation.  Comparing either against the opposite lane
+        // would falsely turn normal stream establishment/closure skew into a
+        // source-loss claim.
+        let (frontier_slot, _) =
+            self.reconciled_full_block_frontier(boundary.cohort_slots_strictly_after, slots)?;
+        let comparable_slots = self
+            .block_lanes_by_slot
+            .keys()
+            .copied()
+            .filter(|slot| *slot > boundary.cohort_slots_strictly_after && *slot <= frontier_slot)
+            .collect::<BTreeSet<_>>();
+        reconcile_filtered_and_full_block_transactions(
+            &self.filtered_transactions,
+            &self.full_block_pump_transactions,
+            &comparable_slots,
+        )?;
         let _ = self.source_availability_bounds(completion, slots)?;
         Ok(())
     }
@@ -4184,16 +4218,28 @@ impl PumpExactStateRawIndexBuilderV2 {
 fn reconcile_filtered_and_full_block_transactions(
     filtered: &BTreeMap<PumpExactStateTransactionKeyV2, [u8; 32]>,
     full_block: &BTreeMap<PumpExactStateTransactionKeyV2, [u8; 32]>,
+    comparable_slots: &BTreeSet<u64>,
 ) -> Result<()> {
-    if filtered.len() != full_block.len() || filtered != full_block {
-        bail!("V2 filtered Pump transaction lane differs from full-block Pump inventory");
+    let filtered_in_scope = filtered
+        .iter()
+        .filter(|(key, _)| comparable_slots.contains(&key.slot))
+        .collect::<Vec<_>>();
+    let full_block_in_scope = full_block
+        .iter()
+        .filter(|(key, _)| comparable_slots.contains(&key.slot))
+        .collect::<Vec<_>>();
+    if filtered_in_scope != full_block_in_scope {
+        bail!(
+            "V2 filtered actual-Pump invocation lane differs from full-block inventory within the reconciled prospective chain"
+        );
     }
     Ok(())
 }
 
 fn filtered_transaction_identity(
     transaction: &ghost_core::pump_research_exact_tape_v2::PumpExactStateTransactionEvidenceV2,
-) -> Result<(PumpExactStateTransactionKeyV2, [u8; 32])> {
+    expected_pump_program_id: [u8; 32],
+) -> Result<Option<(PumpExactStateTransactionKeyV2, [u8; 32])>> {
     let update = SubscribeUpdate::decode(transaction.source_payload.as_slice())
         .context("decode V2 filtered transaction SubscribeUpdate")?;
     let Some(UpdateOneof::Transaction(transaction_update)) = update.update_oneof else {
@@ -4208,14 +4254,32 @@ fn filtered_transaction_identity(
     {
         bail!("V2 filtered transaction record identity differs from retained protobuf");
     }
-    Ok((
+    if !transaction_matches_filtered_pump_transaction_contract_v2(&info, expected_pump_program_id)?
+    {
+        return Ok(None);
+    }
+    Ok(Some((
         PumpExactStateTransactionKeyV2 {
             slot: transaction.slot,
             tx_index: info.index,
             signature: transaction.signature.into_inner(),
         },
         *blake3::hash(&info.encode_to_vec()).as_bytes(),
-    ))
+    )))
+}
+
+/// The full-block inventory must use the same mutation predicate as the
+/// source request. `account_include` is deliberately broader than execution:
+/// it admits account references in static or loaded keys, while exact-state
+/// completeness is about actual Pump instruction occurrences. The request
+/// also excludes vote transactions, so votes cannot be manufactured into an
+/// apparent full-block-only mutation.
+fn transaction_matches_filtered_pump_transaction_contract_v2(
+    transaction_info: &SubscribeUpdateTransactionInfo,
+    expected_pump_program_id: [u8; 32],
+) -> Result<bool> {
+    Ok(!transaction_info.is_vote
+        && transaction_invokes_pump(transaction_info, expected_pump_program_id)?)
 }
 
 fn transaction_invokes_pump(
@@ -5713,9 +5777,61 @@ mod tests {
                 },
             ))
             .expect("filtered transaction");
+        assert_eq!(collector.filtered_transaction_message_count, 1);
         assert_eq!(
             collector.full_block_pump_transactions,
             collector.filtered_transactions
+        );
+    }
+
+    #[test]
+    fn account_include_only_filtered_record_keeps_lane_census_but_not_actual_pump_inventory() {
+        let mut account_reference_only = transaction_info(11, 6);
+        let message = account_reference_only
+            .transaction
+            .as_mut()
+            .and_then(|transaction| transaction.message.as_mut())
+            .expect("fixture transaction message");
+        // Yellowstone's `account_include` predicate legitimately admits this
+        // record because Pump occurs in the account key vector, even though
+        // the executed instruction targets a different program.
+        message.account_keys.push(vec![9; 32]);
+        message.instructions[0].program_id_index = 1;
+        let payload = SubscribeUpdate {
+            filters: vec!["pump-filtered-account-include".to_owned()],
+            update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                transaction: Some(account_reference_only),
+                slot: 43,
+            })),
+        }
+        .encode_to_vec();
+        let mut collector = PumpExactStateRawRecordCollectorV2 {
+            expected_pump_program_id: pump_key()
+                .try_into()
+                .expect("Pump pubkey must have 32 bytes"),
+            ..PumpExactStateRawRecordCollectorV2::default()
+        };
+        collector
+            .observe(&PumpExactStateRawRecordV2::PrimaryTransaction(
+                PumpExactStateTransactionEvidenceV2 {
+                    source: source(1, &payload),
+                    slot: 43,
+                    tx_index: Some(6),
+                    signature: PumpResearchStorageSignatureV1::from([11; 64]),
+                    event_time: PumpResearchEventTimeV1 {
+                        chain_event_ts_ms: None,
+                        ingress_wall_ts_ms: Some(1_000),
+                        ingress_monotonic_ts_ms: Some(1_000),
+                    },
+                    block_time: None,
+                    source_payload: payload,
+                },
+            ))
+            .expect("account-include source record is still valid raw evidence");
+        assert_eq!(collector.filtered_transaction_message_count, 1);
+        assert!(
+            collector.filtered_transactions.is_empty(),
+            "an account-only reference must not masquerade as an actual Pump mutation"
         );
     }
 
@@ -5765,6 +5881,19 @@ mod tests {
                 .expect("Pump pubkey must have 32 bytes"),
         )
         .expect("inner Pump program"));
+
+        let mut vote = transaction_info(10, 6);
+        vote.is_vote = true;
+        assert!(
+            !transaction_matches_filtered_pump_transaction_contract_v2(
+                &vote,
+                pump_key()
+                    .try_into()
+                    .expect("Pump pubkey must have 32 bytes"),
+            )
+            .expect("vote transaction predicate"),
+            "the source request has vote=false, so votes cannot enter the comparable inventory"
+        );
     }
 
     #[test]
@@ -5776,7 +5905,12 @@ mod tests {
         };
         let filtered = BTreeMap::from([(key.clone(), [1; 32])]);
         let full_block = BTreeMap::from([(key, [2; 32])]);
-        assert!(reconcile_filtered_and_full_block_transactions(&filtered, &full_block).is_err());
+        assert!(reconcile_filtered_and_full_block_transactions(
+            &filtered,
+            &full_block,
+            &BTreeSet::from([77]),
+        )
+        .is_err());
     }
 
     #[test]
@@ -5788,11 +5922,21 @@ mod tests {
         };
         let filtered = BTreeMap::from([(key.clone(), [1; 32])]);
         assert!(
-            reconcile_filtered_and_full_block_transactions(&filtered, &BTreeMap::new()).is_err(),
+            reconcile_filtered_and_full_block_transactions(
+                &filtered,
+                &BTreeMap::new(),
+                &BTreeSet::from([77]),
+            )
+            .is_err(),
             "a missing filtered Pump transaction must fail closed"
         );
         assert!(
-            reconcile_filtered_and_full_block_transactions(&BTreeMap::new(), &filtered).is_err(),
+            reconcile_filtered_and_full_block_transactions(
+                &BTreeMap::new(),
+                &filtered,
+                &BTreeSet::from([77]),
+            )
+            .is_err(),
             "an extra full-block Pump transaction must fail closed"
         );
         let signature_drift = BTreeMap::from([(
@@ -5803,7 +5947,12 @@ mod tests {
             [1; 32],
         )]);
         assert!(
-            reconcile_filtered_and_full_block_transactions(&filtered, &signature_drift).is_err(),
+            reconcile_filtered_and_full_block_transactions(
+                &filtered,
+                &signature_drift,
+                &BTreeSet::from([77]),
+            )
+            .is_err(),
             "signature drift must fail closed"
         );
         let tx_index_drift = BTreeMap::from([(
@@ -5811,8 +5960,47 @@ mod tests {
             [1; 32],
         )]);
         assert!(
-            reconcile_filtered_and_full_block_transactions(&filtered, &tx_index_drift).is_err(),
+            reconcile_filtered_and_full_block_transactions(
+                &filtered,
+                &tx_index_drift,
+                &BTreeSet::from([77]),
+            )
+            .is_err(),
             "transaction-index drift must fail closed"
+        );
+    }
+
+    #[test]
+    fn full_block_reconciliation_excludes_warmup_and_unreconciled_tail_only() {
+        let warmup = PumpExactStateTransactionKeyV2 {
+            slot: 100,
+            tx_index: 1,
+            signature: [1; 64],
+        };
+        let in_chain = PumpExactStateTransactionKeyV2 {
+            slot: 101,
+            tx_index: 2,
+            signature: [2; 64],
+        };
+        let tail = PumpExactStateTransactionKeyV2 {
+            slot: 102,
+            tx_index: 3,
+            signature: [3; 64],
+        };
+        let filtered = BTreeMap::from([(in_chain.clone(), [8; 32]), (tail.clone(), [9; 32])]);
+        let full_block = BTreeMap::from([(warmup, [7; 32]), (in_chain.clone(), [8; 32])]);
+        let scope = BTreeSet::from([101]);
+        reconcile_filtered_and_full_block_transactions(&filtered, &full_block, &scope)
+            .expect("only the post-readiness parent-linked block chain is comparable");
+
+        assert!(
+            reconcile_filtered_and_full_block_transactions(
+                &BTreeMap::from([(tail, [9; 32])]),
+                &full_block,
+                &scope,
+            )
+            .is_err(),
+            "an omitted in-chain Pump invocation must still fail closed"
         );
     }
 

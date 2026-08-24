@@ -3146,10 +3146,12 @@ fn build_subscribe_request_for_profile(
         SubscribeRequestFilterBlocksMeta {},
     );
 
-    // V2 keeps a second, unfiltered block evidence lane.  The standalone
-    // materializer later scans each captured block's full transaction list and
-    // compares every Pump invocation against the filtered transaction tap.
-    // This is deliberately not a provider-side Pump filter: a filter cannot
+    // V2 keeps a second, unfiltered block evidence lane. The standalone
+    // materializer later compares non-vote, actual Pump invocations from each
+    // parent-linked post-readiness block against the same invocation predicate
+    // on the transaction tap. `account_include` deliberately admits broader
+    // account-reference traffic, so it is not itself an invocation count.
+    // The full block is deliberately not provider-filtered: a filter cannot
     // prove that it did not omit an inner-CPI or loaded-address invocation.
     let mut block_filters = HashMap::new();
     if matches!(

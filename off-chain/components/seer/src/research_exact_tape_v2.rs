@@ -5231,6 +5231,7 @@ mod tests {
         WrongEventIxName,
         WrongEventQuoteMint,
         WrongEventCanonicalReserve,
+        WarmupAndUnreconciledTailInvocationSkew,
     }
 
     #[derive(Clone, Copy)]
@@ -5829,6 +5830,25 @@ mod tests {
         )
     }
 
+    fn fixture_account_include_only_transaction_v2(
+        mut transaction: SubscribeUpdateTransactionInfo,
+    ) -> SubscribeUpdateTransactionInfo {
+        let message = transaction
+            .transaction
+            .as_mut()
+            .and_then(|body| body.message.as_mut())
+            .expect("fixture account-include transaction has a message");
+        // Preserve Pump in the static account vector, which is sufficient for
+        // Yellowstone's account-include predicate, but target the only outer
+        // instruction at an unrelated program. This is source-lane evidence,
+        // not an actual Pump invocation.
+        let non_pump_program_index =
+            u32::try_from(message.account_keys.len()).expect("fixture account index fits u32");
+        message.account_keys.push(vec![0xa5; 32]);
+        message.instructions[0].program_id_index = non_pump_program_index;
+        transaction
+    }
+
     fn fixture_account_source_v2(
         bonding_curve: Pubkey,
         data: Vec<u8>,
@@ -6104,6 +6124,28 @@ mod tests {
             mint,
             user,
         );
+        let skew_warmup_and_tail_invocations = matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::WarmupAndUnreconciledTailInvocationSkew
+        );
+        let warmup_filtered_transaction = if skew_warmup_and_tail_invocations {
+            fixture_account_include_only_transaction_v2(pre_cohort_buy.clone())
+        } else {
+            pre_cohort_buy.clone()
+        };
+        let tail_filtered_transaction = skew_warmup_and_tail_invocations.then(|| {
+            fixture_exact_instruction_info_v2(
+                semantics,
+                "buy",
+                buy_discriminator,
+                fixture_buy_payload_v2(),
+                4,
+                0,
+                curve,
+                mint,
+                user,
+            )
+        });
         let create_token_program = fixture_parent_account_role_pubkey_v2(
             &create,
             semantics,
@@ -6175,7 +6217,7 @@ mod tests {
             .write_source(
                 4,
                 fixture_apply_time_variant_v2(
-                    fixture_transaction_source_v2(pre_cohort_buy, 102, 1_000),
+                    fixture_transaction_source_v2(warmup_filtered_transaction, 102, 1_000),
                     variant,
                     4,
                 ),
@@ -6396,6 +6438,21 @@ mod tests {
                 );
             }
         }
+        if let Some(tail_filtered_transaction) = tail_filtered_transaction {
+            // This source message arrived after the last complete block pair.
+            // It remains raw evidence but cannot become a rooted capability
+            // mutation until a later capture has a parent-linked block proof.
+            write_fixture_source!(
+                fixture_transaction_source_v2(
+                    tail_filtered_transaction,
+                    forward_slot
+                        .checked_add(1)
+                        .expect("fixture tail slot overflow"),
+                    241_001,
+                ),
+                "write fixture unreconciled tail Pump transaction"
+            );
+        }
         if fixture_projection_corruption_for_variant_v2(variant).is_some() {
             assert!(
                 projection_corruption_applied,
@@ -6410,7 +6467,13 @@ mod tests {
             .checked_sub(1)
             .expect("fixture boundary ordering marker must be reserved");
         let mut required_lane_census = writer.full_block_census(true);
-        required_lane_census.transaction_messages = if omit_whole_buy_block { 2 } else { 3 };
+        required_lane_census.transaction_messages = if omit_whole_buy_block {
+            2
+        } else if skew_warmup_and_tail_invocations {
+            4
+        } else {
+            3
+        };
         required_lane_census.account_updates = if omit_whole_buy_block || omit_buy_final_anchor {
             2
         } else {
@@ -6912,6 +6975,42 @@ mod tests {
         );
         assert!(!unscoped_windows.exists());
         assert!(!temporary.path().join(".unscoped-windows.partial").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_prxtape3_reconciles_only_actual_pump_invocations_inside_the_complete_cohort_chain() {
+        let temporary = tempdir().expect("temporary V2 reconciliation-scope fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for reconciliation-scope fixture");
+        let raw_dir = temporary.path().join("reconciliation-scope-raw-v2");
+        let exact_dir = temporary.path().join("reconciliation-scope-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "reconciliation-scope-public-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::WarmupAndUnreconciledTailInvocationSkew,
+        );
+
+        let summary = qualify_prospective_exact_state_raw_run_v2(
+            &raw_dir,
+            &semantics_path,
+            &exact_dir,
+        )
+        .expect(
+            "warm-up/full-only and trailing/filtered-only evidence outside the complete chain must not falsify in-chain reconciliation",
+        );
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+        assert_eq!(summary.successful_rooted_mutation_denominator, 2);
+        assert!(exact_dir.join("exact_state_capability_v2.json").is_file());
+        assert!(
+            !temporary
+                .path()
+                .join(".reconciliation-scope-exact-v2.partial")
+                .exists(),
+            "public qualifier must not leave a partial exact artifact"
+        );
     }
 
     #[cfg(unix)]
