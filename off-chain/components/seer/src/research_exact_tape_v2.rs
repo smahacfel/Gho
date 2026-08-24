@@ -47,6 +47,7 @@ use prost::Message;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use solana_account_decoder::UiAccountEncoding;
 use solana_client::rpc_config::RpcAccountInfoConfig;
 use solana_sdk::{
     bpf_loader_upgradeable::{self, UpgradeableLoaderState},
@@ -1713,6 +1714,10 @@ async fn observe_program_data_receipt_v2(
         .map_err(anyhow::Error::msg)?,
     };
     let account_config = RpcAccountInfoConfig {
+        // ProgramData is larger than the JSON-RPC Base58 account-data limit.
+        // Use one explicit binary encoding for both of the only permitted
+        // ProgramData authority reads rather than relying on client defaults.
+        encoding: Some(UiAccountEncoding::Base64),
         commitment: Some(CommitmentConfig::finalized()),
         ..RpcAccountInfoConfig::default()
     };
@@ -8098,7 +8103,8 @@ bootstrap_queue_capacity = 1
     }
 
     #[tokio::test]
-    async fn v3_program_data_receipt_rpc_reads_only_program_and_programdata_accounts() {
+    async fn v3_program_data_receipt_rpc_uses_base64_and_reads_only_program_and_programdata_accounts(
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local ProgramData RPC mock");
@@ -8122,6 +8128,7 @@ bootstrap_queue_capacity = 1
         let server = tokio::spawn(async move {
             let mut observed_methods = Vec::new();
             let mut observed_accounts = Vec::new();
+            let mut observed_encodings = Vec::new();
             for (expected_account, account_data) in [
                 (pump_program, program_account_data),
                 (program_data, program_data_account_data),
@@ -8140,6 +8147,15 @@ bootstrap_queue_capacity = 1
                         .expect("getAccountInfo account parameter")
                         .to_owned(),
                 );
+                observed_encodings.push(
+                    request["params"]
+                        .as_array()
+                        .and_then(|params| params.get(1))
+                        .and_then(|config| config.get("encoding"))
+                        .and_then(serde_json::Value::as_str)
+                        .expect("ProgramData RPC request must use explicit Base64 encoding")
+                        .to_owned(),
+                );
                 assert_eq!(
                     observed_accounts.last(),
                     Some(&expected_account.to_string()),
@@ -8148,18 +8164,19 @@ bootstrap_queue_capacity = 1
                 write_v2_mock_rpc_response(&mut socket, request["id"].clone(), 900, &account_data)
                     .await;
             }
-            (observed_methods, observed_accounts)
+            (observed_methods, observed_accounts, observed_encodings)
         });
 
         let receipt = observe_program_data_receipt_v2(&endpoint, None, "x-test", pump_program)
             .await
             .expect("ProgramData receipt from local mock");
-        let (methods, accounts) = server.await.expect("ProgramData RPC mock task");
+        let (methods, accounts, encodings) = server.await.expect("ProgramData RPC mock task");
         assert_eq!(methods, vec!["getAccountInfo", "getAccountInfo"]);
         assert_eq!(
             accounts,
             vec![pump_program.to_string(), program_data.to_string()]
         );
+        assert_eq!(encodings, vec!["base64", "base64"]);
         assert_eq!(
             receipt.pump_programdata_pubkey.into_inner(),
             program_data.to_bytes()

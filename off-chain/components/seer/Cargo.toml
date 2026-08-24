@@ -14,6 +14,7 @@ async-stream = "0.3"
 
 # Solana SDK
 solana-sdk = "1.18"
+solana-account-decoder = "1.18"
 solana-client = "1.18"
 solana-rpc-client = "1.18"
 solana-geyser-plugin-interface = "1.18"

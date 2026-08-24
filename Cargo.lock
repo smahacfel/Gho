@@ -4992,6 +4992,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
+ "solana-account-decoder",
  "solana-client",
  "solana-geyser-plugin-interface",
  "solana-rpc-client",
