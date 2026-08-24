@@ -4949,7 +4949,8 @@ mod tests {
     use crate::research_exact_tape_v2_materializer::{
         export_prospective_exact_state_outcome_blind_windows_v2,
         qualify_prospective_exact_state_raw_run_v2,
-        validate_prospective_exact_state_strategy_input_v2, PumpExactStateCapabilityStatusV2,
+        validate_prospective_exact_state_strategy_input_v2, PumpExactStateCapabilityBlockerV2,
+        PumpExactStateCapabilityStatusV2,
     };
     use base64::{engine::general_purpose, Engine as _};
     use std::fs;
@@ -5235,6 +5236,11 @@ mod tests {
         ProvisionalFinalityTail,
         QualifiedWithBuyRemainingAccount,
         QualifiedWithMessageWritableEventAuthority,
+        QualifiedWithPostBoundaryLegacyCurveTrade,
+        QualifiedWithRepeatedPostBoundaryLegacyCurveCreate,
+        PostBoundaryCurveWithoutProvenBirth,
+        PreExistingCurveTradeWithUnknownPumpOccurrence,
+        GlobalDependencyMutation,
     }
 
     #[derive(Clone, Copy)]
@@ -5549,6 +5555,21 @@ mod tests {
                 program_id_index = Some(u32::from(index));
             }
         }
+        // Some global-dependency instructions legitimately do not declare the
+        // Pump program in their account vector.  The compiled instruction
+        // still needs a program-id message index, so retain it as a separate
+        // readonly key rather than inventing an instruction account role.
+        let program_id_index = program_id_index.unwrap_or_else(|| {
+            let index = u8::try_from(ordered.len()).expect("fixture Pump program index fits u8");
+            ordered.push(DeclaredAccount {
+                original_position: usize::MAX,
+                pubkey: pump_program,
+                signer: false,
+                writable: false,
+                name: "program".to_owned(),
+            });
+            u32::from(index)
+        });
         if include_remaining_account {
             // Pump documents variant-specific `remaining_accounts`. It is an
             // unsigned readonly message key deliberately appended after the
@@ -5575,7 +5596,7 @@ mod tests {
                 .collect(),
             recent_blockhash: Vec::new(),
             instructions: vec![CompiledInstruction {
-                program_id_index: program_id_index.expect("fixture Pump program account"),
+                program_id_index,
                 accounts: instruction_account_indices,
                 data: instruction_data,
             }],
@@ -5890,6 +5911,29 @@ mod tests {
         });
     }
 
+    fn fixture_append_unknown_pump_instruction_v2(
+        transaction: &mut SubscribeUpdateTransactionInfo,
+    ) {
+        let transaction_body = transaction
+            .transaction
+            .as_mut()
+            .expect("fixture unknown Pump instruction has transaction body");
+        let message = transaction_body
+            .message
+            .as_mut()
+            .expect("fixture unknown Pump instruction has message");
+        let program_id_index = message
+            .instructions
+            .first()
+            .expect("fixture unknown Pump instruction has an existing Pump instruction")
+            .program_id_index;
+        message.instructions.push(CompiledInstruction {
+            program_id_index,
+            accounts: Vec::new(),
+            data: vec![0xff; 8],
+        });
+    }
+
     fn fixture_transaction_source_v2(
         transaction: SubscribeUpdateTransactionInfo,
         slot: u64,
@@ -6155,8 +6199,15 @@ mod tests {
         fs::set_permissions(raw_dir, fs::Permissions::from_mode(0o700))
             .expect("make local raw fixture authority-private");
 
+        // The warm-up evidence is deliberately a different, already-live
+        // curve.  It remains in raw/coverage as pre-boundary evidence while
+        // the Create below can prove a genuinely prospective birth.
+        let legacy_curve = Pubkey::new_from_array([60; 32]);
+        let legacy_mint = Pubkey::new_from_array([59; 32]);
         let curve = Pubkey::new_from_array([61; 32]);
         let mint = Pubkey::new_from_array([62; 32]);
+        let unproven_curve = Pubkey::new_from_array([65; 32]);
+        let unproven_mint = Pubkey::new_from_array([66; 32]);
         let user = Pubkey::new_from_array([63; 32]);
         let creator = Pubkey::new_from_array([64; 32]);
         let quote_mint = Pubkey::default();
@@ -6179,8 +6230,8 @@ mod tests {
             fixture_buy_payload_v2(),
             1,
             0,
-            curve,
-            mint,
+            legacy_curve,
+            legacy_mint,
             user,
             false,
         );
@@ -6208,6 +6259,104 @@ mod tests {
             user,
             buy_has_remaining_account,
         );
+        let mut post_boundary_legacy_curve_trade = matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::QualifiedWithPostBoundaryLegacyCurveTrade
+                | QualifiedExportFixtureVariantV2::PreExistingCurveTradeWithUnknownPumpOccurrence
+        )
+        .then(|| {
+            fixture_exact_instruction_info_v2(
+                semantics,
+                "buy",
+                buy_discriminator,
+                fixture_buy_payload_v2(),
+                4,
+                1,
+                legacy_curve,
+                legacy_mint,
+                user,
+                false,
+            )
+        });
+        if matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::PreExistingCurveTradeWithUnknownPumpOccurrence
+        ) {
+            fixture_append_unknown_pump_instruction_v2(
+                post_boundary_legacy_curve_trade
+                    .as_mut()
+                    .expect("fixture unknown occurrence has retained legacy trade"),
+            );
+        }
+        let post_boundary_legacy_curve_creates = if matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::QualifiedWithRepeatedPostBoundaryLegacyCurveCreate
+        ) {
+            vec![
+                fixture_exact_instruction_info_v2(
+                    semantics,
+                    "create",
+                    create_discriminator,
+                    fixture_create_payload_v2(creator),
+                    4,
+                    1,
+                    legacy_curve,
+                    legacy_mint,
+                    user,
+                    false,
+                ),
+                fixture_exact_instruction_info_v2(
+                    semantics,
+                    "create",
+                    create_discriminator,
+                    fixture_create_payload_v2(creator),
+                    5,
+                    2,
+                    legacy_curve,
+                    legacy_mint,
+                    user,
+                    false,
+                ),
+            ]
+        } else {
+            Vec::new()
+        };
+        let post_boundary_curve_without_proven_birth = matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::PostBoundaryCurveWithoutProvenBirth
+        )
+        .then(|| {
+            fixture_exact_instruction_info_v2(
+                semantics,
+                "buy",
+                buy_discriminator,
+                fixture_buy_payload_v2(),
+                4,
+                1,
+                unproven_curve,
+                unproven_mint,
+                user,
+                false,
+            )
+        });
+        let global_dependency_mutation = matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::GlobalDependencyMutation
+        )
+        .then(|| {
+            fixture_exact_instruction_info_v2(
+                semantics,
+                "initialize",
+                [175, 175, 109, 31, 13, 152, 155, 237],
+                Vec::new(),
+                4,
+                1,
+                curve,
+                mint,
+                user,
+                false,
+            )
+        });
         let skew_warmup_and_tail_invocations = matches!(
             variant,
             QualifiedExportFixtureVariantV2::WarmupAndUnreconciledTailInvocationSkew
@@ -6271,6 +6420,22 @@ mod tests {
             fixture_trade_event_payload_v2(mint, user, quote_mint, 800, 700, event_corruption),
             message_event_authority_writable,
         );
+        // The full block must retain the exact post-CPI transaction bytes
+        // that the filtered lane retains.  Build this vector only after the
+        // fixture attaches the real Event-CPI evidence to `buy`.
+        let mut buy_full_block_transactions = vec![buy.clone()];
+        if let Some(legacy_trade) = &post_boundary_legacy_curve_trade {
+            buy_full_block_transactions.push(legacy_trade.clone());
+        }
+        buy_full_block_transactions.extend(post_boundary_legacy_curve_creates.iter().cloned());
+        if let Some(unproven_curve_trade) = &post_boundary_curve_without_proven_birth {
+            buy_full_block_transactions.push(unproven_curve_trade.clone());
+        }
+        if let Some(global_dependency) = &global_dependency_mutation {
+            buy_full_block_transactions.push(global_dependency.clone());
+        }
+        let buy_full_block_transaction_count = u64::try_from(buy_full_block_transactions.len())
+            .expect("fixture Buy full-block transaction count fits u64");
 
         writer
             .write_source(
@@ -6302,7 +6467,7 @@ mod tests {
             .write_source(
                 3,
                 fixture_apply_time_variant_v2(
-                    fixture_account_source_v2(curve, pre_state, 102, 1, None, 1_000),
+                    fixture_account_source_v2(legacy_curve, pre_state, 102, 1, None, 1_000),
                     variant,
                     3,
                 ),
@@ -6413,6 +6578,30 @@ mod tests {
                 fixture_transaction_source_v2(buy.clone(), buy_slot, 150_999),
                 "write fixture Buy transaction"
             );
+            if let Some(legacy_trade) = &post_boundary_legacy_curve_trade {
+                write_fixture_source!(
+                    fixture_transaction_source_v2(legacy_trade.clone(), buy_slot, 150_999),
+                    "write fixture post-boundary legacy-curve Buy transaction"
+                );
+            }
+            for legacy_create in &post_boundary_legacy_curve_creates {
+                write_fixture_source!(
+                    fixture_transaction_source_v2(legacy_create.clone(), buy_slot, 150_999),
+                    "write fixture repeated post-boundary legacy-curve Create transaction"
+                );
+            }
+            if let Some(unproven_curve_trade) = &post_boundary_curve_without_proven_birth {
+                write_fixture_source!(
+                    fixture_transaction_source_v2(unproven_curve_trade.clone(), buy_slot, 150_999),
+                    "write fixture post-boundary curve without proven birth transaction"
+                );
+            }
+            if let Some(global_dependency) = &global_dependency_mutation {
+                write_fixture_source!(
+                    fixture_transaction_source_v2(global_dependency.clone(), buy_slot, 150_999),
+                    "write fixture global-dependency mutation transaction"
+                );
+            }
             if !omit_buy_final_anchor {
                 write_fixture_source!(
                     fixture_account_source_v2(curve, buy_state, buy_slot, 3, Some(3), 150_999,),
@@ -6454,11 +6643,21 @@ mod tests {
                 "write fixture Buy finalized Slot evidence"
             );
             write_fixture_source!(
-                fixture_block_meta_source_v2(buy_slot, buy_parent_slot, 150_999),
+                fixture_block_meta_source_with_transaction_count_v2(
+                    buy_slot,
+                    buy_parent_slot,
+                    buy_full_block_transaction_count,
+                    150_999,
+                ),
                 "write fixture Buy BlockMeta evidence"
             );
             write_fixture_source!(
-                fixture_full_block_source_v2(buy_slot, buy_parent_slot, buy, 150_999),
+                fixture_full_block_source_with_transactions_v2(
+                    buy_slot,
+                    buy_parent_slot,
+                    buy_full_block_transactions,
+                    150_999,
+                ),
                 "write fixture Buy full block"
             );
         }
@@ -6593,12 +6792,27 @@ mod tests {
             .checked_sub(1)
             .expect("fixture boundary ordering marker must be reserved");
         let mut required_lane_census = writer.full_block_census(true);
+        let optional_post_boundary_transaction_count =
+            u64::from(post_boundary_legacy_curve_trade.is_some())
+                .checked_add(
+                    u64::try_from(post_boundary_legacy_curve_creates.len())
+                        .expect("fixture legacy Create count fits u64"),
+                )
+                .and_then(|count| {
+                    count.checked_add(u64::from(global_dependency_mutation.is_some()))
+                })
+                .and_then(|count| {
+                    count.checked_add(u64::from(
+                        post_boundary_curve_without_proven_birth.is_some(),
+                    ))
+                })
+                .expect("fixture optional transaction count does not overflow");
         required_lane_census.transaction_messages = if omit_whole_buy_block {
             2
         } else if skew_warmup_and_tail_invocations {
             4
         } else {
-            3
+            3 + optional_post_boundary_transaction_count
         };
         required_lane_census.account_updates = if omit_whole_buy_block || omit_buy_final_anchor {
             2
@@ -6895,10 +7109,14 @@ mod tests {
             .first_mut()
             .expect("fixture coverage has a pre-cohort row");
         pre_cohort["candidate_count"] = serde_json::json!(1u32);
+        pre_cohort["cohort_candidate_count"] = serde_json::json!(0u32);
+        pre_cohort["exact_candidate_count"] = serde_json::json!(0u32);
         pre_cohort["candidates"] = serde_json::json!([{
             "bonding_curve": null,
             "mint": null,
             "effect": "known_reserve_or_dependency_unsupported",
+            "qualification_scope": "unscoped_curve_mutation_blocker",
+            "counted_in_qualification_denominator": false,
             "exact": false,
             "non_exact_reason": "fixture_unscoped_candidate"
         }]);
@@ -6919,6 +7137,10 @@ mod tests {
             &fs::read(&receipt_path).expect("read cloned capability receipt"),
         )
         .expect("parse cloned capability receipt");
+        receipt["successful_rooted_out_of_scope_pre_boundary_candidate_count"] =
+            serde_json::json!(0u64);
+        receipt["successful_rooted_unscoped_curve_mutation_candidate_count"] =
+            serde_json::json!(1u64);
         receipt["coverage_artifact"] = coverage_digest.clone();
         rewrite_private_fixture_json_v2(&receipt_path, &receipt);
         let receipt_digest = fixture_exact_artifact_digest_json_v2(&receipt_path);
@@ -6927,6 +7149,80 @@ mod tests {
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(&manifest_path).expect("read cloned exact manifest"))
                 .expect("parse cloned exact manifest");
+        manifest["coverage_artifact"] = coverage_digest;
+        manifest["exact_state_capability_artifact"] = receipt_digest;
+        rewrite_private_fixture_json_v2(&manifest_path, &manifest);
+    }
+
+    #[cfg(unix)]
+    fn clone_and_relabel_preboundary_candidate_as_preexisting_fixture_v2(
+        source_dir: &Path,
+        target_dir: &Path,
+    ) {
+        fs::create_dir(target_dir).expect("create relabelled exact fixture directory");
+        fs::set_permissions(target_dir, fs::Permissions::from_mode(0o700))
+            .expect("make relabelled exact fixture directory private");
+        for filename in [
+            "births_v2.jsonl",
+            "trajectories_v2.jsonl",
+            "coverage_v2.jsonl",
+            "exact_state_capability_v2.json",
+            "manifest_v2.json",
+        ] {
+            let target = target_dir.join(filename);
+            fs::copy(source_dir.join(filename), &target)
+                .expect("clone relabelled exact fixture artifact");
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+                .expect("make relabelled exact fixture artifact private");
+        }
+
+        let coverage_path = target_dir.join("coverage_v2.jsonl");
+        let mut coverage_rows = fs::read_to_string(&coverage_path)
+            .expect("read relabelled coverage JSONL")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .expect("parse relabelled coverage row")
+            })
+            .collect::<Vec<_>>();
+        let preboundary_candidate = coverage_rows
+            .first_mut()
+            .and_then(|row| row.get_mut("candidates"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|candidates| candidates.first_mut())
+            .expect("fixture coverage has a retained pre-boundary candidate");
+        preboundary_candidate["qualification_scope"] =
+            serde_json::json!("pre_existing_curve_out_of_scope");
+        let mut coverage_bytes = Vec::new();
+        for row in &coverage_rows {
+            coverage_bytes.extend_from_slice(
+                &serde_json::to_vec(row).expect("serialize relabelled coverage row"),
+            );
+            coverage_bytes.push(b'\n');
+        }
+        fs::write(&coverage_path, coverage_bytes).expect("rewrite relabelled coverage JSONL");
+        fs::set_permissions(&coverage_path, fs::Permissions::from_mode(0o600))
+            .expect("restore relabelled coverage private mode");
+        let coverage_digest = fixture_exact_artifact_digest_json_v2(&coverage_path);
+
+        let receipt_path = target_dir.join("exact_state_capability_v2.json");
+        let mut receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(&receipt_path).expect("read relabelled capability receipt"),
+        )
+        .expect("parse relabelled capability receipt");
+        receipt["successful_rooted_out_of_scope_pre_boundary_candidate_count"] =
+            serde_json::json!(0u64);
+        receipt["successful_rooted_out_of_scope_pre_existing_curve_candidate_count"] =
+            serde_json::json!(1u64);
+        receipt["coverage_artifact"] = coverage_digest.clone();
+        rewrite_private_fixture_json_v2(&receipt_path, &receipt);
+        let receipt_digest = fixture_exact_artifact_digest_json_v2(&receipt_path);
+
+        let manifest_path = target_dir.join("manifest_v2.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(&manifest_path).expect("read relabelled exact manifest"),
+        )
+        .expect("parse relabelled exact manifest");
         manifest["coverage_artifact"] = coverage_digest;
         manifest["exact_state_capability_artifact"] = receipt_digest;
         rewrite_private_fixture_json_v2(&manifest_path, &manifest);
@@ -6993,6 +7289,26 @@ mod tests {
             qualified_receipt["successful_rooted_validated_event_transport_count"],
             serde_json::json!(2u64),
             "the public fixture must prove both real inner CreateEvent and TradeEvent transports"
+        );
+        assert_eq!(
+            qualified_receipt["qualification_scope"],
+            serde_json::json!("prospective_birth_cohort_v1"),
+            "the exact artifact must bind the prospective-birth denominator contract"
+        );
+        assert_eq!(
+            qualified_receipt["successful_rooted_candidate_count"],
+            serde_json::json!(3u64),
+            "warm-up evidence remains in the global rooted occurrence ledger"
+        );
+        assert_eq!(
+            qualified_receipt["successful_rooted_out_of_scope_pre_boundary_candidate_count"],
+            serde_json::json!(1u64),
+            "the retained warm-up curve mutation is typed out of the prospective cohort"
+        );
+        assert_eq!(
+            qualified_receipt["successful_rooted_mutation_denominator"],
+            serde_json::json!(2u64),
+            "only the post-boundary Create and Buy of the newly born curve enter the denominator"
         );
         assert_eq!(
             qualified_receipt["exact_birth_count"],
@@ -7103,6 +7419,314 @@ mod tests {
         );
         assert!(!unscoped_windows.exists());
         assert!(!temporary.path().join(".unscoped-windows.partial").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_prxtape3_strategy_authority_rebuilds_raw_candidate_scope() {
+        let temporary = tempdir().expect("temporary V2 raw-scope-binding fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for raw-scope-binding fixture");
+        let raw_dir = temporary.path().join("raw-scope-binding-raw-v2");
+        let exact_dir = temporary.path().join("raw-scope-binding-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "raw-scope-binding-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::Qualified,
+        );
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect("baseline raw-scope-binding fixture must qualify");
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+
+        // Keep receipt, manifest, coverage digests and all receipt-wide
+        // counters self-consistent, but relabel the immutable warm-up
+        // candidate from pre-boundary to pre-existing. Only a raw-derived
+        // per-candidate scope reconstruction can reject this substitution.
+        let relabelled_exact = temporary.path().join("relabelled-exact");
+        clone_and_relabel_preboundary_candidate_as_preexisting_fixture_v2(
+            &exact_dir,
+            &relabelled_exact,
+        );
+        let error = match validate_prospective_exact_state_strategy_input_v2(
+            &raw_dir,
+            &semantics_path,
+            &relabelled_exact,
+        ) {
+            Ok(_) => panic!("strategy authority must bind each candidate scope to immutable raw"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}")
+                .contains("coverage candidate scope differs from immutable raw authority"),
+            "relabelled coverage must fail raw scope binding: {error:#}"
+        );
+        let windows = temporary.path().join("relabelled-windows");
+        assert!(
+            export_prospective_exact_state_outcome_blind_windows_v2(
+                &raw_dir,
+                &semantics_path,
+                &relabelled_exact,
+                &windows,
+            )
+            .is_err(),
+            "a scope-relabelled exact artifact must not publish windows"
+        );
+        assert!(!windows.exists());
+        assert!(
+            !temporary
+                .path()
+                .join(".relabelled-windows.partial")
+                .exists(),
+            "scope binding must fail before output publication"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_prxtape3_post_boundary_preexisting_curve_mutation_is_typed_out_of_scope() {
+        let temporary = tempdir().expect("temporary V2 prospective-birth fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for prospective-birth fixture");
+        let raw_dir = temporary.path().join("legacy-curve-raw-v2");
+        let exact_dir = temporary.path().join("legacy-curve-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "post-boundary-legacy-curve-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::QualifiedWithPostBoundaryLegacyCurveTrade,
+        );
+
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect("typed pre-existing curve evidence must remain offline-qualifiable");
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+        assert_eq!(summary.successful_rooted_mutation_denominator, 2);
+        assert_eq!(summary.exact_rooted_mutation_count, 2);
+
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(exact_dir.join("exact_state_capability_v2.json"))
+                .expect("read prospective-birth receipt"),
+        )
+        .expect("parse prospective-birth receipt");
+        assert_eq!(
+            receipt["successful_rooted_candidate_count"],
+            serde_json::json!(4u64)
+        );
+        assert_eq!(
+            receipt["successful_rooted_out_of_scope_pre_boundary_candidate_count"],
+            serde_json::json!(1u64)
+        );
+        assert_eq!(
+            receipt["successful_rooted_out_of_scope_pre_existing_curve_candidate_count"],
+            serde_json::json!(1u64),
+            "a rooted post-boundary trade on the warm-up curve must stay visible but outside the birth cohort"
+        );
+        assert_eq!(
+            receipt["candidate_scope_reconciled"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            receipt["successful_rooted_mutation_denominator"],
+            serde_json::json!(2u64),
+            "retained old-curve activity may not inflate or shrink the prospective-birth denominator"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_prxtape3_repeated_create_on_preexisting_curve_is_typed_out_of_scope() {
+        let temporary = tempdir().expect("temporary V2 repeated legacy-Create fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for repeated legacy-Create fixture");
+        let raw_dir = temporary.path().join("repeated-legacy-create-raw-v2");
+        let exact_dir = temporary.path().join("repeated-legacy-create-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "repeated-post-boundary-legacy-create-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::QualifiedWithRepeatedPostBoundaryLegacyCurveCreate,
+        );
+
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect("repeated Create on a retained old curve must remain offline-qualifiable");
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+        assert_eq!(summary.successful_rooted_mutation_denominator, 2);
+        assert_eq!(summary.exact_rooted_mutation_count, 2);
+
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(exact_dir.join("exact_state_capability_v2.json"))
+                .expect("read repeated legacy-Create receipt"),
+        )
+        .expect("parse repeated legacy-Create receipt");
+        assert_eq!(
+            receipt["successful_rooted_candidate_count"],
+            serde_json::json!(5u64),
+            "the two retained post-boundary Create occurrences must remain globally visible"
+        );
+        assert_eq!(
+            receipt["successful_rooted_out_of_scope_pre_boundary_candidate_count"],
+            serde_json::json!(1u64)
+        );
+        assert_eq!(
+            receipt["successful_rooted_out_of_scope_pre_existing_curve_candidate_count"],
+            serde_json::json!(2u64),
+            "a repeated Create of a curve proven old before boundary is not a prospective-birth conflict"
+        );
+        assert_eq!(
+            receipt["conflicting_prospective_birth_curve_count"],
+            serde_json::json!(0u64)
+        );
+        assert_eq!(
+            receipt["candidate_scope_reconciled"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_prxtape3_post_boundary_curve_without_proven_birth_blocks_qualification() {
+        let temporary = tempdir().expect("temporary V2 unproven-birth fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for unproven-birth fixture");
+        let raw_dir = temporary.path().join("unproven-birth-curve-raw-v2");
+        let exact_dir = temporary.path().join("unproven-birth-curve-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "post-boundary-curve-without-proven-birth-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::PostBoundaryCurveWithoutProvenBirth,
+        );
+
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect("unproven post-boundary curve must yield a typed Blocked receipt");
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Blocked);
+        assert!(
+            summary
+                .blockers
+                .contains(&PumpExactStateCapabilityBlockerV2::UnprovenPostBoundaryCurveMutationObserved),
+            "a curve without retained pre-boundary evidence or an observed Create cannot be relabelled pre-existing"
+        );
+
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(exact_dir.join("exact_state_capability_v2.json"))
+                .expect("read unproven-birth receipt"),
+        )
+        .expect("parse unproven-birth receipt");
+        assert_eq!(
+            receipt["successful_rooted_unproven_post_boundary_curve_candidate_count"],
+            serde_json::json!(1u64)
+        );
+        assert_eq!(
+            receipt["successful_rooted_mutation_denominator"],
+            serde_json::json!(2u64),
+            "the unproven curve may not be silently scoped out or used to change the eligible birth-cohort denominator"
+        );
+        assert!(
+            !temporary
+                .path()
+                .join(".unproven-birth-curve-exact-v2.partial")
+                .exists(),
+            "the typed Blocked receipt must be atomically published without a partial output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_prxtape3_unknown_pump_occurrence_cannot_hide_beside_preexisting_curve() {
+        let temporary = tempdir().expect("temporary V2 unknown-old-curve fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for unknown-old-curve fixture");
+        let raw_dir = temporary.path().join("unknown-old-curve-raw-v2");
+        let exact_dir = temporary.path().join("unknown-old-curve-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "unknown-occurrence-beside-legacy-curve-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::PreExistingCurveTradeWithUnknownPumpOccurrence,
+        );
+
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect("unknown Pump occurrence must produce a typed Blocked receipt");
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Blocked);
+        assert!(
+            summary
+                .blockers
+                .contains(&PumpExactStateCapabilityBlockerV2::MutationInventoryIncomplete),
+            "an unknown Pump occurrence must remain a global authority blocker"
+        );
+
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(exact_dir.join("exact_state_capability_v2.json"))
+                .expect("read unknown-old-curve receipt"),
+        )
+        .expect("parse unknown-old-curve receipt");
+        assert_eq!(
+            receipt["successful_rooted_out_of_scope_pre_existing_curve_candidate_count"],
+            serde_json::json!(1u64),
+            "the known legacy trade remains typed out-of-scope"
+        );
+        assert_eq!(
+            receipt["successful_rooted_unknown_occurrence_count"],
+            serde_json::json!(1u64),
+            "the appended unknown Pump instruction remains in global occurrence conservation"
+        );
+        assert_eq!(
+            receipt["successful_rooted_scope_incomplete_occurrence_count"],
+            serde_json::json!(1u64),
+            "a known old curve cannot lend its scope to an unknown adjacent Pump occurrence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_prxtape3_global_dependency_remains_a_qualification_blocker() {
+        let temporary = tempdir().expect("temporary V2 global-dependency fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for global-dependency fixture");
+        let raw_dir = temporary.path().join("global-dependency-raw-v2");
+        let exact_dir = temporary.path().join("global-dependency-exact-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "global-dependency-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::GlobalDependencyMutation,
+        );
+
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect("global dependency must yield a typed Blocked receipt, not raw failure");
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Blocked);
+        assert!(
+            summary
+                .blockers
+                .contains(&PumpExactStateCapabilityBlockerV2::GlobalDependencyMutationObserved),
+            "a retained rooted global dependency cannot be scoped out with an old curve"
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(exact_dir.join("exact_state_capability_v2.json"))
+                .expect("read global-dependency receipt"),
+        )
+        .expect("parse global-dependency receipt");
+        assert_eq!(
+            receipt["successful_rooted_global_dependency_candidate_count"],
+            serde_json::json!(1u64)
+        );
+        assert!(receipt["blockers"]
+            .as_array()
+            .expect("typed blocker list")
+            .iter()
+            .any(|blocker| blocker == "global_dependency_mutation_observed"));
     }
 
     #[cfg(unix)]
@@ -8028,6 +8652,16 @@ mod tests {
                     .as_u64()
                     .is_some_and(|count| count >= 1),
                 "Event-CPI {label} must become an explicit Unknown occurrence: {receipt}"
+            );
+            assert_eq!(
+                receipt["successful_rooted_mutation_denominator"],
+                serde_json::json!(2u64),
+                "Event-CPI {label} may make the prospective birth non-exact, but may not remove its Create/Buy curve from the denominator"
+            );
+            assert_eq!(
+                receipt["candidate_scope_reconciled"],
+                serde_json::json!(true),
+                "Event-CPI {label} must remain in the typed global/cohort conservation partition"
             );
             assert!(
                 receipt["blockers"]

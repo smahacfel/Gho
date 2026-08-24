@@ -58,10 +58,14 @@ const V2_RAW_CONTROL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const V2_WINDOW_EXPORT_MAX_BIRTHS: usize = 1_000_000;
 const V2_WINDOW_EXPORT_MAX_RELEVANT_COVERAGE_EVENTS: usize = 8_000_000;
 const V2_WINDOW_EXPORT_MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
-// No V2 raw or Qualified artifact has been admitted.  These prospective
-// revisions make monotonic ingress time the duration/cutoff authority and
-// bind the forward boundary to a reconciled BlockMeta + full-block frontier.
-const PUMP_EXACT_STATE_WINDOW_EXPORT_SCHEMA_VERSION_V2: u16 = 3;
+// These prospective revisions make monotonic ingress time the duration/cutoff
+// authority and bind the forward boundary to a reconciled BlockMeta +
+// full-block frontier. PRXTAPE3 itself remains immutable. This revision
+// changes only the offline capability universe: the raw source ledger stays
+// global, while strategy authority is limited to curves whose first rooted
+// successful mutation is a structurally recognized Create/CreateV2 after the
+// persisted readiness boundary.
+const PUMP_EXACT_STATE_WINDOW_EXPORT_SCHEMA_VERSION_V2: u16 = 4;
 const PUMP_EXACT_STATE_WINDOW_OBSERVATION_MS_V2: u64 = 150_000;
 const PUMP_EXACT_STATE_WINDOW_FORWARD_MS_V2: u64 = 90_000;
 /// Extra space reserved for the three JSONL streams and two JSON authority
@@ -69,11 +73,12 @@ const PUMP_EXACT_STATE_WINDOW_FORWARD_MS_V2: u64 = 90_000;
 /// sized from the immutable receipt set rather than from a mutable directory
 /// walk or the capture-time maximum budget.
 const V2_QUALIFICATION_METADATA_ALLOWANCE_BYTES: u64 = 64 * 1024 * 1024;
-const PUMP_EXACT_STATE_CAPABILITY_SCHEMA_VERSION_V2: u16 = 3;
-const PUMP_EXACT_STATE_EXACT_OUTPUT_SCHEMA_VERSION_V2: u16 = 2;
+const PUMP_EXACT_STATE_CAPABILITY_SCHEMA_VERSION_V2: u16 = 4;
+const PUMP_EXACT_STATE_EXACT_OUTPUT_SCHEMA_VERSION_V2: u16 = 3;
 const PUMP_EXACT_STATE_REQUIRED_COVERAGE_PPM_V2: u64 = 999_000;
 const PUMP_EXACT_STATE_MIN_QUALIFICATION_COHORT_ELAPSED_MS_V2: u64 = 1_800_000;
 const PUMP_EXACT_STATE_MIN_QUALIFICATION_MUTATION_DENOMINATOR_V2: u64 = 10_000;
+const PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2: &str = "prospective_birth_cohort_v1";
 
 /// The result of the pre-semantic V2 raw authority check.  It is intentionally
 /// narrow: exact-state qualification will add account, mutation, and coverage
@@ -116,6 +121,8 @@ pub enum PumpExactStateCapabilityBlockerV2 {
     NoExactBirth,
     CanonicalSlotEvidenceMissing,
     QualificationRunBelowMinimum,
+    GlobalDependencyMutationObserved,
+    UnprovenPostBoundaryCurveMutationObserved,
     RawAuthorityRevalidationFailed,
 }
 
@@ -201,8 +208,32 @@ struct PumpExactStateCandidateCoverageRecordV2 {
     bonding_curve: Option<String>,
     mint: Option<String>,
     effect: String,
+    qualification_scope: PumpExactStateCandidateQualificationScopeV2,
+    counted_in_qualification_denominator: bool,
     exact: bool,
     non_exact_reason: Option<String>,
+}
+
+/// A candidate's disposition is durable diagnostic evidence.  It never
+/// changes the raw universe: it only says whether a rooted successful Pump
+/// mutation is in the prospective birth cohort, demonstrably older than it,
+/// or a global dependency that must still block qualification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PumpExactStateCandidateQualificationScopeV2 {
+    OutsideRootedSuccessfulUniverse,
+    PreBoundaryOutOfScope,
+    PreExistingCurveOutOfScope,
+    ProspectiveBirthCohort,
+    GlobalDependencyBlocker,
+    UnprovenPostBoundaryCurveMutationBlocker,
+    UnscopedCurveMutationBlocker,
+}
+
+impl PumpExactStateCandidateQualificationScopeV2 {
+    const fn counts_in_qualification_denominator(self) -> bool {
+        matches!(self, Self::ProspectiveBirthCohort)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -219,7 +250,10 @@ struct PumpExactStateCoverageRecordV2 {
     rooted: bool,
     success: bool,
     occurrence_count: u32,
+    /// All recognized candidate occurrences in this transaction.  This stays
+    /// global even where every candidate is warm-up/pre-existing evidence.
     candidate_count: u32,
+    cohort_candidate_count: u32,
     exact_candidate_count: u32,
     inventory_complete: bool,
     reason_codes: Vec<String>,
@@ -243,6 +277,9 @@ struct PumpExactStateCapabilityReceiptV2 {
     vendored_idl_digest: PumpExactStateDigestV2,
     materializer_running_executable_digest: PumpExactStateDigestV2,
     cohort_slots_strictly_after: u64,
+    qualification_scope: String,
+    prospective_birth_cohort_curve_count: u64,
+    conflicting_prospective_birth_curve_count: u64,
     rooted_canonical_slot_count: u64,
     filtered_pump_transaction_count: u64,
     full_block_pump_transaction_count: u64,
@@ -260,6 +297,13 @@ struct PumpExactStateCapabilityReceiptV2 {
     successful_rooted_unknown_occurrence_count: u64,
     successful_rooted_malformed_candidate_count: u64,
     occurrence_ledger_reconciled: bool,
+    successful_rooted_out_of_scope_pre_boundary_candidate_count: u64,
+    successful_rooted_out_of_scope_pre_existing_curve_candidate_count: u64,
+    successful_rooted_global_dependency_candidate_count: u64,
+    successful_rooted_unproven_post_boundary_curve_candidate_count: u64,
+    successful_rooted_unscoped_curve_mutation_candidate_count: u64,
+    candidate_scope_reconciled: bool,
+    successful_rooted_scope_incomplete_occurrence_count: u64,
     successful_rooted_mutation_denominator: u64,
     exact_rooted_mutation_count: u64,
     explicit_non_exact_mutation_count: u64,
@@ -288,6 +332,7 @@ struct PumpExactStateExactManifestV2 {
     materializer_running_executable_sha256: String,
     materializer_running_executable_blake3: String,
     materializer_running_executable_bytes: u64,
+    qualification_scope: String,
     exact_state_capability_artifact: PumpExactStateArtifactDigestV2,
     births_artifact: PumpExactStateArtifactDigestV2,
     trajectories_artifact: PumpExactStateArtifactDigestV2,
@@ -350,6 +395,7 @@ struct PumpExactStateOutcomeBlindWindowManifestV2 {
     kind: String,
     source_run_id: String,
     exact_state_capability_status: PumpExactStateCapabilityStatusV2,
+    qualification_scope: String,
     outcome_blind: bool,
     time_axis: String,
     observation_ms: u64,
@@ -546,13 +592,27 @@ pub fn validate_prospective_exact_state_strategy_input_v2(
     semantics_manifest_path: &Path,
     exact_dir: &Path,
 ) -> Result<PumpExactStateValidatedStrategyInputV2> {
-    let raw = index_prospective_exact_state_raw_run_v2(raw_dir)
+    let unsealed_raw = index_prospective_exact_state_raw_run_v2(raw_dir)
         .context("validate V2 raw authority for strategy-input adapter")?;
     let semantics = load_pump_exact_state_semantics_authority_v2(semantics_manifest_path)
         .context("load V2 semantics authority for strategy-input adapter")?;
-    validate_raw_semantics_binding_v2(&raw.start_manifest, &semantics)?;
-    semantics.validate_program_data(&raw.start_manifest.program_data_at_start)?;
+    validate_raw_semantics_binding_v2(&unsealed_raw.start_manifest, &semantics)?;
+    semantics.validate_program_data(&unsealed_raw.start_manifest.program_data_at_start)?;
     let exact = validate_exact_output_artifacts_v2(exact_dir)?;
+    // Recompute the prospective-birth cohort only from anonymous, receipt-bound
+    // raw descriptors.  The strategy-input adapter must not reopen mutable
+    // raw paths after inspection merely because its extra cohort binding needs
+    // transaction payloads; reserve the same bounded scratch budget used by
+    // qualification before taking that immutable snapshot.
+    let snapshot_parent = exact_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("V2 exact output has no snapshot parent"))?;
+    require_v2_qualification_storage_budget(
+        snapshot_parent,
+        unsealed_raw.start_manifest.min_free_bytes,
+        unsealed_raw.total_receipt_bound_segment_bytes()?,
+    )?;
+    let raw = unsealed_raw.seal_anonymous_snapshot_v2(snapshot_parent)?;
     validate_qualified_exact_output_binding_v2(&raw, &semantics, &exact)?;
     let running_executable = digest_v2_running_executable()?;
     if running_executable != exact.receipt.materializer_running_executable_digest {
@@ -712,6 +772,29 @@ pub fn export_prospective_exact_state_outcome_blind_windows_v2(
                 )
             })?;
             for candidate in coverage.candidates {
+                match candidate.qualification_scope {
+                    PumpExactStateCandidateQualificationScopeV2::ProspectiveBirthCohort => {
+                        if !candidate.counted_in_qualification_denominator {
+                            bail!("V2 prospective coverage candidate is absent from its cohort denominator");
+                        }
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::GlobalDependencyBlocker
+                    | PumpExactStateCandidateQualificationScopeV2::UnprovenPostBoundaryCurveMutationBlocker
+                    | PumpExactStateCandidateQualificationScopeV2::UnscopedCurveMutationBlocker => {
+                        bail!(
+                            "V2 outcome-blind export refuses a globally blocking coverage candidate"
+                        );
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::OutsideRootedSuccessfulUniverse
+                    | PumpExactStateCandidateQualificationScopeV2::PreBoundaryOutOfScope
+                    | PumpExactStateCandidateQualificationScopeV2::PreExistingCurveOutOfScope
+                    => {
+                        if candidate.counted_in_qualification_denominator {
+                            bail!("V2 out-of-scope coverage candidate is incorrectly counted in the cohort denominator");
+                        }
+                        continue;
+                    }
+                }
                 let bonding_curve = outcome_blind_candidate_curve_v2(&candidate)?;
                 if window_by_curve.contains_key(bonding_curve) {
                     if relevant_events.len() >= V2_WINDOW_EXPORT_MAX_RELEVANT_COVERAGE_EVENTS {
@@ -871,6 +954,7 @@ pub fn export_prospective_exact_state_outcome_blind_windows_v2(
             kind: "pump_exact_state_outcome_blind_windows_v2".to_owned(),
             source_run_id: authority.source_run_id.clone(),
             exact_state_capability_status: PumpExactStateCapabilityStatusV2::Qualified,
+            qualification_scope: PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2.to_owned(),
             outcome_blind: true,
             time_axis: "observed_ingress_monotonic_ms".to_owned(),
             observation_ms: PUMP_EXACT_STATE_WINDOW_OBSERVATION_MS_V2,
@@ -1169,6 +1253,11 @@ fn validate_exact_output_artifacts_v2(
         &trajectories_artifact.digest,
         &coverage_artifact.digest,
     )?;
+    validate_qualified_coverage_scope_v2(
+        &receipt,
+        &coverage_artifact.file,
+        &coverage_artifact.digest,
+    )?;
     Ok(PumpExactStateValidatedExactOutputV2 {
         receipt,
         receipt_artifact,
@@ -1187,6 +1276,8 @@ fn validate_qualified_exact_output_binding_v2(
 ) -> Result<()> {
     if exact.receipt.source_run_id != raw.start_manifest.run_id
         || exact.manifest.source_run_id != raw.start_manifest.run_id
+        || exact.receipt.qualification_scope != PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2
+        || exact.manifest.qualification_scope != PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2
         || exact.receipt.source_raw_segment_set_blake3 != raw.raw_segment_set_blake3
         || exact.manifest.source_raw_segment_set_blake3 != raw.raw_segment_set_blake3
         || exact.receipt.semantics_id != semantics.semantics_id
@@ -1217,6 +1308,165 @@ fn validate_qualified_exact_output_binding_v2(
     }
     if expected_qualification_run_below_minimum {
         bail!("V2 raw authority remains below the literal qualification-run minimum");
+    }
+    let rooted_slots = raw.rooted_slots();
+    let anchors = PumpExactStateAnchorIndexV2::build(raw, semantics, &rooted_slots)?;
+    let mut transactions = raw.transactions.clone();
+    transactions.sort_by_key(|transaction| {
+        (
+            transaction.slot,
+            transaction.tx_index,
+            transaction.signature,
+        )
+    });
+    let cohort_slots_strictly_after = raw
+        .completion_receipt
+        .cohort_slots_strictly_after
+        .ok_or_else(|| anyhow::anyhow!("verified V2 raw run lacks cohort boundary"))?;
+    let expected_cohort = build_prospective_birth_cohort_v2(
+        raw,
+        semantics,
+        &anchors,
+        &rooted_slots,
+        cohort_slots_strictly_after,
+        &transactions,
+    )?;
+    if exact.receipt.cohort_slots_strictly_after != cohort_slots_strictly_after
+        || exact.receipt.prospective_birth_cohort_curve_count
+            != u64::try_from(expected_cohort.births.len()).unwrap_or(u64::MAX)
+        || exact.receipt.conflicting_prospective_birth_curve_count
+            != u64::try_from(expected_cohort.conflicting_create_curves.len()).unwrap_or(u64::MAX)
+    {
+        bail!("V2 exact receipt prospective-birth cohort differs from immutable raw authority");
+    }
+    let mut emitted_birth_curves = BTreeSet::new();
+    visit_pinned_jsonl_v2(
+        &exact.births_artifact.file,
+        &exact.births_artifact.digest,
+        "V2 exact births JSONL",
+        |birth: PumpExactStateBirthRecordV2| {
+            if birth.schema_version != PUMP_EXACT_STATE_EXACT_OUTPUT_SCHEMA_VERSION_V2
+                || birth.source_run_id != raw.start_manifest.run_id
+            {
+                bail!("V2 exact birth row differs from the raw-bound cohort authority");
+            }
+            if !emitted_birth_curves.insert(birth.bonding_curve) {
+                bail!("V2 exact artifact repeats a prospective birth curve");
+            }
+            Ok(())
+        },
+    )?;
+    let expected_birth_curves = expected_cohort
+        .births
+        .keys()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    if emitted_birth_curves != expected_birth_curves {
+        bail!("V2 exact births do not match the immutable prospective-birth cohort");
+    }
+    validate_qualified_coverage_raw_scope_binding_v2(
+        raw,
+        semantics,
+        &anchors,
+        &rooted_slots,
+        &expected_cohort,
+        &transactions,
+        &exact.coverage_artifact.file,
+        &exact.coverage_artifact.digest,
+    )?;
+    Ok(())
+}
+
+/// The receipt-wide scope partition is necessary but not sufficient: a
+/// rewritten artifact could otherwise move one raw candidate from the birth
+/// cohort into a self-consistent out-of-scope bucket. Reconstruct each
+/// retained transaction's immutable candidate identity and typed scope before
+/// accepting a Qualified artifact for strategy/export authority.
+#[allow(clippy::too_many_arguments)]
+fn validate_qualified_coverage_raw_scope_binding_v2(
+    raw: &PumpExactStateRawTapeIndexV2,
+    semantics: &PumpExactStateSemanticsAuthorityV2,
+    anchors: &PumpExactStateAnchorIndexV2,
+    rooted_slots: &BTreeSet<u64>,
+    cohort: &PumpExactStateProspectiveBirthCohortV2,
+    transactions: &[PumpExactStateIndexedTransactionV2],
+    coverage_file: &File,
+    coverage_digest: &PumpExactStateArtifactDigestV2,
+) -> Result<()> {
+    let mut transaction_position = 0usize;
+    visit_pinned_jsonl_v2(
+        coverage_file,
+        coverage_digest,
+        "V2 exact coverage JSONL",
+        |coverage: PumpExactStateCoverageRecordV2| {
+            let indexed = transactions.get(transaction_position).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "V2 Qualified coverage has more rows than immutable raw transactions"
+                )
+            })?;
+            transaction_position = transaction_position
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("V2 raw scope transaction position overflow"))?;
+
+            let transaction = raw.read_transaction(indexed)?;
+            let context = decode_v2_transaction_context(&transaction)?;
+            let inventory = inventory_v2_from_transaction_context(&context, semantics, anchors)?;
+            if inventory.slot != indexed.slot
+                || inventory.tx_index != indexed.tx_index
+                || inventory.signature != indexed.signature
+            {
+                bail!("V2 raw scope inventory identity differs from its indexed transaction");
+            }
+            let rooted = rooted_slots.contains(&inventory.slot);
+            if coverage.source_capture_sequence != indexed.source_capture_sequence
+                || coverage.slot != inventory.slot
+                || coverage.tx_index != inventory.tx_index
+                || coverage.signature != bs58::encode(inventory.signature).into_string()
+                || coverage.rooted != rooted
+                || coverage.success != inventory.success
+            {
+                bail!("V2 coverage row identity differs from immutable raw scope authority");
+            }
+            let candidates = candidate_descriptors_v2(&inventory)?;
+            if coverage.candidate_count != u32::try_from(candidates.len()).unwrap_or(u32::MAX)
+                || coverage.candidates.len() != candidates.len()
+            {
+                bail!("V2 coverage candidate count differs from immutable raw scope authority");
+            }
+            let mut expected_cohort_candidate_count = 0u32;
+            for (candidate, persisted) in candidates.iter().zip(coverage.candidates.iter()) {
+                let expected_scope = cohort.candidate_scope(
+                    rooted,
+                    inventory.success,
+                    inventory.slot,
+                    candidate.effect,
+                    candidate.bonding_curve,
+                );
+                if expected_scope.counts_in_qualification_denominator() {
+                    expected_cohort_candidate_count = expected_cohort_candidate_count
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("V2 raw scope cohort-candidate count overflow")
+                        })?;
+                }
+                if persisted.bonding_curve != candidate.bonding_curve.map(|curve| curve.to_string())
+                    || persisted.mint != candidate.mint.map(|mint| mint.to_string())
+                    || persisted.effect != exact_state_effect_label_v2(candidate.effect)
+                    || persisted.qualification_scope != expected_scope
+                    || persisted.counted_in_qualification_denominator
+                        != expected_scope.counts_in_qualification_denominator()
+                {
+                    bail!("V2 coverage candidate scope differs from immutable raw authority");
+                }
+            }
+            if coverage.cohort_candidate_count != expected_cohort_candidate_count {
+                bail!("V2 coverage row cohort count differs from immutable raw authority");
+            }
+            Ok(())
+        },
+    )?;
+    if transaction_position != transactions.len() {
+        bail!("V2 Qualified coverage row count differs from immutable raw transactions");
     }
     Ok(())
 }
@@ -1326,6 +1576,8 @@ fn validate_exact_output_receipt_v2(
         || receipt.kind != "pump_exact_state_capability_v2"
         || manifest.schema_version != PUMP_EXACT_STATE_EXACT_OUTPUT_SCHEMA_VERSION_V2
         || manifest.kind != "pump_exact_state_tape_v2"
+        || receipt.qualification_scope != PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2
+        || manifest.qualification_scope != PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2
         || !matches!(receipt.status, PumpExactStateCapabilityStatusV2::Qualified)
         || !matches!(
             manifest.exact_state_capability_status,
@@ -1338,6 +1590,8 @@ fn validate_exact_output_receipt_v2(
     }
     if receipt.source_run_id.trim().is_empty()
         || receipt.required_exact_rooted_coverage_ppm != PUMP_EXACT_STATE_REQUIRED_COVERAGE_PPM_V2
+        || receipt.prospective_birth_cohort_curve_count == 0
+        || receipt.conflicting_prospective_birth_curve_count != 0
         || receipt.successful_rooted_mutation_denominator == 0
         || receipt.exact_rooted_mutation_count == 0
         || receipt.exact_trajectory_count == 0
@@ -1360,13 +1614,36 @@ fn validate_exact_output_receipt_v2(
         .ok_or_else(|| anyhow::anyhow!("V2 exact occurrence conservation overflow"))?;
     if !receipt.occurrence_ledger_reconciled
         || occurrence_sum != receipt.successful_rooted_instruction_occurrence_count
+        || !receipt.candidate_scope_reconciled
+        || receipt
+            .successful_rooted_mutation_denominator
+            .checked_add(receipt.successful_rooted_out_of_scope_pre_boundary_candidate_count)
+            .and_then(|value| {
+                value.checked_add(
+                    receipt.successful_rooted_out_of_scope_pre_existing_curve_candidate_count,
+                )
+            })
+            .and_then(|value| {
+                value.checked_add(receipt.successful_rooted_global_dependency_candidate_count)
+            })
+            .and_then(|value| {
+                value.checked_add(
+                    receipt.successful_rooted_unproven_post_boundary_curve_candidate_count,
+                )
+            })
+            .and_then(|value| {
+                value.checked_add(receipt.successful_rooted_unscoped_curve_mutation_candidate_count)
+            })
+            != Some(receipt.successful_rooted_candidate_count)
         || !receipt.denominator_reconciled
         || receipt
             .exact_rooted_mutation_count
             .checked_add(receipt.explicit_non_exact_mutation_count)
             != Some(receipt.successful_rooted_mutation_denominator)
-        || receipt.successful_rooted_unknown_occurrence_count != 0
-        || receipt.successful_rooted_malformed_candidate_count != 0
+        || receipt.successful_rooted_scope_incomplete_occurrence_count != 0
+        || receipt.successful_rooted_global_dependency_candidate_count != 0
+        || receipt.successful_rooted_unproven_post_boundary_curve_candidate_count != 0
+        || receipt.successful_rooted_unscoped_curve_mutation_candidate_count != 0
         || receipt.account_decode_failure_count != 0
         || receipt.unknown_pump_owned_account_count != 0
     {
@@ -1392,6 +1669,7 @@ fn validate_exact_output_receipt_v2(
             != receipt.materializer_running_executable_digest.blake3
         || manifest.materializer_running_executable_bytes
             != receipt.materializer_running_executable_digest.bytes
+        || manifest.qualification_scope != receipt.qualification_scope
         || manifest.exact_state_capability_artifact != *receipt_digest
         || manifest.births_artifact != *births_digest
         || manifest.trajectories_artifact != *trajectories_digest
@@ -1400,6 +1678,154 @@ fn validate_exact_output_receipt_v2(
         || !manifest_digest.newline_complete
     {
         bail!("V2 exact manifest does not bind the complete Qualified artifact set");
+    }
+    Ok(())
+}
+
+/// The coverage stream is deliberately complete diagnostic evidence, not a
+/// denominator-only projection.  Recount its explicit scope partition before
+/// granting strategy authority so a rewritten receipt cannot silently discard
+/// warm-up, pre-existing-curve, or globally blocking source mutations.
+fn validate_qualified_coverage_scope_v2(
+    receipt: &PumpExactStateCapabilityReceiptV2,
+    coverage_file: &File,
+    coverage_digest: &PumpExactStateArtifactDigestV2,
+) -> Result<()> {
+    let mut global_candidate_count = 0u64;
+    let mut cohort_candidate_count = 0u64;
+    let mut cohort_exact_candidate_count = 0u64;
+    let mut cohort_exact_create_count = 0u64;
+    let mut pre_boundary_candidate_count = 0u64;
+    let mut pre_existing_curve_candidate_count = 0u64;
+    let mut global_dependency_candidate_count = 0u64;
+    let mut unproven_post_boundary_curve_candidate_count = 0u64;
+    let mut unscoped_curve_candidate_count = 0u64;
+
+    visit_pinned_jsonl_v2(
+        coverage_file,
+        coverage_digest,
+        "V2 exact coverage JSONL",
+        |coverage: PumpExactStateCoverageRecordV2| {
+            if coverage.schema_version != PUMP_EXACT_STATE_EXACT_OUTPUT_SCHEMA_VERSION_V2
+                || coverage.source_run_id != receipt.source_run_id
+                || coverage.candidate_count
+                    != u32::try_from(coverage.candidates.len()).unwrap_or(u32::MAX)
+            {
+                bail!("V2 coverage row differs from its Qualified receipt authority");
+            }
+            let mut row_cohort_candidates = 0u32;
+            let mut row_cohort_exact = 0u32;
+            for candidate in coverage.candidates {
+                let in_rooted_successful_universe = coverage.rooted && coverage.success;
+                let expected_counted = candidate
+                    .qualification_scope
+                    .counts_in_qualification_denominator();
+                if candidate.counted_in_qualification_denominator != expected_counted {
+                    bail!("V2 coverage candidate denominator flag differs from its typed scope");
+                }
+                if !in_rooted_successful_universe {
+                    if !matches!(
+                        candidate.qualification_scope,
+                        PumpExactStateCandidateQualificationScopeV2::OutsideRootedSuccessfulUniverse
+                    ) {
+                        bail!("V2 non-rooted/non-successful coverage candidate has a capability scope");
+                    }
+                    continue;
+                }
+                if matches!(
+                    candidate.qualification_scope,
+                    PumpExactStateCandidateQualificationScopeV2::OutsideRootedSuccessfulUniverse
+                ) {
+                    bail!("V2 rooted successful coverage candidate is outside its global universe");
+                }
+                global_candidate_count =
+                    global_candidate_count.checked_add(1).ok_or_else(|| {
+                        anyhow::anyhow!("V2 global coverage candidate count overflow")
+                    })?;
+                match candidate.qualification_scope {
+                    PumpExactStateCandidateQualificationScopeV2::ProspectiveBirthCohort => {
+                        if candidate.bonding_curve.is_none() {
+                            bail!("V2 prospective coverage candidate lacks BondingCurve identity");
+                        }
+                        cohort_candidate_count = cohort_candidate_count.checked_add(1).ok_or_else(|| {
+                            anyhow::anyhow!("V2 cohort coverage candidate count overflow")
+                        })?;
+                        row_cohort_candidates = row_cohort_candidates.checked_add(1).ok_or_else(|| {
+                            anyhow::anyhow!("V2 row cohort candidate count overflow")
+                        })?;
+                        if candidate.exact {
+                            cohort_exact_candidate_count = cohort_exact_candidate_count
+                                .checked_add(1)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("V2 cohort exact coverage count overflow")
+                                })?;
+                            row_cohort_exact = row_cohort_exact.checked_add(1).ok_or_else(|| {
+                                anyhow::anyhow!("V2 row cohort exact count overflow")
+                            })?;
+                            if candidate.effect == "supported_exact_create" {
+                                cohort_exact_create_count = cohort_exact_create_count
+                                    .checked_add(1)
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("V2 cohort exact birth count overflow")
+                                    })?;
+                            }
+                        }
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::PreBoundaryOutOfScope => {
+                        pre_boundary_candidate_count = pre_boundary_candidate_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 pre-boundary coverage count overflow"))?;
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::PreExistingCurveOutOfScope => {
+                        pre_existing_curve_candidate_count = pre_existing_curve_candidate_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 pre-existing coverage count overflow"))?;
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::GlobalDependencyBlocker => {
+                        global_dependency_candidate_count = global_dependency_candidate_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 global dependency coverage count overflow"))?;
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::UnprovenPostBoundaryCurveMutationBlocker => {
+                        unproven_post_boundary_curve_candidate_count = unproven_post_boundary_curve_candidate_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 unproven post-boundary curve coverage count overflow"))?;
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::UnscopedCurveMutationBlocker => {
+                        unscoped_curve_candidate_count = unscoped_curve_candidate_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 unscoped coverage count overflow"))?;
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::OutsideRootedSuccessfulUniverse => {
+                        unreachable!("checked above")
+                    }
+                }
+            }
+            if coverage.cohort_candidate_count != row_cohort_candidates
+                || coverage.exact_candidate_count != row_cohort_exact
+            {
+                bail!("V2 coverage row cohort counters differ from typed candidates");
+            }
+            Ok(())
+        },
+    )?;
+
+    if global_candidate_count != receipt.successful_rooted_candidate_count
+        || cohort_candidate_count != receipt.successful_rooted_mutation_denominator
+        || cohort_exact_candidate_count != receipt.exact_rooted_mutation_count
+        || cohort_exact_create_count != receipt.exact_birth_count
+        || pre_boundary_candidate_count
+            != receipt.successful_rooted_out_of_scope_pre_boundary_candidate_count
+        || pre_existing_curve_candidate_count
+            != receipt.successful_rooted_out_of_scope_pre_existing_curve_candidate_count
+        || global_dependency_candidate_count
+            != receipt.successful_rooted_global_dependency_candidate_count
+        || unproven_post_boundary_curve_candidate_count
+            != receipt.successful_rooted_unproven_post_boundary_curve_candidate_count
+        || unscoped_curve_candidate_count
+            != receipt.successful_rooted_unscoped_curve_mutation_candidate_count
+    {
+        bail!("V2 Qualified coverage scope counters differ from its receipt");
     }
     Ok(())
 }
@@ -2429,6 +2855,121 @@ struct PumpExactStateTransactionInventoryV2 {
     occurrences: Vec<PumpExactStateInstructionOccurrenceV2>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PumpExactStateCandidateOrderV2 {
+    slot: u64,
+    tx_index: u32,
+    signature: [u8; 64],
+    outer_instruction_index: u32,
+    inner_instruction_path: Vec<u16>,
+    stack_height: Option<u32>,
+}
+
+impl PumpExactStateCandidateOrderV2 {
+    fn from_occurrence(
+        inventory: &PumpExactStateTransactionInventoryV2,
+        occurrence: &PumpExactStateInstructionOccurrenceV2,
+    ) -> Self {
+        Self {
+            slot: inventory.slot,
+            tx_index: inventory.tx_index,
+            signature: inventory.signature,
+            outer_instruction_index: occurrence.key.outer_instruction_index,
+            inner_instruction_path: occurrence.key.inner_instruction_path.clone(),
+            stack_height: occurrence.key.stack_height,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PumpExactStateCandidateDescriptorV2 {
+    order: PumpExactStateCandidateOrderV2,
+    effect: PumpExactStateInstructionEffectV2,
+    instruction_payload_exact: bool,
+    account_vector_exact: bool,
+    bonding_curve: Option<Pubkey>,
+    mint: Option<Pubkey>,
+    failure_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PumpExactStateTransactionMutationStatsV2 {
+    candidate_count: u32,
+    unknown_occurrence_count: u32,
+    malformed_candidate_count: u32,
+}
+
+impl PumpExactStateTransactionMutationStatsV2 {
+    const fn unknown_or_malformed(self) -> bool {
+        self.unknown_occurrence_count != 0 || self.malformed_candidate_count != 0
+    }
+}
+
+/// A curve may enter the capability denominator only through structurally
+/// recognized, stream-observed birth evidence.  A later Create cannot repair
+/// earlier rooted curve activity, and a curve with ambiguous repeated
+/// prospective Creates never becomes eligible by choosing one record
+/// arbitrarily.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PumpExactStateProspectiveBirthEvidenceV2 {
+    order: PumpExactStateCandidateOrderV2,
+}
+
+#[derive(Default)]
+struct PumpExactStateProspectiveBirthCohortV2 {
+    cohort_slots_strictly_after: u64,
+    births: BTreeMap<Pubkey, PumpExactStateProspectiveBirthEvidenceV2>,
+    pre_boundary_curve_activity: BTreeSet<Pubkey>,
+    first_rooted_successful_candidate: BTreeMap<Pubkey, PumpExactStateCandidateOrderV2>,
+    create_orders: BTreeMap<Pubkey, Vec<PumpExactStateCandidateOrderV2>>,
+    conflicting_create_curves: BTreeSet<Pubkey>,
+}
+
+impl PumpExactStateProspectiveBirthCohortV2 {
+    fn candidate_scope(
+        &self,
+        rooted: bool,
+        success: bool,
+        slot: u64,
+        effect: PumpExactStateInstructionEffectV2,
+        bonding_curve: Option<Pubkey>,
+    ) -> PumpExactStateCandidateQualificationScopeV2 {
+        if !rooted || !success {
+            return PumpExactStateCandidateQualificationScopeV2::OutsideRootedSuccessfulUniverse;
+        }
+        if matches!(
+            effect,
+            PumpExactStateInstructionEffectV2::GlobalDependencyMutation
+        ) {
+            return PumpExactStateCandidateQualificationScopeV2::GlobalDependencyBlocker;
+        }
+        let Some(curve) = bonding_curve else {
+            return PumpExactStateCandidateQualificationScopeV2::UnscopedCurveMutationBlocker;
+        };
+        if slot <= self.cohort_slots_strictly_after {
+            return PumpExactStateCandidateQualificationScopeV2::PreBoundaryOutOfScope;
+        }
+        if self.births.contains_key(&curve) {
+            return PumpExactStateCandidateQualificationScopeV2::ProspectiveBirthCohort;
+        }
+        if self.pre_boundary_curve_activity.contains(&curve) {
+            return PumpExactStateCandidateQualificationScopeV2::PreExistingCurveOutOfScope;
+        }
+        // A post-boundary curve that has neither a retained pre-boundary
+        // predecessor nor an unambiguous observed Create cannot be labelled
+        // pre-existing.  It might instead be a missed/malformed prospective
+        // birth, so excluding its mutations would shrink the cohort
+        // denominator without proof.
+        PumpExactStateCandidateQualificationScopeV2::UnprovenPostBoundaryCurveMutationBlocker
+    }
+
+    fn is_selected_birth(&self, curve: Pubkey, order: &PumpExactStateCandidateOrderV2) -> bool {
+        self.births
+            .get(&curve)
+            .is_some_and(|birth| &birth.order == order)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PumpExactStateAccountMetaV2 {
     pubkey: Pubkey,
@@ -2724,6 +3265,18 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
             transaction.signature,
         )
     });
+    let prospective_birth_cohort = build_prospective_birth_cohort_v2(
+        &raw,
+        &semantics,
+        &anchors,
+        &rooted_slots,
+        cohort_slots_strictly_after,
+        &transactions,
+    )?;
+    counters.prospective_birth_cohort_curve_count =
+        u64::try_from(prospective_birth_cohort.births.len()).unwrap_or(u64::MAX);
+    counters.conflicting_prospective_birth_curve_count =
+        u64::try_from(prospective_birth_cohort.conflicting_create_curves.len()).unwrap_or(u64::MAX);
     for indexed in &transactions {
         let transaction = raw.read_transaction(indexed)?;
         let source_capture_sequence = transaction.source.capture_sequence;
@@ -2737,19 +3290,34 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
         {
             bail!("V2 semantic inventory identity differs from indexed raw transaction");
         }
-        let rooted =
-            rooted_slots.contains(&inventory.slot) && inventory.slot > cohort_slots_strictly_after;
-        let capability_relevant = rooted && inventory.success;
+        let rooted = rooted_slots.contains(&inventory.slot);
+        let successful_rooted = rooted && inventory.success;
+        let mutation_stats = transaction_mutation_stats_v2(&inventory)?;
+        let candidates = candidate_descriptors_v2(&inventory)?;
+        if mutation_stats.candidate_count != u32::try_from(candidates.len()).unwrap_or(u32::MAX) {
+            bail!("V2 transaction candidate census differs from candidate projection");
+        }
+        let candidate_scopes = candidates
+            .iter()
+            .map(|candidate| {
+                prospective_birth_cohort.candidate_scope(
+                    rooted,
+                    inventory.success,
+                    inventory.slot,
+                    candidate.effect,
+                    candidate.bonding_curve,
+                )
+            })
+            .collect::<Vec<_>>();
         let mut transaction_reasons = BTreeSet::new();
-        let mut candidate_count = 0u32;
+        let mut cohort_candidate_count = 0u32;
         let mut exact_candidate_count = 0u32;
-        let mut unknown_or_malformed = false;
         let mut candidate_coverage = Vec::new();
 
         for occurrence in &inventory.occurrences {
             match &occurrence.class {
                 PumpExactStateOccurrenceClassV2::ProvenNonReserve { .. } => {
-                    if capability_relevant {
+                    if successful_rooted {
                         counters.successful_rooted_proven_non_reserve_count = counters
                             .successful_rooted_proven_non_reserve_count
                             .checked_add(1)
@@ -2757,7 +3325,7 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                     }
                 }
                 PumpExactStateOccurrenceClassV2::ValidatedEventTransport { .. } => {
-                    if capability_relevant {
+                    if successful_rooted {
                         counters.successful_rooted_validated_event_transport_count = counters
                             .successful_rooted_validated_event_transport_count
                             .checked_add(1)
@@ -2765,102 +3333,156 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                     }
                 }
                 PumpExactStateOccurrenceClassV2::Unknown { reason } => {
-                    if capability_relevant {
-                        unknown_or_malformed = true;
+                    insert_bounded_v2_reason(&mut transaction_reasons, reason.clone());
+                    if successful_rooted {
                         counters.successful_rooted_unknown_occurrence_count = counters
                             .successful_rooted_unknown_occurrence_count
                             .checked_add(1)
                             .ok_or_else(|| anyhow::anyhow!("V2 occurrence census overflow"))?;
-                        insert_bounded_v2_reason(&mut transaction_reasons, reason.clone());
                     }
                 }
-                PumpExactStateOccurrenceClassV2::Candidate {
-                    instruction_payload_exact,
-                    account_vector_exact,
-                    failure_reason,
-                    ..
-                } => {
-                    if capability_relevant {
-                        candidate_count = candidate_count
-                            .checked_add(1)
-                            .ok_or_else(|| anyhow::anyhow!("V2 candidate count overflow"))?;
-                        if !instruction_payload_exact || !account_vector_exact {
-                            unknown_or_malformed = true;
-                            counters.successful_rooted_malformed_candidate_count = counters
-                                .successful_rooted_malformed_candidate_count
-                                .checked_add(1)
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("V2 malformed-candidate census overflow")
-                                })?;
-                            insert_bounded_v2_reason(
-                                &mut transaction_reasons,
-                                failure_reason.clone().unwrap_or_else(|| {
-                                    "candidate_instruction_contract_not_exact".to_owned()
-                                }),
-                            );
-                        }
+                PumpExactStateOccurrenceClassV2::Candidate { failure_reason, .. } => {
+                    if let Some(reason) = failure_reason {
+                        insert_bounded_v2_reason(&mut transaction_reasons, reason.clone());
                     }
                 }
             }
         }
 
-        if capability_relevant {
+        if successful_rooted {
             counters.successful_rooted_instruction_occurrence_count = counters
                 .successful_rooted_instruction_occurrence_count
                 .checked_add(u64::try_from(inventory.occurrences.len()).unwrap_or(u64::MAX))
                 .ok_or_else(|| anyhow::anyhow!("V2 occurrence census overflow"))?;
-        }
-
-        for occurrence in &inventory.occurrences {
-            let PumpExactStateOccurrenceClassV2::Candidate {
-                effect,
-                instruction_payload_exact,
-                account_vector_exact,
-                bonding_curve,
-                mint,
-                failure_reason,
-                ..
-            } = &occurrence.class
-            else {
-                continue;
-            };
-            if !capability_relevant {
-                continue;
-            }
             counters.successful_rooted_candidate_count = counters
                 .successful_rooted_candidate_count
-                .checked_add(1)
+                .checked_add(u64::from(mutation_stats.candidate_count))
                 .ok_or_else(|| anyhow::anyhow!("V2 candidate census overflow"))?;
-            counters.successful_rooted_mutation_denominator = counters
-                .successful_rooted_mutation_denominator
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("V2 mutation denominator overflow"))?;
+            counters.successful_rooted_malformed_candidate_count = counters
+                .successful_rooted_malformed_candidate_count
+                .checked_add(u64::from(mutation_stats.malformed_candidate_count))
+                .ok_or_else(|| anyhow::anyhow!("V2 malformed-candidate census overflow"))?;
+        }
 
-            let evaluation = evaluate_candidate_exactness_v2(
-                *effect,
-                *instruction_payload_exact,
-                *account_vector_exact,
-                *bonding_curve,
+        // A recognized old-curve candidate can be typed out of the prospective
+        // denominator, but it cannot grant that status to another Pump
+        // occurrence whose effect/curve identity is unknown.  Keeping every
+        // such occurrence in the global ledger is necessary but insufficient:
+        // without a typed scope it remains a global fail-closed blocker.
+        if successful_rooted && mutation_stats.unknown_occurrence_count != 0 {
+            counters.successful_rooted_scope_incomplete_occurrence_count = counters
+                .successful_rooted_scope_incomplete_occurrence_count
+                .checked_add(u64::from(mutation_stats.unknown_occurrence_count))
+                .ok_or_else(|| anyhow::anyhow!("V2 scoped unknown-occurrence count overflow"))?;
+        }
+
+        for (candidate, scope) in candidates.iter().zip(candidate_scopes.iter().copied()) {
+            let mut evaluation = evaluate_candidate_exactness_v2(
+                candidate.effect,
+                candidate.instruction_payload_exact,
+                candidate.account_vector_exact,
+                candidate.bonding_curve,
                 inventory.signature,
                 inventory.slot,
                 inventory.tx_index,
-                candidate_count,
-                unknown_or_malformed,
+                mutation_stats.candidate_count,
+                mutation_stats.unknown_or_malformed(),
                 &anchors,
             );
-            if let Some(reason) = failure_reason {
+            if matches!(
+                scope,
+                PumpExactStateCandidateQualificationScopeV2::ProspectiveBirthCohort
+            ) && matches!(
+                candidate.effect,
+                PumpExactStateInstructionEffectV2::SupportedExactCreate
+            ) && !candidate.bonding_curve.is_some_and(|curve| {
+                prospective_birth_cohort.is_selected_birth(curve, &candidate.order)
+            }) {
+                evaluation = PumpExactStateCandidateEvaluationV2 {
+                    exact: false,
+                    non_exact_reason: Some("duplicate_or_noninitial_prospective_create".to_owned()),
+                    state_before: None,
+                    state_after: None,
+                };
+            }
+            if let Some(reason) = &candidate.failure_reason {
                 insert_bounded_v2_reason(&mut transaction_reasons, reason.clone());
             }
             if let Some(reason) = &evaluation.non_exact_reason {
                 insert_bounded_v2_reason(&mut transaction_reasons, reason.clone());
             }
+            if successful_rooted {
+                match scope {
+                    PumpExactStateCandidateQualificationScopeV2::ProspectiveBirthCohort => {
+                        cohort_candidate_count = cohort_candidate_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 cohort candidate count overflow"))?;
+                        counters.successful_rooted_mutation_denominator = counters
+                            .successful_rooted_mutation_denominator
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 mutation denominator overflow"))?;
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::PreBoundaryOutOfScope => {
+                        counters.successful_rooted_out_of_scope_pre_boundary_candidate_count = counters
+                            .successful_rooted_out_of_scope_pre_boundary_candidate_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 pre-boundary candidate census overflow"))?;
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::PreExistingCurveOutOfScope => {
+                        counters.successful_rooted_out_of_scope_pre_existing_curve_candidate_count = counters
+                            .successful_rooted_out_of_scope_pre_existing_curve_candidate_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 pre-existing-curve candidate census overflow"))?;
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::GlobalDependencyBlocker => {
+                        counters.successful_rooted_global_dependency_candidate_count = counters
+                            .successful_rooted_global_dependency_candidate_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 global-dependency candidate census overflow"))?;
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::UnprovenPostBoundaryCurveMutationBlocker => {
+                        counters.successful_rooted_unproven_post_boundary_curve_candidate_count = counters
+                            .successful_rooted_unproven_post_boundary_curve_candidate_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 unproven post-boundary curve candidate census overflow"))?;
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::UnscopedCurveMutationBlocker => {
+                        counters.successful_rooted_unscoped_curve_mutation_candidate_count = counters
+                            .successful_rooted_unscoped_curve_mutation_candidate_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("V2 unscoped curve candidate census overflow"))?;
+                    }
+                    PumpExactStateCandidateQualificationScopeV2::OutsideRootedSuccessfulUniverse => {
+                        bail!("V2 successful rooted candidate received an outside-universe scope");
+                    }
+                }
+                if (!candidate.instruction_payload_exact || !candidate.account_vector_exact)
+                    && matches!(
+                        scope,
+                            PumpExactStateCandidateQualificationScopeV2::ProspectiveBirthCohort
+                            | PumpExactStateCandidateQualificationScopeV2::GlobalDependencyBlocker
+                            | PumpExactStateCandidateQualificationScopeV2::UnprovenPostBoundaryCurveMutationBlocker
+                            | PumpExactStateCandidateQualificationScopeV2::UnscopedCurveMutationBlocker
+                    )
+                {
+                    counters.successful_rooted_scope_incomplete_occurrence_count = counters
+                        .successful_rooted_scope_incomplete_occurrence_count
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("V2 scoped malformed-candidate count overflow"))?;
+                }
+            }
             candidate_coverage.push(PumpExactStateCandidateCoverageRecordV2 {
-                bonding_curve: (*bonding_curve).map(|value| value.to_string()),
-                mint: (*mint).map(|value| value.to_string()),
-                effect: exact_state_effect_label_v2(*effect).to_owned(),
+                bonding_curve: candidate.bonding_curve.map(|value| value.to_string()),
+                mint: candidate.mint.map(|value| value.to_string()),
+                effect: exact_state_effect_label_v2(candidate.effect).to_owned(),
+                qualification_scope: scope,
+                counted_in_qualification_denominator: scope.counts_in_qualification_denominator(),
                 exact: evaluation.exact,
                 non_exact_reason: evaluation.non_exact_reason.clone(),
             });
+            if !scope.counts_in_qualification_denominator() {
+                continue;
+            }
             if evaluation.exact {
                 exact_candidate_count = exact_candidate_count
                     .checked_add(1)
@@ -2873,7 +3495,7 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                     .exact_trajectory_count
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("V2 exact trajectory count overflow"))?;
-                if effect.is_supported_exact_trade()
+                if candidate.effect.is_supported_exact_trade()
                     && evaluation.state_before.is_some()
                     && evaluation.state_after.is_some()
                 {
@@ -2891,9 +3513,12 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                 // Qualified artifact can legitimately contain a small number
                 // of explicit non-exact candidates without contradicting its
                 // exact-trajectory line-count binding.
-                let curve = bonding_curve
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_owned());
+                let curve = candidate
+                    .bonding_curve
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("V2 cohort candidate lacks BondingCurve identity")
+                    })?
+                    .to_string();
                 writer.write_trajectory(&PumpExactStateTrajectoryRecordV2 {
                     schema_version: PUMP_EXACT_STATE_EXACT_OUTPUT_SCHEMA_VERSION_V2,
                     source_run_id: raw.start_manifest.run_id.clone(),
@@ -2904,8 +3529,8 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                     tx_index: inventory.tx_index,
                     signature: bs58::encode(inventory.signature).into_string(),
                     bonding_curve: curve.clone(),
-                    mint: mint.map(|value| value.to_string()),
-                    effect: exact_state_effect_label_v2(*effect).to_owned(),
+                    mint: candidate.mint.map(|value| value.to_string()),
+                    effect: exact_state_effect_label_v2(candidate.effect).to_owned(),
                     state_before: evaluation
                         .state_before
                         .as_ref()
@@ -2916,9 +3541,15 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                         .map(PumpExactStateCurveStateArtifactV2::from),
                 })?;
                 if matches!(
-                    effect,
+                    candidate.effect,
                     PumpExactStateInstructionEffectV2::SupportedExactCreate
                 ) {
+                    let curve_pubkey = candidate.bonding_curve.ok_or_else(|| {
+                        anyhow::anyhow!("V2 cohort exact Create lacks BondingCurve identity")
+                    })?;
+                    if !prospective_birth_cohort.is_selected_birth(curve_pubkey, &candidate.order) {
+                        bail!("V2 cohort exact Create is not its selected prospective birth");
+                    }
                     let state = evaluation.state_after.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("V2 exact create lacks final curve state")
                     })?;
@@ -2936,7 +3567,7 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                         tx_index: inventory.tx_index,
                         signature: bs58::encode(inventory.signature).into_string(),
                         bonding_curve: curve,
-                        mint: mint.map(|value| value.to_string()),
+                        mint: candidate.mint.map(|value| value.to_string()),
                         initial_state: PumpExactStateCurveStateArtifactV2::from(state),
                     })?;
                 }
@@ -2960,9 +3591,10 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
             rooted,
             success: inventory.success,
             occurrence_count: u32::try_from(inventory.occurrences.len()).unwrap_or(u32::MAX),
-            candidate_count,
+            candidate_count: mutation_stats.candidate_count,
+            cohort_candidate_count,
             exact_candidate_count,
-            inventory_complete: !unknown_or_malformed,
+            inventory_complete: !mutation_stats.unknown_or_malformed(),
             reason_codes: transaction_reasons.into_iter().collect(),
             candidates: candidate_coverage,
         })?;
@@ -2975,6 +3607,28 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
             .and_then(|value| value.checked_add(counters.successful_rooted_candidate_count))
             .and_then(|value| {
                 value.checked_add(counters.successful_rooted_unknown_occurrence_count)
+            })
+            .unwrap_or(u64::MAX);
+    counters.candidate_scope_reconciled = counters.successful_rooted_candidate_count
+        == counters
+            .successful_rooted_mutation_denominator
+            .checked_add(counters.successful_rooted_out_of_scope_pre_boundary_candidate_count)
+            .and_then(|value| {
+                value.checked_add(
+                    counters.successful_rooted_out_of_scope_pre_existing_curve_candidate_count,
+                )
+            })
+            .and_then(|value| {
+                value.checked_add(counters.successful_rooted_global_dependency_candidate_count)
+            })
+            .and_then(|value| {
+                value.checked_add(
+                    counters.successful_rooted_unproven_post_boundary_curve_candidate_count,
+                )
+            })
+            .and_then(|value| {
+                value
+                    .checked_add(counters.successful_rooted_unscoped_curve_mutation_candidate_count)
             })
             .unwrap_or(u64::MAX);
     counters.denominator_reconciled = counters.successful_rooted_mutation_denominator
@@ -3039,6 +3693,10 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                 vendored_idl_digest: vendored_idl_digest.clone(),
                 materializer_running_executable_digest: running_executable.clone(),
                 cohort_slots_strictly_after,
+                qualification_scope: PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2.to_owned(),
+                prospective_birth_cohort_curve_count: counters.prospective_birth_cohort_curve_count,
+                conflicting_prospective_birth_curve_count: counters
+                    .conflicting_prospective_birth_curve_count,
                 rooted_canonical_slot_count: counters.rooted_canonical_slot_count,
                 filtered_pump_transaction_count: u64::try_from(raw.transactions.len())
                     .unwrap_or(u64::MAX),
@@ -3063,6 +3721,19 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                 successful_rooted_malformed_candidate_count: counters
                     .successful_rooted_malformed_candidate_count,
                 occurrence_ledger_reconciled: counters.occurrence_ledger_reconciled,
+                successful_rooted_out_of_scope_pre_boundary_candidate_count: counters
+                    .successful_rooted_out_of_scope_pre_boundary_candidate_count,
+                successful_rooted_out_of_scope_pre_existing_curve_candidate_count: counters
+                    .successful_rooted_out_of_scope_pre_existing_curve_candidate_count,
+                successful_rooted_global_dependency_candidate_count: counters
+                    .successful_rooted_global_dependency_candidate_count,
+                successful_rooted_unproven_post_boundary_curve_candidate_count: counters
+                    .successful_rooted_unproven_post_boundary_curve_candidate_count,
+                successful_rooted_unscoped_curve_mutation_candidate_count: counters
+                    .successful_rooted_unscoped_curve_mutation_candidate_count,
+                candidate_scope_reconciled: counters.candidate_scope_reconciled,
+                successful_rooted_scope_incomplete_occurrence_count: counters
+                    .successful_rooted_scope_incomplete_occurrence_count,
                 successful_rooted_mutation_denominator: counters
                     .successful_rooted_mutation_denominator,
                 exact_rooted_mutation_count: counters.exact_rooted_mutation_count,
@@ -3093,6 +3764,7 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                 materializer_running_executable_sha256: running_executable.sha256.clone(),
                 materializer_running_executable_blake3: running_executable.blake3.clone(),
                 materializer_running_executable_bytes: running_executable.bytes,
+                qualification_scope: PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2.to_owned(),
                 exact_state_capability_artifact: receipt_artifact,
                 births_artifact,
                 trajectories_artifact,
@@ -3167,6 +3839,15 @@ struct PumpExactStateQualificationCountersV2 {
     successful_rooted_unknown_occurrence_count: u64,
     successful_rooted_malformed_candidate_count: u64,
     occurrence_ledger_reconciled: bool,
+    prospective_birth_cohort_curve_count: u64,
+    conflicting_prospective_birth_curve_count: u64,
+    successful_rooted_out_of_scope_pre_boundary_candidate_count: u64,
+    successful_rooted_out_of_scope_pre_existing_curve_candidate_count: u64,
+    successful_rooted_global_dependency_candidate_count: u64,
+    successful_rooted_unproven_post_boundary_curve_candidate_count: u64,
+    successful_rooted_unscoped_curve_mutation_candidate_count: u64,
+    candidate_scope_reconciled: bool,
+    successful_rooted_scope_incomplete_occurrence_count: u64,
     successful_rooted_mutation_denominator: u64,
     exact_rooted_mutation_count: u64,
     explicit_non_exact_mutation_count: u64,
@@ -3307,10 +3988,21 @@ fn capability_blockers_v2(
     {
         blockers.insert(PumpExactStateCapabilityBlockerV2::AccountDecodeIncomplete);
     }
-    if counters.successful_rooted_unknown_occurrence_count != 0
-        || counters.successful_rooted_malformed_candidate_count != 0
+    if counters.successful_rooted_scope_incomplete_occurrence_count != 0
         || !counters.occurrence_ledger_reconciled
+        || !counters.candidate_scope_reconciled
+        || counters.conflicting_prospective_birth_curve_count != 0
     {
+        blockers.insert(PumpExactStateCapabilityBlockerV2::MutationInventoryIncomplete);
+    }
+    if counters.successful_rooted_global_dependency_candidate_count != 0 {
+        blockers.insert(PumpExactStateCapabilityBlockerV2::GlobalDependencyMutationObserved);
+    }
+    if counters.successful_rooted_unproven_post_boundary_curve_candidate_count != 0 {
+        blockers
+            .insert(PumpExactStateCapabilityBlockerV2::UnprovenPostBoundaryCurveMutationObserved);
+    }
+    if counters.successful_rooted_unscoped_curve_mutation_candidate_count != 0 {
         blockers.insert(PumpExactStateCapabilityBlockerV2::MutationInventoryIncomplete);
     }
     if counters.successful_rooted_mutation_denominator == 0 {
@@ -4552,6 +5244,179 @@ fn inventory_v2_from_transaction_context(
         success: context.success,
         occurrences,
     })
+}
+
+fn candidate_descriptors_v2(
+    inventory: &PumpExactStateTransactionInventoryV2,
+) -> Result<Vec<PumpExactStateCandidateDescriptorV2>> {
+    let mut candidates = Vec::new();
+    for occurrence in &inventory.occurrences {
+        let PumpExactStateOccurrenceClassV2::Candidate {
+            effect,
+            instruction_payload_exact,
+            account_vector_exact,
+            bonding_curve,
+            mint,
+            failure_reason,
+            ..
+        } = &occurrence.class
+        else {
+            continue;
+        };
+        candidates.push(PumpExactStateCandidateDescriptorV2 {
+            order: PumpExactStateCandidateOrderV2::from_occurrence(inventory, occurrence),
+            effect: *effect,
+            instruction_payload_exact: *instruction_payload_exact,
+            account_vector_exact: *account_vector_exact,
+            bonding_curve: *bonding_curve,
+            mint: *mint,
+            failure_reason: failure_reason.clone(),
+        });
+    }
+    Ok(candidates)
+}
+
+fn transaction_mutation_stats_v2(
+    inventory: &PumpExactStateTransactionInventoryV2,
+) -> Result<PumpExactStateTransactionMutationStatsV2> {
+    let mut stats = PumpExactStateTransactionMutationStatsV2::default();
+    for occurrence in &inventory.occurrences {
+        match &occurrence.class {
+            PumpExactStateOccurrenceClassV2::Unknown { .. } => {
+                stats.unknown_occurrence_count = stats
+                    .unknown_occurrence_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("V2 unknown-occurrence count overflow"))?;
+            }
+            PumpExactStateOccurrenceClassV2::Candidate {
+                instruction_payload_exact,
+                account_vector_exact,
+                ..
+            } => {
+                stats.candidate_count = stats
+                    .candidate_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("V2 candidate count overflow"))?;
+                if !instruction_payload_exact || !account_vector_exact {
+                    stats.malformed_candidate_count = stats
+                        .malformed_candidate_count
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("V2 malformed-candidate count overflow"))?;
+                }
+            }
+            PumpExactStateOccurrenceClassV2::ProvenNonReserve { .. }
+            | PumpExactStateOccurrenceClassV2::ValidatedEventTransport { .. } => {}
+        }
+    }
+    Ok(stats)
+}
+
+/// Establish the only curves that may contribute to the prospective
+/// qualification denominator.  This is a first pass over immutable raw, not a
+/// snapshot or a repair: it refuses to call a later Create a birth when the
+/// same rooted source evidence already observed that curve in warm-up or in a
+/// prior successful mutation. A structurally recognized Create establishes
+/// cohort membership even if it is later non-exact; otherwise a malformed
+/// birth could shrink the denominator that is supposed to expose it.
+fn build_prospective_birth_cohort_v2(
+    raw: &PumpExactStateRawTapeIndexV2,
+    semantics: &PumpExactStateSemanticsAuthorityV2,
+    anchors: &PumpExactStateAnchorIndexV2,
+    rooted_slots: &BTreeSet<u64>,
+    cohort_slots_strictly_after: u64,
+    transactions: &[PumpExactStateIndexedTransactionV2],
+) -> Result<PumpExactStateProspectiveBirthCohortV2> {
+    let mut cohort = PumpExactStateProspectiveBirthCohortV2 {
+        cohort_slots_strictly_after,
+        ..PumpExactStateProspectiveBirthCohortV2::default()
+    };
+
+    // A canonical warm-up account update is direct retained evidence that the
+    // curve predates the boundary; do not let a malformed/future Create relabel
+    // it as a prospective birth.
+    for (curve, curve_anchors) in &anchors.by_curve {
+        if curve_anchors
+            .iter()
+            .any(|anchor| anchor.canonical && anchor.slot <= cohort_slots_strictly_after)
+        {
+            cohort.pre_boundary_curve_activity.insert(*curve);
+        }
+    }
+
+    for indexed in transactions {
+        let transaction = raw.read_transaction(indexed)?;
+        let context = decode_v2_transaction_context(&transaction)?;
+        let inventory = inventory_v2_from_transaction_context(&context, semantics, anchors)?;
+        if inventory.slot != indexed.slot
+            || inventory.tx_index != indexed.tx_index
+            || inventory.signature != indexed.signature
+        {
+            bail!("V2 prospective-birth inventory identity differs from indexed raw transaction");
+        }
+        if !rooted_slots.contains(&inventory.slot) || !inventory.success {
+            continue;
+        }
+        let candidates = candidate_descriptors_v2(&inventory)?;
+        for candidate in candidates {
+            let Some(curve) = candidate.bonding_curve else {
+                continue;
+            };
+            if inventory.slot <= cohort_slots_strictly_after {
+                cohort.pre_boundary_curve_activity.insert(curve);
+            }
+            let candidate_order = candidate.order;
+            let first_candidate = cohort
+                .first_rooted_successful_candidate
+                .entry(curve)
+                .or_insert_with(|| candidate_order.clone());
+            if candidate_order < *first_candidate {
+                *first_candidate = candidate_order.clone();
+            }
+            if !matches!(
+                candidate.effect,
+                PumpExactStateInstructionEffectV2::SupportedExactCreate
+            ) {
+                continue;
+            }
+            cohort
+                .create_orders
+                .entry(curve)
+                .or_default()
+                .push(candidate_order);
+        }
+    }
+
+    for (curve, create_orders) in &cohort.create_orders {
+        let Some(first_candidate) = cohort.first_rooted_successful_candidate.get(curve) else {
+            bail!("V2 prospective-birth Create lacks its first-candidate record");
+        };
+        let first_create = create_orders
+            .iter()
+            .min()
+            .ok_or_else(|| anyhow::anyhow!("V2 prospective-birth curve has no Create order"))?;
+        // A repeated Create is a global ambiguity only if this curve could
+        // otherwise be admitted as a prospective birth.  A curve already
+        // observed in warm-up/pre-boundary evidence is typed out of scope;
+        // later source records for that old curve must not manufacture a
+        // prospective-cohort blocker.
+        if cohort.pre_boundary_curve_activity.contains(curve)
+            || first_candidate != first_create
+            || first_create.slot <= cohort_slots_strictly_after
+        {
+            continue;
+        }
+        if create_orders.len() != 1 {
+            cohort.conflicting_create_curves.insert(*curve);
+            continue;
+        }
+        cohort.births.insert(
+            *curve,
+            PumpExactStateProspectiveBirthEvidenceV2 {
+                order: first_create.clone(),
+            },
+        );
+    }
+    Ok(cohort)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6769,6 +7634,9 @@ mod tests {
             vendored_idl_digest: test_digest(),
             materializer_running_executable_digest: test_digest(),
             cohort_slots_strictly_after: 0,
+            qualification_scope: PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2.to_owned(),
+            prospective_birth_cohort_curve_count: 1,
+            conflicting_prospective_birth_curve_count: 0,
             rooted_canonical_slot_count: 1,
             filtered_pump_transaction_count: 2,
             full_block_pump_transaction_count: 2,
@@ -6787,6 +7655,13 @@ mod tests {
             successful_rooted_unknown_occurrence_count: 0,
             successful_rooted_malformed_candidate_count: 0,
             occurrence_ledger_reconciled: true,
+            successful_rooted_out_of_scope_pre_boundary_candidate_count: 0,
+            successful_rooted_out_of_scope_pre_existing_curve_candidate_count: 0,
+            successful_rooted_global_dependency_candidate_count: 0,
+            successful_rooted_unproven_post_boundary_curve_candidate_count: 0,
+            successful_rooted_unscoped_curve_mutation_candidate_count: 0,
+            candidate_scope_reconciled: true,
+            successful_rooted_scope_incomplete_occurrence_count: 0,
             successful_rooted_mutation_denominator: 1_000,
             exact_rooted_mutation_count: 999,
             explicit_non_exact_mutation_count: 1,
@@ -6813,6 +7688,7 @@ mod tests {
             materializer_running_executable_sha256: "11".repeat(32),
             materializer_running_executable_blake3: "22".repeat(32),
             materializer_running_executable_bytes: 1,
+            qualification_scope: PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2.to_owned(),
             exact_state_capability_artifact: receipt_digest.clone(),
             births_artifact: births.clone(),
             trajectories_artifact: trajectories.clone(),
@@ -6981,6 +7857,9 @@ mod tests {
             bonding_curve: Some(curve.clone()),
             mint: None,
             effect: "known_reserve_or_dependency_unsupported".to_owned(),
+            qualification_scope:
+                PumpExactStateCandidateQualificationScopeV2::ProspectiveBirthCohort,
+            counted_in_qualification_denominator: true,
             exact: false,
             non_exact_reason: Some("fixture".to_owned()),
         };
@@ -6995,6 +7874,25 @@ mod tests {
         assert!(
             outcome_blind_candidate_curve_v2(&unscoped).is_err(),
             "an unscoped non-exact candidate must block window export rather than disappear"
+        );
+    }
+
+    #[test]
+    fn known_reserve_or_dependency_without_curve_identity_is_unscoped_blocker() {
+        let cohort = PumpExactStateProspectiveBirthCohortV2 {
+            cohort_slots_strictly_after: 10,
+            ..PumpExactStateProspectiveBirthCohortV2::default()
+        };
+        assert_eq!(
+            cohort.candidate_scope(
+                true,
+                true,
+                11,
+                PumpExactStateInstructionEffectV2::KnownReserveOrDependencyUnsupported,
+                None,
+            ),
+            PumpExactStateCandidateQualificationScopeV2::UnscopedCurveMutationBlocker,
+            "a retained reserve/dependency candidate without a curve identity cannot be proven non-curve or out-of-scope"
         );
     }
 
@@ -7291,6 +8189,7 @@ mod tests {
                 success: true,
                 occurrence_count: 1,
                 candidate_count: 1,
+                cohort_candidate_count: 0,
                 exact_candidate_count: 0,
                 inventory_complete: false,
                 reason_codes: vec!["fixture".to_owned()],
@@ -7317,6 +8216,9 @@ mod tests {
                         vendored_idl_digest: test_digest(),
                         materializer_running_executable_digest: test_digest(),
                         cohort_slots_strictly_after: 0,
+                        qualification_scope: PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2.to_owned(),
+                        prospective_birth_cohort_curve_count: 0,
+                        conflicting_prospective_birth_curve_count: 0,
                         rooted_canonical_slot_count: 1,
                         filtered_pump_transaction_count: 1,
                         full_block_pump_transaction_count: 1,
@@ -7335,6 +8237,13 @@ mod tests {
                         successful_rooted_unknown_occurrence_count: 0,
                         successful_rooted_malformed_candidate_count: 0,
                         occurrence_ledger_reconciled: true,
+                        successful_rooted_out_of_scope_pre_boundary_candidate_count: 0,
+                        successful_rooted_out_of_scope_pre_existing_curve_candidate_count: 0,
+                        successful_rooted_global_dependency_candidate_count: 0,
+                        successful_rooted_unproven_post_boundary_curve_candidate_count: 0,
+                        successful_rooted_unscoped_curve_mutation_candidate_count: 0,
+                        candidate_scope_reconciled: true,
+                        successful_rooted_scope_incomplete_occurrence_count: 0,
                         successful_rooted_mutation_denominator: 1,
                         exact_rooted_mutation_count: 0,
                         explicit_non_exact_mutation_count: 1,
@@ -7362,6 +8271,7 @@ mod tests {
                         materializer_running_executable_sha256: "44".repeat(32),
                         materializer_running_executable_blake3: "55".repeat(32),
                         materializer_running_executable_bytes: 1,
+                        qualification_scope: PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2.to_owned(),
                         exact_state_capability_artifact: receipt,
                         births_artifact: births,
                         trajectories_artifact: trajectories,
@@ -7465,13 +8375,17 @@ mod tests {
                 success: true,
                 occurrence_count: 1,
                 candidate_count: 1,
+                cohort_candidate_count: 1,
                 exact_candidate_count: 1,
                 inventory_complete: true,
                 reason_codes: Vec::new(),
                 candidates: vec![PumpExactStateCandidateCoverageRecordV2 {
                     bonding_curve: Some(Pubkey::new_from_array([7; 32]).to_string()),
                     mint: None,
-                    effect: "supported_exact_trade".to_owned(),
+                    effect: "supported_exact_create".to_owned(),
+                    qualification_scope:
+                        PumpExactStateCandidateQualificationScopeV2::ProspectiveBirthCohort,
+                    counted_in_qualification_denominator: true,
                     exact: true,
                     non_exact_reason: None,
                 }],
@@ -7495,6 +8409,7 @@ mod tests {
                 success: true,
                 occurrence_count: 1,
                 candidate_count: 1,
+                cohort_candidate_count: 0,
                 exact_candidate_count: 0,
                 inventory_complete: false,
                 reason_codes: vec!["outside_rooted_capability_universe".to_owned()],
@@ -7502,6 +8417,8 @@ mod tests {
                     bonding_curve: Some(Pubkey::new_from_array([7; 32]).to_string()),
                     mint: None,
                     effect: "known_reserve_or_dependency_unsupported".to_owned(),
+                    qualification_scope: PumpExactStateCandidateQualificationScopeV2::OutsideRootedSuccessfulUniverse,
+                    counted_in_qualification_denominator: false,
                     exact: false,
                     non_exact_reason: Some("outside_rooted_capability_universe".to_owned()),
                 }],
@@ -7526,6 +8443,9 @@ mod tests {
                         vendored_idl_digest: test_digest(),
                         materializer_running_executable_digest: test_digest(),
                         cohort_slots_strictly_after: 0,
+                        qualification_scope: PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2.to_owned(),
+                        prospective_birth_cohort_curve_count: 1,
+                        conflicting_prospective_birth_curve_count: 0,
                         rooted_canonical_slot_count: 1,
                         filtered_pump_transaction_count: 2,
                         full_block_pump_transaction_count: 1,
@@ -7544,6 +8464,13 @@ mod tests {
                         successful_rooted_unknown_occurrence_count: 0,
                         successful_rooted_malformed_candidate_count: 0,
                         occurrence_ledger_reconciled: true,
+                        successful_rooted_out_of_scope_pre_boundary_candidate_count: 0,
+                        successful_rooted_out_of_scope_pre_existing_curve_candidate_count: 0,
+                        successful_rooted_global_dependency_candidate_count: 0,
+                        successful_rooted_unproven_post_boundary_curve_candidate_count: 0,
+                        successful_rooted_unscoped_curve_mutation_candidate_count: 0,
+                        candidate_scope_reconciled: true,
+                        successful_rooted_scope_incomplete_occurrence_count: 0,
                         successful_rooted_mutation_denominator: 1,
                         exact_rooted_mutation_count: 1,
                         explicit_non_exact_mutation_count: 0,
@@ -7571,6 +8498,7 @@ mod tests {
                         materializer_running_executable_sha256: "11".repeat(32),
                         materializer_running_executable_blake3: "22".repeat(32),
                         materializer_running_executable_bytes: 1,
+                        qualification_scope: PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2.to_owned(),
                         exact_state_capability_artifact: receipt,
                         births_artifact: births,
                         trajectories_artifact: trajectories,
