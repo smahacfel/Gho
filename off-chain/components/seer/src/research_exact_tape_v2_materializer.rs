@@ -1445,6 +1445,12 @@ struct PumpExactStateSlotNodeV2 {
     // evidence: a finalized Slot that omits its parent cannot borrow a parent
     // from a BlockMeta record or an earlier Processed/Confirmed Slot update.
     finalized_parents: BTreeSet<Option<u64>>,
+    // A Processed/Confirmed update is never parent authority. It does prove
+    // that this slot remains provisional at the captured end boundary, which
+    // lets the reconciler distinguish a normal finality-lag suffix from a
+    // completely absent Slot lane. A later finalized pair beyond such a
+    // suffix remains an interior evidence gap and fails closed.
+    saw_nonfinalized_slot: bool,
 }
 
 /// A pair of clocks taken from one admitted source update.  Monotonic time is
@@ -3794,11 +3800,19 @@ impl PumpExactStateRawRecordCollectorV2 {
         })
     }
 
-    /// Require a bijective BlockMeta/full-block pair for every executed block
-    /// record in the accepted cohort.  We deliberately do not require the
-    /// converse for arbitrary Slot updates: the Slot stream itself cannot
-    /// distinguish a skipped Solana slot from a provider omission.  It is
-    /// therefore never the forward-completeness watermark.
+    /// Require a bijective BlockMeta/full-block pair and one retained
+    /// parent-linked block chain for every executed-block record in the
+    /// accepted cohort. A bounded capture may naturally end with a suffix of
+    /// still-provisional slots; it cannot yet claim that suffix as finalized
+    /// availability, but it need not reinterpret it as a source loss. Such a
+    /// suffix is accepted only with retained non-finalized Slot evidence and
+    /// only after the complete finalized prefix. A later finalized block after
+    /// it is an interior finality-evidence gap and fails closed.
+    ///
+    /// We deliberately do not require the converse for arbitrary Slot
+    /// updates: the Slot stream itself cannot distinguish a skipped Solana
+    /// slot from a provider omission. It is therefore never the
+    /// forward-completeness watermark.
     fn reconciled_full_block_frontier(
         &self,
         cohort_slots_strictly_after: u64,
@@ -3813,8 +3827,11 @@ impl PumpExactStateRawRecordCollectorV2 {
         // numeric slots, but it cannot make a finalized child skip its actual
         // produced parent without leaving an evidence gap.
         let mut reconciled_blockhashes = BTreeMap::<u64, String>::new();
-        let mut chain_tip_slot: Option<u64> = None;
-        let mut chain_availability: Option<(PumpExactStateIngressTimestampV2, u64)> = None;
+        let mut retained_chain_tip_slot: Option<u64> = None;
+        let mut finalized_chain_tip_slot: Option<u64> = None;
+        let mut finalized_chain_availability: Option<(PumpExactStateIngressTimestampV2, u64)> =
+            None;
+        let mut provisional_finality_tail_started = false;
         for (slot, ledger) in &self.block_lanes_by_slot {
             if *slot <= cohort_slots_strictly_after {
                 continue;
@@ -3835,27 +3852,6 @@ impl PumpExactStateRawRecordCollectorV2 {
                 || meta.executed_transaction_count != full.executed_transaction_count
             {
                 bail!("V2 BlockMeta/full-block identity differs for accepted cohort slot {slot}");
-            }
-            // We do not require a BlockMeta/full-block pair for every Slot:
-            // a naked Slot can describe a legitimate skipped Solana slot.
-            // The converse is different.  Once both block lanes prove that a
-            // block executed, a matching finalized Slot is mandatory.  Without
-            // it, a real Pump transaction could be silently excluded from the
-            // rooted capability denominator merely because the Slot lane was
-            // lost.
-            let slot_node = slots.get(slot).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "V2 accepted cohort BlockMeta/full-block slot {slot} lacks finalized Slot evidence"
-                )
-            })?;
-            if slot_node.finalized_parents.len() != 1
-                || !slot_node
-                    .finalized_parents
-                    .contains(&Some(meta.parent_slot))
-            {
-                bail!(
-                    "V2 finalized Slot parent differs from BlockMeta/full-block identity for accepted cohort slot {slot}"
-                );
             }
             if meta.parent_slot >= *slot {
                 bail!(
@@ -3878,15 +3874,42 @@ impl PumpExactStateRawRecordCollectorV2 {
                         meta.parent_slot
                     );
                 }
-                if chain_tip_slot != Some(meta.parent_slot) {
+                if retained_chain_tip_slot != Some(meta.parent_slot) {
                     bail!(
                         "V2 accepted cohort BlockMeta/full-block slot {slot} does not extend the complete parent-linked chain tip {:?}",
-                        chain_tip_slot
+                        retained_chain_tip_slot
                     );
                 }
-            } else if chain_tip_slot.is_some() {
+            } else if retained_chain_tip_slot.is_some() {
                 bail!(
                     "V2 accepted cohort BlockMeta/full-block slot {slot} reconnects below the stream-readiness boundary instead of extending the complete parent-linked chain"
+                );
+            }
+            // A finalized parent value is a separate lane authority and must
+            // exactly match the block pair. A tail with no finalized update is
+            // accepted only when a retained Processed/Confirmed Slot proves
+            // it is a normal finality-lag suffix. A missing Slot record cannot
+            // be silently classified as a tail because it could be lane loss.
+            let slot_node = slots.get(slot);
+            let finalized_parent_matches = slot_node.is_some_and(|node| {
+                node.finalized_parents.len() == 1
+                    && node.finalized_parents.contains(&Some(meta.parent_slot))
+            });
+            if finalized_parent_matches {
+                if provisional_finality_tail_started {
+                    bail!(
+                        "V2 accepted cohort BlockMeta/full-block slot {slot} has finalized Slot evidence after a provisional-finality tail"
+                    );
+                }
+            } else if slot_node.is_some_and(|node| !node.finalized_parents.is_empty()) {
+                bail!(
+                    "V2 finalized Slot parent differs from BlockMeta/full-block identity for accepted cohort slot {slot}"
+                );
+            } else if slot_node.is_some_and(|node| node.saw_nonfinalized_slot) {
+                provisional_finality_tail_started = true;
+            } else {
+                bail!(
+                    "V2 accepted cohort BlockMeta/full-block slot {slot} lacks retained Slot evidence and cannot be classified as a provisional-finality tail"
                 );
             }
             // The availability frontier begins only when the second member of
@@ -3904,20 +3927,30 @@ impl PumpExactStateRawRecordCollectorV2 {
                 } else {
                     (full.ingress, full.source_capture_sequence)
                 };
-            if chain_availability.as_ref().is_none_or(|current| {
-                (pair_completed_ingress.monotonic_ms, pair_completed_sequence)
-                    > (current.0.monotonic_ms, current.1)
-            }) {
-                chain_availability = Some((pair_completed_ingress, pair_completed_sequence));
+            if finalized_parent_matches
+                && finalized_chain_availability.as_ref().is_none_or(|current| {
+                    (pair_completed_ingress.monotonic_ms, pair_completed_sequence)
+                        > (current.0.monotonic_ms, current.1)
+                })
+            {
+                finalized_chain_availability =
+                    Some((pair_completed_ingress, pair_completed_sequence));
             }
             reconciled_blockhashes.insert(*slot, meta.blockhash.clone());
-            chain_tip_slot = Some(*slot);
+            retained_chain_tip_slot = Some(*slot);
+            if finalized_parent_matches {
+                finalized_chain_tip_slot = Some(*slot);
+            }
         }
-        let slot = chain_tip_slot.ok_or_else(|| {
-            anyhow::anyhow!("V2 accepted cohort has no reconciled BlockMeta/full-block frontier")
+        let slot = finalized_chain_tip_slot.ok_or_else(|| {
+            anyhow::anyhow!(
+                "V2 accepted cohort has no finalized parent-linked BlockMeta/full-block frontier"
+            )
         })?;
-        let (ingress, _) = chain_availability.ok_or_else(|| {
-            anyhow::anyhow!("V2 accepted cohort parent-linked chain lacks availability evidence")
+        let (ingress, _) = finalized_chain_availability.ok_or_else(|| {
+            anyhow::anyhow!(
+                "V2 accepted cohort finalized parent-linked chain lacks availability evidence"
+            )
         })?;
         Ok((slot, ingress))
     }
@@ -4197,12 +4230,21 @@ impl PumpExactStateRawIndexBuilderV2 {
                     });
             }
             PumpExactStateRawRecordV2::PrimarySlotUpdate(update) => {
+                let slot_node = self.slots.entry(update.slot).or_default();
                 if update.source_status == CommitmentLevel::Finalized as i32 {
-                    self.slots
-                        .entry(update.slot)
-                        .or_default()
-                        .finalized_parents
-                        .insert(update.parent);
+                    slot_node.finalized_parents.insert(update.parent);
+                } else if update.source_status == CommitmentLevel::Processed as i32
+                    || update.source_status == CommitmentLevel::Confirmed as i32
+                {
+                    // A retained provisional Slot may establish only that a
+                    // finality-lag tail is observed. Its parent is never used
+                    // as authority for a rooted block or block-chain edge.
+                    slot_node.saw_nonfinalized_slot = true;
+                } else {
+                    bail!(
+                        "V2 Slot update has unsupported commitment status {}",
+                        update.source_status
+                    );
                 }
             }
             // BlockMeta parentage belongs exclusively to the independently
@@ -5625,6 +5667,13 @@ mod tests {
         node
     }
 
+    fn provisional_slot_node() -> PumpExactStateSlotNodeV2 {
+        PumpExactStateSlotNodeV2 {
+            saw_nonfinalized_slot: true,
+            ..PumpExactStateSlotNodeV2::default()
+        }
+    }
+
     fn reconciled_block_pair(
         parent_slot: u64,
         blockhash: &str,
@@ -5686,6 +5735,65 @@ mod tests {
         assert_eq!(frontier_slot, 105);
         assert_eq!(frontier_ingress.monotonic_ms, 3_000);
         assert_eq!(frontier_ingress.wall_ms, 3_000);
+    }
+
+    #[test]
+    fn reconciled_frontier_stops_at_a_retained_provisional_finality_tail() {
+        let mut collector = PumpExactStateRawRecordCollectorV2::default();
+        let mut slots = BTreeMap::new();
+        slots.insert(103, finalized_slot_node(102));
+        slots.insert(104, finalized_slot_node(103));
+        // A bounded source can close after a Processed/Confirmed update but
+        // before this produced slot's Finalized update. This proves a
+        // provisional suffix, not a finalized rooted block.
+        slots.insert(105, provisional_slot_node());
+
+        collector.block_lanes_by_slot.insert(
+            103,
+            reconciled_block_pair(102, "hash-103", "hash-102", 1_000, 1),
+        );
+        collector.block_lanes_by_slot.insert(
+            104,
+            reconciled_block_pair(103, "hash-104", "hash-103", 2_000, 2),
+        );
+        collector.block_lanes_by_slot.insert(
+            105,
+            reconciled_block_pair(104, "hash-105", "hash-104", 3_000, 3),
+        );
+
+        let (frontier_slot, frontier_ingress) = collector
+            .reconciled_full_block_frontier(102, &slots)
+            .expect("a retained provisional suffix must not invalidate the finalized prefix");
+        assert_eq!(frontier_slot, 104);
+        assert_eq!(frontier_ingress.monotonic_ms, 2_000);
+    }
+
+    #[test]
+    fn reconciled_frontier_rejects_a_finalized_pair_after_a_provisional_tail() {
+        let mut collector = PumpExactStateRawRecordCollectorV2::default();
+        let mut slots = BTreeMap::new();
+        slots.insert(103, finalized_slot_node(102));
+        slots.insert(104, provisional_slot_node());
+        slots.insert(105, finalized_slot_node(104));
+
+        collector.block_lanes_by_slot.insert(
+            103,
+            reconciled_block_pair(102, "hash-103", "hash-102", 1_000, 1),
+        );
+        collector.block_lanes_by_slot.insert(
+            104,
+            reconciled_block_pair(103, "hash-104", "hash-103", 2_000, 2),
+        );
+        collector.block_lanes_by_slot.insert(
+            105,
+            reconciled_block_pair(104, "hash-105", "hash-104", 3_000, 3),
+        );
+
+        assert!(collector
+            .reconciled_full_block_frontier(102, &slots)
+            .is_err_and(|error| error
+                .to_string()
+                .contains("finalized Slot evidence after a provisional-finality tail")));
     }
 
     #[test]

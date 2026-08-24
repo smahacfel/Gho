@@ -5232,6 +5232,7 @@ mod tests {
         WrongEventQuoteMint,
         WrongEventCanonicalReserve,
         WarmupAndUnreconciledTailInvocationSkew,
+        ProvisionalFinalityTail,
     }
 
     #[derive(Clone, Copy)]
@@ -6128,6 +6129,10 @@ mod tests {
             variant,
             QualifiedExportFixtureVariantV2::WarmupAndUnreconciledTailInvocationSkew
         );
+        let provisional_finality_tail = matches!(
+            variant,
+            QualifiedExportFixtureVariantV2::ProvisionalFinalityTail
+        );
         let warmup_filtered_transaction = if skew_warmup_and_tail_invocations {
             fixture_account_include_only_transaction_v2(pre_cohort_buy.clone())
         } else {
@@ -6453,6 +6458,37 @@ mod tests {
                 "write fixture unreconciled tail Pump transaction"
             );
         }
+        if provisional_finality_tail {
+            let tail_slot = forward_slot
+                .checked_add(1)
+                .expect("fixture provisional-finality tail slot overflow");
+            // The Slot lane explicitly reports this produced block as
+            // Processed, but the fixture closes before it becomes Finalized.
+            // It is auditable tail evidence, never a rooted capability slot;
+            // the preceding finalized full-block pair remains the frontier.
+            write_fixture_source!(
+                fixture_slot_source_with_parent_and_status_v2(
+                    tail_slot,
+                    Some(forward_slot),
+                    CommitmentLevel::Processed as i32,
+                    241_001,
+                ),
+                "write fixture provisional-finality tail Slot evidence"
+            );
+            write_fixture_source!(
+                fixture_block_meta_source_with_transaction_count_v2(
+                    tail_slot,
+                    forward_slot,
+                    0,
+                    241_001,
+                ),
+                "write fixture provisional-finality tail BlockMeta evidence"
+            );
+            write_fixture_source!(
+                fixture_empty_full_block_source_v2(tail_slot, forward_slot, 241_001),
+                "write fixture provisional-finality tail full-block evidence"
+            );
+        }
         if fixture_projection_corruption_for_variant_v2(variant).is_some() {
             assert!(
                 projection_corruption_applied,
@@ -6484,11 +6520,13 @@ mod tests {
             | QualifiedExportFixtureVariantV2::OmitWholeBuyBlock => 3,
             QualifiedExportFixtureVariantV2::ProcessedParentThenFinalizedParentNone
             | QualifiedExportFixtureVariantV2::ConflictingFinalizedSlotParents => 5,
+            QualifiedExportFixtureVariantV2::ProvisionalFinalityTail => 5,
             _ => 4,
         };
         required_lane_census.block_meta_updates = match variant {
             QualifiedExportFixtureVariantV2::SlotOnlyForwardWatermark
             | QualifiedExportFixtureVariantV2::OmitWholeBuyBlock => 3,
+            QualifiedExportFixtureVariantV2::ProvisionalFinalityTail => 5,
             _ => 4,
         };
         let program_data = fixture_program_data_receipt_v2(semantics, 102);
@@ -7015,6 +7053,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn public_prxtape3_uses_the_last_finalized_pair_before_a_provisional_tail() {
+        let temporary = tempdir().expect("temporary V2 provisional-tail fixture root");
+        let semantics_path = prospective_v2_semantics_manifest_path_for_test();
+        let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
+            .expect("real vendored V2 semantics must load for provisional-tail fixture");
+        let raw_dir = temporary.path().join("provisional-tail-raw-v2");
+        let exact_dir = temporary.path().join("provisional-tail-exact-v2");
+        let windows_dir = temporary.path().join("provisional-tail-windows-v2");
+        write_complete_raw_fixture_for_qualified_export_v2(
+            &raw_dir,
+            "provisional-finality-tail-public-fixture",
+            &semantics,
+            QualifiedExportFixtureVariantV2::ProvisionalFinalityTail,
+        );
+
+        let summary =
+            qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
+                .expect("a retained non-finalized tail must not invalidate the finalized prefix");
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+        assert_eq!(summary.successful_rooted_mutation_denominator, 2);
+        let exported = export_prospective_exact_state_outcome_blind_windows_v2(
+            &raw_dir,
+            &semantics_path,
+            &exact_dir,
+            &windows_dir,
+        )
+        .expect("the preceding finalized frontier must remain eligible for outcome-blind export");
+        assert_eq!(exported.complete_window_count, 1);
+        assert!(exact_dir.join("exact_state_capability_v2.json").is_file());
+        assert!(windows_dir.join("outcome_blind_windows_v2.jsonl").is_file());
+        assert!(
+            !temporary
+                .path()
+                .join(".provisional-tail-exact-v2.partial")
+                .exists(),
+            "public qualifier must not leave a partial exact artifact"
+        );
+        assert!(
+            !temporary
+                .path()
+                .join(".provisional-tail-windows-v2.partial")
+                .exists(),
+            "public exporter must not leave a partial window artifact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn public_prxtape3_intermediate_rollover_footer_qualifies_as_a_complete_chain() {
         let temporary = tempdir().expect("temporary V2 rollover-chain fixture root");
         let semantics_path = prospective_v2_semantics_manifest_path_for_test();
@@ -7446,12 +7532,12 @@ mod tests {
         let error =
             qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
                 .expect_err(
-                    "a known executed block without a finalized Slot must not shrink the rooted denominator",
+                    "a known executed block without any Slot evidence must not be relabeled as a provisional tail",
                 );
         assert!(
             error
                 .to_string()
-                .contains("BlockMeta/full-block slot 105 lacks finalized Slot evidence"),
+                .contains("BlockMeta/full-block slot 105 lacks retained Slot evidence"),
             "unexpected raw-authority error: {error:#}"
         );
         assert!(
