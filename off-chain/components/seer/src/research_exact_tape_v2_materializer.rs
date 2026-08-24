@@ -65,7 +65,7 @@ const V2_WINDOW_EXPORT_MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 // global, while strategy authority is limited to curves whose first rooted
 // successful mutation is a structurally recognized Create/CreateV2 after the
 // persisted readiness boundary.
-const PUMP_EXACT_STATE_WINDOW_EXPORT_SCHEMA_VERSION_V2: u16 = 4;
+const PUMP_EXACT_STATE_WINDOW_EXPORT_SCHEMA_VERSION_V2: u16 = 5;
 const PUMP_EXACT_STATE_WINDOW_OBSERVATION_MS_V2: u64 = 150_000;
 const PUMP_EXACT_STATE_WINDOW_FORWARD_MS_V2: u64 = 90_000;
 /// Extra space reserved for the three JSONL streams and two JSON authority
@@ -73,12 +73,12 @@ const PUMP_EXACT_STATE_WINDOW_FORWARD_MS_V2: u64 = 90_000;
 /// sized from the immutable receipt set rather than from a mutable directory
 /// walk or the capture-time maximum budget.
 const V2_QUALIFICATION_METADATA_ALLOWANCE_BYTES: u64 = 64 * 1024 * 1024;
-const PUMP_EXACT_STATE_CAPABILITY_SCHEMA_VERSION_V2: u16 = 4;
-const PUMP_EXACT_STATE_EXACT_OUTPUT_SCHEMA_VERSION_V2: u16 = 3;
+const PUMP_EXACT_STATE_CAPABILITY_SCHEMA_VERSION_V2: u16 = 5;
+const PUMP_EXACT_STATE_EXACT_OUTPUT_SCHEMA_VERSION_V2: u16 = 4;
 const PUMP_EXACT_STATE_REQUIRED_COVERAGE_PPM_V2: u64 = 999_000;
 const PUMP_EXACT_STATE_MIN_QUALIFICATION_COHORT_ELAPSED_MS_V2: u64 = 1_800_000;
 const PUMP_EXACT_STATE_MIN_QUALIFICATION_MUTATION_DENOMINATOR_V2: u64 = 10_000;
-const PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2: &str = "prospective_birth_cohort_v1";
+const PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2: &str = "prospective_birth_cohort_v2";
 
 /// The result of the pre-semantic V2 raw authority check.  It is intentionally
 /// narrow: exact-state qualification will add account, mutation, and coverage
@@ -122,7 +122,6 @@ pub enum PumpExactStateCapabilityBlockerV2 {
     CanonicalSlotEvidenceMissing,
     QualificationRunBelowMinimum,
     GlobalDependencyMutationObserved,
-    UnprovenPostBoundaryCurveMutationObserved,
     RawAuthorityRevalidationFailed,
 }
 
@@ -226,7 +225,6 @@ enum PumpExactStateCandidateQualificationScopeV2 {
     PreExistingCurveOutOfScope,
     ProspectiveBirthCohort,
     GlobalDependencyBlocker,
-    UnprovenPostBoundaryCurveMutationBlocker,
     UnscopedCurveMutationBlocker,
 }
 
@@ -300,7 +298,6 @@ struct PumpExactStateCapabilityReceiptV2 {
     successful_rooted_out_of_scope_pre_boundary_candidate_count: u64,
     successful_rooted_out_of_scope_pre_existing_curve_candidate_count: u64,
     successful_rooted_global_dependency_candidate_count: u64,
-    successful_rooted_unproven_post_boundary_curve_candidate_count: u64,
     successful_rooted_unscoped_curve_mutation_candidate_count: u64,
     candidate_scope_reconciled: bool,
     successful_rooted_scope_incomplete_occurrence_count: u64,
@@ -779,7 +776,6 @@ pub fn export_prospective_exact_state_outcome_blind_windows_v2(
                         }
                     }
                     PumpExactStateCandidateQualificationScopeV2::GlobalDependencyBlocker
-                    | PumpExactStateCandidateQualificationScopeV2::UnprovenPostBoundaryCurveMutationBlocker
                     | PumpExactStateCandidateQualificationScopeV2::UnscopedCurveMutationBlocker => {
                         bail!(
                             "V2 outcome-blind export refuses a globally blocking coverage candidate"
@@ -1627,11 +1623,6 @@ fn validate_exact_output_receipt_v2(
                 value.checked_add(receipt.successful_rooted_global_dependency_candidate_count)
             })
             .and_then(|value| {
-                value.checked_add(
-                    receipt.successful_rooted_unproven_post_boundary_curve_candidate_count,
-                )
-            })
-            .and_then(|value| {
                 value.checked_add(receipt.successful_rooted_unscoped_curve_mutation_candidate_count)
             })
             != Some(receipt.successful_rooted_candidate_count)
@@ -1642,7 +1633,6 @@ fn validate_exact_output_receipt_v2(
             != Some(receipt.successful_rooted_mutation_denominator)
         || receipt.successful_rooted_scope_incomplete_occurrence_count != 0
         || receipt.successful_rooted_global_dependency_candidate_count != 0
-        || receipt.successful_rooted_unproven_post_boundary_curve_candidate_count != 0
         || receipt.successful_rooted_unscoped_curve_mutation_candidate_count != 0
         || receipt.account_decode_failure_count != 0
         || receipt.unknown_pump_owned_account_count != 0
@@ -1698,7 +1688,6 @@ fn validate_qualified_coverage_scope_v2(
     let mut pre_boundary_candidate_count = 0u64;
     let mut pre_existing_curve_candidate_count = 0u64;
     let mut global_dependency_candidate_count = 0u64;
-    let mut unproven_post_boundary_curve_candidate_count = 0u64;
     let mut unscoped_curve_candidate_count = 0u64;
 
     visit_pinned_jsonl_v2(
@@ -1786,11 +1775,6 @@ fn validate_qualified_coverage_scope_v2(
                             .checked_add(1)
                             .ok_or_else(|| anyhow::anyhow!("V2 global dependency coverage count overflow"))?;
                     }
-                    PumpExactStateCandidateQualificationScopeV2::UnprovenPostBoundaryCurveMutationBlocker => {
-                        unproven_post_boundary_curve_candidate_count = unproven_post_boundary_curve_candidate_count
-                            .checked_add(1)
-                            .ok_or_else(|| anyhow::anyhow!("V2 unproven post-boundary curve coverage count overflow"))?;
-                    }
                     PumpExactStateCandidateQualificationScopeV2::UnscopedCurveMutationBlocker => {
                         unscoped_curve_candidate_count = unscoped_curve_candidate_count
                             .checked_add(1)
@@ -1820,8 +1804,6 @@ fn validate_qualified_coverage_scope_v2(
             != receipt.successful_rooted_out_of_scope_pre_existing_curve_candidate_count
         || global_dependency_candidate_count
             != receipt.successful_rooted_global_dependency_candidate_count
-        || unproven_post_boundary_curve_candidate_count
-            != receipt.successful_rooted_unproven_post_boundary_curve_candidate_count
         || unscoped_curve_candidate_count
             != receipt.successful_rooted_unscoped_curve_mutation_candidate_count
     {
@@ -2952,15 +2934,17 @@ impl PumpExactStateProspectiveBirthCohortV2 {
         if self.births.contains_key(&curve) {
             return PumpExactStateCandidateQualificationScopeV2::ProspectiveBirthCohort;
         }
-        if self.pre_boundary_curve_activity.contains(&curve) {
-            return PumpExactStateCandidateQualificationScopeV2::PreExistingCurveOutOfScope;
-        }
-        // A post-boundary curve that has neither a retained pre-boundary
-        // predecessor nor an unambiguous observed Create cannot be labelled
-        // pre-existing.  It might instead be a missed/malformed prospective
-        // birth, so excluding its mutations would shrink the cohort
-        // denominator without proof.
-        PumpExactStateCandidateQualificationScopeV2::UnprovenPostBoundaryCurveMutationBlocker
+        // The source universe is complete from the sealed readiness boundary:
+        // every Pump invocation is retained in both the filtered and
+        // unfiltered full-block lanes.  Therefore a curve with no structural
+        // Create/CreateV2 in that immutable post-boundary source cannot be a
+        // member of this *prospective birth* cohort.  This is a scope decision,
+        // not a reconstructed account state: a structurally recognized but
+        // malformed Create is still placed in `births` above and remains in
+        // the denominator; an unknown Pump occurrence remains a global
+        // occurrence-conservation blocker.  A known curve mutation with no
+        // observed birth is retained, typed, and out of scope.
+        PumpExactStateCandidateQualificationScopeV2::PreExistingCurveOutOfScope
     }
 
     fn is_selected_birth(&self, curve: Pubkey, order: &PumpExactStateCandidateOrderV2) -> bool {
@@ -3440,12 +3424,6 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                             .checked_add(1)
                             .ok_or_else(|| anyhow::anyhow!("V2 global-dependency candidate census overflow"))?;
                     }
-                    PumpExactStateCandidateQualificationScopeV2::UnprovenPostBoundaryCurveMutationBlocker => {
-                        counters.successful_rooted_unproven_post_boundary_curve_candidate_count = counters
-                            .successful_rooted_unproven_post_boundary_curve_candidate_count
-                            .checked_add(1)
-                            .ok_or_else(|| anyhow::anyhow!("V2 unproven post-boundary curve candidate census overflow"))?;
-                    }
                     PumpExactStateCandidateQualificationScopeV2::UnscopedCurveMutationBlocker => {
                         counters.successful_rooted_unscoped_curve_mutation_candidate_count = counters
                             .successful_rooted_unscoped_curve_mutation_candidate_count
@@ -3461,7 +3439,6 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                         scope,
                             PumpExactStateCandidateQualificationScopeV2::ProspectiveBirthCohort
                             | PumpExactStateCandidateQualificationScopeV2::GlobalDependencyBlocker
-                            | PumpExactStateCandidateQualificationScopeV2::UnprovenPostBoundaryCurveMutationBlocker
                             | PumpExactStateCandidateQualificationScopeV2::UnscopedCurveMutationBlocker
                     )
                 {
@@ -3622,11 +3599,6 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                 value.checked_add(counters.successful_rooted_global_dependency_candidate_count)
             })
             .and_then(|value| {
-                value.checked_add(
-                    counters.successful_rooted_unproven_post_boundary_curve_candidate_count,
-                )
-            })
-            .and_then(|value| {
                 value
                     .checked_add(counters.successful_rooted_unscoped_curve_mutation_candidate_count)
             })
@@ -3727,8 +3699,6 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                     .successful_rooted_out_of_scope_pre_existing_curve_candidate_count,
                 successful_rooted_global_dependency_candidate_count: counters
                     .successful_rooted_global_dependency_candidate_count,
-                successful_rooted_unproven_post_boundary_curve_candidate_count: counters
-                    .successful_rooted_unproven_post_boundary_curve_candidate_count,
                 successful_rooted_unscoped_curve_mutation_candidate_count: counters
                     .successful_rooted_unscoped_curve_mutation_candidate_count,
                 candidate_scope_reconciled: counters.candidate_scope_reconciled,
@@ -3844,7 +3814,6 @@ struct PumpExactStateQualificationCountersV2 {
     successful_rooted_out_of_scope_pre_boundary_candidate_count: u64,
     successful_rooted_out_of_scope_pre_existing_curve_candidate_count: u64,
     successful_rooted_global_dependency_candidate_count: u64,
-    successful_rooted_unproven_post_boundary_curve_candidate_count: u64,
     successful_rooted_unscoped_curve_mutation_candidate_count: u64,
     candidate_scope_reconciled: bool,
     successful_rooted_scope_incomplete_occurrence_count: u64,
@@ -3997,10 +3966,6 @@ fn capability_blockers_v2(
     }
     if counters.successful_rooted_global_dependency_candidate_count != 0 {
         blockers.insert(PumpExactStateCapabilityBlockerV2::GlobalDependencyMutationObserved);
-    }
-    if counters.successful_rooted_unproven_post_boundary_curve_candidate_count != 0 {
-        blockers
-            .insert(PumpExactStateCapabilityBlockerV2::UnprovenPostBoundaryCurveMutationObserved);
     }
     if counters.successful_rooted_unscoped_curve_mutation_candidate_count != 0 {
         blockers.insert(PumpExactStateCapabilityBlockerV2::MutationInventoryIncomplete);
@@ -7658,7 +7623,6 @@ mod tests {
             successful_rooted_out_of_scope_pre_boundary_candidate_count: 0,
             successful_rooted_out_of_scope_pre_existing_curve_candidate_count: 0,
             successful_rooted_global_dependency_candidate_count: 0,
-            successful_rooted_unproven_post_boundary_curve_candidate_count: 0,
             successful_rooted_unscoped_curve_mutation_candidate_count: 0,
             candidate_scope_reconciled: true,
             successful_rooted_scope_incomplete_occurrence_count: 0,
@@ -8240,7 +8204,6 @@ mod tests {
                         successful_rooted_out_of_scope_pre_boundary_candidate_count: 0,
                         successful_rooted_out_of_scope_pre_existing_curve_candidate_count: 0,
                         successful_rooted_global_dependency_candidate_count: 0,
-                        successful_rooted_unproven_post_boundary_curve_candidate_count: 0,
                         successful_rooted_unscoped_curve_mutation_candidate_count: 0,
                         candidate_scope_reconciled: true,
                         successful_rooted_scope_incomplete_occurrence_count: 0,
@@ -8467,7 +8430,6 @@ mod tests {
                         successful_rooted_out_of_scope_pre_boundary_candidate_count: 0,
                         successful_rooted_out_of_scope_pre_existing_curve_candidate_count: 0,
                         successful_rooted_global_dependency_candidate_count: 0,
-                        successful_rooted_unproven_post_boundary_curve_candidate_count: 0,
                         successful_rooted_unscoped_curve_mutation_candidate_count: 0,
                         candidate_scope_reconciled: true,
                         successful_rooted_scope_incomplete_occurrence_count: 0,

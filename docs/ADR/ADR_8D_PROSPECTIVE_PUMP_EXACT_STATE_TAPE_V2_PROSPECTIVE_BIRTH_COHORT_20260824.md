@@ -2,7 +2,13 @@
 
 **Data:** 2026-08-24
 
-**Status:** IMPLEMENTED / SELF-REVIEW PASS / IMMUTABLE RAW UNCHANGED / ONE OFFLINE REQUALIFICATION PENDING
+**Status:** SUPERSEDED IN SCOPE by
+[`ADR_8D_PROSPECTIVE_PUMP_EXACT_STATE_TAPE_V2_NO_OBSERVED_CREATE_OUT_OF_SCOPE_20260824.md`](ADR_8D_PROSPECTIVE_PUMP_EXACT_STATE_TAPE_V2_NO_OBSERVED_CREATE_OUT_OF_SCOPE_20260824.md)
+
+This ADR remains the historical record of the first prospective-birth-cohort
+revision. Its prior treatment of a post-boundary trade without a retained
+warm-up predecessor as a global blocker is replaced by the later, narrower
+scope correction.
 
 **Typ:** ADR-8D / standalone prospective V2 offline qualifier / fail-closed prospective-birth scope
 
@@ -75,10 +81,6 @@ curve'ów. Coverage JSONL zapisuje dla każdego candidate jeden typed scope:
   potwierdzonej canonical anchor albo rooted candidate przed boundary;
 - `global_dependency_blocker` — globalny dependency mutation, który nadal
   blokuje capability;
-- `unproven_post_boundary_curve_mutation_blocker` — post-boundary mutation z
-  curve identity, ale bez retained pre-boundary evidence i bez jednoznacznego
-  observed Create; nie może zostać relabelled jako pre-existing, ponieważ
-  mogłaby należeć do pominiętego lub malformed prospective birth;
 - `unscoped_curve_mutation_blocker` — każdy candidate bez bezpiecznej curve
   identity; `KnownReserveOrDependencyUnsupported` nie jest dowodem, że
   mutation jest non-curve, więc również pozostaje blockerem;
@@ -100,8 +102,7 @@ Następujące warunki nadal blokują capability niezależnie od cohort coverage:
 - global occurrence conservation;
 - full-block/filter reconciliation oraz parent-linked finalized frontier;
 - unknown/malformed occurrence w cohort, unscoped curve mutation lub
-  curve o nieudowodnionym post-boundary birth albo otherwise unclassifiable
-  rooted successful source evidence;
+  otherwise unclassifiable rooted successful source evidence;
 - każde `global_dependency_mutation`;
 - ambiguous/repeated prospective Create;
 - exact coverage poniżej `999000 ppm`, brak exact birth, trajectory albo
@@ -153,9 +154,10 @@ Publiczne fixturey oparte na rzeczywistym writerze i qualifierze pokrywają:
 7. unknown Pump occurrence obok znanego trade starej curve pozostaje globalnym
    `MutationInventoryIncomplete`; typed scope znanego candidate nie może
    przykryć niezidentyfikowanej mutation.
-8. post-boundary Buy curve bez retained pre-boundary evidence i bez observed
-   Create publikuje typed Blocked receipt; nie może zostać zaklasyfikowany jako
-   `pre_existing_curve_out_of_scope` ani zmniejszyć denominatora.
+8. Zastąpione przez późniejszą korektę scope: brak observed Create w pełnym
+   prospective source oznacza typed out-of-scope, przy zachowaniu globalnego
+   occurrence ledgera oraz blockerów dla unknown, malformed prospective Create
+   i global dependency.
 
 ## D5. Zakres wyłączony
 

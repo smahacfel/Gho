@@ -5238,7 +5238,7 @@ mod tests {
         QualifiedWithMessageWritableEventAuthority,
         QualifiedWithPostBoundaryLegacyCurveTrade,
         QualifiedWithRepeatedPostBoundaryLegacyCurveCreate,
-        PostBoundaryCurveWithoutProvenBirth,
+        PostBoundaryCurveWithoutObservedCreate,
         PreExistingCurveTradeWithUnknownPumpOccurrence,
         GlobalDependencyMutation,
     }
@@ -6206,8 +6206,8 @@ mod tests {
         let legacy_mint = Pubkey::new_from_array([59; 32]);
         let curve = Pubkey::new_from_array([61; 32]);
         let mint = Pubkey::new_from_array([62; 32]);
-        let unproven_curve = Pubkey::new_from_array([65; 32]);
-        let unproven_mint = Pubkey::new_from_array([66; 32]);
+        let no_observed_create_curve = Pubkey::new_from_array([65; 32]);
+        let no_observed_create_mint = Pubkey::new_from_array([66; 32]);
         let user = Pubkey::new_from_array([63; 32]);
         let creator = Pubkey::new_from_array([64; 32]);
         let quote_mint = Pubkey::default();
@@ -6321,9 +6321,9 @@ mod tests {
         } else {
             Vec::new()
         };
-        let post_boundary_curve_without_proven_birth = matches!(
+        let post_boundary_curve_without_observed_create = matches!(
             variant,
-            QualifiedExportFixtureVariantV2::PostBoundaryCurveWithoutProvenBirth
+            QualifiedExportFixtureVariantV2::PostBoundaryCurveWithoutObservedCreate
         )
         .then(|| {
             fixture_exact_instruction_info_v2(
@@ -6333,8 +6333,8 @@ mod tests {
                 fixture_buy_payload_v2(),
                 4,
                 1,
-                unproven_curve,
-                unproven_mint,
+                no_observed_create_curve,
+                no_observed_create_mint,
                 user,
                 false,
             )
@@ -6428,8 +6428,10 @@ mod tests {
             buy_full_block_transactions.push(legacy_trade.clone());
         }
         buy_full_block_transactions.extend(post_boundary_legacy_curve_creates.iter().cloned());
-        if let Some(unproven_curve_trade) = &post_boundary_curve_without_proven_birth {
-            buy_full_block_transactions.push(unproven_curve_trade.clone());
+        if let Some(curve_without_observed_create_trade) =
+            &post_boundary_curve_without_observed_create
+        {
+            buy_full_block_transactions.push(curve_without_observed_create_trade.clone());
         }
         if let Some(global_dependency) = &global_dependency_mutation {
             buy_full_block_transactions.push(global_dependency.clone());
@@ -6590,10 +6592,16 @@ mod tests {
                     "write fixture repeated post-boundary legacy-curve Create transaction"
                 );
             }
-            if let Some(unproven_curve_trade) = &post_boundary_curve_without_proven_birth {
+            if let Some(curve_without_observed_create_trade) =
+                &post_boundary_curve_without_observed_create
+            {
                 write_fixture_source!(
-                    fixture_transaction_source_v2(unproven_curve_trade.clone(), buy_slot, 150_999),
-                    "write fixture post-boundary curve without proven birth transaction"
+                    fixture_transaction_source_v2(
+                        curve_without_observed_create_trade.clone(),
+                        buy_slot,
+                        150_999
+                    ),
+                    "write fixture post-boundary curve without observed Create transaction"
                 );
             }
             if let Some(global_dependency) = &global_dependency_mutation {
@@ -6803,7 +6811,7 @@ mod tests {
                 })
                 .and_then(|count| {
                     count.checked_add(u64::from(
-                        post_boundary_curve_without_proven_birth.is_some(),
+                        post_boundary_curve_without_observed_create.is_some(),
                     ))
                 })
                 .expect("fixture optional transaction count does not overflow");
@@ -7292,7 +7300,7 @@ mod tests {
         );
         assert_eq!(
             qualified_receipt["qualification_scope"],
-            serde_json::json!("prospective_birth_cohort_v1"),
+            serde_json::json!("prospective_birth_cohort_v2"),
             "the exact artifact must bind the prospective-birth denominator contract"
         );
         assert_eq!(
@@ -7590,51 +7598,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn public_prxtape3_post_boundary_curve_without_proven_birth_blocks_qualification() {
-        let temporary = tempdir().expect("temporary V2 unproven-birth fixture root");
+    fn public_prxtape3_post_boundary_trade_without_observed_create_is_typed_out_of_scope() {
+        let temporary = tempdir().expect("temporary V2 no-observed-birth fixture root");
         let semantics_path = prospective_v2_semantics_manifest_path_for_test();
         let semantics = load_pump_exact_state_semantics_authority_v2(&semantics_path)
-            .expect("real vendored V2 semantics must load for unproven-birth fixture");
-        let raw_dir = temporary.path().join("unproven-birth-curve-raw-v2");
-        let exact_dir = temporary.path().join("unproven-birth-curve-exact-v2");
+            .expect("real vendored V2 semantics must load for no-observed-birth fixture");
+        let raw_dir = temporary.path().join("no-observed-birth-curve-raw-v2");
+        let exact_dir = temporary.path().join("no-observed-birth-curve-exact-v2");
         write_complete_raw_fixture_for_qualified_export_v2(
             &raw_dir,
-            "post-boundary-curve-without-proven-birth-fixture",
+            "post-boundary-curve-without-observed-create-fixture",
             &semantics,
-            QualifiedExportFixtureVariantV2::PostBoundaryCurveWithoutProvenBirth,
+            QualifiedExportFixtureVariantV2::PostBoundaryCurveWithoutObservedCreate,
         );
 
         let summary =
             qualify_prospective_exact_state_raw_run_v2(&raw_dir, &semantics_path, &exact_dir)
-                .expect("unproven post-boundary curve must yield a typed Blocked receipt");
-        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Blocked);
-        assert!(
-            summary
-                .blockers
-                .contains(&PumpExactStateCapabilityBlockerV2::UnprovenPostBoundaryCurveMutationObserved),
-            "a curve without retained pre-boundary evidence or an observed Create cannot be relabelled pre-existing"
-        );
+                .expect(
+                "post-boundary trade without an observed Create must remain offline-qualifiable",
+            );
+        assert_eq!(summary.status, PumpExactStateCapabilityStatusV2::Qualified);
+        assert_eq!(summary.successful_rooted_mutation_denominator, 2);
+        assert_eq!(summary.exact_rooted_mutation_count, 2);
 
         let receipt: serde_json::Value = serde_json::from_slice(
             &fs::read(exact_dir.join("exact_state_capability_v2.json"))
-                .expect("read unproven-birth receipt"),
+                .expect("read no-observed-birth receipt"),
         )
-        .expect("parse unproven-birth receipt");
+        .expect("parse no-observed-birth receipt");
         assert_eq!(
-            receipt["successful_rooted_unproven_post_boundary_curve_candidate_count"],
-            serde_json::json!(1u64)
+            receipt["successful_rooted_candidate_count"],
+            serde_json::json!(4u64),
+            "the post-boundary trade remains in the global rooted-successful candidate census"
         );
         assert_eq!(
-            receipt["successful_rooted_mutation_denominator"],
-            serde_json::json!(2u64),
-            "the unproven curve may not be silently scoped out or used to change the eligible birth-cohort denominator"
+            receipt["successful_rooted_out_of_scope_pre_existing_curve_candidate_count"],
+            serde_json::json!(1u64),
+            "the complete retained stream proves this trade has no observed prospective birth; it stays globally visible but outside the birth cohort"
+        );
+        assert_eq!(
+            receipt["candidate_scope_reconciled"],
+            serde_json::json!(true),
+            "the global candidate census must still partition exactly after the cohort exclusion"
         );
         assert!(
             !temporary
                 .path()
-                .join(".unproven-birth-curve-exact-v2.partial")
+                .join(".no-observed-birth-curve-exact-v2.partial")
                 .exists(),
-            "the typed Blocked receipt must be atomically published without a partial output"
+            "the typed out-of-scope candidate must still produce an atomic exact artifact"
         );
     }
 
