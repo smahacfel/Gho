@@ -73,7 +73,11 @@ const PUMP_EXACT_STATE_WINDOW_FORWARD_MS_V2: u64 = 90_000;
 /// sized from the immutable receipt set rather than from a mutable directory
 /// walk or the capture-time maximum budget.
 const V2_QUALIFICATION_METADATA_ALLOWANCE_BYTES: u64 = 64 * 1024 * 1024;
-const PUMP_EXACT_STATE_CAPABILITY_SCHEMA_VERSION_V2: u16 = 5;
+/// Schema 6: the qualification-run minimum flag is derived from the global
+/// successful rooted mutation-candidate universe, never from the scoped
+/// prospective denominator.  Receipts written under schema 5 computed that
+/// flag from the scoped denominator and must remain rejected.
+const PUMP_EXACT_STATE_CAPABILITY_SCHEMA_VERSION_V2: u16 = 6;
 const PUMP_EXACT_STATE_EXACT_OUTPUT_SCHEMA_VERSION_V2: u16 = 4;
 const PUMP_EXACT_STATE_REQUIRED_COVERAGE_PPM_V2: u64 = 999_000;
 const PUMP_EXACT_STATE_MIN_QUALIFICATION_COHORT_ELAPSED_MS_V2: u64 = 1_800_000;
@@ -1265,6 +1269,30 @@ fn validate_exact_output_artifacts_v2(
     })
 }
 
+/// Re-derive the receipt's V1.1 qualification-run minimum flag from the
+/// artifact-bound GLOBAL successful rooted mutation-candidate universe.  A
+/// receipt whose flag was computed from the scoped prospective denominator
+/// (the retired schema-5 behavior) necessarily mismatches the global
+/// authority and is rejected; a globally below-minimum authority remains
+/// blocked even when the flag itself is internally consistent.
+fn receipt_minimum_flag_matches_global_authority_v2(
+    receipt_flag: bool,
+    cohort_capture_elapsed_ms: Option<u64>,
+    global_successful_rooted_candidate_count: u64,
+) -> Result<()> {
+    let expected_qualification_run_below_minimum = qualification_run_below_minimum_v2(
+        cohort_capture_elapsed_ms,
+        global_successful_rooted_candidate_count,
+    );
+    if receipt_flag != expected_qualification_run_below_minimum {
+        bail!("V2 exact receipt qualification-run minimum flag differs from raw cohort authority");
+    }
+    if expected_qualification_run_below_minimum {
+        bail!("V2 raw authority remains below the literal qualification-run minimum");
+    }
+    Ok(())
+}
+
 fn validate_qualified_exact_output_binding_v2(
     raw: &PumpExactStateRawTapeIndexV2,
     semantics: &PumpExactStateSemanticsAuthorityV2,
@@ -1295,16 +1323,15 @@ fn validate_qualified_exact_output_binding_v2(
     {
         bail!("V2 exact output source control binding differs from current raw authority");
     }
-    let expected_qualification_run_below_minimum = qualification_run_below_minimum_v2(
+    // The receipt's global candidate counter is artifact-bound: the qualified
+    // coverage-scope recount rejects any receipt whose global universe count
+    // differs from the coverage rows.  Re-derive the V1.1 minimum from that
+    // global authority, never from the scoped denominator.
+    receipt_minimum_flag_matches_global_authority_v2(
+        exact.receipt.qualification_run_below_minimum,
         raw.completion_receipt.cohort_capture_elapsed_ms,
-        exact.receipt.successful_rooted_mutation_denominator,
-    );
-    if exact.receipt.qualification_run_below_minimum != expected_qualification_run_below_minimum {
-        bail!("V2 exact receipt qualification-run minimum flag differs from raw cohort authority");
-    }
-    if expected_qualification_run_below_minimum {
-        bail!("V2 raw authority remains below the literal qualification-run minimum");
-    }
+        exact.receipt.successful_rooted_candidate_count,
+    )?;
     let rooted_slots = raw.rooted_slots();
     let anchors = PumpExactStateAnchorIndexV2::build(raw, semantics, &rooted_slots)?;
     let mut transactions = raw.transactions.clone();
@@ -3293,6 +3320,11 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                 )
             })
             .collect::<Vec<_>>();
+        let transaction_candidate_evaluations =
+            evaluate_transaction_candidates_v2(&inventory, &candidates, &anchors, &semantics)?;
+        if transaction_candidate_evaluations.len() != candidates.len() {
+            bail!("V2 transaction-local evaluator lost a candidate");
+        }
         let mut transaction_reasons = BTreeSet::new();
         let mut cohort_candidate_count = 0u32;
         let mut exact_candidate_count = 0u32;
@@ -3360,19 +3392,11 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
                 .ok_or_else(|| anyhow::anyhow!("V2 scoped unknown-occurrence count overflow"))?;
         }
 
-        for (candidate, scope) in candidates.iter().zip(candidate_scopes.iter().copied()) {
-            let mut evaluation = evaluate_candidate_exactness_v2(
-                candidate.effect,
-                candidate.instruction_payload_exact,
-                candidate.account_vector_exact,
-                candidate.bonding_curve,
-                inventory.signature,
-                inventory.slot,
-                inventory.tx_index,
-                mutation_stats.candidate_count,
-                mutation_stats.unknown_or_malformed(),
-                &anchors,
-            );
+        for ((candidate, scope), mut evaluation) in candidates
+            .iter()
+            .zip(candidate_scopes.iter().copied())
+            .zip(transaction_candidate_evaluations.into_iter())
+        {
             if matches!(
                 scope,
                 PumpExactStateCandidateQualificationScopeV2::ProspectiveBirthCohort
@@ -3612,9 +3636,13 @@ pub fn qualify_prospective_exact_state_raw_run_v2(
         counters.exact_rooted_mutation_count,
         counters.successful_rooted_mutation_denominator,
     )?;
+    // PLAN V1.1 "Qualification run" minimum: the mutation branch is the
+    // GLOBAL successful rooted mutation-candidate universe.  The scoped
+    // denominator is a coverage population, not a capture-sufficiency
+    // population, and must never be substituted here.
     counters.qualification_run_below_minimum = qualification_run_below_minimum_v2(
         raw.completion_receipt.cohort_capture_elapsed_ms,
-        counters.successful_rooted_mutation_denominator,
+        counters.successful_rooted_candidate_count,
     );
 
     let blockers = capability_blockers_v2(&counters);
@@ -3836,6 +3864,710 @@ struct PumpExactStateCandidateEvaluationV2 {
     state_after: Option<PumpExactStateCurveStateV2>,
 }
 
+fn blocked_candidate_evaluation_v2(
+    reason: impl Into<String>,
+) -> PumpExactStateCandidateEvaluationV2 {
+    PumpExactStateCandidateEvaluationV2 {
+        exact: false,
+        non_exact_reason: Some(reason.into()),
+        state_before: None,
+        state_after: None,
+    }
+}
+
+fn occurrence_for_candidate_v2<'a>(
+    inventory: &'a PumpExactStateTransactionInventoryV2,
+    candidate: &PumpExactStateCandidateDescriptorV2,
+) -> Result<&'a PumpExactStateInstructionOccurrenceV2> {
+    inventory
+        .occurrences
+        .iter()
+        .find(|occurrence| {
+            matches!(
+                occurrence.class,
+                PumpExactStateOccurrenceClassV2::Candidate { .. }
+            ) && PumpExactStateCandidateOrderV2::from_occurrence(inventory, occurrence)
+                == candidate.order
+        })
+        .ok_or_else(|| anyhow::anyhow!("V2 candidate descriptor lost its occurrence"))
+}
+
+fn exact_borsh_u64_v2(fields: &BTreeMap<String, Vec<u8>>, name: &str) -> Result<u64> {
+    let bytes: [u8; 8] = fields
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("V2 strict Event-CPI lacks {name}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("V2 strict Event-CPI field {name} is not u64"))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn exact_borsh_bool_v2(fields: &BTreeMap<String, Vec<u8>>, name: &str) -> Result<bool> {
+    match fields.get(name).map(Vec::as_slice) {
+        Some([0]) => Ok(false),
+        Some([1]) => Ok(true),
+        Some(_) => bail!("V2 strict Event-CPI field {name} is not bool"),
+        None => bail!("V2 strict Event-CPI lacks {name}"),
+    }
+}
+
+fn exact_borsh_pubkey_v2(fields: &BTreeMap<String, Vec<u8>>, name: &str) -> Result<Pubkey> {
+    let bytes: [u8; 32] = fields
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("V2 strict Event-CPI lacks {name}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("V2 strict Event-CPI field {name} is not pubkey"))?;
+    Ok(Pubkey::new_from_array(bytes))
+}
+
+fn exact_argument_u64_v2(fields: &BTreeMap<String, Vec<u8>>, name: &str) -> Result<u64> {
+    let bytes: [u8; 8] = fields
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("V2 exact instruction lacks argument {name}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("V2 exact instruction argument {name} is not u64"))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+struct PumpExactStateReplayEventV2<'a> {
+    fields: &'a BTreeMap<String, Vec<u8>>,
+}
+
+struct PumpExactStateReplayCandidateV2<'a> {
+    descriptor: &'a PumpExactStateCandidateDescriptorV2,
+    instruction_name: &'a str,
+    account_roles: &'a BTreeMap<String, Pubkey>,
+    arguments: &'a BTreeMap<String, Vec<u8>>,
+    primary_event: PumpExactStateReplayEventV2<'a>,
+    completion_event_count: usize,
+}
+
+fn replay_candidate_evidence_v2<'a>(
+    inventory: &'a PumpExactStateTransactionInventoryV2,
+    candidate: &'a PumpExactStateCandidateDescriptorV2,
+    semantics: &'a PumpExactStateSemanticsAuthorityV2,
+) -> Result<PumpExactStateReplayCandidateV2<'a>> {
+    let parent = occurrence_for_candidate_v2(inventory, candidate)?;
+    let semantic_evidence = match &parent.class {
+        PumpExactStateOccurrenceClassV2::Candidate {
+            semantic_evidence: Some(evidence),
+            instruction_payload_exact: true,
+            account_vector_exact: true,
+            ..
+        } => evidence,
+        _ => bail!("V2 transaction-local replay parent contract is not exact"),
+    };
+    let arguments = &semantic_evidence.argument_fields;
+    let instruction_name = semantics
+        .instruction(&parent.key.discriminator)
+        .ok_or_else(|| anyhow::anyhow!("V2 replay parent discriminator lost semantics"))?
+        .name
+        .as_str();
+    let expected_event = match (candidate.effect, instruction_name) {
+        (PumpExactStateInstructionEffectV2::SupportedExactCreate, _) => "CreateEvent",
+        (PumpExactStateInstructionEffectV2::SupportedExactTrade, _) => "TradeEvent",
+        (
+            PumpExactStateInstructionEffectV2::KnownReserveOrDependencyUnsupported,
+            "migrate" | "migrate_v2",
+        ) => "CompletePumpAmmMigrationEvent",
+        (
+            PumpExactStateInstructionEffectV2::KnownReserveOrDependencyUnsupported,
+            "migrate_bonding_curve_creator",
+        ) => "MigrateBondingCurveCreatorEvent",
+        _ => bail!("V2 transaction-local replay candidate is not a supported exact effect"),
+    };
+    let mut primary = Vec::new();
+    let mut completions = 0usize;
+    for occurrence in &inventory.occurrences {
+        let PumpExactStateOccurrenceClassV2::ValidatedEventTransport {
+            immediate_parent,
+            event_discriminator,
+            event_fields,
+            ..
+        } = &occurrence.class
+        else {
+            continue;
+        };
+        if immediate_parent != &parent.key {
+            continue;
+        }
+        let event = semantics
+            .event(event_discriminator)
+            .ok_or_else(|| anyhow::anyhow!("V2 replay retained an unknown strict event"))?;
+        if event.name == expected_event {
+            primary.push(event_fields);
+        } else if event.name == "CompleteEvent" {
+            completions = completions
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("V2 completion-event count overflow"))?;
+        }
+    }
+    let fields = match primary.as_slice() {
+        [fields] => *fields,
+        [] => bail!("V2 transaction-local replay lacks unique {expected_event}"),
+        _ => bail!("V2 transaction-local replay has ambiguous {expected_event}"),
+    };
+    if completions > 1 {
+        bail!("V2 transaction-local replay has multiple CompleteEvent records");
+    }
+    Ok(PumpExactStateReplayCandidateV2 {
+        descriptor: candidate,
+        instruction_name,
+        account_roles: &semantic_evidence.account_roles,
+        arguments,
+        primary_event: PumpExactStateReplayEventV2 { fields },
+        completion_event_count: completions,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PumpExactStateReserveTupleV2 {
+    virtual_token_reserves: u64,
+    virtual_quote_reserves: u64,
+    real_token_reserves: u64,
+    real_quote_reserves: u64,
+}
+
+fn trade_event_reserve_tuple_v2(
+    event: &PumpExactStateReplayEventV2<'_>,
+) -> Result<PumpExactStateReserveTupleV2> {
+    Ok(PumpExactStateReserveTupleV2 {
+        virtual_token_reserves: exact_borsh_u64_v2(event.fields, "virtual_token_reserves")?,
+        virtual_quote_reserves: exact_borsh_u64_v2(event.fields, "virtual_quote_reserves")?,
+        real_token_reserves: exact_borsh_u64_v2(event.fields, "real_token_reserves")?,
+        real_quote_reserves: exact_borsh_u64_v2(event.fields, "real_quote_reserves")?,
+    })
+}
+
+fn derive_trade_pre_reserves_v2(
+    after: PumpExactStateReserveTupleV2,
+    token_amount: u64,
+    quote_amount: u64,
+    is_buy: bool,
+) -> Result<PumpExactStateReserveTupleV2> {
+    let (virtual_token_reserves, real_token_reserves, virtual_quote_reserves, real_quote_reserves) =
+        if is_buy {
+            (
+                after.virtual_token_reserves.checked_add(token_amount),
+                after.real_token_reserves.checked_add(token_amount),
+                after.virtual_quote_reserves.checked_sub(quote_amount),
+                after.real_quote_reserves.checked_sub(quote_amount),
+            )
+        } else {
+            (
+                after.virtual_token_reserves.checked_sub(token_amount),
+                after.real_token_reserves.checked_sub(token_amount),
+                after.virtual_quote_reserves.checked_add(quote_amount),
+                after.real_quote_reserves.checked_add(quote_amount),
+            )
+        };
+    Ok(PumpExactStateReserveTupleV2 {
+        virtual_token_reserves: virtual_token_reserves
+            .ok_or_else(|| anyhow::anyhow!("V2 transaction-local token reserve overflow"))?,
+        virtual_quote_reserves: virtual_quote_reserves
+            .ok_or_else(|| anyhow::anyhow!("V2 transaction-local quote reserve overflow"))?,
+        real_token_reserves: real_token_reserves
+            .ok_or_else(|| anyhow::anyhow!("V2 transaction-local real-token reserve overflow"))?,
+        real_quote_reserves: real_quote_reserves
+            .ok_or_else(|| anyhow::anyhow!("V2 transaction-local real-quote reserve overflow"))?,
+    })
+}
+
+fn curve_reserve_tuple_v2(state: &PumpExactStateCurveStateV2) -> PumpExactStateReserveTupleV2 {
+    PumpExactStateReserveTupleV2 {
+        virtual_token_reserves: state.virtual_token_reserves,
+        virtual_quote_reserves: state.virtual_quote_reserves,
+        real_token_reserves: state.real_token_reserves,
+        real_quote_reserves: state.real_quote_reserves,
+    }
+}
+
+fn validate_trade_parent_limits_v2(
+    candidate: &PumpExactStateReplayCandidateV2<'_>,
+    token_amount: u64,
+    quote_amount: u64,
+) -> Result<()> {
+    let fee = exact_borsh_u64_v2(candidate.primary_event.fields, "fee")?;
+    let creator_fee = exact_borsh_u64_v2(candidate.primary_event.fields, "creator_fee")?;
+    let gross_quote = quote_amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(creator_fee))
+        .ok_or_else(|| anyhow::anyhow!("V2 transaction-local gross quote overflow"))?;
+    match candidate.descriptor.effect {
+        PumpExactStateInstructionEffectV2::SupportedExactTrade => {}
+        _ => bail!("V2 trade limit validation received a non-trade"),
+    }
+    match candidate.instruction_name {
+        "buy" | "buy_v2" => {
+            if exact_argument_u64_v2(candidate.arguments, "amount")? != token_amount {
+                bail!("V2 TradeEvent token amount differs from exact-buy parent amount");
+            }
+            if gross_quote > exact_argument_u64_v2(candidate.arguments, "max_sol_cost")? {
+                bail!("V2 TradeEvent gross quote exceeds exact-buy parent cap");
+            }
+        }
+        "buy_exact_sol_in" => {
+            if token_amount < exact_argument_u64_v2(candidate.arguments, "min_tokens_out")? {
+                bail!("V2 TradeEvent token amount violates exact-sol parent minimum");
+            }
+            if gross_quote > exact_argument_u64_v2(candidate.arguments, "spendable_sol_in")? {
+                bail!("V2 TradeEvent gross quote exceeds exact-sol parent budget");
+            }
+        }
+        "buy_exact_quote_in_v2" => {
+            if token_amount < exact_argument_u64_v2(candidate.arguments, "min_tokens_out")? {
+                bail!("V2 TradeEvent token amount violates exact-quote parent minimum");
+            }
+            if gross_quote > exact_argument_u64_v2(candidate.arguments, "spendable_quote_in")? {
+                bail!("V2 TradeEvent gross quote exceeds exact-quote parent budget");
+            }
+        }
+        "sell" | "sell_v2" => {
+            if exact_argument_u64_v2(candidate.arguments, "amount")? != token_amount {
+                bail!("V2 TradeEvent token amount differs from exact-sell parent amount");
+            }
+            let net_quote = quote_amount
+                .checked_sub(fee)
+                .and_then(|value| value.checked_sub(creator_fee))
+                .ok_or_else(|| anyhow::anyhow!("V2 TradeEvent fees exceed sell output"))?;
+            if net_quote < exact_argument_u64_v2(candidate.arguments, "min_sol_output")? {
+                bail!("V2 TradeEvent net quote violates exact-sell parent minimum");
+            }
+        }
+        other => bail!("V2 transaction-local replay does not support trade variant {other}"),
+    }
+    Ok(())
+}
+
+fn create_event_initial_state_v2(
+    create: &PumpExactStateReplayCandidateV2<'_>,
+    first_trade: &PumpExactStateReplayCandidateV2<'_>,
+) -> Result<PumpExactStateCurveStateV2> {
+    if !matches!(
+        create.descriptor.effect,
+        PumpExactStateInstructionEffectV2::SupportedExactCreate
+    ) || !matches!(
+        first_trade.descriptor.effect,
+        PumpExactStateInstructionEffectV2::SupportedExactTrade
+    ) {
+        bail!("V2 transaction-local genesis requires Create followed by Trade");
+    }
+    let trade_fields = first_trade.primary_event.fields;
+    let token_amount = exact_borsh_u64_v2(trade_fields, "token_amount")?;
+    let quote_amount = exact_borsh_u64_v2(trade_fields, "quote_amount")?;
+    let is_buy = exact_borsh_bool_v2(trade_fields, "is_buy")?;
+    let derived = derive_trade_pre_reserves_v2(
+        trade_event_reserve_tuple_v2(&first_trade.primary_event)?,
+        token_amount,
+        quote_amount,
+        is_buy,
+    )?;
+    let fields = create.primary_event.fields;
+    if derived.virtual_token_reserves != exact_borsh_u64_v2(fields, "virtual_token_reserves")?
+        || derived.virtual_quote_reserves != exact_borsh_u64_v2(fields, "virtual_quote_reserves")?
+        || derived.real_token_reserves != exact_borsh_u64_v2(fields, "real_token_reserves")?
+    {
+        bail!("V2 CreateEvent genesis tuple differs from adjacent TradeEvent preimage");
+    }
+    Ok(PumpExactStateCurveStateV2 {
+        virtual_token_reserves: derived.virtual_token_reserves,
+        virtual_quote_reserves: derived.virtual_quote_reserves,
+        real_token_reserves: derived.real_token_reserves,
+        real_quote_reserves: derived.real_quote_reserves,
+        token_total_supply: exact_borsh_u64_v2(fields, "token_total_supply")?,
+        complete: false,
+        creator: exact_borsh_pubkey_v2(fields, "creator")?,
+        is_mayhem_mode: exact_borsh_bool_v2(fields, "is_mayhem_mode")?,
+        is_cashback_coin: exact_borsh_bool_v2(fields, "is_cashback_enabled")?,
+        quote_mint: exact_borsh_pubkey_v2(fields, "quote_mint")?,
+    })
+}
+
+fn apply_strict_trade_event_v2(
+    before: &PumpExactStateCurveStateV2,
+    trade: &PumpExactStateReplayCandidateV2<'_>,
+) -> Result<PumpExactStateCurveStateV2> {
+    if before.complete {
+        bail!("V2 transaction-local replay observed a mutation after completion");
+    }
+    let fields = trade.primary_event.fields;
+    let token_amount = exact_borsh_u64_v2(fields, "token_amount")?;
+    let quote_amount = exact_borsh_u64_v2(fields, "quote_amount")?;
+    if token_amount == 0 || quote_amount == 0 {
+        bail!("V2 transaction-local TradeEvent has a zero reserve movement");
+    }
+    let is_buy = exact_borsh_bool_v2(fields, "is_buy")?;
+    let expected_buy = match trade.instruction_name {
+        "buy" | "buy_v2" | "buy_exact_sol_in" | "buy_exact_quote_in_v2" => true,
+        "sell" | "sell_v2" => false,
+        other => bail!("V2 transaction-local replay does not support trade variant {other}"),
+    };
+    if is_buy != expected_buy {
+        bail!("V2 TradeEvent side differs from its strict parent variant");
+    }
+    validate_trade_parent_limits_v2(trade, token_amount, quote_amount)?;
+    let after_reserves = trade_event_reserve_tuple_v2(&trade.primary_event)?;
+    if derive_trade_pre_reserves_v2(after_reserves, token_amount, quote_amount, is_buy)?
+        != curve_reserve_tuple_v2(before)
+    {
+        bail!("V2 TradeEvent reserve deltas do not reproduce the preceding exact state");
+    }
+    if exact_borsh_pubkey_v2(fields, "quote_mint")? != before.quote_mint
+        || exact_borsh_pubkey_v2(fields, "creator")? != before.creator
+        || exact_borsh_bool_v2(fields, "mayhem_mode")? != before.is_mayhem_mode
+    {
+        bail!("V2 TradeEvent carry identity differs from the preceding exact state");
+    }
+    Ok(PumpExactStateCurveStateV2 {
+        virtual_token_reserves: after_reserves.virtual_token_reserves,
+        virtual_quote_reserves: after_reserves.virtual_quote_reserves,
+        real_token_reserves: after_reserves.real_token_reserves,
+        real_quote_reserves: after_reserves.real_quote_reserves,
+        token_total_supply: before.token_total_supply,
+        complete: trade.completion_event_count == 1,
+        creator: before.creator,
+        is_mayhem_mode: before.is_mayhem_mode,
+        is_cashback_coin: before.is_cashback_coin,
+        quote_mint: before.quote_mint,
+    })
+}
+
+fn validate_replay_event_parent_role_v2(
+    candidate: &PumpExactStateReplayCandidateV2<'_>,
+    event_field: &str,
+    parent_role: &str,
+) -> Result<()> {
+    let observed = exact_borsh_pubkey_v2(candidate.primary_event.fields, event_field)?;
+    let expected = candidate.account_roles.get(parent_role).ok_or_else(|| {
+        anyhow::anyhow!(
+            "V2 exact transition parent {} lacks account role {parent_role}",
+            candidate.instruction_name
+        )
+    })?;
+    if observed != *expected {
+        bail!(
+            "V2 exact transition event field {event_field} differs from parent role {parent_role}"
+        );
+    }
+    Ok(())
+}
+
+/// Validate one anchor-observed migration transition.  Both states are
+/// primary account evidence: `before` is the unique latest canonical anchor
+/// (or the exact state produced by the preceding transaction-local mutation)
+/// and `after` is the unique same-signature final anchor.  Event fields prove
+/// the exact migration identity.  Only `migrate_bonding_curve_creator` has a
+/// state equation here: every field except `creator` must be conserved and
+/// the event binds both creator values.  `migrate`/`migrate_v2` grant no
+/// inferred reserve equation; their complete before/after states remain the
+/// two literal anchors.
+fn apply_strict_migration_transition_v2(
+    before: &PumpExactStateCurveStateV2,
+    after: &PumpExactStateCurveStateV2,
+    transition: &PumpExactStateReplayCandidateV2<'_>,
+) -> Result<PumpExactStateCurveStateV2> {
+    if !matches!(
+        transition.descriptor.effect,
+        PumpExactStateInstructionEffectV2::KnownReserveOrDependencyUnsupported
+    ) {
+        bail!("V2 observed transition replay received a non-transition candidate");
+    }
+    match transition.instruction_name {
+        "migrate" => {
+            validate_replay_event_parent_role_v2(transition, "user", "user")?;
+            validate_replay_event_parent_role_v2(transition, "mint", "mint")?;
+            validate_replay_event_parent_role_v2(transition, "bonding_curve", "bonding_curve")?;
+            validate_replay_event_parent_role_v2(transition, "pool", "pool")?;
+            if exact_borsh_pubkey_v2(transition.primary_event.fields, "quote_mint")?
+                != Pubkey::default()
+            {
+                bail!(
+                    "V2 legacy migration event quote_mint is not the pinned native-SOL zero pubkey"
+                );
+            }
+            if !before.complete {
+                bail!("V2 legacy migration starts from an incomplete BondingCurve");
+            }
+        }
+        "migrate_v2" => {
+            validate_replay_event_parent_role_v2(transition, "user", "user")?;
+            validate_replay_event_parent_role_v2(transition, "mint", "base_mint")?;
+            validate_replay_event_parent_role_v2(transition, "bonding_curve", "bonding_curve")?;
+            validate_replay_event_parent_role_v2(transition, "pool", "pool")?;
+            validate_replay_event_parent_role_v2(transition, "quote_mint", "quote_mint")?;
+            if !before.complete {
+                bail!("V2 quote migration starts from an incomplete BondingCurve");
+            }
+        }
+        "migrate_bonding_curve_creator" => {
+            validate_replay_event_parent_role_v2(transition, "mint", "mint")?;
+            validate_replay_event_parent_role_v2(transition, "bonding_curve", "bonding_curve")?;
+            validate_replay_event_parent_role_v2(transition, "sharing_config", "sharing_config")?;
+            let old_creator =
+                exact_borsh_pubkey_v2(transition.primary_event.fields, "old_creator")?;
+            let new_creator =
+                exact_borsh_pubkey_v2(transition.primary_event.fields, "new_creator")?;
+            if old_creator != before.creator || new_creator != after.creator {
+                bail!("V2 creator-migration event differs from anchored creator transition");
+            }
+            let expected_after = PumpExactStateCurveStateV2 {
+                creator: new_creator,
+                ..before.clone()
+            };
+            if after != &expected_after {
+                bail!("V2 creator migration changed a non-creator BondingCurve field");
+            }
+        }
+        other => bail!("V2 transaction-local replay does not support transition variant {other}"),
+    }
+    Ok(after.clone())
+}
+
+fn evaluate_single_observed_transition_v2(
+    inventory: &PumpExactStateTransactionInventoryV2,
+    candidate: &PumpExactStateCandidateDescriptorV2,
+    anchors: &PumpExactStateAnchorIndexV2,
+    semantics: &PumpExactStateSemanticsAuthorityV2,
+) -> PumpExactStateCandidateEvaluationV2 {
+    let attempt = (|| -> Result<(PumpExactStateCurveStateV2, PumpExactStateCurveStateV2)> {
+        let curve = candidate
+            .bonding_curve
+            .ok_or_else(|| anyhow::anyhow!("V2 observed transition lacks BondingCurve identity"))?;
+        let before = anchors
+            .unique_pre_anchor(curve, inventory.slot, inventory.tx_index)
+            .ok_or_else(|| anyhow::anyhow!("V2 observed transition lacks exact pre-anchor"))?
+            .state
+            .clone();
+        let final_anchor = anchors
+            .unique_final_anchor(
+                inventory.signature,
+                curve,
+                inventory.slot,
+                inventory.tx_index,
+            )
+            .ok_or_else(|| anyhow::anyhow!("V2 observed transition lacks final anchor"))?;
+        let evidence = replay_candidate_evidence_v2(inventory, candidate, semantics)?;
+        let after = apply_strict_migration_transition_v2(&before, &final_anchor.state, &evidence)?;
+        Ok((before, after))
+    })();
+    match attempt {
+        Ok((before, after)) => PumpExactStateCandidateEvaluationV2 {
+            exact: true,
+            non_exact_reason: None,
+            state_before: Some(before),
+            state_after: Some(after),
+        },
+        Err(error) => blocked_candidate_evaluation_v2(format!(
+            "anchor_observed_exact_transition_failed:{error}"
+        )),
+    }
+}
+
+/// Replay one ordered same-curve transaction-local chain using only preserved
+/// primary evidence.  Every intermediate TradeEvent is a strict Borsh record
+/// under the capture-pinned IDL and exact Pump parent; its reserve tuple is
+/// accepted only after direction/amount/budget checks, adjacency conservation,
+/// carry-field agreement, and a bit-exact final same-signature account anchor.
+/// The missing Create real-quote field is derived from the immediately
+/// adjacent strict trade preimage, never filled with a protocol default.
+fn replay_same_curve_transaction_v2(
+    inventory: &PumpExactStateTransactionInventoryV2,
+    candidates: &[PumpExactStateCandidateDescriptorV2],
+    positions: &[usize],
+    anchors: &PumpExactStateAnchorIndexV2,
+    semantics: &PumpExactStateSemanticsAuthorityV2,
+) -> Result<Vec<(usize, PumpExactStateCandidateEvaluationV2)>> {
+    if positions.len() < 2 {
+        bail!("V2 transaction-local replay requires at least two same-curve candidates");
+    }
+    let (curve, _) = replay_group_identity_v2(candidates, positions)?;
+    let evidence = positions
+        .iter()
+        .map(|position| replay_candidate_evidence_v2(inventory, &candidates[*position], semantics))
+        .collect::<Result<Vec<_>>>()?;
+    let final_anchor = anchors
+        .unique_final_anchor(
+            inventory.signature,
+            curve,
+            inventory.slot,
+            inventory.tx_index,
+        )
+        .ok_or_else(|| anyhow::anyhow!("V2 transaction-local replay lacks final anchor"))?;
+    let mut result = Vec::with_capacity(positions.len());
+    let mut next_trade = 0usize;
+    let mut current = if matches!(
+        evidence[0].descriptor.effect,
+        PumpExactStateInstructionEffectV2::SupportedExactCreate
+    ) {
+        if evidence.len() < 2
+            || !matches!(
+                evidence[1].descriptor.effect,
+                PumpExactStateInstructionEffectV2::SupportedExactTrade
+            )
+            || evidence.iter().skip(1).any(|candidate| {
+                matches!(
+                    candidate.descriptor.effect,
+                    PumpExactStateInstructionEffectV2::SupportedExactCreate
+                )
+            })
+        {
+            bail!("V2 transaction-local replay has an unsupported Create ordering");
+        }
+        let initial = create_event_initial_state_v2(&evidence[0], &evidence[1])?;
+        result.push((
+            positions[0],
+            PumpExactStateCandidateEvaluationV2 {
+                exact: true,
+                non_exact_reason: None,
+                state_before: None,
+                state_after: Some(initial.clone()),
+            },
+        ));
+        next_trade = 1;
+        initial
+    } else {
+        anchors
+            .unique_pre_anchor(curve, inventory.slot, inventory.tx_index)
+            .ok_or_else(|| anyhow::anyhow!("V2 transaction-local replay lacks exact pre-anchor"))?
+            .state
+            .clone()
+    };
+
+    for (local_position, transition) in evidence.iter().enumerate().skip(next_trade) {
+        let before = current.clone();
+        current = match transition.descriptor.effect {
+            PumpExactStateInstructionEffectV2::SupportedExactTrade => {
+                apply_strict_trade_event_v2(&before, transition)?
+            }
+            PumpExactStateInstructionEffectV2::KnownReserveOrDependencyUnsupported
+                if local_position + 1 == evidence.len() =>
+            {
+                apply_strict_migration_transition_v2(&before, &final_anchor.state, transition)?
+            }
+            _ => bail!("V2 transaction-local replay has an unsupported nonterminal transition"),
+        };
+        result.push((
+            positions[local_position],
+            PumpExactStateCandidateEvaluationV2 {
+                exact: true,
+                non_exact_reason: None,
+                state_before: Some(before),
+                state_after: Some(current.clone()),
+            },
+        ));
+    }
+    if current != final_anchor.state {
+        bail!("V2 transaction-local replay does not reproduce the final account anchor");
+    }
+    Ok(result)
+}
+
+fn replay_group_identity_v2(
+    candidates: &[PumpExactStateCandidateDescriptorV2],
+    positions: &[usize],
+) -> Result<(Pubkey, Pubkey)> {
+    let first = positions
+        .first()
+        .and_then(|position| candidates.get(*position))
+        .ok_or_else(|| anyhow::anyhow!("V2 replay group is empty or has an invalid position"))?;
+    let curve = first
+        .bonding_curve
+        .ok_or_else(|| anyhow::anyhow!("V2 replay group lacks BondingCurve identity"))?;
+    let mint = first
+        .mint
+        .ok_or_else(|| anyhow::anyhow!("V2 replay group lacks mint identity"))?;
+    for position in positions.iter().copied() {
+        let candidate = candidates
+            .get(position)
+            .ok_or_else(|| anyhow::anyhow!("V2 replay group position is out of range"))?;
+        if candidate.bonding_curve != Some(curve) {
+            bail!("V2 replay group mixes BondingCurve identities");
+        }
+        if candidate.mint != Some(mint) {
+            bail!("V2 replay group mixes mint identities");
+        }
+    }
+    Ok((curve, mint))
+}
+
+fn evaluate_transaction_candidates_v2(
+    inventory: &PumpExactStateTransactionInventoryV2,
+    candidates: &[PumpExactStateCandidateDescriptorV2],
+    anchors: &PumpExactStateAnchorIndexV2,
+    semantics: &PumpExactStateSemanticsAuthorityV2,
+) -> Result<Vec<PumpExactStateCandidateEvaluationV2>> {
+    let mutation_stats = transaction_mutation_stats_v2(inventory)?;
+    if mutation_stats.candidate_count != u32::try_from(candidates.len()).unwrap_or(u32::MAX) {
+        bail!("V2 transaction-local evaluator candidate count differs from inventory");
+    }
+    if mutation_stats.unknown_or_malformed() {
+        return Ok(candidates
+            .iter()
+            .map(|_| blocked_candidate_evaluation_v2("transaction_mutation_inventory_incomplete"))
+            .collect());
+    }
+    let mut evaluations = candidates
+        .iter()
+        .map(|_| blocked_candidate_evaluation_v2("transaction_local_group_not_evaluated"))
+        .collect::<Vec<_>>();
+    let mut groups = BTreeMap::<Pubkey, Vec<usize>>::new();
+    for (position, candidate) in candidates.iter().enumerate() {
+        let Some(curve) = candidate.bonding_curve else {
+            evaluations[position] = blocked_candidate_evaluation_v2(
+                "bonding_curve_role_absent_from_candidate_account_contract",
+            );
+            continue;
+        };
+        groups.entry(curve).or_default().push(position);
+    }
+    for positions in groups.values_mut() {
+        positions.sort_by(|left, right| candidates[*left].order.cmp(&candidates[*right].order));
+        if positions.len() == 1 {
+            let position = positions[0];
+            let candidate = &candidates[position];
+            evaluations[position] = if matches!(
+                candidate.effect,
+                PumpExactStateInstructionEffectV2::KnownReserveOrDependencyUnsupported
+            ) && candidate.instruction_payload_exact
+                && candidate.account_vector_exact
+            {
+                evaluate_single_observed_transition_v2(inventory, candidate, anchors, semantics)
+            } else {
+                evaluate_candidate_exactness_v2(
+                    candidate.effect,
+                    candidate.instruction_payload_exact,
+                    candidate.account_vector_exact,
+                    candidate.bonding_curve,
+                    inventory.signature,
+                    inventory.slot,
+                    inventory.tx_index,
+                    1,
+                    false,
+                    anchors,
+                )
+            };
+            continue;
+        }
+        match replay_same_curve_transaction_v2(inventory, candidates, positions, anchors, semantics)
+        {
+            Ok(group) => {
+                for (position, evaluation) in group {
+                    evaluations[position] = evaluation;
+                }
+            }
+            Err(error) => {
+                let reason = format!("transaction_local_exact_replay_failed:{error}");
+                for position in positions.iter().copied() {
+                    evaluations[position] = blocked_candidate_evaluation_v2(reason.clone());
+                }
+            }
+        }
+    }
+    Ok(evaluations)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_candidate_exactness_v2(
     effect: PumpExactStateInstructionEffectV2,
@@ -3936,13 +4668,18 @@ fn coverage_ppm_v2(numerator: u64, denominator: u64) -> Result<u64> {
 
 /// A prospective run is usable only after a full V1.1 minimum cohort: either
 /// thirty minutes of sealed cohort time or ten thousand successful rooted
-/// mutations.  A missing elapsed value is deliberately below minimum.
+/// Pump mutations.  This is the global capture-sufficiency gate from PLAN
+/// V1.1 "Qualification run": its mutation branch counts the GLOBAL successful
+/// rooted-canonical mutation-candidate universe (the reconciled global
+/// candidate count), never the prospective-birth scoped denominator.  The
+/// scoped denominator measures cohort coverage, not capture sufficiency.  A
+/// missing elapsed value is deliberately below minimum.
 fn qualification_run_below_minimum_v2(
     cohort_capture_elapsed_ms: Option<u64>,
-    successful_rooted_mutation_denominator: u64,
+    global_successful_rooted_candidate_count: u64,
 ) -> bool {
     cohort_capture_elapsed_ms.unwrap_or(0) < PUMP_EXACT_STATE_MIN_QUALIFICATION_COHORT_ELAPSED_MS_V2
-        && successful_rooted_mutation_denominator
+        && global_successful_rooted_candidate_count
             < PUMP_EXACT_STATE_MIN_QUALIFICATION_MUTATION_DENOMINATOR_V2
 }
 
@@ -5148,6 +5885,28 @@ fn inventory_v2_from_transaction_context(
     semantics: &PumpExactStateSemanticsAuthorityV2,
     anchors: &PumpExactStateAnchorIndexV2,
 ) -> Result<PumpExactStateTransactionInventoryV2> {
+    let mut inventory = structural_inventory_v2_from_transaction_context(context, semantics)?;
+    validate_event_transport_parent_semantics_v2(
+        &mut inventory.occurrences,
+        semantics,
+        anchors,
+        context,
+    );
+    Ok(inventory)
+}
+
+/// Build the transaction occurrence ledger after strict structural
+/// classification and Event-CPI parent-link validation, but before semantic
+/// Event-CPI validation may replace a structurally valid transport with a
+/// typed `Unknown`.  The production qualifier immediately applies semantic
+/// validation in [`inventory_v2_from_transaction_context`].  The test-gated
+/// feasibility census also retains this pre-semantic ledger so a closed,
+/// source-backed parent-layout hypothesis can re-run the semantic binding
+/// against the original Event-CPI fields without dropping genuine unknowns.
+fn structural_inventory_v2_from_transaction_context(
+    context: &PumpExactStateTransactionContextV2,
+    semantics: &PumpExactStateSemanticsAuthorityV2,
+) -> Result<PumpExactStateTransactionInventoryV2> {
     let mut occurrences = Vec::new();
     let mut keys = BTreeSet::new();
     for (outer_index, instruction) in context.outer.iter().enumerate() {
@@ -5201,7 +5960,6 @@ fn inventory_v2_from_transaction_context(
         }
     }
     validate_event_transport_parent_links_v2(&mut occurrences);
-    validate_event_transport_parent_semantics_v2(&mut occurrences, semantics, anchors, context);
     Ok(PumpExactStateTransactionInventoryV2 {
         slot: context.slot,
         tx_index: context.tx_index,
@@ -5492,7 +6250,7 @@ fn classify_pump_instruction_occurrence_v2(
                 match accounts {
                     Ok(account_roles) => {
                         let (bonding_curve, mint) =
-                            semantics.exact_state_account_pubkeys(contract, &account_roles)?;
+                            semantics.candidate_scope_account_pubkeys(contract, &account_roles)?;
                         (bonding_curve, mint, true, None, Some(account_roles))
                     }
                     Err(error) => (None, None, false, Some(error.to_string()), None),
@@ -6536,6 +7294,9 @@ fn hex_bytes(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod feasibility_census_v2;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ghost_core::{
@@ -7314,14 +8075,14 @@ mod tests {
     }
 
     #[test]
-    fn qualification_run_minimum_is_literal_for_time_or_mutation_denominator() {
+    fn qualification_run_minimum_is_literal_for_time_or_global_mutation_universe() {
         assert!(
             qualification_run_below_minimum_v2(Some(1_799_999), 9_999),
-            "9,999 mutations below thirty minutes must remain blocked"
+            "9,999 global mutations below thirty minutes must remain blocked"
         );
         assert!(
             !qualification_run_below_minimum_v2(Some(1_799_999), 10_000),
-            "10,000 mutations satisfies the alternative V1.1 minimum"
+            "10,000 global mutations satisfies the alternative V1.1 minimum"
         );
         assert!(
             !qualification_run_below_minimum_v2(Some(1_800_000), 0),
@@ -7330,6 +8091,379 @@ mod tests {
         assert!(
             qualification_run_below_minimum_v2(None, 9_999),
             "missing elapsed cohort evidence cannot silently satisfy the minimum"
+        );
+        // Preserved raw shape: a 600,001 ms cohort with the global successful
+        // rooted mutation-candidate universe of 23,908 passes the V1.1
+        // mutation branch even though its scoped prospective denominator is
+        // only 8,408.  The scoped denominator is deliberately not an input to
+        // this gate.
+        assert!(
+            !qualification_run_below_minimum_v2(Some(600_001), 23_908),
+            "the global mutation universe satisfies the V1.1 minimum below thirty minutes"
+        );
+        assert!(
+            qualification_run_below_minimum_v2(Some(600_001), 9_999),
+            "a short cohort below ten thousand global mutations stays blocked"
+        );
+    }
+
+    #[test]
+    fn receipt_minimum_flag_revalidation_rejects_a_scoped_denominator_flag() {
+        // Schema-5 receipts computed the flag from the scoped prospective
+        // denominator.  Reproduce that retired derivation for the preserved
+        // raw numbers and prove the global revalidation rejects it.
+        let legacy_scoped_flag = qualification_run_below_minimum_v2(Some(600_001), 8_408);
+        assert!(
+            legacy_scoped_flag,
+            "the retired scoped-denominator derivation reproduces the legacy blocked flag"
+        );
+        assert!(
+            receipt_minimum_flag_matches_global_authority_v2(
+                legacy_scoped_flag,
+                Some(600_001),
+                23_908
+            )
+            .is_err(),
+            "a receipt flag computed from the scoped denominator must be rejected against the global universe"
+        );
+        assert!(
+            receipt_minimum_flag_matches_global_authority_v2(false, Some(600_001), 23_908).is_ok(),
+            "a flag computed from the global universe passes revalidation"
+        );
+        assert!(
+            receipt_minimum_flag_matches_global_authority_v2(false, Some(600_001), 9_999).is_err(),
+            "a globally below-minimum authority remains blocked even with a consistent false flag"
+        );
+    }
+
+    fn observed_transition_test_state_v2(creator: Pubkey) -> PumpExactStateCurveStateV2 {
+        PumpExactStateCurveStateV2 {
+            virtual_token_reserves: 1_000,
+            virtual_quote_reserves: 2_000,
+            real_token_reserves: 900,
+            real_quote_reserves: 1_800,
+            token_total_supply: 1_000_000,
+            complete: true,
+            creator,
+            is_mayhem_mode: false,
+            is_cashback_coin: true,
+            quote_mint: Pubkey::new_from_array([90; 32]),
+        }
+    }
+
+    fn observed_transition_test_descriptor_v2() -> PumpExactStateCandidateDescriptorV2 {
+        PumpExactStateCandidateDescriptorV2 {
+            order: PumpExactStateCandidateOrderV2 {
+                slot: 7,
+                tx_index: 3,
+                signature: [77; 64],
+                outer_instruction_index: 0,
+                inner_instruction_path: Vec::new(),
+                stack_height: None,
+            },
+            effect: PumpExactStateInstructionEffectV2::KnownReserveOrDependencyUnsupported,
+            instruction_payload_exact: true,
+            account_vector_exact: true,
+            bonding_curve: Some(Pubkey::new_from_array([3; 32])),
+            mint: Some(Pubkey::new_from_array([2; 32])),
+            failure_reason: None,
+        }
+    }
+
+    #[test]
+    fn creator_migration_exactness_requires_identity_and_only_creator_state_change() {
+        let descriptor = observed_transition_test_descriptor_v2();
+        let mint = descriptor.mint.expect("fixture mint");
+        let curve = descriptor.bonding_curve.expect("fixture curve");
+        let sharing_config = Pubkey::new_from_array([4; 32]);
+        let old_creator = Pubkey::new_from_array([5; 32]);
+        let new_creator = Pubkey::new_from_array([6; 32]);
+        let roles = BTreeMap::from([
+            ("mint".to_owned(), mint),
+            ("bonding_curve".to_owned(), curve),
+            ("sharing_config".to_owned(), sharing_config),
+        ]);
+        let arguments = BTreeMap::new();
+        let fields = BTreeMap::from([
+            ("mint".to_owned(), mint.to_bytes().to_vec()),
+            ("bonding_curve".to_owned(), curve.to_bytes().to_vec()),
+            (
+                "sharing_config".to_owned(),
+                sharing_config.to_bytes().to_vec(),
+            ),
+            ("old_creator".to_owned(), old_creator.to_bytes().to_vec()),
+            ("new_creator".to_owned(), new_creator.to_bytes().to_vec()),
+        ]);
+        let transition = PumpExactStateReplayCandidateV2 {
+            descriptor: &descriptor,
+            instruction_name: "migrate_bonding_curve_creator",
+            account_roles: &roles,
+            arguments: &arguments,
+            primary_event: PumpExactStateReplayEventV2 { fields: &fields },
+            completion_event_count: 0,
+        };
+        let before = observed_transition_test_state_v2(old_creator);
+        let mut after = before.clone();
+        after.creator = new_creator;
+        assert_eq!(
+            apply_strict_migration_transition_v2(&before, &after, &transition)
+                .expect("identity-bound creator-only migration must be exact"),
+            after
+        );
+
+        let mut reserve_drift = after.clone();
+        reserve_drift.real_quote_reserves += 1;
+        assert!(
+            apply_strict_migration_transition_v2(&before, &reserve_drift, &transition).is_err(),
+            "a creator migration may not hide a reserve change"
+        );
+
+        let mut wrong_fields = fields.clone();
+        wrong_fields.insert("old_creator".to_owned(), vec![9; 32]);
+        let wrong_identity = PumpExactStateReplayCandidateV2 {
+            primary_event: PumpExactStateReplayEventV2 {
+                fields: &wrong_fields,
+            },
+            ..transition
+        };
+        assert!(
+            apply_strict_migration_transition_v2(&before, &after, &wrong_identity).is_err(),
+            "event identity must bind the anchored creator transition"
+        );
+    }
+
+    #[test]
+    fn pool_migration_exactness_requires_complete_pre_anchor_and_parent_identity() {
+        let descriptor = observed_transition_test_descriptor_v2();
+        let user = Pubkey::new_from_array([1; 32]);
+        let mint = descriptor.mint.expect("fixture mint");
+        let curve = descriptor.bonding_curve.expect("fixture curve");
+        let pool = Pubkey::new_from_array([4; 32]);
+        let roles = BTreeMap::from([
+            ("user".to_owned(), user),
+            ("mint".to_owned(), mint),
+            ("bonding_curve".to_owned(), curve),
+            ("pool".to_owned(), pool),
+        ]);
+        let arguments = BTreeMap::new();
+        let fields = BTreeMap::from([
+            ("user".to_owned(), user.to_bytes().to_vec()),
+            ("mint".to_owned(), mint.to_bytes().to_vec()),
+            ("bonding_curve".to_owned(), curve.to_bytes().to_vec()),
+            ("pool".to_owned(), pool.to_bytes().to_vec()),
+            (
+                "quote_mint".to_owned(),
+                Pubkey::default().to_bytes().to_vec(),
+            ),
+        ]);
+        let transition = PumpExactStateReplayCandidateV2 {
+            descriptor: &descriptor,
+            instruction_name: "migrate",
+            account_roles: &roles,
+            arguments: &arguments,
+            primary_event: PumpExactStateReplayEventV2 { fields: &fields },
+            completion_event_count: 0,
+        };
+        let before = observed_transition_test_state_v2(Pubkey::new_from_array([5; 32]));
+        let mut after = before.clone();
+        after.real_token_reserves = 0;
+        after.real_quote_reserves = 0;
+        assert_eq!(
+            apply_strict_migration_transition_v2(&before, &after, &transition)
+                .expect("two literal anchors plus strict migration identity are exact"),
+            after
+        );
+
+        let mut incomplete = before.clone();
+        incomplete.complete = false;
+        assert!(
+            apply_strict_migration_transition_v2(&incomplete, &after, &transition).is_err(),
+            "pool migration must begin from a completed BondingCurve"
+        );
+
+        let mut wrong_fields = fields.clone();
+        wrong_fields.insert("quote_mint".to_owned(), vec![9; 32]);
+        let wrong_identity = PumpExactStateReplayCandidateV2 {
+            primary_event: PumpExactStateReplayEventV2 {
+                fields: &wrong_fields,
+            },
+            ..transition
+        };
+        assert!(
+            apply_strict_migration_transition_v2(&before, &after, &wrong_identity).is_err(),
+            "migration Event-CPI must match literal parent account identity"
+        );
+    }
+
+    #[test]
+    fn transaction_local_group_requires_one_curve_and_one_mint_identity() {
+        let mut first = observed_transition_test_descriptor_v2();
+        first.order.outer_instruction_index = 1;
+        let mut second = observed_transition_test_descriptor_v2();
+        second.order.outer_instruction_index = 2;
+        let candidates = vec![first.clone(), second.clone()];
+        assert_eq!(
+            replay_group_identity_v2(&candidates, &[0, 1])
+                .expect("identical curve and mint identity"),
+            (first.bonding_curve.unwrap(), first.mint.unwrap())
+        );
+
+        second.mint = Some(Pubkey::new_from_array([99; 32]));
+        assert!(
+            replay_group_identity_v2(&[first.clone(), second], &[0, 1]).is_err(),
+            "same-curve replay may not combine different mint identities"
+        );
+
+        let mut different_curve = first.clone();
+        different_curve.bonding_curve = Some(Pubkey::new_from_array([98; 32]));
+        assert!(
+            replay_group_identity_v2(&[first, different_curve], &[0, 1]).is_err(),
+            "transaction-local replay may not combine different curve identities"
+        );
+    }
+
+    fn qualified_fixture_artifact_digest(
+        label: &str,
+        line_count: u64,
+    ) -> PumpExactStateArtifactDigestV2 {
+        PumpExactStateArtifactDigestV2 {
+            sha256: format!("{label}-sha256"),
+            blake3: format!("{label}-blake3"),
+            bytes: 1,
+            line_count,
+            newline_complete: true,
+        }
+    }
+
+    fn qualified_fixture_receipt(
+        schema_version: u16,
+        minimum_flag: bool,
+    ) -> (
+        PumpExactStateCapabilityReceiptV2,
+        PumpExactStateExactManifestV2,
+        PumpExactStateArtifactDigestV2,
+    ) {
+        // The receipt binds artifact line counts: births == exact births,
+        // trajectories == exact trajectories, coverage == filtered
+        // transactions.  Keep the fixture internally consistent.
+        let births = qualified_fixture_artifact_digest("births", 60);
+        let trajectories = qualified_fixture_artifact_digest("trajectories", 8_400);
+        let coverage = qualified_fixture_artifact_digest("coverage", 1);
+        let receipt = PumpExactStateCapabilityReceiptV2 {
+            schema_version,
+            kind: "pump_exact_state_capability_v2".to_owned(),
+            source_run_id: "fixture".to_owned(),
+            status: PumpExactStateCapabilityStatusV2::Qualified,
+            blockers: Vec::new(),
+            source_storage_format_version: 3,
+            source_raw_segment_set_blake3: "33".repeat(32),
+            source_start_manifest_digest: test_digest(),
+            source_completion_receipt_digest: test_digest(),
+            semantics_id: "fixture".to_owned(),
+            semantics_manifest_digest: test_digest(),
+            vendored_idl_digest: test_digest(),
+            materializer_running_executable_digest: test_digest(),
+            cohort_slots_strictly_after: 1,
+            qualification_scope: PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2.to_owned(),
+            prospective_birth_cohort_curve_count: 1,
+            conflicting_prospective_birth_curve_count: 0,
+            rooted_canonical_slot_count: 1,
+            filtered_pump_transaction_count: 1,
+            full_block_pump_transaction_count: 1,
+            pump_owned_account_update_count: 1,
+            bonding_curve_account_count: 1,
+            bonding_curve_decoded_count: 1,
+            global_account_count: 1,
+            global_validated_count: 1,
+            unknown_pump_owned_account_count: 0,
+            account_decode_failure_count: 0,
+            successful_rooted_instruction_occurrence_count: 23_908,
+            successful_rooted_proven_non_reserve_count: 0,
+            successful_rooted_validated_event_transport_count: 0,
+            successful_rooted_candidate_count: 23_908,
+            successful_rooted_unknown_occurrence_count: 0,
+            successful_rooted_malformed_candidate_count: 0,
+            occurrence_ledger_reconciled: true,
+            successful_rooted_out_of_scope_pre_boundary_candidate_count: 0,
+            successful_rooted_out_of_scope_pre_existing_curve_candidate_count: 15_500,
+            successful_rooted_global_dependency_candidate_count: 0,
+            successful_rooted_unscoped_curve_mutation_candidate_count: 0,
+            candidate_scope_reconciled: true,
+            successful_rooted_scope_incomplete_occurrence_count: 0,
+            successful_rooted_mutation_denominator: 8_408,
+            exact_rooted_mutation_count: 8_400,
+            explicit_non_exact_mutation_count: 8,
+            denominator_reconciled: true,
+            exact_rooted_coverage_ppm: 999_048,
+            qualification_run_below_minimum: minimum_flag,
+            required_exact_rooted_coverage_ppm: PUMP_EXACT_STATE_REQUIRED_COVERAGE_PPM_V2,
+            exact_trajectory_count: 8_400,
+            successful_rooted_exact_trade_with_both_states_count: 8_000,
+            exact_birth_count: 60,
+            births_artifact: births.clone(),
+            trajectories_artifact: trajectories.clone(),
+            coverage_artifact: coverage.clone(),
+        };
+        let manifest = PumpExactStateExactManifestV2 {
+            schema_version: PUMP_EXACT_STATE_EXACT_OUTPUT_SCHEMA_VERSION_V2,
+            kind: "pump_exact_state_tape_v2".to_owned(),
+            source_run_id: "fixture".to_owned(),
+            exact_state_capability_status: PumpExactStateCapabilityStatusV2::Qualified,
+            source_raw_segment_set_blake3: "33".repeat(32),
+            semantics_manifest_sha256: receipt.semantics_manifest_digest.sha256.clone(),
+            semantics_manifest_blake3: receipt.semantics_manifest_digest.blake3.clone(),
+            materializer_running_executable_sha256: receipt
+                .materializer_running_executable_digest
+                .sha256
+                .clone(),
+            materializer_running_executable_blake3: receipt
+                .materializer_running_executable_digest
+                .blake3
+                .clone(),
+            materializer_running_executable_bytes: receipt
+                .materializer_running_executable_digest
+                .bytes,
+            qualification_scope: PUMP_EXACT_STATE_QUALIFICATION_SCOPE_V2.to_owned(),
+            exact_state_capability_artifact: qualified_fixture_artifact_digest("receipt", 1),
+            births_artifact: births.clone(),
+            trajectories_artifact: trajectories.clone(),
+            coverage_artifact: coverage.clone(),
+        };
+        (
+            receipt,
+            manifest,
+            qualified_fixture_artifact_digest("receipt", 1),
+        )
+    }
+
+    #[test]
+    fn capability_receipt_schema_five_is_rejected_after_global_minimum_contract() {
+        let (receipt, manifest, receipt_digest) =
+            qualified_fixture_receipt(PUMP_EXACT_STATE_CAPABILITY_SCHEMA_VERSION_V2, false);
+        validate_exact_output_receipt_v2(
+            &receipt,
+            &manifest,
+            &receipt_digest,
+            &receipt_digest,
+            &receipt.births_artifact,
+            &receipt.trajectories_artifact,
+            &receipt.coverage_artifact,
+        )
+        .expect("a schema-6 Qualified fixture must pass receipt authority");
+        let (legacy_receipt, legacy_manifest, legacy_receipt_digest) =
+            qualified_fixture_receipt(5, false);
+        assert!(
+            validate_exact_output_receipt_v2(
+                &legacy_receipt,
+                &legacy_manifest,
+                &legacy_receipt_digest,
+                &legacy_receipt_digest,
+                &legacy_receipt.births_artifact,
+                &legacy_receipt.trajectories_artifact,
+                &legacy_receipt.coverage_artifact,
+            )
+            .is_err(),
+            "a schema-5 receipt computed the minimum flag from the scoped denominator and must never be re-accepted"
         );
     }
 
@@ -8134,6 +9268,9 @@ mod tests {
     #[test]
     fn exact_output_is_atomic_and_manifest_binds_capability_receipt() {
         let temporary = tempfile::tempdir().expect("temporary output root");
+        #[cfg(unix)]
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
+            .expect("make temporary exact-output parent private");
         let raw_dir = temporary.path().join("raw-v2");
         let output_dir = temporary.path().join("exact-v2");
         fs::create_dir(&raw_dir).expect("raw directory");
@@ -8286,6 +9423,9 @@ mod tests {
     #[test]
     fn qualified_exact_output_adapter_pins_artifacts_and_detects_late_drift() {
         let temporary = tempfile::tempdir().expect("temporary output root");
+        #[cfg(unix)]
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
+            .expect("make temporary exact-output parent private");
         let raw_dir = temporary.path().join("raw-v2");
         let output_dir = temporary.path().join("exact-v2");
         fs::create_dir(&raw_dir).expect("raw directory");

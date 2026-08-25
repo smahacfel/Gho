@@ -6184,6 +6184,16 @@ mod tests {
         variant: QualifiedExportFixtureVariantV2,
         force_intermediate_rollover: bool,
     ) {
+        // The real writer requires the parent of a create-new exact artifact
+        // to be owner-private.  `tempfile` deliberately follows the process
+        // umask on this platform, so make the fixture authority explicit
+        // rather than allowing the public test suite to depend on `umask
+        // 077` in its caller.
+        let fixture_root = raw_dir
+            .parent()
+            .expect("local V2 raw fixture has an authority parent");
+        fs::set_permissions(fixture_root, fs::Permissions::from_mode(0o700))
+            .expect("make local V2 fixture authority parent private");
         let capture_contract =
             ghost_core::pump_research_tape::PumpResearchStorageHashV1::from([41; 32]);
         let mut writer = PumpExactStateRawSegmentWriterV2::new(

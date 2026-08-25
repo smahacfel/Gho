@@ -9373,8 +9373,12 @@ mod tests {
         let parser = BinaryParser::new(false);
         let mint = Pubkey::new_unique();
         let curve = Pubkey::new_unique();
-        let direct_user = Pubkey::new_unique();
-        let cpi_user = Pubkey::new_unique();
+        // This fixture exercises source precedence, not rejection of a
+        // program-derived address.  Creator sanitization deliberately accepts
+        // only wallet/on-curve owners, so use literal wallet keys rather than
+        // `Pubkey::new_unique()` (which is not guaranteed to be on curve).
+        let direct_user = Keypair::new().pubkey();
+        let cpi_user = Keypair::new().pubkey();
         let event = make_decoded_tx_event(vec![], vec![]);
         let direct = ParsedPumpEvent {
             received_at: Instant::now(),

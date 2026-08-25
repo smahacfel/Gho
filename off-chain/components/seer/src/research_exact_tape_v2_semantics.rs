@@ -70,6 +70,14 @@ const LEGACY_BUY_OPTIONAL_BOOLEAN_COMPATIBILITY_INSTRUCTIONS_V2: &[&str] =
 const LEGACY_BUY_OPTIONAL_BOOLEAN_COMPATIBILITY_PREFIX_BYTES_V2: usize = 16;
 const LEGACY_BUY_OPTIONAL_BOOLEAN_COMPATIBILITY_MAX_TRAILING_BYTES_V2: usize = 2;
 
+/// Closed current-ProgramData ABI spellings observed in the immutable
+/// PRXTAPE3 run but not expressible by the pinned public IDL.  These are not
+/// tolerant decoders: every admitted suffix byte is a literal Borsh bool and
+/// the `create_v2` spelling must end exactly after the declared prefix.  No
+/// compatibility byte is assigned to a semantic argument unless the pinned
+/// IDL names it unambiguously.
+const CURRENT_ABI_BOOLEAN_SUFFIX_PREFIX_BYTES_V2: usize = 16;
+
 /// The only offline behavior classes accepted for a Pump instruction in a
 /// prospective V2 qualifier.  Every instruction in the vendored IDL must
 /// appear in the manifest exactly once; absent or extra names are authority
@@ -1153,6 +1161,63 @@ impl PumpExactStateSemanticsAuthorityV2 {
         validate_account_layout(&self.global_layout, data, &self.defined_types)
     }
 
+    /// Test/census-only read access to the vendored defined-type registry.
+    /// The registry content is fully pinned by the manifest digest; exposing
+    /// a read reference creates no second semantics authority.
+    #[cfg(test)]
+    pub(crate) fn census_defined_types(&self) -> &BTreeMap<String, Value> {
+        &self.defined_types
+    }
+
+    /// Test/census-only read access to one instruction contract's declared
+    /// argument fields.
+    #[cfg(test)]
+    pub(crate) fn census_instruction_arg_fields<'a>(
+        &self,
+        contract: &'a PumpExactStateInstructionContractV2,
+    ) -> &'a [Value] {
+        &contract.args
+    }
+
+    /// Test/census-only strict named-field Borsh decode against the pinned
+    /// defined-type registry.
+    #[cfg(test)]
+    pub(crate) fn census_decode_named_fields_exact(
+        &self,
+        fields: &[Value],
+        payload: &[u8],
+        label: &str,
+    ) -> Result<BTreeMap<String, Vec<u8>>> {
+        decode_named_borsh_fields_exact_v2(fields, payload, &self.defined_types, label)
+    }
+
+    /// Return the exact event-field names whose manifest disposition for the
+    /// selected parent is `StrictDecodeOnly`. This keeps the census report
+    /// honest: identity/literal bindings must not be mislabeled as opaque
+    /// merely because they are not final curve-state fields.
+    #[cfg(test)]
+    pub(crate) fn census_strict_decode_only_event_fields(
+        &self,
+        event: &PumpExactStateEventContractV2,
+        parent_discriminator: &[u8; 8],
+    ) -> Result<BTreeSet<String>> {
+        let contract = event
+            .parent_contracts
+            .get(parent_discriminator)
+            .ok_or_else(|| anyhow::anyhow!("V2 census event parent contract is absent"))?;
+        Ok(contract
+            .field_bindings
+            .iter()
+            .filter_map(|binding| {
+                matches!(
+                    binding.source,
+                    PumpExactStateEventFieldSourceV2::StrictDecodeOnly
+                )
+                .then_some(binding.event_field.clone())
+            })
+            .collect())
+    }
+
     /// Verify full Borsh consumption for an instruction payload that follows
     /// an Anchor eight-byte discriminator.  The closed legacy-buy ABI
     /// compatibility grammar is shared with semantic field decoding so a
@@ -1208,12 +1273,17 @@ impl PumpExactStateSemanticsAuthorityV2 {
         );
         match strict {
             Ok(fields) => Ok(fields),
-            Err(strict_error) => legacy_buy_optional_boolean_argument_fields_v2(
-                contract,
-                payload,
-                &self.defined_types,
-            )
-            .unwrap_or(Err(strict_error)),
+            Err(strict_error) => {
+                if let Some(result) = legacy_buy_optional_boolean_argument_fields_v2(
+                    contract,
+                    payload,
+                    &self.defined_types,
+                ) {
+                    return result;
+                }
+                current_program_abi_argument_fields_v2(contract, payload, &self.defined_types)
+                    .unwrap_or(Err(strict_error))
+            }
         }
     }
 
@@ -1252,6 +1322,51 @@ impl PumpExactStateSemanticsAuthorityV2 {
         Ok((Some(curve), Some(mint)))
     }
 
+    /// Resolve candidate identity for denominator/scope conservation.  Exact
+    /// trade/create variants remain bound exclusively by manifest
+    /// `instruction_state_roles`.  A known unsupported curve mutation may use
+    /// only the literal `bonding_curve` plus `mint`/`base_mint` roles from the
+    /// same hash-pinned IDL account vector.  This identity alone grants no
+    /// transition semantics.  The production materializer may separately
+    /// prove one closed anchor-observed transition, but an unsupported
+    /// occurrence cannot become exact merely by passing this scope helper.
+    pub fn candidate_scope_account_pubkeys(
+        &self,
+        contract: &PumpExactStateInstructionContractV2,
+        account_roles: &BTreeMap<String, Pubkey>,
+    ) -> Result<(Option<Pubkey>, Option<Pubkey>)> {
+        if matches!(
+            contract.effect,
+            PumpExactStateInstructionEffectV2::SupportedExactTrade
+                | PumpExactStateInstructionEffectV2::SupportedExactCreate
+        ) {
+            return self.exact_state_account_pubkeys(contract, account_roles);
+        }
+        if !matches!(
+            contract.effect,
+            PumpExactStateInstructionEffectV2::KnownReserveOrDependencyUnsupported
+        ) {
+            return Ok((None, None));
+        }
+        let Some(curve) = account_roles.get("bonding_curve").copied() else {
+            return Ok((None, None));
+        };
+        let mint = match (
+            account_roles.get("mint").copied(),
+            account_roles.get("base_mint").copied(),
+        ) {
+            (Some(mint), None) | (None, Some(mint)) => Some(mint),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                bail!(
+                    "V2 unsupported instruction {} has ambiguous literal mint roles",
+                    contract.name
+                )
+            }
+        };
+        Ok((Some(curve), mint))
+    }
+
     /// Decode every event field exactly once.  This is separate from the
     /// tolerant active runtime decoder: a prospective qualification event is
     /// evidence only when all bytes are consumed by its vendored field layout.
@@ -1281,15 +1396,23 @@ impl PumpExactStateSemanticsAuthorityV2 {
         event_fields: &BTreeMap<String, Vec<u8>>,
         parent: &PumpExactStateInstructionSemanticEvidenceV2,
     ) -> Result<Vec<PumpExactStateEventFinalStateBindingV2>> {
-        let contract = event
-            .parent_contracts
-            .get(&parent.discriminator)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
+        let contract = match event.parent_contracts.get(&parent.discriminator) {
+            Some(contract) => contract,
+            None if self.validate_legacy_migrate_completion_transport_v2(
+                event,
+                event_fields,
+                parent,
+            )? =>
+            {
+                return Ok(Vec::new())
+            }
+            None => {
+                bail!(
                     "V2 event {} is not permitted under its immediate parent instruction discriminator",
                     event.name
                 )
-            })?;
+            }
+        };
         let mut final_state_bindings = Vec::new();
         for binding in &contract.field_bindings {
             let observed = event_fields.get(&binding.event_field).ok_or_else(|| {
@@ -1355,6 +1478,54 @@ impl PumpExactStateSemanticsAuthorityV2 {
             }
         }
         Ok(final_state_bindings)
+    }
+
+    /// The capture-pinned current ProgramData emitted
+    /// `CompletePumpAmmMigrationEvent` directly below legacy `migrate`, while
+    /// the vendored public IDL manifest lists the same event only for
+    /// `migrate_v2`.  This closed compatibility accepts exactly that one
+    /// structurally proven parent/event pair and validates every available
+    /// identity against literal parent account roles.  It grants no final
+    /// curve-state binding and cannot make the unsupported migration exact by
+    /// itself; it only prevents a genuine strict Event-CPI transport from
+    /// becoming an `Unknown` occurrence.
+    fn validate_legacy_migrate_completion_transport_v2(
+        &self,
+        event: &PumpExactStateEventContractV2,
+        event_fields: &BTreeMap<String, Vec<u8>>,
+        parent: &PumpExactStateInstructionSemanticEvidenceV2,
+    ) -> Result<bool> {
+        let Some(parent_contract) = self.instruction(&parent.discriminator) else {
+            return Ok(false);
+        };
+        if event.name != "CompletePumpAmmMigrationEvent" || parent_contract.name != "migrate" {
+            return Ok(false);
+        }
+        for (event_field, parent_role) in [
+            ("user", "user"),
+            ("mint", "mint"),
+            ("bonding_curve", "bonding_curve"),
+            ("pool", "pool"),
+        ] {
+            let observed = event_fields.get(event_field).ok_or_else(|| {
+                anyhow::anyhow!("V2 legacy migrate event lacks identity field {event_field}")
+            })?;
+            let expected = parent.account_roles.get(parent_role).ok_or_else(|| {
+                anyhow::anyhow!("V2 legacy migrate parent lacks account role {parent_role}")
+            })?;
+            if observed.as_slice() != expected.to_bytes() {
+                bail!(
+                    "V2 legacy migrate event field {event_field} differs from parent account role {parent_role}"
+                );
+            }
+        }
+        let observed_quote_mint = event_fields.get("quote_mint").ok_or_else(|| {
+            anyhow::anyhow!("V2 legacy migrate event lacks identity field quote_mint")
+        })?;
+        if observed_quote_mint.as_slice() != Pubkey::default().to_bytes() {
+            bail!("V2 legacy migrate event quote_mint is not the pinned native-SOL zero pubkey");
+        }
+        Ok(true)
     }
 }
 
@@ -1480,6 +1651,93 @@ fn legacy_buy_optional_boolean_idl_shape_v2(
             .and_then(|value| value.get("name"))
             .and_then(Value::as_str)
             == Some("OptionBool")
+}
+
+/// Decode only the four closed ABI differences established by the bounded
+/// feasibility census over the preserved current-ProgramData run:
+///
+/// * `buy_exact_quote_in_v2` and `buy_v2`: two canonical `u64` arguments plus
+///   one unassigned Borsh boolean;
+/// * `sell`: two canonical `u64` arguments plus one or two unassigned Borsh
+///   booleans;
+/// * `create_v2`: every declared argument through `is_mayhem_mode`, with the
+///   terminal `OptionBool` absent.
+///
+/// The absent `create_v2` argument is deliberately not inserted into the
+/// returned map.  Exactness may only be recovered later when the strict
+/// CreateEvent supplies the two affected state facts and the transaction-local
+/// replay reproduces the final account anchor.
+fn current_program_abi_argument_fields_v2(
+    contract: &PumpExactStateInstructionContractV2,
+    payload: &[u8],
+    defined_types: &BTreeMap<String, Value>,
+) -> Option<Result<BTreeMap<String, Vec<u8>>>> {
+    match contract.name.as_str() {
+        "buy_exact_quote_in_v2" | "buy_v2" | "sell" => {
+            let expected_suffix = match contract.name.as_str() {
+                "buy_exact_quote_in_v2" | "buy_v2" => 1..=1,
+                "sell" => 1..=2,
+                _ => unreachable!(),
+            };
+            if contract.args.len() != 2
+                || contract
+                    .args
+                    .iter()
+                    .any(|field| field.get("type").and_then(Value::as_str) != Some("u64"))
+                || payload.len() < CURRENT_ABI_BOOLEAN_SUFFIX_PREFIX_BYTES_V2
+            {
+                return None;
+            }
+            let suffix_len = payload.len() - CURRENT_ABI_BOOLEAN_SUFFIX_PREFIX_BYTES_V2;
+            if !expected_suffix.contains(&suffix_len) {
+                return None;
+            }
+            Some((|| {
+                let fields = decode_named_borsh_fields_exact_v2(
+                    &contract.args,
+                    &payload[..CURRENT_ABI_BOOLEAN_SUFFIX_PREFIX_BYTES_V2],
+                    defined_types,
+                    "V2 current Pump two-u64 compatibility prefix",
+                )?;
+                if payload[CURRENT_ABI_BOOLEAN_SUFFIX_PREFIX_BYTES_V2..]
+                    .iter()
+                    .any(|value| !matches!(*value, 0 | 1))
+                {
+                    bail!("V2 current Pump compatibility suffix contains an invalid boolean");
+                }
+                Ok(fields)
+            })())
+        }
+        "create_v2" => {
+            let Some((terminal, prefix)) = contract.args.split_last() else {
+                return None;
+            };
+            if terminal.get("name").and_then(Value::as_str) != Some("is_cashback_enabled")
+                || terminal
+                    .get("type")
+                    .and_then(Value::as_object)
+                    .and_then(|value| value.get("defined"))
+                    .and_then(Value::as_object)
+                    .and_then(|value| value.get("name"))
+                    .and_then(Value::as_str)
+                    != Some("OptionBool")
+                || prefix
+                    .last()
+                    .and_then(|field| field.get("name"))
+                    .and_then(Value::as_str)
+                    != Some("is_mayhem_mode")
+            {
+                return None;
+            }
+            Some(decode_named_borsh_fields_exact_v2(
+                prefix,
+                payload,
+                defined_types,
+                "V2 current Pump create_v2 prefix without terminal OptionBool",
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn load_account_layout(
@@ -2448,6 +2706,57 @@ mod tests {
     }
 
     #[test]
+    fn real_vendored_legacy_migrate_completion_transport_is_closed_and_identity_bound() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repository root from seer manifest directory");
+        let authority = load_pump_exact_state_semantics_authority_v2(
+            &repository_root.join("configs/research/pump_exact_state_semantics_manifest_v2.json"),
+        )
+        .expect("real vendored Pump semantics manifest must load");
+        let event = authority
+            .event(&[0xbd, 0xe9, 0x5d, 0xb9, 0x5c, 0x94, 0xea, 0x94])
+            .expect("CompletePumpAmmMigrationEvent contract");
+        let user = Pubkey::new_from_array([1; 32]);
+        let mint = Pubkey::new_from_array([2; 32]);
+        let curve = Pubkey::new_from_array([3; 32]);
+        let pool = Pubkey::new_from_array([4; 32]);
+        let parent = PumpExactStateInstructionSemanticEvidenceV2 {
+            discriminator: [0x9b, 0xea, 0xe7, 0x92, 0xec, 0x9e, 0xa2, 0x1e],
+            account_roles: BTreeMap::from([
+                ("user".to_owned(), user),
+                ("mint".to_owned(), mint),
+                ("bonding_curve".to_owned(), curve),
+                ("pool".to_owned(), pool),
+            ]),
+            argument_fields: BTreeMap::new(),
+        };
+        let mut fields = BTreeMap::from([
+            ("user".to_owned(), user.to_bytes().to_vec()),
+            ("mint".to_owned(), mint.to_bytes().to_vec()),
+            ("bonding_curve".to_owned(), curve.to_bytes().to_vec()),
+            ("pool".to_owned(), pool.to_bytes().to_vec()),
+            (
+                "quote_mint".to_owned(),
+                Pubkey::default().to_bytes().to_vec(),
+            ),
+        ]);
+        assert!(authority
+            .validate_event_parent_semantics(event, &fields, &parent)
+            .is_ok_and(|bindings| bindings.is_empty()));
+        fields.insert("mint".to_owned(), vec![9; 32]);
+        assert!(authority
+            .validate_event_parent_semantics(event, &fields, &parent)
+            .is_err());
+        fields.insert("mint".to_owned(), mint.to_bytes().to_vec());
+        fields.insert("quote_mint".to_owned(), vec![9; 32]);
+        assert!(authority
+            .validate_event_parent_semantics(event, &fields, &parent)
+            .is_err());
+    }
+
+    #[test]
     fn real_vendored_quote_regime_reserves_are_strict_decode_only_until_variant_contract_exists() {
         let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
@@ -2664,12 +2973,83 @@ mod tests {
         );
         let mut unrelated_trailing_byte = prefix();
         unrelated_trailing_byte.push(0);
-        assert!(
+        assert_eq!(
             authority
-                .validate_instruction_payload(buy_v2, &unrelated_trailing_byte)
-                .is_err(),
-            "no other instruction may inherit the legacy-buy exception"
+                .instruction_argument_fields(buy_v2, &unrelated_trailing_byte)
+                .expect("buy_v2 has its own census-proven one-boolean ABI spelling")
+                .len(),
+            2,
+            "the extra boolean is consumed but not invented as a named argument"
         );
+    }
+
+    #[test]
+    fn current_program_compatibility_grammars_are_closed_and_do_not_invent_arguments() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repository root from seer manifest directory");
+        let authority = load_pump_exact_state_semantics_authority_v2(
+            &repository_root.join("configs/research/pump_exact_state_semantics_manifest_v2.json"),
+        )
+        .expect("real vendored Pump semantics manifest must load");
+        let instruction = |name: &str| {
+            authority
+                .instructions_by_discriminator
+                .values()
+                .find(|contract| contract.name == name)
+                .expect("real instruction contract")
+        };
+
+        let mut two_u64 = Vec::new();
+        two_u64.extend_from_slice(&11u64.to_le_bytes());
+        two_u64.extend_from_slice(&22u64.to_le_bytes());
+        for name in ["buy_exact_quote_in_v2", "buy_v2"] {
+            let mut observed = two_u64.clone();
+            observed.push(1);
+            let decoded = authority
+                .instruction_argument_fields(instruction(name), &observed)
+                .expect("one observed unassigned boolean is a closed spelling");
+            assert_eq!(decoded.len(), 2);
+            assert!(decoded.values().all(|value| value.len() == 8));
+            observed.push(0);
+            assert!(authority
+                .instruction_argument_fields(instruction(name), &observed)
+                .is_err());
+        }
+
+        let mut sell_two = two_u64.clone();
+        sell_two.extend_from_slice(&[0, 1]);
+        assert_eq!(
+            authority
+                .instruction_argument_fields(instruction("sell"), &sell_two)
+                .expect("sell admits the observed bounded two-boolean suffix")
+                .len(),
+            2
+        );
+        sell_two.push(0);
+        assert!(authority
+            .instruction_argument_fields(instruction("sell"), &sell_two)
+            .is_err());
+
+        let create_v2 = instruction("create_v2");
+        let mut create_prefix = Vec::new();
+        for value in ["name", "SYM", "uri"] {
+            create_prefix.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            create_prefix.extend_from_slice(value.as_bytes());
+        }
+        create_prefix.extend_from_slice(&[7; 32]);
+        create_prefix.push(1);
+        let decoded = authority
+            .instruction_argument_fields(create_v2, &create_prefix)
+            .expect("observed create_v2 prefix without terminal OptionBool");
+        assert_eq!(decoded.get("is_mayhem_mode"), Some(&vec![1]));
+        assert!(!decoded.contains_key("is_cashback_enabled"));
+        let mut invalid = create_prefix;
+        invalid.push(2);
+        assert!(authority
+            .instruction_argument_fields(create_v2, &invalid)
+            .is_err());
     }
 
     #[test]
