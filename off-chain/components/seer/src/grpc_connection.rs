@@ -2335,7 +2335,6 @@ impl PumpResearchSourceConnectionV1 {
             // it bounded and sized from the standalone capture config so no
             // hidden unbounded transport buffer is introduced.
             ingress_queue_capacity: ingress_queue_capacity.max(1),
-            scope_primary_global_account_updates_to_registry: false,
         };
         config.validate_provider_roles()?;
 
