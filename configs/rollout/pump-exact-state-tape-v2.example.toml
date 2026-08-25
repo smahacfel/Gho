@@ -1,0 +1,62 @@
+# Prospective Pump Exact-State Tape V2 — operator template only.
+#
+# This file intentionally contains no usable endpoint, hostname, credential, or
+# historical GO-D path.  Copy it to a private 0600 operator location, replace
+# the .invalid endpoints, and choose a dedicated existing 0700 output root on
+# a filesystem sized for `max_raw_bytes + min_free_bytes`.
+#
+# This is a new prospective source contract.  It never repairs, appends to, or
+# reinterprets frozen GO-D.  A raw-complete V2 run remains distinct from the
+# later offline exact-state qualification and from any strategy outcome gate.
+
+primary_provider_id = "replace-with-source-provider-id"
+grpc_endpoint = "https://replace-grpc-endpoint.invalid"
+grpc_auth_token_env = "PUMP_EXACT_STATE_TAPE_V2_GRPC_TOKEN"
+grpc_auth_header = "x-token"
+
+# RPC has one deliberately narrow job: finalized start/end receipts for the
+# Pump Program and ProgramData accounts.  It never scans or reconstructs the
+# Pump account universe.
+program_data_rpc_endpoint = "https://replace-program-data-rpc.invalid"
+program_data_rpc_auth_token_env = "PUMP_EXACT_STATE_TAPE_V2_PROGRAM_DATA_RPC_TOKEN"
+program_data_rpc_auth_header = "x-api-key"
+
+# Exact compiled Pump program ID.  The binary rejects a substituted value.
+pump_program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+# Required, hash-pinned offline semantics authority for this prospective run.
+# It must name one vendored public Pump IDL and the expected finalized
+# ProgramData BLAKE3 before capture starts. Preflight binds its manifest/IDL
+# digests, and capture refuses to allocate raw-v2 if observed ProgramData does
+# not match. This template path is intentionally non-operational.
+semantics_manifest_path = "/protected/operator/pump-exact-state-semantics-v2.json"
+
+# Must exist before preflight, be a private non-symlink directory (0700), and
+# be outside every V1/V2 raw run.  The capture creates a new child run only.
+output_dir = "/protected/operator/pump-exact-state-tape-v2-runs"
+required_for_run = true
+
+# Bounded source ingress.  V2 receives unfiltered full blocks in addition to
+# the Pump-filtered transaction and the canonical BondingCurve/Global account
+# lanes, so both item and serialized-protobuf-byte limits are authority inputs.
+source_queue_capacity = 8192
+source_queue_max_bytes = 536870912
+source_readiness_timeout_ms = 30000
+
+# A finite prospective cohort begins only after all five live lanes have
+# supplied their first accepted record and the one stream-readiness boundary
+# has been durably flushed.  Deadline expiry is a deliberate normal stop; an
+# unexpected source exit, source epoch change, gap, queue overflow, raw
+# byte-budget breach, or storage-reserve breach makes the run incomplete.
+cohort_capture_wall_ms = 3600000
+
+# Preflight requires at least min_free_bytes + max_raw_bytes + a fixed 64 MiB
+# metadata allowance to be available on this filesystem before any provider
+# connection.  The writer periodically verifies the retained floor and refuses
+# to persist more than max_raw_bytes.
+min_free_bytes = 14000000000
+max_raw_bytes = 16000000000
+
+flush_interval_ms = 1000
+segment_max_bytes = 268435456
+segment_max_duration_ms = 300000

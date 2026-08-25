@@ -1,0 +1,58 @@
+# Pump Research Evidence Tape V1.1 — standalone raw capture.
+#
+# This is a tracked, non-secret TEMPLATE.  Do not use this in-repository file
+# for a real preflight: copy it to a protected operator-local path outside the
+# Git worktree, then supply that external path to both commands.  The raw
+# external TOML is never copied into the provenance bundle; only its digest
+# and a redacted projection are retained.
+#
+# A release bootstrap binary seals a *fresh* capture binary from the complete
+# source snapshot.  Capture must then be executed through the copied binary in
+# that preflight bundle, from the repository root:
+#
+#   cargo build --locked --release -p seer --bin pump-research-tape
+#   target/release/pump-research-tape preflight \
+#     --config /protected/operator/pump-research-tape-v1.toml \
+#     --output datasets/pump-research/preflight/<operator-preflight-id>
+#   datasets/pump-research/preflight/<operator-preflight-id>/release/pump-research-tape capture \
+#     --config /protected/operator/pump-research-tape-v1.toml \
+#     --provenance-receipt datasets/pump-research/preflight/<operator-preflight-id>/operator_preflight_receipt_v1.json
+#
+# `capture` rejects a debug bootstrap, a non-sealed executable, missing receipt,
+# placeholder/non-origin endpoint, drifted Cargo.lock/tracked patch/untracked
+# source inventory/required ignored fixture/config or altered bundle sidecar.
+# `preflight` is local-only: it performs no Yellowstone or RPC request and
+# persists no credential value.  The bundle is sensitive forensic material:
+# source patches/snapshots can contain unrelated local data, so do not publish
+# it or place it in a world-readable directory.
+#
+# It is deliberately not part of SeerConfig and cannot alter the active Ghost
+# runtime.  Set the named environment variable before running `preflight`; its
+# credential value is never written to the raw manifest or receipts.
+
+primary_provider_id = "primary-yellowstone"
+grpc_endpoint = "https://your-yellowstone-provider.example"
+grpc_auth_token_env = "GHOST_PUMP_RESEARCH_GRPC_TOKEN"
+grpc_auth_header = "x-token"
+
+# Used only for the finalized Program/ProgramData start and completion receipts.
+rpc_endpoint = "https://your-finalized-rpc.example"
+# Optional named RPC header credential. Keep provider credentials out of the
+# URL; the endpoint must be a root-only HTTPS origin.
+# rpc_auth_token_env = "GHOST_PUMP_RESEARCH_RPC_TOKEN"
+rpc_auth_header = "x-api-key"
+
+# Frozen canonical Pump.fun program for V1.  Any other value fails preflight.
+pump_program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+# A new immutable run is created at <output_dir>/<run_id>/raw.
+output_dir = "datasets/pump-research"
+required_for_run = true
+
+queue_capacity = 2048
+flush_interval_ms = 1000
+segment_max_bytes = 268435456
+segment_max_duration_ms = 300000
+
+# Frozen V1 binary contract.  Do not change this value.
+record_max_bytes = 16777216

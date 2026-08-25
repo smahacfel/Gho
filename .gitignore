@@ -25,6 +25,17 @@ dashboard.py
 *.log
 *.jsonl
 *.json
+# The V2 prospective tape has two versioned, public authority inputs.  Keep
+# the broad protection for generated/operational JSON, but track this exact
+# vendored IDL and its companion semantics manifest so a sealed preflight can
+# reproduce the offline qualification contract.
+!configs/research/
+!configs/research/pump_exact_state_semantics_manifest_v2.json
+!configs/research/vendor/
+!configs/research/vendor/pump-public-docs/
+!configs/research/vendor/pump-public-docs/3c6721a67c0b206b39130b454c8ba22a83ce972e/
+!configs/research/vendor/pump-public-docs/3c6721a67c0b206b39130b454c8ba22a83ce972e/idl/
+!configs/research/vendor/pump-public-docs/3c6721a67c0b206b39130b454c8ba22a83ce972e/idl/pump.json
 # Wyjątek dla plików Cargo (jeśli jednak chciałbyś je śledzić - patrz niżej)
 !Cargo.toml
 !Cargo.lock

@@ -73,6 +73,20 @@ pub mod metrics;
 pub mod nln_program_streams;
 pub mod paradox_sensor;
 pub mod pumpportal_connection;
+/// Standalone prospective V2 raw capture.  It is independent from the frozen
+/// GO-D V1 tape and cannot alter active Seer runtime subscription behavior.
+pub mod research_exact_tape_v2;
+/// Offline-only V2 raw-contract inspection and later exact-state qualification.
+/// It consumes only frozen V2 artifacts and is not connected to active Seer.
+pub mod research_exact_tape_v2_materializer;
+/// Hash-pinned offline semantics selection for prospective Exact-State Tape
+/// V2. It is deliberately separate from the active parser/runtime path.
+pub mod research_exact_tape_v2_semantics;
+pub mod research_tape;
+/// Offline-only PR-B replay and exact-tape materialisation.  Kept separate
+/// from the PR-A capture writer so importing it cannot alter the active Seer
+/// runtime or the frozen raw V1 storage contract.
+pub mod research_tape_materializer;
 pub mod rpc_http_client;
 pub mod types;
 pub mod websocket_connection;
@@ -4225,7 +4239,7 @@ impl Seer {
 
             let disc = &data[..8];
             if disc == binary_parser::DISC_CREATE.as_slice()
-                || disc == binary_parser::DISC_CREATE_ANCHOR.as_slice()
+                || disc == binary_parser::DISC_CREATE_V2.as_slice()
                 || disc == binary_parser::DISC_SWAP_CREATE_POOL.as_slice()
                 || disc == binary_parser::DISC_EVENT_CREATE.as_slice()
             {
@@ -6958,6 +6972,7 @@ mod tests {
             provider_role: None,
             slot: Some(1),
             tx_index: None,
+            birth_canonical_order: None,
             event_ts_ms: Some(1_000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: Signature::new_unique().to_string(),
@@ -6965,11 +6980,13 @@ mod tests {
             pool_amm_id: Pubkey::new_unique(),
             base_mint: Pubkey::new_unique(),
             quote_mint: Pubkey::new_unique(),
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
             bonding_curve: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
             timestamp: 1_000,
             bonding_curve_progress: Some(0.0),
             initial_liquidity_sol: Some(30.0),
+            initial_virtual_quote_reserves: None,
             token_total_supply: Some(1_000_000_000_000_000),
             block_time: Some(1),
         };
@@ -7122,10 +7139,12 @@ mod tests {
                 pool_amm_id: pool,
                 base_mint: mint,
                 quote_mint: *wsol_mint_pubkey(),
+                creation_regime: ghost_core::PumpCreationRegimeV1::default(),
                 bonding_curve: pool,
                 creator: Pubkey::new_unique(),
                 initial_virtual_token_reserves: None,
                 initial_virtual_sol_reserves: None,
+                initial_virtual_quote_reserves: None,
                 initial_real_token_reserves: None,
                 initial_real_sol_reserves: None,
                 token_total_supply: None,
@@ -7181,10 +7200,12 @@ mod tests {
                 pool_amm_id: pumpswap_pool,
                 base_mint: mint,
                 quote_mint: *wsol_mint_pubkey(),
+                creation_regime: ghost_core::PumpCreationRegimeV1::default(),
                 bonding_curve: pumpswap_pool,
                 creator: Pubkey::new_unique(),
                 initial_virtual_token_reserves: None,
                 initial_virtual_sol_reserves: None,
+                initial_virtual_quote_reserves: None,
                 initial_real_token_reserves: None,
                 initial_real_sol_reserves: None,
                 token_total_supply: None,
@@ -7959,6 +7980,7 @@ mod tests {
             provider_role: None,
             slot: Some(1),
             tx_index: None,
+            birth_canonical_order: None,
             event_ts_ms: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: "sig1".to_string(),
@@ -7966,11 +7988,13 @@ mod tests {
             pool_amm_id: Pubkey::new_unique(),
             base_mint: Pubkey::new_unique(),
             quote_mint: Pubkey::new_unique(),
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
             bonding_curve: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
             timestamp: 0,
             bonding_curve_progress: None,
             initial_liquidity_sol: None,
+            initial_virtual_quote_reserves: None,
             token_total_supply: None,
             block_time: None,
         };
@@ -8013,10 +8037,12 @@ mod tests {
             pool_amm_id: curve,
             base_mint: mint,
             quote_mint: sol_mint,
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
             bonding_curve: curve,
             creator: Pubkey::new_unique(),
             initial_virtual_token_reserves: None,
             initial_virtual_sol_reserves: None,
+            initial_virtual_quote_reserves: None,
             initial_real_token_reserves: None,
             initial_real_sol_reserves: None,
             token_total_supply: None,
@@ -11258,6 +11284,7 @@ mod tests {
             provider_role: None,
             slot: Some(1),
             tx_index: None,
+            birth_canonical_order: None,
             event_ts_ms: Some(1_000_000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: Signature::new_unique().to_string(),
@@ -11269,11 +11296,13 @@ mod tests {
             quote_mint: "So11111111111111111111111111111111111111112"
                 .parse()
                 .unwrap(),
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
             bonding_curve: curve,
             creator: Pubkey::new_unique(),
             timestamp: 1_000_000,
             bonding_curve_progress: Some(0.0),
             initial_liquidity_sol: Some(30.0),
+            initial_virtual_quote_reserves: None,
             token_total_supply: Some(1_000_000_000_000_000),
             block_time: Some(1),
         };
