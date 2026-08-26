@@ -26,6 +26,10 @@ use ghost_core::{
     PumpRouteVariant, PumpTradeSideV1, RawProviderRoleV1, TimestampQuality, Wal,
 };
 use metrics::increment_counter;
+use once_cell::sync::Lazy;
+use prometheus::{
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts,
+};
 use seer::{
     config::{
         ConnectionMode, FilterConfig, FundingLaneMode, ProgramStreamPayloadFormat,
@@ -34,7 +38,7 @@ use seer::{
     },
     ipc::{
         create_ipc_channel, BackpressurePolicy, FundingLaneRuntimeHealth, IpcChannelConfig,
-        LocalCoverageGapNoticeV1, PoolDetectionRuntimeDispositionV1,
+        IpcReceiver, LocalCoverageGapNoticeV1, PoolDetectionRuntimeDispositionV1,
     },
     nln_program_streams::{
         normalize_nln_event, NlnEvent, NlnFundingTransferCoverage, NlnProgramStreamMessage,
@@ -44,6 +48,7 @@ use seer::{
     Seer,
 };
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::hash::Hash;
@@ -76,6 +81,460 @@ const SESSION_POOL_REGISTRY_FALLBACK_CAP: usize = 16_384;
 const SEER_CORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_POOL_BRIDGE_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
 const NLN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+const ORACLE_RUNTIME_SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(5);
+const ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const ORACLE_RUNTIME_IPC_RECV_GAP_THRESHOLD: Duration = Duration::from_millis(5);
+const ORACLE_RUNTIME_IPC_RECV_GAP_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const ORACLE_RUNTIME_SCHEDULING_LAG_INTERVAL: Duration = Duration::from_millis(10);
+const ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US: &[f64] = &[
+    10.0,
+    25.0,
+    50.0,
+    100.0,
+    250.0,
+    500.0,
+    1_000.0,
+    2_500.0,
+    5_000.0,
+    10_000.0,
+    25_000.0,
+    50_000.0,
+    100_000.0,
+    250_000.0,
+    500_000.0,
+    1_000_000.0,
+    2_500_000.0,
+    5_000_000.0,
+];
+
+/// Prometheus evidence for the bounded hand-off from `IpcReceiver` into the
+/// launcher-side bridge that forwards work to OracleRuntime.  These metrics
+/// observe only; they do not feed queue, admission, or execution control.
+struct OracleRuntimeIpcProfileMetrics {
+    processing_duration_us: HistogramVec,
+    handler_stage_duration_us: HistogramVec,
+    events_handled: IntCounterVec,
+    backlog_before: IntGaugeVec,
+    backlog_after: IntGaugeVec,
+    select_branch_selected: IntCounterVec,
+    prune_invocations: IntCounter,
+    prune_stage_duration_us: HistogramVec,
+    prune_stage_total_duration_us: IntCounterVec,
+    prune_stage_max_duration_us: IntGaugeVec,
+    prune_items_total: IntCounterVec,
+    recv_gap_with_backlog_us: HistogramVec,
+    recv_gap_with_backlog_max_us: IntGaugeVec,
+    scheduling_lag_us: Histogram,
+}
+
+impl OracleRuntimeIpcProfileMetrics {
+    fn register() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            processing_duration_us: prometheus::register_histogram_vec!(
+                HistogramOpts::new(
+                    "oracle_runtime_ipc_event_processing_duration_us",
+                    "End-to-end launcher bridge processing time per IpcReceiver event in microseconds"
+                )
+                .buckets(ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US.to_vec()),
+                &["event_kind"]
+            )?,
+            handler_stage_duration_us: prometheus::register_histogram_vec!(
+                HistogramOpts::new(
+                    "oracle_runtime_ipc_handler_stage_duration_us",
+                    "Observed main-stage processing time per IpcReceiver event in microseconds"
+                )
+                .buckets(ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US.to_vec()),
+                &["event_kind", "handler_stage"]
+            )?,
+            events_handled: prometheus::register_int_counter_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_events_handled_total",
+                    "IpcReceiver events whose launcher bridge handler returned"
+                ),
+                &["event_kind", "handler_stage"]
+            )?,
+            backlog_before: prometheus::register_int_gauge_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_downstream_backlog_before",
+                    "Bounded IpcReceiver downstream backlog immediately before an event handler"
+                ),
+                &["event_kind"]
+            )?,
+            backlog_after: prometheus::register_int_gauge_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_downstream_backlog_after",
+                    "Bounded IpcReceiver downstream backlog immediately after an event handler"
+                ),
+                &["event_kind"]
+            )?,
+            select_branch_selected: prometheus::register_int_counter_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_select_branch_selected_total",
+                    "Selections of each branch in the OracleRuntime IPC consumer select loop"
+                ),
+                &["branch"]
+            )?,
+            prune_invocations: prometheus::register_int_counter!(
+                Opts::new(
+                    "oracle_runtime_ipc_prune_invocations_total",
+                    "Invocations of the OracleRuntime IPC prune_interval branch"
+                )
+            )?,
+            prune_stage_duration_us: prometheus::register_histogram_vec!(
+                HistogramOpts::new(
+                    "oracle_runtime_ipc_prune_stage_duration_us",
+                    "Duration of each stage in the OracleRuntime IPC prune_interval branch in microseconds"
+                )
+                .buckets(ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US.to_vec()),
+                &["stage"]
+            )?,
+            prune_stage_total_duration_us: prometheus::register_int_counter_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_prune_stage_total_duration_us",
+                    "Accumulated duration of each OracleRuntime IPC prune stage in microseconds"
+                ),
+                &["stage"]
+            )?,
+            prune_stage_max_duration_us: prometheus::register_int_gauge_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_prune_stage_max_duration_us",
+                    "Largest observed duration of each OracleRuntime IPC prune stage in microseconds"
+                ),
+                &["stage"]
+            )?,
+            prune_items_total: prometheus::register_int_counter_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_prune_items_total",
+                    "Items or decisions processed by each OracleRuntime IPC prune stage"
+                ),
+                &["stage"]
+            )?,
+            recv_gap_with_backlog_us: prometheus::register_histogram_vec!(
+                HistogramOpts::new(
+                    "oracle_runtime_ipc_recv_gap_with_backlog_us",
+                    "Time from a completed IPC event to the next recv when either IPC backlog is nonzero"
+                )
+                .buckets(ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US.to_vec()),
+                &["last_selected_branch"]
+            )?,
+            recv_gap_with_backlog_max_us: prometheus::register_int_gauge_vec!(
+                Opts::new(
+                    "oracle_runtime_ipc_recv_gap_with_backlog_max_us",
+                    "Largest IPC recv gap with nonzero IPC backlog in microseconds"
+                ),
+                &["last_selected_branch"]
+            )?,
+            scheduling_lag_us: prometheus::register_histogram!(
+                HistogramOpts::new(
+                    "oracle_runtime_scheduling_lag_us",
+                    "Scheduling delay of the diagnostic 10 ms OracleRuntime lag observer in microseconds"
+                )
+                .buckets(ORACLE_RUNTIME_IPC_PROCESSING_BUCKETS_US.to_vec())
+            )?,
+        })
+    }
+}
+
+static ORACLE_RUNTIME_IPC_PROFILE_METRICS: Lazy<Result<OracleRuntimeIpcProfileMetrics, String>> =
+    Lazy::new(|| OracleRuntimeIpcProfileMetrics::register().map_err(|error| error.to_string()));
+static ORACLE_RUNTIME_SLOW_EVENT_LAST_LOGGED_AT: Lazy<Mutex<Option<Instant>>> =
+    Lazy::new(|| Mutex::new(None));
+static ORACLE_RUNTIME_IPC_RECV_GAP_LAST_LOGGED_AT: Lazy<Mutex<Option<Instant>>> =
+    Lazy::new(|| Mutex::new(None));
+
+fn oracle_runtime_ipc_profile_metrics() -> Option<&'static OracleRuntimeIpcProfileMetrics> {
+    ORACLE_RUNTIME_IPC_PROFILE_METRICS.as_ref().ok()
+}
+
+fn oracle_runtime_ipc_event_kind(event: &seer::ipc::SeerEvent) -> &'static str {
+    match event {
+        seer::ipc::SeerEvent::PoolDetected(_) => "pool_detected",
+        seer::ipc::SeerEvent::Trade(_) => "trade",
+        seer::ipc::SeerEvent::FundingTransfer(_) => "funding_transfer",
+        seer::ipc::SeerEvent::AccountUpdate(_) => "account_update",
+        seer::ipc::SeerEvent::ExecutionAccountEvidence(_) => "execution_account_evidence",
+    }
+}
+
+fn should_emit_oracle_runtime_slow_event_marker(
+    last_logged_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    last_logged_at
+        .is_none_or(|last| now.duration_since(last) >= ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL)
+}
+
+fn claim_oracle_runtime_slow_event_log(now: Instant) -> bool {
+    let Ok(mut last_logged_at) = ORACLE_RUNTIME_SLOW_EVENT_LAST_LOGGED_AT.lock() else {
+        return false;
+    };
+    if should_emit_oracle_runtime_slow_event_marker(*last_logged_at, now) {
+        *last_logged_at = Some(now);
+        true
+    } else {
+        false
+    }
+}
+
+fn should_emit_oracle_runtime_ipc_recv_gap_marker(
+    last_logged_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    last_logged_at
+        .is_none_or(|last| now.duration_since(last) >= ORACLE_RUNTIME_IPC_RECV_GAP_LOG_INTERVAL)
+}
+
+fn claim_oracle_runtime_ipc_recv_gap_log(now: Instant) -> bool {
+    let Ok(mut last_logged_at) = ORACLE_RUNTIME_IPC_RECV_GAP_LAST_LOGGED_AT.lock() else {
+        return false;
+    };
+    if should_emit_oracle_runtime_ipc_recv_gap_marker(*last_logged_at, now) {
+        *last_logged_at = Some(now);
+        true
+    } else {
+        false
+    }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn record_oracle_runtime_ipc_prune_stage(stage: &'static str, duration: Duration, items: usize) {
+    let Some(metrics) = oracle_runtime_ipc_profile_metrics() else {
+        return;
+    };
+    let elapsed_us = duration_us(duration);
+    let max_duration = metrics
+        .prune_stage_max_duration_us
+        .with_label_values(&[stage]);
+    metrics
+        .prune_stage_duration_us
+        .with_label_values(&[stage])
+        .observe(elapsed_us as f64);
+    metrics
+        .prune_stage_total_duration_us
+        .with_label_values(&[stage])
+        .inc_by(elapsed_us);
+    metrics
+        .prune_items_total
+        .with_label_values(&[stage])
+        .inc_by(items.min(u64::MAX as usize) as u64);
+    if elapsed_us > max_duration.get().max(0) as u64 {
+        max_duration.set(elapsed_us.min(i64::MAX as u64) as i64);
+    }
+}
+
+fn record_oracle_runtime_ipc_select_branch(branch: &'static str) {
+    if let Some(metrics) = oracle_runtime_ipc_profile_metrics() {
+        metrics
+            .select_branch_selected
+            .with_label_values(&[branch])
+            .inc();
+    }
+}
+
+fn record_oracle_runtime_ipc_recv_gap(
+    gap: Duration,
+    downstream_backlog: usize,
+    egress_backlog: usize,
+    last_selected_branch: &'static str,
+) {
+    if downstream_backlog == 0 && egress_backlog == 0 {
+        return;
+    }
+
+    let gap_us = duration_us(gap);
+    if let Some(metrics) = oracle_runtime_ipc_profile_metrics() {
+        metrics
+            .recv_gap_with_backlog_us
+            .with_label_values(&[last_selected_branch])
+            .observe(gap_us as f64);
+        let max_gap = metrics
+            .recv_gap_with_backlog_max_us
+            .with_label_values(&[last_selected_branch]);
+        if gap_us > max_gap.get().max(0) as u64 {
+            max_gap.set(gap_us.min(i64::MAX as u64) as i64);
+        }
+    }
+
+    if gap >= ORACLE_RUNTIME_IPC_RECV_GAP_THRESHOLD
+        && claim_oracle_runtime_ipc_recv_gap_log(Instant::now())
+    {
+        warn!(
+            gap_us,
+            downstream_backlog, egress_backlog, last_selected_branch, "IPC_CONSUMER_RECV_GAP"
+        );
+    }
+}
+
+fn spawn_oracle_runtime_scheduling_lag_observer(
+    mut stop_rx: oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(metrics) = oracle_runtime_ipc_profile_metrics() else {
+            return;
+        };
+        let mut interval = tokio::time::interval(ORACLE_RUNTIME_SCHEDULING_LAG_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                scheduled_at = interval.tick() => {
+                    let lag_us = duration_us(tokio::time::Instant::now().duration_since(scheduled_at));
+                    metrics.scheduling_lag_us.observe(lag_us as f64);
+                }
+            }
+        }
+    })
+}
+
+fn oracle_runtime_ipc_slow_identity(
+    event: &seer::ipc::SeerEvent,
+) -> (Option<String>, Option<String>) {
+    match event {
+        seer::ipc::SeerEvent::PoolDetected(event) => (
+            Some(event.candidate.pool_amm_id.to_string()),
+            Some(event.candidate.signature.clone()),
+        ),
+        seer::ipc::SeerEvent::Trade(event) => (
+            Some(event.trade.pool_amm_id.to_string()),
+            Some(event.trade.signature.to_string()),
+        ),
+        seer::ipc::SeerEvent::AccountUpdate(event) => (
+            Some(event.bonding_curve.to_string()),
+            event.txn_signature.map(|signature| signature.to_string()),
+        ),
+        seer::ipc::SeerEvent::FundingTransfer(_)
+        | seer::ipc::SeerEvent::ExecutionAccountEvidence(_) => (None, None),
+    }
+}
+
+/// Records one event boundary without changing its ordering, admission, or
+/// delivery.  `Drop` deliberately covers early `continue` paths as well as
+/// successful bridge completion.
+struct OracleRuntimeIpcEventProfile<'a> {
+    event: &'a seer::ipc::SeerEvent,
+    receiver: &'a IpcReceiver,
+    completed_at: &'a Cell<Option<Instant>>,
+    started_at: Instant,
+    stage_started_at: Cell<Instant>,
+    handler_stage: Cell<&'static str>,
+    backlog_before: usize,
+    metrics: Option<&'static OracleRuntimeIpcProfileMetrics>,
+}
+
+impl<'a> OracleRuntimeIpcEventProfile<'a> {
+    fn new(
+        event: &'a seer::ipc::SeerEvent,
+        receiver: &'a IpcReceiver,
+        completed_at: &'a Cell<Option<Instant>>,
+    ) -> Self {
+        let started_at = Instant::now();
+        Self {
+            event,
+            receiver,
+            completed_at,
+            started_at,
+            stage_started_at: Cell::new(started_at),
+            handler_stage: Cell::new("ipc_received"),
+            backlog_before: receiver.pending_len(),
+            metrics: oracle_runtime_ipc_profile_metrics(),
+        }
+    }
+
+    fn transition_to(&self, next_stage: &'static str) {
+        self.record_current_stage();
+        self.handler_stage.set(next_stage);
+        self.stage_started_at.set(Instant::now());
+    }
+
+    fn record_current_stage(&self) {
+        let Some(metrics) = self.metrics else {
+            return;
+        };
+        let elapsed_us = self.stage_started_at.get().elapsed().as_micros() as f64;
+        metrics
+            .handler_stage_duration_us
+            .with_label_values(&[
+                oracle_runtime_ipc_event_kind(self.event),
+                self.handler_stage.get(),
+            ])
+            .observe(elapsed_us);
+    }
+}
+
+impl Drop for OracleRuntimeIpcEventProfile<'_> {
+    fn drop(&mut self) {
+        self.record_current_stage();
+
+        let event_kind = oracle_runtime_ipc_event_kind(self.event);
+        let handler_stage = self.handler_stage.get();
+        let duration = self.started_at.elapsed();
+        let duration_us = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+        let backlog_after = self.receiver.pending_len();
+
+        if let Some(metrics) = self.metrics {
+            metrics
+                .processing_duration_us
+                .with_label_values(&[event_kind])
+                .observe(duration_us as f64);
+            metrics
+                .events_handled
+                .with_label_values(&[event_kind, handler_stage])
+                .inc();
+            metrics
+                .backlog_before
+                .with_label_values(&[event_kind])
+                .set(self.backlog_before.min(i64::MAX as usize) as i64);
+            metrics
+                .backlog_after
+                .with_label_values(&[event_kind])
+                .set(backlog_after.min(i64::MAX as usize) as i64);
+        }
+
+        if duration >= ORACLE_RUNTIME_SLOW_EVENT_THRESHOLD
+            && claim_oracle_runtime_slow_event_log(Instant::now())
+        {
+            let (pool, signature) = oracle_runtime_ipc_slow_identity(self.event);
+            match (pool, signature) {
+                (Some(pool), Some(signature)) => warn!(
+                    event_kind,
+                    duration_us,
+                    handler_stage,
+                    pool = %pool,
+                    signature = %signature,
+                    current_backlog = backlog_after,
+                    "ORACLE_RUNTIME_SLOW_EVENT"
+                ),
+                (Some(pool), None) => warn!(
+                    event_kind,
+                    duration_us,
+                    handler_stage,
+                    pool = %pool,
+                    current_backlog = backlog_after,
+                    "ORACLE_RUNTIME_SLOW_EVENT"
+                ),
+                (None, Some(signature)) => warn!(
+                    event_kind,
+                    duration_us,
+                    handler_stage,
+                    signature = %signature,
+                    current_backlog = backlog_after,
+                    "ORACLE_RUNTIME_SLOW_EVENT"
+                ),
+                (None, None) => warn!(
+                    event_kind,
+                    duration_us,
+                    handler_stage,
+                    current_backlog = backlog_after,
+                    "ORACLE_RUNTIME_SLOW_EVENT"
+                ),
+            }
+        }
+
+        self.completed_at.set(Some(Instant::now()));
+    }
+}
 
 #[derive(Debug, Clone)]
 struct NlnArtifactCaptureConfig {
@@ -4064,6 +4523,12 @@ fn session_bridge_prune_interval(ttl: Duration, detected_pool_ttl: Duration) -> 
         .max(Duration::from_millis(50))
 }
 
+fn pump_observation_ledger_finalization_interval(
+    config: PumpObservationLedgerConfigV1,
+) -> Duration {
+    Duration::from_nanos(config.correlation_window_ns)
+}
+
 fn pump_observation_classification_label(
     classification: PumpObservationClassificationV1,
 ) -> &'static str {
@@ -4093,9 +4558,20 @@ fn pump_observation_classification_label(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntegritySignalFailureScopeV1 {
+    /// No canonical apply receipt exists. The implicated candidate remains
+    /// blocked, but an unrelated future candidate must not be invalidated.
+    NonCanonicalEvidence,
+    /// A receipt has been staged or the signal belongs to an active canonical
+    /// lifecycle. Missing required integrity evidence closes admission.
+    CanonicalLifecycle,
+}
+
 fn emit_pump_observation_decision(
     candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
     decision: &PumpObservationLedgerDecisionV1,
+    failure_scope: IntegritySignalFailureScopeV1,
 ) -> Result<(), CandidateIntegrityErrorV1> {
     ::metrics::counter!(
         "pump_observation_ledger_decisions_total",
@@ -4193,16 +4669,45 @@ fn emit_pump_observation_decision(
                 1u64,
                 "error" => error.to_string()
             );
-            error!(
-                candidate_pool = %signal.candidate.pool_amm_id,
-                candidate_mint = %signal.candidate.mint,
-                outcome = ?signal.outcome,
-                error = %error,
-                "Seer: CandidateIntegrity update failed; new-candidate admission closed"
-            );
-            candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
-                "candidate_integrity_signal_failed",
-            );
+            match failure_scope {
+                IntegritySignalFailureScopeV1::NonCanonicalEvidence => warn!(
+                    candidate_pool = %signal.candidate.pool_amm_id,
+                    candidate_mint = %signal.candidate.mint,
+                    outcome = ?signal.outcome,
+                    error = %error,
+                    "Seer: CandidateIntegrity non-canonical evidence failed; conflicting candidate remains blocked and global admission stays open"
+                ),
+                // An alias conflict is terminal evidence for the implicated
+                // candidate, including when its receipt was already staged.
+                // `record_signal` has invalidated the conflicting identity;
+                // the caller blocks this mutation and reclaims its receipt.
+                // It is not a registry failure and must not invalidate
+                // unrelated future candidate admission.
+                IntegritySignalFailureScopeV1::CanonicalLifecycle
+                    if matches!(error, CandidateIntegrityErrorV1::CandidateAliasConflict) =>
+                {
+                    warn!(
+                        candidate_pool = %signal.candidate.pool_amm_id,
+                        candidate_mint = %signal.candidate.mint,
+                        outcome = ?signal.outcome,
+                        error = %error,
+                        "Seer: CandidateIntegrity canonical evidence alias conflict; candidate remains blocked, staged receipt is reclaimed, and global admission stays open"
+                    );
+                }
+                IntegritySignalFailureScopeV1::CanonicalLifecycle => {
+                    error!(
+                        candidate_pool = %signal.candidate.pool_amm_id,
+                        candidate_mint = %signal.candidate.mint,
+                        outcome = ?signal.outcome,
+                        error = %error,
+                        "Seer: CandidateIntegrity canonical-lifecycle update failed; new-candidate admission closed"
+                    );
+                    candidate_integrity_registry
+                        .close_candidate_admission_with_integrity_invalidation(
+                            "candidate_integrity_signal_failed",
+                        );
+                }
+            }
             Err(error)
         }
     }
@@ -4310,6 +4815,35 @@ fn fail_staged_canonical_runtime_admission(
         );
     }
     candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(reason);
+}
+
+/// An alias conflict is evidence-local even when it was discovered after the
+/// receipt fence was staged. The particular mutation is still blocked and its
+/// fence must be resolved. A failed reclamation, however, is a registry
+/// integrity failure and retains the global fail-closed transition.
+fn reclaim_staged_candidate_alias_conflict(
+    candidate_integrity_registry: &CandidateIntegrityRegistry,
+    receipt: &CanonicalMutationApplyReceiptV1,
+) {
+    match candidate_integrity_registry.fail_canonical_apply(receipt) {
+        Ok(()) | Err(CandidateIntegrityErrorV1::CandidateAliasConflict) => {
+            // `fail_canonical_apply` removes the receipt before recording its
+            // coverage-incomplete signal. That follow-up signal can observe
+            // the same established alias conflict and return this local
+            // error after the fence is already reclaimed.
+        }
+        Err(error) => {
+            error!(
+                signature = %receipt.signature,
+                locator = ?receipt.locator,
+                error = %error,
+                "Seer: staged canonical receipt could not be reclaimed after candidate-local alias conflict; new-candidate admission closed"
+            );
+            candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
+                "candidate_alias_conflict_receipt_reclaim_failed",
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4475,7 +5009,11 @@ pub(crate) fn ingest_pump_observation(
         .collect::<Vec<_>>();
     let Some(canonical) = result.observation_decision.canonical_mutation.as_ref() else {
         for decision in decisions.iter().copied() {
-            let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
+            let _ = emit_pump_observation_decision(
+                candidate_integrity_registry,
+                decision,
+                IntegritySignalFailureScopeV1::NonCanonicalEvidence,
+            );
         }
         if wrapper_primary_observation_mismatch {
             return CanonicalRuntimeAdmissionV1::Blocked(
@@ -4522,10 +5060,18 @@ pub(crate) fn ingest_pump_observation(
     let receipt = match candidate_integrity_registry.stage_canonical_mutation(canonical) {
         Ok(receipt) => receipt,
         Err(error) => {
+            let candidate_admission_open = candidate_integrity_registry.candidate_admission_open();
+            let registry_available = candidate_integrity_registry.is_available();
+            let admission_generation = candidate_integrity_registry.admission_generation();
+            let authority_epoch_id = candidate_integrity_registry.authority_epoch().epoch_id;
             error!(
                 signature = %canonical.locator.signature,
                 locator = ?canonical.locator,
                 error = %error,
+                candidate_admission_open,
+                registry_available,
+                admission_generation,
+                authority_epoch_id,
                 "Seer: canonical apply receipt staging failed; canonical runtime emission blocked"
             );
             record_integrity_signal(
@@ -4560,7 +5106,11 @@ pub(crate) fn ingest_pump_observation(
             .as_ref()
             .is_none_or(|signal| signal.outcome != ghost_core::CandidateIntegrityOutcomeV1::Ready)
     }) {
-        if let Err(error) = emit_pump_observation_decision(candidate_integrity_registry, decision) {
+        if let Err(error) = emit_pump_observation_decision(
+            candidate_integrity_registry,
+            decision,
+            IntegritySignalFailureScopeV1::CanonicalLifecycle,
+        ) {
             error!(
                 signature = %receipt.signature,
                 locator = ?receipt.locator,
@@ -4568,11 +5118,15 @@ pub(crate) fn ingest_pump_observation(
                 error = %error,
                 "Seer: required non-Ready integrity evidence failed after receipt staging; canonical runtime emission blocked"
             );
-            fail_staged_canonical_runtime_admission(
-                candidate_integrity_registry,
-                &receipt,
-                "candidate_integrity_signal_failed_after_receipt_stage",
-            );
+            if matches!(error, CandidateIntegrityErrorV1::CandidateAliasConflict) {
+                reclaim_staged_candidate_alias_conflict(candidate_integrity_registry, &receipt);
+            } else {
+                fail_staged_canonical_runtime_admission(
+                    candidate_integrity_registry,
+                    &receipt,
+                    "candidate_integrity_signal_failed_after_receipt_stage",
+                );
+            }
             return CanonicalRuntimeAdmissionV1::Blocked(
                 CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
             );
@@ -4584,7 +5138,11 @@ pub(crate) fn ingest_pump_observation(
             .as_ref()
             .is_some_and(|signal| signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready)
     }) {
-        let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
+        let _ = emit_pump_observation_decision(
+            candidate_integrity_registry,
+            decision,
+            IntegritySignalFailureScopeV1::CanonicalLifecycle,
+        );
     }
     let ready_signals = decisions
         .iter()
@@ -4592,36 +5150,51 @@ pub(crate) fn ingest_pump_observation(
         .filter(|signal| signal.outcome == ghost_core::CandidateIntegrityOutcomeV1::Ready)
         .cloned()
         .collect::<Vec<_>>();
-    if !ready_signals.is_empty()
-        && candidate_integrity_registry
+    if !ready_signals.is_empty() {
+        if let Err(error) = candidate_integrity_registry
             .seal_complete_transaction_inventory(receipt.signature, &ready_signals)
-            .is_err()
-    {
-        let _ = candidate_integrity_registry.fail_canonical_apply(&receipt);
-        error!(
-            signature = %receipt.signature,
-            locator = ?receipt.locator,
-            "Seer: complete transaction inventory could not seal apply fence; canonical runtime emission blocked"
-        );
-        record_integrity_signal(
-            candidate_integrity_registry,
-            canonical_coverage_incomplete_signal(canonical),
-            "inventory_seal_failed",
-        );
-        ::metrics::counter!(
-            "pr1_runtime_inventory_incomplete_total",
-            1u64,
-            "authority_epoch_id" => candidate_integrity_registry
-                .authority_epoch()
-                .epoch_id
-                .to_string(),
-            "reason" => "inventory_seal_failed"
-        );
-        candidate_integrity_registry
-            .close_candidate_admission_with_integrity_invalidation("inventory_seal_failed");
-        return CanonicalRuntimeAdmissionV1::Blocked(
-            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
-        );
+        {
+            if matches!(error, CandidateIntegrityErrorV1::CandidateAliasConflict) {
+                warn!(
+                    signature = %receipt.signature,
+                    locator = ?receipt.locator,
+                    candidate_pool = %receipt.candidate.pool_amm_id,
+                    candidate_mint = %receipt.candidate.mint,
+                    error = %error,
+                    "Seer: complete transaction inventory found a candidate-local alias conflict; canonical mutation remains blocked, staged receipt is reclaimed, and global admission stays open"
+                );
+                reclaim_staged_candidate_alias_conflict(candidate_integrity_registry, &receipt);
+                return CanonicalRuntimeAdmissionV1::Blocked(
+                    CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                );
+            }
+            let _ = candidate_integrity_registry.fail_canonical_apply(&receipt);
+            error!(
+                signature = %receipt.signature,
+                locator = ?receipt.locator,
+                error = %error,
+                "Seer: complete transaction inventory could not seal apply fence; canonical runtime emission blocked"
+            );
+            record_integrity_signal(
+                candidate_integrity_registry,
+                canonical_coverage_incomplete_signal(canonical),
+                "inventory_seal_failed",
+            );
+            ::metrics::counter!(
+                "pr1_runtime_inventory_incomplete_total",
+                1u64,
+                "authority_epoch_id" => candidate_integrity_registry
+                    .authority_epoch()
+                    .epoch_id
+                    .to_string(),
+                "reason" => "inventory_seal_failed"
+            );
+            candidate_integrity_registry
+                .close_candidate_admission_with_integrity_invalidation("inventory_seal_failed");
+            return CanonicalRuntimeAdmissionV1::Blocked(
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+            );
+        }
     }
     if !candidate_integrity_registry.is_available()
         || !candidate_integrity_registry.candidate_admission_open()
@@ -4656,12 +5229,18 @@ pub(crate) fn ingest_pump_observation(
     })
 }
 
-fn finalize_pump_observation_ledger(
+#[derive(Default)]
+struct PumpObservationLedgerFinalizationV1 {
+    decisions: Vec<PumpObservationLedgerDecisionV1>,
+    retired_terminal_candidates: usize,
+}
+
+fn collect_pump_observation_ledger_finalization(
     ledger: &Arc<Mutex<PumpObservationLedgerV1>>,
     candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
     now_monotonic_ns: u64,
-) {
-    let decisions = match ledger.lock() {
+) -> PumpObservationLedgerFinalizationV1 {
+    let (decisions, retired_terminal_candidates) = match ledger.lock() {
         Ok(mut ledger) => {
             let retirements = match candidate_integrity_registry.drain_terminal_ledger_retirements()
             {
@@ -4676,9 +5255,10 @@ fn finalize_pump_observation_ledger(
                         .close_candidate_admission_with_integrity_invalidation(
                             "terminal_retirement_handoff_unavailable",
                         );
-                    return;
+                    return PumpObservationLedgerFinalizationV1::default();
                 }
             };
+            let retired_terminal_candidates = retirements.len();
             for retirement in retirements {
                 let retired = ledger.retire_terminal_candidate(retirement.candidate);
                 if retired > 0 {
@@ -4692,7 +5272,10 @@ fn finalize_pump_observation_ledger(
                     );
                 }
             }
-            ledger.finalize_expired(now_monotonic_ns)
+            (
+                ledger.finalize_expired(now_monotonic_ns),
+                retired_terminal_candidates,
+            )
         }
         Err(error) => {
             ::metrics::counter!("pump_observation_ledger_unavailable_total", 1u64);
@@ -4703,12 +5286,44 @@ fn finalize_pump_observation_ledger(
             candidate_integrity_registry.close_candidate_admission_with_integrity_invalidation(
                 "ledger_finalize_unavailable",
             );
-            return;
+            return PumpObservationLedgerFinalizationV1::default();
         }
     };
-    for decision in &decisions {
-        let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
+
+    PumpObservationLedgerFinalizationV1 {
+        decisions,
+        retired_terminal_candidates,
     }
+}
+
+fn emit_finalized_pump_observation_decisions(
+    candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
+    decisions: &[PumpObservationLedgerDecisionV1],
+) -> usize {
+    for decision in decisions {
+        let _ = emit_pump_observation_decision(
+            candidate_integrity_registry,
+            decision,
+            IntegritySignalFailureScopeV1::CanonicalLifecycle,
+        );
+    }
+    decisions.len()
+}
+
+fn finalize_pump_observation_ledger(
+    ledger: &Arc<Mutex<PumpObservationLedgerV1>>,
+    candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
+    now_monotonic_ns: u64,
+) {
+    let finalization = collect_pump_observation_ledger_finalization(
+        ledger,
+        candidate_integrity_registry,
+        now_monotonic_ns,
+    );
+    let _ = emit_finalized_pump_observation_decisions(
+        candidate_integrity_registry,
+        &finalization.decisions,
+    );
 }
 
 /// Apply the active PR1E consequence of an unrecovered local coverage gap.
@@ -4738,6 +5353,7 @@ pub(crate) fn handle_local_coverage_gap_notice(
         "reason" => notice.reason.as_str(),
         "authority_epoch_id" => candidate_integrity_registry.authority_epoch().epoch_id.to_string()
     );
+    crate::oracle_metrics::record_pr1_runtime_primary_coverage_gap();
     error!(
         provider_id = %notice.provider_id,
         reason = notice.reason.as_str(),
@@ -4900,6 +5516,8 @@ pub(crate) fn process_trade_event_for_session_gate(
         SessionTradeDecision::Buffered => {}
         SessionTradeDecision::SilentDrop => {
             increment_counter!("pr1_runtime_bypass_attempt_total");
+            crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
+            warn!("Seer: PR1 runtime bypass attempt because session gate silently dropped trade");
         }
     }
 
@@ -5626,6 +6244,8 @@ pub async fn run(
     // silently inheriting an opaque `default()` inside the runtime path.
     // `try_new` rejects zero capacities before candidate admission begins.
     let pump_observation_ledger_config = PumpObservationLedgerConfigV1::default();
+    let pump_observation_ledger_finalization_interval =
+        pump_observation_ledger_finalization_interval(pump_observation_ledger_config);
     let pump_observation_ledger = Arc::new(Mutex::new(
         PumpObservationLedgerV1::try_new(pump_observation_ledger_config).map_err(|error| {
             anyhow::anyhow!("invalid PR1E PumpObservationLedger config: {error}")
@@ -5808,6 +6428,9 @@ pub async fn run(
     let pump_observation_ledger_ipc = pump_observation_ledger.clone();
     let candidate_integrity_registry_ipc = candidate_integrity_registry;
     let pump_observation_clock_ipc = pump_observation_clock;
+    let (scheduling_lag_stop_tx, scheduling_lag_stop_rx) = oneshot::channel();
+    let mut scheduling_lag_handle =
+        spawn_oracle_runtime_scheduling_lag_observer(scheduling_lag_stop_rx);
     let mut ipc_handle = tokio::spawn(async move {
         let detected_pool_ttl = Duration::from_millis(seer_config.watched_pools_ttl_ms.max(1));
         let detected_pool_cap = seer_config.watched_pools_cap.max(1);
@@ -5822,6 +6445,10 @@ pub async fn run(
             SESSION_POOL_TRADE_BUFFER_TTL,
             detected_pool_ttl,
         ));
+        let mut ledger_finalization_interval =
+            tokio::time::interval(pump_observation_ledger_finalization_interval);
+        ledger_finalization_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The IPC coverage control plane retains a bounded monotonic prefix
         // of notices. Track the prefix already classified so secondary audit
         // metrics are not replayed on every subsequent notice. An overflow is
@@ -5829,12 +6456,16 @@ pub async fn run(
         // be disproven.
         let mut handled_local_coverage_gap_notices = 0usize;
         let mut local_coverage_gap_control_overflow_handled = false;
+        let last_ipc_event_completed_at = Cell::new(None);
+        let mut last_selected_branch = "startup";
         info!("Seer: Starting IPC event processing");
         info!("Seer: IPC receiver task is now listening for pool detection events from Seer core");
 
         loop {
             let seer_event = tokio::select! {
                 gap_changed = local_coverage_gap_rx.changed() => {
+                    record_oracle_runtime_ipc_select_branch("local_coverage_gap_control");
+                    last_selected_branch = "local_coverage_gap_control";
                     match gap_changed {
                         Ok(()) => {
                             let gap_state = local_coverage_gap_rx.borrow_and_update().clone();
@@ -5873,10 +6504,24 @@ pub async fn run(
                     }
                 }
                 _ = prune_interval.tick() => {
+                    record_oracle_runtime_ipc_select_branch("prune_interval");
+                    last_selected_branch = "prune_interval";
+                    if let Some(metrics) = oracle_runtime_ipc_profile_metrics() {
+                        metrics.prune_invocations.inc();
+                    }
+                    let prune_started_at = Instant::now();
+                    let trade_prune_started_at = Instant::now();
                     let (expired_permits, expired_detected) =
                         session_trade_bridge.prune_expired(Instant::now());
+                    record_oracle_runtime_ipc_prune_stage(
+                        "session_trade_bridge::prune_expired",
+                        trade_prune_started_at.elapsed(),
+                        expired_permits.len().saturating_add(expired_detected),
+                    );
                     record_session_buffer_expired(expired_permits.len());
                     record_session_detected_pool_expired(expired_detected);
+                    let emit_expired_decisions_started_at = Instant::now();
+                    let expired_permit_count = expired_permits.len();
                     for expired in expired_permits {
                         let _ = candidate_integrity_registry_ipc
                             .fail_canonical_apply(&expired.apply_receipt);
@@ -5887,11 +6532,40 @@ pub async fn run(
                             "reason" => "buffer_expired"
                         );
                     }
-                    let (expired_updates, expired_update_keys, _expired_evidence) =
+                    record_oracle_runtime_ipc_prune_stage(
+                        "emit_finalized_decisions",
+                        emit_expired_decisions_started_at.elapsed(),
+                        expired_permit_count,
+                    );
+                    let account_update_prune_started_at = Instant::now();
+                    let (expired_updates, expired_update_keys, expired_evidence) =
                         session_account_update_bridge.prune_expired(Instant::now());
+                    record_oracle_runtime_ipc_prune_stage(
+                        "session_account_update_bridge::prune_expired",
+                        account_update_prune_started_at.elapsed(),
+                        expired_updates
+                            .saturating_add(expired_update_keys)
+                            .saturating_add(expired_evidence),
+                    );
                     record_session_account_update_expired(expired_updates);
                     record_session_account_update_detected_key_expired(expired_update_keys);
-                    finalize_pump_observation_ledger(
+                    record_oracle_runtime_ipc_prune_stage(
+                        "total",
+                        prune_started_at.elapsed(),
+                        expired_permit_count
+                            .saturating_add(expired_detected)
+                            .saturating_add(expired_updates)
+                            .saturating_add(expired_update_keys)
+                            .saturating_add(expired_evidence)
+                    );
+                    continue;
+                }
+                _ = ledger_finalization_interval.tick() => {
+                    record_oracle_runtime_ipc_select_branch("ledger_finalization_interval");
+                    last_selected_branch = "ledger_finalization_interval";
+                    let finalization_started_at = Instant::now();
+                    let ledger_finalization_started_at = Instant::now();
+                    let finalization = collect_pump_observation_ledger_finalization(
                         &pump_observation_ledger_ipc,
                         &candidate_integrity_registry_ipc,
                         pump_observation_clock_ipc
@@ -5899,11 +6573,52 @@ pub async fn run(
                             .as_nanos()
                             .min(u128::from(u64::MAX)) as u64,
                     );
+                    record_oracle_runtime_ipc_prune_stage(
+                        "finalize_pump_observation_ledger",
+                        ledger_finalization_started_at.elapsed(),
+                        finalization
+                            .retired_terminal_candidates
+                            .saturating_add(finalization.decisions.len()),
+                    );
+                    let emit_ledger_decisions_started_at = Instant::now();
+                    let emitted_ledger_decisions = emit_finalized_pump_observation_decisions(
+                        &candidate_integrity_registry_ipc,
+                        &finalization.decisions,
+                    );
+                    record_oracle_runtime_ipc_prune_stage(
+                        "emit_finalized_decisions",
+                        emit_ledger_decisions_started_at.elapsed(),
+                        emitted_ledger_decisions,
+                    );
+                    record_oracle_runtime_ipc_prune_stage(
+                        "ledger_finalization_total",
+                        finalization_started_at.elapsed(),
+                        finalization
+                            .retired_terminal_candidates
+                            .saturating_add(emitted_ledger_decisions),
+                    );
                     continue;
                 }
-                maybe_event = ipc_receiver.recv() => match maybe_event {
-                    Some(event) => event,
-                    None => break,
+                maybe_event = ipc_receiver.recv() => {
+                    record_oracle_runtime_ipc_select_branch("ipc_recv");
+                    match maybe_event {
+                        Some(event) => {
+                            let received_at = Instant::now();
+                            let downstream_backlog = ipc_receiver.pending_len();
+                            let egress_backlog = ipc_receiver.egress_pending_len();
+                            if let Some(completed_at) = last_ipc_event_completed_at.get() {
+                                record_oracle_runtime_ipc_recv_gap(
+                                    received_at.saturating_duration_since(completed_at),
+                                    downstream_backlog,
+                                    egress_backlog,
+                                    last_selected_branch,
+                                );
+                            }
+                            last_selected_branch = "ipc_recv";
+                            event
+                        }
+                        None => break,
+                    }
                 }
             };
 
@@ -5912,8 +6627,18 @@ pub async fn run(
                 h.mark_ipc_event();
             }
 
-            match seer_event {
+            // This is the sole bounded IpcReceiver consumer before the Event
+            // Bus / OracleRuntime path. The guard covers every branch,
+            // including early fail-closed and witness-only returns.
+            let ipc_event_profile = OracleRuntimeIpcEventProfile::new(
+                &seer_event,
+                &ipc_receiver,
+                &last_ipc_event_completed_at,
+            );
+
+            match &seer_event {
                 seer::ipc::SeerEvent::PoolDetected(event) => {
+                    ipc_event_profile.transition_to("pool_detected::canonical_admission");
                     let candidate = &event.candidate;
                     let primary_raw = is_primary_raw_runtime_authority(candidate.provider_role);
                     let boundary_payload_aligned =
@@ -5940,6 +6665,7 @@ pub async fn run(
                             )
                         }),
                     );
+                    ipc_event_profile.transition_to("pool_detected::canonical_permit");
                     if !primary_raw {
                         debug!(
                             pool = %candidate.pool_amm_id,
@@ -5971,6 +6697,7 @@ pub async fn run(
                             continue;
                         }
                     };
+                    ipc_event_profile.transition_to("pool_detected::last_gate_validation");
                     if let Err(reason) = authorize_pool_runtime_disposition(
                         event.runtime_disposition,
                         &permit,
@@ -6162,6 +6889,7 @@ pub async fn run(
                     }
 
                     // Emit to unified event bus if available
+                    ipc_event_profile.transition_to("pool_detected::event_bus_bridge");
                     if let Some(ref tx) = event_bus_tx {
                         let now = Instant::now();
                         process_pool_detected_event_for_session_gate(
@@ -6273,6 +7001,7 @@ pub async fn run(
                 }
 
                 seer::ipc::SeerEvent::Trade(trade_event) => {
+                    ipc_event_profile.transition_to("trade::canonical_admission");
                     let trade = &trade_event.trade;
                     let primary_raw = is_primary_raw_runtime_authority(trade.provider_role);
                     let boundary_payload_aligned =
@@ -6298,6 +7027,7 @@ pub async fn run(
                             )
                         }),
                     );
+                    ipc_event_profile.transition_to("trade::canonical_permit");
                     if !primary_raw {
                         debug!(
                             pool = %trade.pool_amm_id,
@@ -6333,6 +7063,7 @@ pub async fn run(
                         }
                     };
 
+                    ipc_event_profile.transition_to("trade::identity_validation");
                     if !trade_has_forwardable_identity(trade) {
                         warn!(
                             "Seer: dropping unresolved trade before Event Bus bridge sig={} pool={} mint={} event_ordinal={:?}",
@@ -6359,6 +7090,7 @@ pub async fn run(
                     // NOTE: Log only forwarded trades (ForwardNow). Pools born before session
                     // startup are SilentDrop — logging before the gate check would spam hundreds
                     // of thousands of INFO lines per minute for pools we will never observe.
+                    ipc_event_profile.transition_to("trade::event_bus_bridge");
                     if let Some(ref tx) = event_bus_tx {
                         let now = Instant::now();
                         let gate = process_trade_event_for_session_gate(
@@ -6408,15 +7140,17 @@ pub async fn run(
                 }
 
                 seer::ipc::SeerEvent::FundingTransfer(funding_event) => {
+                    ipc_event_profile.transition_to("funding_transfer::event_bus_bridge");
                     if let Some(ref tx) = event_bus_tx {
-                        emit_funding_transfer_to_event_bus(tx, &funding_event, health_ipc.as_ref());
+                        emit_funding_transfer_to_event_bus(tx, funding_event, health_ipc.as_ref());
                     }
                 }
 
                 seer::ipc::SeerEvent::ExecutionAccountEvidence(evidence_event) => {
+                    ipc_event_profile.transition_to("execution_account_evidence::session_bridge");
                     if let Some(ref tx) = event_bus_tx {
                         let ingress = session_account_update_bridge
-                            .ingest_execution_account_evidence(&evidence_event, Instant::now());
+                            .ingest_execution_account_evidence(evidence_event, Instant::now());
                         record_session_account_update_expired(ingress.expired_count);
                         record_session_account_update_detected_key_expired(
                             ingress.expired_detected_keys,
@@ -6425,7 +7159,7 @@ pub async fn run(
                             SessionExecutionAccountEvidenceDecision::ForwardNow => {
                                 emit_execution_account_evidence_to_event_bus(
                                     tx,
-                                    &evidence_event,
+                                    evidence_event,
                                     health_ipc.as_ref(),
                                 );
                             }
@@ -6450,9 +7184,10 @@ pub async fn run(
                 // suppressed end-to-end.
                 seer::ipc::SeerEvent::AccountUpdate(au) => {
                     if canonical_account_update_relay_enabled {
+                        ipc_event_profile.transition_to("account_update::session_bridge");
                         if let Some(ref tx) = event_bus_tx {
                             let ingress = session_account_update_bridge
-                                .ingest_account_update(&au, Instant::now());
+                                .ingest_account_update(au, Instant::now());
                             record_session_account_update_expired(ingress.expired_count);
                             record_session_account_update_detected_key_expired(
                                 ingress.expired_detected_keys,
@@ -6465,7 +7200,7 @@ pub async fn run(
                                 SessionAccountUpdateDecision::ForwardNow => {
                                     emit_account_update_to_event_bus(
                                         tx,
-                                        &au,
+                                        au,
                                         health_ipc.as_ref(),
                                         false,
                                     );
@@ -6483,6 +7218,8 @@ pub async fn run(
                                 }
                             }
                         }
+                    } else {
+                        ipc_event_profile.transition_to("account_update::relay_disabled");
                     }
                     // degraded/test compatibility: silently drop — no
                     // ShadowLedger writes happen in Seer, so there is no local
@@ -6581,6 +7318,18 @@ pub async fn run(
                 "Seer IPC receiver did not drain within {:?}",
                 SEER_CORE_SHUTDOWN_TIMEOUT
             ));
+        }
+    }
+    let _ = scheduling_lag_stop_tx.send(());
+    match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, &mut scheduling_lag_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join_err)) => {
+            warn!(error = %join_err, "Seer: diagnostic scheduling-lag observer join failed");
+        }
+        Err(_) => {
+            scheduling_lag_handle.abort();
+            let _ = scheduling_lag_handle.await;
+            warn!("Seer: diagnostic scheduling-lag observer did not stop within shutdown timeout");
         }
     }
     if let Some(handle) = nln_program_streams_handle {
@@ -6750,16 +7499,21 @@ mod tests {
         handle_local_coverage_gap_notice, ingest_pump_observation,
         is_primary_raw_runtime_authority, missing_primary_observation_signal,
         nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
-        pool_candidate_matches_primary_observation, process_pool_detected_event_for_session_gate,
-        process_trade_event_for_session_gate, pumpswap_program_id,
-        select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
+        oracle_runtime_ipc_profile_metrics, pool_candidate_matches_primary_observation,
+        process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
+        pump_observation_ledger_finalization_interval, pumpswap_program_id,
+        record_oracle_runtime_ipc_prune_stage, record_oracle_runtime_ipc_recv_gap,
+        record_oracle_runtime_ipc_select_branch, select_nln_program_stream_subscriptions,
+        should_emit_oracle_runtime_ipc_recv_gap_marker,
+        should_emit_oracle_runtime_slow_event_marker, trade_event_to_pool_transaction,
         trade_has_forwardable_identity, trade_matches_primary_observation,
         validate_pr1e_startup_contract, CanonicalRuntimeAdmissionV1,
         CanonicalRuntimeNoApplyReasonV1, NlnArtifactDeliveryState, NlnArtifactOverflowReasonV1,
         NlnArtifactRecord, NlnArtifactWriter, NlnProgramStreamCaptureTopic,
         NlnTradePoolIdentityResolver, NlnTradeResolveDecision, SessionAccountUpdateBridge,
         SessionAccountUpdateDecision, SessionBcv2Context, SessionExecutionAccountEvidenceDecision,
-        SessionPoolTradeBridge, SessionTradeDecision, TOKEN_PROGRAM_ID,
+        SessionPoolTradeBridge, SessionTradeDecision, ORACLE_RUNTIME_IPC_RECV_GAP_LOG_INTERVAL,
+        ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL, TOKEN_PROGRAM_ID,
     };
     use crate::candidate_integrity::{
         CandidateIntegrityRegistry, CandidateIntegrityRegistryLimitsV1,
@@ -6799,6 +7553,135 @@ mod tests {
             CanonicalRuntimeAdmissionV1::Apply(permit) => permit,
             other => panic!("expected canonical runtime permit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oracle_runtime_ipc_profile_registers_duration_and_backlog_metrics() {
+        let metrics = oracle_runtime_ipc_profile_metrics()
+            .expect("diagnostic metrics must register without affecting runtime control");
+
+        metrics
+            .processing_duration_us
+            .with_label_values(&["trade"])
+            .observe(250.0);
+        metrics
+            .handler_stage_duration_us
+            .with_label_values(&["trade", "trade::event_bus_bridge"])
+            .observe(125.0);
+        metrics
+            .events_handled
+            .with_label_values(&["trade", "trade::event_bus_bridge"])
+            .inc();
+        metrics.backlog_before.with_label_values(&["trade"]).set(10);
+        metrics.backlog_after.with_label_values(&["trade"]).set(8);
+
+        assert_eq!(
+            metrics.backlog_before.with_label_values(&["trade"]).get(),
+            10
+        );
+        assert_eq!(metrics.backlog_after.with_label_values(&["trade"]).get(), 8);
+    }
+
+    #[test]
+    fn oracle_runtime_slow_event_marker_is_rate_limited() {
+        let started = Instant::now();
+        assert!(should_emit_oracle_runtime_slow_event_marker(None, started));
+        assert!(!should_emit_oracle_runtime_slow_event_marker(
+            Some(started),
+            started + ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(should_emit_oracle_runtime_slow_event_marker(
+            Some(started),
+            started + ORACLE_RUNTIME_SLOW_EVENT_LOG_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn pump_observation_ledger_finalizer_uses_the_correlation_window_cadence() {
+        let config = PumpObservationLedgerConfigV1::default();
+
+        assert_eq!(
+            pump_observation_ledger_finalization_interval(config),
+            Duration::from_millis(250),
+        );
+    }
+
+    #[test]
+    fn oracle_runtime_ipc_select_prune_and_recv_gap_metrics_are_observe_only() {
+        let metrics = oracle_runtime_ipc_profile_metrics()
+            .expect("diagnostic metrics must register without affecting runtime control");
+        let select_before = metrics
+            .select_branch_selected
+            .with_label_values(&["prune_interval"])
+            .get();
+        let prune_total_before = metrics
+            .prune_stage_total_duration_us
+            .with_label_values(&["total"])
+            .get();
+        let prune_items_before = metrics
+            .prune_items_total
+            .with_label_values(&["total"])
+            .get();
+        let recv_gap_before = metrics
+            .recv_gap_with_backlog_us
+            .with_label_values(&["prune_interval"])
+            .get_sample_count();
+
+        record_oracle_runtime_ipc_select_branch("prune_interval");
+        record_oracle_runtime_ipc_prune_stage("total", Duration::from_micros(250), 3);
+        record_oracle_runtime_ipc_recv_gap(Duration::from_micros(6_000), 1, 2, "prune_interval");
+
+        assert_eq!(
+            metrics
+                .select_branch_selected
+                .with_label_values(&["prune_interval"])
+                .get(),
+            select_before + 1
+        );
+        assert_eq!(
+            metrics
+                .prune_stage_total_duration_us
+                .with_label_values(&["total"])
+                .get(),
+            prune_total_before + 250
+        );
+        assert_eq!(
+            metrics
+                .prune_items_total
+                .with_label_values(&["total"])
+                .get(),
+            prune_items_before + 3
+        );
+        assert_eq!(
+            metrics
+                .recv_gap_with_backlog_us
+                .with_label_values(&["prune_interval"])
+                .get_sample_count(),
+            recv_gap_before + 1
+        );
+        assert!(
+            metrics
+                .recv_gap_with_backlog_max_us
+                .with_label_values(&["prune_interval"])
+                .get()
+                >= 6_000
+        );
+    }
+
+    #[test]
+    fn oracle_runtime_ipc_recv_gap_marker_is_rate_limited() {
+        let started = Instant::now();
+        assert!(should_emit_oracle_runtime_ipc_recv_gap_marker(
+            None, started
+        ));
+        assert!(!should_emit_oracle_runtime_ipc_recv_gap_marker(
+            Some(started),
+            started + ORACLE_RUNTIME_IPC_RECV_GAP_LOG_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(should_emit_oracle_runtime_ipc_recv_gap_marker(
+            Some(started),
+            started + ORACLE_RUNTIME_IPC_RECV_GAP_LOG_INTERVAL
+        ));
     }
 
     #[test]
@@ -7148,7 +8031,7 @@ mod tests {
     }
 
     #[test]
-    fn integrity_signal_alias_conflict_after_receipt_stage_blocks_permit_and_reclaims_fence() {
+    fn integrity_signal_alias_conflict_after_receipt_stage_blocks_only_conflicting_candidate() {
         let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
         let registry = Arc::new(CandidateIntegrityRegistry::new(
             CandidateIntegrityRegistryLimitsV1 {
@@ -7203,7 +8086,10 @@ mod tests {
             admission.into_permit().is_none(),
             "the Event Bus bridge is reachable only from Apply; an integrity signal failure may issue zero permits"
         );
-        assert!(!registry.candidate_admission_open());
+        assert!(
+            registry.candidate_admission_open(),
+            "a candidate-local alias conflict after receipt staging must not globally close admission"
+        );
         assert_eq!(
             registry
                 .canonical_apply_fence_counts()
@@ -7226,6 +8112,140 @@ mod tests {
                 .canonical_mutation_count,
             1,
             "the primary structural fact remains ledger evidence, but it cannot enter runtime"
+        );
+    }
+
+    #[test]
+    fn integrity_signal_alias_conflict_before_receipt_blocks_only_conflicting_candidate() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::new(
+            CandidateIntegrityRegistryLimitsV1 {
+                max_candidates: 4,
+                max_audit_markers_per_candidate: 4,
+                max_terminal_tombstones: 4,
+            },
+        ));
+        let pool = Pubkey::new_unique();
+        let existing = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint: Pubkey::new_unique(),
+        };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate: existing,
+                outcome: CandidateIntegrityOutcomeV1::Ready,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [0xA2; 32],
+            })
+            .expect("existing pool identity occupies the alias lane");
+
+        // The wrapper/observation mismatch yields non-canonical evidence for
+        // P/B. It collides with P/A before any receipt is staged. P/B is
+        // blocked, P/A is invalidated, and unrelated admissions stay open.
+        let admission = ingest_pump_observation(
+            &ledger,
+            &registry,
+            Some(primary_trade_observation(
+                Signature::new_unique(),
+                pool,
+                Pubkey::new_unique(),
+                0,
+            )),
+            1,
+            false,
+            None,
+        );
+
+        assert!(matches!(
+            admission,
+            CanonicalRuntimeAdmissionV1::Blocked(
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+            )
+        ));
+        assert!(
+            registry.candidate_admission_open(),
+            "a conflict before a canonical receipt must not globally close admission"
+        );
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("no receipt was staged"),
+            (0, 0)
+        );
+        assert_eq!(
+            registry
+                .snapshot(existing)
+                .expect("existing alias remains auditable")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+        );
+        assert_eq!(
+            ledger
+                .lock()
+                .expect("non-canonical ledger fact")
+                .snapshot()
+                .canonical_mutation_count,
+            0,
+            "the failed non-canonical observation must issue no runtime evidence"
+        );
+    }
+
+    #[test]
+    fn inventory_seal_alias_conflict_blocks_only_conflicting_candidate() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::new(
+            CandidateIntegrityRegistryLimitsV1 {
+                max_candidates: 4,
+                max_audit_markers_per_candidate: 4,
+                max_terminal_tombstones: 4,
+            },
+        ));
+        let pool = Pubkey::new_unique();
+        let existing = PumpCandidateIdentityV1 {
+            pool_amm_id: pool,
+            mint: Pubkey::new_unique(),
+        };
+        registry
+            .record_signal(CandidateIntegritySignalV1 {
+                candidate: existing,
+                outcome: CandidateIntegrityOutcomeV1::Ready,
+                signature: Some(Signature::new_unique()),
+                locator: None,
+                conflict_fields: Vec::new(),
+                evidence_hash_blake3: [0xA3; 32],
+            })
+            .expect("existing pool identity occupies the alias lane");
+
+        let mut observation =
+            primary_trade_observation(Signature::new_unique(), pool, Pubkey::new_unique(), 0);
+        observation.raw_transaction_mutation_count = Some(1);
+        let admission =
+            ingest_pump_observation(&ledger, &registry, Some(observation), 1, true, None);
+
+        assert!(matches!(
+            admission,
+            CanonicalRuntimeAdmissionV1::Blocked(
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+            )
+        ));
+        assert!(
+            registry.candidate_admission_open(),
+            "a ready-inventory alias conflict must not globally close admission"
+        );
+        assert_eq!(
+            registry
+                .canonical_apply_fence_counts()
+                .expect("conflicting receipt must be reclaimed"),
+            (0, 0)
+        );
+        assert_eq!(
+            registry
+                .snapshot(existing)
+                .expect("existing alias remains auditable")
+                .outcome,
+            CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
         );
     }
 

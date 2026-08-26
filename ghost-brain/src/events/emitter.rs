@@ -101,9 +101,24 @@ impl EventEmitter {
     }
 
     fn emit(&self, event: ExecutionEvent) {
-        if let Ok(mut w) = self.writer.lock() {
-            if let Err(e) = w.write_event(&event) {
-                error!(error = %e, kind = event.kind.type_name(), "EventEmitter: failed to write event");
+        match self.writer.lock() {
+            Ok(mut writer) => {
+                if let Err(error) = writer.write_event(&event) {
+                    ::metrics::counter!("event_writer_write_failure_total", 1u64);
+                    error!(
+                        error = %error,
+                        kind = event.kind.type_name(),
+                        "EventEmitter: failed to write event"
+                    );
+                }
+            }
+            Err(error) => {
+                ::metrics::counter!("event_writer_lock_failure_total", 1u64);
+                error!(
+                    error = %error,
+                    kind = event.kind.type_name(),
+                    "EventEmitter: writer mutex poisoned; event was not persisted"
+                );
             }
         }
     }
@@ -669,6 +684,9 @@ mod tests {
                 error_code: None,
                 signer: "wallet".to_string(),
                 wallet: "wallet".to_string(),
+                signer_pre_balance_lamports: Some(1_000_000_000),
+                signer_post_balance_lamports: Some(580_000_000),
+                is_synthetic: Some(false),
                 quote_amount_sol: 0.42,
                 volume_sol: 0.42,
                 sol_amount_lamports: Some(420_000_000),
@@ -709,6 +727,15 @@ mod tests {
         assert_eq!(parsed["kind"]["type"], "PoolTransaction");
         assert_eq!(parsed["kind"]["payload"]["side"], "buy");
         assert_eq!(parsed["kind"]["payload"]["signer"], "wallet");
+        assert_eq!(
+            parsed["kind"]["payload"]["signer_pre_balance_lamports"],
+            1_000_000_000
+        );
+        assert_eq!(
+            parsed["kind"]["payload"]["signer_post_balance_lamports"],
+            580_000_000
+        );
+        assert_eq!(parsed["kind"]["payload"]["is_synthetic"], false);
         assert_eq!(parsed["kind"]["payload"]["quote_amount_sol"], 0.42);
         assert_eq!(
             parsed["kind"]["payload"]["effective_curve_quote_lamports"],

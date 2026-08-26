@@ -284,14 +284,14 @@ impl LocalGapTracker {
         stream_epoch: u64,
         dropped: LocalCoverageBoundaryV1,
         queue_high_water: usize,
-    ) {
+    ) -> bool {
         self.unreliable.store(true, Ordering::Release);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(active) = state.active.as_mut() {
             active.missing_event_count = active.missing_event_count.saturating_add(1);
             active.last_dropped = dropped;
             active.queue_high_water = active.queue_high_water.max(queue_high_water);
-            return;
+            return false;
         }
 
         let before = state.last_admitted.clone();
@@ -307,6 +307,7 @@ impl LocalGapTracker {
             queue_high_water,
             started_at_ms: wall_clock_ms(),
         });
+        true
     }
 
     pub(crate) fn observe_admitted(&self, after: LocalCoverageBoundaryV1) {
@@ -493,8 +494,8 @@ mod tests {
     fn one_continuous_saturation_episode_produces_one_deterministic_gap() {
         let tracker = LocalGapTracker::new(LocalCoverageGapReasonV1::IngressQueueSaturated);
         tracker.observe_admitted(boundary(10, 1));
-        tracker.observe_saturation("primary-a", 7, boundary(11, 2), 1_024);
-        tracker.observe_saturation("primary-a", 7, boundary(12, 3), 1_024);
+        assert!(tracker.observe_saturation("primary-a", 7, boundary(11, 2), 1_024));
+        assert!(!tracker.observe_saturation("primary-a", 7, boundary(12, 3), 1_024));
         tracker.observe_admitted(boundary(13, 4));
 
         assert_eq!(tracker.completed_len(), 1);

@@ -300,6 +300,24 @@ pub struct PoolTransactionPayload {
     pub signer: String,
     /// Alias for feature rollups that use wallet identity.
     pub wallet: String,
+    /// SOL pre-balance of the observed signer before this transaction.
+    ///
+    /// This is raw ingest evidence. Consumers that need wallet-debit
+    /// semantics must require both balances and must not substitute an
+    /// instruction cap or a price-derived amount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_pre_balance_lamports: Option<u64>,
+    /// SOL post-balance of the observed signer after this transaction.
+    ///
+    /// This is raw ingest evidence paired with the pre-balance; absence
+    /// remains absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_post_balance_lamports: Option<u64>,
+    /// Whether the source transaction is synthetic according to the ingest
+    /// semantic envelope. It is optional for backward-compatible decoding;
+    /// absent provenance must not be treated as a real observed trade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_synthetic: Option<bool>,
     /// SOL-denominated trade amount used by flow features.
     pub quote_amount_sol: f64,
     /// Alias accepted by selector feature normalizers.
@@ -781,6 +799,9 @@ mod tests {
             error_code: None,
             signer: "wallet".to_string(),
             wallet: "wallet".to_string(),
+            signer_pre_balance_lamports: None,
+            signer_post_balance_lamports: None,
+            is_synthetic: None,
             quote_amount_sol: 0.42,
             volume_sol: 0.42,
             sol_amount_lamports: Some(420_000_000),
@@ -875,6 +896,9 @@ mod tests {
                     error_code: None,
                     signer: "wallet".to_string(),
                     wallet: "wallet".to_string(),
+                    signer_pre_balance_lamports: None,
+                    signer_post_balance_lamports: None,
+                    is_synthetic: None,
                     quote_amount_sol: 1.0,
                     volume_sol: 1.0,
                     sol_amount_lamports: Some(1_000_000_000),
