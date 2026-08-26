@@ -719,8 +719,10 @@ const PENDING_TRADE_TTL: Duration = Duration::from_millis(30);
 const PENDING_TRADES_PER_CURVE_MAX: usize = 1_024;
 const RAW_PUMPFUN_INSTRUCTION_EVIDENCE_QUEUE_CAP: usize = 1_024;
 const RAW_PUMPFUN_INSTRUCTION_EVIDENCE_FLUSH_MS: u64 = 1_000;
-// Keep the Seer-owned deadline below the launcher's five-second outer guard so
-// typed per-dispatcher failures can propagate before the caller fallback fires.
+// Raw evidence and WAL retain their historical short shared deadline. BCV2
+// hydration is intentionally separate: accepted RPC work is sequential and
+// cannot honestly be guaranteed by the old all-dispatchers-in-four-seconds
+// budget.
 const DISPATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 const RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT: usize = 16;
 const RAW_PUMPFUN_LEGACY_TAIL_COUNT: usize = 2;
@@ -2519,6 +2521,20 @@ impl Seer {
         self.health = Some(health);
     }
 
+    /// Restrict primary-global AccountUpdate transport to curves explicitly
+    /// registered by candidate/create processing. This is used only by the
+    /// observe-only ACE full-universe capture to keep unrelated global curve
+    /// churn out of the bounded raw ingress queue.
+    ///
+    /// The method must be called before `run()` starts the gRPC connector.
+    pub fn enable_primary_global_account_update_registry_scope(&mut self) -> bool {
+        let Some(connection) = self.grpc_connection.as_mut() else {
+            return false;
+        };
+        connection.enable_primary_global_account_update_registry_scope();
+        true
+    }
+
     /// Attach a shared WAL handle for raw/parsed ingest durability.
     pub fn with_wal(mut self, wal: Arc<Wal>) -> Self {
         if let Some(connection) = self.grpc_connection.as_ref() {
@@ -2592,17 +2608,17 @@ impl Seer {
 
     async fn shutdown_dispatchers_with_timeout(&self, timeout: Duration) -> Result<(), String> {
         let mut failures = Vec::new();
-        let deadline = Instant::now() + timeout;
-        let remaining = || deadline.saturating_duration_since(Instant::now());
+        let raw_wal_deadline = Instant::now() + timeout;
+        let raw_wal_remaining = || raw_wal_deadline.saturating_duration_since(Instant::now());
 
         if let Some(dispatcher) = self.raw_pumpfun_instruction_evidence_tx.as_ref() {
-            if let Err(err) = dispatcher.shutdown_and_join(remaining()).await {
+            if let Err(err) = dispatcher.shutdown_and_join(raw_wal_remaining()).await {
                 failures.push(err);
             }
         }
 
         if let Some(dispatcher) = self.wal_dispatcher.clone() {
-            let step_timeout = remaining();
+            let step_timeout = raw_wal_remaining();
             let task =
                 tokio::task::spawn_blocking(move || dispatcher.shutdown_and_join(step_timeout));
             match tokio::time::timeout(step_timeout, task).await {
@@ -2616,8 +2632,22 @@ impl Seer {
             }
         }
 
+        // BCV2 hydration owns an async producer that may emit execution
+        // evidence. It has its own bounded budget: accepted requests are
+        // sequential and must be drained (or fail shutdown explicitly) before
+        // IPC stops accepting evidence. It is intentionally not charged
+        // against the raw/WAL deadline above.
+        if let Some(parser) = self.parser.as_ref() {
+            if let Err(err) = parser
+                .shutdown_bcv2_hydration(binary_parser::BCV2_HYDRATION_DRAIN_TIMEOUT)
+                .await
+            {
+                failures.push(format!("BCV2 hydration shutdown failed: {err}"));
+            }
+        }
+
         if let Some(sender) = self.ipc_sender.clone() {
-            let step_timeout = remaining();
+            let step_timeout = timeout;
             let task = tokio::task::spawn_blocking(move || sender.shutdown_and_join(step_timeout));
             match tokio::time::timeout(step_timeout, task).await {
                 Ok(Ok(Ok(()))) => {}
@@ -2631,7 +2661,7 @@ impl Seer {
         }
 
         if let Some(dispatcher) = self.local_gap_audit_dispatcher.clone() {
-            let step_timeout = remaining();
+            let step_timeout = timeout;
             let task =
                 tokio::task::spawn_blocking(move || dispatcher.shutdown_and_join(step_timeout));
             match tokio::time::timeout(step_timeout, task).await {
@@ -3904,6 +3934,20 @@ impl Seer {
         ::metrics::increment_counter!("seer.account_updates.received_total");
         let primary_authority =
             provider_role == Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
+
+        if self.grpc_connection.as_ref().is_some_and(|connection| {
+            connection.primary_global_account_update_registry_scope_enabled()
+                && primary_authority
+                && !connection.is_capture_account_watched(&pubkey)
+        }) {
+            // This is a defensive duplicate of the transport-router scope.
+            // It matters for injected/replayed events: no untracked AccountUpdate
+            // may teach the registry a new curve during ACE capture.
+            ::metrics::increment_counter!(
+                "seer_primary_global_account_update_suppressed_untracked_total"
+            );
+            return Ok(true);
+        }
 
         if let Some(context) = self.bcv2_context_for_account_update(pubkey) {
             self.emit_bcv2_account_update_evidence(context, slot, write_version, owner, data.len())

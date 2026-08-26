@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "ghost-launcher"
 path = "src/main.rs"
 
+[[bin]]
+name = "ace_core_one_day_probe"
+path = "src/bin/ace_core_one_day_probe.rs"
+
 [features]
 default = []
 manual-debug-examples = []

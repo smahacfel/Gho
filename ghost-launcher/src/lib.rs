@@ -35,7 +35,10 @@
 //! tx.send(GhostEvent::new_pool_detected(pool)).unwrap();
 //! ```
 
+pub mod ace_core_one_day_probe;
+pub mod ace_ev_v2_probe;
 pub mod candidate_integrity;
+pub mod capture_resilience;
 pub mod components;
 pub mod config;
 pub mod events;

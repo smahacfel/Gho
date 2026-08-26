@@ -1,0 +1,18 @@
+{
+  "schema": "ace_ev_v2_prospective_1000_amendment_v1",
+  "amendment_id": "ACE_EV_V2_PROSPECTIVE_1000",
+  "base_contract_sha256": "60d6afbceb919b4a1be3b10cc62d914bb8fb8d0d279bc0db7d0cd19c86e55a8d",
+  "target_terminal_outcomes": 1000,
+  "train_rows": 400,
+  "threshold_calibration_rows": 200,
+  "untouched_test_rows": 400,
+  "max_enrollment_ms": 21600000,
+  "outcome_drain_ms": 150000,
+  "test_min_entry_filled": 60,
+  "test_min_exit_filled": 25,
+  "positive_min_selected": 80,
+  "positive_min_selected_entry_filled": 20,
+  "positive_min_selected_exit_filled": 10,
+  "positive_max_top1_positive_pnl_share": 0.25,
+  "positive_max_top3_positive_pnl_share": 0.5
+}

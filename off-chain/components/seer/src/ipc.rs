@@ -1251,6 +1251,28 @@ impl IpcSender {
             .await
     }
 
+    /// Synchronously attempt to enqueue execution-account evidence into the
+    /// existing bounded IPC egress FIFO.
+    ///
+    /// This is used by normal BCV2 hydration enqueue failures. It deliberately
+    /// does not spawn a task per failure and does not wait for capacity: a
+    /// full/closed FIFO is returned as a typed transport failure and opens the
+    /// existing local-coverage-gap path rather than silently dropping the
+    /// missing-evidence fact.
+    pub fn try_send_execution_account_evidence(
+        &self,
+        evidence: ExecutionAccountEvidence,
+        priority: EventPriority,
+    ) -> Result<(), IpcError> {
+        let event = SeerEvent::ExecutionAccountEvidence(DetectedExecutionAccountEvidenceEvent {
+            evidence,
+            detected_at: std::time::SystemTime::now(),
+            sequence_number: 0,
+            priority,
+        });
+        self.try_send_event_strict(event)
+    }
+
     #[must_use]
     pub fn current_queue_length(&self) -> usize {
         self.egress.len()
@@ -1323,6 +1345,53 @@ impl IpcSender {
                 Ok(())
             }
             Err(e) => Err(e),
+        }
+    }
+
+    fn try_send_event_strict(&self, event: SeerEvent) -> Result<(), IpcError> {
+        let current_queue_length = self.egress.len();
+        self.metrics.update_queue_length(current_queue_length);
+        let utilization = self
+            .metrics
+            .calculate_queue_utilization(self.egress.total_capacity());
+        if utilization >= self.config.warning_threshold_percent && self.config.log_overflows {
+            warn!(
+                "IPC queue utilization high: {:.1}% ({}/{})",
+                utilization,
+                current_queue_length,
+                self.egress.total_capacity()
+            );
+        }
+
+        let boundary = ipc_event_boundary(&event);
+        let provider_id = ipc_event_provider_id(&event);
+        match self.egress.try_enqueue(event) {
+            Ok(()) => {
+                self.local_gap.observe_admitted(boundary);
+                self.local_gap.flush_completed_to(&self.local_gap_audit);
+                self.metrics.events_sent.inc();
+                Ok(())
+            }
+            Err(IpcQueueError::Full(_event)) => {
+                self.local_gap.observe_saturation(
+                    provider_id.clone(),
+                    0,
+                    boundary,
+                    current_queue_length.max(self.config.buffer_size),
+                );
+                ::metrics::increment_counter!(
+                    "seer_local_coverage_gap_opened_total",
+                    "reason" => "ipc_egress_queue_saturated"
+                );
+                self.report_local_coverage_gap(
+                    provider_id,
+                    ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
+                );
+                Err(IpcError::LocalProcessingGap)
+            }
+            Err(IpcQueueError::Closed(_event)) => Err(IpcError::SendError(
+                "IPC egress dispatcher disconnected".to_string(),
+            )),
         }
     }
 
@@ -1475,6 +1544,14 @@ impl IpcReceiver {
     #[must_use]
     pub fn local_coverage_gap_receiver(&self) -> watch::Receiver<LocalCoverageGapStateV1> {
         self.local_coverage_gap_rx.clone()
+    }
+
+    /// Number of accepted events still waiting for launcher-side handling.
+    /// This is an observation-only shutdown invariant; it does not alter
+    /// backpressure or receiver scheduling.
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.receiver.len()
     }
 
     /// Record handling latency for the given event using the shared helper.

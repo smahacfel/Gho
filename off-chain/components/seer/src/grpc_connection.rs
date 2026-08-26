@@ -817,6 +817,17 @@ impl AccountRegistry {
         self.bcv2_accounts.contains(addr)
     }
 
+    /// Whether a raw AccountUpdate belongs to an explicitly tracked capture
+    /// subject. This is deliberately a registry lookup only; it never infers
+    /// a candidate identity from an untracked global state write.
+    #[inline(always)]
+    pub fn contains_capture_account(&self, addr: &str) -> bool {
+        self.curve_accounts.contains(addr)
+            || self.pool_accounts.contains(addr)
+            || self.bcv2_accounts.contains(addr)
+            || self.generic_accounts.contains(addr)
+    }
+
     #[inline(always)]
     pub fn bcv2_context(&self, addr: &str) -> Option<Bcv2AccountContext> {
         self.bcv2_contexts
@@ -1008,6 +1019,9 @@ pub struct TransportStats {
     pub entry_events: AtomicU64,   // [FIX-1] entry event counter
     pub tx_events: AtomicU64,      // per-type: transaction events
     pub account_events: AtomicU64, // per-type: account update events
+    /// Global account writes intentionally excluded by the capture-only exact
+    /// candidate scope before they can occupy the raw ingress FIFO.
+    pub account_events_suppressed_untracked: AtomicU64,
     pub delayed_pushes: AtomicU64, // [FIX-5] buffered account updates
     pub delayed_drains: AtomicU64, // [FIX-5] recovered account updates
     /// Wall-clock ms of last received gRPC message (any variant).
@@ -1090,6 +1104,14 @@ impl TransportStats {
         self.account_events.fetch_add(1, Ordering::Relaxed);
         metrics::increment_counter!("ghost.pump.account_recv");
         metrics::increment_counter!("account_received_total");
+    }
+    #[inline(always)]
+    pub fn bump_account_suppressed_untracked(&self) {
+        self.account_events_suppressed_untracked
+            .fetch_add(1, Ordering::Relaxed);
+        metrics::increment_counter!(
+            "seer_primary_global_account_update_suppressed_untracked_total"
+        );
     }
     #[inline(always)]
     pub fn bump_delayed_push(&self) {
@@ -1671,6 +1693,10 @@ pub struct GrpcConfig {
     pub subscription_profile: GrpcSubscriptionProfile,
     pub registry_resubscribe_mode: RegistryResubscribeMode,
     pub ingress_queue_capacity: usize,
+    /// Capture-only ingress scope. When enabled for the primary-global
+    /// profile, global Pump account writes not belonging to an explicitly
+    /// registered candidate are discarded before the bounded raw FIFO.
+    pub scope_primary_global_account_updates_to_registry: bool,
 }
 
 impl Default for GrpcConfig {
@@ -1687,6 +1713,7 @@ impl Default for GrpcConfig {
             subscription_profile: GrpcSubscriptionProfile::default(),
             registry_resubscribe_mode: RegistryResubscribeMode::HealthTickOnly,
             ingress_queue_capacity: DEFAULT_PRIMARY_CHANNEL_CAP,
+            scope_primary_global_account_updates_to_registry: false,
         }
     }
 }
@@ -3598,6 +3625,7 @@ async fn stream_loop(
                                 gap_tx,
                                 latest_block_time_secs,
                                 registry,
+                                cfg.scope_primary_global_account_updates_to_registry,
                             );
                         }
 
@@ -3819,6 +3847,7 @@ fn route_update(
     gap_tx: &tokio::sync::mpsc::UnboundedSender<SlotGap>,
     latest_block_time_secs: &Arc<AtomicI64>,
     registry: &AccountRegistry,
+    scope_primary_global_account_updates_to_registry: bool,
 ) {
     let received_at_monotonic_ns = crate::types::arrival_time_ns();
     let received_at = Instant::now();
@@ -3876,6 +3905,17 @@ fn route_update(
                 .map(|acc| bs58::encode(&acc.pubkey).into_string())
                 .unwrap_or_default();
             if pubkey.is_empty() {
+                return;
+            }
+            if scope_primary_global_account_updates_to_registry
+                && provider_role == ghost_core::RawProviderRoleV1::PrimaryAuthority
+                && !registry.contains_capture_account(&pubkey)
+            {
+                // Deliberately exclude unrelated global account churn before
+                // decode/allocation/queueing. This is capture scoping, not a
+                // canonical candidate loss: registered candidates continue to
+                // use the same primary source and bounded FIFO.
+                stats.bump_account_suppressed_untracked();
                 return;
             }
             if registry.contains_bcv2(&pubkey) {
@@ -3992,6 +4032,19 @@ pub(crate) fn route_update_for_hot_path_harness_with_capture(
     msg: yellowstone_grpc_proto::prelude::SubscribeUpdate,
     capture_payload: bool,
 ) -> SeerResult<GeyserEvent> {
+    route_update_for_hot_path_harness_with_registry_scope(msg, capture_payload, None, false)?
+        .ok_or_else(|| {
+            SeerError::ParseError("PR1B harness route_update emitted no event".to_string())
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn route_update_for_hot_path_harness_with_registry_scope(
+    msg: yellowstone_grpc_proto::prelude::SubscribeUpdate,
+    capture_payload: bool,
+    registered_account: Option<String>,
+    scope_primary_global_account_updates_to_registry: bool,
+) -> SeerResult<Option<GeyserEvent>> {
     let (channel, receiver) = DualLaneChannel::with_capacities(64, 64);
     channel.set_live_transaction_capture_enabled(capture_payload);
     let stats = Arc::new(TransportStats::default());
@@ -3999,6 +4052,9 @@ pub(crate) fn route_update_for_hot_path_harness_with_capture(
     let (gap_tx, _gap_rx) = tokio::sync::mpsc::unbounded_channel();
     let latest_block_time_secs = Arc::new(AtomicI64::new(0));
     let registry = AccountRegistry::new();
+    if let Some(account) = registered_account {
+        registry.insert_curve(account);
+    }
 
     route_update(
         "pr1b-hot-path-harness",
@@ -4011,14 +4067,25 @@ pub(crate) fn route_update_for_hot_path_harness_with_capture(
         &gap_tx,
         &latest_block_time_secs,
         &registry,
+        scope_primary_global_account_updates_to_registry,
     );
 
-    let event = receiver.queue.try_recv().map_err(|_| {
-        SeerError::ParseError("PR1B harness route_update emitted no event".to_string())
-    })?;
-    pump_event_to_geyser_event(event, GRPC_GLOBAL_STREAM_SOURCE_LABEL, None).ok_or_else(|| {
-        SeerError::ParseError("PR1B harness event has no normalized mapping".to_string())
-    })?
+    match receiver.queue.try_recv() {
+        Ok(event) => {
+            let event = pump_event_to_geyser_event(event, GRPC_GLOBAL_STREAM_SOURCE_LABEL, None)
+                .transpose()?
+                .ok_or_else(|| {
+                    SeerError::ParseError(
+                        "PR1B harness event has no normalized mapping".to_string(),
+                    )
+                })?;
+            Ok(Some(event))
+        }
+        Err(TryRecvError::Empty) => Ok(None),
+        Err(TryRecvError::Disconnected) => Err(SeerError::ParseError(
+            "PR1B harness route_update receiver disconnected".to_string(),
+        )),
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -4363,6 +4430,7 @@ impl GrpcConnection {
             subscription_profile: GrpcSubscriptionProfile::PrimaryGlobal,
             registry_resubscribe_mode: RegistryResubscribeMode::HealthTickOnly,
             ingress_queue_capacity: DEFAULT_PRIMARY_CHANNEL_CAP,
+            scope_primary_global_account_updates_to_registry: false,
         };
 
         let (connector, rx, gap_rx) = YellowstoneConnector::new(cfg.clone());
@@ -4431,6 +4499,18 @@ impl GrpcConnection {
             connector.config.registry_resubscribe_mode = registry_resubscribe_mode;
         }
         self
+    }
+
+    /// Enable the ACE capture-only account scope before `connect_geyser`
+    /// consumes the connector. Both stored config copies are updated so the
+    /// live worker receives the exact same scope contract.
+    pub fn enable_primary_global_account_update_registry_scope(&mut self) {
+        self.config.scope_primary_global_account_updates_to_registry = true;
+        if let Some(connector) = self.connector.get_mut().as_mut() {
+            connector
+                .config
+                .scope_primary_global_account_updates_to_registry = true;
+        }
     }
 
     pub fn with_ingress_queue_capacity(mut self, capacity: usize) -> Self {
@@ -4761,6 +4841,19 @@ impl GrpcConnection {
         let key = pool.to_string();
         self.watched_curve_accounts.contains_key(&key)
             || self.watched_pool_accounts.contains_key(&key)
+    }
+
+    /// Whether this connection is running the capture-only exact-candidate
+    /// AccountUpdate scope.
+    pub fn primary_global_account_update_registry_scope_enabled(&self) -> bool {
+        self.config.scope_primary_global_account_updates_to_registry
+    }
+
+    /// Lookup used as a defensive second boundary after transport routing.
+    /// This protects injected/replayed AccountUpdate paths from re-populating
+    /// the registry with unrelated global state while the scope is active.
+    pub fn is_capture_account_watched(&self, account: &Pubkey) -> bool {
+        self.registry.contains_capture_account(&account.to_string())
     }
 
     pub fn is_mint_watched(&self, mint: &Pubkey) -> bool {
