@@ -8066,6 +8066,7 @@ fn p37_shadow_probe_artifact_records(
         probe_bucket: Some(record.probe_bucket.clone()),
         probe_position_id: None,
         decision_ts_ms: Some(decision_ts_ms),
+        decision_to_buy_ms: None,
         probe_dispatch_ts_ms: Some(now_ms),
         probe_amount_lamports: Some(record.probe_amount_lamports),
         probe_amount_source: Some(record.probe_amount_source.clone()),
@@ -19895,6 +19896,7 @@ async fn execute_gatekeeper_buy_path(
     identity: &mut ObservationIdentity,
     base_mint_pubkey: &mut Option<Pubkey>,
     pool_data: &mut Option<Arc<DetectedPool>>,
+    gatekeeper_decision_ts_ms: u64,
 ) -> BuyPathExecutionOutcome {
     let metadata_source = hydrate_buy_path_metadata(
         pool_id,
@@ -20312,6 +20314,7 @@ async fn execute_gatekeeper_buy_path(
                                 .simcov
                                 .state_readiness_latch,
                             Some(&integrity_submit_guard),
+                            Some(gatekeeper_decision_ts_ms),
                         )
                         .await;
                         let live_confirmed = matches!(
@@ -20438,6 +20441,7 @@ async fn execute_gatekeeper_buy_via_trigger(
         None,
         &state_latch_config,
         None,
+        None,
     )
     .await
 }
@@ -20518,7 +20522,11 @@ async fn p37_apply_selected_fallback_route_handoff_for_shadow_only(
     if !matches!(
         trigger_component.entry_mode(),
         crate::config::TriggerEntryMode::ShadowOnly
+    ) || !matches!(
+        primary_request.account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
     ) {
+        // LegacyBuy nie ma dalszego fallbacku; finalny precheck nadal bada cały manifest.
         return Ok(primary_request);
     }
     let primary_bcv2_reason =
@@ -20956,6 +20964,7 @@ async fn active_shadow_simulation_load_precheck_receipt(
         });
     }
 
+    let mut required_account_precheck = None;
     if working_builder_parity_mode {
         let account_set_diagnostics =
             p37_shadow_probe_account_set_diagnostics(trigger_component, request).await;
@@ -20996,8 +21005,12 @@ async fn active_shadow_simulation_load_precheck_receipt(
         request.account_overrides.buy_variant,
         Some(trigger::PumpfunBuyVariant::LegacyBuy)
     ) {
-        let account_set_diagnostics =
-            p37_shadow_probe_account_set_diagnostics(trigger_component, request).await;
+        // Obie walidacje czytają ten sam niezmienny request; nie zależą od siebie.
+        let (account_set_diagnostics, required_accounts) = tokio::join!(
+            p37_shadow_probe_account_set_diagnostics(trigger_component, request),
+            trigger_component.counterfactual_probe_missing_required_account(request),
+        );
+        required_account_precheck = Some(required_accounts);
         if let Some(reason) =
             p37_selected_route_final_manifest_failure_reason(request, &account_set_diagnostics)
         {
@@ -21076,9 +21089,10 @@ async fn active_shadow_simulation_load_precheck_receipt(
         }
     }
 
-    let precheck_result = trigger_component
-        .counterfactual_probe_missing_required_account(request)
-        .await;
+    let precheck_result = match required_account_precheck {
+        Some(result) => result,
+        None => trigger_component.counterfactual_probe_missing_required_account(request).await,
+    };
     let error = match precheck_result {
         Ok(Some(missing)) => {
             let missing_role = missing.role.clone();
@@ -21144,6 +21158,7 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
     working_builder_execution_evidence_context: Option<P37WorkingBuilderExecutionEvidenceContext>,
     state_latch_config: &SelectorStateReadinessLatchConfig,
     integrity_submit_guard: Option<&CandidateIntegritySubmitGuardV1>,
+    gatekeeper_decision_ts_ms: Option<u64>,
 ) -> crate::components::trigger::TriggerDispatchReceipt {
     if let Some(gate_status) = fsc_gate_status {
         match trigger_component.entry_mode() {
@@ -21174,7 +21189,10 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                     )
                     .await
                 {
-                    Ok(prepared_buy) => {
+                    Ok(mut prepared_buy) => {
+                if let Some(decision_ts_ms) = gatekeeper_decision_ts_ms {
+                    prepared_buy.decision_ts_ms = decision_ts_ms;
+                }
                         let prepared_buy = if let Some(metadata) = join_metadata.clone() {
                             prepared_buy.with_join_metadata(metadata)
                         } else {
@@ -21299,7 +21317,10 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
             )
             .await
         {
-            Ok(prepared_buy) => {
+            Ok(mut prepared_buy) => {
+                if let Some(decision_ts_ms) = gatekeeper_decision_ts_ms {
+                    prepared_buy.decision_ts_ms = decision_ts_ms;
+                }
                 let prepared_buy = if let Some(metadata) = join_metadata.clone() {
                     prepared_buy.with_join_metadata(metadata)
                 } else {
@@ -21634,7 +21655,7 @@ fn shadow_entry_record_from_event(
     event: &crate::events::ShadowBuySimulationEvent,
     execution_outcome: &str,
 ) -> Option<ShadowEntryRecord> {
-    let entry_execution_ts_ms = event.decision_ts_ms;
+    let entry_execution_ts_ms = event.simulation_finished_ts_ms;
     let mut entry = ShadowEntryRecord {
         join_metadata: event.join_metadata.clone(),
         schema_version: 1,
@@ -21644,6 +21665,11 @@ fn shadow_entry_record_from_event(
         probe_bucket: None,
         probe_position_id: None,
         decision_ts_ms: Some(event.decision_ts_ms),
+        decision_to_buy_ms: event
+            .err
+            .is_none()
+            .then(|| entry_execution_ts_ms.checked_sub(event.decision_ts_ms))
+            .flatten(),
         probe_dispatch_ts_ms: None,
         probe_amount_lamports: None,
         probe_amount_source: None,
@@ -22115,7 +22141,7 @@ fn shadow_entry_record_from_event(
         candidate_id: Some(event.candidate_id.clone()),
         order_id: None,
         quote_id: None,
-        timing_source: Some("decision_ts_ms".to_string()),
+        timing_source: Some("simulation_finished_ts_ms".to_string()),
         execution_outcome: execution_outcome.to_string(),
     };
     enrich_active_shadow_entry_with_account_diagnostics(&mut entry, &event.account_diagnostics);
@@ -22138,6 +22164,7 @@ fn shadow_entry_record_from_request(
         probe_bucket: None,
         probe_position_id: None,
         decision_ts_ms: Some(request.decision_ts_ms),
+        decision_to_buy_ms: None,
         probe_dispatch_ts_ms: None,
         probe_amount_lamports: None,
         probe_amount_source: None,
@@ -22895,6 +22922,7 @@ fn shadow_execution_outcome_from_report_err(err: &str) -> String {
         return "shadow_transport_rate_limit".to_string();
     }
     match crate::components::trigger::shadow_run::classify_shadow_error(err) {
+        "execution_deadline_exceeded" => "shadow_execution_deadline_exceeded".to_string(),
         "network_provider_problem" | "timing_blockhash_problem" => {
             "shadow_transport_error".to_string()
         }
@@ -23260,6 +23288,9 @@ struct ShadowEntryRecord {
     probe_position_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     decision_ts_ms: Option<u64>,
+    /// Czas od decyzji do wyniku udanej symulacji BUY, wraz z przygotowaniem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision_to_buy_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probe_dispatch_ts_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -24736,7 +24767,7 @@ async fn apply_trigger_buy_outcome(
                     .clone()
                     .unwrap_or_else(|| shadow_event.decision_ts_ms.to_string());
                 if post_buy_lane == "shadow" {
-                    let shadow_runtime_opened_at_ms = current_time_ms();
+                    let shadow_runtime_opened_at_ms = shadow_event.simulation_finished_ts_ms;
                     match send_shadow_post_buy_handoff(
                         event_tx,
                         post_buy_tx,
@@ -26611,6 +26642,7 @@ async fn pool_observation_task(
                     &mut identity,
                     &mut base_mint_pubkey,
                     &mut pool_data,
+                    gatekeeper_verdict_at,
                 )
                 .await;
                 let bought = buy_execution.bought;
@@ -38030,6 +38062,7 @@ mod tests {
             &mut identity,
             &mut base_mint_pubkey,
             &mut pool_data,
+            current_time_ms(),
         )
         .await;
 
@@ -38127,6 +38160,7 @@ mod tests {
                 &mut identity,
                 &mut base_mint_pubkey,
                 &mut pool_data,
+                current_time_ms(),
             )
             .await;
             (outcome, identity, base_mint_pubkey, pool_data)
@@ -38594,6 +38628,7 @@ mod tests {
             &mut identity,
             &mut base_mint_pubkey,
             &mut pool_data,
+            current_time_ms(),
         )
         .await;
 
@@ -38672,6 +38707,7 @@ mod tests {
                 &mut identity,
                 &mut base_mint_pubkey,
                 &mut pool_data,
+                current_time_ms(),
             )
             .await
         });
@@ -38742,6 +38778,7 @@ mod tests {
                 &mut identity,
                 &mut base_mint_pubkey,
                 &mut pool_data,
+                current_time_ms(),
             )
             .await;
             (outcome, pool_data)
@@ -38805,6 +38842,7 @@ mod tests {
             &mut identity,
             &mut base_mint_pubkey,
             &mut pool_data,
+            current_time_ms(),
         )
         .await;
 
@@ -39124,6 +39162,7 @@ mod tests {
             &mut identity,
             &mut base_mint_pubkey,
             &mut pool_data,
+            current_time_ms(),
         )
         .await;
 
@@ -39240,6 +39279,7 @@ mod tests {
             &mut identity,
             &mut base_mint_pubkey,
             &mut pool_data,
+            current_time_ms(),
         )
         .await;
 
@@ -40692,6 +40732,7 @@ mod tests {
             None,
             &SelectorStateReadinessLatchConfig::default(),
             None,
+            None,
         )
         .await;
         let err = receipt
@@ -40751,6 +40792,7 @@ mod tests {
             false,
             None,
             &SelectorStateReadinessLatchConfig::default(),
+            None,
             None,
         )
         .await;
@@ -43898,7 +43940,13 @@ mod tests {
             .expect("shadow slot should reserve");
         let ack_task = tokio::spawn(async move {
             let handoff = direct_rx.recv().await.expect("direct handoff");
-            let (_event, ack_tx) = handoff.into_parts();
+            let (event, ack_tx) = handoff.into_parts();
+            assert!(matches!(
+                event,
+                crate::components::post_buy_runtime::DirectPostBuyPayload::Event(
+                    GhostEvent::PostBuySubmitted { entry_opened_at_ms: Some(ts), .. }
+                ) if ts == decision_ts_ms + 6
+            ));
             ack_tx
                 .expect("shadow handoff ack channel")
                 .send(DirectPostBuyHandoffAck::Accepted)
@@ -43977,8 +44025,19 @@ mod tests {
         assert_eq!(record.pool_id, pool_id.to_string());
         assert_eq!(record.mint_id, pool.base_mint);
         assert_eq!(record.slot, Some(777));
-        assert_eq!(record.timestamp_ms, decision_ts_ms);
-        assert_eq!(record.timing_source.as_deref(), Some("decision_ts_ms"));
+        assert_eq!(record.decision_ts_ms, Some(decision_ts_ms));
+        assert_eq!(record.timestamp_ms, decision_ts_ms + 6);
+        assert_eq!(record.decision_to_buy_ms, Some(6));
+        assert_eq!(entry_row["decision_to_buy_ms"], 6);
+        let mut legacy_row = entry_row.clone();
+        legacy_row.as_object_mut().unwrap().remove("decision_to_buy_ms");
+        let legacy_record: ShadowEntryRecord =
+            serde_json::from_value(legacy_row).expect("starszy wpis bez nowego pola");
+        assert_eq!(legacy_record.decision_to_buy_ms, None);
+        assert_eq!(
+            record.timing_source.as_deref(),
+            Some("simulation_finished_ts_ms")
+        );
         assert_eq!(record.execution_outcome, "shadow_simulated");
         assert_eq!(entry_row["ab_record_id"], "pool:1000:11000:BUY");
         assert_eq!(entry_row["v3_feature_snapshot_hash"], "feature-hash-j2b");

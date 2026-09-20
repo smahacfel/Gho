@@ -131,6 +131,8 @@ impl TestScenario for ScenarioE2EFull {
                         seer::config::SeerConfig::default_grpc_max_stalls_before_open(),
                     grpc_stall_timeout_secs:
                         seer::config::SeerConfig::default_grpc_stall_timeout_secs(),
+                    grpc_candidate_handoff_slo_ms: None,
+                    event_worker_concurrency: None,
                     grpc_circuit_breaker_cooldown_ms:
                         seer::config::SeerConfig::default_grpc_circuit_breaker_cooldown_ms(),
                     verbose: config.seer.verbose,

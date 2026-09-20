@@ -6022,6 +6022,8 @@ pub async fn run(
         max_reconnect_delay_secs: 300,
         grpc_max_stalls_before_open: config.grpc_max_stalls_before_open,
         grpc_stall_timeout_secs: config.grpc_stall_timeout_secs,
+        grpc_candidate_handoff_slo_ms: config.grpc_candidate_handoff_slo_ms,
+        event_worker_concurrency: config.event_worker_concurrency,
         grpc_circuit_breaker_cooldown_ms: config.grpc_circuit_breaker_cooldown_ms,
         verbose: false,
         filter: FilterConfig {
@@ -6151,6 +6153,14 @@ pub async fn run(
     info!(
         "  grpc_stall_timeout_secs: {}",
         seer_config.grpc_stall_timeout_secs
+    );
+    info!(
+        "  grpc_candidate_handoff_slo_ms: {:?}",
+        seer_config.grpc_candidate_handoff_slo_ms
+    );
+    info!(
+        "  event_worker_concurrency: {:?}",
+        seer_config.event_worker_concurrency
     );
     info!(
         "  grpc_commitment_fallback_to_websocket: {}",

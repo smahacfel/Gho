@@ -1,0 +1,134 @@
+# Ephemeral per-run launcher; brain_sha256=8a38763a0ec5e48f404696dfb0334f678561b244614d2f6cae058ff7562806bc
+# PREDATOR v11 full shadow burn-in profile with the 50 ms candidate handoff SLO.
+# First-class standalone shadow runtime. Live sender remains disabled; the
+# trigger.shadow_run block is only the launcher shadow transport adapter.
+# Guardian/AEM thresholds live in the dedicated Ghost Brain profile below.
+# Shadow exits reuse the same simple take-profit / stop-loss percentages as
+# live / dual-live and do not use the Revolver shadow target ladder.
+# Wszystkie wartości sekretowe muszą być dostarczone przez env/.env.
+
+mode = "production"
+ghost_brain_config_path = "/root/Gho_ingest/configs/rollout/ghost_brain_predator_v11_shadow_burnin_20260916.toml"
+# Active Gatekeeper profile is the dedicated PREDATOR v11 collector config:
+# - final window: 2111 ms; DOW disabled
+# - Phase 1: total_tx >= 10, unique_signers >= 8, buy_count >= 6
+# - collector-permissive velocity, concentration, volume and curve caps
+# - market_cap_sol >= 5, bonding_pct >= 3, total volume >= 4 SOL
+# - Alpha and Prosperity filters disabled; three-layer evidence stays enabled
+# - APS rollout-local decision: this launcher overlay intentionally does not
+#   duplicate [gatekeeper_v2.aps]. The referenced ghost_brain_config.toml is the
+#   rollout-local source of truth and sets regime_local_heuristic_enabled = true,
+#   cross_pool_outcome_tracker_available = false, min_calibration_samples = 30.
+# - Active shadow guardian: TP +50%, SL -25%; pozostałe warunki bez zmian
+
+[seer]
+enabled = true
+source_mode = "grpc"
+commitment = "processed"
+stream_mode = "single_global"
+tx_filter_strategy = "per_pool"
+# Legacy PR-6 shadow burn-in profile keeps the authoritative funding lane on.
+# For current V3 validation under the single-stream provider constraint, ADR-0130
+# pauses FSC/full-chain bake; use primary-only profiles with funding lane disabled.
+funding_lane_mode = "disabled"
+grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
+grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+grpc_auth_header = "x-api-key"
+grpc_stall_timeout_secs = 20
+# The first diagnostic run proved queueing behind the default 16 shared workers
+# during transaction bursts. Keep the pool hot path bounded but give this feed
+# enough parallel headroom to preserve the 50 ms handoff budget.
+event_worker_concurrency = 32
+# Hard fail-closed admission budget measured from the Yellowstone adapter
+# receive boundary to CandidatePool IPC handoff. Breached/unmeasurable creates
+# remain evidence-only and cannot open a stale 2111 ms observation session.
+grpc_candidate_handoff_slo_ms = 50
+rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"
+enable_pumpfun = true
+enable_bonkfun = false
+enable_raydium = false
+
+[trigger]
+enabled = true
+rpc_url = "${GHOST_TRIGGER_RPC_URL}"
+# REQUIRED in production (live/dual): override via GHOST_TRIGGER_KEYPAIR_PATH.
+# This repaired shadow-only rerun still uses the funded rollout wallet for
+# simulation. entry_mode remains shadow_only, so this does not enable live send.
+entry_mode = "shadow_only"
+# Even without live send, canonical shadow burn-in keeps the same production
+# bulkhead contract: these values are still the primary wallet/risk guardrails.
+max_concurrent_positions = 5
+max_position_size_sol = 0.007
+emergency_floor_sol = 0.0001
+position_size_buffer_sol = 0.0001
+slippage_tolerance = 0.20
+# Shadow: aktywny guardian w pliku brain ma TP +50% i SL -25%.
+# Pozostałe warunki wyjścia pozostają bez zmian.
+live_exit_take_profit_pct = 0.50  # TP +50%; shadow używa również target_threshold w brain.
+live_exit_stop_loss_pct = 0.25  # SL -25%.
+
+[trigger.shadow_run]
+# Brak decision_to_buy_deadline_ms: pomiar czasu bez twardego limitu.
+enabled = true
+# REQUIRED in production: override via GHOST_TRIGGER_SHADOW_RPC_URL.
+shadow_rpc_url = "${GHOST_TRIGGER_SHADOW_RPC_URL}"
+# Read the rollout wallet from [trigger].keypair_path / GHOST_TRIGGER_KEYPAIR_PATH
+# so shadow simulation uses a funded, chain-visible payer account.
+payer_strategy = "configured"
+commitment = "processed"
+sig_verify = false
+replace_recent_blockhash = true
+timeout_ms = 5000
+max_retries = 1
+max_concurrent = 1
+output_path = "/root/Gho_ingest/logs/shadow_run/predator-v11-20260920-latency-report-r13-buys.jsonl"
+emit_event_bus = true
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+tx_build_compensation_ms = 200
+max_quote_age_ms = 1500
+# Canonical shadow proof artifacts.
+entry_log_path = "/root/Gho_ingest/logs/shadow_run/predator-v11-20260920-latency-report-r13/shadow_entries.jsonl"
+lifecycle_log_path = "/root/Gho_ingest/logs/shadow_run/predator-v11-20260920-latency-report-r13/shadow_lifecycle.jsonl"
+timing_model = "prepared_entry_mirror"
+stale_policy = "emit_warning"
+
+[execution.events]
+output_dir = "/root/Gho_ingest/datasets/events/predator-v11-20260920-latency-report-r13"
+rotation_interval_ms = 300000
+flush_interval_ms = 1000
+max_file_size_bytes = 50000000
+enable_aem_ticks = true
+enable_optional_events = false
+
+[oracle]
+# Dedicated Gatekeeper decision artifacts for the latency-corrected rerun.
+decision_log_path = "/root/Gho_ingest/logs/rollout/predator-v11-20260920-latency-report-r13/decisions"
+
+[durability]
+wal_enabled = false
+wal_dir = "/root/Gho_ingest/data/rollout/predator-v11-20260920-latency-report-r13/wal"
+snapshot_dir = "/root/Gho_ingest/data/rollout/predator-v11-20260920-latency-report-r13/snapshots"
+
+[metrics]
+enabled = true
+bind = "0.0.0.0"
+port = 9090
+
+[gui_backend]
+enabled = true
+bind_address = "127.0.0.1"
+port = 8801
+
+[logging]
+level = "info"
+console_enabled = true
+json_format = false
+file_enabled = true
+file_path = "/root/Gho_ingest/logs/rollout/predator-v11-20260920-latency-report-r13/system.log"
+oracle_log_enabled = true
+oracle_log_path = "/root/Gho_ingest/logs/rollout/predator-v11-20260920-latency-report-r13/oracle.log"
+oracle_json_format = false

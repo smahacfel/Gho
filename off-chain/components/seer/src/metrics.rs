@@ -30,6 +30,14 @@ pub struct SeerMetrics {
     /// Latency from event detection to CandidatePool creation (milliseconds)
     pub processing_latency: HistogramVec,
 
+    /// End-to-end latency from Yellowstone adapter receive to CandidatePool
+    /// IPC admission (milliseconds).
+    pub grpc_to_candidate_latency: HistogramVec,
+
+    /// Candidates downgraded to evidence-only because the configured gRPC
+    /// receive-to-handoff budget was breached or could not be proven.
+    pub grpc_to_candidate_slo_breach_total: IntCounterVec,
+
     /// Total number of events received from Geyser stream
     pub geyser_events_received: IntCounterVec,
 
@@ -88,10 +96,12 @@ pub struct SeerMetrics {
     /// Helius events dropped/filtered
     pub helius_events_dropped: IntCounterVec,
 
-    /// Latency from on-chain mint time to detection (milliseconds)
+    /// Wall-clock age of the second-resolution on-chain block timestamp at
+    /// detection. This is clock diagnostics, not transport latency.
     pub mint_to_detection_latency: HistogramVec,
 
-    /// Counter for detections exceeding latency SLO
+    /// Counter for block-time age diagnostics exceeding the legacy threshold.
+    /// This is not a transport-latency SLO counter.
     pub late_detection_total: IntCounterVec,
 
     /// Total binary parser invocations (pool detection + trade parsing)
@@ -230,9 +240,42 @@ impl SeerMetrics {
             .unwrap()
         });
 
+        let grpc_to_candidate_latency = register_histogram_vec!(
+            "seer_grpc_to_candidate_latency_ms",
+            "Latency from Yellowstone adapter receive to CandidatePool IPC admission (milliseconds)",
+            &["amm_program", "source"],
+            vec![0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 75.0, 100.0, 250.0]
+        )
+        .unwrap_or_else(|_| {
+            prometheus::HistogramVec::new(
+                prometheus::HistogramOpts::new(
+                    "seer_grpc_to_candidate_latency_ms",
+                    "Latency from Yellowstone adapter receive to CandidatePool IPC admission (milliseconds)",
+                ),
+                &["amm_program", "source"],
+            )
+            .unwrap()
+        });
+
+        let grpc_to_candidate_slo_breach_total = register_int_counter_vec!(
+            "seer_grpc_to_candidate_slo_breach_total",
+            "Candidates downgraded to evidence-only by the configured gRPC receive-to-handoff SLO",
+            &["amm_program", "source", "reason"]
+        )
+        .unwrap_or_else(|_| {
+            prometheus::IntCounterVec::new(
+                prometheus::Opts::new(
+                    "seer_grpc_to_candidate_slo_breach_total",
+                    "Candidates downgraded to evidence-only by the configured gRPC receive-to-handoff SLO",
+                ),
+                &["amm_program", "source", "reason"],
+            )
+            .unwrap()
+        });
+
         let mint_to_detection_latency = register_histogram_vec!(
             "seer_mint_to_detection_ms",
-            "Latency from mint/block timestamp to detection (milliseconds)",
+            "Wall-clock age of the second-resolution on-chain block timestamp at detection; not transport latency",
             &["amm_program", "source"],
             vec![10.0, 25.0, 50.0, 100.0, 200.0, 300.0, 500.0, 750.0, 1000.0, 2000.0]
         )
@@ -240,7 +283,7 @@ impl SeerMetrics {
             prometheus::HistogramVec::new(
                 prometheus::HistogramOpts::new(
                     "seer_mint_to_detection_ms",
-                    "Latency from mint/block timestamp to detection (milliseconds)",
+                    "Wall-clock age of the second-resolution on-chain block timestamp at detection; not transport latency",
                 ),
                 &["amm_program", "source"],
             )
@@ -361,14 +404,14 @@ impl SeerMetrics {
 
         let late_detection_total = register_int_counter_vec!(
             "seer_late_detection_total",
-            "Number of pools detected later than latency SLO",
+            "Number of block-time age diagnostics above the legacy threshold; not transport-latency breaches",
             &["amm_program", "source"]
         )
         .unwrap_or_else(|_| {
             prometheus::IntCounterVec::new(
                 prometheus::Opts::new(
                     "seer_late_detection_total",
-                    "Number of pools detected later than latency SLO",
+                    "Number of block-time age diagnostics above the legacy threshold; not transport-latency breaches",
                 ),
                 &["amm_program", "source"],
             )
@@ -733,6 +776,8 @@ impl SeerMetrics {
             initialize_pool_parsed_failed,
             candidate_forwarded_to_oracle,
             processing_latency,
+            grpc_to_candidate_latency,
+            grpc_to_candidate_slo_breach_total,
             geyser_events_received,
             events_received,
             websocket_reconnections,

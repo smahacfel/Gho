@@ -493,6 +493,12 @@ fn normalize_swap_pair(raw_base: String, raw_quote: String) -> Option<(String, S
 /// so that routed / aggregator flows (where the PumpSwap ix is a CPI) are
 /// handled correctly.
 fn pumpswap_pool_wsol_is_base(event: &GeyserEvent, pool: &Pubkey) -> bool {
+    pumpswap_pool_mints(event, pool).is_some_and(|(base, _)| base == WSOL_MINT)
+}
+
+// Minty muszą pochodzić z instrukcji swap tego poola. Inne instrukcje
+// programu (np. create_pool lub emit_cpi) mają inne role kont.
+fn pumpswap_pool_mints(event: &GeyserEvent, pool: &Pubkey) -> Option<(String, String)> {
     let GeyserEvent::Transaction {
         ref accounts,
         ref instructions,
@@ -500,39 +506,59 @@ fn pumpswap_pool_wsol_is_base(event: &GeyserEvent, pool: &Pubkey) -> bool {
         ..
     } = event
     else {
-        return false;
+        return None;
     };
     let all_keys: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
     let pool_str = pool.to_string();
+    let is_swap = |data: &[u8]| {
+        matches!(data.get(..8), Some(d) if d == DISC_BUY || d == DISC_SELL
+            || d == DISC_SWAP_BUY_EXACT_QUOTE_IN || d == DISC_PUMP_BUY_ROUTED)
+    };
 
     // 1. Top-level instructions (RawInstruction has a direct program_id Pubkey).
     for ix in instructions {
-        if ix.program_id.to_string() != PUMP_SWAP_PROGRAM_ID {
+        if ix.program_id.to_string() != PUMP_SWAP_PROGRAM_ID || !is_swap(&ix.data) {
             continue;
         }
         let ix_accounts = resolve_accounts(&ix.account_indices, &all_keys);
         if acs(&ix_accounts, SWAP_IDX_POOL) != pool_str {
             continue;
         }
-        return acs(&ix_accounts, SWAP_IDX_BASE_MINT) == WSOL_MINT;
+        return Some((
+            acs(&ix_accounts, SWAP_IDX_BASE_MINT),
+            acs(&ix_accounts, SWAP_IDX_QUOTE_MINT),
+        ));
     }
 
     // 2. Inner instructions / CPI (InnerIx uses program_id_index into accounts).
     for group in inner_instructions {
         for ix in &group.instructions {
             let prog = key_at(&all_keys, ix.program_id_index as usize);
-            if prog != PUMP_SWAP_PROGRAM_ID {
+            if prog != PUMP_SWAP_PROGRAM_ID || !is_swap(&ix.data) {
                 continue;
             }
             let ix_accounts = resolve_accounts(&ix.accounts, &all_keys);
             if acs(&ix_accounts, SWAP_IDX_POOL) != pool_str {
                 continue;
             }
-            return acs(&ix_accounts, SWAP_IDX_BASE_MINT) == WSOL_MINT;
+            return Some((
+                acs(&ix_accounts, SWAP_IDX_BASE_MINT),
+                acs(&ix_accounts, SWAP_IDX_QUOTE_MINT),
+            ));
         }
     }
 
-    false
+    None
+}
+
+fn pumpswap_cpi_layout(event: &GeyserEvent, pool: &Pubkey) -> Result<bool, &'static str> {
+    match pumpswap_pool_mints(event, pool) {
+        Some((base, quote)) => normalize_swap_pair(base, quote)
+            .map(|(_, _, swapped)| swapped)
+            .ok_or("pool_or_mints_invalid"),
+        // Zachowaj dotychczasową obsługę zdarzenia bez instrukcji poola.
+        None => Ok(false),
+    }
 }
 
 fn sanitize_creator_pubkey(creator: Pubkey) -> Pubkey {
@@ -3086,6 +3112,9 @@ impl PumpParser {
                     } else {
                         (raw_base_amt, raw_quote_amt)
                     };
+                    // CPI nie zawiera mintu. Zapisz tożsamość z kont tej instrukcji
+                    // przed deduplikacją, zamiast zgadywać z salda całej trasy.
+                    cm_reg.insert(&pool, &base_mint);
                     ParsedEventKind::SwapTrade {
                         side: TradeSide::Buy,
                         pool,
@@ -3256,6 +3285,8 @@ impl PumpParser {
                     } else {
                         (raw_base_amt, raw_quote_amt)
                     };
+                    // Jak dla buy: mint pochodzi z instrukcji tego konkretnego poola.
+                    cm_reg.insert(&pool, &base_mint);
                     ParsedEventKind::SwapTrade {
                         side: TradeSide::Sell,
                         pool,
@@ -6274,7 +6305,17 @@ impl BinaryParser {
                     // For WSOL-base pools the on-chain "base" is WSOL and "quote" is the token,
                     // so field semantics are inverted: base_* = SOL, quote_* = token.
                     // DISC_BUY with WSOL-base = user pays quote(tokens) to get base(WSOL) = TOKEN SELL.
-                    let wsol_is_base = pumpswap_pool_wsol_is_base(event, &pool);
+                    let wsol_is_base = match pumpswap_cpi_layout(event, &pool) {
+                        Ok(swapped) => swapped,
+                        Err(reason) => {
+                            log_drop_role_mismatch(
+                                "cpi_swap_buy", PUMP_SWAP_PROGRAM_ID,
+                                slot_val.unwrap_or_default(), true,
+                                Some(&sig.to_string()), reason,
+                            );
+                            continue;
+                        }
+                    };
                     let inferred = infer_signer_swap_from_balances(event, &user);
                     let (is_buy, token_amount, sol_amount) = if wsol_is_base {
                         (false, e.quote_amount_in, e.base_amount_out)
@@ -6394,7 +6435,17 @@ impl BinaryParser {
                     let user = Pubkey::try_from(e.user.as_slice()).unwrap_or_default();
                     // For WSOL-base pools: base_* = SOL, quote_* = token (inverted layout).
                     // DISC_SELL with WSOL-base = user sells base(WSOL) to get quote(tokens) = TOKEN BUY.
-                    let wsol_is_base = pumpswap_pool_wsol_is_base(event, &pool);
+                    let wsol_is_base = match pumpswap_cpi_layout(event, &pool) {
+                        Ok(swapped) => swapped,
+                        Err(reason) => {
+                            log_drop_role_mismatch(
+                                "cpi_swap_sell", PUMP_SWAP_PROGRAM_ID,
+                                slot_val.unwrap_or_default(), true,
+                                Some(&sig.to_string()), reason,
+                            );
+                            continue;
+                        }
+                    };
                     let inferred = infer_signer_swap_from_balances(event, &user);
                     let (is_buy, token_amount, sol_amount) = if wsol_is_base {
                         (true, e.quote_amount_out, e.base_amount_in)
@@ -8865,6 +8916,8 @@ mod tests {
     ) -> GeyserEvent {
         make_decoded_tx_event_with_inner(accounts, instructions, vec![])
     }
+
+    include!("binary_parser_identity_tests.rs");
 
     fn make_decoded_tx_event_with_inner(
         accounts: Vec<Pubkey>,

@@ -2928,6 +2928,8 @@ pub async fn run(
             Some(shadow_ledger) => {
                 let guardian_config = build_shadow_guardian_config(&config);
                 let wait_for_timestop_ms = guardian_config.wait_for_timestop_ms();
+                let quote_recovery_timeout =
+                    Duration::from_millis(guardian_config.exit_policy_v1.quote_recovery_ms);
                 let exit_replay_enabled = guardian_config.exit_replay_v1.enabled;
                 let (signal_tx, signal_rx) =
                     mpsc::channel(guardian_config.signal_channel_buffer.max(1));
@@ -2948,6 +2950,15 @@ pub async fn run(
                     };
                 if let Some(account_state_core) = config.account_state_core.clone() {
                     monitoring_engine.set_account_state_core(account_state_core);
+                    if let Some(rpc_url) = config.shadow_market_refresh_rpc_url.as_ref() {
+                        monitoring_engine.set_shadow_quote_confirmation_rpc(Arc::new(
+                            new_async_rpc_client_with_timeout(
+                                rpc_url.clone(),
+                                quote_recovery_timeout,
+                            ),
+                        ));
+                        info!("PostBuyRuntime: on-demand shadow exit quote confirmation enabled");
+                    }
                 }
                 if let Some(shadow_v2_harness) = shadow_v2_harness.as_ref() {
                     monitoring_engine

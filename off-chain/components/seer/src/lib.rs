@@ -702,7 +702,33 @@ use ghost_core::shadow_ledger::{
 };
 use humantime::format_rfc3339_seconds;
 
-const LATE_DETECTION_THRESHOLD_MS: f64 = 300.0;
+/// Legacy diagnostic threshold for the age of Solana's second-resolution
+/// `block_time`. This value is not a transport or pipeline latency SLO.
+const BLOCK_TIME_AGE_DIAGNOSTIC_THRESHOLD_MS: f64 = 300.0;
+
+fn receive_to_candidate_latency_ms_at(
+    received_at_monotonic_ns: Option<u64>,
+    candidate_handoff_monotonic_ns: u64,
+) -> Option<f64> {
+    let received_at_monotonic_ns = received_at_monotonic_ns.filter(|value| *value > 0)?;
+    let elapsed_ns = candidate_handoff_monotonic_ns.checked_sub(received_at_monotonic_ns)?;
+    Some(elapsed_ns as f64 / 1_000_000.0)
+}
+
+fn receive_to_candidate_latency_ms(received_at_monotonic_ns: Option<u64>) -> Option<f64> {
+    receive_to_candidate_latency_ms_at(received_at_monotonic_ns, types::arrival_time_ns())
+}
+
+fn candidate_handoff_slo_breach_reason(
+    latency_ms: Option<f64>,
+    slo_ms: u64,
+) -> Option<&'static str> {
+    match latency_ms {
+        Some(latency_ms) if latency_ms > slo_ms as f64 => Some("over_budget"),
+        Some(_) => None,
+        None => Some("missing_receive_timestamp"),
+    }
+}
 const DEV_BUY_SOL_SANITY_LIMIT: f64 = 5_000.0;
 const COVERAGE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const PARSE_MISS_LOG_EVERY: u64 = 200;
@@ -2084,10 +2110,14 @@ pub struct Seer {
 }
 
 impl Seer {
-    fn event_worker_concurrency() -> usize {
-        std::thread::available_parallelism()
-            .map(|parallelism| parallelism.get().saturating_mul(EVENT_WORKERS_PER_CORE))
-            .unwrap_or(MIN_EVENT_WORKERS)
+    fn event_worker_concurrency(&self) -> usize {
+        self.config
+            .event_worker_concurrency
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|parallelism| parallelism.get().saturating_mul(EVENT_WORKERS_PER_CORE))
+                    .unwrap_or(MIN_EVENT_WORKERS)
+            })
             .clamp(MIN_EVENT_WORKERS, MAX_EVENT_WORKERS)
     }
 
@@ -2768,7 +2798,7 @@ impl Seer {
     pub async fn run(self: Arc<Self>) -> SeerResult<()> {
         info!("Starting Seer module");
         let effective_mode = self.config.effective_source_mode();
-        let event_worker_concurrency = Self::event_worker_concurrency();
+        let event_worker_concurrency = self.event_worker_concurrency();
         let mut funding_lane_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut primary_grpc_active = false;
         self.ensure_entry_cpi_scan_worker();
@@ -2952,7 +2982,7 @@ impl Seer {
         mode: FundingLaneMode,
         mut event_stream: EventStream,
     ) {
-        let worker_concurrency = Self::event_worker_concurrency();
+        let worker_concurrency = self.event_worker_concurrency();
         let source_label = Self::funding_lane_source_label(mode).unwrap_or("unknown");
         info!(
             "Dedicated funding lane started mode={} source_label={} worker_concurrency={}",
@@ -4500,7 +4530,11 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         );
     }
 
-    fn hydrate_trade_mapping(&self, trade: &mut types::TradeEvent) {
+    fn hydrate_trade_mapping(
+        &self,
+        trade: &mut types::TradeEvent,
+        observation: Option<&ObservedPumpMutationV1>,
+    ) {
         if trade.pool_amm_id == Pubkey::default() && trade.mint != Pubkey::default() {
             if let Some(curve_bytes) = self
                 .mint_to_curve
@@ -4518,7 +4552,12 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             }
         }
 
-        if trade.is_pumpswap && trade.mint != Pubkey::default() && trade.mint != *wsol_mint_pubkey()
+        // Surowy dowód odnosi się do źródłowego poola. Alias obserwacji innego
+        // poola tego tokena nie może zmieniać tożsamości zdarzenia z dowodem.
+        if observation.is_none()
+            && trade.is_pumpswap
+            && trade.mint != Pubkey::default()
+            && trade.mint != *wsol_mint_pubkey()
         {
             if let Some(observation_pool) = self.observation_alias_pool_for_mint(trade.mint) {
                 if observation_pool != trade.pool_amm_id {
@@ -4882,7 +4921,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             trade.slot.is_some(),
             inferred_timestamp_quality,
         );
-        self.hydrate_trade_mapping(&mut trade);
+        self.hydrate_trade_mapping(&mut trade, observation.as_ref());
         let trade_ts_ms = trade
             .compat_event_ts_ms()
             .unwrap_or_else(types::ingress_epoch_ms);
@@ -4950,7 +4989,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         // but before we decide to buffer a mint=default trade. Re-check once here
         // to avoid buffering a trade when the mapping is already known (which could
         // otherwise miss the replay window if CREATE already drained an empty buffer).
-        self.hydrate_trade_mapping(&mut trade);
+        self.hydrate_trade_mapping(&mut trade, observation.as_ref());
 
         match self.should_forward_trade_with_observation(
             &trade,
@@ -5242,6 +5281,13 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             types::GeyserEvent::Transaction { source, .. } => source.clone(),
             _ => "unknown".to_string(),
         };
+        let grpc_received_at_monotonic_ns = match event.as_ref() {
+            types::GeyserEvent::Transaction {
+                observation_provenance: Some(provenance),
+                ..
+            } if source_label.starts_with("grpc_") => Some(provenance.received_at_monotonic_ns),
+            _ => None,
+        };
 
         // SOURCE ROUTING: Check if this is a synthetic event (e.g., from PumpPortal)
         // Synthetic events are pre-parsed and should NEVER go through binary parsing
@@ -5469,7 +5515,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 candidate.semantic =
                     transaction_semantic_from_event(&event, &source_label, is_synthetic);
                 let candidate_mode = self.pool_init_candidate_mode(amm_program, &candidate);
-                let runtime_disposition =
+                let mut runtime_disposition =
                     if session_slot_suppressed || is_backfill || filtered_by_config {
                         PoolDetectionRuntimeDispositionV1::Suppressed
                     } else {
@@ -5491,9 +5537,6 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     }
                     _ => None,
                 };
-                let admit_candidate = primary_runtime_authority
-                    && runtime_disposition == PoolDetectionRuntimeDispositionV1::CandidateAdmission;
-
                 if matches!(candidate_mode, PoolInitCandidateMode::Suppressed) {
                     self.metrics
                         .pool_events_filtered
@@ -5520,6 +5563,44 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 ) {
                     return Ok(());
                 }
+
+                // Enforce the admission budget only after every local operation
+                // which precedes IPC. Keeping this check adjacent to the bounded
+                // enqueue prevents WAL work from consuming the budget after a
+                // candidate has already been declared timely.
+                let pre_handoff_latency_ms =
+                    receive_to_candidate_latency_ms(grpc_received_at_monotonic_ns);
+                if primary_runtime_authority
+                    && runtime_disposition == PoolDetectionRuntimeDispositionV1::CandidateAdmission
+                {
+                    if let Some(slo_ms) = self.config.grpc_candidate_handoff_slo_ms {
+                        let breach_reason =
+                            candidate_handoff_slo_breach_reason(pre_handoff_latency_ms, slo_ms);
+                        if let Some(reason) = breach_reason {
+                            runtime_disposition = PoolDetectionRuntimeDispositionV1::Suppressed;
+                            self.metrics
+                                .grpc_to_candidate_slo_breach_total
+                                .with_label_values(&[amm_program.name(), &source_label, reason])
+                                .inc();
+                            self.metrics
+                                .pool_events_filtered
+                                .with_label_values(&["grpc_candidate_handoff_slo_breach"])
+                                .inc();
+                            error!(
+                                pool = %candidate.pool_amm_id,
+                                mint = %candidate.base_mint,
+                                slot = ?pool_slot,
+                                source = %source_label,
+                                reason,
+                                latency_ms = ?pre_handoff_latency_ms,
+                                slo_ms,
+                                "GRPC_CANDIDATE_HANDOFF_SLO_BREACH: candidate downgraded to evidence-only"
+                            );
+                        }
+                    }
+                }
+                let admit_candidate = primary_runtime_authority
+                    && runtime_disposition == PoolDetectionRuntimeDispositionV1::CandidateAdmission;
 
                 // Send PoolDetected via IPC *before* register_curve_mapping.
                 //
@@ -5565,6 +5646,15 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                         "PR1E candidate admission requires the IPC Observation Ledger boundary; direct CandidatePool emission is disabled"
                             .to_string(),
                     ));
+                }
+
+                let grpc_to_candidate_handoff_ms =
+                    receive_to_candidate_latency_ms(grpc_received_at_monotonic_ns);
+                if let Some(latency_ms) = grpc_to_candidate_handoff_ms {
+                    self.metrics
+                        .grpc_to_candidate_latency
+                        .with_label_values(&[amm_program.name(), &source_label])
+                        .observe(latency_ms);
                 }
 
                 if primary_runtime_authority {
@@ -5679,13 +5769,13 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                                 .with_label_values(&[amm_program.name(), &source_label])
                                 .observe(delta_ms);
 
-                            if delta_ms > LATE_DETECTION_THRESHOLD_MS {
+                            if delta_ms > BLOCK_TIME_AGE_DIAGNOSTIC_THRESHOLD_MS {
                                 self.metrics
                                     .late_detection_total
                                     .with_label_values(&[amm_program.name(), &source_label])
                                     .inc();
                                 warn!(
-                                    "⚠️ Late pool detection: {:.2}ms after mint (slot={:?}, source={})",
+                                    "BLOCK_TIME_AGE_DIAGNOSTIC age_ms={:.2} slot={:?} source={} not_transport_latency=true",
                                     delta_ms,
                                     pool_slot,
                                     source_label
@@ -5699,10 +5789,11 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
 
                 if admit_candidate {
                     info!(
-                        "Detected new pool: {} on {} (latency: {:.2}ms) [enhanced: false] | detection_ts={} parser_ts={} block_time={:?} slot={:?} source={}",
+                        "Detected new pool: {} on {} (latency: {:.2}ms) [enhanced: false] | grpc_to_candidate_ms={:?} detection_ts={} parser_ts={} block_time={:?} slot={:?} source={}",
                         candidate.pool_amm_id,
                         amm_program.name(),
                         latency_ms,
+                        grpc_to_candidate_handoff_ms,
                         format_rfc3339_seconds(detection_received_at),
                         format_rfc3339_seconds(parser_finished_at),
                         pool_block_time,
@@ -6114,6 +6205,41 @@ mod tests {
     fn coverage_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn grpc_receive_to_candidate_latency_uses_the_process_monotonic_axis() {
+        assert_eq!(
+            receive_to_candidate_latency_ms_at(Some(1_000_000), 11_000_000),
+            Some(10.0)
+        );
+        assert_eq!(
+            receive_to_candidate_latency_ms_at(Some(1_000_000), 52_000_000),
+            Some(51.0)
+        );
+        assert_eq!(receive_to_candidate_latency_ms_at(None, 52_000_000), None);
+        assert_eq!(
+            receive_to_candidate_latency_ms_at(Some(0), 52_000_000),
+            None
+        );
+        assert_eq!(
+            receive_to_candidate_latency_ms_at(Some(52_000_000), 1_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn grpc_candidate_handoff_slo_is_strict_and_fail_closed_when_unmeasurable() {
+        assert_eq!(candidate_handoff_slo_breach_reason(Some(49.999), 50), None);
+        assert_eq!(candidate_handoff_slo_breach_reason(Some(50.0), 50), None);
+        assert_eq!(
+            candidate_handoff_slo_breach_reason(Some(50.001), 50),
+            Some("over_budget")
+        );
+        assert_eq!(
+            candidate_handoff_slo_breach_reason(None, 50),
+            Some("missing_receive_timestamp")
+        );
     }
 
     #[test]
@@ -7292,6 +7418,49 @@ mod tests {
         };
         assert_eq!(event.trade.pool_amm_id, observation_pool);
         assert_eq!(event.trade.mint, mint);
+    }
+
+    #[tokio::test]
+    async fn test_raw_pumpswap_trade_preserves_observation_pool_identity() {
+        let (ipc_sender, mut ipc_receiver, _metrics) =
+            create_ipc_channel(IpcChannelConfig::default());
+        let seer = Seer::new_with_ipc(SeerConfig::default(), ipc_sender);
+        let observation_pool = Pubkey::new_unique();
+        let pumpswap_pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        seer.set_curve_mapping(observation_pool, mint, "test", true);
+
+        let mut trade = test_trade(pumpswap_pool, mint);
+        trade.is_pumpswap = true;
+        trade.provider_id = Some("raw-primary".to_string());
+        trade.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
+        let mut observation = test_raw_trade_observation(trade.signature);
+        observation.claims.curve = Some(pumpswap_pool);
+        observation.claims.mint = Some(mint);
+        assert!(
+            seer.handle_trade_event_with_observation(
+                trade,
+                Some(observation.clone()),
+                "grpc_global_stream",
+                false,
+            )
+            .await
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match ipc_receiver.recv().await {
+                    Some(SeerEvent::Trade(event)) => break event,
+                    Some(_) => continue,
+                    None => panic!("Kanał IPC zamknięty przed trade"),
+                }
+            }
+        })
+        .await
+        .expect("Brak surowego trade w IPC");
+        assert_eq!(event.trade.pool_amm_id, pumpswap_pool);
+        assert_eq!(event.trade.mint, mint);
+        assert_eq!(event.observation, Some(observation));
     }
 
     #[test]

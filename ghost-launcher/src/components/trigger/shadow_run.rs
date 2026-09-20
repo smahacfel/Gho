@@ -339,7 +339,7 @@ pub struct ShadowSimulationError {
 }
 
 impl ShadowSimulationError {
-    fn new(message: impl Into<String>, retry_count: usize) -> Self {
+    pub(crate) fn new(message: impl Into<String>, retry_count: usize) -> Self {
         Self {
             message: message.into(),
             retry_count,
@@ -864,7 +864,9 @@ fn classify_shadow_error_detail(err: &str) -> Option<&'static str> {
 
 pub fn classify_shadow_error(err: &str) -> &'static str {
     let lower = err.to_lowercase();
-    if lower.contains("legacy_buy_simulation_load_not_ready")
+    if lower.contains("decision_to_buy_deadline_exceeded") {
+        "execution_deadline_exceeded"
+    } else if lower.contains("legacy_buy_simulation_load_not_ready")
         || lower.contains("simulation_load_not_ready")
     {
         "state_readiness_error"
