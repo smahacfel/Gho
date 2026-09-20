@@ -621,7 +621,7 @@ pub struct TriggerComponent {
 impl TriggerComponent {
     const MINT_FETCH_ATTEMPTS: usize = 20;
     const MINT_FETCH_RETRY_DELAY_MS: u64 = 150;
-    const MINT_NOT_FOUND_RETRY_DELAY_MS: u64 = 150;
+    const MINT_NOT_FOUND_RETRY_DELAY_MS: u64 = 10;
     const ATA_FETCH_ATTEMPTS: usize = 4;
     const ATA_FETCH_RETRY_DELAY_MS: u64 = 50;
     const RPC_FETCH_ATTEMPTS: usize = 6;
@@ -817,6 +817,8 @@ impl TriggerComponent {
         primary_rpc: &solana_client::nonblocking::rpc_client::RpcClient,
     ) -> Result<Account> {
         let secondary_rpc = self.secondary_shadow_rpc();
+        let fetch_started_at = Instant::now();
+        let mut primary_missing_count = 0usize;
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut retries_performed = 0usize;
@@ -830,9 +832,15 @@ impl TriggerComponent {
             {
                 Ok(response) => {
                     if let Some(account) = response.value {
+                        if attempt > 0 {
+                            info!(mint = %mint, retries = attempt, primary_missing_count,
+                                elapsed_ms = saturating_elapsed_ms(fetch_started_at),
+                                "Trigger: mint account fetch recovered after retry");
+                        }
                         return Ok(account);
                     }
 
+                    primary_missing_count += 1;
                     let primary_not_found = true;
                     let primary_retryable = true;
                     let mut local_retry_delay_ms = Self::account_fetch_retry_delay_ms(
@@ -849,7 +857,12 @@ impl TriggerComponent {
                         {
                             Ok(response) => {
                                 if let Some(account) = response.value {
-                                    return Ok(account);
+                                    if attempt > 0 {
+                            info!(mint = %mint, retries = attempt, primary_missing_count,
+                                elapsed_ms = saturating_elapsed_ms(fetch_started_at),
+                                "Trigger: mint account fetch recovered after retry");
+                        }
+                        return Ok(account);
                                 }
 
                                 let secondary_not_found = Some(true);
@@ -926,7 +939,12 @@ impl TriggerComponent {
                         {
                             Ok(response) => {
                                 if let Some(account) = response.value {
-                                    return Ok(account);
+                                    if attempt > 0 {
+                            info!(mint = %mint, retries = attempt, primary_missing_count,
+                                elapsed_ms = saturating_elapsed_ms(fetch_started_at),
+                                "Trigger: mint account fetch recovered after retry");
+                        }
+                        return Ok(account);
                                 }
 
                                 secondary_retryable = Some(true);
@@ -3917,6 +3935,7 @@ impl TriggerComponent {
         tip_floor_telemetry: Option<TipFloorResolutionTelemetry>,
         amount_lamports_override: Option<u64>,
     ) -> Result<PreparedBuyRequest> {
+        let decision_ts_ms = Self::now_ms();
         #[cfg(test)]
         self.prepared_request_invocations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4019,6 +4038,13 @@ impl TriggerComponent {
                 .map(|account| (account, saturating_elapsed_ms(started_at)))
                 .map_err(|e| anyhow::anyhow!("Failed to fetch mint account: {}", e))
         };
+        let blockhash_fetch = async {
+            let started_at = Instant::now();
+            let (snapshot, source) = self.resolve_live_blockhash(rpc)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to fetch recent blockhash: {}", e))?;
+            Ok::<_, anyhow::Error>((snapshot, source, saturating_elapsed_ms(started_at)))
+        };
         let (
             amount_lamports,
             effective_tip_lamports,
@@ -4026,29 +4052,38 @@ impl TriggerComponent {
             mint_account,
             mint_account_fetch_ms,
             speculative_ata_probe_result,
+            (blockhash_snapshot, blockhash_source, blockhash_fetch_latency_ms),
         ) = if requires_balance_preflight {
             let (
                 (payer_balance_lamports, payer_balance_fetch_ms),
                 (payer_account, payer_account_fetch_ms),
                 (mint_account, mint_account_fetch_ms),
                 speculative_ata_probe_result,
+                blockhash_result,
             ) = if let Some(speculative_ata_probe) = speculative_ata_probe {
-                let (payer_balance, payer_account, mint_account, speculative_probe) = tokio::try_join!(
+                let (payer_balance, payer_account, mint_account, speculative_probe, blockhash_result) = tokio::try_join!(
                     payer_balance_fetch,
                     payer_account_fetch,
                     mint_account_fetch,
                     speculative_ata_probe,
+                    blockhash_fetch,
                 )?;
                 (
                     payer_balance,
                     payer_account,
                     mint_account,
                     Some(speculative_probe),
+                    blockhash_result,
                 )
             } else {
-                let (payer_balance, payer_account, mint_account) =
-                    tokio::try_join!(payer_balance_fetch, payer_account_fetch, mint_account_fetch)?;
-                (payer_balance, payer_account, mint_account, None)
+                let (payer_balance, payer_account, mint_account, blockhash_result) =
+                    tokio::try_join!(
+                        payer_balance_fetch,
+                        payer_account_fetch,
+                        mint_account_fetch,
+                        blockhash_fetch
+                    )?;
+                (payer_balance, payer_account, mint_account, None, blockhash_result)
             };
             preparation_telemetry.payer_balance_fetch_ms = payer_balance_fetch_ms;
             preparation_telemetry.payer_account_fetch_ms = payer_account_fetch_ms;
@@ -4103,10 +4138,11 @@ impl TriggerComponent {
                 mint_account,
                 mint_account_fetch_ms,
                 speculative_ata_probe_result,
+                blockhash_result,
             )
         } else if let Some(speculative_ata_probe) = speculative_ata_probe {
-            let ((mint_account, mint_account_fetch_ms), speculative_probe) =
-                tokio::try_join!(mint_account_fetch, speculative_ata_probe)?;
+            let ((mint_account, mint_account_fetch_ms), speculative_probe, blockhash_result) =
+                tokio::try_join!(mint_account_fetch, speculative_ata_probe, blockhash_fetch)?;
             (
                 amount_lamports_override
                     .map(|amount| {
@@ -4121,9 +4157,11 @@ impl TriggerComponent {
                 mint_account,
                 mint_account_fetch_ms,
                 Some(speculative_probe),
+                blockhash_result,
             )
         } else {
-            let (mint_account, mint_account_fetch_ms) = mint_account_fetch.await?;
+            let ((mint_account, mint_account_fetch_ms), blockhash_result) =
+                tokio::try_join!(mint_account_fetch, blockhash_fetch)?;
             (
                 amount_lamports_override
                     .map(|amount| {
@@ -4138,6 +4176,7 @@ impl TriggerComponent {
                 mint_account,
                 mint_account_fetch_ms,
                 None,
+                blockhash_result,
             )
         };
         preparation_telemetry.mint_account_fetch_ms = mint_account_fetch_ms;
@@ -4296,13 +4335,19 @@ impl TriggerComponent {
             buy_variant = buy_variant.as_str(),
             "Trigger: prepared buy request accounts"
         );
-        let decision_ts_ms = Self::now_ms();
-        let blockhash_fetch_started_at = Instant::now();
-        let (blockhash_snapshot, blockhash_source) = self
-            .resolve_live_blockhash(rpc)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch recent blockhash: {}", e))?;
-        let blockhash_fetch_latency_ms = saturating_elapsed_ms(blockhash_fetch_started_at);
+        let (blockhash_snapshot, blockhash_source, blockhash_fetch_latency_ms) =
+            if blockhash_snapshot.is_fresh() {
+                (
+                    blockhash_snapshot,
+                    blockhash_source,
+                    blockhash_fetch_latency_ms,
+                )
+            } else {
+                // Równoległy odczyt nie może rozszerzyć dotychczasowego limitu świeżości.
+                let started_at = Instant::now();
+                let (snapshot, source) = self.resolve_live_blockhash(rpc).await?;
+                (snapshot, source, saturating_elapsed_ms(started_at))
+            };
         let recent_blockhash = blockhash_snapshot.blockhash;
         let tip_seed = format!("{mint}:{recent_blockhash}");
         let tip_account = self
@@ -4732,10 +4777,7 @@ impl TriggerComponent {
                 };
             }
         };
-        let report = self
-            .shadow_simulator
-            .simulate_buy(&request, &self.config.shadow_run)
-            .await;
+        let report = self.simulate_shadow_entry_with_deadline(&request).await;
         TriggerDispatchReceipt {
             primary_outcome: report.map(|report| TriggerBuyOutcome::ShadowSimulated { report }),
             shadow_task: None,
@@ -4753,6 +4795,40 @@ impl TriggerComponent {
         self.shadow_simulator
             .simulate_buy(request, &self.config.shadow_run)
             .await
+    }
+
+    async fn simulate_shadow_entry_with_deadline(
+        &self,
+        request: &PreparedBuyRequest,
+    ) -> Result<super::shadow_run::ShadowBuySimulationReport> {
+        let Some(budget_ms) = self.config.shadow_run.decision_to_buy_deadline_ms else {
+            return self.shadow_simulator
+                .simulate_buy(request, &self.config.shadow_run)
+                .await;
+        };
+        let deadline_ms = request.decision_ts_ms.saturating_add(budget_ms);
+        let deadline_error = || {
+            super::shadow_run::ShadowSimulationError::new(
+                format!("decision_to_buy_deadline_exceeded: budget_ms={budget_ms}"),
+                0,
+            )
+        };
+        let remaining_ms = deadline_ms.saturating_sub(Self::now_ms());
+        if remaining_ms == 0 {
+            return Err(deadline_error().into());
+        }
+        // Jeden budżet obejmuje również wszystkie ponowienia RPC; wynik po terminie
+        // nie może otworzyć pozycji. Anulowanie dotyczy wyłącznie symulacji shadow.
+        let report = tokio::time::timeout(
+            Duration::from_millis(remaining_ms),
+            self.shadow_simulator.simulate_buy(request, &self.config.shadow_run),
+        )
+        .await
+        .map_err(|_| deadline_error())??;
+        if Self::now_ms() > deadline_ms || report.simulation_finished_ts_ms > deadline_ms {
+            return Err(deadline_error().into());
+        }
+        Ok(report)
     }
 
     fn counterfactual_probe_can_create_missing_user_ata(
@@ -5077,30 +5153,16 @@ impl TriggerComponent {
         &self,
         request: &PreparedBuyRequest,
     ) -> Result<Option<CounterfactualProbeMissingAccount>> {
-        let rpc = self.preparation_rpc();
-        for (pubkey, role) in Self::counterfactual_probe_required_account_roles(request) {
-            match rpc
-                .get_account_with_commitment(&pubkey, CommitmentConfig::processed())
-                .await
-            {
-                Ok(response) if response.value.is_some() => {}
-                Ok(_) => {
-                    return Ok(Some(CounterfactualProbeMissingAccount { pubkey, role }));
-                }
-                Err(err) if Self::is_account_not_found_error(&err) => {
-                    return Ok(Some(CounterfactualProbeMissingAccount { pubkey, role }));
-                }
-                Err(err) => {
-                    return Err(anyhow::anyhow!(
-                        "counterfactual probe account precheck failed: role={} pubkey={} error={}",
-                        role,
-                        pubkey,
-                        err
-                    ));
-                }
-            }
-        }
-        Ok(None)
+        let accounts = Self::counterfactual_probe_required_account_roles(request);
+        Ok(self
+            .counterfactual_probe_manifest_account_checks(&accounts)
+            .await?
+            .into_iter()
+            .find(|check| !check.rpc_load_ready)
+            .map(|check| CounterfactualProbeMissingAccount {
+                pubkey: check.pubkey,
+                role: check.role,
+            }))
     }
 
     pub(crate) async fn counterfactual_probe_missing_manifest_accounts(
@@ -5124,70 +5186,52 @@ impl TriggerComponent {
         accounts: &[(Pubkey, String)],
     ) -> Result<Vec<CounterfactualProbeManifestAccountCheck>> {
         let rpc = self.preparation_rpc();
-        let commitment = CommitmentConfig::processed();
-        let commitment_label = "processed".to_string();
-        let mut checks = Vec::new();
         let mut seen = HashSet::new();
-        for (pubkey, role) in accounts {
-            if !seen.insert(*pubkey) {
-                continue;
-            }
+        let unique_accounts: Vec<_> = accounts
+            .iter()
+            .filter(|(pubkey, _)| seen.insert(*pubkey))
+            .collect();
+        let mut checks = Vec::with_capacity(unique_accounts.len());
+        // Limit protokołu RPC; kolejność i pierwsza rola każdego konta pozostają stabilne.
+        for chunk in unique_accounts.chunks(100) {
+            let pubkeys: Vec<_> = chunk.iter().map(|(pubkey, _)| *pubkey).collect();
             let started = Instant::now();
-            match rpc.get_account_with_commitment(pubkey, commitment).await {
-                Ok(response) if response.value.is_some() => {
-                    let Some(account) = response.value.as_ref() else {
-                        continue;
-                    };
-                    checks.push(CounterfactualProbeManifestAccountCheck {
-                        pubkey: *pubkey,
-                        role: role.clone(),
-                        rpc_load_status: "rpc_load_ready".to_string(),
-                        rpc_load_ready: true,
-                        commitment: commitment_label.clone(),
-                        context_slot: Some(response.context.slot),
-                        attempt_count: 1,
-                        latency_ms: started.elapsed().as_millis() as u64,
-                        rpc_error_class: None,
-                        account_owner: Some(account.owner.to_string()),
-                        account_data_len: Some(account.data.len() as u64),
-                    });
-                }
-                Ok(response) => checks.push(CounterfactualProbeManifestAccountCheck {
+            let response = rpc
+                .get_multiple_accounts_with_commitment(&pubkeys, CommitmentConfig::processed())
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "counterfactual probe manifest account batch check failed: accounts={} error={}",
+                        pubkeys.len(), err
+                    )
+                })?;
+            if response.value.len() != chunk.len() {
+                anyhow::bail!(
+                    "counterfactual probe manifest account batch length mismatch: expected={} actual={}",
+                    chunk.len(), response.value.len()
+                );
+            }
+            let latency_ms = started.elapsed().as_millis() as u64;
+            for ((pubkey, role), account) in chunk.iter().zip(response.value.iter()) {
+                let ready = account.is_some();
+                checks.push(CounterfactualProbeManifestAccountCheck {
                     pubkey: *pubkey,
                     role: role.clone(),
-                    rpc_load_status: "missing_on_rpc_precheck".to_string(),
-                    rpc_load_ready: false,
-                    commitment: commitment_label.clone(),
+                    rpc_load_status: if ready {
+                        "rpc_load_ready"
+                    } else {
+                        "missing_on_rpc_precheck"
+                    }
+                    .to_string(),
+                    rpc_load_ready: ready,
+                    commitment: "processed".to_string(),
                     context_slot: Some(response.context.slot),
                     attempt_count: 1,
-                    latency_ms: started.elapsed().as_millis() as u64,
-                    rpc_error_class: Some("account_missing".to_string()),
-                    account_owner: None,
-                    account_data_len: None,
-                }),
-                Err(err) if Self::is_account_not_found_error(&err) => {
-                    checks.push(CounterfactualProbeManifestAccountCheck {
-                        pubkey: *pubkey,
-                        role: role.clone(),
-                        rpc_load_status: "missing_on_rpc_precheck".to_string(),
-                        rpc_load_ready: false,
-                        commitment: commitment_label.clone(),
-                        context_slot: None,
-                        attempt_count: 1,
-                        latency_ms: started.elapsed().as_millis() as u64,
-                        rpc_error_class: Some("account_not_found_error".to_string()),
-                        account_owner: None,
-                        account_data_len: None,
-                    });
-                }
-                Err(err) => {
-                    return Err(anyhow::anyhow!(
-                        "counterfactual probe manifest account check failed: role={} pubkey={} error={}",
-                        role,
-                        pubkey,
-                        err
-                    ));
-                }
+                    latency_ms,
+                    rpc_error_class: (!ready).then(|| "account_missing".to_string()),
+                    account_owner: account.as_ref().map(|value| value.owner.to_string()),
+                    account_data_len: account.as_ref().map(|value| value.data.len() as u64),
+                });
             }
         }
         Ok(checks)
@@ -5273,10 +5317,7 @@ impl TriggerComponent {
                             };
                         }
                     };
-                let report = self
-                    .shadow_simulator
-                    .simulate_buy(&request, &self.config.shadow_run)
-                    .await;
+                let report = self.simulate_shadow_entry_with_deadline(&request).await;
                 return TriggerDispatchReceipt {
                     primary_outcome: report
                         .map(|report| TriggerBuyOutcome::ShadowSimulated { report }),
@@ -5865,6 +5906,7 @@ pub async fn run_with_oracle(
 
 #[cfg(test)]
 mod tests {
+    include!("buy_precheck_tests.rs");
     use super::*;
     use crate::events::{create_event_bus, DetectedPool};
     use async_trait::async_trait;

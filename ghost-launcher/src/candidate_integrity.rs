@@ -173,7 +173,6 @@ pub(crate) struct CandidateIntegrityTerminalRetirementV1 {
 struct TerminalCandidateTombstonesV1 {
     by_candidate: HashMap<PumpCandidateIdentityV1, CandidateIntegrityRecordV1>,
     by_pool: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
-    by_mint: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
     fifo: VecDeque<PumpCandidateIdentityV1>,
     cap: usize,
     eviction_count: u64,
@@ -185,7 +184,6 @@ impl TerminalCandidateTombstonesV1 {
         Self {
             by_candidate: HashMap::with_capacity(cap.min(4096)),
             by_pool: HashMap::with_capacity(cap.min(4096)),
-            by_mint: HashMap::with_capacity(cap.min(4096)),
             fifo: VecDeque::with_capacity(cap.min(4096)),
             cap: cap.max(1),
             eviction_count: 0,
@@ -209,9 +207,6 @@ impl TerminalCandidateTombstonesV1 {
                 if self.by_pool.get(&old_record.candidate.pool_amm_id) == Some(&oldest) {
                     self.by_pool.remove(&old_record.candidate.pool_amm_id);
                 }
-                if self.by_mint.get(&old_record.candidate.mint) == Some(&oldest) {
-                    self.by_mint.remove(&old_record.candidate.mint);
-                }
                 self.eviction_count = self.eviction_count.saturating_add(1);
                 if self.first_evicted.is_none() {
                     self.first_evicted = Some(old_record.clone());
@@ -222,7 +217,6 @@ impl TerminalCandidateTombstonesV1 {
         }
 
         self.by_pool.insert(candidate.pool_amm_id, candidate);
-        self.by_mint.insert(candidate.mint, candidate);
         self.by_candidate.insert(candidate, record);
         self.fifo.push_back(candidate);
         evicted
@@ -246,11 +240,6 @@ impl TerminalCandidateTombstonesV1 {
                 conflicts.insert(*existing);
             }
         }
-        if let Some(existing) = self.by_mint.get(&candidate.mint) {
-            if *existing != candidate {
-                conflicts.insert(*existing);
-            }
-        }
         conflicts.into_iter().collect()
     }
 
@@ -264,7 +253,6 @@ impl TerminalCandidateTombstonesV1 {
 struct CandidateIntegrityRegistryStateV1 {
     records: HashMap<PumpCandidateIdentityV1, CandidateIntegrityRecordV1>,
     by_pool: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
-    by_mint: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
     canonical_apply_fence: CanonicalApplyFenceV1,
     /// Per-candidate linearization fence for terminal Oracle cleanup.
     ///
@@ -294,7 +282,6 @@ impl CandidateIntegrityRegistryStateV1 {
         Self {
             records: HashMap::new(),
             by_pool: HashMap::new(),
-            by_mint: HashMap::new(),
             canonical_apply_fence: CanonicalApplyFenceV1::default(),
             terminal_cleanup_barriers: HashSet::new(),
             canonical_observation_leases: HashMap::new(),
@@ -687,9 +674,6 @@ impl CandidateIntegrityRegistry {
         };
         if state.by_pool.get(&candidate.pool_amm_id) == Some(&candidate) {
             state.by_pool.remove(&candidate.pool_amm_id);
-        }
-        if state.by_mint.get(&candidate.mint) == Some(&candidate) {
-            state.by_mint.remove(&candidate.mint);
         }
         Self::cleanup_canonical_apply_fence_for_candidate(state, candidate);
         let evicted = state.terminal_tombstones.insert(removed.clone());
@@ -1555,9 +1539,6 @@ impl CandidateIntegrityRegistry {
             state
                 .by_pool
                 .insert(signal.candidate.pool_amm_id, signal.candidate);
-            state
-                .by_mint
-                .insert(signal.candidate.mint, signal.candidate);
             state.records.insert(
                 signal.candidate,
                 CandidateIntegrityRecordV1 {
@@ -2417,9 +2398,6 @@ fn publish_ready_with_cas(
             state
                 .by_pool
                 .insert(signal.candidate.pool_amm_id, signal.candidate);
-            state
-                .by_mint
-                .insert(signal.candidate.mint, signal.candidate);
             state.records.insert(
                 signal.candidate,
                 CandidateIntegrityRecordV1 {
@@ -2463,23 +2441,16 @@ fn validate_aliases(
     state: &CandidateIntegrityRegistryStateV1,
     candidate: PumpCandidateIdentityV1,
 ) -> Result<(), CandidateIntegrityErrorV1> {
+    // Mint może mieć krzywą Pump i wiele pooli PumpSwap. Sprzecznością
+    // tożsamości jest inny mint tego samego poola, a nie inny pool tokena.
     if state
         .by_pool
         .get(&candidate.pool_amm_id)
         .is_some_and(|existing| *existing != candidate)
         || state
-            .by_mint
-            .get(&candidate.mint)
-            .is_some_and(|existing| *existing != candidate)
-        || state
             .terminal_tombstones
             .by_pool
             .get(&candidate.pool_amm_id)
-            .is_some_and(|existing| *existing != candidate)
-        || state
-            .terminal_tombstones
-            .by_mint
-            .get(&candidate.mint)
             .is_some_and(|existing| *existing != candidate)
     {
         return Err(CandidateIntegrityErrorV1::CandidateAliasConflict);
@@ -2493,11 +2464,6 @@ fn conflicting_alias_candidates(
 ) -> Vec<PumpCandidateIdentityV1> {
     let mut conflicts = HashSet::new();
     if let Some(existing) = state.by_pool.get(&candidate.pool_amm_id) {
-        if *existing != candidate {
-            conflicts.insert(*existing);
-        }
-    }
-    if let Some(existing) = state.by_mint.get(&candidate.mint) {
         if *existing != candidate {
             conflicts.insert(*existing);
         }
@@ -3030,6 +2996,112 @@ mod tests {
             CaptureFailureClassV1::CandidateLocal
         );
         assert!(registry.candidate_admission_open());
+    }
+
+    #[test]
+    fn same_mint_other_pool_failure_preserves_buy_guard_and_receipts() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let first = candidate();
+        registry
+            .record_signal(signal(first, CandidateIntegrityOutcomeV1::Ready, 1))
+            .unwrap();
+        let evaluation = registry.evaluation_guard(first).unwrap();
+        evaluation.mark_mfs_materialized().unwrap();
+        evaluation.mark_evaluation_running().unwrap();
+        let submit = evaluation
+            .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
+            .unwrap()
+            .unwrap();
+        let before = registry.snapshot(first).unwrap();
+        let mutation = canonical(Signature::new_unique(), 0, first);
+        let _receipt = registry.stage_canonical_mutation(&mutation).unwrap();
+        let counts = registry.canonical_apply_fence_counts().unwrap();
+        let other = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: first.mint,
+        };
+        registry
+            .record_signal(signal(
+                other,
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                2,
+            ))
+            .expect("Awaria drugiego poola nie jest konfliktem tożsamości pierwszego");
+        assert_eq!(registry.snapshot(first).unwrap(), before);
+        assert_eq!(registry.canonical_apply_fence_counts().unwrap(), counts);
+        assert_eq!(
+            submit.try_begin_submit().unwrap(),
+            CandidateSubmitTransitionV1::StartedNow
+        );
+        assert!(registry.evaluation_guard(other).is_err());
+    }
+
+    #[test]
+    fn same_mint_pools_keep_independent_ready_proofs_and_terminal_history() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let first = candidate();
+        registry
+            .record_signal(signal(first, CandidateIntegrityOutcomeV1::Ready, 1))
+            .unwrap();
+        let other = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: first.mint,
+        };
+        let mutation = canonical(Signature::new_unique(), 0, other);
+        let receipt = registry.stage_canonical_mutation(&mutation).unwrap();
+        registry
+            .seal_complete_transaction_inventory(
+                mutation.locator.signature,
+                &[ready_signal(&mutation, other)],
+            )
+            .expect("Mint współdzielony przez poole nie blokuje odrębnego dowodu");
+        assert!(matches!(
+            registry.snapshot(other),
+            Err(CandidateIntegrityErrorV1::CandidateMissing)
+        ));
+        registry.mark_canonical_apply_succeeded(&receipt).unwrap();
+        assert!(registry.evaluation_guard(other).is_ok());
+        registry.retire_terminal_candidate(first).unwrap();
+        assert!(registry.evaluation_guard(other).is_ok());
+        assert_eq!(
+            registry.account_state_apply_allowed(other).unwrap(),
+            Some(true)
+        );
+        assert!(registry.evaluation_guard(first).is_err());
+        let third = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: first.mint,
+        };
+        registry
+            .record_signal(signal(third, CandidateIntegrityOutcomeV1::Ready, 3))
+            .unwrap();
+        assert!(registry.evaluation_guard(third).is_ok());
+        assert!(registry.candidate_admission_open());
+    }
+
+    #[test]
+    fn same_pool_changed_mint_still_fails_closed_active_and_retired() {
+        for retired in [false, true] {
+            let registry = Arc::new(CandidateIntegrityRegistry::default());
+            let first = candidate();
+            registry
+                .record_signal(signal(first, CandidateIntegrityOutcomeV1::Ready, 1))
+                .unwrap();
+            if retired {
+                registry.retire_terminal_candidate(first).unwrap();
+            }
+            let forged = PumpCandidateIdentityV1 {
+                pool_amm_id: first.pool_amm_id,
+                mint: Pubkey::new_unique(),
+            };
+            assert_eq!(
+                registry.record_signal(signal(forged, CandidateIntegrityOutcomeV1::Ready, 2)),
+                Err(CandidateIntegrityErrorV1::CandidateAliasConflict)
+            );
+            assert!(registry.evaluation_guard(forged).is_err());
+            assert!(registry.evaluation_guard(first).is_err());
+            assert!(registry.candidate_admission_open());
+        }
     }
 
     #[test]

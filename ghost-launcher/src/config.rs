@@ -1684,6 +1684,15 @@ pub struct SeerComponentConfig {
     #[serde(default = "default_seer_grpc_stall_timeout_secs")]
     pub grpc_stall_timeout_secs: u64,
 
+    /// Optional hard budget from Yellowstone receive to CandidatePool IPC
+    /// admission. A breached or unmeasurable candidate remains evidence-only.
+    #[serde(default)]
+    pub grpc_candidate_handoff_slo_ms: Option<u64>,
+
+    /// Optional bounded concurrency for Seer's shared event workers.
+    #[serde(default)]
+    pub event_worker_concurrency: Option<usize>,
+
     /// Cooldown before an open provider circuit performs a half-open probe.
     #[serde(default = "default_seer_grpc_circuit_breaker_cooldown_ms")]
     pub grpc_circuit_breaker_cooldown_ms: u64,
@@ -2141,6 +2150,10 @@ pub struct TriggerShadowRunConfig {
     #[serde(default = "default_shadow_run_max_retries")]
     pub max_retries: usize,
 
+    /// Maksymalny czas od werdyktu do wyniku BUY shadow; brak zachowuje dawny tryb.
+    #[serde(default)]
+    pub decision_to_buy_deadline_ms: Option<u64>,
+
     /// Maximum concurrent shadow simulation tasks.
     #[serde(default = "default_shadow_run_max_concurrent")]
     pub max_concurrent: usize,
@@ -2165,6 +2178,7 @@ impl Default for TriggerShadowRunConfig {
             replace_recent_blockhash: true,
             timeout_ms: default_shadow_run_timeout_ms(),
             max_retries: default_shadow_run_max_retries(),
+            decision_to_buy_deadline_ms: None,
             max_concurrent: default_shadow_run_max_concurrent(),
             output_path: default_shadow_run_output_path(),
             emit_event_bus: true,
@@ -3875,6 +3889,8 @@ impl LauncherConfig {
                 grpc_commitment_fallback_to_websocket: false,
                 grpc_max_stalls_before_open: default_seer_grpc_max_stalls_before_open(),
                 grpc_stall_timeout_secs: default_seer_grpc_stall_timeout_secs(),
+                grpc_candidate_handoff_slo_ms: None,
+                event_worker_concurrency: None,
                 grpc_circuit_breaker_cooldown_ms: default_seer_grpc_circuit_breaker_cooldown_ms(),
                 grpc_client_id: None,
                 grpc_auth_token: None,

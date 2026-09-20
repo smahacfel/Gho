@@ -77,6 +77,18 @@ pub struct SeerConfig {
     #[serde(default = "SeerConfig::default_grpc_stall_timeout_secs")]
     pub grpc_stall_timeout_secs: u64,
 
+    /// Optional hard budget from the Yellowstone adapter receive boundary to
+    /// CandidatePool IPC admission. When set, a candidate that cannot prove
+    /// this budget is downgraded to evidence-only instead of opening a late
+    /// observation session.
+    #[serde(default)]
+    pub grpc_candidate_handoff_slo_ms: Option<u64>,
+
+    /// Optional bounded concurrency for the shared Seer event workers. This
+    /// can be raised for high-burst feeds without changing global defaults.
+    #[serde(default)]
+    pub event_worker_concurrency: Option<usize>,
+
     /// Cooldown before an open provider circuit performs a half-open probe.
     #[serde(default = "SeerConfig::default_grpc_circuit_breaker_cooldown_ms")]
     pub grpc_circuit_breaker_cooldown_ms: u64,
@@ -605,6 +617,8 @@ impl Default for SeerConfig {
             max_reconnect_delay_secs: 300, // 5 minutes max backoff
             grpc_max_stalls_before_open: Self::default_grpc_max_stalls_before_open(),
             grpc_stall_timeout_secs: Self::default_grpc_stall_timeout_secs(),
+            grpc_candidate_handoff_slo_ms: None,
+            event_worker_concurrency: None,
             grpc_circuit_breaker_cooldown_ms: Self::default_grpc_circuit_breaker_cooldown_ms(),
             verbose: false,
             filter: FilterConfig::default(),
