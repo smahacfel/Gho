@@ -5629,11 +5629,12 @@ impl OracleRuntime {
 
 fn format_gatekeeper_v2_config(config: &GatekeeperV2Config) -> String {
     format!(
-        "cfg[min_sol={:.4} min_tx={} min_signers={} min_buy={} max_wait_ms={} int_cv=[{:.3},{:.3}] max_burst={:.2} avg_ms=[{:.0},{:.0}] entropy=[{:.2},{:.2}] min_unique_ratio={:.2} max_hhi={:.3} max_tx_signer={} max_gini={:.2} max_top3={:.2} min_buy_ratio={:.2} avg_tx_sol=[{:.3},{:.3}] vol_cv=[{:.2},{:.2}] total_sol=[{:.3},{:.3}] max_dev_buy={:.2} dev_tx_ratio=[{:.2},{:.2}] dev_vol_ratio=[{:.2},{:.2}] reject_on_dev_sell={} max_price_change={:.2} max_tx_impact={:.2}% bonding=[{:.2}%,{:.2}%] min_mcap={:.2} min_phases={} reeval_every_tx={} failed_tx_ratio={:?} use_slot_ordering={} hybrid[sell_buy=[{:.3},{:.3}] cu_cluster=[{:.3},{:.3}] static_fee=[{:.3},{:.3}] inner_ix=[{:.3},{:.3}] max_fixed_buy={:.3} max_fixed_buy_1e4={:.3} max_flipper={:.3} jito_tip=[{:.3},{:.3}] max_early_slot_dom={:.3} max_early_top3_3s={:.3} max_whale_top3={:.3} max_whale_top1={:.3} min_dev_latency_ms={}]]",
+        "cfg[min_sol={:.4} min_tx={} min_signers={} min_buy={} min_sell={} max_wait_ms={} int_cv=[{:.3},{:.3}] max_burst={:.2} avg_ms=[{:.0},{:.0}] entropy=[{:.2},{:.2}] min_unique_ratio={:.2} max_hhi={:.3} max_tx_signer={} max_gini={:.2} max_top3={:.2} min_buy_ratio={:.2} avg_tx_sol=[{:.3},{:.3}] vol_cv=[{:.2},{:.2}] total_sol=[{:.3},{:.3}] max_dev_buy={:.2} dev_tx_ratio=[{:.2},{:.2}] dev_vol_ratio=[{:.2},{:.2}] reject_on_dev_sell={} max_price_change={:.2} max_tx_impact={:.2}% bonding=[{:.2}%,{:.2}%] min_mcap={:.2} min_phases={} reeval_every_tx={} failed_tx_ratio={:?} use_slot_ordering={} hybrid[sell_buy=[{:.3},{:.3}] cu_cluster=[{:.3},{:.3}] static_fee=[{:.3},{:.3}] inner_ix=[{:.3},{:.3}] max_fixed_buy={:.3} max_fixed_buy_1e4={:.3} max_flipper={:.3} jito_tip=[{:.3},{:.3}] max_early_slot_dom={:.3} max_early_top3_3s={:.3} max_whale_top3={:.3} max_whale_top1={:.3} min_dev_latency_ms={}]]",
         config.min_sol_threshold,
         config.min_tx_count,
         config.min_unique_signers,
         config.min_buy_count,
+        config.min_sell_count,
         config.max_wait_time_ms,
         config.min_interval_cv,
         config.max_interval_cv,
@@ -18503,7 +18504,8 @@ fn try_evaluate_feature_driven_terminal_verdict(
             >= gatekeeper_config.min_tx_count as u64
             && features.tx_intel_features.unique_signers
                 >= gatekeeper_config.min_unique_signers as u64
-            && features.tx_intel_features.buy_count >= gatekeeper_config.min_buy_count as u64;
+            && features.tx_intel_features.buy_count >= gatekeeper_config.min_buy_count as u64
+            && features.tx_intel_features.sell_count >= gatekeeper_config.min_sell_count as u64;
         if !phase1_passed {
             if session.canonical_update_count() == 0 {
                 ::metrics::counter!("timeout_without_canonical_updates_total", 1u64);
@@ -28902,6 +28904,7 @@ mod tests {
                 Some(Pubkey::new_from_array(
                     *blake3::hash(b"test-account-owner-v1").as_bytes(),
                 )),
+                None,
                 curve_finality,
                 UpdateSource::GeyserAccountUpdate,
                 Some(&bonding_curve),
@@ -46234,6 +46237,7 @@ mod tests {
                 Some(56),
                 Some(source_account_pubkey),
                 Some(source_owner),
+                None,
                 CurveFinality::Speculative,
                 UpdateSource::GeyserAccountUpdate,
                 Some(&bonding_curve),
@@ -46265,6 +46269,7 @@ mod tests {
                 0,
                 3,
                 Some(18),
+                None,
                 None,
                 None,
                 None,

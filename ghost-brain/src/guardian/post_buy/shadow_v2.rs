@@ -6285,6 +6285,7 @@ mod tests {
             market_cap_sol: 30.0,
             token_total_supply: 1_000_000_000_000,
             is_complete: false,
+            canonical_creator: None,
             last_update_slot: 41,
             last_update_ts_ms: 1_785_000_000_000,
             last_observed_slot: 41,
