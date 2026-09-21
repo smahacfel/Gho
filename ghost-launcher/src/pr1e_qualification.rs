@@ -610,6 +610,7 @@ fn primary_account_update(
         sol_reserves: 30_000_000_000 + slot,
         token_reserves: 900_000_000_000_000 - slot,
         is_complete: 0,
+        canonical_creator: None,
         slot,
         write_version: Some(write_version),
         source_account_pubkey: Some(curve),

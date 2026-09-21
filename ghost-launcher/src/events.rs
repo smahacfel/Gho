@@ -633,6 +633,12 @@ pub struct ShadowV2EntryBoundaryPayload {
     pub amount_lamports: u64,
     pub min_tokens_out: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_tokens_out: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_state_age_slots: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_refresh_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_bps: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slippage_tolerance_bps: Option<u16>,
@@ -1159,6 +1165,9 @@ pub struct AccountUpdateEvent {
     /// Raw real token reserves from the same canonical bonding-curve account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub real_token_reserves: Option<u64>,
+    /// Creator decoded from the canonical Pump bonding-curve account bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_creator: Option<solana_sdk::pubkey::Pubkey>,
     /// Curve completion flag (1 = graduated, 0 = active).
     pub complete: u8,
     /// Slot at which this AccountUpdate was observed.
@@ -2205,6 +2214,7 @@ mod tests {
             token_reserves: 20,
             real_sol_reserves: None,
             real_token_reserves: None,
+            canonical_creator: None,
             complete: 0,
             slot: 42,
             write_version: Some(7),

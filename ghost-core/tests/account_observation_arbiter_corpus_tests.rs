@@ -160,6 +160,7 @@ fn account_observation_differential_corpus_v2_is_frozen_and_replays_through_cano
                 sol_reserves: 1_000_000_000_u64.saturating_add(index as u64),
                 token_reserves: 500_000_000_000_u64.saturating_add(index as u64),
                 is_complete: 0,
+                canonical_creator: None,
                 slot: observation.slot,
                 write_version: observation.write_version,
                 source_account_pubkey: Some(account),

@@ -1509,6 +1509,9 @@ pub struct BondingCurveState {
     pub real_sol_reserves: u64,
     pub token_total_supply: u64,
     pub complete: bool,
+    /// Canonical Pump creator stored directly in the bonding-curve account.
+    /// This field follows `complete` in the current Anchor account layout.
+    pub creator: [u8; 32],
 }
 
 impl BondingCurveState {
@@ -9909,6 +9912,7 @@ mod tests {
             real_sol_reserves: 10_000_000_000,
             token_total_supply: 1_000_000_000_000,
             complete: false,
+            creator: [0; 32],
         };
         assert!((s.price_sol_per_token() - 3e-5).abs() < 1e-11);
         assert!((s.progress() - 0.2).abs() < 1e-9);
@@ -9923,6 +9927,7 @@ mod tests {
             real_sol_reserves: 0,
             token_total_supply: 0,
             complete: false,
+            creator: [0; 32],
         };
         assert_eq!(s.price_sol_per_token(), 0.0);
         assert_eq!(s.market_cap_sol(), 0.0);
@@ -9938,6 +9943,7 @@ mod tests {
             real_sol_reserves: 85_000_000_000,
             token_total_supply: 1_000_000_000_000,
             complete: true,
+            creator: [0; 32],
         };
         assert!((s.progress() - 1.0).abs() < 1e-9);
     }
