@@ -51,7 +51,7 @@ Nie zastąpiono twardego modelu 100 bps inną zgadywaną stałą. Repozytorium n
 - Brak promocji `DetectedPool.creator` dla legacy BUY.
 - Synchronizacja P37 authority po canonical materialization.
 - Odrzucenie mismatchu przed zbudowaniem transakcji.
-- Ponowne przeliczenie quote na nowszym canonical state oraz fail closed po przekroczeniu polityki wieku.
+- Ponowne przeliczenie quote na nowszym canonical state, dowód użycia odświeżonego boundary przez rzeczywisty shadow dispatch oraz fail closed po przekroczeniu polityki wieku.
 - Latch: świeży odczyt, timeout oraz niepełna identity; wszystkie jako pre-dispatch bez fałszywej flagi symulacji.
 - Parsery `ConstraintSeeds` z kontem/Left/Right oraz `TooMuchSolRequired` z wyliczeniem shortfall.
 
@@ -79,7 +79,8 @@ Preflight pełnego profilu poprawnie załadował TOML, Ghost Brain 1000/7/5/4, s
 Niezależny przegląd finalnej zmiany wykrył i poprawił dwa problemy przed zakończeniem:
 
 1. nowe pola creator były początkowo wstawione w środku struktur serializowanych; przeniesiono je na koniec;
-2. kontekst P37 zachowywał stare źródło authority po poprawnej canonical materialization; teraz odczytuje finalne overrides.
+2. kontekst P37 zachowywał stare źródło authority po poprawnej canonical materialization; teraz odczytuje finalne overrides;
+3. helper finalnego re-quote miał początkowo test bez wywołania w aktywnej ścieżce; podłączono go przed rezerwacją pozycji i przed shadow/live dispatch, a test sprawdza boundary faktycznie przekazane symulatorowi.
 
 Nie dodano RPC do authority quote, nie zmieniono progów Gatekeepera, nie zmieniono PnL ani zasad wyjścia, nie włączono live execution. Dirty checkout zawiera wiele wcześniejszych zmian; ten ADR nie przypisuje ich do niniejszej poprawki.
 

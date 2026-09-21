@@ -4911,6 +4911,20 @@ impl TriggerComponent {
         &self,
         request: PreparedBuyRequest,
     ) -> TriggerDispatchReceipt {
+        let request_before_refresh = request.clone();
+        let request = match self.refresh_prepared_buy_quote_from_canonical(&request) {
+            Ok(request) => request,
+            Err(err) => {
+                return TriggerDispatchReceipt {
+                    primary_outcome: Err(err),
+                    shadow_task: None,
+                    active_position_lease: None,
+                    retain_position_slot_on_error: false,
+                    failed_request: Some(request_before_refresh),
+                    failed_context: None,
+                };
+            }
+        };
         let request_for_error = request.clone();
         let active_position_lease = match self.try_reserve_position_slot(&request.mint, &request) {
             Ok(lease) => Some(lease),
@@ -5417,6 +5431,22 @@ impl TriggerComponent {
         &self,
         mut request: PreparedBuyRequest,
     ) -> TriggerDispatchReceipt {
+        if !matches!(self.config.entry_mode, TriggerEntryMode::DryRunMock) {
+            let request_before_refresh = request.clone();
+            request = match self.refresh_prepared_buy_quote_from_canonical(&request) {
+                Ok(request) => request,
+                Err(err) => {
+                    return TriggerDispatchReceipt {
+                        primary_outcome: Err(err),
+                        shadow_task: None,
+                        active_position_lease: None,
+                        retain_position_slot_on_error: false,
+                        failed_request: Some(request_before_refresh),
+                        failed_context: None,
+                    };
+                }
+            };
+        }
         match self.config.entry_mode {
             TriggerEntryMode::DryRunMock => {
                 let active_position_lease =
@@ -7949,8 +7979,8 @@ mod tests {
             .any(|value| value == "ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME"));
     }
 
-    #[test]
-    fn legacy_buy_quote_is_rebuilt_from_latest_canonical_state_before_dispatch() {
+    #[tokio::test]
+    async fn legacy_buy_quote_is_rebuilt_from_latest_canonical_state_before_dispatch() {
         let mint = Pubkey::new_unique();
         let bonding_curve = DirectBuyBuilder::derive_bonding_curve(&mint).0;
         let canonical_creator = Pubkey::new_unique();
@@ -7990,8 +8020,9 @@ mod tests {
         config.entry_mode = TriggerEntryMode::ShadowOnly;
         config.shadow_run.enabled = true;
         config.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
-        let trigger = TriggerComponent::new_with_position_limit_tracker_and_runtime_state(
+        let trigger = TriggerComponent::new_with_runtime_guards_and_runtime_state(
             config,
+            Arc::new(MockShadowSimulator),
             PositionLimitTracker::new(1),
             Arc::new(ShadowLedger::new()),
             Arc::clone(&account_state_core),
@@ -8094,6 +8125,28 @@ mod tests {
             boundary.quote_refresh_status.as_deref(),
             Some("canonical_state_requoted_before_dispatch")
         );
+
+        let dispatch_receipt = trigger
+            .dispatch_prepared_buy_shadow_only(request.clone())
+            .await;
+        let report = match dispatch_receipt
+            .primary_outcome
+            .as_ref()
+            .expect("dispatch must accept the refreshed canonical request")
+        {
+            TriggerBuyOutcome::ShadowSimulated { report } => report,
+            other => panic!("expected shadow simulation, got {other:?}"),
+        };
+        let dispatched_boundary = report
+            .shadow_v2_entry_boundary
+            .as_ref()
+            .expect("dispatch must carry the refreshed quote boundary");
+        assert_eq!(dispatched_boundary.state_slot, 101);
+        assert_eq!(
+            dispatched_boundary.quote_refresh_status.as_deref(),
+            Some("canonical_state_requoted_before_dispatch")
+        );
+        drop(dispatch_receipt);
 
         let stale_mint = Pubkey::new_unique();
         let stale_curve = DirectBuyBuilder::derive_bonding_curve(&stale_mint).0;

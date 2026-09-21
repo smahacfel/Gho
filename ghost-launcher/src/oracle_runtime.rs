@@ -10652,6 +10652,8 @@ fn p37_shadow_probe_derive_account_override_context_for_pool_with_mode(
     }
     p37_apply_legacy_bonding_curve_v2_tail_resolver(&mut account_overrides, buy_mint);
     mark_buy_account_overrides_route_contract(&mut account_overrides, false, true);
+    creator_identity_source = account_overrides.creator_pubkey_source.clone();
+    creator_identity_authoritative = account_overrides.creator_pubkey_authoritative;
     P37ShadowProbeAccountOverrideContext {
         account_overrides,
         creator_identity_source,
