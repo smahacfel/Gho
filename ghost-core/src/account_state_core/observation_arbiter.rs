@@ -1747,6 +1747,7 @@ mod tests {
             sol_reserves: 1,
             token_reserves: 2,
             is_complete: 0,
+            canonical_creator: None,
             slot,
             write_version,
             source_account_pubkey: Some(account),

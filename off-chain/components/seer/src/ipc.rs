@@ -436,6 +436,11 @@ pub struct DetectedAccountUpdateEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub real_token_reserves: Option<u64>,
 
+    /// Creator decoded from the same canonical Pump bonding-curve bytes as
+    /// the reserves. Absent for layouts that do not carry a Pump creator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_creator: Option<Pubkey>,
+
     /// Curve completion flag (1 = graduated, 0 = active).
     pub complete: u8,
 
@@ -1190,6 +1195,7 @@ impl IpcSender {
         token_reserves: u64,
         real_sol_reserves: Option<u64>,
         real_token_reserves: Option<u64>,
+        canonical_creator: Option<Pubkey>,
         complete: u8,
         slot: u64,
         write_version: Option<u64>,
@@ -1213,6 +1219,7 @@ impl IpcSender {
             token_reserves,
             real_sol_reserves,
             real_token_reserves,
+            canonical_creator,
             complete,
             slot,
             write_version,
@@ -1747,6 +1754,7 @@ mod tests {
             token_reserves: 2_000,
             real_sol_reserves: Some(300),
             real_token_reserves: Some(400),
+            canonical_creator: None,
             complete: 0,
             slot: 123,
             write_version,
@@ -1808,6 +1816,7 @@ mod tests {
                 2_000,
                 Some(300),
                 Some(400),
+                None,
                 0,
                 123,
                 Some(7),
@@ -1877,6 +1886,7 @@ mod tests {
                 2_000,
                 Some(300),
                 Some(400),
+                None,
                 0,
                 123,
                 Some(7),
@@ -2064,6 +2074,7 @@ mod tests {
             token_reserves: 2_000,
             real_sol_reserves: None,
             real_token_reserves: None,
+            canonical_creator: None,
             complete: 0,
             slot: 123,
             write_version: Some(7),
@@ -2088,6 +2099,7 @@ mod tests {
         object.remove("account_data_len");
         object.remove("source_account_pubkey");
         object.remove("source_account_owner_or_program");
+        object.remove("canonical_creator");
 
         let decoded: DetectedAccountUpdateEvent =
             serde_json::from_value(value).expect("deserialize old account update shape");
@@ -2098,6 +2110,7 @@ mod tests {
         assert_eq!(decoded.account_data_len, None);
         assert_eq!(decoded.source_account_pubkey, None);
         assert_eq!(decoded.source_account_owner_or_program, None);
+        assert_eq!(decoded.canonical_creator, None);
     }
 
     #[tokio::test]

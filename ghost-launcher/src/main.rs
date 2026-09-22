@@ -289,11 +289,12 @@ fn load_gatekeeper_v2_config(
     match GhostBrainConfig::gatekeeper_v2_from_toml_file(config_path) {
         Ok(Some(cfg)) => {
             info!(
-                "🛡️ Gatekeeper V2 config loaded from {}: min_tx={} min_unique={} min_buy={} max_wait_ms={} min_sol_threshold={} min_phases={}",
+                "🛡️ Gatekeeper V2 config loaded from {}: min_tx={} min_unique={} min_buy={} min_sell={} max_wait_ms={} min_sol_threshold={} min_phases={}",
                 config_path.display(),
                 cfg.min_tx_count,
                 cfg.min_unique_signers,
                 cfg.min_buy_count,
+                cfg.min_sell_count,
                 cfg.max_wait_time_ms,
                 cfg.min_sol_threshold,
                 cfg.min_phases_to_pass,

@@ -232,6 +232,10 @@ pub struct CanonicalPoolState {
     pub price_change_since_t0_pct: f64,
     #[serde(default)]
     pub reserve_velocity_sol_per_sec: f64,
+    /// Creator decoded from the canonical Pump bonding-curve account bytes.
+    /// Appended to preserve the positional prefix used by binary serializers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_creator: Option<Pubkey>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -281,6 +285,10 @@ pub struct AccountStateUpdate {
     pub provider_role: Option<crate::RawProviderRoleV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub txn_signature: Option<solana_sdk::signature::Signature>,
+    /// Creator carried by the same raw account mutation as the reserves.
+    /// Appended to preserve the positional prefix used by binary serializers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_creator: Option<Pubkey>,
 }
 
 /// Canonical feature bundle derived from account state and passed onward.

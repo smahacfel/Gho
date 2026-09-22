@@ -2686,13 +2686,15 @@ impl GatekeeperAssessment {
                 "TIMEOUT: Phase 1 never met — zero transactions ingested".to_string()
             } else if !self.phase1_passed {
                 format!(
-                    "TIMEOUT: Phase 1 insufficient — tx={}/{} signers={}/{} buys={}/{}",
+                    "TIMEOUT: Phase 1 insufficient — tx={}/{} signers={}/{} buys={}/{} sells={}/{}",
                     self.total_tx_evaluated,
                     config.min_tx_count,
                     self.unique_signers_evaluated,
                     config.min_unique_signers,
                     self.buy_count,
-                    config.min_buy_count
+                    config.min_buy_count,
+                    self.total_tx_evaluated.saturating_sub(self.buy_count),
+                    config.min_sell_count,
                 )
             } else {
                 format!(
@@ -5604,6 +5606,7 @@ impl GatekeeperBuffer {
         self.total_tx_count >= self.config.min_tx_count
             && self.unique_signers.len() >= self.config.min_unique_signers
             && self.buy_count >= self.config.min_buy_count
+            && self.sell_count >= self.config.min_sell_count
     }
 
     fn evaluation_due_after_ingest(&self) -> bool {
@@ -6673,13 +6676,17 @@ impl GatekeeperBuffer {
                 false,
                 GatekeeperVerdictType::RejectCoreFail,
                 format!(
-                    "CORE_FAIL: Phase1 (tx={}/{} signers={}/{} buys={}/{})",
+                    "CORE_FAIL: Phase1 (tx={}/{} signers={}/{} buys={}/{} sells={}/{})",
                     assessment.total_tx_evaluated,
                     cfg.min_tx_count,
                     assessment.unique_signers_evaluated,
                     cfg.min_unique_signers,
                     assessment.buy_count,
                     cfg.min_buy_count,
+                    assessment
+                        .total_tx_evaluated
+                        .saturating_sub(assessment.buy_count),
+                    cfg.min_sell_count,
                 ),
                 GatekeeperReasonCode::RejectCoreFail,
             )
@@ -7436,7 +7443,8 @@ impl GatekeeperBuffer {
     /// In long mode the gatekeeper accumulates ALL transactions for the full
     /// `max_wait_time_ms` window without making any early decisions.  Only when
     /// the deadline is reached does it perform a single final evaluation:
-    ///   - Phase 1 met (`min_tx_count`, `min_unique_signers`, `min_buy_count`) AND
+    ///   - Phase 1 met (`min_tx_count`, `min_unique_signers`, `min_buy_count`,
+    ///     `min_sell_count`) AND
     ///     `phases_passed >= min_phases_to_pass` → **Buy**
     ///   - Phase 1 met but not enough phases → **Reject**
     ///   - Phase 1 never met → **Timeout**
@@ -7561,8 +7569,9 @@ impl GatekeeperBuffer {
         let has_enough_tx = self.total_tx_count >= self.config.min_tx_count;
         let has_enough_signers = self.unique_signers.len() >= self.config.min_unique_signers;
         let has_enough_buys = self.buy_count >= self.config.min_buy_count;
+        let has_enough_sells = self.sell_count >= self.config.min_sell_count;
 
-        if !(has_enough_tx && has_enough_signers && has_enough_buys) {
+        if !(has_enough_tx && has_enough_signers && has_enough_buys && has_enough_sells) {
             let shadow = ShadowV25Decision {
                 kind: ShadowDecisionKind::InsufficientData,
                 window: stage,
@@ -7571,7 +7580,7 @@ impl GatekeeperBuffer {
                 phases_passed: 0,
                 reason_code: Some(GatekeeperReasonCode::ShadowInsufficientData),
                 reason: format!(
-                    "{}: tx={}/{} elapsed_ms={} phase1_sig={}/{} buy={}/{}",
+                    "{}: tx={}/{} elapsed_ms={} phase1_sig={}/{} buy={}/{} sell={}/{}",
                     source.insufficient_reason_prefix(),
                     self.total_tx_count,
                     self.config.min_tx_count,
@@ -7580,6 +7589,8 @@ impl GatekeeperBuffer {
                     self.config.min_unique_signers,
                     self.buy_count,
                     self.config.min_buy_count,
+                    self.sell_count,
+                    self.config.min_sell_count,
                 ),
             };
             let assessment = self.build_minimal_assessment();
@@ -8663,10 +8674,11 @@ impl GatekeeperBuffer {
             elapsed_ms = elapsed_ms,
             phases = %breakdown,
             deadline_wall_ts_ms = self.deadline_wall_ts_ms,
-            "🚫 GATEKEEPER V2 TIMEOUT (Phase 1 never met: tx={}/{} signers={}/{} buys={}/{}) {}",
+            "🚫 GATEKEEPER V2 TIMEOUT (Phase 1 never met: tx={}/{} signers={}/{} buys={}/{} sells={}/{}) {}",
             self.total_tx_count, self.config.min_tx_count,
             self.unique_signers.len(), self.config.min_unique_signers,
             self.buy_count, self.config.min_buy_count,
+            self.sell_count, self.config.min_sell_count,
             breakdown
         );
         self.record_deadline_finalize_metrics("standard", "timeout", now_ms);
@@ -8711,8 +8723,9 @@ impl GatekeeperBuffer {
         let has_enough_tx = self.total_tx_count >= self.config.min_tx_count;
         let has_enough_signers = self.unique_signers.len() >= self.config.min_unique_signers;
         let has_enough_buys = self.buy_count >= self.config.min_buy_count;
+        let has_enough_sells = self.sell_count >= self.config.min_sell_count;
 
-        if !(has_enough_tx && has_enough_signers && has_enough_buys) {
+        if !(has_enough_tx && has_enough_signers && has_enough_buys && has_enough_sells) {
             // Phase 1 never met → Timeout
             let mut assessment = self.build_minimal_assessment();
             assessment.v25_shadow_decisions = self.v25_shadow_decisions.clone();
@@ -8764,10 +8777,11 @@ impl GatekeeperBuffer {
                 mode = "long",
                 phases = %breakdown,
                 deadline_wall_ts_ms = self.deadline_wall_ts_ms,
-                "🚫 GATEKEEPER V2 LONG TIMEOUT (Phase 1 never met: tx={}/{} signers={}/{} buys={}/{}) {}",
+                "🚫 GATEKEEPER V2 LONG TIMEOUT (Phase 1 never met: tx={}/{} signers={}/{} buys={}/{} sells={}/{}) {}",
                 self.total_tx_count, self.config.min_tx_count,
                 self.unique_signers.len(), self.config.min_unique_signers,
                 self.buy_count, self.config.min_buy_count,
+                self.sell_count, self.config.min_sell_count,
                 breakdown
             );
             self.record_deadline_finalize_metrics("long", "timeout", now_ms);
@@ -9463,6 +9477,37 @@ mod tests {
             !gk.phase1_passed,
             "Phase 1 should NOT pass with only 2 buys"
         );
+    }
+
+    #[test]
+    fn test_phase1_requires_configured_minimum_sell_count() {
+        let pool_id = Pubkey::new_unique();
+        let mut cfg = v2_default_config();
+        cfg.min_tx_count = 3;
+        cfg.min_unique_signers = 3;
+        cfg.min_buy_count = 2;
+        cfg.min_sell_count = 1;
+        cfg.max_wait_time_ms = 30_000;
+        let mut gk = GatekeeperBuffer::new(pool_id, &cfg);
+
+        for i in 0..3 {
+            let mut tx = create_v2_mock_tx(1_000 + i * 100, &format!("buy_{i}"));
+            tx.signer = format!("buyer_{i}");
+            let verdict = gk.on_transaction(Arc::new(tx));
+            assert!(matches!(verdict, GatekeeperVerdict::Wait));
+        }
+        assert!(
+            !gk.phase1_passed,
+            "buy-only flow must not satisfy an enabled sell floor"
+        );
+
+        let mut sell = create_v2_mock_tx(1_400, "sell_0");
+        sell.signer = "seller_0".to_string();
+        sell.is_buy = false;
+        let _ = gk.on_transaction(Arc::new(sell));
+
+        assert!(gk.phase1_passed);
+        assert_eq!(gk.sell_count, 1);
     }
 
     #[test]
@@ -12373,7 +12418,8 @@ mod tests {
         use ghost_brain::oracle::GATEKEEPER_BUY_LOG_SCHEMA_VERSION;
 
         let pool_id = Pubkey::new_unique();
-        let config = v2_default_config();
+        let mut config = v2_default_config();
+        config.min_sell_count = 2;
         let mut feature_snapshot = MaterializedFeatureSet::default();
         feature_snapshot.tx_intel_features.burst_ratio = 0.41;
 
@@ -12556,6 +12602,14 @@ mod tests {
                 .and_then(|value| value.get("min_tx_count"))
                 .and_then(serde_json::Value::as_u64),
             Some(config.min_tx_count as u64)
+        );
+        assert_eq!(
+            buy_log
+                .gatekeeper_v2_config_payload
+                .as_ref()
+                .and_then(|value| value.get("min_sell_count"))
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
         );
         assert!(buy_log.materialized_feature_snapshot.is_some());
         assert_eq!(
@@ -13777,11 +13831,13 @@ mod tests {
         let toml_str = r#"
             mode = "long"
             min_tx_count = 10
+            min_sell_count = 2
             max_wait_time_ms = 10000
         "#;
         let cfg: GatekeeperV2Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.mode, ghost_brain::config::GatekeeperMode::Long);
         assert_eq!(cfg.min_tx_count, 10);
+        assert_eq!(cfg.min_sell_count, 2);
         assert_eq!(cfg.max_wait_time_ms, 10_000);
 
         // Standard mode default
@@ -13790,6 +13846,7 @@ mod tests {
         "#;
         let cfg2: GatekeeperV2Config = toml::from_str(toml_default).unwrap();
         assert_eq!(cfg2.mode, ghost_brain::config::GatekeeperMode::Standard);
+        assert_eq!(cfg2.min_sell_count, 0);
     }
 
     /// Dust TXs in long mode must advance the clock and trigger

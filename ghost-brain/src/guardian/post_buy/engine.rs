@@ -11212,6 +11212,7 @@ mod tests {
             sol_reserves: 210_000_000_000,
             token_reserves: 760_000_000_000_000,
             is_complete: 0,
+            canonical_creator: None,
             slot,
             write_version: Some(1),
             txn_signature: None,
@@ -11254,6 +11255,7 @@ mod tests {
             sol_reserves: 210_000_000_000,
             token_reserves: 760_000_000_000_000,
             is_complete: 0,
+            canonical_creator: None,
             slot,
             write_version: Some(17),
             txn_signature: None,
@@ -11307,6 +11309,7 @@ mod tests {
             sol_reserves: 210_000_000_000,
             token_reserves: 760_000_000_000_000,
             is_complete: 0,
+            canonical_creator: canonical.canonical_creator,
             // A node may be far ahead of the Geyser event that supplied the
             // canonical state. This is diagnostic evidence only: it cannot
             // refresh a canonical quote boundary or lifecycle timestamp.

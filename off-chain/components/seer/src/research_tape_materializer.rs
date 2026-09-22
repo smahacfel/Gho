@@ -2036,6 +2036,7 @@ fn build_account_anchor_index(
             sol_reserves: curve_state.map_or(0, |state| state.real_quote_reserves),
             token_reserves: curve_state.map_or(0, |state| state.real_token_reserves),
             is_complete: curve_state.map_or(0, |state| u8::from(state.complete)),
+            canonical_creator: None,
             slot: account.slot,
             write_version: Some(account.write_version),
             source_account_pubkey: Some(account_pubkey),

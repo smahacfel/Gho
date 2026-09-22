@@ -33,6 +33,7 @@ fn account_update(
         sol_reserves,
         token_reserves,
         is_complete: 0,
+        canonical_creator: None,
         slot,
         write_version: Some(slot),
         txn_signature: None,

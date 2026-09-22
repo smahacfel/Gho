@@ -1363,6 +1363,7 @@ pub struct CanonicalAccountUpdatePayload {
     real_token_reserves: Option<u64>,
     complete: u8,
     token_mint: Option<Pubkey>,
+    canonical_creator: Option<Pubkey>,
 }
 
 impl CanonicalAccountUpdatePayload {
@@ -1395,6 +1396,11 @@ impl CanonicalAccountUpdatePayload {
     pub fn token_mint(&self) -> Option<Pubkey> {
         self.token_mint
     }
+
+    #[inline]
+    pub fn canonical_creator(&self) -> Option<Pubkey> {
+        self.canonical_creator
+    }
 }
 
 pub fn decode_canonical_account_update(
@@ -1409,6 +1415,9 @@ pub fn decode_canonical_account_update(
             real_token_reserves: Some(curve.real_token_reserves),
             complete: u8::from(curve.complete),
             token_mint: None,
+            canonical_creator: (owner == AmmProgram::PumpFun.program_id())
+                .then(|| Pubkey::new_from_array(curve.creator))
+                .filter(|creator| *creator != Pubkey::default()),
         }),
         PumpAccountState::AmmPool(pool) => {
             let base_mint = Pubkey::new_from_array(pool.base_mint);
@@ -1421,6 +1430,7 @@ pub fn decode_canonical_account_update(
                     real_token_reserves: None,
                     complete: 1,
                     token_mint: Some(quote_mint),
+                    canonical_creator: None,
                 })
             } else if quote_mint == *wsol_mint_pubkey() {
                 Ok(CanonicalAccountUpdatePayload {
@@ -1430,6 +1440,7 @@ pub fn decode_canonical_account_update(
                     real_token_reserves: None,
                     complete: 1,
                     token_mint: Some(base_mint),
+                    canonical_creator: None,
                 })
             } else {
                 Err(format!(
@@ -1445,6 +1456,7 @@ pub fn decode_canonical_account_update(
                 real_token_reserves: Some(curve.real_token_reserves),
                 complete: curve.complete,
                 token_mint: None,
+                canonical_creator: None,
             })
             .map_err(|err| err.to_string()),
         PumpAccountState::Global(_) => Err(format!(
@@ -3716,6 +3728,7 @@ impl Seer {
                         update_payload.token_reserves,
                         update_payload.real_sol_reserves,
                         update_payload.real_token_reserves,
+                        update_payload.canonical_creator,
                         update_payload.complete,
                         replay.slot,
                         replay.write_version,
@@ -4093,6 +4106,7 @@ impl Seer {
                     update_payload.token_reserves,
                     update_payload.real_sol_reserves,
                     update_payload.real_token_reserves,
+                    update_payload.canonical_creator,
                     update_payload.complete,
                     slot,
                     write_version,
@@ -8480,6 +8494,33 @@ mod tests {
             account_data_hash_blake3(&first),
             account_data_hash_blake3(&second)
         );
+    }
+
+    #[test]
+    fn canonical_pump_account_decode_preserves_creator_from_account_bytes() {
+        let creator = Pubkey::new_unique();
+        let mut data = vec![0u8; 81];
+        data[..8].copy_from_slice(&binary_parser::DISC_BONDING_CURVE);
+        data[8..16].copy_from_slice(&1_000_000_000_000u64.to_le_bytes());
+        data[16..24].copy_from_slice(&30_000_000_000u64.to_le_bytes());
+        data[24..32].copy_from_slice(&500_000_000_000u64.to_le_bytes());
+        data[32..40].copy_from_slice(&7_000_000_000u64.to_le_bytes());
+        data[40..48].copy_from_slice(&1_000_000_000_000u64.to_le_bytes());
+        data[48] = 0;
+        data[49..81].copy_from_slice(creator.as_ref());
+
+        let owner = AmmProgram::PumpFun.program_id();
+        let payload = decode_canonical_account_update(owner, &data)
+            .expect("current Pump bonding-curve layout must decode");
+
+        assert_eq!(payload.canonical_creator(), Some(creator));
+        assert_eq!(payload.sol_reserves(), 30_000_000_000);
+        assert_eq!(payload.token_reserves(), 1_000_000_000_000);
+
+        let foreign_owner = Pubkey::new_unique();
+        let foreign_payload = decode_canonical_account_update(foreign_owner, &data)
+            .expect("layout decoding remains independent from owner authority");
+        assert_eq!(foreign_payload.canonical_creator(), None);
     }
 
     #[tokio::test]

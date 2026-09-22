@@ -212,7 +212,7 @@ fn canonical_runtime_reserves(state: &CanonicalPoolState) -> (u64, u64) {
     (reserve_sol_lamports, reserve_tok_units)
 }
 
-fn canonical_shadow_curve(state: &CanonicalPoolState) -> BondingCurve {
+pub(crate) fn canonical_shadow_curve(state: &CanonicalPoolState) -> BondingCurve {
     BondingCurve {
         discriminator: 0,
         virtual_token_reserves: state.virtual_token_reserves,
@@ -2465,6 +2465,7 @@ fn bcv2_evidence_status_from_record(record: &ExecutionAccountEvidenceRecord) -> 
 struct P37LegacyBuyCurveMaterialization {
     curve: BondingCurve,
     pubkey: Pubkey,
+    canonical_creator: Option<Pubkey>,
     source: String,
     authority_status: String,
 }
@@ -3419,6 +3420,7 @@ impl OracleRuntime {
         account_data_len: Option<u64>,
         source_account_pubkey: Option<Pubkey>,
         source_account_owner_or_program: Option<Pubkey>,
+        canonical_creator: Option<Pubkey>,
         curve_finality: CurveFinality,
         source: UpdateSource,
         bonding_curve_hint: Option<&Pubkey>,
@@ -3470,6 +3472,7 @@ impl OracleRuntime {
             sol_reserves: on_chain_sol,
             token_reserves: on_chain_tok,
             is_complete: on_chain_complete,
+            canonical_creator,
             slot,
             write_version,
             txn_signature,
@@ -3874,6 +3877,7 @@ impl OracleRuntime {
             event.and_then(|event| event.account_data_len),
             event.and_then(|event| event.source_account_pubkey),
             event.and_then(|event| event.source_account_owner_or_program),
+            event.and_then(|event| event.canonical_creator),
             curve_finality,
             source,
             event.map(|event| &event.bonding_curve),
@@ -4095,6 +4099,7 @@ impl OracleRuntime {
             .map(|canonical_state| P37LegacyBuyCurveMaterialization {
                 curve: canonical_shadow_curve(&canonical_state),
                 pubkey: canonical_state.bonding_curve,
+                canonical_creator: canonical_state.canonical_creator,
                 source: "account_state_core".to_string(),
                 authority_status: "authoritative_account_state".to_string(),
             })
@@ -5624,11 +5629,12 @@ impl OracleRuntime {
 
 fn format_gatekeeper_v2_config(config: &GatekeeperV2Config) -> String {
     format!(
-        "cfg[min_sol={:.4} min_tx={} min_signers={} min_buy={} max_wait_ms={} int_cv=[{:.3},{:.3}] max_burst={:.2} avg_ms=[{:.0},{:.0}] entropy=[{:.2},{:.2}] min_unique_ratio={:.2} max_hhi={:.3} max_tx_signer={} max_gini={:.2} max_top3={:.2} min_buy_ratio={:.2} avg_tx_sol=[{:.3},{:.3}] vol_cv=[{:.2},{:.2}] total_sol=[{:.3},{:.3}] max_dev_buy={:.2} dev_tx_ratio=[{:.2},{:.2}] dev_vol_ratio=[{:.2},{:.2}] reject_on_dev_sell={} max_price_change={:.2} max_tx_impact={:.2}% bonding=[{:.2}%,{:.2}%] min_mcap={:.2} min_phases={} reeval_every_tx={} failed_tx_ratio={:?} use_slot_ordering={} hybrid[sell_buy=[{:.3},{:.3}] cu_cluster=[{:.3},{:.3}] static_fee=[{:.3},{:.3}] inner_ix=[{:.3},{:.3}] max_fixed_buy={:.3} max_fixed_buy_1e4={:.3} max_flipper={:.3} jito_tip=[{:.3},{:.3}] max_early_slot_dom={:.3} max_early_top3_3s={:.3} max_whale_top3={:.3} max_whale_top1={:.3} min_dev_latency_ms={}]]",
+        "cfg[min_sol={:.4} min_tx={} min_signers={} min_buy={} min_sell={} max_wait_ms={} int_cv=[{:.3},{:.3}] max_burst={:.2} avg_ms=[{:.0},{:.0}] entropy=[{:.2},{:.2}] min_unique_ratio={:.2} max_hhi={:.3} max_tx_signer={} max_gini={:.2} max_top3={:.2} min_buy_ratio={:.2} avg_tx_sol=[{:.3},{:.3}] vol_cv=[{:.2},{:.2}] total_sol=[{:.3},{:.3}] max_dev_buy={:.2} dev_tx_ratio=[{:.2},{:.2}] dev_vol_ratio=[{:.2},{:.2}] reject_on_dev_sell={} max_price_change={:.2} max_tx_impact={:.2}% bonding=[{:.2}%,{:.2}%] min_mcap={:.2} min_phases={} reeval_every_tx={} failed_tx_ratio={:?} use_slot_ordering={} hybrid[sell_buy=[{:.3},{:.3}] cu_cluster=[{:.3},{:.3}] static_fee=[{:.3},{:.3}] inner_ix=[{:.3},{:.3}] max_fixed_buy={:.3} max_fixed_buy_1e4={:.3} max_flipper={:.3} jito_tip=[{:.3},{:.3}] max_early_slot_dom={:.3} max_early_top3_3s={:.3} max_whale_top3={:.3} max_whale_top1={:.3} min_dev_latency_ms={}]]",
         config.min_sol_threshold,
         config.min_tx_count,
         config.min_unique_signers,
         config.min_buy_count,
+        config.min_sell_count,
         config.max_wait_time_ms,
         config.min_interval_cv,
         config.max_interval_cv,
@@ -9352,7 +9358,7 @@ fn p37_shadow_probe_legacy_buy_route_diagnostics(
     } else if missing_roles.iter().any(|role| role == "bonding_curve_v2") {
         Some("legacy_buy_missing_route_identity".to_string())
     } else if !manifest_ready {
-        Some("legacy_buy_simulation_load_not_ready".to_string())
+        Some("legacy_buy_pre_dispatch_manifest_not_ready".to_string())
     } else {
         Some("legacy_buy_unknown_not_ready".to_string())
     };
@@ -10497,6 +10503,27 @@ fn p37_apply_legacy_buy_curve_materialization(
     account_overrides: &mut crate::components::trigger::BuyAccountOverrides,
     materialization: P37LegacyBuyCurveMaterialization,
 ) {
+    if matches!(
+        account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) {
+        if let Some(canonical_creator) = materialization.canonical_creator {
+            let expected_creator_vault =
+                trigger::DirectBuyBuilder::derive_creator_vault(&canonical_creator);
+            if let Some(observed_creator_vault) = account_overrides.creator_vault {
+                if observed_creator_vault != expected_creator_vault {
+                    account_overrides.creator_vault_source = Some(format!(
+                        "creator_vault_canonical_mismatch:observed={observed_creator_vault}:expected={expected_creator_vault}"
+                    ));
+                    account_overrides.creator_vault_authoritative = Some(false);
+                }
+            }
+            account_overrides.creator_pubkey = Some(canonical_creator);
+            account_overrides.creator_pubkey_source =
+                Some("canonical_bonding_curve.creator".to_string());
+            account_overrides.creator_pubkey_authoritative = Some(true);
+        }
+    }
     match account_overrides.legacy_buy_curve_pubkey {
         Some(existing_pubkey) if existing_pubkey != materialization.pubkey => {
             if !p37_legacy_buy_curve_authority_is_verified(
@@ -10626,6 +10653,8 @@ fn p37_shadow_probe_derive_account_override_context_for_pool_with_mode(
     }
     p37_apply_legacy_bonding_curve_v2_tail_resolver(&mut account_overrides, buy_mint);
     mark_buy_account_overrides_route_contract(&mut account_overrides, false, true);
+    creator_identity_source = account_overrides.creator_pubkey_source.clone();
+    creator_identity_authoritative = account_overrides.creator_pubkey_authoritative;
     P37ShadowProbeAccountOverrideContext {
         account_overrides,
         creator_identity_source,
@@ -10674,6 +10703,7 @@ fn p37_shadow_probe_legacy_curve_materialization_for_pool(
     Some(P37LegacyBuyCurveMaterialization {
         curve,
         pubkey,
+        canonical_creator: None,
         source: "materialized_feature_set".to_string(),
         authority_status: "authoritative_mfs".to_string(),
     })
@@ -18477,7 +18507,8 @@ fn try_evaluate_feature_driven_terminal_verdict(
             >= gatekeeper_config.min_tx_count as u64
             && features.tx_intel_features.unique_signers
                 >= gatekeeper_config.min_unique_signers as u64
-            && features.tx_intel_features.buy_count >= gatekeeper_config.min_buy_count as u64;
+            && features.tx_intel_features.buy_count >= gatekeeper_config.min_buy_count as u64
+            && features.tx_intel_features.sell_count >= gatekeeper_config.min_sell_count as u64;
         if !phase1_passed {
             if session.canonical_update_count() == 0 {
                 ::metrics::counter!("timeout_without_canonical_updates_total", 1u64);
@@ -20665,6 +20696,7 @@ fn state_readiness_latch_metric(outcome: &str) {
 fn state_readiness_latch_error_is_state_not_ready(reason: &str) -> bool {
     let lower = reason.to_ascii_lowercase();
     lower.contains("legacy_buy_simulation_load_not_ready")
+        || lower.contains("legacy_buy_pre_dispatch_manifest_not_ready")
         || lower.contains("simulation_load_not_ready:bonding_curve")
         || lower.contains("route_incomplete_state_not_ready")
 }
@@ -20714,6 +20746,8 @@ fn state_readiness_latch_eligibility_diagnostics(
     };
     let eligible = skip_reason.is_none();
     let diagnostics = crate::events::ShadowSimulationAccountDiagnostics {
+        dispatch_attempted: Some(false),
+        simulation_attempted: Some(false),
         state_latch_eligibility_marker: Some("STATE_LATCH_ELIGIBILITY_CHECKED".to_string()),
         state_latch_eligibility_checked: Some(true),
         state_latch_enabled: Some(config.enabled),
@@ -20834,6 +20868,8 @@ async fn run_state_readiness_latch(
 ) {
     let route_kind = p37_shadow_probe_route_kind(Some(request));
     let mut diagnostics = crate::events::ShadowSimulationAccountDiagnostics {
+        dispatch_attempted: Some(false),
+        simulation_attempted: Some(false),
         state_latch_attempted: Some(true),
         state_latch_mint: Some(request.mint.to_string()),
         state_latch_bonding_curve: request
@@ -20877,8 +20913,8 @@ async fn run_state_readiness_latch(
         diagnostics.state_latch_outcome = Some("STATE_LATCH_RECOVERED_BY_FRESH_READ".to_string());
         diagnostics.state_latch_error_after_latch =
             Some("state_readiness_available_by_fresh_read".to_string());
-        diagnostics.dispatch_attempted = Some(true);
-        diagnostics.simulation_attempted = Some(true);
+        diagnostics.dispatch_attempted = Some(false);
+        diagnostics.simulation_attempted = Some(false);
         diagnostics.active_shadow_precheck_status = Some("precheck_recovered".to_string());
         state_readiness_latch_metric("STATE_LATCH_RECOVERED_BY_FRESH_READ");
         return (StateReadinessLatchStatus::Recovered, diagnostics);
@@ -20904,8 +20940,8 @@ async fn run_state_readiness_latch(
             diagnostics.state_latch_outcome = Some("STATE_LATCH_RECOVERED_AFTER_WAIT".to_string());
             diagnostics.state_latch_error_after_latch =
                 Some("state_readiness_available_after_wait".to_string());
-            diagnostics.dispatch_attempted = Some(true);
-            diagnostics.simulation_attempted = Some(true);
+            diagnostics.dispatch_attempted = Some(false);
+            diagnostics.simulation_attempted = Some(false);
             diagnostics.active_shadow_precheck_status = Some("precheck_recovered".to_string());
             state_readiness_latch_metric("STATE_LATCH_RECOVERED_AFTER_WAIT");
             return (StateReadinessLatchStatus::Recovered, diagnostics);
@@ -22857,9 +22893,18 @@ fn shadow_execution_outcome_from_dispatch_error(
         return "shadow_transport_rate_limit".to_string();
     }
     if lower.contains("legacy_buy_simulation_load_not_ready")
+        || lower.contains("legacy_buy_pre_dispatch_manifest_not_ready")
         || lower.contains("simulation_load_not_ready")
     {
         return "shadow_state_readiness_error".to_string();
+    }
+    if lower.contains("stale_canonical_curve") {
+        return "shadow_canonical_state_stale".to_string();
+    }
+    if lower.contains("creator_vault_canonical_mismatch")
+        || lower.contains("canonical_creator_missing")
+    {
+        return "shadow_canonical_creator_error".to_string();
     }
     if lower.contains("no_executable_route_account_set")
         || lower.contains("legacy_buy_missing_buyback_remaining_accounts")
@@ -28795,6 +28840,7 @@ mod tests {
             token_reserves,
             real_sol_reserves: None,
             real_token_reserves: None,
+            canonical_creator: None,
             complete,
             slot,
             write_version,
@@ -28892,6 +28938,7 @@ mod tests {
                 Some(Pubkey::new_from_array(
                     *blake3::hash(b"test-account-owner-v1").as_bytes(),
                 )),
+                None,
                 curve_finality,
                 UpdateSource::GeyserAccountUpdate,
                 Some(&bonding_curve),
@@ -31932,6 +31979,7 @@ mod tests {
                 pubkey: curve_pubkey,
                 source: "account_state_core".to_string(),
                 authority_status: "authoritative_account_state".to_string(),
+                canonical_creator: None,
             },
         );
 
@@ -31945,6 +31993,138 @@ mod tests {
             overrides.legacy_buy_curve_authority_status.as_deref(),
             Some("authoritative_cross_checked")
         );
+    }
+
+    #[test]
+    fn p37_legacy_buy_uses_canonical_creator_and_flags_any_observed_vault_mismatch() {
+        let curve_pubkey = Pubkey::new_unique();
+        let detected_creator = Pubkey::new_unique();
+        let canonical_creator = Pubkey::new_unique();
+        let observed_wrong_vault = Pubkey::new_unique();
+        let expected_vault = trigger::DirectBuyBuilder::derive_creator_vault(&canonical_creator);
+        assert_ne!(observed_wrong_vault, expected_vault);
+        let mut overrides = crate::components::trigger::BuyAccountOverrides {
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            creator_pubkey: Some(detected_creator),
+            creator_pubkey_source: Some("detected_pool.creator".to_string()),
+            creator_pubkey_authoritative: Some(false),
+            creator_vault: Some(observed_wrong_vault),
+            creator_vault_source: Some("observed_manifest".to_string()),
+            creator_vault_authoritative: Some(false),
+            legacy_buy_curve_pubkey: Some(curve_pubkey),
+            ..Default::default()
+        };
+
+        p37_apply_legacy_buy_curve_materialization(
+            &mut overrides,
+            P37LegacyBuyCurveMaterialization {
+                curve: p37_shadow_probe_test_legacy_curve(),
+                pubkey: curve_pubkey,
+                source: "account_state_core".to_string(),
+                authority_status: "authoritative_account_state".to_string(),
+                canonical_creator: Some(canonical_creator),
+            },
+        );
+
+        assert_eq!(overrides.creator_pubkey, Some(canonical_creator));
+        assert_eq!(
+            overrides.creator_pubkey_source.as_deref(),
+            Some("canonical_bonding_curve.creator")
+        );
+        assert_eq!(overrides.creator_pubkey_authoritative, Some(true));
+        assert_eq!(overrides.creator_vault, Some(observed_wrong_vault));
+        assert_eq!(overrides.creator_vault_authoritative, Some(false));
+        assert!(overrides
+            .creator_vault_source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("creator_vault_canonical_mismatch:")));
+    }
+
+    #[test]
+    fn p37_shadow_probe_context_uses_canonical_creator_after_materialization() {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+
+        let (mut record, pool, buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let curve = p37_shadow_probe_test_legacy_curve();
+        record.legacy_bonding_curve_snapshot = Some(curve);
+        let curve_pubkey = Pubkey::try_from(pool.bonding_curve.as_str()).expect("curve pubkey");
+        let pool_pubkey = Pubkey::try_from(pool.pool_amm_id.as_str()).expect("pool pubkey");
+        let canonical_creator = Pubkey::new_unique();
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+        let update = ghost_core::account_state_core::types::AccountStateUpdate {
+            pool_amm_id: pool_pubkey,
+            base_mint: buy_mint,
+            bonding_curve: curve_pubkey,
+            sol_reserves: curve.virtual_sol_reserves,
+            token_reserves: curve.virtual_token_reserves,
+            is_complete: curve.complete,
+            slot: 100,
+            write_version: Some(1),
+            source_account_pubkey: Some(curve_pubkey),
+            source_account_owner_or_program: Some(
+                Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+                    .expect("Pump program id"),
+            ),
+            account_data_len: Some(81),
+            account_data_hash: Some(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+            ),
+            receive_ts_ms: 1_000,
+            receive_seq: 1,
+            curve_finality: ghost_core::CurveFinality::Provisional,
+            source: ghost_core::account_state_core::types::UpdateSource::GeyserAccountUpdate,
+            provider_id: Some("test-primary".to_string()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+            txn_signature: None,
+            canonical_creator: Some(canonical_creator),
+        };
+        assert!(matches!(
+            runtime.account_state_core.apply_account_update(update),
+            ghost_core::account_state_core::types::AccountUpdateResult::Applied
+        ));
+
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("token program");
+        let associated_bonding_curve =
+            trigger::DirectBuyBuilder::canonical_associated_bonding_curve(
+                &buy_mint,
+                &token_program,
+            );
+        let mut tx = (*test_pool_observation_tx("canonical-creator-context")).clone();
+        tx.buy_variant = Some("legacy_buy".to_string());
+        tx.associated_bonding_curve = Some(associated_bonding_curve.to_string());
+        tx.token_program = Some(token_program.to_string());
+        tx.success = true;
+        tx.is_buy = true;
+        let buffered_txs = vec![crate::components::gatekeeper::GatekeeperBufferedTx {
+            tx: Arc::new(tx),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1_000, Some(1), Some(0), None, 0).expect("tx key"),
+        }];
+
+        let context = p37_shadow_probe_derive_account_override_context_for_pool(
+            &runtime,
+            &pool,
+            &buffered_txs,
+            buy_mint,
+            &record,
+        );
+
+        assert_eq!(
+            context.account_overrides.creator_pubkey,
+            Some(canonical_creator)
+        );
+        assert_eq!(
+            context.creator_identity_source.as_deref(),
+            Some("canonical_bonding_curve.creator")
+        );
+        assert_eq!(context.creator_identity_authoritative, Some(true));
+        assert!(p37_shadow_probe_creator_vault_precheck_failure(&context).is_none());
     }
 
     #[test]
@@ -31965,6 +32145,7 @@ mod tests {
                 pubkey: account_state_pubkey,
                 source: "account_state_core".to_string(),
                 authority_status: "authoritative_account_state".to_string(),
+                canonical_creator: None,
             },
         );
 
@@ -33727,29 +33908,17 @@ mod tests {
     }
 
     #[test]
-    fn restore_legacy_buy_detected_pool_creator_recovery_requires_complete_observed_shape() {
+    fn legacy_buy_detected_pool_creator_is_never_promoted_to_execution_authority() {
         let mint = Pubkey::new_unique();
         let mut overrides = complete_legacy_execution_contract_overrides(mint);
         overrides.creator_pubkey_source = Some("detected_pool.creator".to_string());
         overrides.creator_pubkey_authoritative = Some(false);
-
-        p37_restore_legacy_buy_authorize_detected_pool_creator(&mut overrides);
-
-        assert_eq!(overrides.creator_pubkey_authoritative, Some(true));
-
-        let mut missing_remaining = complete_legacy_execution_contract_overrides(mint);
-        missing_remaining.creator_pubkey_source = Some("detected_pool.creator".to_string());
-        missing_remaining.creator_pubkey_authoritative = Some(false);
-        missing_remaining.buy_remaining_accounts.clear();
-        p37_restore_legacy_buy_authorize_detected_pool_creator(&mut missing_remaining);
-        assert_eq!(missing_remaining.creator_pubkey_authoritative, Some(false));
-
-        let mut telemetry = complete_legacy_execution_contract_overrides(mint);
-        telemetry.creator_pubkey_source = Some("detected_pool.creator".to_string());
-        telemetry.creator_pubkey_authoritative = Some(false);
-        telemetry.route_account_manifest_source = Some("nln_program_streams".to_string());
-        p37_restore_legacy_buy_authorize_detected_pool_creator(&mut telemetry);
-        assert_eq!(telemetry.creator_pubkey_authoritative, Some(false));
+        assert_eq!(overrides.creator_pubkey_authoritative, Some(false));
+        let mut request = test_prepared_buy_request();
+        request.account_overrides = overrides;
+        let reason = p37_selected_route_account_contract_failure_reason(&request)
+            .expect("detected creator must stay non-authoritative");
+        assert!(reason.contains("creator_vault_source_not_authoritative"));
     }
 
     #[test]
@@ -34142,6 +34311,7 @@ mod tests {
             sol_reserves: 30_000_000_000,
             token_reserves: 1_073_000_000_000_000,
             is_complete: 0,
+            canonical_creator: None,
             slot: 100,
             write_version: Some(1),
             txn_signature: None,
@@ -34211,8 +34381,8 @@ mod tests {
             diagnostics.state_latch_outcome.as_deref(),
             Some("STATE_LATCH_RECOVERED_BY_FRESH_READ")
         );
-        assert_eq!(diagnostics.dispatch_attempted, Some(true));
-        assert_eq!(diagnostics.simulation_attempted, Some(true));
+        assert_eq!(diagnostics.dispatch_attempted, Some(false));
+        assert_eq!(diagnostics.simulation_attempted, Some(false));
         assert_eq!(diagnostics.can_unlock_execution, Some(false));
     }
 
@@ -34249,6 +34419,8 @@ mod tests {
             diagnostics.state_latch_error_after_latch.as_deref(),
             Some("legacy_buy_simulation_load_not_ready:bonding_curve")
         );
+        assert_eq!(diagnostics.dispatch_attempted, Some(false));
+        assert_eq!(diagnostics.simulation_attempted, Some(false));
         assert_eq!(diagnostics.can_unlock_execution, Some(false));
     }
 
@@ -34284,6 +34456,8 @@ mod tests {
             diagnostics.state_latch_outcome.as_deref(),
             Some("STATE_LATCH_SKIPPED_BONDING_CURVE_MISSING")
         );
+        assert_eq!(diagnostics.dispatch_attempted, Some(false));
+        assert_eq!(diagnostics.simulation_attempted, Some(false));
         assert_eq!(diagnostics.can_unlock_execution, Some(false));
     }
 
@@ -35835,6 +36009,7 @@ mod tests {
             token_reserves: virtual_token_reserves,
             real_sol_reserves: Some(real_sol_reserves),
             real_token_reserves: Some(real_token_reserves),
+            canonical_creator: None,
             complete: 0,
             slot,
             write_version: Some(1),
@@ -45621,6 +45796,7 @@ mod tests {
             sol_reserves: 45_000_000_000,
             token_reserves: 900_000_000_000_000,
             is_complete: 0,
+            canonical_creator: None,
             slot: 7,
             write_version: None,
             txn_signature: None,
@@ -46122,6 +46298,7 @@ mod tests {
                 Some(56),
                 Some(source_account_pubkey),
                 Some(source_owner),
+                None,
                 CurveFinality::Speculative,
                 UpdateSource::GeyserAccountUpdate,
                 Some(&bonding_curve),
@@ -46153,6 +46330,7 @@ mod tests {
                 0,
                 3,
                 Some(18),
+                None,
                 None,
                 None,
                 None,
@@ -47693,6 +47871,7 @@ mod tests {
                 sol_reserves: 1_000_000_000 + slot,
                 token_reserves: 500_000_000_000 + slot,
                 is_complete: 0,
+                canonical_creator: None,
                 slot,
                 write_version: Some(slot),
                 txn_signature: None,
@@ -49346,6 +49525,7 @@ mod tests {
             token_reserves: 20,
             real_sol_reserves: None,
             real_token_reserves: None,
+            canonical_creator: None,
             complete: 0,
             slot: 42,
             write_version: Some(7),
@@ -52470,6 +52650,7 @@ mod tests {
                     token_reserves: initial_tok,
                     real_sol_reserves: None,
                     real_token_reserves: None,
+                    canonical_creator: None,
                     complete: 0,
                     slot: 101,
                     write_version: None,

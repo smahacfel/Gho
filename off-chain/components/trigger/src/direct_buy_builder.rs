@@ -168,6 +168,16 @@ pub const FALLBACK_ENTRY_PRICE: u64 = 1000;
 pub struct DirectBuyBuilder;
 
 impl DirectBuyBuilder {
+    /// Derive the Pump creator-vault PDA from the canonical creator stored in
+    /// the bonding-curve account.
+    pub fn derive_creator_vault(creator: &Pubkey) -> Pubkey {
+        Pubkey::find_program_address(
+            &[CREATOR_VAULT_SEED, creator.as_ref()],
+            &Self::pump_program_id(),
+        )
+        .0
+    }
+
     /// Get the Pump.fun program ID
     pub fn pump_program_id() -> Pubkey {
         Pubkey::from_str(PUMP_PROGRAM_ID).expect("Invalid PUMP_PROGRAM_ID")
@@ -379,10 +389,7 @@ impl DirectBuyBuilder {
             &[USER_VOLUME_ACCUMULATOR_SEED, payer.as_ref()],
             &program_id,
         );
-        let (derived_creator_vault, _) = Pubkey::find_program_address(
-            &[CREATOR_VAULT_SEED, creator_pubkey.as_ref()],
-            &program_id,
-        );
+        let derived_creator_vault = Self::derive_creator_vault(&creator_pubkey);
         let creator_vault = creator_vault_override.unwrap_or(derived_creator_vault);
         let (fee_config, _) =
             Pubkey::find_program_address(&[FEE_CONFIG_SEED, &FEE_SEED_CONST], &fee_program);
@@ -1177,6 +1184,36 @@ mod tests {
         );
         assert_ne!(observed_creator_vault, derived_creator_vault);
         assert_eq!(ix.accounts[9].pubkey, observed_creator_vault);
+    }
+
+    #[test]
+    fn test_build_buy_ix_derives_creator_vault_from_canonical_creator() {
+        let payer = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let token_program =
+            Pubkey::from_str(TOKEN_2022_PROGRAM_ID).expect("valid token2022 program");
+
+        let ix = DirectBuyBuilder::build_buy_ix_with_accounts_and_remaining_and_creator_vault(
+            &payer,
+            &mint,
+            &token_program,
+            None,
+            None,
+            Some(creator),
+            None,
+            Some(PumpfunBuyVariant::LegacyBuy),
+            None,
+            None,
+            &[Pubkey::new_unique(), Pubkey::new_unique()],
+            1_000_000,
+            1_000,
+        );
+
+        assert_eq!(
+            ix.accounts[9].pubkey,
+            DirectBuyBuilder::derive_creator_vault(&creator)
+        );
     }
 
     #[test]
