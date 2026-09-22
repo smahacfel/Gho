@@ -858,11 +858,11 @@ impl TriggerComponent {
                             Ok(response) => {
                                 if let Some(account) = response.value {
                                     if attempt > 0 {
-                            info!(mint = %mint, retries = attempt, primary_missing_count,
+                                        info!(mint = %mint, retries = attempt, primary_missing_count,
                                 elapsed_ms = saturating_elapsed_ms(fetch_started_at),
                                 "Trigger: mint account fetch recovered after retry");
-                        }
-                        return Ok(account);
+                                    }
+                                    return Ok(account);
                                 }
 
                                 let secondary_not_found = Some(true);
@@ -940,11 +940,11 @@ impl TriggerComponent {
                             Ok(response) => {
                                 if let Some(account) = response.value {
                                     if attempt > 0 {
-                            info!(mint = %mint, retries = attempt, primary_missing_count,
+                                        info!(mint = %mint, retries = attempt, primary_missing_count,
                                 elapsed_ms = saturating_elapsed_ms(fetch_started_at),
                                 "Trigger: mint account fetch recovered after retry");
-                        }
-                        return Ok(account);
+                                    }
+                                    return Ok(account);
                                 }
 
                                 secondary_retryable = Some(true);
@@ -4233,7 +4233,8 @@ impl TriggerComponent {
         };
         let blockhash_fetch = async {
             let started_at = Instant::now();
-            let (snapshot, source) = self.resolve_live_blockhash(rpc)
+            let (snapshot, source) = self
+                .resolve_live_blockhash(rpc)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to fetch recent blockhash: {}", e))?;
             Ok::<_, anyhow::Error>((snapshot, source, saturating_elapsed_ms(started_at)))
@@ -4254,7 +4255,13 @@ impl TriggerComponent {
                 speculative_ata_probe_result,
                 blockhash_result,
             ) = if let Some(speculative_ata_probe) = speculative_ata_probe {
-                let (payer_balance, payer_account, mint_account, speculative_probe, blockhash_result) = tokio::try_join!(
+                let (
+                    payer_balance,
+                    payer_account,
+                    mint_account,
+                    speculative_probe,
+                    blockhash_result,
+                ) = tokio::try_join!(
                     payer_balance_fetch,
                     payer_account_fetch,
                     mint_account_fetch,
@@ -4269,14 +4276,19 @@ impl TriggerComponent {
                     blockhash_result,
                 )
             } else {
-                let (payer_balance, payer_account, mint_account, blockhash_result) =
-                    tokio::try_join!(
-                        payer_balance_fetch,
-                        payer_account_fetch,
-                        mint_account_fetch,
-                        blockhash_fetch
-                    )?;
-                (payer_balance, payer_account, mint_account, None, blockhash_result)
+                let (payer_balance, payer_account, mint_account, blockhash_result) = tokio::try_join!(
+                    payer_balance_fetch,
+                    payer_account_fetch,
+                    mint_account_fetch,
+                    blockhash_fetch
+                )?;
+                (
+                    payer_balance,
+                    payer_account,
+                    mint_account,
+                    None,
+                    blockhash_result,
+                )
             };
             preparation_telemetry.payer_balance_fetch_ms = payer_balance_fetch_ms;
             preparation_telemetry.payer_account_fetch_ms = payer_account_fetch_ms;
@@ -5009,7 +5021,8 @@ impl TriggerComponent {
         request: &PreparedBuyRequest,
     ) -> Result<super::shadow_run::ShadowBuySimulationReport> {
         let Some(budget_ms) = self.config.shadow_run.decision_to_buy_deadline_ms else {
-            return self.shadow_simulator
+            return self
+                .shadow_simulator
                 .simulate_buy(request, &self.config.shadow_run)
                 .await;
         };
@@ -5028,7 +5041,8 @@ impl TriggerComponent {
         // nie może otworzyć pozycji. Anulowanie dotyczy wyłącznie symulacji shadow.
         let report = tokio::time::timeout(
             Duration::from_millis(remaining_ms),
-            self.shadow_simulator.simulate_buy(request, &self.config.shadow_run),
+            self.shadow_simulator
+                .simulate_buy(request, &self.config.shadow_run),
         )
         .await
         .map_err(|_| deadline_error())??;

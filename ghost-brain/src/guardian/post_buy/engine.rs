@@ -9031,16 +9031,16 @@ impl MonitoringEngine {
         }
 
         'authority_tick: {
-            let confirmation = match self.poll_quote_confirmation(base_mint, snapshot.guard(), now_ms)
-            {
-                quote_confirmation::ConfirmationPoll::Pending => {
-                    receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery;
-                    receipt_reason = Some("rpc_confirmation_pending".to_string());
-                    break 'authority_tick;
-                }
-                quote_confirmation::ConfirmationPoll::Ready(confirmation) => Some(confirmation),
-                quote_confirmation::ConfirmationPoll::Absent => None,
-            };
+            let confirmation =
+                match self.poll_quote_confirmation(base_mint, snapshot.guard(), now_ms) {
+                    quote_confirmation::ConfirmationPoll::Pending => {
+                        receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery;
+                        receipt_reason = Some("rpc_confirmation_pending".to_string());
+                        break 'authority_tick;
+                    }
+                    quote_confirmation::ConfirmationPoll::Ready(confirmation) => Some(confirmation),
+                    quote_confirmation::ConfirmationPoll::Absent => None,
+                };
             let baseline_candidate = match authoritative_prequote {
                 PreQuoteDecision::QuoteRequired { candidate } => Some(candidate.clone()),
                 PreQuoteDecision::Hold | PreQuoteDecision::UnknownEvidence { .. } => None,
@@ -9471,9 +9471,12 @@ impl MonitoringEngine {
                         receipt_reason = Some("final_intent_mismatch".to_string());
                         break 'authority_tick;
                     }
-                    if let Err(error) =
-                        self.apply_shadow_quote_outcome(&action, snapshot, &truth, used_confirmation)
-                    {
+                    if let Err(error) = self.apply_shadow_quote_outcome(
+                        &action,
+                        snapshot,
+                        &truth,
+                        used_confirmation,
+                    ) {
                         receipt_outcome = V1AuthorityTickOutcomeV1::ApplyRejected;
                         receipt_reason = Some(format!("resolved_quote_apply_rejected:{error}"));
                         debug!(
