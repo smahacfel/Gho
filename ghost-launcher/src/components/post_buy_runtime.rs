@@ -333,8 +333,8 @@ pub struct PostBuyRuntimeConfig {
     pub shadow_ledger: Option<Arc<ShadowLedger>>,
     /// Canonical account-state runtime truth shared with shadow guardian.
     pub account_state_core: Option<Arc<AccountStateReducer>>,
-    /// Read-only RPC endpoint used only by the bounded stale-market refresh
-    /// task for active shadow positions.
+    /// Read-only RPC endpoint used by bounded shadow-only recovery tasks:
+    /// periodic stale-market refresh and point confirmation of a stale exit quote.
     pub shadow_market_refresh_rpc_url: Option<String>,
     /// Canonical shadow lifecycle/PnL proof log path derived from execution.shadow.*.
     pub shadow_lifecycle_log_path: Option<PathBuf>,

@@ -21127,7 +21127,11 @@ async fn active_shadow_simulation_load_precheck_receipt(
 
     let precheck_result = match required_account_precheck {
         Some(result) => result,
-        None => trigger_component.counterfactual_probe_missing_required_account(request).await,
+        None => {
+            trigger_component
+                .counterfactual_probe_missing_required_account(request)
+                .await
+        }
     };
     let error = match precheck_result {
         Ok(Some(missing)) => {
@@ -21226,9 +21230,9 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                     .await
                 {
                     Ok(mut prepared_buy) => {
-                if let Some(decision_ts_ms) = gatekeeper_decision_ts_ms {
-                    prepared_buy.decision_ts_ms = decision_ts_ms;
-                }
+                        if let Some(decision_ts_ms) = gatekeeper_decision_ts_ms {
+                            prepared_buy.decision_ts_ms = decision_ts_ms;
+                        }
                         let prepared_buy = if let Some(metadata) = join_metadata.clone() {
                             prepared_buy.with_join_metadata(metadata)
                         } else {
@@ -44205,7 +44209,10 @@ mod tests {
         assert_eq!(record.decision_to_buy_ms, Some(6));
         assert_eq!(entry_row["decision_to_buy_ms"], 6);
         let mut legacy_row = entry_row.clone();
-        legacy_row.as_object_mut().unwrap().remove("decision_to_buy_ms");
+        legacy_row
+            .as_object_mut()
+            .unwrap()
+            .remove("decision_to_buy_ms");
         let legacy_record: ShadowEntryRecord =
             serde_json::from_value(legacy_row).expect("starszy wpis bez nowego pola");
         assert_eq!(legacy_record.decision_to_buy_ms, None);

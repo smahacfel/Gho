@@ -6312,9 +6312,12 @@ impl BinaryParser {
                         Ok(swapped) => swapped,
                         Err(reason) => {
                             log_drop_role_mismatch(
-                                "cpi_swap_buy", PUMP_SWAP_PROGRAM_ID,
-                                slot_val.unwrap_or_default(), true,
-                                Some(&sig.to_string()), reason,
+                                "cpi_swap_buy",
+                                PUMP_SWAP_PROGRAM_ID,
+                                slot_val.unwrap_or_default(),
+                                true,
+                                Some(&sig.to_string()),
+                                reason,
                             );
                             continue;
                         }
@@ -6442,9 +6445,12 @@ impl BinaryParser {
                         Ok(swapped) => swapped,
                         Err(reason) => {
                             log_drop_role_mismatch(
-                                "cpi_swap_sell", PUMP_SWAP_PROGRAM_ID,
-                                slot_val.unwrap_or_default(), true,
-                                Some(&sig.to_string()), reason,
+                                "cpi_swap_sell",
+                                PUMP_SWAP_PROGRAM_ID,
+                                slot_val.unwrap_or_default(),
+                                true,
+                                Some(&sig.to_string()),
+                                reason,
                             );
                             continue;
                         }
