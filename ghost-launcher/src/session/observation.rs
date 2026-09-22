@@ -171,6 +171,7 @@ pub struct PoolObservationSession {
         Option<Mutex<Option<crate::metric_contracts::Pr2bTimedCompleteMetricContractSnapshotV1>>>,
     temporal_carry_forward_config: TemporalCarryForwardRuntimeConfig,
     decision_time_series_tx_capacity: usize,
+    max_evicted_decision_tx_event_ts_ms: Option<u64>,
     decision_time_series_retention_policy: DecisionTimeSeriesRetentionPolicy,
     decision_series_account_price_observations: Vec<DecisionSeriesAccountPriceObservation>,
     pub checkpoint_engine: CheckpointEngine,
@@ -292,6 +293,7 @@ impl PoolObservationSession {
             temporal_carry_forward_config:
                 TemporalCarryForwardRuntimeConfig::from_gatekeeper_config(gatekeeper_config),
             decision_time_series_tx_capacity,
+            max_evicted_decision_tx_event_ts_ms: None,
             decision_time_series_retention_policy: gatekeeper_config
                 .decision_time_series_retention_policy,
             decision_series_account_price_observations: Vec::new(),
@@ -309,7 +311,13 @@ impl PoolObservationSession {
 
     fn retain_decision_series_tx(&mut self, tx: Arc<PoolTransaction>) {
         while self.tx_buffer.len() >= self.decision_time_series_tx_capacity {
-            self.tx_buffer.pop_front();
+            if let Some(evicted) = self.tx_buffer.pop_front() {
+                let evicted_ts_ms = Self::temporal_tx_event_ts_ms(evicted.as_ref());
+                self.max_evicted_decision_tx_event_ts_ms = Some(
+                    self.max_evicted_decision_tx_event_ts_ms
+                        .map_or(evicted_ts_ms, |previous| previous.max(evicted_ts_ms)),
+                );
+            }
         }
         self.tx_buffer.push_back(tx);
     }
@@ -1821,8 +1829,6 @@ impl PoolObservationSession {
         MetricContractMaterializationErrorV1,
     > {
         let sorted_txs = self.temporal_sorted_transactions();
-        let source_complete = u64::try_from(self.tx_buffer.len())
-            .is_ok_and(|retained| retained == self.diagnostics.total_tx_seen);
         let (Some((_, _, first_ts_ms)), Some((_, _, last_ts_ms))) =
             (sorted_txs.first(), sorted_txs.last())
         else {
@@ -1832,12 +1838,15 @@ impl PoolObservationSession {
                 sell_count: 0,
                 transaction_count: 0,
                 failed_transaction_count: 0,
-                source_complete,
+                source_complete: self.max_evicted_decision_tx_event_ts_ms.is_none()
+                    && self.diagnostics.total_tx_seen == 0,
             });
         };
-        let recent_start = last_ts_ms
-            .saturating_sub(RCE_RECENT_WINDOW_MS_V1)
-            .max(*first_ts_ms);
+        let window_start = last_ts_ms.saturating_sub(RCE_RECENT_WINDOW_MS_V1);
+        let source_complete = self
+            .max_evicted_decision_tx_event_ts_ms
+            .is_none_or(|max_evicted_ts_ms| max_evicted_ts_ms < window_start);
+        let recent_start = window_start.max(*first_ts_ms);
         let recent = Self::rce_window_stats(&sorted_txs, recent_start, *last_ts_ms);
         let failed_transaction_count = u64::try_from(
             sorted_txs

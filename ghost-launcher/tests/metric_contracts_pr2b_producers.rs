@@ -204,6 +204,11 @@ fn recent_tx(timestamp_ms: u64, is_buy: bool, success: bool) -> PoolTransaction 
         token_mint: None,
         v_tokens_in_bonding_curve: None,
         v_sol_in_bonding_curve: None,
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         market_cap_sol: None,
         global_config: None,
         fee_recipient: None,
@@ -229,8 +234,13 @@ fn recent_tx(timestamp_ms: u64, is_buy: bool, success: bool) -> PoolTransaction 
     }
 }
 
-fn recent_snapshot(events: Vec<PoolTransaction>) -> RecentBuySellProducerSnapshotV1 {
-    let (.., gatekeeper, _, funding) = runtime_context();
+fn recent_session_with_capacity(
+    events: Vec<PoolTransaction>,
+    capacity: usize,
+) -> (SessionManager, Pubkey) {
+    let (.., mut gatekeeper, _, _) = runtime_context();
+    gatekeeper.decision_time_series_tx_capacity = capacity;
+    let funding = FundingSourceConfig::from_gatekeeper_config(&gatekeeper);
     let manager = SessionManager::new(SessionConfig {
         max_sessions: 1,
         ..SessionConfig::default()
@@ -261,11 +271,33 @@ fn recent_snapshot(events: Vec<PoolTransaction>) -> RecentBuySellProducerSnapsho
         })
         .unwrap();
     let session = manager.get_session(&pool).unwrap();
-    let mut session = session.write();
-    for event in events {
-        session.ingest_transaction(Arc::new(event));
+    {
+        let mut session = session.write();
+        for event in events {
+            session.ingest_transaction(Arc::new(event));
+        }
     }
-    session.metric_contract_recent_buy_sell_snapshot().unwrap()
+    (manager, pool)
+}
+
+fn recent_snapshot_with_capacity(
+    events: Vec<PoolTransaction>,
+    capacity: usize,
+) -> RecentBuySellProducerSnapshotV1 {
+    let (manager, pool) = recent_session_with_capacity(events, capacity);
+    let session = manager.get_session(&pool).unwrap();
+    let snapshot = session
+        .read()
+        .metric_contract_recent_buy_sell_snapshot()
+        .unwrap();
+    snapshot
+}
+
+fn recent_snapshot(events: Vec<PoolTransaction>) -> RecentBuySellProducerSnapshotV1 {
+    recent_snapshot_with_capacity(
+        events,
+        GatekeeperV2Config::default().decision_time_series_tx_capacity,
+    )
 }
 
 fn threshold(
@@ -685,6 +717,103 @@ fn recent_owner_is_successful_only_and_uses_inclusive_window_boundaries() {
     assert_eq!(snapshot.transaction_count, 2);
     assert_eq!(snapshot.failed_transaction_count, 1);
     assert!(snapshot.source_complete);
+}
+
+#[test]
+fn recent_buy_sell_safe_eviction_outside_window_remains_complete() {
+    let snapshot = recent_snapshot_with_capacity(
+        vec![
+            recent_tx(1_000, true, true),
+            recent_tx(12_000, true, true),
+            recent_tx(13_000, false, true),
+            recent_tx(14_000, true, true),
+        ],
+        3,
+    );
+    assert!(snapshot.source_complete);
+
+    let (profile, effective, _, _, _) = runtime_context();
+    let context = build_context(&profile, &effective);
+    build_recent_buy_sell_evidence_v1(&snapshot, &context).unwrap();
+}
+
+#[test]
+fn recent_buy_sell_eviction_at_inclusive_start_is_incomplete() {
+    let snapshot = recent_snapshot_with_capacity(
+        vec![
+            recent_tx(4_000, true, true),
+            recent_tx(12_000, true, true),
+            recent_tx(13_000, false, true),
+            recent_tx(14_000, true, true),
+        ],
+        3,
+    );
+    assert!(!snapshot.source_complete);
+
+    let (profile, effective, _, _, _) = runtime_context();
+    let context = build_context(&profile, &effective);
+    assert!(build_recent_buy_sell_evidence_v1(&snapshot, &context).is_err());
+}
+
+#[test]
+fn recent_buy_sell_eviction_inside_window_is_incomplete() {
+    let snapshot = recent_snapshot_with_capacity(
+        vec![
+            recent_tx(5_000, true, true),
+            recent_tx(12_000, true, true),
+            recent_tx(13_000, false, true),
+            recent_tx(14_000, true, true),
+        ],
+        3,
+    );
+    assert!(!snapshot.source_complete);
+}
+
+#[test]
+fn recent_buy_sell_out_of_order_eviction_uses_evicted_event_time_maximum() {
+    let snapshot = recent_snapshot_with_capacity(
+        vec![
+            recent_tx(13_000, true, true),
+            recent_tx(1_000, true, true),
+            recent_tx(2_000, false, true),
+            recent_tx(14_000, true, true),
+        ],
+        3,
+    );
+    assert!(!snapshot.source_complete);
+}
+
+#[test]
+fn recent_buy_sell_completeness_recovers_after_window_moves_past_evictions() {
+    let (manager, pool) = recent_session_with_capacity(
+        vec![
+            recent_tx(5_000, true, true),
+            recent_tx(12_000, true, true),
+            recent_tx(13_000, false, true),
+            recent_tx(14_000, true, true),
+        ],
+        3,
+    );
+    let session = manager.get_session(&pool).unwrap();
+    assert!(
+        !session
+            .read()
+            .metric_contract_recent_buy_sell_snapshot()
+            .unwrap()
+            .source_complete
+    );
+
+    session
+        .write()
+        .ingest_transaction(Arc::new(recent_tx(30_000, true, true)));
+
+    assert!(
+        session
+            .read()
+            .metric_contract_recent_buy_sell_snapshot()
+            .unwrap()
+            .source_complete
+    );
 }
 
 fn current_materialized_projection() -> (
