@@ -726,6 +726,7 @@ pub async fn run(
                             GhostEvent::PoolTransaction(_, None)
                             | GhostEvent::NewPoolDetected(_, None) => {
                                 increment_counter!("pr1_runtime_bypass_attempt_total");
+                                crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
                                 warn!(
                                     "SnapshotListener: rejected structural event without canonical PR1 permit"
                                 );

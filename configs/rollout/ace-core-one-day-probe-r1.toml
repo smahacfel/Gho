@@ -1,0 +1,142 @@
+# ACE Core V3 — one continuous, observe-only 24 h capture for the offline
+# SELECTED-vs-REST falsification probe.  This file has its own run ID and all
+# output paths are intentionally new; it must never overwrite a RUG R6 tape.
+# No reducer, entry intent, Position Manager lifecycle, simulation, or live
+# execution is enabled by this rollout.
+
+mode = "production"
+ghost_brain_config_path = "../../ghost-brain/ghost_brain_config.toml"
+
+[seer]
+ # The durable reserve-state lane must retain the exact candidate curve for
+ # the 11.111 s feature cutoff plus the 120 s sustained-outcome horizon.
+watched_pools_ttl_ms = 140000
+enabled = true
+source_mode = "grpc"
+commitment = "processed"
+stream_mode = "single_global"
+tx_filter_strategy = "per_pool"
+funding_lane_mode = "disabled"
+grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
+grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+grpc_auth_header = "x-api-key"
+rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"
+enable_pumpfun = true
+enable_bonkfun = false
+enable_raydium = false
+
+[trigger]
+enabled = false
+rpc_url = "${GHOST_TRIGGER_RPC_URL}"
+entry_mode = "shadow_only"
+max_concurrent_positions = 1
+# Trigger is disabled.  The ACE notional is only the offline typed quote cap.
+max_position_size_sol = 0.10
+emergency_floor_sol = 0.0001
+position_size_buffer_sol = 0.0001
+slippage_tolerance = 0.20
+
+[trigger.shadow_run]
+# The launcher validates this transport surface for execution_mode=shadow.
+# [trigger].enabled=false remains the hard no-dispatch switch.
+enabled = true
+payer_strategy = "ephemeral"
+shadow_rpc_url = "${GHOST_TRIGGER_SHADOW_RPC_URL}"
+commitment = "processed"
+sig_verify = false
+replace_recent_blockhash = true
+timeout_ms = 1600
+max_retries = 1
+max_concurrent = 1
+output_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/disabled_shadow_entries.jsonl"
+emit_event_bus = false
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+tx_build_compensation_ms = 250
+max_quote_age_ms = 1500
+entry_log_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/disabled_shadow_entries.jsonl"
+lifecycle_log_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/disabled_shadow_lifecycle.jsonl"
+timing_model = "prepared_entry_mirror"
+stale_policy = "emit_warning"
+
+[execution.events]
+output_dir = "/root/Gho_ingest/datasets/events/ace_core_one_day_probe/r1/day1"
+rotation_interval_ms = 300000
+flush_interval_ms = 1000
+max_file_size_bytes = 50000000
+enable_aem_ticks = false
+# PoolTransaction is optional in EventWriter and is mandatory for ACE V3.
+enable_optional_events = true
+
+[p37_shadow_probe]
+enabled = false
+
+[rug_scalp_v2]
+enabled = false
+
+[rug_reality_capture]
+enabled = true
+run_id = "ace-core-one-day-probe-r1-day1"
+manifest_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/run_manifest_v3.json"
+# `implementation_sha` is the frozen corrective implementation commit, distinct
+# from baseline PR #86 and from the runtime-computed BLAKE3 binary hash.
+baseline_sha = "43057b296663129ca9b4f572e793474830a5452c"
+implementation_sha = "6668ee64908d0f7ffac71f801931b650a1759c0a"
+code_hash = "git:6668ee64908d0f7ffac71f801931b650a1759c0a"
+health_evidence_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/capture_health_v1.json"
+
+[rug_reality_capture.cost_profile]
+profile_id = "current-pump-shadow-execution-policy-ace-core-r1"
+entry_compute_unit_limit = 400000
+entry_compute_unit_price_micro_lamports = 25000
+exit_compute_unit_limit = 400000
+exit_compute_unit_price_micro_lamports = 50000
+tip_policy_id = "entry_helius_sender_baseline_1000000__exit_legacy_jito_300000"
+ata_policy_id = "create_standard_spl_ata_if_missing__retain_no_close_refund__rent_165_bytes_at_manifest_start"
+retry_policy_id = "first_attempt_cost_only__no_retry_cost_amortisation__failed_retry_cost_recorded_separately"
+quote_age_policy_ms = 1500
+
+[rug_reality_capture.cost_profile.entry_transaction_costs]
+base_fee_lamports = 5000
+priority_fee_lamports = 10000
+jito_tip_lamports = 1000000
+ata_rent_lamports = 2039280
+ata_close_refund_lamports = 0
+retry_or_failure_cost_lamports = 0
+
+[rug_reality_capture.cost_profile.exit_transaction_costs]
+base_fee_lamports = 5000
+priority_fee_lamports = 20000
+jito_tip_lamports = 300000
+ata_rent_lamports = 0
+ata_close_refund_lamports = 0
+retry_or_failure_cost_lamports = 0
+
+[account_state_core]
+enable = true
+
+[durability]
+wal_enabled = false
+
+[metrics]
+enabled = true
+bind = "127.0.0.1"
+port = 19090
+
+[gui_backend]
+enabled = false
+bind_address = "127.0.0.1"
+port = 8848
+
+[logging]
+level = "info"
+console_enabled = true
+json_format = false
+file_enabled = true
+file_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/system.log"
+oracle_log_enabled = true
+oracle_log_path = "/root/Gho_ingest/logs/ace_core_one_day_probe/r1/day1/oracle.log"
+oracle_json_format = false

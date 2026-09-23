@@ -53,6 +53,68 @@ const PUMP_FEE_CONFIG_ACCOUNT_LEN: usize = 4_073;
 const PUMP_FEE_CONFIG_KNOWN_PREFIX_LEN: usize = 153;
 const BPS_DENOMINATOR: u64 = 10_000;
 
+/// Stable diagnostic class for a refresh of the immutable two-account fee
+/// authority.  Transport failures are intentionally distinct from an
+/// on-chain semantic contradiction: the former may be retried/advisory while
+/// the latter remains evidence about the optional RUG lane itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RugScalpFeeAuthorityRefreshErrorClassV1 {
+    Timeout,
+    RateLimited,
+    HttpStatus,
+    Transport,
+    Decode,
+    SemanticValidation,
+}
+
+impl RugScalpFeeAuthorityRefreshErrorClassV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::RateLimited => "http_429",
+            Self::HttpStatus => "http_status",
+            Self::Transport => "transport",
+            Self::Decode => "decode",
+            Self::SemanticValidation => "semantic_validation",
+        }
+    }
+}
+
+/// Classify without losing the raw error text at the callsite.  Solana's RPC
+/// client wraps transport implementations, so the diagnostic boundary uses
+/// conservative string recognition and defaults to `transport` only for
+/// known connection-family messages; all other failures remain semantic.
+pub fn classify_rug_scalp_fee_authority_refresh_error(
+    error: &anyhow::Error,
+) -> RugScalpFeeAuthorityRefreshErrorClassV1 {
+    let text = error.to_string().to_ascii_lowercase();
+    if text.contains("timeout") || text.contains("timed out") {
+        RugScalpFeeAuthorityRefreshErrorClassV1::Timeout
+    } else if text.contains("429") || text.contains("too many requests") {
+        RugScalpFeeAuthorityRefreshErrorClassV1::RateLimited
+    } else if text.contains("http status")
+        || text.contains("http error")
+        || text.contains("status code")
+    {
+        RugScalpFeeAuthorityRefreshErrorClassV1::HttpStatus
+    } else if text.contains("connection")
+        || text.contains("dns")
+        || text.contains("reset")
+        || text.contains("transport")
+        || text.contains("network")
+    {
+        RugScalpFeeAuthorityRefreshErrorClassV1::Transport
+    } else if text.contains("decode")
+        || text.contains("discriminator")
+        || text.contains("layout")
+        || text.contains("account data")
+    {
+        RugScalpFeeAuthorityRefreshErrorClassV1::Decode
+    } else {
+        RugScalpFeeAuthorityRefreshErrorClassV1::SemanticValidation
+    }
+}
+
 /// Frozen runtime authority for the two and only two Pump routes used by the
 /// prospective RUG experiment.  The serialized form is deliberately only an
 /// input to [`RuntimeProgramFeeScheduleRegistryV1`]: fixture evidence is
@@ -85,7 +147,7 @@ pub struct RugScalpPumpFeeScheduleV1 {
 /// build the runtime registry. It is persisted into the validation run
 /// manifest so schedule identifiers cannot be separated from their concrete
 /// owner/address/data evidence later.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RugScalpRuntimeFeeAuthorityManifestV1 {
     pub schema_version: u16,
     pub observed_slot: u64,
@@ -615,7 +677,11 @@ impl RugScalpPumpQuoteContractV1 {
         self.entry_transaction_costs.net_wallet_debit()
     }
 
-    fn exit_transaction_cost_lamports(&self) -> Result<u64, PumpQuoteError> {
+    /// Frozen cost of one full-position sell attempt.  Offline ACE-EV V2
+    /// records this cost when a typed take-profit instruction misses its
+    /// landed min-output protection; it never treats a failed attempt as a
+    /// free hypothetical retry.
+    pub(crate) fn exit_transaction_cost_lamports(&self) -> Result<u64, PumpQuoteError> {
         self.exit_transaction_costs.net_wallet_debit()
     }
 
@@ -650,19 +716,53 @@ impl RugScalpPumpQuoteContractV1 {
         best.ok_or(PumpQuoteError::ZeroAmount)
     }
 
+    /// Re-quote the *already selected* BuyV2 base amount on a landed state.
+    /// The original instruction cap remains immutable: callers cannot resize
+    /// upward after observing a more favourable landed reserve state.
+    pub(crate) fn quote_buy_v2_exact_base_out_with_max_sol_cost(
+        &self,
+        slot: u64,
+        reserves: PumpReserveState,
+        token_amount: u64,
+        max_sol_cost: u64,
+    ) -> Result<PumpQuoteV1, PumpQuoteError> {
+        self.registry.quote_exact_base_out(
+            RUG_SCALP_ENTRY_ROUTE,
+            slot,
+            reserves,
+            token_amount,
+            max_sol_cost,
+        )
+    }
+
     fn quote_exit_value(
         &self,
         slot: u64,
         reserves: PumpReserveState,
         token_amount: u64,
+        min_program_credit: u64,
     ) -> Result<PumpQuoteV1, PumpQuoteError> {
         self.registry.quote_exact_base_in_sell(
             RUG_SCALP_EXIT_ROUTE,
             slot,
             reserves,
             token_amount,
-            0,
+            min_program_credit,
         )
+    }
+
+    /// Typed full-position sell quote with an explicit instruction min-output
+    /// floor.  It exposes the program-level credit separately from transaction
+    /// costs so an offline state machine can account for failed take-profit
+    /// attempts without pretending a min-output rejection filled.
+    pub(crate) fn quote_full_position_exit_with_min_program_credit(
+        &self,
+        slot: u64,
+        reserves: PumpReserveState,
+        token_amount: u64,
+        min_program_credit: u64,
+    ) -> Result<PumpQuoteV1, PumpQuoteError> {
+        self.quote_exit_value(slot, reserves, token_amount, min_program_credit)
     }
 
     pub(crate) fn executable_exit_value_lamports(
@@ -671,7 +771,7 @@ impl RugScalpPumpQuoteContractV1 {
         reserves: PumpReserveState,
         token_amount: u64,
     ) -> Result<(PumpQuoteV1, u64), PumpQuoteError> {
-        let quote = self.quote_exit_value(slot, reserves, token_amount)?;
+        let quote = self.quote_exit_value(slot, reserves, token_amount, 0)?;
         let net = quote
             .program_settlement
             .wallet_debit_or_credit
@@ -2515,6 +2615,38 @@ mod tests {
     use super::*;
     use ghost_core::EventSemanticEnvelope;
     use ghost_core::{FeeRounding, ProgramFeeRule, ProgramFeeScheduleEvidenceV1, PumpQuoteError};
+
+    #[test]
+    fn fee_authority_refresh_classifies_transient_errors_separately_from_semantic_errors() {
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!("request timed out")),
+            RugScalpFeeAuthorityRefreshErrorClassV1::Timeout
+        );
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!("HTTP status 429")),
+            RugScalpFeeAuthorityRefreshErrorClassV1::RateLimited
+        );
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!("connection reset by peer")),
+            RugScalpFeeAuthorityRefreshErrorClassV1::Transport
+        );
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!("HTTP status 503")),
+            RugScalpFeeAuthorityRefreshErrorClassV1::HttpStatus
+        );
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!(
+                "account discriminator decode failed"
+            )),
+            RugScalpFeeAuthorityRefreshErrorClassV1::Decode
+        );
+        assert_eq!(
+            classify_rug_scalp_fee_authority_refresh_error(&anyhow!(
+                "Pump global/fee_config protocol fee conflict"
+            )),
+            RugScalpFeeAuthorityRefreshErrorClassV1::SemanticValidation
+        );
+    }
 
     fn runtime_schedule(
         route_variant: PumpRouteVariant,

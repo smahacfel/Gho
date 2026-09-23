@@ -1,0 +1,4 @@
+# Pinned runtime dependencies for the one offline ACE-EV V2 model script.
+# These are deliberately not linked into the Rust capture/runtime.
+numpy==2.3.2
+scikit-learn==1.7.1

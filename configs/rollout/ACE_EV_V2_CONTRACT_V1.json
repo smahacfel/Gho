@@ -1,0 +1,142 @@
+{
+  "schema": "ace_ev_v2_contract_v1",
+  "experiment_id": "ACE_EV_V2",
+  "estimand_id": "pump_bonding_curve_only_zero_recovery_floor_v1",
+  "mode": "offline_observed_path_non_propagated_executable_proxy",
+  "live_execution": false,
+  "typed_pumpswap_route": false,
+  "capture_invalid_if_any": [
+    "ace_capture_segment_invalid_total > 0",
+    "pr1_runtime_primary_coverage_gap_total > 0",
+    "pr1_runtime_candidate_admission_closed_total > 0",
+    "pr1_runtime_bypass_attempt_total > 0"
+  ],
+  "feature_contract": {
+    "feature_order": ["F1", "F2", "F3", "F4", "F5", "F6", "F7"],
+    "cutoff_ms": 11111,
+    "availability": "event_ts_ms <= birth_ts_ms + 11111 AND arrival_ts_ms <= detected_wall_ts_ms + 11111",
+    "minimum_buy_contract": "at least one successful non-synthetic BUY with known creator and signer, positive signer_pre_balance_lamports - signer_post_balance_lamports, and complete canonical order",
+    "pre_entry_creator_sell_veto": "successful non-synthetic creator SELL available on both event and arrival axes before the decision cutoff",
+    "features": {
+      "F1": "ln(1 + unique_first_buyers)",
+      "F2": "ln(1 + sum(first_buy_wallet_debit_lamports))",
+      "F3": "ln(((buyers_last_3s + 1) / (3.0 + 1.0)) / ((buyers_full_window + 1) / (11.111 + 1.0)))",
+      "F4": "creator_buy_debit / total_buy_debit",
+      "F5": "sum((first_buy_debit_i / total_first_buy_flow)^2)",
+      "F6": "max(first_buy_flow_in_one_slot) / total_first_buy_flow",
+      "F7": "ln((successful_sell_count + 1) / (successful_buy_count + 1))"
+    }
+  },
+  "feature_scale": {
+    "source": "valid_outcome_blind_checkpoint",
+    "population": "complete F1-F7 rows with no pre-entry creator-sell veto and minimum semantic wallet-debit contract",
+    "forbidden_inputs": ["post_cutoff_state", "quote", "entry", "exit", "pnl", "return", "hit_rate"],
+    "transform": "raw_feature -> winsorize[p01,p99] -> (value - median) / IQR",
+    "log_base": "natural",
+    "quantile_method": "quantile_linear",
+    "iqr_zero": "FEATURE_SCALE_INVALID",
+    "non_finite": "FEATURE_SCALE_INVALID",
+    "epsilon_fallback": false
+  },
+  "pre_entry": {
+    "required_route": "BuyV2",
+    "required_state": "direct PrimaryAuthority PoolReserveState",
+    "wallet_debit_cap_lamports": 150000000,
+    "entry_impact_bps_max": 500,
+    "immediate_exit_impact_bps_max": 500,
+    "complete_or_migrated_or_missing_route": "PRE_ENTRY_NON_EVALUABLE"
+  },
+  "entry": {
+    "send_time": "decision_ingress_cutoff_ms",
+    "latency_ms": 250,
+    "landing_window_ms": [250, 1250],
+    "landing_rule": "first direct state satisfying both event-time and arrival-time landing windows",
+    "sizing": "fix token quantity and BuyV2 max_sol_cost from the decision-time typed quote; do not resize on landed state",
+    "price_protection_failure": "ENTRY_FAILED_PRICE_PROTECTION with terminal_net_pnl_lamports = -entry_attempt_transaction_costs",
+    "no_landing_failure": "ENTRY_FAILED_NO_LANDING_STATE with terminal_net_pnl_lamports = -entry_attempt_transaction_costs"
+  },
+  "exit": {
+    "full_position_only": true,
+    "max_hold_ms": 120000,
+    "latency_ms": 250,
+    "landing_window_ms": [250, 1250],
+    "trigger_order_same_observation_time": ["creator_sell", "hard_loss", "take_profit", "max_hold"],
+    "hard_loss_net_return_lte": -0.30,
+    "take_profit_net_return_gte": 0.17,
+    "take_profit_max_attempts": 3,
+    "take_profit_landing_requirement": "landed program credit >= entry_total_debit * 1.17 + cumulative_failed_exit_costs + current_exit_transaction_cost",
+    "take_profit_failed_fill": "retain token amount, do not mutate curve, add frozen exit attempt cost, then continue creator-sell/hard-loss/max-hold policy",
+    "profit17_hit": "only a filled landed take-profit exit with terminal net return >= 0.17",
+    "post_entry_route_loss": {
+      "terminal_status": "POST_ENTRY_UNSUPPORTED_ROUTE_LOSS_FLOOR",
+      "exit_net_credit": 0,
+      "terminal_net_pnl": "-entry_total_debit - cumulative_failed_exit_costs",
+      "retain_in_cohort": true
+    },
+    "exit_state_unavailable": {
+      "terminal_status": "EXIT_STATE_UNAVAILABLE_LOSS_FLOOR",
+      "exit_net_credit": 0,
+      "terminal_net_pnl": "-entry_total_debit - cumulative_failed_exit_costs",
+      "retain_in_cohort": true
+    }
+  },
+  "enrollment": {
+    "limit": 250,
+    "candidate_order": ["decision_ingress_cutoff_ms", "birth_ts_ms", "event_slot", "bonding_curve", "base_mint"],
+    "selection_basis": "pre_entry_only",
+    "close_after_n": 250,
+    "outcome_drain_ms": 150000,
+    "latest_close_before_24h_ms": 150000,
+    "splits": {"TRAIN": [1, 100], "THRESHOLD_CALIBRATION": [101, 150], "UNTOUCHED_TEST": [151, 250]},
+    "insufficient_yield": "ACE_EV_V2_INSUFFICIENT_YIELD"
+  },
+  "model": {
+    "kind": "HuberRegressor",
+    "target": "terminal_net_pnl_sol",
+    "prediction": "predicted_robust_net_pnl_sol",
+    "epsilon": 1.35,
+    "alpha": 1.0,
+    "fit_intercept": true,
+    "tol": 0.00001,
+    "max_iter": 1000,
+    "warm_start": false,
+    "blas_threads": 1,
+    "threshold": "max(0, p75(predicted_robust_net_pnl_sol on THRESHOLD_CALIBRATION))",
+    "no_convergence": "ACE_EV_V2_INCONCLUSIVE"
+  },
+  "stress": {
+    "entry_latency_ms": 1000,
+    "exit_latency_ms": 1000,
+    "membership": "same model, same tau, same TEST selected/rest membership",
+    "missing_trajectory": "same terminal loss-floor contract"
+  },
+  "verdict": {
+    "positive": [
+      "selected_count >= 20",
+      "mean net PnL SELECTED > 0",
+      "mean net PnL SELECTED > mean REST",
+      "median SELECTED >= median REST",
+      "profit17 hit-rate SELECTED > REST",
+      "top-1 trade <= 50% positive PnL",
+      "latency 1s mean SELECTED > REST"
+    ],
+    "falsified": [
+      "selected_count >= 20",
+      "mean SELECTED <= 0",
+      "delta mean <= 0",
+      "median SELECTED <= median REST",
+      "profit17 hit-rate SELECTED <= REST"
+    ],
+    "otherwise": "ACE_EV_V2_INCONCLUSIVE",
+    "unsupported_route_negative_subtype": "unsupported_route_dominant",
+    "unsupported_route_dominant_definition": "POST_ENTRY_UNSUPPORTED_ROUTE_LOSS_FLOOR contributes more than 50% of absolute negative terminal_net_pnl_sol in the untouched TEST partition"
+  },
+  "qualification": {
+    "enrollment_duration_ms": 3600000,
+    "outcome_drain_ms": 150000,
+    "minimum_terminal_outcomes": 12,
+    "minimum_successful_entries_with_terminal_exit": 6,
+    "direct_post_birth_120s_state_count_gt": 0,
+    "qualification_rows_excluded_from_prospective_250": true
+  }
+}

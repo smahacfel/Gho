@@ -1,8 +1,9 @@
-//! Watchdog task — periodic health-status logging and controlled exit on stall.
+//! Watchdog task — periodic health-status logging and policy-controlled escalation.
 //!
 //! Every 60 seconds the watchdog reads the shared `RuntimeHealth` atomics and
-//! emits a single INFO line with channel ages. If any data-plane channel is
-//! stalled beyond configured thresholds the watchdog escalates:
+//! emits a single INFO line with channel ages. In ordinary execution a stalled
+//! data-plane can escalate to an exit; an observe-only ACE capture supplies an
+//! advisory policy so the same observations cannot acquire process authority.
 //!
 //! | condition                                  | action         |
 //! |--------------------------------------------|----------------|
@@ -14,6 +15,7 @@
 //! A timestamp of **0** means "not yet reported" (startup) and is treated as
 //! unknown — never triggering an exit.
 
+use crate::capture_resilience::{record_capture_failure, CaptureFailureClassV1};
 use ghost_core::health::{
     now_ms, RuntimeHealth, GRPC_STATE_AUTHENTICATING, GRPC_STATE_CONNECTED, GRPC_STATE_CONNECTING,
     GRPC_STATE_DISCONNECTED, GRPC_STATE_FAILED, GRPC_STATE_RECONNECTING, GRPC_STATE_SUBSCRIBING,
@@ -23,9 +25,24 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
+/// Whether a watchdog may terminate the process or may only emit typed,
+/// advisory capture evidence.  Observe-only ACE capture must never delegate
+/// process authority to a single external-stream stall sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchdogEscalationV1 {
+    FatalExit,
+    AdvisoryCapture,
+}
+
+impl WatchdogEscalationV1 {
+    fn fatal_exit_enabled(self) -> bool {
+        matches!(self, Self::FatalExit)
+    }
+}
+
 /// Threshold (ms) after which a gRPC stall is logged as ERROR.
 const GRPC_STALL_WARN_MS: u64 = 60_000;
-/// Threshold (ms) after which a gRPC stall triggers `process::exit(2)`.
+/// Threshold (ms) after which a gRPC stall requests the policy's escalation.
 const GRPC_STALL_EXIT_MS: u64 = 300_000;
 /// Absolute cap (ms) — zombie-connection guard.
 ///
@@ -33,7 +50,7 @@ const GRPC_STALL_EXIT_MS: u64 = 300_000;
 /// progress timestamp fresh), if no actual gRPC message has arrived for this
 /// long the connection is a zombie: TCP/HTTP2 handshakes happen, state
 /// transitions fire, reconnect counter rises, but subscription data never
-/// flows.  After this hard deadline we exit regardless.
+/// flows. After this hard deadline the caller's policy escalates.
 const GRPC_ZOMBIE_EXIT_MS: u64 = 10 * 60 * 1_000; // 10 minutes
 /// Threshold (ms) after which a pipeline stall (decisions) triggers `exit(3)`.
 const PIPELINE_DECISIONS_STALL_EXIT_MS: u64 = 300_000;
@@ -120,6 +137,22 @@ pub async fn run_with_shutdown(
     let fatal_exit_enabled = std::env::var("GHOST_WATCHDOG_FATAL_EXIT")
         .map(|v| v != "0" && v.to_lowercase() != "false")
         .unwrap_or(true);
+    let escalation = if fatal_exit_enabled {
+        WatchdogEscalationV1::FatalExit
+    } else {
+        WatchdogEscalationV1::AdvisoryCapture
+    };
+    run_with_shutdown_policy(health, is_grpc_mode, shutdown_rx, escalation).await;
+}
+
+/// Policy-aware entrypoint for launcher-owned runtime paths.
+pub async fn run_with_shutdown_policy(
+    health: Arc<RuntimeHealth>,
+    is_grpc_mode: bool,
+    mut shutdown_rx: Option<broadcast::Receiver<()>>,
+    escalation: WatchdogEscalationV1,
+) {
+    let fatal_exit_enabled = escalation.fatal_exit_enabled();
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -209,9 +242,12 @@ pub async fn run_with_shutdown(
                                 grpc_state_label(grpc_state),
                                 GRPC_ZOMBIE_EXIT_MS,
                             );
-                            if fatal_exit_enabled {
-                                std::process::exit(2);
-                            }
+                            escalate_or_record_advisory(
+                                escalation,
+                                CaptureFailureClassV1::CaptureSegmentInvalid,
+                                "grpc_zombie_stall",
+                                2,
+                            );
                         } else {
                             error!(
                                 "WATCHDOG WARN: gRPC silent for {}ms but transport progress was observed {} ago (state={}, reconnects={})",
@@ -228,9 +264,12 @@ pub async fn run_with_shutdown(
                             fmt_age(age_grpc_progress),
                             GRPC_STALL_EXIT_MS,
                         );
-                        if fatal_exit_enabled {
-                            std::process::exit(2);
-                        }
+                        escalate_or_record_advisory(
+                            escalation,
+                            CaptureFailureClassV1::CaptureSegmentInvalid,
+                            "grpc_stall",
+                            2,
+                        );
                     }
                 } else if grpc_age > GRPC_STALL_WARN_MS {
                     error!(
@@ -257,9 +296,12 @@ pub async fn run_with_shutdown(
                         grpc_state_label(grpc_state),
                         fmt_age(age_grpc_progress),
                     );
-                    if fatal_exit_enabled {
-                        std::process::exit(2);
-                    }
+                    escalate_or_record_advisory(
+                        escalation,
+                        CaptureFailureClassV1::CaptureSegmentInvalid,
+                        "grpc_subscribe_stall",
+                        2,
+                    );
                 }
             } else if grpc_subscribe_has_stalled_without_messages(
                 age_grpc,
@@ -286,9 +328,12 @@ pub async fn run_with_shutdown(
                         "WATCHDOG FATAL: decisions writer stalled for {}ms while gatekeeper decisions are flowing — exiting with code 3",
                         dec_age
                     );
-                    if fatal_exit_enabled {
-                        std::process::exit(3);
-                    }
+                    escalate_or_record_advisory(
+                        escalation,
+                        CaptureFailureClassV1::OptionalLaneDegraded,
+                        "decisions_writer_stall",
+                        3,
+                    );
                 }
             }
 
@@ -301,9 +346,12 @@ pub async fn run_with_shutdown(
                             "WATCHDOG FATAL: events writer stalled for {}ms while decisions are flowing — exiting with code 4",
                             events_age,
                         );
-                        if fatal_exit_enabled {
-                            std::process::exit(4);
-                        }
+                        escalate_or_record_advisory(
+                            escalation,
+                            CaptureFailureClassV1::CaptureSegmentInvalid,
+                            "events_writer_stall",
+                            4,
+                        );
                     }
                 }
             }
@@ -311,6 +359,26 @@ pub async fn run_with_shutdown(
     }
 
     info!("Watchdog stopped");
+}
+
+fn escalate_or_record_advisory(
+    escalation: WatchdogEscalationV1,
+    advisory_class: CaptureFailureClassV1,
+    code: &'static str,
+    exit_code: i32,
+) {
+    if escalation.fatal_exit_enabled() {
+        std::process::exit(exit_code);
+    }
+    debug_assert!(
+        !advisory_class.closes_candidate_admission(),
+        "an advisory watchdog path cannot own global admission authority"
+    );
+    record_capture_failure(advisory_class, code);
+    error!(
+        failure_class = advisory_class.as_str(),
+        code, "WATCHDOG_CAPTURE_ADVISORY: process exit suppressed for observe-only capture"
+    );
 }
 
 #[cfg(test)]
@@ -399,5 +467,17 @@ mod tests {
             .await
             .expect("watchdog should stop promptly after shutdown")
             .expect("watchdog task should not panic");
+    }
+
+    #[test]
+    fn advisory_capture_policy_has_no_process_exit_authority() {
+        assert!(!WatchdogEscalationV1::AdvisoryCapture.fatal_exit_enabled());
+        assert!(WatchdogEscalationV1::FatalExit.fatal_exit_enabled());
+    }
+
+    #[test]
+    fn ace_watchdog_keeps_external_stalls_nonfatal_but_marks_prolonged_tape_gaps() {
+        assert!(!CaptureFailureClassV1::CaptureSegmentInvalid.closes_candidate_admission());
+        assert!(!CaptureFailureClassV1::OptionalLaneDegraded.closes_candidate_admission());
     }
 }

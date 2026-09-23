@@ -5724,6 +5724,10 @@ pub async fn run_with_oracle(
                     match event {
                         Ok(ghost_event) => {
                             match ghost_event {
+                                GhostEvent::SeerOracleDrainBarrier(_) => {
+                                    // Shutdown-only transport watermark; it is consumed by
+                                    // OracleRuntime and never enters Trigger policy/execution.
+                                }
                                 GhostEvent::NewPoolDetected(pool, Some(_permit)) => {
                                     // 🟢 CHANGED: The "Lobotomy" - Don't score immediately. Cache and wait.
                                     info!(
@@ -5740,6 +5744,7 @@ pub async fn run_with_oracle(
                                         "pr1_runtime_bypass_attempt_total",
                                         1u64
                                     );
+                                    crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
                                     warn!(
                                         "Trigger: rejected NewPoolDetected without canonical PR1 permit"
                                     );
@@ -5770,6 +5775,10 @@ pub async fn run_with_oracle(
                                     ::metrics::counter!(
                                         "pr1_runtime_bypass_attempt_total",
                                         1u64
+                                    );
+                                    crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
+                                    warn!(
+                                        "Trigger: rejected PoolTransaction without canonical PR1 permit"
                                     );
                                 }
                                 GhostEvent::FundingTransferObserved(_) => {
@@ -5805,6 +5814,11 @@ pub async fn run_with_oracle(
                                 GhostEvent::AccountUpdate(_) => {
                                     // AccountUpdate events are consumed by OracleRuntime for
                                     // reconciliation; Trigger does not need to process them.
+                                }
+                                GhostEvent::FullUniverseReserveEvidence(_) => {
+                                    // ACE reserve evidence is a capture-only durable lane.
+                                    // It must never reach Trigger, Gatekeeper policy, or any
+                                    // execution surface.
                                 }
                                 GhostEvent::ShadowBuySimulated(_) => {
                                     // Compare-only shadow entry results are not consumed here.
