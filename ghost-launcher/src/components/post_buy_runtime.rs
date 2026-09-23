@@ -333,8 +333,8 @@ pub struct PostBuyRuntimeConfig {
     pub shadow_ledger: Option<Arc<ShadowLedger>>,
     /// Canonical account-state runtime truth shared with shadow guardian.
     pub account_state_core: Option<Arc<AccountStateReducer>>,
-    /// Read-only RPC endpoint used only by the bounded stale-market refresh
-    /// task for active shadow positions.
+    /// Read-only RPC endpoint used by bounded shadow-only recovery tasks:
+    /// periodic stale-market refresh and point confirmation of a stale exit quote.
     pub shadow_market_refresh_rpc_url: Option<String>,
     /// Canonical shadow lifecycle/PnL proof log path derived from execution.shadow.*.
     pub shadow_lifecycle_log_path: Option<PathBuf>,
@@ -647,6 +647,7 @@ async fn refresh_shadow_market_target(
         sol_reserves: curve.virtual_sol_reserves,
         token_reserves: curve.virtual_token_reserves,
         is_complete: curve.complete,
+        canonical_creator: None,
         slot: response.context.slot,
         // This is an observation-context slot, never an account-write
         // ordering proof. `apply_rpc_refresh` deliberately keeps it out of
@@ -2928,6 +2929,8 @@ pub async fn run(
             Some(shadow_ledger) => {
                 let guardian_config = build_shadow_guardian_config(&config);
                 let wait_for_timestop_ms = guardian_config.wait_for_timestop_ms();
+                let quote_recovery_timeout =
+                    Duration::from_millis(guardian_config.exit_policy_v1.quote_recovery_ms);
                 let exit_replay_enabled = guardian_config.exit_replay_v1.enabled;
                 let (signal_tx, signal_rx) =
                     mpsc::channel(guardian_config.signal_channel_buffer.max(1));
@@ -2948,6 +2951,15 @@ pub async fn run(
                     };
                 if let Some(account_state_core) = config.account_state_core.clone() {
                     monitoring_engine.set_account_state_core(account_state_core);
+                    if let Some(rpc_url) = config.shadow_market_refresh_rpc_url.as_ref() {
+                        monitoring_engine.set_shadow_quote_confirmation_rpc(Arc::new(
+                            new_async_rpc_client_with_timeout(
+                                rpc_url.clone(),
+                                quote_recovery_timeout,
+                            ),
+                        ));
+                        info!("PostBuyRuntime: on-demand shadow exit quote confirmation enabled");
+                    }
                 }
                 if let Some(shadow_v2_harness) = shadow_v2_harness.as_ref() {
                     monitoring_engine
@@ -6334,6 +6346,7 @@ mod tests {
             virtual_token_reserves: 1_000_000_000_000,
             real_sol_reserves: 7_000_000_000,
             real_token_reserves: 500_000_000_000,
+            canonical_creator: None,
             bonding_curve_progress: 42.5,
             price_sol: 0.00003,
             market_cap_sol: 30.0,
@@ -6375,6 +6388,9 @@ mod tests {
             state_ts_ms: state.last_update_ts_ms,
             amount_lamports: 7_000_000,
             min_tokens_out: 1,
+            quoted_tokens_out: None,
+            quote_state_age_slots: None,
+            quote_refresh_status: None,
             fee_bps: Some(100),
             slippage_tolerance_bps: Some(500),
             token_decimals: 6,
@@ -6756,6 +6772,7 @@ sys.exit(0)
             virtual_token_reserves: 1_000_000_000_000,
             real_sol_reserves: 7_000_000_000,
             real_token_reserves: 500_000_000_000,
+            canonical_creator: None,
             bonding_curve_progress: 42.5,
             price_sol: 0.00003,
             market_cap_sol: 30.0,
@@ -6904,6 +6921,7 @@ sys.exit(0)
             virtual_token_reserves: 1_000_000_000_000,
             real_sol_reserves: 7_000_000_000,
             real_token_reserves: 500_000_000_000,
+            canonical_creator: None,
             bonding_curve_progress: 42.5,
             price_sol: 0.00003,
             market_cap_sol: 30.0,
@@ -6941,6 +6959,9 @@ sys.exit(0)
             state_ts_ms: state.last_update_ts_ms,
             amount_lamports: 7_000_000,
             min_tokens_out: 1,
+            quoted_tokens_out: None,
+            quote_state_age_slots: None,
+            quote_refresh_status: None,
             fee_bps: Some(100),
             slippage_tolerance_bps: Some(500),
             token_decimals: 6,
@@ -7723,6 +7744,7 @@ sys.exit(0)
             sol_reserves,
             token_reserves,
             is_complete: 0,
+            canonical_creator: None,
             slot: 42,
             write_version: Some(1),
             txn_signature: None,

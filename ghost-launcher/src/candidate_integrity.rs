@@ -173,7 +173,6 @@ pub(crate) struct CandidateIntegrityTerminalRetirementV1 {
 struct TerminalCandidateTombstonesV1 {
     by_candidate: HashMap<PumpCandidateIdentityV1, CandidateIntegrityRecordV1>,
     by_pool: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
-    by_mint: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
     fifo: VecDeque<PumpCandidateIdentityV1>,
     cap: usize,
     eviction_count: u64,
@@ -185,7 +184,6 @@ impl TerminalCandidateTombstonesV1 {
         Self {
             by_candidate: HashMap::with_capacity(cap.min(4096)),
             by_pool: HashMap::with_capacity(cap.min(4096)),
-            by_mint: HashMap::with_capacity(cap.min(4096)),
             fifo: VecDeque::with_capacity(cap.min(4096)),
             cap: cap.max(1),
             eviction_count: 0,
@@ -209,9 +207,6 @@ impl TerminalCandidateTombstonesV1 {
                 if self.by_pool.get(&old_record.candidate.pool_amm_id) == Some(&oldest) {
                     self.by_pool.remove(&old_record.candidate.pool_amm_id);
                 }
-                if self.by_mint.get(&old_record.candidate.mint) == Some(&oldest) {
-                    self.by_mint.remove(&old_record.candidate.mint);
-                }
                 self.eviction_count = self.eviction_count.saturating_add(1);
                 if self.first_evicted.is_none() {
                     self.first_evicted = Some(old_record.clone());
@@ -222,7 +217,6 @@ impl TerminalCandidateTombstonesV1 {
         }
 
         self.by_pool.insert(candidate.pool_amm_id, candidate);
-        self.by_mint.insert(candidate.mint, candidate);
         self.by_candidate.insert(candidate, record);
         self.fifo.push_back(candidate);
         evicted
@@ -246,11 +240,6 @@ impl TerminalCandidateTombstonesV1 {
                 conflicts.insert(*existing);
             }
         }
-        if let Some(existing) = self.by_mint.get(&candidate.mint) {
-            if *existing != candidate {
-                conflicts.insert(*existing);
-            }
-        }
         conflicts.into_iter().collect()
     }
 
@@ -264,7 +253,6 @@ impl TerminalCandidateTombstonesV1 {
 struct CandidateIntegrityRegistryStateV1 {
     records: HashMap<PumpCandidateIdentityV1, CandidateIntegrityRecordV1>,
     by_pool: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
-    by_mint: HashMap<solana_sdk::pubkey::Pubkey, PumpCandidateIdentityV1>,
     canonical_apply_fence: CanonicalApplyFenceV1,
     /// Per-candidate linearization fence for terminal Oracle cleanup.
     ///
@@ -273,6 +261,8 @@ struct CandidateIntegrityRegistryStateV1 {
     /// retired the candidate, and removed its runtime identity. This prevents
     /// a receipt from appearing between a reclaim snapshot and retirement.
     terminal_cleanup_barriers: HashSet<PumpCandidateIdentityV1>,
+    // Własność sesji jest niezależna od Ready i liczby nierozliczonych receiptów.
+    oracle_sessions: HashSet<PumpCandidateIdentityV1>,
     /// In-flight ingest leases that have passed the CandidateIntegrity
     /// boundary but have not yet completed the corresponding
     /// `PumpObservationLedger::observe` plus receipt-stage sequence.
@@ -294,9 +284,9 @@ impl CandidateIntegrityRegistryStateV1 {
         Self {
             records: HashMap::new(),
             by_pool: HashMap::new(),
-            by_mint: HashMap::new(),
             canonical_apply_fence: CanonicalApplyFenceV1::default(),
             terminal_cleanup_barriers: HashSet::new(),
+            oracle_sessions: HashSet::new(),
             canonical_observation_leases: HashMap::new(),
             terminal_tombstones: TerminalCandidateTombstonesV1::new(max_terminal_tombstones),
             terminal_ledger_retirements: VecDeque::with_capacity(max_terminal_tombstones.min(4096)),
@@ -641,6 +631,7 @@ impl CandidateIntegrityRegistry {
         // turning a valid terminal reclaim into a later CandidateMissing.
         let terminal_cleanup_owns_retirement = state.terminal_cleanup_barriers.contains(&candidate);
         let retire = !terminal_cleanup_owns_retirement
+            && !state.oracle_sessions.contains(&candidate)
             && !Self::has_unresolved_canonical_receipt(&state, candidate)
             && state.records.get(&candidate).is_some_and(|record| {
                 record.outcome != CandidateIntegrityOutcomeV1::Ready
@@ -687,9 +678,6 @@ impl CandidateIntegrityRegistry {
         };
         if state.by_pool.get(&candidate.pool_amm_id) == Some(&candidate) {
             state.by_pool.remove(&candidate.pool_amm_id);
-        }
-        if state.by_mint.get(&candidate.mint) == Some(&candidate) {
-            state.by_mint.remove(&candidate.mint);
         }
         Self::cleanup_canonical_apply_fence_for_candidate(state, candidate);
         let evicted = state.terminal_tombstones.insert(removed.clone());
@@ -1555,9 +1543,6 @@ impl CandidateIntegrityRegistry {
             state
                 .by_pool
                 .insert(signal.candidate.pool_amm_id, signal.candidate);
-            state
-                .by_mint
-                .insert(signal.candidate.mint, signal.candidate);
             state.records.insert(
                 signal.candidate,
                 CandidateIntegrityRecordV1 {
@@ -1628,6 +1613,7 @@ impl CandidateIntegrityRegistry {
         // technical failure in the same bounded tombstone lane used by
         // ordinary terminal Oracle cleanup instead.
         let pre_session_terminal_failure = inserted
+            && !state.oracle_sessions.contains(&signal.candidate)
             && signal.outcome != CandidateIntegrityOutcomeV1::Ready
             && !state
                 .canonical_apply_fence
@@ -1725,6 +1711,44 @@ impl CandidateIntegrityRegistry {
             .ok_or(CandidateIntegrityErrorV1::CandidateMissing)
     }
 
+    /// Przejęcie własności przed spawnem Oracle, kiedy receipt CREATE jest jeszcze pending.
+    /// Nie tworzy Ready, nie odtwarza tombstone i nie zmienia wyniku integralności.
+    pub(crate) fn claim_oracle_session(
+        &self,
+        receipt: &CanonicalMutationApplyReceiptV1,
+    ) -> Result<(), CandidateIntegrityErrorV1> {
+        self.require_candidate_admission_open()?;
+        let mut state = self.lock_state()?;
+        // Zamknięcie admission używa tej samej blokady co przejęcie własności.
+        self.require_candidate_admission_open()?;
+        validate_aliases(&state, receipt.candidate)?;
+        if state.terminal_tombstones.get(receipt.candidate).is_some()
+            || state.terminal_cleanup_barriers.contains(&receipt.candidate)
+        {
+            return Err(CandidateIntegrityErrorV1::TerminalCleanupInProgress);
+        }
+        let valid = state
+            .canonical_apply_fence
+            .receipts_by_runtime_key
+            .get(&receipt.runtime_key)
+            .is_some_and(|entry| {
+                entry.receipt == *receipt
+                    && !entry.failed
+                    && !entry.applied
+                    && receipt.runtime_key.mutation_family == PumpMutationFamilyV1::InitializePool
+            });
+        if !valid {
+            return Err(CandidateIntegrityErrorV1::CandidateMissing);
+        }
+        if !state.oracle_sessions.contains(&receipt.candidate)
+            && state.oracle_sessions.len() >= self.limits.max_candidates
+        {
+            return Err(CandidateIntegrityErrorV1::RegistryCapacityExceeded);
+        }
+        state.oracle_sessions.insert(receipt.candidate);
+        Ok(())
+    }
+
     /// Retire a completed runtime candidate from the active admission maps.
     ///
     /// This is called only after the Oracle has removed its session/pool. The
@@ -1746,6 +1770,7 @@ impl CandidateIntegrityRegistry {
             if has_unresolved_receipt {
                 return Err(CandidateIntegrityErrorV1::TerminalRetirementPending);
             }
+            state.oracle_sessions.remove(&candidate);
             return Ok(false);
         };
         if has_unresolved_receipt {
@@ -1757,8 +1782,9 @@ impl CandidateIntegrityRegistry {
                 actual: record.lifecycle_phase,
             });
         }
-        self.retire_resolved_record(&mut state, candidate)
-            .map(|removed| removed.is_some())
+        let removed = self.retire_resolved_record(&mut state, candidate)?;
+        state.oracle_sessions.remove(&candidate);
+        Ok(removed.is_some())
     }
 
     /// Drain the bounded terminal-retirement control handoff. The caller is
@@ -2417,9 +2443,6 @@ fn publish_ready_with_cas(
             state
                 .by_pool
                 .insert(signal.candidate.pool_amm_id, signal.candidate);
-            state
-                .by_mint
-                .insert(signal.candidate.mint, signal.candidate);
             state.records.insert(
                 signal.candidate,
                 CandidateIntegrityRecordV1 {
@@ -2463,23 +2486,16 @@ fn validate_aliases(
     state: &CandidateIntegrityRegistryStateV1,
     candidate: PumpCandidateIdentityV1,
 ) -> Result<(), CandidateIntegrityErrorV1> {
+    // Mint może mieć krzywą Pump i wiele pooli PumpSwap. Sprzecznością
+    // tożsamości jest inny mint tego samego poola, a nie inny pool tokena.
     if state
         .by_pool
         .get(&candidate.pool_amm_id)
         .is_some_and(|existing| *existing != candidate)
         || state
-            .by_mint
-            .get(&candidate.mint)
-            .is_some_and(|existing| *existing != candidate)
-        || state
             .terminal_tombstones
             .by_pool
             .get(&candidate.pool_amm_id)
-            .is_some_and(|existing| *existing != candidate)
-        || state
-            .terminal_tombstones
-            .by_mint
-            .get(&candidate.mint)
             .is_some_and(|existing| *existing != candidate)
     {
         return Err(CandidateIntegrityErrorV1::CandidateAliasConflict);
@@ -2493,11 +2509,6 @@ fn conflicting_alias_candidates(
 ) -> Vec<PumpCandidateIdentityV1> {
     let mut conflicts = HashSet::new();
     if let Some(existing) = state.by_pool.get(&candidate.pool_amm_id) {
-        if *existing != candidate {
-            conflicts.insert(*existing);
-        }
-    }
-    if let Some(existing) = state.by_mint.get(&candidate.mint) {
         if *existing != candidate {
             conflicts.insert(*existing);
         }
@@ -2615,6 +2626,87 @@ mod tests {
     };
     use solana_sdk::{pubkey::Pubkey, signature::Signature};
     use std::sync::Barrier;
+
+    #[test]
+    fn r21_owned_session_keeps_failure_before_and_after_create_ack() {
+        for ack_first in [false, true] {
+            let registry = Arc::new(CandidateIntegrityRegistry::new(Default::default()));
+            let c = candidate();
+            let mut create = canonical(Signature::new_unique(), 0, c);
+            create.mutation_family = PumpMutationFamilyV1::InitializePool;
+            let receipt = registry.stage_canonical_mutation(&create).unwrap();
+            registry.claim_oracle_session(&receipt).unwrap();
+            if ack_first {
+                registry.mark_canonical_apply_succeeded(&receipt).unwrap();
+            }
+            registry
+                .record_signal(signal(
+                    c,
+                    CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                    1,
+                ))
+                .unwrap();
+            if !ack_first {
+                registry.mark_canonical_apply_succeeded(&receipt).unwrap();
+            }
+            assert!(matches!(
+                registry.evaluation_guard(c),
+                Err(CandidateIntegrityErrorV1::NotReady(
+                    CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete
+                ))
+            ));
+            assert_eq!(registry.terminal_tombstone_count().unwrap(), 0);
+            // Kolejne Ready nie może usunąć uprzednio stwierdzonego błędu.
+            registry
+                .record_signal(signal(c, CandidateIntegrityOutcomeV1::Ready, 2))
+                .unwrap();
+            assert!(matches!(
+                registry.evaluation_guard(c),
+                Err(CandidateIntegrityErrorV1::NotReady(_))
+            ));
+            registry
+                .fail_pending_canonical_applies_for_candidate(c)
+                .unwrap();
+            assert!(registry.retire_terminal_candidate(c).unwrap());
+            registry.finish_terminal_candidate_cleanup(c).unwrap();
+            assert!(!registry.lock_state().unwrap().oracle_sessions.contains(&c));
+            assert!(matches!(
+                registry.evaluation_guard(c),
+                Err(CandidateIntegrityErrorV1::CandidateMissing)
+            ));
+            assert!(registry.candidate_admission_open());
+        }
+    }
+
+    #[test]
+    fn r21_session_claim_requires_pending_authentic_create_and_keeps_pending_cleanup() {
+        let registry = Arc::new(CandidateIntegrityRegistry::new(Default::default()));
+        let c = candidate();
+        let trade = canonical(Signature::new_unique(), 0, c);
+        let receipt = registry.stage_canonical_mutation(&trade).unwrap();
+        assert!(registry.claim_oracle_session(&receipt).is_err());
+        registry.fail_canonical_apply(&receipt).unwrap();
+        let c = candidate();
+        let mut create = canonical(Signature::new_unique(), 0, c);
+        create.mutation_family = PumpMutationFamilyV1::InitializePool;
+        let receipt = registry.stage_canonical_mutation(&create).unwrap();
+        let mut forged = receipt.clone();
+        forged.evidence_hash_blake3 = [255; 32];
+        assert!(registry.claim_oracle_session(&forged).is_err());
+        registry.claim_oracle_session(&receipt).unwrap();
+        assert_eq!(
+            registry.retire_terminal_candidate(c),
+            Err(CandidateIntegrityErrorV1::TerminalRetirementPending)
+        );
+        assert!(registry.lock_state().unwrap().oracle_sessions.contains(&c));
+        registry
+            .fail_pending_canonical_applies_for_candidate(c)
+            .unwrap();
+        registry.retire_terminal_candidate(c).unwrap();
+        registry.finish_terminal_candidate_cleanup(c).unwrap();
+        assert!(registry.lock_state().unwrap().oracle_sessions.is_empty());
+        assert!(registry.claim_oracle_session(&receipt).is_err());
+    }
 
     fn candidate() -> PumpCandidateIdentityV1 {
         PumpCandidateIdentityV1 {
@@ -3030,6 +3122,112 @@ mod tests {
             CaptureFailureClassV1::CandidateLocal
         );
         assert!(registry.candidate_admission_open());
+    }
+
+    #[test]
+    fn same_mint_other_pool_failure_preserves_buy_guard_and_receipts() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let first = candidate();
+        registry
+            .record_signal(signal(first, CandidateIntegrityOutcomeV1::Ready, 1))
+            .unwrap();
+        let evaluation = registry.evaluation_guard(first).unwrap();
+        evaluation.mark_mfs_materialized().unwrap();
+        evaluation.mark_evaluation_running().unwrap();
+        let submit = evaluation
+            .publish_terminal(CandidateTerminalTransitionV1::BuyNotSubmitted)
+            .unwrap()
+            .unwrap();
+        let before = registry.snapshot(first).unwrap();
+        let mutation = canonical(Signature::new_unique(), 0, first);
+        let _receipt = registry.stage_canonical_mutation(&mutation).unwrap();
+        let counts = registry.canonical_apply_fence_counts().unwrap();
+        let other = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: first.mint,
+        };
+        registry
+            .record_signal(signal(
+                other,
+                CandidateIntegrityOutcomeV1::PrimaryRawCoverageIncomplete,
+                2,
+            ))
+            .expect("Awaria drugiego poola nie jest konfliktem tożsamości pierwszego");
+        assert_eq!(registry.snapshot(first).unwrap(), before);
+        assert_eq!(registry.canonical_apply_fence_counts().unwrap(), counts);
+        assert_eq!(
+            submit.try_begin_submit().unwrap(),
+            CandidateSubmitTransitionV1::StartedNow
+        );
+        assert!(registry.evaluation_guard(other).is_err());
+    }
+
+    #[test]
+    fn same_mint_pools_keep_independent_ready_proofs_and_terminal_history() {
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let first = candidate();
+        registry
+            .record_signal(signal(first, CandidateIntegrityOutcomeV1::Ready, 1))
+            .unwrap();
+        let other = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: first.mint,
+        };
+        let mutation = canonical(Signature::new_unique(), 0, other);
+        let receipt = registry.stage_canonical_mutation(&mutation).unwrap();
+        registry
+            .seal_complete_transaction_inventory(
+                mutation.locator.signature,
+                &[ready_signal(&mutation, other)],
+            )
+            .expect("Mint współdzielony przez poole nie blokuje odrębnego dowodu");
+        assert!(matches!(
+            registry.snapshot(other),
+            Err(CandidateIntegrityErrorV1::CandidateMissing)
+        ));
+        registry.mark_canonical_apply_succeeded(&receipt).unwrap();
+        assert!(registry.evaluation_guard(other).is_ok());
+        registry.retire_terminal_candidate(first).unwrap();
+        assert!(registry.evaluation_guard(other).is_ok());
+        assert_eq!(
+            registry.account_state_apply_allowed(other).unwrap(),
+            Some(true)
+        );
+        assert!(registry.evaluation_guard(first).is_err());
+        let third = PumpCandidateIdentityV1 {
+            pool_amm_id: Pubkey::new_unique(),
+            mint: first.mint,
+        };
+        registry
+            .record_signal(signal(third, CandidateIntegrityOutcomeV1::Ready, 3))
+            .unwrap();
+        assert!(registry.evaluation_guard(third).is_ok());
+        assert!(registry.candidate_admission_open());
+    }
+
+    #[test]
+    fn same_pool_changed_mint_still_fails_closed_active_and_retired() {
+        for retired in [false, true] {
+            let registry = Arc::new(CandidateIntegrityRegistry::default());
+            let first = candidate();
+            registry
+                .record_signal(signal(first, CandidateIntegrityOutcomeV1::Ready, 1))
+                .unwrap();
+            if retired {
+                registry.retire_terminal_candidate(first).unwrap();
+            }
+            let forged = PumpCandidateIdentityV1 {
+                pool_amm_id: first.pool_amm_id,
+                mint: Pubkey::new_unique(),
+            };
+            assert_eq!(
+                registry.record_signal(signal(forged, CandidateIntegrityOutcomeV1::Ready, 2)),
+                Err(CandidateIntegrityErrorV1::CandidateAliasConflict)
+            );
+            assert!(registry.evaluation_guard(forged).is_err());
+            assert!(registry.evaluation_guard(first).is_err());
+            assert!(registry.candidate_admission_open());
+        }
     }
 
     #[test]

@@ -621,7 +621,7 @@ pub struct TriggerComponent {
 impl TriggerComponent {
     const MINT_FETCH_ATTEMPTS: usize = 20;
     const MINT_FETCH_RETRY_DELAY_MS: u64 = 150;
-    const MINT_NOT_FOUND_RETRY_DELAY_MS: u64 = 150;
+    const MINT_NOT_FOUND_RETRY_DELAY_MS: u64 = 10;
     const ATA_FETCH_ATTEMPTS: usize = 4;
     const ATA_FETCH_RETRY_DELAY_MS: u64 = 50;
     const RPC_FETCH_ATTEMPTS: usize = 6;
@@ -817,6 +817,8 @@ impl TriggerComponent {
         primary_rpc: &solana_client::nonblocking::rpc_client::RpcClient,
     ) -> Result<Account> {
         let secondary_rpc = self.secondary_shadow_rpc();
+        let fetch_started_at = Instant::now();
+        let mut primary_missing_count = 0usize;
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut retries_performed = 0usize;
@@ -830,9 +832,15 @@ impl TriggerComponent {
             {
                 Ok(response) => {
                     if let Some(account) = response.value {
+                        if attempt > 0 {
+                            info!(mint = %mint, retries = attempt, primary_missing_count,
+                                elapsed_ms = saturating_elapsed_ms(fetch_started_at),
+                                "Trigger: mint account fetch recovered after retry");
+                        }
                         return Ok(account);
                     }
 
+                    primary_missing_count += 1;
                     let primary_not_found = true;
                     let primary_retryable = true;
                     let mut local_retry_delay_ms = Self::account_fetch_retry_delay_ms(
@@ -849,6 +857,11 @@ impl TriggerComponent {
                         {
                             Ok(response) => {
                                 if let Some(account) = response.value {
+                                    if attempt > 0 {
+                                        info!(mint = %mint, retries = attempt, primary_missing_count,
+                                elapsed_ms = saturating_elapsed_ms(fetch_started_at),
+                                "Trigger: mint account fetch recovered after retry");
+                                    }
                                     return Ok(account);
                                 }
 
@@ -926,6 +939,11 @@ impl TriggerComponent {
                         {
                             Ok(response) => {
                                 if let Some(account) = response.value {
+                                    if attempt > 0 {
+                                        info!(mint = %mint, retries = attempt, primary_missing_count,
+                                elapsed_ms = saturating_elapsed_ms(fetch_started_at),
+                                "Trigger: mint account fetch recovered after retry");
+                                    }
                                     return Ok(account);
                                 }
 
@@ -2441,6 +2459,10 @@ impl TriggerComponent {
             state_ts_ms: canonical_pool_state.last_update_ts_ms,
             amount_lamports: build_profile.amount_lamports,
             min_tokens_out: build_profile.min_tokens_out,
+            quoted_tokens_out: build_profile.entry_token_amount_raw,
+            quote_state_age_slots: latest_observed_slot
+                .map(|slot| slot.saturating_sub(canonical_pool_state.last_update_slot)),
+            quote_refresh_status: Some("canonical_state_at_build".to_string()),
             fee_bps: Some(SHADOW_V2_ENTRY_BONDING_FEE_BPS),
             slippage_tolerance_bps: Some(slippage_tolerance_bps),
             token_decimals: SHADOW_V2_ENTRY_TOKEN_DECIMALS,
@@ -2685,6 +2707,13 @@ impl TriggerComponent {
         buy_variant: trigger::PumpfunBuyVariant,
         account_overrides: &BuyAccountOverrides,
     ) -> Result<()> {
+        if matches!(buy_variant, trigger::PumpfunBuyVariant::LegacyBuy) {
+            if let Some(source) = account_overrides.creator_vault_source.as_deref() {
+                if source.starts_with("creator_vault_canonical_mismatch:") {
+                    bail!("{source}");
+                }
+            }
+        }
         let has_observed_creator_vault = matches!(
             account_overrides.creator_vault,
             Some(pubkey) if pubkey != Pubkey::default()
@@ -3217,6 +3246,188 @@ impl TriggerComponent {
         );
         Self::log_buy_preparation_breakdown(&rebuilt);
         Ok(rebuilt)
+    }
+
+    /// Rebuild a legacy Pump BUY from the newest canonical gRPC state directly
+    /// before dispatch. No RPC read participates in quote authority.
+    pub(crate) fn refresh_prepared_buy_quote_from_canonical(
+        &self,
+        request: &PreparedBuyRequest,
+    ) -> Result<PreparedBuyRequest> {
+        if !matches!(
+            request.account_overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        ) {
+            return Ok(request.clone());
+        }
+
+        let state_before = self
+            .account_state_core
+            .get_canonical_state(&request.mint)
+            .ok_or_else(|| {
+                anyhow::anyhow!("stale_canonical_curve:missing_state:mint={}", request.mint)
+            })?;
+        let latest_observed_slot =
+            self.account_state_core
+                .latest_observed_slot()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "stale_canonical_curve:latest_observed_slot_missing:mint={}",
+                        request.mint
+                    )
+                })?;
+        let state_age_slots = latest_observed_slot.saturating_sub(state_before.last_update_slot);
+        let max_state_age_slots = self.config.live_preflight_max_state_age_slots.max(1);
+        if state_age_slots > max_state_age_slots {
+            bail!(
+                "stale_canonical_curve:age_exceeds_policy:mint={} latest_observed_slot={} state_slot={} age_slots={} max_age_slots={}",
+                request.mint,
+                latest_observed_slot,
+                state_before.last_update_slot,
+                state_age_slots,
+                max_state_age_slots
+            );
+        }
+        if request.account_overrides.legacy_buy_curve_pubkey != Some(state_before.bonding_curve) {
+            bail!(
+                "stale_canonical_curve:bonding_curve_mismatch:mint={} request_curve={} canonical_curve={}",
+                request.mint,
+                request
+                    .account_overrides
+                    .legacy_buy_curve_pubkey
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "missing".to_string()),
+                state_before.bonding_curve
+            );
+        }
+        let canonical_creator = state_before.canonical_creator.ok_or_else(|| {
+            anyhow::anyhow!(
+                "canonical_creator_missing:mint={} curve={} state_slot={}",
+                request.mint,
+                state_before.bonding_curve,
+                state_before.last_update_slot
+            )
+        })?;
+        let expected_creator_vault = DirectBuyBuilder::derive_creator_vault(&canonical_creator);
+        if let Some(observed_creator_vault) = request.account_overrides.creator_vault {
+            if observed_creator_vault != expected_creator_vault {
+                bail!(
+                    "creator_vault_canonical_mismatch:mint={} observed={} expected={} canonical_creator={}",
+                    request.mint,
+                    observed_creator_vault,
+                    expected_creator_vault,
+                    canonical_creator
+                );
+            }
+        }
+
+        let mut refreshed_overrides = request.account_overrides.clone();
+        refreshed_overrides.legacy_buy_curve =
+            Some(crate::oracle_runtime::canonical_shadow_curve(&state_before));
+        refreshed_overrides.legacy_buy_curve_pubkey = Some(state_before.bonding_curve);
+        refreshed_overrides.legacy_buy_curve_source =
+            Some("account_state_core.pre_dispatch_refresh".to_string());
+        refreshed_overrides.legacy_buy_curve_authority_status =
+            Some("authoritative_account_state_pre_dispatch".to_string());
+        refreshed_overrides.creator_pubkey = Some(canonical_creator);
+        refreshed_overrides.creator_pubkey_source =
+            Some("canonical_bonding_curve.creator".to_string());
+        refreshed_overrides.creator_pubkey_authoritative = Some(true);
+        refreshed_overrides.creator_vault = Some(expected_creator_vault);
+        refreshed_overrides.creator_vault_source =
+            Some("canonical_bonding_curve.creator_pda".to_string());
+        refreshed_overrides.creator_vault_authoritative = Some(true);
+
+        let ResolvedTriggerPayer {
+            payer,
+            provenance: payer_provenance,
+            ..
+        } = self.load_payer()?;
+        if payer.pubkey() != request.payer_pubkey {
+            bail!(
+                "pre_dispatch_quote_refresh_payer_mismatch:expected={} actual={}",
+                request.payer_pubkey,
+                payer.pubkey()
+            );
+        }
+        let build_profile = self.create_buy_build_profile(
+            &request.payer_pubkey,
+            &request.mint,
+            &request.token_program,
+            request.attach_idempotent_ata_create,
+            &refreshed_overrides,
+            request.amount_lamports,
+            request.ata_missing_pre_submit,
+            request.pre_submit_token_balance,
+        )?;
+        let tip_seed = format!("{}:{}", request.mint, request.recent_blockhash);
+        let tip_account = self
+            .live_tx_sender
+            .as_ref()
+            .map(|sender| sender.select_tip_account(tip_seed.as_bytes()))
+            .unwrap_or_else(|| select_sender_tip_account(tip_seed.as_bytes()));
+        let (rpc_buy_tx, buy_tx) = self.build_buy_transaction_from_profile(
+            payer.as_ref(),
+            &build_profile,
+            request.priority_fee_micro_lamports,
+            &tip_account,
+            request.tip_lamports,
+            request.recent_blockhash,
+        )?;
+        let metadata = PreparedBuyRequestBuildMetadata {
+            recent_blockhash: request.recent_blockhash,
+            blockhash_source: request.blockhash_source,
+            blockhash_age_ms: request.blockhash_age_ms,
+            blockhash_last_valid_block_height: request.blockhash_last_valid_block_height,
+            blockhash_observed_block_height: request.blockhash_observed_block_height,
+            blockhash_fetched_at: request.blockhash_fetched_at,
+            blockhash_fetch_latency_ms: request.blockhash_fetch_latency_ms,
+            post_blockhash_build_latency_ms: request.post_blockhash_build_latency_ms,
+            reserve_slot_latency_ms: request.reserve_slot_latency_ms,
+            shadow_spawn_latency_ms: request.shadow_spawn_latency_ms,
+            decision_ts_ms: request.decision_ts_ms,
+        };
+        let mut refreshed = self.assemble_prepared_buy_request_from_profile(
+            payer_provenance,
+            &build_profile,
+            request.tip_lamports,
+            request.priority_fee_micro_lamports,
+            metadata,
+            rpc_buy_tx,
+            buy_tx,
+        );
+        refreshed.join_metadata = request.join_metadata.clone();
+        refreshed.state_readiness_latch_diagnostics =
+            request.state_readiness_latch_diagnostics.clone();
+        refreshed.preparation_telemetry = request.preparation_telemetry.clone();
+        if let Some(boundary) = refreshed.shadow_v2_entry_boundary.as_mut() {
+            boundary.quote_refresh_status =
+                Some("canonical_state_requoted_before_dispatch".to_string());
+        }
+
+        let state_after = self
+            .account_state_core
+            .get_canonical_state(&request.mint)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "stale_canonical_curve:state_disappeared_during_refresh:mint={}",
+                    request.mint
+                )
+            })?;
+        let unchanged = state_before.last_update_slot == state_after.last_update_slot
+            && state_before.source_write_version == state_after.source_write_version
+            && state_before.account_data_hash == state_after.account_data_hash
+            && state_before.virtual_sol_reserves == state_after.virtual_sol_reserves
+            && state_before.virtual_token_reserves == state_after.virtual_token_reserves;
+        if !unchanged {
+            bail!(
+                "stale_canonical_curve:changed_during_quote_refresh:mint={} before_slot={} after_slot={}",
+                request.mint,
+                state_before.last_update_slot,
+                state_after.last_update_slot
+            );
+        }
+        Ok(refreshed)
     }
 
     fn record_initial_buy_preparation_metrics(telemetry: &BuyPreparationTelemetry) {
@@ -3917,6 +4128,7 @@ impl TriggerComponent {
         tip_floor_telemetry: Option<TipFloorResolutionTelemetry>,
         amount_lamports_override: Option<u64>,
     ) -> Result<PreparedBuyRequest> {
+        let decision_ts_ms = Self::now_ms();
         #[cfg(test)]
         self.prepared_request_invocations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4019,6 +4231,14 @@ impl TriggerComponent {
                 .map(|account| (account, saturating_elapsed_ms(started_at)))
                 .map_err(|e| anyhow::anyhow!("Failed to fetch mint account: {}", e))
         };
+        let blockhash_fetch = async {
+            let started_at = Instant::now();
+            let (snapshot, source) = self
+                .resolve_live_blockhash(rpc)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to fetch recent blockhash: {}", e))?;
+            Ok::<_, anyhow::Error>((snapshot, source, saturating_elapsed_ms(started_at)))
+        };
         let (
             amount_lamports,
             effective_tip_lamports,
@@ -4026,29 +4246,49 @@ impl TriggerComponent {
             mint_account,
             mint_account_fetch_ms,
             speculative_ata_probe_result,
+            (blockhash_snapshot, blockhash_source, blockhash_fetch_latency_ms),
         ) = if requires_balance_preflight {
             let (
                 (payer_balance_lamports, payer_balance_fetch_ms),
                 (payer_account, payer_account_fetch_ms),
                 (mint_account, mint_account_fetch_ms),
                 speculative_ata_probe_result,
+                blockhash_result,
             ) = if let Some(speculative_ata_probe) = speculative_ata_probe {
-                let (payer_balance, payer_account, mint_account, speculative_probe) = tokio::try_join!(
+                let (
+                    payer_balance,
+                    payer_account,
+                    mint_account,
+                    speculative_probe,
+                    blockhash_result,
+                ) = tokio::try_join!(
                     payer_balance_fetch,
                     payer_account_fetch,
                     mint_account_fetch,
                     speculative_ata_probe,
+                    blockhash_fetch,
                 )?;
                 (
                     payer_balance,
                     payer_account,
                     mint_account,
                     Some(speculative_probe),
+                    blockhash_result,
                 )
             } else {
-                let (payer_balance, payer_account, mint_account) =
-                    tokio::try_join!(payer_balance_fetch, payer_account_fetch, mint_account_fetch)?;
-                (payer_balance, payer_account, mint_account, None)
+                let (payer_balance, payer_account, mint_account, blockhash_result) = tokio::try_join!(
+                    payer_balance_fetch,
+                    payer_account_fetch,
+                    mint_account_fetch,
+                    blockhash_fetch
+                )?;
+                (
+                    payer_balance,
+                    payer_account,
+                    mint_account,
+                    None,
+                    blockhash_result,
+                )
             };
             preparation_telemetry.payer_balance_fetch_ms = payer_balance_fetch_ms;
             preparation_telemetry.payer_account_fetch_ms = payer_account_fetch_ms;
@@ -4103,10 +4343,11 @@ impl TriggerComponent {
                 mint_account,
                 mint_account_fetch_ms,
                 speculative_ata_probe_result,
+                blockhash_result,
             )
         } else if let Some(speculative_ata_probe) = speculative_ata_probe {
-            let ((mint_account, mint_account_fetch_ms), speculative_probe) =
-                tokio::try_join!(mint_account_fetch, speculative_ata_probe)?;
+            let ((mint_account, mint_account_fetch_ms), speculative_probe, blockhash_result) =
+                tokio::try_join!(mint_account_fetch, speculative_ata_probe, blockhash_fetch)?;
             (
                 amount_lamports_override
                     .map(|amount| {
@@ -4121,9 +4362,11 @@ impl TriggerComponent {
                 mint_account,
                 mint_account_fetch_ms,
                 Some(speculative_probe),
+                blockhash_result,
             )
         } else {
-            let (mint_account, mint_account_fetch_ms) = mint_account_fetch.await?;
+            let ((mint_account, mint_account_fetch_ms), blockhash_result) =
+                tokio::try_join!(mint_account_fetch, blockhash_fetch)?;
             (
                 amount_lamports_override
                     .map(|amount| {
@@ -4138,6 +4381,7 @@ impl TriggerComponent {
                 mint_account,
                 mint_account_fetch_ms,
                 None,
+                blockhash_result,
             )
         };
         preparation_telemetry.mint_account_fetch_ms = mint_account_fetch_ms;
@@ -4296,13 +4540,19 @@ impl TriggerComponent {
             buy_variant = buy_variant.as_str(),
             "Trigger: prepared buy request accounts"
         );
-        let decision_ts_ms = Self::now_ms();
-        let blockhash_fetch_started_at = Instant::now();
-        let (blockhash_snapshot, blockhash_source) = self
-            .resolve_live_blockhash(rpc)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch recent blockhash: {}", e))?;
-        let blockhash_fetch_latency_ms = saturating_elapsed_ms(blockhash_fetch_started_at);
+        let (blockhash_snapshot, blockhash_source, blockhash_fetch_latency_ms) =
+            if blockhash_snapshot.is_fresh() {
+                (
+                    blockhash_snapshot,
+                    blockhash_source,
+                    blockhash_fetch_latency_ms,
+                )
+            } else {
+                // Równoległy odczyt nie może rozszerzyć dotychczasowego limitu świeżości.
+                let started_at = Instant::now();
+                let (snapshot, source) = self.resolve_live_blockhash(rpc).await?;
+                (snapshot, source, saturating_elapsed_ms(started_at))
+            };
         let recent_blockhash = blockhash_snapshot.blockhash;
         let tip_seed = format!("{mint}:{recent_blockhash}");
         let tip_account = self
@@ -4718,6 +4968,20 @@ impl TriggerComponent {
         &self,
         request: PreparedBuyRequest,
     ) -> TriggerDispatchReceipt {
+        let request_before_refresh = request.clone();
+        let request = match self.refresh_prepared_buy_quote_from_canonical(&request) {
+            Ok(request) => request,
+            Err(err) => {
+                return TriggerDispatchReceipt {
+                    primary_outcome: Err(err),
+                    shadow_task: None,
+                    active_position_lease: None,
+                    retain_position_slot_on_error: false,
+                    failed_request: Some(request_before_refresh),
+                    failed_context: None,
+                };
+            }
+        };
         let request_for_error = request.clone();
         let active_position_lease = match self.try_reserve_position_slot(&request.mint, &request) {
             Ok(lease) => Some(lease),
@@ -4732,10 +4996,7 @@ impl TriggerComponent {
                 };
             }
         };
-        let report = self
-            .shadow_simulator
-            .simulate_buy(&request, &self.config.shadow_run)
-            .await;
+        let report = self.simulate_shadow_entry_with_deadline(&request).await;
         TriggerDispatchReceipt {
             primary_outcome: report.map(|report| TriggerBuyOutcome::ShadowSimulated { report }),
             shadow_task: None,
@@ -4753,6 +5014,42 @@ impl TriggerComponent {
         self.shadow_simulator
             .simulate_buy(request, &self.config.shadow_run)
             .await
+    }
+
+    async fn simulate_shadow_entry_with_deadline(
+        &self,
+        request: &PreparedBuyRequest,
+    ) -> Result<super::shadow_run::ShadowBuySimulationReport> {
+        let Some(budget_ms) = self.config.shadow_run.decision_to_buy_deadline_ms else {
+            return self
+                .shadow_simulator
+                .simulate_buy(request, &self.config.shadow_run)
+                .await;
+        };
+        let deadline_ms = request.decision_ts_ms.saturating_add(budget_ms);
+        let deadline_error = || {
+            super::shadow_run::ShadowSimulationError::new(
+                format!("decision_to_buy_deadline_exceeded: budget_ms={budget_ms}"),
+                0,
+            )
+        };
+        let remaining_ms = deadline_ms.saturating_sub(Self::now_ms());
+        if remaining_ms == 0 {
+            return Err(deadline_error().into());
+        }
+        // Jeden budżet obejmuje również wszystkie ponowienia RPC; wynik po terminie
+        // nie może otworzyć pozycji. Anulowanie dotyczy wyłącznie symulacji shadow.
+        let report = tokio::time::timeout(
+            Duration::from_millis(remaining_ms),
+            self.shadow_simulator
+                .simulate_buy(request, &self.config.shadow_run),
+        )
+        .await
+        .map_err(|_| deadline_error())??;
+        if Self::now_ms() > deadline_ms || report.simulation_finished_ts_ms > deadline_ms {
+            return Err(deadline_error().into());
+        }
+        Ok(report)
     }
 
     fn counterfactual_probe_can_create_missing_user_ata(
@@ -5077,30 +5374,16 @@ impl TriggerComponent {
         &self,
         request: &PreparedBuyRequest,
     ) -> Result<Option<CounterfactualProbeMissingAccount>> {
-        let rpc = self.preparation_rpc();
-        for (pubkey, role) in Self::counterfactual_probe_required_account_roles(request) {
-            match rpc
-                .get_account_with_commitment(&pubkey, CommitmentConfig::processed())
-                .await
-            {
-                Ok(response) if response.value.is_some() => {}
-                Ok(_) => {
-                    return Ok(Some(CounterfactualProbeMissingAccount { pubkey, role }));
-                }
-                Err(err) if Self::is_account_not_found_error(&err) => {
-                    return Ok(Some(CounterfactualProbeMissingAccount { pubkey, role }));
-                }
-                Err(err) => {
-                    return Err(anyhow::anyhow!(
-                        "counterfactual probe account precheck failed: role={} pubkey={} error={}",
-                        role,
-                        pubkey,
-                        err
-                    ));
-                }
-            }
-        }
-        Ok(None)
+        let accounts = Self::counterfactual_probe_required_account_roles(request);
+        Ok(self
+            .counterfactual_probe_manifest_account_checks(&accounts)
+            .await?
+            .into_iter()
+            .find(|check| !check.rpc_load_ready)
+            .map(|check| CounterfactualProbeMissingAccount {
+                pubkey: check.pubkey,
+                role: check.role,
+            }))
     }
 
     pub(crate) async fn counterfactual_probe_missing_manifest_accounts(
@@ -5124,70 +5407,52 @@ impl TriggerComponent {
         accounts: &[(Pubkey, String)],
     ) -> Result<Vec<CounterfactualProbeManifestAccountCheck>> {
         let rpc = self.preparation_rpc();
-        let commitment = CommitmentConfig::processed();
-        let commitment_label = "processed".to_string();
-        let mut checks = Vec::new();
         let mut seen = HashSet::new();
-        for (pubkey, role) in accounts {
-            if !seen.insert(*pubkey) {
-                continue;
-            }
+        let unique_accounts: Vec<_> = accounts
+            .iter()
+            .filter(|(pubkey, _)| seen.insert(*pubkey))
+            .collect();
+        let mut checks = Vec::with_capacity(unique_accounts.len());
+        // Limit protokołu RPC; kolejność i pierwsza rola każdego konta pozostają stabilne.
+        for chunk in unique_accounts.chunks(100) {
+            let pubkeys: Vec<_> = chunk.iter().map(|(pubkey, _)| *pubkey).collect();
             let started = Instant::now();
-            match rpc.get_account_with_commitment(pubkey, commitment).await {
-                Ok(response) if response.value.is_some() => {
-                    let Some(account) = response.value.as_ref() else {
-                        continue;
-                    };
-                    checks.push(CounterfactualProbeManifestAccountCheck {
-                        pubkey: *pubkey,
-                        role: role.clone(),
-                        rpc_load_status: "rpc_load_ready".to_string(),
-                        rpc_load_ready: true,
-                        commitment: commitment_label.clone(),
-                        context_slot: Some(response.context.slot),
-                        attempt_count: 1,
-                        latency_ms: started.elapsed().as_millis() as u64,
-                        rpc_error_class: None,
-                        account_owner: Some(account.owner.to_string()),
-                        account_data_len: Some(account.data.len() as u64),
-                    });
-                }
-                Ok(response) => checks.push(CounterfactualProbeManifestAccountCheck {
+            let response = rpc
+                .get_multiple_accounts_with_commitment(&pubkeys, CommitmentConfig::processed())
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "counterfactual probe manifest account batch check failed: accounts={} error={}",
+                        pubkeys.len(), err
+                    )
+                })?;
+            if response.value.len() != chunk.len() {
+                anyhow::bail!(
+                    "counterfactual probe manifest account batch length mismatch: expected={} actual={}",
+                    chunk.len(), response.value.len()
+                );
+            }
+            let latency_ms = started.elapsed().as_millis() as u64;
+            for ((pubkey, role), account) in chunk.iter().zip(response.value.iter()) {
+                let ready = account.is_some();
+                checks.push(CounterfactualProbeManifestAccountCheck {
                     pubkey: *pubkey,
                     role: role.clone(),
-                    rpc_load_status: "missing_on_rpc_precheck".to_string(),
-                    rpc_load_ready: false,
-                    commitment: commitment_label.clone(),
+                    rpc_load_status: if ready {
+                        "rpc_load_ready"
+                    } else {
+                        "missing_on_rpc_precheck"
+                    }
+                    .to_string(),
+                    rpc_load_ready: ready,
+                    commitment: "processed".to_string(),
                     context_slot: Some(response.context.slot),
                     attempt_count: 1,
-                    latency_ms: started.elapsed().as_millis() as u64,
-                    rpc_error_class: Some("account_missing".to_string()),
-                    account_owner: None,
-                    account_data_len: None,
-                }),
-                Err(err) if Self::is_account_not_found_error(&err) => {
-                    checks.push(CounterfactualProbeManifestAccountCheck {
-                        pubkey: *pubkey,
-                        role: role.clone(),
-                        rpc_load_status: "missing_on_rpc_precheck".to_string(),
-                        rpc_load_ready: false,
-                        commitment: commitment_label.clone(),
-                        context_slot: None,
-                        attempt_count: 1,
-                        latency_ms: started.elapsed().as_millis() as u64,
-                        rpc_error_class: Some("account_not_found_error".to_string()),
-                        account_owner: None,
-                        account_data_len: None,
-                    });
-                }
-                Err(err) => {
-                    return Err(anyhow::anyhow!(
-                        "counterfactual probe manifest account check failed: role={} pubkey={} error={}",
-                        role,
-                        pubkey,
-                        err
-                    ));
-                }
+                    latency_ms,
+                    rpc_error_class: (!ready).then(|| "account_missing".to_string()),
+                    account_owner: account.as_ref().map(|value| value.owner.to_string()),
+                    account_data_len: account.as_ref().map(|value| value.data.len() as u64),
+                });
             }
         }
         Ok(checks)
@@ -5224,6 +5489,22 @@ impl TriggerComponent {
         &self,
         mut request: PreparedBuyRequest,
     ) -> TriggerDispatchReceipt {
+        if !matches!(self.config.entry_mode, TriggerEntryMode::DryRunMock) {
+            let request_before_refresh = request.clone();
+            request = match self.refresh_prepared_buy_quote_from_canonical(&request) {
+                Ok(request) => request,
+                Err(err) => {
+                    return TriggerDispatchReceipt {
+                        primary_outcome: Err(err),
+                        shadow_task: None,
+                        active_position_lease: None,
+                        retain_position_slot_on_error: false,
+                        failed_request: Some(request_before_refresh),
+                        failed_context: None,
+                    };
+                }
+            };
+        }
         match self.config.entry_mode {
             TriggerEntryMode::DryRunMock => {
                 let active_position_lease =
@@ -5273,10 +5554,7 @@ impl TriggerComponent {
                             };
                         }
                     };
-                let report = self
-                    .shadow_simulator
-                    .simulate_buy(&request, &self.config.shadow_run)
-                    .await;
+                let report = self.simulate_shadow_entry_with_deadline(&request).await;
                 return TriggerDispatchReceipt {
                     primary_outcome: report
                         .map(|report| TriggerBuyOutcome::ShadowSimulated { report }),
@@ -5865,6 +6143,7 @@ pub async fn run_with_oracle(
 
 #[cfg(test)]
 mod tests {
+    include!("buy_precheck_tests.rs");
     use super::*;
     use crate::events::{create_event_bus, DetectedPool};
     use async_trait::async_trait;
@@ -6083,6 +6362,7 @@ mod tests {
             sol_reserves: 30_000_000_000,
             token_reserves: 1_073_000_000_000_000,
             is_complete: 0,
+            canonical_creator: None,
             slot: 100,
             write_version: Some(1),
             txn_signature: None,
@@ -7452,6 +7732,58 @@ mod tests {
     }
 
     #[test]
+    fn test_build_prepared_buy_request_rejects_canonical_creator_vault_mismatch() {
+        let trigger = TriggerComponent::new(create_test_config());
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let recent_blockhash = Hash::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let curve = BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: 0,
+            complete: 0,
+            _padding: [0; 7],
+        };
+        let overrides = BuyAccountOverrides {
+            creator_pubkey: Some(Pubkey::new_unique()),
+            creator_pubkey_source: Some("canonical_bonding_curve.creator".to_string()),
+            creator_pubkey_authoritative: Some(true),
+            creator_vault: Some(Pubkey::new_unique()),
+            creator_vault_source: Some(
+                "creator_vault_canonical_mismatch:observed=wrong:expected=canonical".to_string(),
+            ),
+            creator_vault_authoritative: Some(false),
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            legacy_buy_curve: Some(curve),
+            ..BuyAccountOverrides::default()
+        };
+
+        let err = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &overrides,
+                trigger.configured_trade_amount_lamports().unwrap(),
+                0,
+                recent_blockhash,
+            )
+            .expect_err("canonical creator/vault mismatch must fail before build dispatch");
+
+        assert!(
+            err.to_string()
+                .contains("creator_vault_canonical_mismatch:"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_build_prepared_buy_request_rejects_legacy_amount_over_real_reserves() {
         let trigger = TriggerComponent::new(create_test_config());
         let payer = Keypair::new();
@@ -7644,6 +7976,7 @@ mod tests {
             sol_reserves: 30_000_000_000,
             token_reserves: 1_073_000_000_000_000,
             is_complete: 0,
+            canonical_creator: None,
             slot: 100,
             write_version: Some(9),
             txn_signature: None,
@@ -7700,6 +8033,199 @@ mod tests {
             .limitations
             .iter()
             .any(|value| value == "ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME"));
+    }
+
+    #[tokio::test]
+    async fn legacy_buy_quote_is_rebuilt_from_latest_canonical_state_before_dispatch() {
+        let mint = Pubkey::new_unique();
+        let bonding_curve = DirectBuyBuilder::derive_bonding_curve(&mint).0;
+        let canonical_creator = Pubkey::new_unique();
+        let pump_program = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+            .expect("valid Pump program id");
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        let first_update = ghost_core::account_state_core::types::AccountStateUpdate {
+            provider_id: Some("test-primary".to_string()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+            pool_amm_id: bonding_curve,
+            base_mint: mint,
+            bonding_curve,
+            sol_reserves: 30_000_000_000,
+            token_reserves: 1_073_000_000_000_000,
+            is_complete: 0,
+            canonical_creator: Some(canonical_creator),
+            slot: 100,
+            write_version: Some(1),
+            txn_signature: None,
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(pump_program),
+            account_data_len: Some(81),
+            account_data_hash: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
+            receive_ts_ms: 1_000,
+            receive_seq: 1,
+            curve_finality: ghost_core::CurveFinality::Provisional,
+            source: ghost_core::account_state_core::types::UpdateSource::GeyserAccountUpdate,
+        };
+        assert!(matches!(
+            account_state_core.apply_account_update(first_update),
+            ghost_core::account_state_core::types::AccountUpdateResult::Applied
+        ));
+
+        let mut config = create_test_config();
+        config.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.shadow_run.enabled = true;
+        config.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
+        let trigger = TriggerComponent::new_with_runtime_guards_and_runtime_state(
+            config,
+            Arc::new(MockShadowSimulator),
+            PositionLimitTracker::new(1),
+            Arc::new(ShadowLedger::new()),
+            Arc::clone(&account_state_core),
+        );
+        let payer = Arc::clone(
+            trigger
+                .cached_shadow_ephemeral_payer
+                .as_ref()
+                .expect("ephemeral shadow payer"),
+        );
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let [bonding_curve_v2, breaking_fee_recipient] =
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            );
+        let initial_curve = account_state_core
+            .bonding_curve(&mint)
+            .expect("initial canonical curve");
+        let overrides = BuyAccountOverrides {
+            creator_pubkey: Some(canonical_creator),
+            creator_pubkey_source: Some("canonical_bonding_curve.creator".to_string()),
+            creator_pubkey_authoritative: Some(true),
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            associated_bonding_curve: Some(DirectBuyBuilder::canonical_associated_bonding_curve(
+                &mint,
+                &token_program,
+            )),
+            bonding_curve_v2: Some(bonding_curve_v2),
+            buy_remaining_accounts: vec![bonding_curve_v2, breaking_fee_recipient],
+            legacy_buy_curve: Some(initial_curve),
+            legacy_buy_curve_pubkey: Some(bonding_curve),
+            legacy_buy_curve_source: Some("account_state_core".to_string()),
+            legacy_buy_curve_authority_status: Some("authoritative_account_state".to_string()),
+            ..Default::default()
+        };
+        let amount_lamports = trigger.configured_trade_amount_lamports().unwrap();
+        let request = trigger
+            .build_prepared_buy_request(
+                payer.as_ref(),
+                &mint,
+                &token_program,
+                false,
+                &overrides,
+                amount_lamports,
+                0,
+                Hash::new_unique(),
+            )
+            .expect("initial legacy request");
+        let initial_quote = request.min_tokens_out;
+
+        let second_update = ghost_core::account_state_core::types::AccountStateUpdate {
+            provider_id: Some("test-primary".to_string()),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+            pool_amm_id: bonding_curve,
+            base_mint: mint,
+            bonding_curve,
+            sol_reserves: 40_000_000_000,
+            token_reserves: 900_000_000_000_000,
+            is_complete: 0,
+            canonical_creator: Some(canonical_creator),
+            slot: 101,
+            write_version: Some(2),
+            txn_signature: None,
+            source_account_pubkey: Some(bonding_curve),
+            source_account_owner_or_program: Some(pump_program),
+            account_data_len: Some(81),
+            account_data_hash: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ),
+            receive_ts_ms: 1_100,
+            receive_seq: 2,
+            curve_finality: ghost_core::CurveFinality::Provisional,
+            source: ghost_core::account_state_core::types::UpdateSource::GeyserAccountUpdate,
+        };
+        assert!(matches!(
+            account_state_core.apply_account_update(second_update.clone()),
+            ghost_core::account_state_core::types::AccountUpdateResult::Applied
+        ));
+
+        let refreshed = trigger
+            .refresh_prepared_buy_quote_from_canonical(&request)
+            .expect("latest canonical state must rebuild the legacy quote");
+        assert_ne!(refreshed.min_tokens_out, initial_quote);
+        assert_eq!(
+            refreshed.account_overrides.creator_pubkey,
+            Some(canonical_creator)
+        );
+        assert_eq!(
+            refreshed.account_overrides.creator_vault,
+            Some(DirectBuyBuilder::derive_creator_vault(&canonical_creator))
+        );
+        let boundary = refreshed
+            .shadow_v2_entry_boundary
+            .as_ref()
+            .expect("refreshed request retains quote audit boundary");
+        assert_eq!(boundary.state_slot, 101);
+        assert_eq!(boundary.quoted_tokens_out, refreshed.entry_token_amount_raw);
+        assert_eq!(
+            boundary.quote_refresh_status.as_deref(),
+            Some("canonical_state_requoted_before_dispatch")
+        );
+
+        let dispatch_receipt = trigger
+            .dispatch_prepared_buy_shadow_only(request.clone())
+            .await;
+        let report = match dispatch_receipt
+            .primary_outcome
+            .as_ref()
+            .expect("dispatch must accept the refreshed canonical request")
+        {
+            TriggerBuyOutcome::ShadowSimulated { report } => report,
+            other => panic!("expected shadow simulation, got {other:?}"),
+        };
+        let dispatched_boundary = report
+            .shadow_v2_entry_boundary
+            .as_ref()
+            .expect("dispatch must carry the refreshed quote boundary");
+        assert_eq!(dispatched_boundary.state_slot, 101);
+        assert_eq!(
+            dispatched_boundary.quote_refresh_status.as_deref(),
+            Some("canonical_state_requoted_before_dispatch")
+        );
+        drop(dispatch_receipt);
+
+        let stale_mint = Pubkey::new_unique();
+        let stale_curve = DirectBuyBuilder::derive_bonding_curve(&stale_mint).0;
+        let mut newer_unrelated_update = second_update;
+        newer_unrelated_update.pool_amm_id = stale_curve;
+        newer_unrelated_update.base_mint = stale_mint;
+        newer_unrelated_update.bonding_curve = stale_curve;
+        newer_unrelated_update.slot = 112;
+        newer_unrelated_update.write_version = Some(1);
+        newer_unrelated_update.source_account_pubkey = Some(stale_curve);
+        newer_unrelated_update.account_data_hash =
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string());
+        newer_unrelated_update.receive_seq = 3;
+        assert!(matches!(
+            account_state_core.apply_account_update(newer_unrelated_update),
+            ghost_core::account_state_core::types::AccountUpdateResult::Applied
+        ));
+        let stale_error = trigger
+            .refresh_prepared_buy_quote_from_canonical(&refreshed)
+            .expect_err("canonical state older than the configured slot policy must fail closed");
+        assert!(stale_error
+            .to_string()
+            .contains("stale_canonical_curve:age_exceeds_policy"));
     }
 
     #[test]

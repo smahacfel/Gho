@@ -83,6 +83,7 @@ mod stress_tests {
             provider_role: None,
             slot: Some(999),
             tx_index: None,
+            birth_canonical_order: None,
             event_ts_ms: Some(1700000000000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: Signature::new_unique().to_string(),
@@ -94,6 +95,8 @@ mod stress_tests {
             quote_mint: "So11111111111111111111111111111111111111112"
                 .parse()
                 .unwrap(),
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
+            initial_virtual_quote_reserves: None,
             bonding_curve: pool, // Simplified for pump.fun
             creator: Pubkey::new_unique(),
             timestamp: 1700000000,
@@ -123,6 +126,7 @@ mod stress_tests {
             is_buy: true,
             is_dev_buy: true,
             amount: 100_000_000_000,
+            instruction_limit: None,
             max_sol_cost: 5_000_000_000,
             min_sol_output: 0,
             success: true,

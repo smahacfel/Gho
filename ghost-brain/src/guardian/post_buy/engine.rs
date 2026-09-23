@@ -5,7 +5,7 @@
 //! against each tracked position, using data from ShadowLedger.
 //!
 //! Design invariants:
-//! - Zero RPC calls on the hot path (all data comes from ShadowLedger).
+//! - Pętla nie czeka na RPC; punktowe potwierdzenie wyjścia działa w osobnym zadaniu.
 //! - No allocations in the steady-state hot loop (pre-allocated buffers).
 //! - Total tick time for 10 positions < 5ms.
 
@@ -123,6 +123,10 @@ const SHADOW_V2_EXIT_FEE_BPS_DIAGNOSTIC_MODEL: u16 = 100;
 const SHADOW_V2_EXIT_SLIPPAGE_BPS_DIAGNOSTIC_MODEL: u16 = 150;
 use super::signals::*;
 use super::trajectory_v1::{materialize_trajectory_v1, TrajectoryFeaturesV1};
+
+#[path = "quote_confirmation.rs"]
+mod quote_confirmation;
+use quote_confirmation::{PendingQuoteConfirmation, QuoteFreshnessConfirmation};
 
 type PostBuySnapshotBundleMaterialization = (
     PostBuySnapshotBundle,
@@ -721,6 +725,8 @@ struct MonitoredPosition {
     state_revision: u64,
     next_exit_action_seq: u64,
     pending_exit_proposal: Option<PendingExitProposal>,
+    pending_quote_confirmation: Option<PendingQuoteConfirmation>,
+    last_quote_confirmation: Option<QuoteFreshnessConfirmation>,
     pending_terminal_commit: Option<PendingTerminalCommit>,
     terminal_tx: Option<oneshot::Sender<ShadowTerminalDisposition>>,
     last_applied_action_id: Option<String>,
@@ -2348,6 +2354,8 @@ struct ShadowLifecycleRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     truth_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    quote_freshness_confirmation: Option<QuoteFreshnessConfirmation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     exit_sample_slot: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_market_anchor_slot: Option<u64>,
@@ -2679,6 +2687,7 @@ pub struct MonitoringEngine {
     config: PostBuyGuardianConfig,
     shadow_ledger: Arc<ShadowLedger>,
     account_state_core: Option<Arc<AccountStateReducer>>,
+    shadow_quote_confirmation_rpc: Option<Arc<solana_client::nonblocking::rpc_client::RpcClient>>,
     exit_policy_v1: Option<EffectiveExitPolicyV1Config>,
     het_pm_v2: Option<EffectiveHetPmV2Config>,
     time_stop_v2_config_hash: String,
@@ -2760,6 +2769,7 @@ impl MonitoringEngine {
             config,
             shadow_ledger,
             account_state_core: None,
+            shadow_quote_confirmation_rpc: None,
             exit_policy_v1,
             het_pm_v2,
             time_stop_v2_config_hash,
@@ -3754,6 +3764,7 @@ impl MonitoringEngine {
         handle: &ShadowExitActionHandle,
         snapshot: &PostBuyDecisionSnapshot,
         truth: &ShadowExitTruth,
+        confirmation: Option<&QuoteFreshnessConfirmation>,
     ) -> Result<(), PositionApplyError> {
         let mut positions = self.positions.write();
         let pos = positions
@@ -3770,6 +3781,8 @@ impl MonitoringEngine {
         if truth.exit_token_amount_raw != handle.expected_remaining_quantity {
             return Err(PositionApplyError::QuantityMismatch);
         }
+
+        pos.last_quote_confirmation = confirmation.cloned();
 
         pos.realized_exit_value_sol += truth.exit_value_sol;
         // `rug_scalp_exit_v1` freezes the complete entry+exit fixed-cost
@@ -5781,7 +5794,14 @@ impl MonitoringEngine {
             record_type,
             ShadowLifecycleRecordType::ExitFilled | ShadowLifecycleRecordType::PositionClosed
         )
-        .then(|| synthetic_next_slot(evidence.slot))
+        .then(|| {
+            synthetic_next_slot(
+                pos.last_quote_confirmation
+                    .as_ref()
+                    .map(|confirmation| confirmation.rpc_context_slot)
+                    .or(evidence.slot),
+            )
+        })
         .flatten();
         let time_stop_v2_observed = pos.time_stop_v2.has_observed();
         ShadowLifecycleRecord {
@@ -5976,6 +5996,7 @@ impl MonitoringEngine {
             truth_source: evidence.source,
             truth_status: evidence.status,
             truth_detail: evidence.detail.clone(),
+            quote_freshness_confirmation: pos.last_quote_confirmation.clone(),
             exit_sample_slot: evidence.slot,
             exit_market_anchor_slot: evidence.slot,
             exit_market_anchor_tx_signature: None,
@@ -5986,8 +6007,14 @@ impl MonitoringEngine {
             source_instruction_index: None,
             exit_reason_evaluation_ts_ms: Some(now_ms),
             exit_landed_slot,
-            exit_landed_slot_source: exit_landed_slot
-                .map(|_| "synthetic_next_slot_after_exit_sample".to_string()),
+            exit_landed_slot_source: exit_landed_slot.map(|_| {
+                if pos.last_quote_confirmation.is_some() {
+                    "synthetic_next_slot_after_rpc_confirmation"
+                } else {
+                    "synthetic_next_slot_after_exit_sample"
+                }
+                .to_string()
+            }),
             sample_slot: evidence.slot,
             sample_timestamp_ms: evidence.timestamp_ms,
             sample_age_ms: evidence.age_ms,
@@ -6384,6 +6411,8 @@ impl MonitoringEngine {
             state_revision: 1,
             next_exit_action_seq: 1,
             pending_exit_proposal: None,
+            pending_quote_confirmation: None,
+            last_quote_confirmation: None,
             pending_terminal_commit: None,
             terminal_tx,
             last_applied_action_id: None,
@@ -8837,7 +8866,7 @@ impl MonitoringEngine {
             pnl_pct,
             evidence,
         };
-        if let Err(error) = self.apply_shadow_quote_outcome(&action, snapshot, &truth) {
+        if let Err(error) = self.apply_shadow_quote_outcome(&action, snapshot, &truth, None) {
             debug!(action_id = %action.action_id, error = %error, "PostBuyGuardian: typed RUG quote apply rejected");
             return;
         }
@@ -9002,6 +9031,16 @@ impl MonitoringEngine {
         }
 
         'authority_tick: {
+            let confirmation =
+                match self.poll_quote_confirmation(base_mint, snapshot.guard(), now_ms) {
+                    quote_confirmation::ConfirmationPoll::Pending => {
+                        receipt_outcome = V1AuthorityTickOutcomeV1::PendingRecovery;
+                        receipt_reason = Some("rpc_confirmation_pending".to_string());
+                        break 'authority_tick;
+                    }
+                    quote_confirmation::ConfirmationPoll::Ready(confirmation) => Some(confirmation),
+                    quote_confirmation::ConfirmationPoll::Absent => None,
+                };
             let baseline_candidate = match authoritative_prequote {
                 PreQuoteDecision::QuoteRequired { candidate } => Some(candidate.clone()),
                 PreQuoteDecision::Hold | PreQuoteDecision::UnknownEvidence { .. } => None,
@@ -9196,7 +9235,7 @@ impl MonitoringEngine {
                     })
                     .map(|cell| cell.outcome.clone())
             });
-            let truth_result = pre_resolved_outcome.unwrap_or_else(|| {
+            let mut truth_result = pre_resolved_outcome.unwrap_or_else(|| {
                 self.resolve_shadow_exit_truth_for_policy(
                     snapshot,
                     quote_snapshot,
@@ -9205,6 +9244,26 @@ impl MonitoringEngine {
                     evidence_source,
                 )
             });
+            let mut used_confirmation = None;
+            if matches!(&truth_result, Err(failure) if failure.kind == ExecutableQuoteFailureKind::StaleSnapshot)
+            {
+                if let Some(confirmation) = confirmation.as_ref().filter(|confirmation| {
+                    action
+                        .as_ref()
+                        .is_some_and(|action| action.action_id == confirmation.action_id)
+                }) {
+                    if let Some(truth) = self.resolve_confirmed_exit_truth(
+                        confirmation,
+                        snapshot,
+                        quote_snapshot,
+                        now_ms,
+                        evidence_source,
+                    ) {
+                        truth_result = Ok(truth);
+                        used_confirmation = Some(confirmation);
+                    }
+                }
+            }
             let truth = match truth_result {
                 Ok(truth) => truth,
                 Err(failure) => {
@@ -9412,7 +9471,12 @@ impl MonitoringEngine {
                         receipt_reason = Some("final_intent_mismatch".to_string());
                         break 'authority_tick;
                     }
-                    if let Err(error) = self.apply_shadow_quote_outcome(&action, snapshot, &truth) {
+                    if let Err(error) = self.apply_shadow_quote_outcome(
+                        &action,
+                        snapshot,
+                        &truth,
+                        used_confirmation,
+                    ) {
                         receipt_outcome = V1AuthorityTickOutcomeV1::ApplyRejected;
                         receipt_reason = Some(format!("resolved_quote_apply_rejected:{error}"));
                         debug!(
@@ -9513,6 +9577,9 @@ impl MonitoringEngine {
         let evidence = failure.evidence.clone();
         self.maybe_record_shadow_exit_blocked(&action.base_mint, now_ms, 10_000, &evidence);
         if now_ms < action.recovery_deadline_ms {
+            if failure.kind == ExecutableQuoteFailureKind::StaleSnapshot {
+                self.start_quote_confirmation(&action, now_ms);
+            }
             return;
         }
 
@@ -11148,6 +11215,7 @@ mod tests {
             sol_reserves: 210_000_000_000,
             token_reserves: 760_000_000_000_000,
             is_complete: 0,
+            canonical_creator: None,
             slot,
             write_version: Some(1),
             txn_signature: None,
@@ -11190,6 +11258,7 @@ mod tests {
             sol_reserves: 210_000_000_000,
             token_reserves: 760_000_000_000_000,
             is_complete: 0,
+            canonical_creator: None,
             slot,
             write_version: Some(17),
             txn_signature: None,
@@ -11243,6 +11312,7 @@ mod tests {
             sol_reserves: 210_000_000_000,
             token_reserves: 760_000_000_000_000,
             is_complete: 0,
+            canonical_creator: canonical.canonical_creator,
             // A node may be far ahead of the Geyser event that supplied the
             // canonical state. This is diagnostic evidence only: it cannot
             // refresh a canonical quote boundary or lifecycle timestamp.
@@ -12932,7 +13002,7 @@ mod tests {
             },
         };
         assert_eq!(
-            engine.apply_shadow_quote_outcome(&action, &decision_snapshot, &truth),
+            engine.apply_shadow_quote_outcome(&action, &decision_snapshot, &truth, None),
             Err(PositionApplyError::StaleRevision)
         );
 

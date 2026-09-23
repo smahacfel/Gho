@@ -1418,14 +1418,24 @@ fn evaluate_prosperity_filter(
     }
 }
 
+/// Wspólny warunek Phase 1 dla oceny i deadline; wyłącznie dane z MFS.
+pub(crate) fn phase1_passes(
+    features: &MaterializedFeatureSet,
+    config: &GatekeeperV2Config,
+) -> bool {
+    let tx = &features.tx_intel_features;
+    tx.tx_count >= config.min_tx_count as u64
+        && tx.unique_signers >= config.min_unique_signers as u64
+        && tx.buy_count >= config.min_buy_count as u64
+        && tx.sell_count >= config.min_sell_count as u64
+}
+
 pub fn build_assessment_from_features(
     features: MaterializedFeatureSet,
     config: &GatekeeperV2Config,
     context: PolicyEvaluationContext,
 ) -> GatekeeperAssessment {
-    let phase1_passed = features.tx_intel_features.tx_count >= config.min_tx_count as u64
-        && features.tx_intel_features.unique_signers >= config.min_unique_signers as u64
-        && features.tx_intel_features.buy_count >= config.min_buy_count as u64;
+    let phase1_passed = phase1_passes(&features, config);
 
     let phase2_velocity = velocity_profile_from_features(&features);
     let phase2_passed = phase2_velocity
@@ -2699,7 +2709,7 @@ pub fn build_timeout_decision_from_assessment(
         (
             GatekeeperVerdictType::TimeoutNoData,
             format!(
-                "{}: tx={}/{} signers={}/{} buys={}/{}",
+                "{}: tx={}/{} signers={}/{} buys={}/{} sells={}/{}",
                 GatekeeperVerdictType::TimeoutNoData.tag(),
                 assessment.total_tx_evaluated,
                 config.min_tx_count,
@@ -2707,13 +2717,15 @@ pub fn build_timeout_decision_from_assessment(
                 config.min_unique_signers,
                 assessment.buy_count,
                 config.min_buy_count,
+                assessment.sell_count(),
+                config.min_sell_count,
             ),
         )
     } else if !assessment.phase1_passed {
         (
             GatekeeperVerdictType::TimeoutPhase1,
             format!(
-                "{}: tx={}/{} signers={}/{} buys={}/{}",
+                "{}: tx={}/{} signers={}/{} buys={}/{} sells={}/{}",
                 GatekeeperVerdictType::TimeoutPhase1.tag(),
                 assessment.total_tx_evaluated,
                 config.min_tx_count,
@@ -2721,13 +2733,15 @@ pub fn build_timeout_decision_from_assessment(
                 config.min_unique_signers,
                 assessment.buy_count,
                 config.min_buy_count,
+                assessment.sell_count(),
+                config.min_sell_count,
             ),
         )
     } else {
         (
             GatekeeperVerdictType::TimeoutDeadlineLowPhases,
             format!(
-                "{}: core1={} core2={} core3={} tx={}/{} signers={}/{} buys={}/{}",
+                "{}: core1={} core2={} core3={} tx={}/{} signers={}/{} buys={}/{} sells={}/{}",
                 GatekeeperVerdictType::TimeoutDeadlineLowPhases.tag(),
                 diagnostics.core1_passed,
                 diagnostics.core2_passed,
@@ -2738,6 +2752,8 @@ pub fn build_timeout_decision_from_assessment(
                 config.min_unique_signers,
                 assessment.buy_count,
                 config.min_buy_count,
+                assessment.sell_count(),
+                config.min_sell_count,
             ),
         )
     };
@@ -3576,6 +3592,89 @@ mod tests {
         SFD_PARTIAL_BALANCE_COVERAGE_REASON, SFD_ZERO_PREBALANCE_SKIPPED_REASON,
     };
     use solana_sdk::pubkey::Pubkey;
+
+    #[test]
+    fn r21_phase1_materialized_sells_are_required_and_reported() {
+        let config = GatekeeperV2Config {
+            min_tx_count: 12,
+            min_unique_signers: 6,
+            min_buy_count: 6,
+            min_sell_count: 3,
+            ..Default::default()
+        };
+        let mut features = MaterializedFeatureSet::default();
+        features.tx_intel_features.tx_count = 16;
+        features.tx_intel_features.buy_count = 16;
+        features.tx_intel_features.unique_signers = 16;
+        let assessment = build_assessment_from_features(
+            features.clone(),
+            &config,
+            PolicyEvaluationContext::default(),
+        );
+        assert!(
+            !assessment.phase1_passed,
+            "SELL 0/3 musi zablokować Phase 1"
+        );
+        features.tx_intel_features.buy_count = 13;
+        features.tx_intel_features.sell_count = 3;
+        let assessment =
+            build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+        assert!(assessment.phase1_passed);
+    }
+
+    #[test]
+    fn r21_sell_timeout_reason_and_json_use_materialized_count_with_legacy_defaults() {
+        let mut config = alpha_config();
+        config.min_tx_count = 12;
+        config.min_unique_signers = 6;
+        config.min_buy_count = 6;
+        config.min_sell_count = 3;
+        let mut assessment = alpha_ready_assessment();
+        assessment.total_tx_evaluated = 16;
+        assessment.unique_signers_evaluated = 16;
+        assessment.buy_count = 16;
+        let tx = &mut assessment.feature_snapshot.tx_intel_features;
+        tx.tx_count = 16;
+        tx.unique_signers = 16;
+        tx.buy_count = 16;
+        tx.sell_count = 0;
+        assessment.phase1_passed = phase1_passes(&assessment.feature_snapshot, &config);
+        let decision = build_timeout_decision_from_assessment(&assessment, &config);
+        assert_eq!(
+            decision.reason_code,
+            Some(GatekeeperReasonCode::TimeoutPhase1Insufficient)
+        );
+        assert!(decision.reason_chain.contains("sells=0/3"));
+        assessment.decision = Some(decision);
+        let log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+        assert_eq!(log.sell_count, 0);
+        assert_eq!(log.min_sell_count, 3);
+        let mut json = serde_json::to_value(&log).unwrap();
+        assert_eq!(json["sell_count"], 0);
+        assert_eq!(json["min_sell_count"], 3);
+        json.as_object_mut().unwrap().remove("sell_count");
+        json.as_object_mut().unwrap().remove("min_sell_count");
+        let old: ghost_brain::oracle::GatekeeperBuyLog = serde_json::from_value(json).unwrap();
+        assert_eq!((old.sell_count, old.min_sell_count), (0, 0));
+        for sells in [2, 3, 4] {
+            assessment.feature_snapshot.tx_intel_features.sell_count = sells;
+            assessment.feature_snapshot.tx_intel_features.buy_count = 16 - sells;
+            assert_eq!(
+                phase1_passes(&assessment.feature_snapshot, &config),
+                sells >= 3
+            );
+            // Eksport nie wylicza SELL jako total-minus-buy z pól kompatybilności.
+            assert_eq!(
+                assessment
+                    .to_buy_log(&Pubkey::new_unique(), &config)
+                    .sell_count,
+                sells as usize
+            );
+        }
+        config.min_sell_count = 0;
+        assessment.feature_snapshot.tx_intel_features.sell_count = 0;
+        assert!(phase1_passes(&assessment.feature_snapshot, &config));
+    }
 
     fn assessment_with_sybil(sybil: SybilResistanceFeatures) -> GatekeeperAssessment {
         let mut feature_snapshot = MaterializedFeatureSet::default();

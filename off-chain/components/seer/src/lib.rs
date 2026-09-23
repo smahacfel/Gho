@@ -73,6 +73,11 @@ pub mod metrics;
 pub mod nln_program_streams;
 pub mod paradox_sensor;
 pub mod pumpportal_connection;
+pub mod research_tape;
+/// Offline-only PR-B replay and exact-tape materialisation.  Kept separate
+/// from the PR-A capture writer so importing it cannot alter the active Seer
+/// runtime or the frozen raw V1 storage contract.
+pub mod research_tape_materializer;
 pub mod rpc_http_client;
 pub mod types;
 pub mod websocket_connection;
@@ -697,7 +702,33 @@ use ghost_core::shadow_ledger::{
 };
 use humantime::format_rfc3339_seconds;
 
-const LATE_DETECTION_THRESHOLD_MS: f64 = 300.0;
+/// Legacy diagnostic threshold for the age of Solana's second-resolution
+/// `block_time`. This value is not a transport or pipeline latency SLO.
+const BLOCK_TIME_AGE_DIAGNOSTIC_THRESHOLD_MS: f64 = 300.0;
+
+fn receive_to_candidate_latency_ms_at(
+    received_at_monotonic_ns: Option<u64>,
+    candidate_handoff_monotonic_ns: u64,
+) -> Option<f64> {
+    let received_at_monotonic_ns = received_at_monotonic_ns.filter(|value| *value > 0)?;
+    let elapsed_ns = candidate_handoff_monotonic_ns.checked_sub(received_at_monotonic_ns)?;
+    Some(elapsed_ns as f64 / 1_000_000.0)
+}
+
+fn receive_to_candidate_latency_ms(received_at_monotonic_ns: Option<u64>) -> Option<f64> {
+    receive_to_candidate_latency_ms_at(received_at_monotonic_ns, types::arrival_time_ns())
+}
+
+fn candidate_handoff_slo_breach_reason(
+    latency_ms: Option<f64>,
+    slo_ms: u64,
+) -> Option<&'static str> {
+    match latency_ms {
+        Some(latency_ms) if latency_ms > slo_ms as f64 => Some("over_budget"),
+        Some(_) => None,
+        None => Some("missing_receive_timestamp"),
+    }
+}
 const DEV_BUY_SOL_SANITY_LIMIT: f64 = 5_000.0;
 const COVERAGE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const PARSE_MISS_LOG_EVERY: u64 = 200;
@@ -1332,6 +1363,7 @@ pub struct CanonicalAccountUpdatePayload {
     real_token_reserves: Option<u64>,
     complete: u8,
     token_mint: Option<Pubkey>,
+    canonical_creator: Option<Pubkey>,
 }
 
 impl CanonicalAccountUpdatePayload {
@@ -1364,6 +1396,11 @@ impl CanonicalAccountUpdatePayload {
     pub fn token_mint(&self) -> Option<Pubkey> {
         self.token_mint
     }
+
+    #[inline]
+    pub fn canonical_creator(&self) -> Option<Pubkey> {
+        self.canonical_creator
+    }
 }
 
 pub fn decode_canonical_account_update(
@@ -1378,6 +1415,9 @@ pub fn decode_canonical_account_update(
             real_token_reserves: Some(curve.real_token_reserves),
             complete: u8::from(curve.complete),
             token_mint: None,
+            canonical_creator: (owner == AmmProgram::PumpFun.program_id())
+                .then(|| Pubkey::new_from_array(curve.creator))
+                .filter(|creator| *creator != Pubkey::default()),
         }),
         PumpAccountState::AmmPool(pool) => {
             let base_mint = Pubkey::new_from_array(pool.base_mint);
@@ -1390,6 +1430,7 @@ pub fn decode_canonical_account_update(
                     real_token_reserves: None,
                     complete: 1,
                     token_mint: Some(quote_mint),
+                    canonical_creator: None,
                 })
             } else if quote_mint == *wsol_mint_pubkey() {
                 Ok(CanonicalAccountUpdatePayload {
@@ -1399,6 +1440,7 @@ pub fn decode_canonical_account_update(
                     real_token_reserves: None,
                     complete: 1,
                     token_mint: Some(base_mint),
+                    canonical_creator: None,
                 })
             } else {
                 Err(format!(
@@ -1414,6 +1456,7 @@ pub fn decode_canonical_account_update(
                 real_token_reserves: Some(curve.real_token_reserves),
                 complete: curve.complete,
                 token_mint: None,
+                canonical_creator: None,
             })
             .map_err(|err| err.to_string()),
         PumpAccountState::Global(_) => Err(format!(
@@ -2079,10 +2122,14 @@ pub struct Seer {
 }
 
 impl Seer {
-    fn event_worker_concurrency() -> usize {
-        std::thread::available_parallelism()
-            .map(|parallelism| parallelism.get().saturating_mul(EVENT_WORKERS_PER_CORE))
-            .unwrap_or(MIN_EVENT_WORKERS)
+    fn event_worker_concurrency(&self) -> usize {
+        self.config
+            .event_worker_concurrency
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|parallelism| parallelism.get().saturating_mul(EVENT_WORKERS_PER_CORE))
+                    .unwrap_or(MIN_EVENT_WORKERS)
+            })
             .clamp(MIN_EVENT_WORKERS, MAX_EVENT_WORKERS)
     }
 
@@ -2763,7 +2810,7 @@ impl Seer {
     pub async fn run(self: Arc<Self>) -> SeerResult<()> {
         info!("Starting Seer module");
         let effective_mode = self.config.effective_source_mode();
-        let event_worker_concurrency = Self::event_worker_concurrency();
+        let event_worker_concurrency = self.event_worker_concurrency();
         let mut funding_lane_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut primary_grpc_active = false;
         self.ensure_entry_cpi_scan_worker();
@@ -2947,7 +2994,7 @@ impl Seer {
         mode: FundingLaneMode,
         mut event_stream: EventStream,
     ) {
-        let worker_concurrency = Self::event_worker_concurrency();
+        let worker_concurrency = self.event_worker_concurrency();
         let source_label = Self::funding_lane_source_label(mode).unwrap_or("unknown");
         info!(
             "Dedicated funding lane started mode={} source_label={} worker_concurrency={}",
@@ -3681,6 +3728,7 @@ impl Seer {
                         update_payload.token_reserves,
                         update_payload.real_sol_reserves,
                         update_payload.real_token_reserves,
+                        update_payload.canonical_creator,
                         update_payload.complete,
                         replay.slot,
                         replay.write_version,
@@ -4058,6 +4106,7 @@ impl Seer {
                     update_payload.token_reserves,
                     update_payload.real_sol_reserves,
                     update_payload.real_token_reserves,
+                    update_payload.canonical_creator,
                     update_payload.complete,
                     slot,
                     write_version,
@@ -4269,7 +4318,7 @@ impl Seer {
 
             let disc = &data[..8];
             if disc == binary_parser::DISC_CREATE.as_slice()
-                || disc == binary_parser::DISC_CREATE_ANCHOR.as_slice()
+                || disc == binary_parser::DISC_CREATE_V2.as_slice()
                 || disc == binary_parser::DISC_SWAP_CREATE_POOL.as_slice()
                 || disc == binary_parser::DISC_EVENT_CREATE.as_slice()
             {
@@ -4495,7 +4544,11 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         );
     }
 
-    fn hydrate_trade_mapping(&self, trade: &mut types::TradeEvent) {
+    fn hydrate_trade_mapping(
+        &self,
+        trade: &mut types::TradeEvent,
+        observation: Option<&ObservedPumpMutationV1>,
+    ) {
         if trade.pool_amm_id == Pubkey::default() && trade.mint != Pubkey::default() {
             if let Some(curve_bytes) = self
                 .mint_to_curve
@@ -4513,7 +4566,12 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             }
         }
 
-        if trade.is_pumpswap && trade.mint != Pubkey::default() && trade.mint != *wsol_mint_pubkey()
+        // Surowy dowód odnosi się do źródłowego poola. Alias obserwacji innego
+        // poola tego tokena nie może zmieniać tożsamości zdarzenia z dowodem.
+        if observation.is_none()
+            && trade.is_pumpswap
+            && trade.mint != Pubkey::default()
+            && trade.mint != *wsol_mint_pubkey()
         {
             if let Some(observation_pool) = self.observation_alias_pool_for_mint(trade.mint) {
                 if observation_pool != trade.pool_amm_id {
@@ -4877,7 +4935,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             trade.slot.is_some(),
             inferred_timestamp_quality,
         );
-        self.hydrate_trade_mapping(&mut trade);
+        self.hydrate_trade_mapping(&mut trade, observation.as_ref());
         let trade_ts_ms = trade
             .compat_event_ts_ms()
             .unwrap_or_else(types::ingress_epoch_ms);
@@ -4945,7 +5003,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         // but before we decide to buffer a mint=default trade. Re-check once here
         // to avoid buffering a trade when the mapping is already known (which could
         // otherwise miss the replay window if CREATE already drained an empty buffer).
-        self.hydrate_trade_mapping(&mut trade);
+        self.hydrate_trade_mapping(&mut trade, observation.as_ref());
 
         match self.should_forward_trade_with_observation(
             &trade,
@@ -5237,6 +5295,13 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             types::GeyserEvent::Transaction { source, .. } => source.clone(),
             _ => "unknown".to_string(),
         };
+        let grpc_received_at_monotonic_ns = match event.as_ref() {
+            types::GeyserEvent::Transaction {
+                observation_provenance: Some(provenance),
+                ..
+            } if source_label.starts_with("grpc_") => Some(provenance.received_at_monotonic_ns),
+            _ => None,
+        };
 
         // SOURCE ROUTING: Check if this is a synthetic event (e.g., from PumpPortal)
         // Synthetic events are pre-parsed and should NEVER go through binary parsing
@@ -5464,7 +5529,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 candidate.semantic =
                     transaction_semantic_from_event(&event, &source_label, is_synthetic);
                 let candidate_mode = self.pool_init_candidate_mode(amm_program, &candidate);
-                let runtime_disposition =
+                let mut runtime_disposition =
                     if session_slot_suppressed || is_backfill || filtered_by_config {
                         PoolDetectionRuntimeDispositionV1::Suppressed
                     } else {
@@ -5486,9 +5551,6 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     }
                     _ => None,
                 };
-                let admit_candidate = primary_runtime_authority
-                    && runtime_disposition == PoolDetectionRuntimeDispositionV1::CandidateAdmission;
-
                 if matches!(candidate_mode, PoolInitCandidateMode::Suppressed) {
                     self.metrics
                         .pool_events_filtered
@@ -5515,6 +5577,44 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 ) {
                     return Ok(());
                 }
+
+                // Enforce the admission budget only after every local operation
+                // which precedes IPC. Keeping this check adjacent to the bounded
+                // enqueue prevents WAL work from consuming the budget after a
+                // candidate has already been declared timely.
+                let pre_handoff_latency_ms =
+                    receive_to_candidate_latency_ms(grpc_received_at_monotonic_ns);
+                if primary_runtime_authority
+                    && runtime_disposition == PoolDetectionRuntimeDispositionV1::CandidateAdmission
+                {
+                    if let Some(slo_ms) = self.config.grpc_candidate_handoff_slo_ms {
+                        let breach_reason =
+                            candidate_handoff_slo_breach_reason(pre_handoff_latency_ms, slo_ms);
+                        if let Some(reason) = breach_reason {
+                            runtime_disposition = PoolDetectionRuntimeDispositionV1::Suppressed;
+                            self.metrics
+                                .grpc_to_candidate_slo_breach_total
+                                .with_label_values(&[amm_program.name(), &source_label, reason])
+                                .inc();
+                            self.metrics
+                                .pool_events_filtered
+                                .with_label_values(&["grpc_candidate_handoff_slo_breach"])
+                                .inc();
+                            error!(
+                                pool = %candidate.pool_amm_id,
+                                mint = %candidate.base_mint,
+                                slot = ?pool_slot,
+                                source = %source_label,
+                                reason,
+                                latency_ms = ?pre_handoff_latency_ms,
+                                slo_ms,
+                                "GRPC_CANDIDATE_HANDOFF_SLO_BREACH: candidate downgraded to evidence-only"
+                            );
+                        }
+                    }
+                }
+                let admit_candidate = primary_runtime_authority
+                    && runtime_disposition == PoolDetectionRuntimeDispositionV1::CandidateAdmission;
 
                 // Send PoolDetected via IPC *before* register_curve_mapping.
                 //
@@ -5560,6 +5660,15 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                         "PR1E candidate admission requires the IPC Observation Ledger boundary; direct CandidatePool emission is disabled"
                             .to_string(),
                     ));
+                }
+
+                let grpc_to_candidate_handoff_ms =
+                    receive_to_candidate_latency_ms(grpc_received_at_monotonic_ns);
+                if let Some(latency_ms) = grpc_to_candidate_handoff_ms {
+                    self.metrics
+                        .grpc_to_candidate_latency
+                        .with_label_values(&[amm_program.name(), &source_label])
+                        .observe(latency_ms);
                 }
 
                 if primary_runtime_authority {
@@ -5674,13 +5783,13 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                                 .with_label_values(&[amm_program.name(), &source_label])
                                 .observe(delta_ms);
 
-                            if delta_ms > LATE_DETECTION_THRESHOLD_MS {
+                            if delta_ms > BLOCK_TIME_AGE_DIAGNOSTIC_THRESHOLD_MS {
                                 self.metrics
                                     .late_detection_total
                                     .with_label_values(&[amm_program.name(), &source_label])
                                     .inc();
                                 warn!(
-                                    "⚠️ Late pool detection: {:.2}ms after mint (slot={:?}, source={})",
+                                    "BLOCK_TIME_AGE_DIAGNOSTIC age_ms={:.2} slot={:?} source={} not_transport_latency=true",
                                     delta_ms,
                                     pool_slot,
                                     source_label
@@ -5694,10 +5803,11 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
 
                 if admit_candidate {
                     info!(
-                        "Detected new pool: {} on {} (latency: {:.2}ms) [enhanced: false] | detection_ts={} parser_ts={} block_time={:?} slot={:?} source={}",
+                        "Detected new pool: {} on {} (latency: {:.2}ms) [enhanced: false] | grpc_to_candidate_ms={:?} detection_ts={} parser_ts={} block_time={:?} slot={:?} source={}",
                         candidate.pool_amm_id,
                         amm_program.name(),
                         latency_ms,
+                        grpc_to_candidate_handoff_ms,
                         format_rfc3339_seconds(detection_received_at),
                         format_rfc3339_seconds(parser_finished_at),
                         pool_block_time,
@@ -6112,6 +6222,41 @@ mod tests {
     }
 
     #[test]
+    fn grpc_receive_to_candidate_latency_uses_the_process_monotonic_axis() {
+        assert_eq!(
+            receive_to_candidate_latency_ms_at(Some(1_000_000), 11_000_000),
+            Some(10.0)
+        );
+        assert_eq!(
+            receive_to_candidate_latency_ms_at(Some(1_000_000), 52_000_000),
+            Some(51.0)
+        );
+        assert_eq!(receive_to_candidate_latency_ms_at(None, 52_000_000), None);
+        assert_eq!(
+            receive_to_candidate_latency_ms_at(Some(0), 52_000_000),
+            None
+        );
+        assert_eq!(
+            receive_to_candidate_latency_ms_at(Some(52_000_000), 1_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn grpc_candidate_handoff_slo_is_strict_and_fail_closed_when_unmeasurable() {
+        assert_eq!(candidate_handoff_slo_breach_reason(Some(49.999), 50), None);
+        assert_eq!(candidate_handoff_slo_breach_reason(Some(50.0), 50), None);
+        assert_eq!(
+            candidate_handoff_slo_breach_reason(Some(50.001), 50),
+            Some("over_budget")
+        );
+        assert_eq!(
+            candidate_handoff_slo_breach_reason(None, 50),
+            Some("missing_receive_timestamp")
+        );
+    }
+
+    #[test]
     fn seer_request_shutdown_marks_primary_and_funding_grpc_lanes() {
         let (ipc_sender, _ipc_receiver, _metrics) = create_ipc_channel(IpcChannelConfig::default());
         let mut config = SeerConfig::default();
@@ -6455,6 +6600,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 42,
+            instruction_limit: None,
             max_sol_cost: 1_000_000,
             min_sol_output: 0,
             success: true,
@@ -7002,6 +7148,7 @@ mod tests {
             provider_role: None,
             slot: Some(1),
             tx_index: None,
+            birth_canonical_order: None,
             event_ts_ms: Some(1_000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: Signature::new_unique().to_string(),
@@ -7009,11 +7156,13 @@ mod tests {
             pool_amm_id: Pubkey::new_unique(),
             base_mint: Pubkey::new_unique(),
             quote_mint: Pubkey::new_unique(),
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
             bonding_curve: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
             timestamp: 1_000,
             bonding_curve_progress: Some(0.0),
             initial_liquidity_sol: Some(30.0),
+            initial_virtual_quote_reserves: None,
             token_total_supply: Some(1_000_000_000_000_000),
             block_time: Some(1),
         };
@@ -7166,10 +7315,12 @@ mod tests {
                 pool_amm_id: pool,
                 base_mint: mint,
                 quote_mint: *wsol_mint_pubkey(),
+                creation_regime: ghost_core::PumpCreationRegimeV1::default(),
                 bonding_curve: pool,
                 creator: Pubkey::new_unique(),
                 initial_virtual_token_reserves: None,
                 initial_virtual_sol_reserves: None,
+                initial_virtual_quote_reserves: None,
                 initial_real_token_reserves: None,
                 initial_real_sol_reserves: None,
                 token_total_supply: None,
@@ -7225,10 +7376,12 @@ mod tests {
                 pool_amm_id: pumpswap_pool,
                 base_mint: mint,
                 quote_mint: *wsol_mint_pubkey(),
+                creation_regime: ghost_core::PumpCreationRegimeV1::default(),
                 bonding_curve: pumpswap_pool,
                 creator: Pubkey::new_unique(),
                 initial_virtual_token_reserves: None,
                 initial_virtual_sol_reserves: None,
+                initial_virtual_quote_reserves: None,
                 initial_real_token_reserves: None,
                 initial_real_sol_reserves: None,
                 token_total_supply: None,
@@ -7280,6 +7433,49 @@ mod tests {
         };
         assert_eq!(event.trade.pool_amm_id, observation_pool);
         assert_eq!(event.trade.mint, mint);
+    }
+
+    #[tokio::test]
+    async fn test_raw_pumpswap_trade_preserves_observation_pool_identity() {
+        let (ipc_sender, mut ipc_receiver, _metrics) =
+            create_ipc_channel(IpcChannelConfig::default());
+        let seer = Seer::new_with_ipc(SeerConfig::default(), ipc_sender);
+        let observation_pool = Pubkey::new_unique();
+        let pumpswap_pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        seer.set_curve_mapping(observation_pool, mint, "test", true);
+
+        let mut trade = test_trade(pumpswap_pool, mint);
+        trade.is_pumpswap = true;
+        trade.provider_id = Some("raw-primary".to_string());
+        trade.provider_role = Some(ghost_core::RawProviderRoleV1::PrimaryAuthority);
+        let mut observation = test_raw_trade_observation(trade.signature);
+        observation.claims.curve = Some(pumpswap_pool);
+        observation.claims.mint = Some(mint);
+        assert!(
+            seer.handle_trade_event_with_observation(
+                trade,
+                Some(observation.clone()),
+                "grpc_global_stream",
+                false,
+            )
+            .await
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match ipc_receiver.recv().await {
+                    Some(SeerEvent::Trade(event)) => break event,
+                    Some(_) => continue,
+                    None => panic!("Kanał IPC zamknięty przed trade"),
+                }
+            }
+        })
+        .await
+        .expect("Brak surowego trade w IPC");
+        assert_eq!(event.trade.pool_amm_id, pumpswap_pool);
+        assert_eq!(event.trade.mint, mint);
+        assert_eq!(event.observation, Some(observation));
     }
 
     #[test]
@@ -8003,6 +8199,7 @@ mod tests {
             provider_role: None,
             slot: Some(1),
             tx_index: None,
+            birth_canonical_order: None,
             event_ts_ms: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: "sig1".to_string(),
@@ -8010,11 +8207,13 @@ mod tests {
             pool_amm_id: Pubkey::new_unique(),
             base_mint: Pubkey::new_unique(),
             quote_mint: Pubkey::new_unique(),
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
             bonding_curve: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
             timestamp: 0,
             bonding_curve_progress: None,
             initial_liquidity_sol: None,
+            initial_virtual_quote_reserves: None,
             token_total_supply: None,
             block_time: None,
         };
@@ -8057,10 +8256,12 @@ mod tests {
             pool_amm_id: curve,
             base_mint: mint,
             quote_mint: sol_mint,
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
             bonding_curve: curve,
             creator: Pubkey::new_unique(),
             initial_virtual_token_reserves: None,
             initial_virtual_sol_reserves: None,
+            initial_virtual_quote_reserves: None,
             initial_real_token_reserves: None,
             initial_real_sol_reserves: None,
             token_total_supply: None,
@@ -8294,6 +8495,33 @@ mod tests {
             account_data_hash_blake3(&first),
             account_data_hash_blake3(&second)
         );
+    }
+
+    #[test]
+    fn canonical_pump_account_decode_preserves_creator_from_account_bytes() {
+        let creator = Pubkey::new_unique();
+        let mut data = vec![0u8; 81];
+        data[..8].copy_from_slice(&binary_parser::DISC_BONDING_CURVE);
+        data[8..16].copy_from_slice(&1_000_000_000_000u64.to_le_bytes());
+        data[16..24].copy_from_slice(&30_000_000_000u64.to_le_bytes());
+        data[24..32].copy_from_slice(&500_000_000_000u64.to_le_bytes());
+        data[32..40].copy_from_slice(&7_000_000_000u64.to_le_bytes());
+        data[40..48].copy_from_slice(&1_000_000_000_000u64.to_le_bytes());
+        data[48] = 0;
+        data[49..81].copy_from_slice(creator.as_ref());
+
+        let owner = AmmProgram::PumpFun.program_id();
+        let payload = decode_canonical_account_update(owner, &data)
+            .expect("current Pump bonding-curve layout must decode");
+
+        assert_eq!(payload.canonical_creator(), Some(creator));
+        assert_eq!(payload.sol_reserves(), 30_000_000_000);
+        assert_eq!(payload.token_reserves(), 1_000_000_000_000);
+
+        let foreign_owner = Pubkey::new_unique();
+        let foreign_payload = decode_canonical_account_update(foreign_owner, &data)
+            .expect("layout decoding remains independent from owner authority");
+        assert_eq!(foreign_payload.canonical_creator(), None);
     }
 
     #[tokio::test]
@@ -11302,6 +11530,7 @@ mod tests {
             provider_role: None,
             slot: Some(1),
             tx_index: None,
+            birth_canonical_order: None,
             event_ts_ms: Some(1_000_000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: Signature::new_unique().to_string(),
@@ -11313,11 +11542,13 @@ mod tests {
             quote_mint: "So11111111111111111111111111111111111111112"
                 .parse()
                 .unwrap(),
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
             bonding_curve: curve,
             creator: Pubkey::new_unique(),
             timestamp: 1_000_000,
             bonding_curve_progress: Some(0.0),
             initial_liquidity_sol: Some(30.0),
+            initial_virtual_quote_reserves: None,
             token_total_supply: Some(1_000_000_000_000_000),
             block_time: Some(1),
         };

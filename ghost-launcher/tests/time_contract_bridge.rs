@@ -23,6 +23,7 @@ fn make_trade(event_time: EventTimeMetadata, legacy_timestamp_ms: u64) -> TradeE
         is_buy: true,
         is_dev_buy: false,
         amount: 123,
+        instruction_limit: None,
         max_sol_cost: 1_000_000_000,
         min_sol_output: 0,
         success: true,

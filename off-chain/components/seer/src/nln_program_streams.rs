@@ -279,6 +279,7 @@ impl NlnPumpFunCreateEvent {
             provider_role: None,
             slot: Some(self.slot),
             tx_index: self.tx_index,
+            birth_canonical_order: None,
             event_ts_ms,
             event_time,
             signature: self.signature.clone(),
@@ -286,6 +287,7 @@ impl NlnPumpFunCreateEvent {
             pool_amm_id: bonding_curve,
             base_mint: self.mint,
             quote_mint,
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
             bonding_curve,
             creator: self.creator,
             timestamp,
@@ -294,6 +296,7 @@ impl NlnPumpFunCreateEvent {
                 .virtual_sol_reserves
                 .or(self.real_sol_reserves)
                 .map(lamports_to_sol),
+            initial_virtual_quote_reserves: None,
             token_total_supply: None,
             block_time: self.block_time,
         })
@@ -349,6 +352,7 @@ impl NlnPumpFunTradeEvent {
             is_buy,
             is_dev_buy: false,
             amount: self.token_amount_units,
+            instruction_limit: None,
             max_sol_cost: if is_buy { self.sol_amount_lamports } else { 0 },
             min_sol_output: if is_buy { 0 } else { self.sol_amount_lamports },
             success: true,

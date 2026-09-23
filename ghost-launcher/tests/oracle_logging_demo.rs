@@ -94,6 +94,7 @@ fn generate_synthetic_history(
             signer: Pubkey::new_unique(),
             is_buy,
             amount: price_lamports,
+            instruction_limit: None,
             max_sol_cost: price_lamports * 2,
             min_sol_output: price_lamports / 2,
             success: true,

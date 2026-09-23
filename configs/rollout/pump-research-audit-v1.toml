@@ -1,0 +1,38 @@
+# Pump Research Evidence Tape V1.1 — independent source-completeness audit.
+#
+# This is a non-secret template. Copy it to a protected operator-local path
+# outside the Git worktree, replace the endpoint/provider identity, and pass
+# that external file to `pump-research-tape certify`:
+#
+#   pump-research-tape certify \
+#     --run-dir datasets/pump-research/<run-id>/raw \
+#     --output datasets/pump-research/<run-id>/exact \
+#     --qualification-audit-config /protected/operator/pump-research-audit-v1.toml \
+#     --provider-suitability-receipt datasets/pump-research/operator-logs/<go-e0-id>/provider_suitability_receipt_v1.json \
+#     --provider-independence-attestation /protected/operator/provider_independence_attestation_v1.json \
+#     --expected-provider-independence-sha256 <reviewed-sha256>
+#
+# The audit endpoint MUST be independent from the primary Yellowstone provider
+# recorded in the raw run. It reads finalized blocks only. Its responses never
+# fill raw evidence, anchors, parser inventory, canonicality or trajectories.
+# The endpoint must be a root-only HTTPS origin without credentials in the URL.
+
+audit_provider_id = "independent-finalized-rpc"
+audit_rpc_endpoint = "https://your-independent-finalized-rpc.example"
+
+# Optional endpoint-path credential for providers whose protected RPC key is
+# encoded in the URL path. The TOML still contains only a root-only HTTPS
+# origin; the complete absolute path is loaded from the named environment
+# variable and exists only in the standalone audit client. Do not configure
+# endpoint-path auth and header auth at the same time.
+# audit_rpc_endpoint_path_env = "GHOST_PUMP_RESEARCH_AUDIT_RPC_PATH"
+
+# Optional explicit header credential. Its value is read only from the named
+# environment variable and never written to the qualification report.
+# audit_rpc_auth_token_env = "GHOST_PUMP_RESEARCH_AUDIT_RPC_TOKEN"
+audit_rpc_auth_header = "x-api-key"
+
+# Bounded read-only concurrency/retry policy for `getBlock` finalized calls.
+bounded_concurrency = 8
+bounded_retry_count = 2
+request_timeout_ms = 20000

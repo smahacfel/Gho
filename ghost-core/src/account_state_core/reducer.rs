@@ -293,6 +293,11 @@ impl AccountStateReducer {
             .as_ref()
             .map(|state| state.bonding_curve)
             .unwrap_or(update.bonding_curve);
+        let canonical_creator = update.canonical_creator.or_else(|| {
+            previous_state
+                .as_ref()
+                .and_then(|state| state.canonical_creator)
+        });
 
         self.states.insert(
             update.base_mint,
@@ -304,6 +309,7 @@ impl AccountStateReducer {
                 virtual_token_reserves: curve.virtual_token_reserves,
                 real_sol_reserves: curve.real_sol_reserves,
                 real_token_reserves: curve.real_token_reserves,
+                canonical_creator,
                 bonding_curve_progress,
                 price_sol,
                 market_cap_sol,
@@ -594,6 +600,7 @@ mod tests {
             sol_reserves: 1_000_000_000,
             token_reserves: 500_000_000_000,
             is_complete: 0,
+            canonical_creator: None,
             slot,
             write_version: Some(slot),
             txn_signature: None,
@@ -674,6 +681,45 @@ mod tests {
             reducer.apply_account_update(delayed_geyser),
             AccountUpdateResult::Applied,
             "a high RPC context slot must not reject a later-delivered Geyser write"
+        );
+    }
+
+    #[test]
+    fn canonical_creator_is_stored_and_preserved_across_compatibility_updates() {
+        let reducer = AccountStateReducer::new();
+        let creator = Pubkey::new_unique();
+        let mut first = sample_update(100, 1);
+        first.canonical_creator = Some(creator);
+        let mint = first.base_mint;
+        let pool = first.pool_amm_id;
+        let curve = first.bonding_curve;
+
+        assert_eq!(
+            reducer.apply_account_update(first),
+            AccountUpdateResult::Applied
+        );
+        assert_eq!(
+            reducer
+                .get_canonical_state(&mint)
+                .and_then(|state| state.canonical_creator),
+            Some(creator)
+        );
+
+        let mut compatibility_update = sample_update(101, 2);
+        compatibility_update.base_mint = mint;
+        compatibility_update.pool_amm_id = pool;
+        compatibility_update.bonding_curve = curve;
+        compatibility_update.canonical_creator = None;
+        compatibility_update.sol_reserves = compatibility_update.sol_reserves.saturating_add(1);
+        assert_eq!(
+            reducer.apply_account_update(compatibility_update),
+            AccountUpdateResult::Applied
+        );
+        assert_eq!(
+            reducer
+                .get_canonical_state(&mint)
+                .and_then(|state| state.canonical_creator),
+            Some(creator)
         );
     }
 

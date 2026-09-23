@@ -436,6 +436,11 @@ pub struct DetectedAccountUpdateEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub real_token_reserves: Option<u64>,
 
+    /// Creator decoded from the same canonical Pump bonding-curve bytes as
+    /// the reserves. Absent for layouts that do not carry a Pump creator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_creator: Option<Pubkey>,
+
     /// Curve completion flag (1 = graduated, 0 = active).
     pub complete: u8,
 
@@ -1190,6 +1195,7 @@ impl IpcSender {
         token_reserves: u64,
         real_sol_reserves: Option<u64>,
         real_token_reserves: Option<u64>,
+        canonical_creator: Option<Pubkey>,
         complete: u8,
         slot: u64,
         write_version: Option<u64>,
@@ -1213,6 +1219,7 @@ impl IpcSender {
             token_reserves,
             real_sol_reserves,
             real_token_reserves,
+            canonical_creator,
             complete,
             slot,
             write_version,
@@ -1710,6 +1717,7 @@ mod tests {
             provider_role: None,
             slot: Some(100),
             tx_index: None,
+            birth_canonical_order: None,
             event_ts_ms: Some(1_234_567_890_000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: "test_sig".to_string(),
@@ -1717,11 +1725,13 @@ mod tests {
             pool_amm_id: Pubkey::new_unique(),
             base_mint: Pubkey::new_unique(),
             quote_mint: Pubkey::new_unique(),
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
             bonding_curve: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
             timestamp: 1234567890,
             bonding_curve_progress: Some(50.0),
             initial_liquidity_sol: Some(10.0),
+            initial_virtual_quote_reserves: None,
             token_total_supply: Some(1_000_000),
             block_time: Some(1234567890),
         }
@@ -1744,6 +1754,7 @@ mod tests {
             token_reserves: 2_000,
             real_sol_reserves: Some(300),
             real_token_reserves: Some(400),
+            canonical_creator: None,
             complete: 0,
             slot: 123,
             write_version,
@@ -1805,6 +1816,7 @@ mod tests {
                 2_000,
                 Some(300),
                 Some(400),
+                None,
                 0,
                 123,
                 Some(7),
@@ -1874,6 +1886,7 @@ mod tests {
                 2_000,
                 Some(300),
                 Some(400),
+                None,
                 0,
                 123,
                 Some(7),
@@ -2061,6 +2074,7 @@ mod tests {
             token_reserves: 2_000,
             real_sol_reserves: None,
             real_token_reserves: None,
+            canonical_creator: None,
             complete: 0,
             slot: 123,
             write_version: Some(7),
@@ -2085,6 +2099,7 @@ mod tests {
         object.remove("account_data_len");
         object.remove("source_account_pubkey");
         object.remove("source_account_owner_or_program");
+        object.remove("canonical_creator");
 
         let decoded: DetectedAccountUpdateEvent =
             serde_json::from_value(value).expect("deserialize old account update shape");
@@ -2095,6 +2110,7 @@ mod tests {
         assert_eq!(decoded.account_data_len, None);
         assert_eq!(decoded.source_account_pubkey, None);
         assert_eq!(decoded.source_account_owner_or_program, None);
+        assert_eq!(decoded.canonical_creator, None);
     }
 
     #[tokio::test]
@@ -2245,6 +2261,7 @@ mod tests {
             is_buy,
             is_dev_buy: false,
             amount: 1000000,
+            instruction_limit: None,
             max_sol_cost: if is_buy { 5000000 } else { 0 },
             min_sol_output: if is_buy { 0 } else { 3000000 },
             success: true,

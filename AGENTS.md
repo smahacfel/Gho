@@ -130,6 +130,52 @@ For narrow localized tasks, use the fast path.
 
 ---
 
+# GHOST — GO-D FROZEN TAPE: GLOBALNA REGUŁA OPERACYJNA
+
+GO-D Tape jest zamrożonym i zweryfikowanym źródłem historycznym
+dla przypisanych do niego walidacji strategii.
+
+GO_D_SOURCE_AUTHORITY = VERIFIED
+GO_E_EXTERNAL_AUDIT   = RETIRED / NOT A GATE
+
+Hashy, manifestu, offsetów, proweniencji binarki i kontraktu
+integralności GO-D należy używać jako jedynej authority źródłowej.
+Nie wolno blokować, unieważniać ani opóźniać analizy GO-D z powodu
+braku, awarii, rate-limitów lub niepowodzenia zewnętrznego RPC/GO-E.
+
+Każdy eksperyment musi:
+
+1. Przed outcome’ami zamrozić hipotezę, universe, cutoffy,
+   SELECTED/REST, entry/exit, metryki i bramkę mocy.
+
+2. Zarejestrować dokładne wejście: run_id, manifest hash,
+   segment/file hashes, newline-complete offsets oraz SHA helpera.
+
+3. Budować SELECTED/REST wyłącznie z informacji dostępnych
+   najpóźniej w decision cutoff. Bez PnL, terminalnych exitów,
+   TP/SL/TIMEOUT ani przyszłej trajektorii podczas census.
+
+4. Klasyfikować niekompletne przypadki precyzyjnym,
+   outcome-blind reason code. Nie wrzucać ich automatycznie do REST
+   i nie uzupełniać ich przez RPC, imputację ani carry-forward.
+
+5. Otwierać outcome’y wyłącznie po literalnym przejściu
+   prerejestrowanej bramki coverage, liczności i mocy.
+
+Nie wolno tworzyć nowego capture’u, używać RPC backfillu, mieszać
+GO-D z późniejszymi danymi zewnętrznymi ani zmieniać runtime’u
+wyłącznie po to, aby „naprawić” historyczny eksperyment.
+
+GO-D może zostać zakwestionowany wyłącznie przez konkretny,
+reprodukowalny dowód naruszenia jego własnego zamrożonego kontraktu
+integralności. Nieudany GO-E nie jest takim dowodem.
+
+Każdy raport końcowy musi jawnie podać:
+GO_D_SOURCE_AUTHORITY = VERIFIED
+EXTERNAL_GO_E_AUDIT_NOT_USED_AS_GATE = TRUE
+
+---
+
 # 4. Specialist Role Routing
 
 The following specialist roles are logical orchestration roles. They are not separate native Codex agents. Use them to choose the correct reasoning mode, skill, and reference document.

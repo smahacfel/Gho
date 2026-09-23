@@ -903,10 +903,12 @@ impl PumpPortalConnection {
             pool_amm_id: bonding_curve,
             base_mint: mint,
             quote_mint: Pubkey::from_str(SOL_MINT).unwrap(), // SOL
+            creation_regime: ghost_core::PumpCreationRegimeV1::default(),
             bonding_curve,
             creator,
             initial_virtual_token_reserves,
             initial_virtual_sol_reserves,
+            initial_virtual_quote_reserves: None,
             initial_real_token_reserves: None,
             initial_real_sol_reserves: None,
             token_total_supply: None,
@@ -931,6 +933,7 @@ impl PumpPortalConnection {
             .map(|ib| ib.saturating_mul(PUMPFUN_TOKEN_BASE_UNITS));
 
         let trade_event = TradeEvent {
+            instruction_limit: None,
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -1103,6 +1106,7 @@ impl PumpPortalConnection {
         };
 
         let trade_event = TradeEvent {
+            instruction_limit: None,
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,

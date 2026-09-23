@@ -1079,6 +1079,10 @@ pub struct GatekeeperBuyLog {
     pub min_unique_signers: usize,
     pub buy_count: usize,
     pub min_buy_count: usize,
+    #[serde(default)]
+    pub sell_count: usize,
+    #[serde(default)]
+    pub min_sell_count: usize,
 
     // Phase 2: Velocity Profile (measured + thresholds)
     pub phase2_passed: bool,
@@ -5075,6 +5079,8 @@ mod tests {
             min_unique_signers: 5,
             buy_count: 22,
             min_buy_count: 20,
+            sell_count: 3,
+            min_sell_count: 3,
             phase2_passed: true,
             interval_cv: Some(0.35),
             min_interval_cv: 0.30,
@@ -5671,6 +5677,8 @@ mod tests {
             min_unique_signers: 5,
             buy_count: 22,
             min_buy_count: 20,
+            sell_count: 3,
+            min_sell_count: 3,
             phase2_passed: true,
             interval_cv: Some(0.35),
             min_interval_cv: 0.30,

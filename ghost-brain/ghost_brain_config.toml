@@ -27,6 +27,7 @@ min_sol_threshold = 0.001
 min_tx_count = 55
 min_unique_signers = 41
 min_buy_count = 39
+min_sell_count = 0
 
 
 # Finalna ewaluacja nadal zbiera wczesne okno; nie wydłużamy go agresywnie.

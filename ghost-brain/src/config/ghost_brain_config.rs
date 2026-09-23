@@ -1639,6 +1639,13 @@ pub struct GatekeeperV2Config {
     /// Default: 5
     pub min_buy_count: usize,
 
+    /// Minimum sell transactions.
+    ///
+    /// The default is neutral so existing profiles retain their current
+    /// Phase-1 behavior until they explicitly opt into a sell floor.
+    #[serde(default)]
+    pub min_sell_count: usize,
+
     /// Hard deadline: maximum time (ms) from first TX to final decision.
     /// Default: 12_000
     pub max_wait_time_ms: u64,
@@ -2401,6 +2408,7 @@ impl Default for GatekeeperV2Config {
             min_tx_count: 30,
             min_unique_signers: 15,
             min_buy_count: 15,
+            min_sell_count: 0,
             max_wait_time_ms: 2_222,
 
             // Phase 2
@@ -6102,6 +6110,7 @@ min_dev_paperhand_latency_ms = 2500
             cfg.min_unique_signers,
             GatekeeperV2Config::default().min_unique_signers
         );
+        assert_eq!(cfg.min_sell_count, 0);
         assert_eq!(
             cfg.max_whale_reversal_ratio_top3,
             GatekeeperV2Config::default().max_whale_reversal_ratio_top3

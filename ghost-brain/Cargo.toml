@@ -12,6 +12,7 @@ tokio-util = "0.7"
 solana-sdk = "1.18"
 solana-client = "1.18"
 solana-rpc-client = "1.18"
+solana-account-decoder = "1.18"
 solana-transaction-status = "1.18"
 
 # Serialization

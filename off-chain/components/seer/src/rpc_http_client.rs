@@ -131,8 +131,93 @@ fn build_http_client(url: &str, timeout: Duration) -> reqwest::Client {
         .expect("build rpc http client")
 }
 
+fn standalone_no_auth_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static(RPC_HTTP_USER_AGENT));
+    headers
+}
+
+/// Construct an async RPC client with an explicit, per-client authorization
+/// header.  This is intentionally separate from the process-global provider
+/// compatibility configuration above: standalone research capture must be
+/// able to keep its read-only RPC credential in a named environment variable
+/// without placing it in the endpoint URL or mutating active-runtime auth.
+pub fn new_async_rpc_client_with_explicit_auth(
+    url: impl Into<String>,
+    header_name: &str,
+    token: &str,
+) -> Result<AsyncRpcClient, String> {
+    let header_name = header_name.trim();
+    if header_name.is_empty() {
+        return Err("explicit RPC auth header name is empty".to_owned());
+    }
+    let header_name = HeaderName::from_bytes(header_name.as_bytes())
+        .map_err(|error| format!("invalid explicit RPC auth header name: {error}"))?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("explicit RPC auth token is empty".to_owned());
+    }
+    let token = HeaderValue::from_str(token)
+        .map_err(|error| format!("invalid explicit RPC auth token value: {error}"))?;
+    let url = url.into();
+    // Do not call `rpc_http_headers` here: it can add legacy process-global
+    // provider credentials for selected hosts.  This explicit client must
+    // have exactly the standalone caller's declared authorization surface.
+    let mut headers = standalone_no_auth_headers();
+    headers.insert(header_name, token);
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(DEFAULT_RPC_TIMEOUT)
+        .pool_idle_timeout(DEFAULT_RPC_TIMEOUT)
+        .build()
+        .map_err(|error| format!("build explicit-auth RPC HTTP client: {error}"))?;
+    let sender = HttpSender::new_with_client(url, client);
+    Ok(AsyncRpcClient::new_sender(
+        sender,
+        RpcClientConfig::with_commitment(CommitmentConfig::default()),
+    ))
+}
+
 pub fn new_async_rpc_client(url: impl Into<String>) -> AsyncRpcClient {
     new_async_rpc_client_with_timeout(url, DEFAULT_RPC_TIMEOUT)
+}
+
+/// Construct a standalone async RPC client that intentionally ignores the
+/// legacy process-global provider-auth lookup, using the module's standard
+/// RPC timeout.  An explicit research credential continues to use
+/// [`new_async_rpc_client_with_explicit_auth`].
+///
+/// Keeping this constructor separate prevents a read-only offline audit from
+/// inheriting unrelated active-runtime authentication merely because two
+/// clients happen to target the same host.
+pub fn new_async_rpc_client_without_legacy_auth(
+    url: impl Into<String>,
+) -> Result<AsyncRpcClient, String> {
+    new_async_rpc_client_without_legacy_auth_with_timeout(url, DEFAULT_RPC_TIMEOUT)
+}
+
+/// Timeout-configurable lower-level form of
+/// [`new_async_rpc_client_without_legacy_auth`].  It exists for bounded
+/// offline materialization, while PR-A ProgramData receipts use the default
+/// constructor above so the standalone capture path does not duplicate the
+/// module-private timeout contract.
+pub fn new_async_rpc_client_without_legacy_auth_with_timeout(
+    url: impl Into<String>,
+    timeout: Duration,
+) -> Result<AsyncRpcClient, String> {
+    let url = url.into();
+    let headers = standalone_no_auth_headers();
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(timeout)
+        .pool_idle_timeout(timeout)
+        .build()
+        .map_err(|error| format!("build standalone no-auth RPC HTTP client: {error}"))?;
+    let sender = HttpSender::new_with_client(url, client);
+    Ok(AsyncRpcClient::new_sender(
+        sender,
+        RpcClientConfig::with_commitment(CommitmentConfig::default()),
+    ))
 }
 
 pub fn new_async_rpc_client_with_timeout(
@@ -228,5 +313,50 @@ mod tests {
                 token: "grpc-token".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn explicit_rpc_auth_client_rejects_empty_or_invalid_auth_without_url_credentials() {
+        assert!(
+            new_async_rpc_client_with_explicit_auth("https://rpc.example.net", "", "token",)
+                .is_err()
+        );
+        assert!(new_async_rpc_client_with_explicit_auth(
+            "https://rpc.example.net",
+            "x-api-key",
+            "",
+        )
+        .is_err());
+        assert!(new_async_rpc_client_with_explicit_auth(
+            "https://rpc.example.net",
+            "x-api-key",
+            "test-token",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn standalone_no_auth_headers_never_include_legacy_or_explicit_auth() {
+        // This helper intentionally performs no environment lookup.  It is
+        // the exact header surface used by PR-A when rpc_auth_token_env is
+        // absent, including for NLN endpoints where the generic client would
+        // otherwise consult legacy Yellowstone auth.
+        let headers = standalone_no_auth_headers();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(
+            headers.get(USER_AGENT),
+            Some(&HeaderValue::from_static(RPC_HTTP_USER_AGENT))
+        );
+        for forbidden in [
+            "x-api-key",
+            "x-token",
+            "authorization",
+            "proxy-authorization",
+        ] {
+            assert!(
+                headers.get(forbidden).is_none(),
+                "standalone no-auth client must not emit {forbidden}"
+            );
+        }
     }
 }

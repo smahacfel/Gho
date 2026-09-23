@@ -1,0 +1,378 @@
+{
+  "source_url": "https://raw.githubusercontent.com/pump-fun/pump-public-docs/main/idl/pump.json",
+  "retrieved_on": "2026-09-22",
+  "full_idl_sha256": "ffe966c42f1af41652ee753fe2f1e3f7cd4077d7e6f49faf3138959c8b56064b",
+  "instructions": [
+    {
+      "name": "buy",
+      "discriminator": [
+        102,
+        6,
+        61,
+        18,
+        1,
+        218,
+        235,
+        234
+      ],
+      "accounts": [
+        {
+          "name": "global"
+        },
+        {
+          "name": "fee_recipient"
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "bonding_curve"
+        },
+        {
+          "name": "associated_bonding_curve"
+        },
+        {
+          "name": "associated_user"
+        },
+        {
+          "name": "user"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "creator_vault"
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program",
+          "address": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+        },
+        {
+          "name": "global_volume_accumulator"
+        },
+        {
+          "name": "user_volume_accumulator"
+        },
+        {
+          "name": "fee_config"
+        },
+        {
+          "name": "fee_program",
+          "address": "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "max_sol_cost",
+          "type": "u64"
+        },
+        {
+          "name": "track_volume",
+          "type": {
+            "defined": {
+              "name": "OptionBool"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "buy_v2",
+      "discriminator": [
+        184,
+        23,
+        238,
+        97,
+        103,
+        197,
+        211,
+        61
+      ],
+      "accounts": [
+        {
+          "name": "global"
+        },
+        {
+          "name": "base_mint"
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "base_token_program"
+        },
+        {
+          "name": "quote_token_program"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "fee_recipient"
+        },
+        {
+          "name": "associated_quote_fee_recipient"
+        },
+        {
+          "name": "buyback_fee_recipient"
+        },
+        {
+          "name": "associated_quote_buyback_fee_recipient"
+        },
+        {
+          "name": "bonding_curve"
+        },
+        {
+          "name": "associated_base_bonding_curve"
+        },
+        {
+          "name": "associated_quote_bonding_curve"
+        },
+        {
+          "name": "user"
+        },
+        {
+          "name": "associated_base_user"
+        },
+        {
+          "name": "associated_quote_user"
+        },
+        {
+          "name": "creator_vault"
+        },
+        {
+          "name": "associated_creator_vault"
+        },
+        {
+          "name": "sharing_config"
+        },
+        {
+          "name": "global_volume_accumulator"
+        },
+        {
+          "name": "user_volume_accumulator"
+        },
+        {
+          "name": "associated_user_volume_accumulator"
+        },
+        {
+          "name": "fee_config"
+        },
+        {
+          "name": "fee_program",
+          "address": "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program",
+          "address": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "max_sol_cost",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "sell",
+      "discriminator": [
+        51,
+        230,
+        133,
+        164,
+        1,
+        127,
+        131,
+        173
+      ],
+      "accounts": [
+        {
+          "name": "global"
+        },
+        {
+          "name": "fee_recipient"
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "bonding_curve"
+        },
+        {
+          "name": "associated_bonding_curve"
+        },
+        {
+          "name": "associated_user"
+        },
+        {
+          "name": "user"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "creator_vault"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program",
+          "address": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+        },
+        {
+          "name": "fee_config"
+        },
+        {
+          "name": "fee_program",
+          "address": "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "min_sol_output",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "sell_v2",
+      "discriminator": [
+        93,
+        246,
+        130,
+        60,
+        231,
+        233,
+        64,
+        178
+      ],
+      "accounts": [
+        {
+          "name": "global"
+        },
+        {
+          "name": "base_mint"
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "base_token_program"
+        },
+        {
+          "name": "quote_token_program"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "fee_recipient"
+        },
+        {
+          "name": "associated_quote_fee_recipient"
+        },
+        {
+          "name": "buyback_fee_recipient"
+        },
+        {
+          "name": "associated_quote_buyback_fee_recipient"
+        },
+        {
+          "name": "bonding_curve"
+        },
+        {
+          "name": "associated_base_bonding_curve"
+        },
+        {
+          "name": "associated_quote_bonding_curve"
+        },
+        {
+          "name": "user"
+        },
+        {
+          "name": "associated_base_user"
+        },
+        {
+          "name": "associated_quote_user"
+        },
+        {
+          "name": "creator_vault"
+        },
+        {
+          "name": "associated_creator_vault"
+        },
+        {
+          "name": "sharing_config"
+        },
+        {
+          "name": "user_volume_accumulator"
+        },
+        {
+          "name": "associated_user_volume_accumulator"
+        },
+        {
+          "name": "fee_config"
+        },
+        {
+          "name": "fee_program",
+          "address": "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program",
+          "address": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "min_sol_output",
+          "type": "u64"
+        }
+      ]
+    }
+  ]
+}

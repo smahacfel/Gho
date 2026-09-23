@@ -403,6 +403,15 @@ impl LocalGapTracker {
         self.unreliable.load(Ordering::Acquire) || self.completed_overflow.load(Ordering::Acquire)
     }
 
+    /// Whether completed gap evidence was discarded because the bounded
+    /// completed queue overflowed.  Consumers that persist their own
+    /// coverage contract must fail closed on this condition; `is_unreliable`
+    /// is intentionally broader because ordinary, successfully-recorded
+    /// saturation also makes a range non-evaluable.
+    pub(crate) fn completed_overflowed(&self) -> bool {
+        self.completed_overflow.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(crate) fn completed_len(&self) -> usize {
         self.state

@@ -27,6 +27,28 @@ Procedura operatorska start/stop/restart/abort jest w [`docs/RUNBOOK_PRODUCTION_
   Czas od odebrania `PumpEvent` do wyemitowania `GeyserEvent` po stronie transportu.
   Wzrost oznacza backlog w dual-lane drain lub koszt dekodowania.
 
+- `seer_grpc_to_candidate_latency_ms{amm_program=...,source=...}`
+  Czas na wspólnej osi monotonicznej procesu od odebrania wiadomości przez adapter
+  Yellowstone do przyjęcia `PoolDetected` przez ograniczoną kolejkę IPC. Dla profilu
+  PREDATOR v11 latency-fix bucket `le="50"` musi być równy bucketowi `le="+Inf"`.
+
+- `seer_grpc_to_candidate_slo_breach_total{amm_program=...,source=...,reason=...}`
+  Liczba kandydatów zdegradowanych do evidence-only przez budżet
+  `seer.grpc_candidate_handoff_slo_ms`. `reason="over_budget"` oznacza przekroczenie
+  budżetu, a `reason="missing_receive_timestamp"` brak dowodu na wspólnej osi czasu.
+  Każdy przyrost oznacza, że pool nie może otworzyć sesji obserwacyjnej.
+
+- `seer.event_worker_concurrency`
+  Opcjonalny, ograniczony limit współbieżnych workerów wspólnego event streamu.
+  Zwiększać tylko na podstawie naruszeń `grpc_to_candidate` powiązanych z
+  kolejką workerów; efektywna wartość jest logowana przy starcie i ograniczona
+  przez runtime do zakresu `4..=32`.
+
+- `seer_mint_to_detection_ms` / `seer_late_detection_total`
+  Legacy diagnostyka wieku sekundowego `block_time` względem zegara hosta. Te metryki
+  obejmują kwantyzację czasu Solany i dryf zegarów; nie wolno interpretować ich jako
+  opóźnienia transportu gRPC ani hot-pathu detekcji.
+
 - `parser_malformed_tx_rate`
   Udział malformed/raw-decode errors w całości prób dekodowania tx przez transport/parser.
   Wzrost zwykle wskazuje na uszkodzony feed, niekompatybilny wire format albo błędny payload.
