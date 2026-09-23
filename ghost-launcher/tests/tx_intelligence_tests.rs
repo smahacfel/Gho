@@ -74,6 +74,11 @@ fn test_tx(
         token_mint: None,
         v_tokens_in_bonding_curve: None,
         v_sol_in_bonding_curve: None,
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         market_cap_sol: None,
         global_config: None,
         fee_recipient: None,
@@ -349,7 +354,7 @@ fn session_tx_buffer_is_bounded() {
     gatekeeper_config.min_tx_count = DEFAULT_SESSION_TX_RING_CAPACITY * 2;
     gatekeeper_config.min_unique_signers = DEFAULT_SESSION_TX_RING_CAPACITY * 2;
     gatekeeper_config.min_buy_count = DEFAULT_SESSION_TX_RING_CAPACITY * 2;
-    gatekeeper_config.max_wait_time_ms = 10_000;
+    gatekeeper_config.max_wait_time_ms = 60_000;
     let funding_source_config = FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config);
 
     let now_ms = SystemTime::now()
@@ -365,7 +370,7 @@ fn session_tx_buffer_is_bounded() {
             dev_wallet: Some(Pubkey::new_unique()),
             candidate_snapshot: candidate(pool_id, base_mint, bonding_curve),
             created_at_wall_ms: now_ms,
-            deadline_wall_ms: Some(now_ms + 10_000),
+            deadline_wall_ms: Some(now_ms + 60_000),
             gatekeeper_config,
             funding_source_config,
             fingerprint_config: EarlyFingerprintConfig::default(),
@@ -382,7 +387,7 @@ fn session_tx_buffer_is_bounded() {
             signer,
             &format!("sig-buffer-{i}"),
             i,
-            now_ms + u64::from(i),
+            now_ms + u64::from(i) * 250,
             true,
             0.2,
             false,
