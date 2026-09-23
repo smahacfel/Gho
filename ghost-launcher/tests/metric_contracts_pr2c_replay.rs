@@ -5,7 +5,7 @@ use common::{equal_policy, paired_fixture, paired_fixture_with_comparator};
 use ghost_core::metric_contracts::{
     CanonicalNullableV1, MetricContractDecisionEvidenceProjectionV1,
     MetricContractDecisionProjectionWireV1, MetricContractDecisionSourceCutoffV1,
-    MetricContractEvidenceTransportV1,
+    MetricContractEvidenceTransportV1, METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V2,
 };
 use ghost_launcher::metric_contracts::{
     replay_metric_contract_record_v2, Pr2cReplayErrorV2, Pr2cReplayInputV2,
@@ -27,8 +27,12 @@ fn replay_v2_rebuilds_exact_domain_projection_hash_and_wire_roundtrip() {
     let original = input.decision_time_projection.clone();
     let result = replay_metric_contract_record_v2(input).unwrap();
     assert_eq!(result.rebuilt_projection, original);
-    assert_eq!(result.wire_version, 1);
+    assert_eq!(
+        result.wire_version,
+        METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V2
+    );
     let wire = MetricContractDecisionProjectionWireV1::try_from_domain(&original).unwrap();
+    assert_eq!(wire.w, METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V2);
     assert_eq!(wire.try_into_domain().unwrap(), original);
 }
 

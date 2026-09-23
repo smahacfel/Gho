@@ -897,6 +897,33 @@ fn build_ftdi_evidence_v1_validated(
 ) -> Result<FtdiEvidenceV1, Pr2aProducerErrorV1> {
     let context = validated.context;
     validate_ftdi_producer_config(context)?;
+    // M2 ma nową semantykę; nigdy nie wkładamy 1-HHI do starego kontraktu K/N.
+    finite_ratio(
+        computation.fee_topology_diversity_index,
+        "ftdi.gini_simpson",
+    )?;
+    finite_ratio(computation.coordination_hhi, "ftdi.coordination_hhi")?;
+    if computation.represented_signer_count > computation.signer_sample_count
+        || computation.unique_topology_count > computation.represented_signer_count
+        || !ratio_bits_equal(
+            computation.fee_topology_diversity_index,
+            computation.coordination_hhi.map(|hhi| 1.0 - hhi),
+        )
+        || (computation.fee_topology_diversity_index.is_some()
+            && (computation.represented_signer_count == 0
+                || computation.unique_topology_count == 0
+                || computation.represented_signer_count != computation.signer_sample_count))
+    {
+        return Err(Pr2aProducerErrorV1::ProducerInvariant(
+            "ftdi.gini_simpson_or_coverage",
+        ));
+    }
+    let gini_simpson_v2 = computation.evidence_v2();
+    gini_simpson_v2
+        .validate()
+        .map_err(Pr2aProducerErrorV1::ProducerInvariant)?;
+    let computation = computation.legacy_contract_v1();
+    let input_complete = computation.input_complete;
     if computation.unique_topology_count > computation.signer_sample_count {
         return Err(Pr2aProducerErrorV1::ProducerInvariant("ftdi.counts"));
     }
@@ -906,11 +933,13 @@ fn build_ftdi_evidence_v1_validated(
     if (computation.fee_topology_diversity_index.is_some() && computation.signer_sample_count < 2)
         || !ratio_bits_equal(computation.fee_topology_diversity_index, expected_value)
         || computation.legacy_buy_tx_actionable
-            != (expected_value.is_some()
+            != (input_complete
+                && expected_value.is_some()
                 && computation.buy_sample_count
                     >= crate::tx_intelligence::MIN_CLEAN_BUY_SAMPLE_COUNT)
         || computation.unique_buyer_actionable_v2
-            != (expected_value.is_some()
+            != (input_complete
+                && expected_value.is_some()
                 && computation.signer_sample_count
                     >= crate::tx_intelligence::MIN_CLEAN_UNIQUE_BUYER_SAMPLE_COUNT_V2)
     {
@@ -940,7 +969,12 @@ fn build_ftdi_evidence_v1_validated(
         .collect::<Vec<_>>();
     let (legacy_availability, legacy_quality) =
         if computation.fee_topology_diversity_index.is_some() {
-            if computation.legacy_buy_tx_actionable {
+            if !input_complete {
+                (
+                    MetricAvailabilityV1::Available,
+                    MetricMeasurementQualityV1::Degraded,
+                )
+            } else if computation.legacy_buy_tx_actionable {
                 (
                     MetricAvailabilityV1::Available,
                     MetricMeasurementQualityV1::Measured,
@@ -957,7 +991,9 @@ fn build_ftdi_evidence_v1_validated(
                 MetricMeasurementQualityV1::NotApplicable,
             )
         };
-    let value_v1_reasons = if computation.fee_topology_diversity_index.is_some() {
+    let value_v1_reasons = if !input_complete {
+        legacy_reasons.clone()
+    } else if computation.fee_topology_diversity_index.is_some() {
         Vec::new()
     } else if computation.signer_sample_count < 2 {
         vec![MetricEvidenceReasonV1::Ftdi(
@@ -969,7 +1005,11 @@ fn build_ftdi_evidence_v1_validated(
         )]
     };
     let value_v1_quality = if computation.fee_topology_diversity_index.is_some() {
-        MetricMeasurementQualityV1::Measured
+        if input_complete {
+            MetricMeasurementQualityV1::Measured
+        } else {
+            MetricMeasurementQualityV1::Degraded
+        }
     } else {
         MetricMeasurementQualityV1::NotApplicable
     };
@@ -1004,7 +1044,8 @@ fn build_ftdi_evidence_v1_validated(
             MetricSurfaceId::FtdiValueEvidenceV1,
             value_v1_availability,
             value_v1_quality,
-            computation.fee_topology_diversity_index.is_some()
+            input_complete
+                && computation.fee_topology_diversity_index.is_some()
                 && surface_is_policy_authoritative(context, MetricSurfaceId::FtdiValueEvidenceV1),
             value_v1_reasons,
         )?,
@@ -1013,18 +1054,23 @@ fn build_ftdi_evidence_v1_validated(
         unique_buyer_sample_count,
         buy_transaction_sample_count,
     };
-    let legacy_actionability_quality = if computation.legacy_buy_tx_actionable {
+    let legacy_actionability_quality = if !input_complete {
+        MetricMeasurementQualityV1::Degraded
+    } else if computation.legacy_buy_tx_actionable {
         MetricMeasurementQualityV1::Measured
     } else {
         MetricMeasurementQualityV1::Insufficient
     };
-    let corrected_quality = if computation.unique_buyer_actionable_v2 {
+    let corrected_quality = if !input_complete {
+        MetricMeasurementQualityV1::Degraded
+    } else if computation.unique_buyer_actionable_v2 {
         MetricMeasurementQualityV1::Measured
     } else {
         MetricMeasurementQualityV1::Insufficient
     };
 
     Ok(FtdiEvidenceV1 {
+        gini_simpson_v2: Some(gini_simpson_v2),
         legacy_value,
         value_v1,
         legacy_actionability_envelope: envelope(
@@ -1065,7 +1111,11 @@ fn build_ftdi_evidence_v1_validated(
                 MetricAvailabilityV1::Unavailable
             },
             if computation.coordination_hhi.is_some() {
-                MetricMeasurementQualityV1::Measured
+                if input_complete {
+                    MetricMeasurementQualityV1::Measured
+                } else {
+                    MetricMeasurementQualityV1::Degraded
+                }
             } else {
                 MetricMeasurementQualityV1::NotApplicable
             },

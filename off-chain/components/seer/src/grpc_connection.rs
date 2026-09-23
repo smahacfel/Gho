@@ -158,8 +158,15 @@ static PARSER_TX_DECODE_MALFORMED: AtomicU64 = AtomicU64::new(0);
 
 // ─── PumpEvent — transport output / parser input ──────────────────────────────
 
+// Epoch obejmuje również odtworzenie Seera w tym samym procesie.
+static PRIMARY_TRADE_SOURCE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone)]
 pub enum PumpEvent {
+    PrimaryTradeFeedProgress {
+        progress: crate::types::PrimaryTradeFeedProgressV1,
+        received_at: Instant,
+    },
     Transaction {
         provider_id: Option<String>,
         provider_role: Option<ghost_core::RawProviderRoleV1>,
@@ -221,6 +228,7 @@ impl PumpEvent {
     #[inline(always)]
     pub fn slot(&self) -> u64 {
         match self {
+            Self::PrimaryTradeFeedProgress { .. } => 0,
             Self::Transaction { slot, .. } => *slot,
             Self::AccountUpdate { slot, .. } => *slot,
             Self::EntryUpdate { slot, .. } => *slot,
@@ -230,6 +238,7 @@ impl PumpEvent {
     #[inline(always)]
     pub fn received_at(&self) -> Instant {
         match self {
+            Self::PrimaryTradeFeedProgress { received_at, .. } => *received_at,
             Self::Transaction { received_at, .. } => *received_at,
             Self::AccountUpdate { received_at, .. } => *received_at,
             Self::EntryUpdate { received_at, .. } => *received_at,
@@ -245,6 +254,9 @@ impl PumpEvent {
     }
 
     fn local_gap_boundary(&self) -> ghost_core::LocalCoverageBoundaryV1 {
+        if matches!(self, Self::PrimaryTradeFeedProgress { .. }) {
+            return ghost_core::LocalCoverageBoundaryV1::default();
+        }
         let signature = match self {
             Self::Transaction { signature, .. } | Self::BackfillTransaction { signature, .. } => {
                 Signature::from_str(signature).ok()
@@ -259,6 +271,7 @@ impl PumpEvent {
 
     fn provider_id(&self) -> &str {
         match self {
+            Self::PrimaryTradeFeedProgress { progress, .. } => &progress.provider_id,
             Self::Transaction { provider_id, .. }
             | Self::AccountUpdate { provider_id, .. }
             | Self::EntryUpdate { provider_id, .. }
@@ -279,6 +292,7 @@ pub struct DualLaneChannel {
     capture_live_payload: Arc<AtomicBool>,
     local_gap: Arc<crate::local_gap::LocalGapTracker>,
     stream_epoch: Arc<AtomicU64>,
+    primary_trade_epoch: Arc<AtomicU64>,
 }
 
 pub struct DualLaneReceiver {
@@ -309,6 +323,7 @@ impl DualLaneChannel {
                 capture_live_payload: Arc::new(AtomicBool::new(false)),
                 local_gap: Arc::clone(&local_gap),
                 stream_epoch: Arc::new(AtomicU64::new(0)),
+                primary_trade_epoch: Arc::new(AtomicU64::new(0)),
             },
             DualLaneReceiver {
                 queue: receiver,
@@ -323,6 +338,32 @@ impl DualLaneChannel {
         overflow_capacity: usize,
     ) -> (Self, DualLaneReceiver) {
         Self::with_capacity(fast_capacity.saturating_add(overflow_capacity).max(1))
+    }
+
+    fn emit_primary_trade_progress(
+        &self,
+        provider_id: &str,
+        role: ghost_core::RawProviderRoleV1,
+        gap: bool,
+        stats: &Arc<TransportStats>,
+    ) {
+        if role != ghost_core::RawProviderRoleV1::PrimaryAuthority {
+            return;
+        }
+        let received_ms = crate::types::ingress_epoch_ms();
+        self.send(
+            PumpEvent::PrimaryTradeFeedProgress {
+                progress: crate::types::PrimaryTradeFeedProgressV1 {
+                    provider_id: provider_id.to_string(),
+                    epoch: self.primary_trade_epoch.load(Ordering::Acquire),
+                    event_ms: received_ms,
+                    received_ms,
+                    gap,
+                },
+                received_at: Instant::now(),
+            },
+            stats,
+        );
     }
 
     /// Nonblocking enqueue into the only ingress FIFO.
@@ -2506,6 +2547,9 @@ async fn connection_loop(
         )
         .await;
 
+        if research_capture_sink.is_none() {
+            channel.emit_primary_trade_progress(&prov.label, prov.role, true, &stats);
+        }
         match result {
             Ok(()) => break,
             Err(err) => {
@@ -3497,6 +3541,15 @@ async fn stream_loop(
 
     let _availability_guard = availability_tracker.connected_guard();
     info!("[{id}] Stream established");
+    if research_capture_sink.is_none()
+        && provider_role == ghost_core::RawProviderRoleV1::PrimaryAuthority
+    {
+        let epoch = PRIMARY_TRADE_SOURCE_EPOCH
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        channel.primary_trade_epoch.store(epoch, Ordering::Release);
+        channel.emit_primary_trade_progress(provider_id, provider_role, true, stats);
+    }
     if let Some(research_capture_sink) = research_capture_sink.as_ref() {
         research_capture_sink.source_stream_established(stream_epoch);
         *research_stream_established = true;
@@ -3965,6 +4018,8 @@ fn route_update(
         // observation window start by ~1 second.
         Some(UpdateOneof::BlockMeta(bm)) => {
             track_slot(slots, stats, bm.slot, gap_tx);
+            // Marker idzie tym samym FIFO za wcześniej odebranymi transakcjami.
+            channel.emit_primary_trade_progress(provider_id, provider_role, false, stats);
             if let Some(ts) = bm.block_time.as_ref().map(|t| t.timestamp) {
                 if ts > 0 {
                     latest_block_time_secs.fetch_max(ts, Ordering::Relaxed);
@@ -5091,6 +5146,11 @@ async fn fetch_gap_backfill_events(
             account_data: HashMap::new(),
             pre_balances,
             post_balances,
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                // Ta ścieżka nie dekoduje inner instructions.
+                inner_instructions_known: false,
+            },
             success: meta.err.is_none(),
             error_code: meta.err.as_ref().map(|err| format!("{:?}", err)),
             compute_units_consumed: Option::<u64>::from(meta.compute_units_consumed.clone()),
@@ -5118,6 +5178,11 @@ pub(crate) fn pump_event_to_geyser_event(
     block_time: Option<i64>,
 ) -> Option<SeerResult<GeyserEvent>> {
     match ev {
+        PumpEvent::PrimaryTradeFeedProgress { mut progress, .. } => {
+            // Ta sama jawna oś co normalizacja primary Transaction (bez block_time hint).
+            progress.event_ms = crate::types::ingress_epoch_ms();
+            Some(Ok(GeyserEvent::PrimaryTradeFeedProgress(progress)))
+        }
         PumpEvent::Transaction {
             provider_id,
             provider_role,
@@ -5326,6 +5391,7 @@ fn tx_update_to_geyser_event(
 
     // Inner instructions
     let inner_instructions: Vec<InnerInstructionGroup> = meta
+        .filter(|m| !m.inner_instructions_none)
         .map(|m| {
             m.inner_instructions
                 .iter()
@@ -5400,7 +5466,11 @@ fn tx_update_to_geyser_event(
         .unwrap_or_default();
 
     // Success / error
-    let success = meta.map(|m| m.err.is_none()).unwrap_or(true);
+    let metadata_availability = crate::types::TransactionMetadataAvailability {
+        status_known: meta.is_some(),
+        inner_instructions_known: meta.is_some_and(|m| !m.inner_instructions_none),
+    };
+    let success = meta.is_some_and(|m| m.err.is_none());
     let error_code = meta
         .and_then(|m| m.err.as_ref())
         .map(|e| format!("{:?}", e.err));
@@ -5435,6 +5505,7 @@ fn tx_update_to_geyser_event(
         account_data: std::collections::HashMap::new(),
         pre_balances,
         post_balances,
+        metadata_availability,
         success,
         error_code,
         compute_units_consumed,
@@ -5446,6 +5517,70 @@ fn tx_update_to_geyser_event(
         pre_token_balances,
         post_token_balances,
     })
+}
+
+/// Offline-only adapter pełnego, zachowanego SubscribeUpdate z Tape V4.
+/// Waliduje envelope/projekcję i używa tego samego normalizatora co dotychczasowy
+/// replay. Nie łączy się ze źródłem ani nie uzupełnia danych bieżącym stanem.
+pub fn decode_research_raw_transaction_v2(
+    record: &ghost_core::pump_research_exact_tape_v2::PumpExactStateTransactionEvidenceV2,
+) -> SeerResult<GeyserEvent> {
+    use yellowstone_grpc_proto::prelude::{subscribe_update::UpdateOneof, SubscribeUpdate};
+    if *blake3::hash(&record.source_payload).as_bytes()
+        != record.source.payload_hash_blake3.into_inner()
+    {
+        return Err(SeerError::ParseError(
+            "raw V2 source payload hash mismatch".into(),
+        ));
+    }
+    let full = SubscribeUpdate::decode(record.source_payload.as_slice())
+        .map_err(|e| SeerError::ParseError(format!("raw V2 source decode: {e}")))?;
+    let Some(UpdateOneof::Transaction(update)) = full.update_oneof else {
+        return Err(SeerError::ParseError(
+            "raw V2 source is not a transaction".into(),
+        ));
+    };
+    let info = update
+        .transaction
+        .as_ref()
+        .ok_or_else(|| SeerError::ParseError("raw V2 transaction info missing".into()))?;
+    if update.slot != record.slot
+        || info.signature.as_slice() != record.signature.into_inner()
+        || record
+            .tx_index
+            .is_some_and(|index| u64::from(index) != info.index)
+    {
+        return Err(SeerError::ParseError(
+            "raw V2 transaction projection mismatch".into(),
+        ));
+    }
+    let mut event = decode_research_raw_transaction_v1(
+        &encode_proto(&update),
+        record.slot,
+        record.block_time,
+        &record.source.provider_id,
+        record.event_time,
+    )?;
+    if let GeyserEvent::Transaction {
+        source,
+        observation_provenance,
+        ..
+    } = &mut event
+    {
+        *source = "pump_exact_state_tape_v2_offline_replay".into();
+        *observation_provenance = Some(ghost_core::ObservationProvenanceV1 {
+            source_family: ghost_core::ObservationSourceFamilyV1::RawYellowstone,
+            source_id: "pump_exact_state_tape_v2_offline_replay".into(),
+            provider_id: record.source.provider_id.clone(),
+            schema_id: "yellowstone_subscribe_update_decoded_protobuf_v1".into(),
+            payload_hash_blake3:
+                ghost_core::ObservationProvenanceV1::payload_hash_for_captured_provider_payload(
+                    &record.source_payload,
+                ),
+            received_at_monotonic_ns: 0,
+        });
+    }
+    Ok(event)
 }
 
 /// Decode a frozen PR-A transaction payload for the offline research
@@ -7573,6 +7708,10 @@ mod tests {
 
     fn make_decoded_tx(signature: Signature, slot: u64, source: &str) -> GeyserEvent {
         GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -8406,5 +8545,44 @@ mod tests {
         let n = conn.drain_and_reinject_delayed_account_updates(&curve_str);
         assert_eq!(n, 1, "exactly one event must be re-injected");
         assert_eq!(conn.delayed_queue.depth(), 0);
+    }
+    #[test]
+    fn m4_progress_is_primary_epoch_bound_and_uses_the_normalizer_time_domain() {
+        let (channel, receiver) = DualLaneChannel::with_capacities(4, 4);
+        let stats = Arc::new(TransportStats::default());
+        channel.primary_trade_epoch.store(7, Ordering::Release);
+        channel.emit_primary_trade_progress(
+            "witness",
+            ghost_core::RawProviderRoleV1::SecondaryWitness,
+            false,
+            &stats,
+        );
+        assert!(receiver.queue.try_recv().is_err());
+        channel.emit_primary_trade_progress(
+            "primary",
+            ghost_core::RawProviderRoleV1::PrimaryAuthority,
+            false,
+            &stats,
+        );
+        let event = receiver.queue.try_recv().unwrap();
+        let normalized = pump_event_to_geyser_event(event, GRPC_GLOBAL_STREAM_SOURCE_LABEL, None)
+            .unwrap()
+            .unwrap();
+        let GeyserEvent::PrimaryTradeFeedProgress(progress) = normalized else {
+            panic!("progress control");
+        };
+        assert_eq!(progress.epoch, 7);
+        assert_eq!(progress.provider_id, "primary");
+        assert!(!progress.gap);
+        assert!(progress.event_ms >= progress.received_ms);
+        channel.emit_primary_trade_progress(
+            "primary",
+            ghost_core::RawProviderRoleV1::PrimaryAuthority,
+            true,
+            &stats,
+        );
+        assert!(
+            matches!(receiver.queue.try_recv().unwrap(),PumpEvent::PrimaryTradeFeedProgress{progress,..} if progress.gap)
+        );
     }
 }

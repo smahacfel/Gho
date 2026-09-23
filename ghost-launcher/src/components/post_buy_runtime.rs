@@ -10358,12 +10358,17 @@ sys.exit(0)
             volume_sol: f64,
         ) -> PoolTransaction {
             PoolTransaction {
+                metadata_availability: seer::types::TransactionMetadataAvailability {
+                    status_known: true,
+                    inner_instructions_known: true,
+                },
                 semantic: EventSemanticEnvelope::default(),
                 pool_amm_id: "pool".to_string(),
                 slot: Some(slot),
                 event_ordinal: Some(0),
                 tx_index: Some(tx_index),
                 outer_instruction_index: None,
+                inner_instruction_path: None,
                 inner_group_index: None,
                 outer_program_id: None,
                 cpi_stack_height: None,

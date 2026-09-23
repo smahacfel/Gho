@@ -187,9 +187,9 @@ impl Pr2cFrozenInputsFixture {
     pub fn with_ftdi_counterfactual(mut self) -> Self {
         // Three accepted BUY transactions satisfy the frozen legacy gate, while
         // two unique buyers remain below the corrected three-buyer gate. The
-        // ratio and HHI are exact outputs for two singleton fee topologies.
+        // Gini-Simpson and HHI are exact outputs for two singleton fee topologies.
         self.ftdi = FtdiComputation {
-            fee_topology_diversity_index: Some(1.0),
+            fee_topology_diversity_index: Some(0.5),
             unique_topology_count: 2,
             coordination_hhi: Some(0.5),
             legacy_buy_tx_actionable: true,
@@ -197,6 +197,7 @@ impl Pr2cFrozenInputsFixture {
             degraded_reasons: Vec::new(),
             buy_sample_count: 3,
             signer_sample_count: 2,
+            represented_signer_count: 2,
         };
         self
     }

@@ -24,6 +24,15 @@ use solana_sdk::signature::Signature;
 /// Build a minimal valid `TradeEvent` for use in bridge tests.
 fn make_buy_trade(pool: Pubkey, mint: Pubkey) -> TradeEvent {
     TradeEvent {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         semantic: ghost_core::EventSemanticEnvelope::default(),
         provider_id: None,
         provider_role: None,
@@ -154,6 +163,7 @@ fn test_bridge_preserves_ordering_metadata() {
 fn test_bridge_preserves_provenance_metadata() {
     let mut trade = make_buy_trade(Pubkey::new_unique(), Pubkey::new_unique());
     trade.provenance = Some(InstructionProvenance {
+        inner_instruction_path: None,
         outer_instruction_index: Some(4),
         inner_group_index: Some(2),
         outer_program_id: Some("outer-program".to_string()),
@@ -501,5 +511,290 @@ fn test_bridge_output_sufficient_for_shadow_ledger_gatekeeper() {
     assert!(
         !pool_tx.signature.is_empty(),
         "signature required for dedup"
+    );
+}
+
+// Real MFS integration runs in its own test binary to isolate global telemetry.
+#[test]
+fn m1_bridge_mfs_evidence_preserves_available_and_missing_metadata() {
+    use ghost_brain::{config::GatekeeperV2Config, fast_pipeline::EnhancedCandidate};
+    use ghost_core::metric_contracts::MetricMeasurementQualityV1;
+    use ghost_launcher::session::{OpenSessionRequest, SessionConfig, SessionManager};
+    use std::sync::Arc;
+    let t0 = seer::types::ingress_epoch_ms().saturating_sub(100);
+    let pool = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let manager = SessionManager::new(SessionConfig {
+        max_sessions: 1,
+        ..SessionConfig::default()
+    });
+    let config = GatekeeperV2Config::default();
+    manager
+        .open_session(OpenSessionRequest {
+            pool_amm_id: pool,
+            base_mint: mint,
+            bonding_curve: pool,
+            dev_wallet: None,
+            candidate_snapshot: EnhancedCandidate {
+                pool_amm_id: pool,
+                base_mint: mint,
+                bonding_curve: pool,
+                timestamp: t0,
+                signature: Signature::new_unique().to_string(),
+                ..EnhancedCandidate::default()
+            },
+            created_at_wall_ms: t0,
+            deadline_wall_ms: Some(t0 + 30_000),
+            funding_source_config:
+                ghost_launcher::tx_intelligence::FundingSourceConfig::from_gatekeeper_config(
+                    &config,
+                ),
+            gatekeeper_config: config,
+            fingerprint_config: seer::early_fingerprint::EarlyFingerprintConfig::default(),
+        })
+        .unwrap();
+    let session = manager.get_session(&pool).unwrap();
+    let mut session = session.write();
+    session.set_pr2c_snapshot_capture_enabled(true);
+    for index in 0..3 {
+        let mut trade = make_buy_trade(pool, mint);
+        trade.tx_index = Some(index);
+        trade.timestamp_ms = t0 + u64::from(index);
+        trade.event_time = ghost_core::EventTimeMetadata::new(
+            Some(trade.timestamp_ms),
+            Some(trade.timestamp_ms),
+            Some(trade.timestamp_ms),
+        );
+        trade.signer_pre_balance_lamports = Some(100);
+        trade.signer_post_balance_lamports = Some(80 + u64::from(index));
+        trade.toolchain_fingerprint = seer::types::ToolchainFingerprintInput {
+            external_fee_transfer_count: Some(0),
+            internal_fee_transfer_count: Some(0),
+            ..Default::default()
+        };
+        let tx = bridge(&trade);
+        assert!(tx.is_confirmed_success());
+        session.ingest_transaction(Arc::new(tx));
+    }
+    let full = session.try_materialize_features().unwrap();
+    assert_eq!(
+        full.sybil_resistance.fee_topology_diversity_index,
+        Some(1.0 / 3.0)
+    );
+    assert_eq!(full.sybil_resistance.signer_sample_count, 3);
+    assert!(full.sybil_resistance.spend_fraction_divergence.is_some());
+    let full_snapshot = session
+        .take_pr2c_complete_metric_contract_snapshot()
+        .unwrap();
+    let ftdi = &full_snapshot
+        .snapshot()
+        .full_evidence
+        .fee_topology_diversity_index;
+    assert!(ftdi.legacy_buy_tx_actionable);
+    assert_eq!(
+        ftdi.legacy_value.envelope.measurement_quality,
+        MetricMeasurementQualityV1::Measured
+    );
+
+    let mut unknown = make_buy_trade(pool, mint);
+    unknown.metadata_availability = Default::default();
+    unknown.timestamp_ms = t0 + 10;
+    unknown.event_time =
+        ghost_core::EventTimeMetadata::new(Some(t0 + 10), Some(t0 + 10), Some(t0 + 10));
+    let unknown = bridge(&unknown);
+    assert!(!unknown.success);
+    assert!(!unknown.metadata_availability.status_known);
+    session.ingest_transaction(Arc::new(unknown));
+    let partial = session.try_materialize_features().unwrap();
+    assert_eq!(partial.sybil_resistance.buy_sample_count, 3);
+    assert!(partial
+        .sybil_resistance
+        .degraded_reasons
+        .contains(&"FTDI_INPUT_STATUS_UNAVAILABLE".to_string()));
+    assert_eq!(
+        partial.sybil_resistance.fee_topology_diversity_index,
+        full.sybil_resistance.fee_topology_diversity_index
+    );
+    let partial_snapshot = session
+        .take_pr2c_complete_metric_contract_snapshot()
+        .unwrap();
+    let ftdi = &partial_snapshot
+        .snapshot()
+        .full_evidence
+        .fee_topology_diversity_index;
+    assert!(!ftdi.legacy_buy_tx_actionable);
+    assert_eq!(
+        ftdi.legacy_value.envelope.measurement_quality,
+        MetricMeasurementQualityV1::Degraded
+    );
+    assert!(
+        !partial
+            .metric_contract_decision_projection_v1
+            .unwrap()
+            .fee_topology_diversity_index
+            .legacy_value
+            .envelope
+            .policy_actionable
+    );
+    assert!(
+        full_snapshot
+            .snapshot()
+            .full_evidence
+            .fee_topology_diversity_index
+            .legacy_buy_tx_actionable
+    );
+}
+
+#[test]
+fn m3_bridge_mfs_policy_preserves_partial_sfd_as_diagnostics_and_recovers() {
+    use ghost_brain::{config::GatekeeperV2Config, fast_pipeline::EnhancedCandidate};
+    use ghost_launcher::components::gatekeeper_policy::evaluate_policy;
+    use ghost_launcher::session::{OpenSessionRequest, SessionConfig, SessionManager};
+    use std::sync::Arc;
+    let t0 = seer::types::ingress_epoch_ms().saturating_sub(100);
+    let pool = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let manager = SessionManager::new(SessionConfig {
+        max_sessions: 1,
+        ..SessionConfig::default()
+    });
+    let mut config = GatekeeperV2Config::default();
+    config.min_spend_fraction_divergence = 0.15;
+    config.soft_penalty_low_sfd = 2;
+    manager
+        .open_session(OpenSessionRequest {
+            pool_amm_id: pool,
+            base_mint: mint,
+            bonding_curve: pool,
+            dev_wallet: None,
+            candidate_snapshot: EnhancedCandidate {
+                pool_amm_id: pool,
+                base_mint: mint,
+                bonding_curve: pool,
+                timestamp: t0,
+                signature: Signature::new_unique().to_string(),
+                ..EnhancedCandidate::default()
+            },
+            created_at_wall_ms: t0,
+            deadline_wall_ms: Some(t0 + 30_000),
+            funding_source_config:
+                ghost_launcher::tx_intelligence::FundingSourceConfig::from_gatekeeper_config(
+                    &config,
+                ),
+            gatekeeper_config: config.clone(),
+            fingerprint_config: seer::early_fingerprint::EarlyFingerprintConfig::default(),
+        })
+        .unwrap();
+    let session = manager.get_session(&pool).unwrap();
+    let mut session = session.write();
+    session.set_pr2c_snapshot_capture_enabled(true);
+    for index in 0..3 {
+        let mut trade = make_buy_trade(pool, mint);
+        trade.tx_index = Some(index);
+        trade.timestamp_ms = t0 + u64::from(index);
+        trade.event_time = ghost_core::EventTimeMetadata::new(
+            Some(trade.timestamp_ms),
+            Some(trade.timestamp_ms),
+            Some(trade.timestamp_ms),
+        );
+        trade.signer_pre_balance_lamports = Some(100);
+        trade.signer_post_balance_lamports = Some(80);
+        trade.toolchain_fingerprint = seer::types::ToolchainFingerprintInput {
+            external_fee_transfer_count: Some(0),
+            internal_fee_transfer_count: Some(0),
+            ..Default::default()
+        };
+        let tx = bridge(&trade);
+        assert!(tx.is_confirmed_success());
+        session.ingest_transaction(Arc::new(tx));
+    }
+    let full = session.try_materialize_features().unwrap();
+    assert_eq!(full.sybil_resistance.spend_fraction_divergence, Some(0.0));
+    assert_eq!(full.sybil_resistance.signer_sample_count, 3);
+    assert!(!full
+        .sybil_resistance
+        .degraded_reasons
+        .iter()
+        .any(|reason| reason.starts_with("SFD_")));
+    let full_record = serde_json::to_vec(&full.sybil_resistance).unwrap();
+    let full_decision = evaluate_policy(&full, &config);
+    assert!(full_decision.sybil_policy.soft_signals.low_sfd);
+    assert_eq!(full_decision.sybil_policy.soft_points, 2);
+
+    let mut missing = make_buy_trade(pool, mint);
+    missing.tx_index = Some(3);
+    missing.timestamp_ms = t0 + 10;
+    missing.event_time =
+        ghost_core::EventTimeMetadata::new(Some(t0 + 10), Some(t0 + 10), Some(t0 + 10));
+    missing.signer_pre_balance_lamports = Some(100);
+    missing.signer_post_balance_lamports = None;
+    // Próbka musi wejść do badanego okna: zachowujemy realną kwotę fixture,
+    // zamiast zmieniać produkcyjny filtr dust na potrzeby testu brakujących sald.
+    let missing_tx = bridge(&missing);
+    assert!(missing_tx.volume_sol >= config.min_sol_threshold);
+    session.ingest_transaction(Arc::new(missing_tx));
+    let mut partial = session.try_materialize_features().unwrap();
+    assert_eq!(
+        partial.sybil_resistance.spend_fraction_divergence,
+        Some(0.0)
+    );
+    assert_eq!(partial.sybil_resistance.signer_sample_count, 4);
+    assert!(partial.sybil_resistance.degraded_reasons.contains(
+        &ghost_core::tx_intelligence::types::SFD_PARTIAL_BALANCE_COVERAGE_REASON.to_string()
+    ));
+    // Ten sam zapis/odczyt evidence, bez przeliczania z surowych danych w policy.
+    let partial_record = serde_json::to_vec(&partial.sybil_resistance).unwrap();
+    let recovered = serde_json::from_slice(&partial_record).unwrap();
+    assert_eq!(partial.sybil_resistance, recovered);
+    partial.sybil_resistance = recovered;
+    let partial_decision = evaluate_policy(&partial, &config);
+    assert!(!partial_decision.sybil_policy.soft_signals.low_sfd);
+    assert_eq!(partial_decision.sybil_policy.soft_points, 0);
+
+    // Nowa poprawna transakcja może uzupełnić reprezentanta tego samego signera.
+    let mut valid = missing.clone();
+    valid.signature = Signature::new_unique();
+    valid.tx_index = Some(4);
+    valid.timestamp_ms = t0 + 20;
+    valid.event_time =
+        ghost_core::EventTimeMetadata::new(Some(t0 + 20), Some(t0 + 20), Some(t0 + 20));
+    valid.signer_post_balance_lamports = Some(80);
+    session.ingest_transaction(Arc::new(bridge(&valid)));
+    let complete_again = session.try_materialize_features().unwrap();
+    assert_eq!(
+        complete_again.sybil_resistance.spend_fraction_divergence,
+        Some(0.0)
+    );
+    assert_eq!(complete_again.sybil_resistance.signer_sample_count, 4);
+    assert!(!complete_again
+        .sybil_resistance
+        .degraded_reasons
+        .iter()
+        .any(|reason| reason.starts_with("SFD_")));
+    assert!(
+        evaluate_policy(&complete_again, &config)
+            .sybil_policy
+            .soft_signals
+            .low_sfd
+    );
+    assert_eq!(
+        serde_json::to_vec(&full.sybil_resistance).unwrap(),
+        full_record
+    );
+    assert_eq!(
+        serde_json::to_vec(&partial.sybil_resistance).unwrap(),
+        partial_record
+    );
+    assert!(
+        evaluate_policy(&full, &config)
+            .sybil_policy
+            .soft_signals
+            .low_sfd
+    );
+    assert!(
+        !evaluate_policy(&partial, &config)
+            .sybil_policy
+            .soft_signals
+            .low_sfd
     );
 }

@@ -157,6 +157,8 @@ pub struct MetricDecisionRatioV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FtdiDecisionProjectionV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gini_simpson_v2: Option<crate::tx_intelligence::types::FtdiEvidenceV2>,
     pub legacy_value: MetricDecisionSurfaceValueV1<f64>,
     pub value_v1: MetricDecisionSurfaceValueV1<f64>,
     pub unique_topology_count: u32,
@@ -1082,6 +1084,29 @@ impl FtdiDecisionProjectionV1 {
             true,
             "FTDI first-sample-per-signer semantics",
         )?;
+        if let Some(v2) = &self.gini_simpson_v2 {
+            v2.validate()
+                .map_err(MetricContractProjectionErrorV1::FamilyInvariant)?;
+            if v2.signer_sample_count != u64::from(self.unique_buyer_sample_count)
+                || v2.buy_sample_count != u64::from(self.buy_transaction_sample_count)
+            {
+                return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                    "FTDI V2 population parity",
+                ));
+            }
+
+            let historical_value_present =
+                matches!(self.legacy_value.value, CanonicalNullableV1::Value(_))
+                    || matches!(self.value_v1.value, CanonicalNullableV1::Value(_));
+            if historical_value_present
+                && v2.fee_topology_diversity_index.is_some()
+                && v2.unique_topology_count != u64::from(self.unique_topology_count)
+            {
+                return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                    "FTDI V2 unique-topology parity",
+                ));
+            }
+        }
         if !nullable_f64_bits_equal(&self.legacy_value.value, &self.value_v1.value) {
             return Err(MetricContractProjectionErrorV1::FamilyInvariant(
                 "FTDI legacy/typed value parity",
@@ -1145,10 +1170,16 @@ impl FtdiDecisionProjectionV1 {
                 invariant: "measured FTDI value is below configured diagnostic sample gate",
             });
         }
-        let expected_legacy =
-            value_present && u64::from(self.buy_transaction_sample_count) >= legacy_gate;
-        let expected_corrected =
-            value_present && u64::from(self.unique_buyer_sample_count) >= corrected_gate;
+        // A diagnostic value can remain available while its input is incomplete.
+        // Preserve the count contract without deriving actionability from counts alone.
+        let input_complete =
+            self.value_v1.envelope.measurement_quality == MetricMeasurementQualityV1::Measured;
+        let expected_legacy = value_present
+            && input_complete
+            && u64::from(self.buy_transaction_sample_count) >= legacy_gate;
+        let expected_corrected = value_present
+            && input_complete
+            && u64::from(self.unique_buyer_sample_count) >= corrected_gate;
         let legacy_actionable = required_bool(
             &self.legacy_buy_tx_actionability.value,
             "FTDI legacy actionability value",
@@ -1215,6 +1246,7 @@ impl FtdiDecisionProjectionV1 {
             ));
         }
         let projection = Self {
+            gini_simpson_v2: evidence.gini_simpson_v2.clone(),
             legacy_value: surface_value(
                 &evidence.legacy_value.envelope,
                 MetricSurfaceId::TxIntelFeeTopologyDiversityLegacy,

@@ -10,6 +10,10 @@ fn make_tx_event(
     arrival_ts_ms: Option<u64>,
 ) -> GeyserEvent {
     GeyserEvent::Transaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
         provider_id: None,
         provider_role: None,
         observation_provenance: None,

@@ -181,12 +181,14 @@ async fn main() {
         let volume_sol = 1.0 + (i as f64 * 0.5);
 
         let pool_tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability::default(),
             semantic: ghost_core::EventSemanticEnvelope::default(),
             pool_amm_id: pool_pubkey.to_string(),
             slot: Some(12345 + i),
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,

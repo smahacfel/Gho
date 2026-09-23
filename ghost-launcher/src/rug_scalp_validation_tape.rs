@@ -1364,6 +1364,10 @@ mod tests {
             (12, 4, "f"),
         ] {
             let tx = PoolTransaction {
+                metadata_availability: seer::types::TransactionMetadataAvailability {
+                    status_known: true,
+                    inner_instructions_known: true,
+                },
                 semantic: Default::default(),
                 pool_amm_id: "pool".to_string(),
                 signature: format!("{slot}-{index}"),
@@ -1372,6 +1376,7 @@ mod tests {
                 tx_index: Some(index),
                 event_ordinal: Some(0),
                 outer_instruction_index: None,
+                inner_instruction_path: None,
                 inner_group_index: None,
                 outer_program_id: None,
                 cpi_stack_height: None,
@@ -1455,6 +1460,10 @@ mod tests {
 
     fn trade(mint: String, slot: u64, index: u32, is_buy: bool) -> PoolTransaction {
         PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             pool_amm_id: "pool".to_string(),
             signature: format!("state-{slot}-{index}"),
@@ -1463,6 +1472,7 @@ mod tests {
             tx_index: Some(index),
             event_ordinal: Some(0),
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,

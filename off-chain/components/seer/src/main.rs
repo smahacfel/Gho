@@ -115,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
         info!("Starting IPC event processing loop");
         while let Some(seer_event) = ipc_receiver.recv().await {
             match seer_event {
+                SeerEvent::PrimaryTradeFeedProgress(_) => {} // standalone consumer: no CPV index
                 SeerEvent::PoolDetected(event) => {
                     info!(
                         "Received Pool IPC event: pool={}, amm={}, priority={:?}, seq={}, queue_utilization={:.1}%",

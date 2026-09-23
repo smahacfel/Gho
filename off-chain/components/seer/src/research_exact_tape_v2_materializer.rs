@@ -6422,7 +6422,7 @@ fn classify_anchor_event_transport_v2(
     // instruction's program_id, not a second account meta.  Do not accept an
     // account-vector superset here: an arbitrary remaining account must not
     // be silently reclassified as event transport.
-    if account_indices.len() != 1 || outer_group >= u32::MAX {
+    if account_indices.len() != 1 || outer_group == u32::MAX {
         return PumpExactStateOccurrenceClassV2::Unknown {
             reason: "anchor_event_transport_account_vector_not_exact".to_owned(),
         };

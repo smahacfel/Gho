@@ -8,6 +8,7 @@
 
 use ghost_brain::config::gatekeeper_v25_config::AdaptiveProsperityConfig;
 
+use super::gatekeeper_policy::{ftdi_comparison_value, sybil_metric_is_actionable, SybilMetric};
 use crate::components::gatekeeper::GatekeeperAssessment;
 use crate::components::gatekeeper_pdd_sequence::PddSignalObservation;
 
@@ -137,7 +138,13 @@ pub fn evaluate_aps(
     };
 
     // Contrafactual: would prosperity filter have passed with APS shadow thresholds?
-    let shadow_would_pass = compute_shadow_prosperity_pass(assessment, mcap, branch1, branch3_hhi);
+    let shadow_would_pass = compute_shadow_prosperity_pass(
+        assessment,
+        mcap,
+        branch1,
+        branch3_hhi,
+        config.ftdi_gini_simpson_v2_min,
+    );
 
     // Raw APS result only. Shadow/live enforcement happens later when
     // GatekeeperAssessment is populated from APS diagnostics.
@@ -156,7 +163,7 @@ pub fn evaluate_aps(
         shadow_prosperity_mcap_sol: mcap,
         shadow_branch1_sniped_pct: branch1,
         shadow_branch3_hhi_max: branch3_hhi,
-        shadow_prosperity_would_pass: Some(shadow_would_pass),
+        shadow_prosperity_would_pass: shadow_would_pass,
         pdd_spike_signal_status: pdd_spike_signal.status_label(),
         pdd_spike_unavailable_reason: pdd_spike_signal.unavailable_reason_label(),
     }
@@ -241,32 +248,31 @@ fn compute_shadow_prosperity_pass(
     mcap_floor: f64,
     branch1_sniped: f64,
     branch3_hhi: f64,
-) -> bool {
+    ftdi_gini_simpson_v2_min: Option<f64>,
+) -> Option<bool> {
     let curve = match assessment.phase6_curve.as_ref() {
         Some(c) if c.curve_data_known => c,
-        _ => return false,
+        _ => return None,
     };
 
     // Market cap floor (light veto)
     if curve.current_market_cap_sol < mcap_floor {
-        return false;
+        return Some(false);
     }
 
     // CPV light veto (static — cross-pool velocity not regime-sensitive in v1)
-    let cpv_ok = assessment
-        .feature_snapshot
-        .sybil_resistance
-        .signer_cross_pool_velocity
-        .map_or(true, |cpv| cpv <= 0.50);
-
-    if !cpv_ok {
-        return false;
+    let sybil = &assessment.feature_snapshot.sybil_resistance;
+    if !sybil_metric_is_actionable(sybil, SybilMetric::Cpv) {
+        return None;
+    }
+    if sybil.signer_cross_pool_velocity? > 0.50 {
+        return Some(false);
     }
 
     // Simple overlay: price must not have moved too far
     let price_ok = curve.price_change_ratio <= 2.2;
     if !price_ok {
-        return false;
+        return Some(false);
     }
 
     // B1: conviction_clean_sells — shadow branch1 sniped threshold
@@ -288,18 +294,16 @@ fn compute_shadow_prosperity_pass(
         .map_or(false, |dom| dom >= 0.90)
         && curve.current_market_cap_sol >= 50.0;
 
-    // B3: organic_structure — shadow branch3 HHI max
-    let b3_pass = assessment.phase3_diversity.as_ref().map_or(false, |div| {
-        div.hhi <= branch3_hhi
-            && assessment
-                .feature_snapshot
-                .sybil_resistance
-                .fee_topology_diversity_index
-                .unwrap_or(0.0)
-                >= 0.0909
-    });
-
-    b1_pass || b2_pass || b3_pass
+    // B3: organic_structure — same input-quality gate as the live FTDI reader.
+    if b1_pass || b2_pass {
+        return Some(true);
+    }
+    let div = assessment.phase3_diversity.as_ref()?;
+    if div.hhi > branch3_hhi {
+        return Some(false);
+    }
+    let (value, threshold) = ftdi_comparison_value(sybil, 0.0909, ftdi_gini_simpson_v2_min)?;
+    Some(value >= threshold)
 }
 
 #[cfg(test)]
@@ -524,5 +528,97 @@ mod tests {
         assert!(result.shadow_prosperity_mcap_sol > 0.0);
         assert!(result.shadow_branch1_sniped_pct > 0.0);
         assert!(result.shadow_branch3_hhi_max > 0.0);
+    }
+    #[test]
+    fn m1_shadow_prosperity_does_not_reward_incomplete_ftdi() {
+        let mut assessment = empty_assessment();
+        assessment.phase3_diversity = Some(SignerDiversityProfile {
+            unique_ratio: 0.8,
+            hhi: 0.03,
+            max_tx_per_signer: 1,
+            volume_gini: 0.2,
+            top3_signer_volume_ratio: Some(0.1),
+            top3_volume_pct: 0.1,
+            same_ms_tx_ratio: 0.0,
+        });
+        assessment.phase6_curve = Some(BondingCurveDynamics {
+            initial_price: 0.001,
+            current_price: 0.001,
+            max_price: 0.001,
+            price_change_ratio: 1.0,
+            max_single_tx_price_impact_pct: 0.0,
+            max_single_sell_impact_pct: 0.0,
+            current_market_cap_sol: 40.0,
+            market_cap_change_ratio: 1.0,
+            bonding_progress_pct: 15.0,
+            curve_data_known: true,
+            curve_finality: ghost_core::CurveFinality::Provisional,
+            price_data_points: 3,
+        });
+        let sybil = &mut assessment.feature_snapshot.sybil_resistance;
+        sybil.fee_topology_diversity_index = Some(0.5);
+        sybil.signer_cross_pool_velocity = Some(0.1);
+        assert_eq!(
+            compute_shadow_prosperity_pass(&assessment, 35.0, 0.28, 0.1, None),
+            Some(true)
+        );
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .degraded_reasons
+            .push("SFD_INPUT_ORDER_UNAVAILABLE".to_string());
+        assert_eq!(
+            compute_shadow_prosperity_pass(&assessment, 35.0, 0.28, 0.1, None),
+            Some(true)
+        );
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .degraded_reasons
+            .push("FTDI_INPUT_STATUS_UNAVAILABLE".to_string());
+        assert_eq!(
+            compute_shadow_prosperity_pass(&assessment, 35.0, 0.28, 0.1, None),
+            None
+        );
+        // M6: historyczne 0.0909 nigdy nie staje się progiem Gini–Simpson.
+        use ghost_core::tx_intelligence::types::{FtdiDefinitionV2, FtdiEvidenceV2};
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .degraded_reasons
+            .clear();
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .fee_topology_diversity_v2 = Some(FtdiEvidenceV2 {
+            definition: FtdiDefinitionV2::GiniSimpson,
+            fee_topology_diversity_index: Some(0.0),
+            coordination_hhi: Some(1.0),
+            unique_topology_count: 1,
+            buy_sample_count: 5,
+            signer_sample_count: 5,
+            represented_signer_count: 5,
+            degraded_reasons: vec![],
+        });
+        assert_eq!(
+            compute_shadow_prosperity_pass(&assessment, 35.0, 0.28, 0.1, None),
+            None
+        );
+        assert_eq!(
+            compute_shadow_prosperity_pass(&assessment, 35.0, 0.28, 0.1, Some(0.1)),
+            Some(false)
+        );
+        assert_eq!(
+            compute_shadow_prosperity_pass(&assessment, 35.0, 0.28, 0.1, Some(0.0)),
+            Some(true)
+        );
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .signer_cross_pool_velocity = None;
+        assert_eq!(
+            compute_shadow_prosperity_pass(&assessment, 35.0, 0.28, 0.1, Some(0.0)),
+            None
+        );
     }
 }

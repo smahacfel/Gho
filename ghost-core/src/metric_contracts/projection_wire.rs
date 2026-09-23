@@ -6,6 +6,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub const METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1: u16 = 1;
+/// V2 dodaje wyłącznie ósmy element rodziny FTDI: jawny rekord Gini–Simpson.
+pub const METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V2: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -896,6 +898,22 @@ impl MetricContractDecisionProjectionWireV1 {
         projection: &MetricContractDecisionEvidenceProjectionV1,
     ) -> Result<Self, MetricContractProjectionWireErrorV1> {
         let ftdi = &projection.fee_topology_diversity_index;
+        if let Some(v2) = &ftdi.gini_simpson_v2 {
+            v2.validate()
+                .map_err(MetricContractProjectionWireErrorV1::InvalidValue)?;
+        }
+        let mut ftdi_wire = vec![
+            encode_surface(&ftdi.legacy_value, enc_f64)?,
+            encode_surface(&ftdi.value_v1, enc_f64)?,
+            Value::from(ftdi.unique_topology_count),
+            Value::from(ftdi.unique_buyer_sample_count),
+            Value::from(ftdi.buy_transaction_sample_count),
+            encode_surface(&ftdi.legacy_buy_tx_actionability, enc_bool)?,
+            encode_surface(&ftdi.unique_buyer_actionability_v2, enc_bool)?,
+        ];
+        if let Some(v2) = &ftdi.gini_simpson_v2 {
+            ftdi_wire.push(scalar(v2)?);
+        }
         let dev = &projection.dev_buy;
         let timing = &projection.same_ms_tx_ratio;
         let top3 = &projection.top3_signer_volume_ratio;
@@ -906,22 +924,18 @@ impl MetricContractDecisionProjectionWireV1 {
         let reserve = &projection.reserve_velocity;
         let recent = &projection.recent_buy_sell;
         Ok(Self {
-            w: METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1,
+            w: if ftdi.gini_simpson_v2.is_some() {
+                METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V2
+            } else {
+                METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1
+            },
             d: vec![
                 Value::from(projection.schema_version),
                 enum_code(&projection.rollout_mode, ROLLOUT_MODES, "rollout mode")?,
                 enum_code(&projection.profile_id, PROFILE_IDS, "profile id")?,
                 scalar(&projection.profile_hash)?,
                 scalar(&projection.metric_contract_effective_config_hash)?,
-                Value::Array(vec![
-                    encode_surface(&ftdi.legacy_value, enc_f64)?,
-                    encode_surface(&ftdi.value_v1, enc_f64)?,
-                    Value::from(ftdi.unique_topology_count),
-                    Value::from(ftdi.unique_buyer_sample_count),
-                    Value::from(ftdi.buy_transaction_sample_count),
-                    encode_surface(&ftdi.legacy_buy_tx_actionability, enc_bool)?,
-                    encode_surface(&ftdi.unique_buyer_actionability_v2, enc_bool)?,
-                ]),
+                Value::Array(ftdi_wire),
                 Value::Array(vec![
                     encode_surface(&dev.tx_intel_first_observed, enc_f64)?,
                     encode_surface(&dev.mfs_first_observed, enc_f64)?,
@@ -1028,7 +1042,11 @@ impl MetricContractDecisionProjectionWireV1 {
         self,
     ) -> Result<MetricContractDecisionEvidenceProjectionV1, MetricContractProjectionWireErrorV1>
     {
-        if self.w != METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1 {
+        if !matches!(
+            self.w,
+            METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1
+                | METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V2
+        ) {
             return Err(MetricContractProjectionWireErrorV1::UnsupportedVersion(
                 self.w,
             ));
@@ -1041,8 +1059,20 @@ impl MetricContractDecisionProjectionWireV1 {
         let metric_contract_effective_config_hash =
             decode_scalar(root.remove(0), "root.config_hash")?;
 
-        let mut f = tuple(root.remove(0), "family.ftdi", 7)?;
+        let has_v2 = self.w == METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V2;
+        let mut f = tuple(root.remove(0), "family.ftdi", if has_v2 { 8 } else { 7 })?;
+        let gini_simpson_v2 = if has_v2 {
+            let evidence: crate::tx_intelligence::types::FtdiEvidenceV2 =
+                decode_scalar(f.remove(7), "ftdi.gini_simpson_v2")?;
+            evidence
+                .validate()
+                .map_err(MetricContractProjectionWireErrorV1::InvalidValue)?;
+            Some(evidence)
+        } else {
+            None
+        };
         let fee_topology_diversity_index = FtdiDecisionProjectionV1 {
+            gini_simpson_v2,
             legacy_value: decode_surface(f.remove(0), dec_f64)?,
             value_v1: decode_surface(f.remove(0), dec_f64)?,
             unique_topology_count: decode_scalar(f.remove(0), "ftdi.unique_topology_count")?,

@@ -1603,6 +1603,54 @@ fn validate_unit_interval(name: &str, value: f64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Wyłącznie progi nowych definicji. Brak pola nie dziedziczy progu V1.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SybilThresholdsV2Config {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ftdi_gini_simpson_min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub des_next_buy_slot_tau_b_min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prosperity_branch3_ftdi_gini_simpson_min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prosperity_overlay_ftdi_gini_simpson_min: Option<f64>,
+}
+
+impl SybilThresholdsV2Config {
+    pub fn is_empty(&self) -> bool {
+        self.ftdi_gini_simpson_min.is_none()
+            && self.des_next_buy_slot_tau_b_min.is_none()
+            && self.prosperity_branch3_ftdi_gini_simpson_min.is_none()
+            && self.prosperity_overlay_ftdi_gini_simpson_min.is_none()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("ftdi_gini_simpson_min", self.ftdi_gini_simpson_min),
+            (
+                "prosperity_branch3_ftdi_gini_simpson_min",
+                self.prosperity_branch3_ftdi_gini_simpson_min,
+            ),
+            (
+                "prosperity_overlay_ftdi_gini_simpson_min",
+                self.prosperity_overlay_ftdi_gini_simpson_min,
+            ),
+        ] {
+            if let Some(value) = value {
+                validate_unit_interval(name, value)?;
+            }
+        }
+        if self
+            .des_next_buy_slot_tau_b_min
+            .is_some_and(|v| !v.is_finite() || !(-1.0..=1.0).contains(&v))
+        {
+            anyhow::bail!("sybil_thresholds_v2.des_next_buy_slot_tau_b_min musi należeć do [-1,1]");
+        }
+        Ok(())
+    }
+}
+
 /// Complete configuration for Gatekeeper v2.
 ///
 /// All thresholds are tuneable per-deployment. Default values are calibrated
@@ -2180,6 +2228,8 @@ pub struct GatekeeperV2Config {
     pub min_dev_paperhand_latency_ms: u64,
 
     // ── Sybil resistance thresholds ────────────────────────────────────────
+    #[serde(default, skip_serializing_if = "SybilThresholdsV2Config::is_empty")]
+    pub sybil_thresholds_v2: SybilThresholdsV2Config,
     /// Minimum acceptable fee topology diversity index.
     /// Default: 0.0 (neutral / telemetry-only)
     pub min_fee_topology_diversity_index: f64,
@@ -2546,6 +2596,7 @@ impl Default for GatekeeperV2Config {
             min_dev_paperhand_latency_ms: 0,
 
             // Sybil resistance thresholds
+            sybil_thresholds_v2: SybilThresholdsV2Config::default(),
             min_fee_topology_diversity_index: 0.0,
             max_dev_buyer_infrastructure_affinity: 1.0,
             min_spend_fraction_divergence: 0.0,
@@ -2611,6 +2662,10 @@ impl Default for GatekeeperV2Config {
 
 impl GatekeeperV2Config {
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.sybil_thresholds_v2.validate()?;
+        if let Some(value) = self.aps.ftdi_gini_simpson_v2_min {
+            validate_unit_interval("aps.ftdi_gini_simpson_v2_min", value)?;
+        }
         if self.dow.enabled && self.dow.extended_window_ms > self.max_wait_time_ms {
             anyhow::bail!(
                 "P0 invariant violated: [gatekeeper_v2.dow].extended_window_ms ({}) > [gatekeeper_v2].max_wait_time_ms ({})",

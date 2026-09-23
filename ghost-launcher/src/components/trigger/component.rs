@@ -5724,6 +5724,7 @@ pub async fn run_with_oracle(
                     match event {
                         Ok(ghost_event) => {
                             match ghost_event {
+                                GhostEvent::CpvFeed(_) => {}, // metric-only, never execution authority
                                 GhostEvent::NewPoolDetected(pool, Some(_permit)) => {
                                     // 🟢 CHANGED: The "Lobotomy" - Don't score immediately. Cache and wait.
                                     info!(

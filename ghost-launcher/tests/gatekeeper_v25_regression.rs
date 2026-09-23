@@ -69,6 +69,10 @@ fn tx_with_curve(
     curve_known: bool,
 ) -> PoolTransaction {
     PoolTransaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
         semantic: EventSemanticEnvelope::default(),
         pool_amm_id: "pool1".to_string(),
         signer: signer.to_string(),
@@ -81,6 +85,7 @@ fn tx_with_curve(
         event_ordinal: Some(0),
         tx_index: None,
         outer_instruction_index: None,
+        inner_instruction_path: None,
         inner_group_index: None,
         outer_program_id: None,
         cpi_stack_height: None,
@@ -101,6 +106,11 @@ fn tx_with_curve(
         mpcf_payload_missing_reason: ghost_launcher::events::RawBytesMissingReason::Unknown,
         v_tokens_in_bonding_curve: Some(v_tokens),
         v_sol_in_bonding_curve: Some(v_sol),
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         market_cap_sol: Some(mcap),
         global_config: None,
         fee_recipient: None,

@@ -1264,6 +1264,10 @@ mod tests {
 
     fn make_tx() -> PoolTransaction {
         PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope {
                 slot_quality: SlotQuality::Present,
                 ..ghost_core::EventSemanticEnvelope::default()
@@ -1273,6 +1277,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,

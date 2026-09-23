@@ -180,6 +180,10 @@ fn curve_tx(
     v_tokens: f64,
 ) -> Arc<PoolTransaction> {
     Arc::new(PoolTransaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
         semantic: EventSemanticEnvelope::default(),
         pool_amm_id: pool_id.to_string(),
         signer: signer.to_string(),
@@ -192,6 +196,7 @@ fn curve_tx(
         event_ordinal: Some(0),
         tx_index: None,
         outer_instruction_index: None,
+        inner_instruction_path: None,
         inner_group_index: None,
         outer_program_id: None,
         cpi_stack_height: None,
@@ -212,6 +217,11 @@ fn curve_tx(
         mpcf_payload_missing_reason: RawBytesMissingReason::Unknown,
         v_tokens_in_bonding_curve: Some(v_tokens),
         v_sol_in_bonding_curve: Some(v_sol),
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         market_cap_sol: Some((v_sol / v_tokens) * 1_000_000_000.0),
         global_config: None,
         fee_recipient: None,

@@ -166,6 +166,15 @@ fn nullable_f64(value: &CanonicalNullableV1<f64>) -> Option<f64> {
 
 fn recent_tx(timestamp_ms: u64, is_buy: bool, success: bool) -> PoolTransaction {
     PoolTransaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         semantic: EventSemanticEnvelope {
             slot_quality: SlotQuality::Present,
             ..EventSemanticEnvelope::default()
@@ -175,6 +184,7 @@ fn recent_tx(timestamp_ms: u64, is_buy: bool, success: bool) -> PoolTransaction 
         event_ordinal: Some((timestamp_ms % 1_000) as u32),
         tx_index: Some((timestamp_ms % 1_000) as u32),
         outer_instruction_index: None,
+        inner_instruction_path: None,
         inner_group_index: None,
         outer_program_id: None,
         cpi_stack_height: None,
@@ -204,11 +214,6 @@ fn recent_tx(timestamp_ms: u64, is_buy: bool, success: bool) -> PoolTransaction 
         token_mint: None,
         v_tokens_in_bonding_curve: None,
         v_sol_in_bonding_curve: None,
-        virtual_sol_reserves: None,
-        virtual_token_reserves: None,
-        real_sol_reserves: None,
-        real_token_reserves: None,
-        complete: None,
         market_cap_sol: None,
         global_config: None,
         fee_recipient: None,
@@ -1034,7 +1039,9 @@ fn projection_resource_gate_is_deterministic_bounded_and_rejects_hard_max() {
 #[test]
 fn compact_json_wire_v1_roundtrips_all_families_and_has_a_frozen_schema() {
     let (complete, profile, effective, source_cutoff) = complete_snapshot_fixture();
-    let projection = complete.compact_projection;
+    let mut projection = complete.compact_projection;
+    // Jawna projekcja historycznego V1. Oba golden hashe pozostają bez zmian.
+    projection.fee_topology_diversity_index.gini_simpson_v2 = None;
     let context = projection_context(&profile, &effective, source_cutoff);
     let semantic_hash_before = projection.validated_canonical_hash(&context).unwrap();
     assert_eq!(
@@ -1095,15 +1102,16 @@ fn compact_json_wire_v1_roundtrips_all_families_and_has_a_frozen_schema() {
 #[test]
 fn compact_json_wire_v1_rejects_version_shape_and_enum_drift() {
     let (complete, ..) = complete_snapshot_fixture();
-    let projection = complete.compact_projection;
+    let mut projection = complete.compact_projection;
+    projection.fee_topology_diversity_index.gini_simpson_v2 = None;
     let wire = MetricContractDecisionProjectionWireV1::try_from_domain(&projection).unwrap();
 
     let mut unsupported = wire.clone();
-    unsupported.w = 2;
+    unsupported.w = 3;
     let unsupported_value = serde_json::to_value(&unsupported).unwrap();
     assert!(matches!(
         unsupported.try_into_domain(),
-        Err(MetricContractProjectionWireErrorV1::UnsupportedVersion(2))
+        Err(MetricContractProjectionWireErrorV1::UnsupportedVersion(3))
     ));
     let mut unsupported_mfs = serde_json::to_value(MaterializedFeatureSet::default()).unwrap();
     unsupported_mfs.as_object_mut().unwrap().insert(
@@ -1392,4 +1400,40 @@ fn full_evidence_and_projection_are_deterministic_views_of_one_frozen_input_set(
             .validated_canonical_hash(&projection_context)
             .unwrap()
     );
+}
+
+#[test]
+fn m6_wire_v2_preserves_definition_rejects_alias_and_cannot_be_downgraded() {
+    let (complete, profile, effective, source_cutoff) = complete_snapshot_fixture();
+    let projection = complete.compact_projection;
+    let context = projection_context(&profile, &effective, source_cutoff);
+    let wire = MetricContractDecisionProjectionWireV1::try_from_domain(&projection).unwrap();
+    assert_eq!(wire.w, METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V2);
+    assert_eq!(wire.d[5].as_array().unwrap().len(), 8);
+    assert_eq!(wire.d[5][7]["definition"], "gini_simpson");
+    assert_eq!(wire.clone().try_into_domain().unwrap(), projection);
+    let mut legacy = projection.clone();
+    legacy.fee_topology_diversity_index.gini_simpson_v2 = None;
+    assert_ne!(
+        projection.validated_canonical_hash(&context).unwrap(),
+        legacy.validated_canonical_hash(&context).unwrap()
+    );
+    assert_eq!(
+        MetricContractDecisionProjectionWireV1::try_from_domain(&legacy)
+            .unwrap()
+            .w,
+        1
+    );
+    let mut downgraded = wire.clone();
+    downgraded.w = 1;
+    assert!(downgraded.try_into_domain().is_err());
+    let mut alias = wire.clone();
+    alias.d[5][7]["definition"] = "unique_buyers_actionability_v2".into();
+    assert!(alias.try_into_domain().is_err());
+    let mut wrong_formula = wire.clone();
+    wrong_formula.d[5][7]["fee_topology_diversity_index"] = serde_json::json!(0.123456);
+    assert!(wrong_formula.try_into_domain().is_err());
+    let mut missing = wire;
+    missing.d[5].as_array_mut().unwrap().pop();
+    assert!(missing.try_into_domain().is_err());
 }

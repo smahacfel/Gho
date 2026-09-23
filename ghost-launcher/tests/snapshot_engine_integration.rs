@@ -403,7 +403,7 @@ async fn test_full_event_flow_integration() {
         let mut sessions: HashMap<Pubkey, PoolObservationSession> = HashMap::new();
         while let Ok(event) = event_rx.recv().await {
             match event {
-                GhostEvent::NewPoolDetected(pool) => {
+                GhostEvent::NewPoolDetected(pool, _) => {
                     // Simulate InitPoolEvent creation from DetectedPool
                     if let (Ok(pool_pubkey), Ok(base_mint), Ok(quote_mint), Ok(bonding_curve)) = (
                         Pubkey::from_str(&pool.pool_amm_id),
@@ -456,7 +456,7 @@ async fn test_full_event_flow_integration() {
                         sessions.insert(pool_pubkey, session);
                     }
                 }
-                GhostEvent::PoolTransaction(pool_tx) => {
+                GhostEvent::PoolTransaction(pool_tx, _) => {
                     let (Ok(pool_pubkey), Ok(signer_key), Some(base_mint)) = (
                         Pubkey::from_str(&pool_tx.pool_amm_id),
                         Pubkey::from_str(&pool_tx.signer),
@@ -602,12 +602,17 @@ async fn test_full_event_flow_integration() {
     for i in 0..5 {
         let volume_sol = 0.5 + (i as f64 * 0.1);
         let pool_tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             pool_amm_id: pool_pubkey.to_string(),
             slot: Some(10001 + i),
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -646,6 +651,11 @@ async fn test_full_event_flow_integration() {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,

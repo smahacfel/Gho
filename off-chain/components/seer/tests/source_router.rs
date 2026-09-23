@@ -74,6 +74,7 @@ fn default_test_config() -> SeerConfig {
 /// Create a synthetic transaction event (like PumpPortal produces)
 fn create_synthetic_event() -> GeyserEvent {
     GeyserEvent::Transaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability::default(),
         provider_id: None,
         provider_role: None,
         observation_provenance: None,
@@ -119,6 +120,7 @@ fn create_synthetic_event() -> GeyserEvent {
 /// Create a raw (non-synthetic) transaction event (like Geyser produces)
 fn create_raw_event() -> GeyserEvent {
     GeyserEvent::Transaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability { status_known: true, inner_instructions_known: true },
         provider_id: None,
         provider_role: None,
         observation_provenance: None,

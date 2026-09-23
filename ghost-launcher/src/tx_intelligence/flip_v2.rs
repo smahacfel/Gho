@@ -553,6 +553,10 @@ mod tests {
         ordinal: u32,
     ) -> PoolTransaction {
         PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: EventSemanticEnvelope {
                 slot_quality: SlotQuality::Present,
                 ..EventSemanticEnvelope::default()
@@ -562,6 +566,7 @@ mod tests {
             event_ordinal: Some(ordinal),
             tx_index: Some(ordinal),
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,

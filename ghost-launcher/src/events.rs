@@ -42,6 +42,18 @@ use std::time::{Duration, Instant};
 use crate::candidate_integrity::CanonicalMutationApplyReceiptV1;
 use ghost_core::RawPumpMutationLocatorV1;
 
+/// Zamknięta wiadomość wejścia CPV, tworzona tylko po walidacji primary raw.
+/// Nie posiada uprawnienia canonical apply ani prawa otwierania sesji.
+#[derive(Debug, Clone)]
+pub struct CpvFeedEvent(pub(crate) CpvFeedEventKind);
+
+#[derive(Debug, Clone)]
+pub(crate) enum CpvFeedEventKind {
+    Trade(Arc<PoolTransaction>),
+    Progress(seer::types::PrimaryTradeFeedProgressV1),
+    Gap { received_ms: u64 },
+}
+
 /// Opaque launcher-local proof that an unchanged rich Seer payload received
 /// canonical runtime authority from the PR1 Observation Ledger.
 ///
@@ -715,6 +727,9 @@ pub struct PoolTransaction {
     /// Optional parser-side outer instruction index for execution provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_instruction_index: Option<u32>,
+    /// Ścieżka wykonania: pusta dla top-level, None przy braku dowodu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_instruction_path: Option<Vec<u16>>,
     /// Optional parser-side inner group index for execution provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inner_group_index: Option<u32>,
@@ -756,8 +771,11 @@ pub struct PoolTransaction {
     pub dev_buy_lamports: u64,
     /// Transaction signature
     pub signature: String,
-    /// True when transaction succeeded (meta.err is None)
-    #[serde(default = "default_tx_success")]
+    /// Dostępność metadata źródłowej; starsze rekordy pozostają niekompletne.
+    #[serde(default)]
+    pub metadata_availability: seer::types::TransactionMetadataAvailability,
+    /// Potwierdzony sukces wymaga również `metadata_availability.status_known`.
+    #[serde(default)]
     pub success: bool,
     /// Parsed error code if transaction failed
     #[serde(default)]
@@ -908,10 +926,6 @@ pub struct PoolTransaction {
     pub curve_finality: CurveFinality,
 }
 
-fn default_tx_success() -> bool {
-    true
-}
-
 impl DetectedPool {
     pub fn effective_event_ts_ms(&self) -> Option<u64> {
         self.event_time.effective_event_ts_ms()
@@ -924,6 +938,10 @@ impl DetectedPool {
 }
 
 impl PoolTransaction {
+    pub fn is_confirmed_success(&self) -> bool {
+        self.metadata_availability.status_known && self.success
+    }
+
     pub fn effective_event_ts_ms(&self) -> Option<u64> {
         self.event_time.effective_event_ts_ms()
     }
@@ -1493,6 +1511,8 @@ pub enum GhostEvent {
     /// `OracleRuntime::process_account_update(...)` to drive corrective
     /// reconciliation. Shadow Ledger remains primary; this is corrective only.
     AccountUpdate(AccountUpdateEvent),
+    /// Historia obsługiwanego feedu; nie ścieżka wykonania.
+    CpvFeed(Arc<CpvFeedEvent>),
 }
 
 impl GhostEvent {
@@ -1783,6 +1803,7 @@ impl GhostEvent {
     /// Get the event type as a string (for logging/metrics)
     pub fn event_type(&self) -> &'static str {
         match self {
+            GhostEvent::CpvFeed(_) => "cpv_feed",
             GhostEvent::CandidateIntegrity(_) => "candidate_integrity",
             GhostEvent::NewPoolDetected(_, _) => "new_pool_detected",
             GhostEvent::PoolTransaction(_, _) => "pool_transaction",

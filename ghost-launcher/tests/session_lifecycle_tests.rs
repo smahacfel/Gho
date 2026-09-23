@@ -26,12 +26,22 @@ fn test_candidate(pool_id: Pubkey, base_mint: Pubkey, bonding_curve: Pubkey) -> 
 
 fn test_tx(pool_id: Pubkey, signature: &str, timestamp_ms: u64) -> Arc<PoolTransaction> {
     Arc::new(PoolTransaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         semantic: EventSemanticEnvelope::default(),
         pool_amm_id: pool_id.to_string(),
         slot: Some(1),
         event_ordinal: Some(0),
         tx_index: None,
         outer_instruction_index: None,
+        inner_instruction_path: None,
         inner_group_index: None,
         outer_program_id: None,
         cpi_stack_height: None,
@@ -387,7 +397,7 @@ fn materialize_features_populates_ftdi_from_session_tx_buffer() {
     );
     assert_eq!(
         features.sybil_resistance.signer_cross_pool_velocity,
-        Some(0.0)
+        None // brak jawnego dowodu feedu nie jest czystym zerem
     );
     assert_eq!(features.sybil_resistance.buy_sample_count, 3);
     assert_eq!(features.sybil_resistance.signer_sample_count, 3);
@@ -395,8 +405,11 @@ fn materialize_features_populates_ftdi_from_session_tx_buffer() {
         features.sybil_resistance.degraded_reasons,
         vec![
             ghost_core::tx_intelligence::types::DBIA_NO_DEV_BUY_REASON.to_string(),
-            ghost_core::tx_intelligence::types::DES_CURVE_DATA_UNAVAILABLE_REASON.to_string(),
-            ghost_core::tx_intelligence::types::DES_INSUFFICIENT_BUYS_REASON.to_string(),
+            // This fixture has no execution index; buffer order cannot replace it.
+            ghost_core::tx_intelligence::types::DES_SLOT_ORDER_UNAVAILABLE_REASON.to_string(),
+            ghost_core::tx_intelligence::types::DES_COMPARISON_DEFINITION_MISMATCH_REASON
+                .to_string(),
+            ghost_core::tx_intelligence::types::CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string(),
             ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
         ]
     );
@@ -461,15 +474,18 @@ fn materialize_features_populates_dbia_from_session_tx_buffer() {
     );
     assert_eq!(
         features.sybil_resistance.signer_cross_pool_velocity,
-        Some(0.0)
+        None // brak jawnego dowodu feedu nie jest czystym zerem
     );
     assert_eq!(features.sybil_resistance.buy_sample_count, 3);
     assert_eq!(features.sybil_resistance.signer_sample_count, 3);
     assert_eq!(
         features.sybil_resistance.degraded_reasons,
         vec![
-            ghost_core::tx_intelligence::types::DES_CURVE_DATA_UNAVAILABLE_REASON.to_string(),
-            ghost_core::tx_intelligence::types::DES_INSUFFICIENT_BUYS_REASON.to_string(),
+            // This fixture has no execution index; buffer order cannot replace it.
+            ghost_core::tx_intelligence::types::DES_SLOT_ORDER_UNAVAILABLE_REASON.to_string(),
+            ghost_core::tx_intelligence::types::DES_COMPARISON_DEFINITION_MISMATCH_REASON
+                .to_string(),
+            ghost_core::tx_intelligence::types::CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string(),
             ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
         ]
     );
@@ -547,14 +563,18 @@ fn materialize_features_populates_sfd_from_session_tx_buffer() {
     );
     assert_eq!(
         features.sybil_resistance.signer_cross_pool_velocity,
-        Some(0.0)
+        None // brak jawnego dowodu feedu nie jest czystym zerem
     );
     assert_eq!(features.sybil_resistance.buy_sample_count, 5);
     assert_eq!(features.sybil_resistance.signer_sample_count, 5);
     assert_eq!(
         features.sybil_resistance.degraded_reasons,
         vec![
-            ghost_core::tx_intelligence::types::DES_CURVE_DATA_UNAVAILABLE_REASON.to_string(),
+            // This fixture has no execution index; buffer order cannot replace it.
+            ghost_core::tx_intelligence::types::DES_SLOT_ORDER_UNAVAILABLE_REASON.to_string(),
+            ghost_core::tx_intelligence::types::DES_COMPARISON_DEFINITION_MISMATCH_REASON
+                .to_string(),
+            ghost_core::tx_intelligence::types::CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string(),
             ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
         ]
     );
@@ -654,55 +674,55 @@ fn materialize_features_populates_des_from_session_tx_buffer() {
 
     let features = {
         let mut guard = session.write();
-        let _ = guard.ingest_transaction(des_tx(
-            pool_id,
-            dev_wallet,
-            "sig-des-dev",
-            40_010,
-            1,
-            Some(0),
-            true,
-            10.0,
-        ));
-        let _ = guard.ingest_transaction(des_tx(
-            pool_id,
-            Pubkey::new_unique(),
-            "sig-des-a",
-            40_020,
-            2,
-            Some(0),
-            false,
-            11.0,
-        ));
-        let _ = guard.ingest_transaction(des_tx(
-            pool_id,
-            Pubkey::new_unique(),
-            "sig-des-b",
-            40_030,
-            4,
-            Some(0),
-            false,
-            13.2,
-        ));
-        let _ = guard.ingest_transaction(des_tx(
-            pool_id,
-            Pubkey::new_unique(),
-            "sig-des-c",
-            40_040,
-            7,
-            Some(0),
-            false,
-            17.16,
-        ));
+        let slots = [1_u64, 2, 4, 7, 11];
+        let virtual_sol_reserves = [10_000_u64, 11_000, 13_200, 17_160, 24_024];
+
+        for (index, (slot, sol_reserves)) in slots.into_iter().zip(virtual_sol_reserves).enumerate()
+        {
+            let signer = if index == 0 {
+                dev_wallet
+            } else {
+                Pubkey::new_unique()
+            };
+            let mut tx = (*des_tx(
+                pool_id,
+                signer,
+                &format!("sig-des-{index}"),
+                40_010 + index as u64 * 10,
+                slot,
+                Some(0),
+                index == 0,
+                sol_reserves as f64 / 1_000.0,
+            ))
+            .clone();
+            tx.virtual_sol_reserves = Some(sol_reserves);
+            tx.virtual_token_reserves = Some(1_000);
+            tx.token_mint = Some(base_mint.to_string());
+            guard.ingest_transaction(Arc::new(tx));
+        }
+
         guard.materialize_features()
     };
 
-    assert_eq!(features.sybil_resistance.demand_elasticity_score, Some(1.0));
-    assert_eq!(features.sybil_resistance.buy_sample_count, 4);
-    assert_eq!(features.sybil_resistance.signer_sample_count, 4);
+    assert_eq!(features.sybil_resistance.demand_elasticity_score, None);
+    let des = features
+        .sybil_resistance
+        .demand_elasticity_v2
+        .as_ref()
+        .expect("DES V2 should materialize");
+    assert_eq!(des.demand_elasticity_score, Some(1.0));
+    assert!(des.has_full_quality());
+    assert_eq!(des.closed_triple_count, 3);
+    assert_eq!(features.sybil_resistance.buy_sample_count, 5);
+    assert_eq!(features.sybil_resistance.signer_sample_count, 5);
     assert_eq!(
         features.sybil_resistance.degraded_reasons,
-        vec![ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()]
+        vec![
+            ghost_core::tx_intelligence::types::DES_COMPARISON_DEFINITION_MISMATCH_REASON
+                .to_string(),
+            ghost_core::tx_intelligence::types::CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string(),
+            ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
+        ]
     );
 }
 
@@ -739,50 +759,63 @@ fn materialize_features_populates_cpv_from_shared_session_index() {
 
     {
         let mut guard = session_a.write();
-        let _ = guard.ingest_transaction(des_tx(
-            pool_a,
-            shared_signer,
-            "sig-cpv-pool-a",
-            49_010,
-            1,
-            Some(0),
-            false,
-            9.0,
-        ));
+        m4_fixture_feed_then_session(
+            &mut guard,
+            des_tx(
+                pool_a,
+                shared_signer,
+                "sig-cpv-pool-a",
+                49_010,
+                1,
+                Some(0),
+                false,
+                9.0,
+            ),
+        );
     }
 
     let features = {
         let mut guard = session_b.write();
-        let _ = guard.ingest_transaction(des_tx(
-            pool_b,
-            session_b_dev_wallet,
-            "sig-cpv-dev",
-            50_010,
-            2,
-            Some(0),
-            true,
-            10.0,
-        ));
-        let _ = guard.ingest_transaction(des_tx(
-            pool_b,
-            shared_signer,
-            "sig-cpv-shared",
-            50_020,
-            3,
-            Some(0),
-            false,
-            11.0,
-        ));
-        let _ = guard.ingest_transaction(des_tx(
-            pool_b,
-            Pubkey::new_unique(),
-            "sig-cpv-local",
-            50_030,
-            4,
-            Some(0),
-            false,
-            12.0,
-        ));
+        m4_fixture_feed_then_session(
+            &mut guard,
+            des_tx(
+                pool_b,
+                session_b_dev_wallet,
+                "sig-cpv-dev",
+                50_010,
+                2,
+                Some(0),
+                true,
+                10.0,
+            ),
+        );
+        m4_fixture_feed_then_session(
+            &mut guard,
+            des_tx(
+                pool_b,
+                shared_signer,
+                "sig-cpv-shared",
+                50_020,
+                3,
+                Some(0),
+                false,
+                11.0,
+            ),
+        );
+        m4_fixture_feed_then_session(
+            &mut guard,
+            des_tx(
+                pool_b,
+                Pubkey::new_unique(),
+                "sig-cpv-local",
+                50_030,
+                4,
+                Some(0),
+                false,
+                12.0,
+            ),
+        );
+        m4_fixture_source_complete(&guard, guard.highest_seen_ts_ms);
         guard.materialize_features()
     };
 
@@ -836,26 +869,32 @@ fn materialize_features_populates_decision_series_and_temporal_deltas_from_sessi
 
     {
         let mut guard = session_a.write();
-        let _ = guard.ingest_transaction(des_tx(
-            pool_a,
-            cross_a,
-            "sig-delta-cpv-seed-a",
-            1_050,
-            1,
-            Some(0),
-            false,
-            9.0,
-        ));
-        let _ = guard.ingest_transaction(des_tx(
-            pool_a,
-            cross_b,
-            "sig-delta-cpv-seed-b",
-            1_060,
-            2,
-            Some(0),
-            false,
-            9.5,
-        ));
+        m4_fixture_feed_then_session(
+            &mut guard,
+            des_tx(
+                pool_a,
+                cross_a,
+                "sig-delta-cpv-seed-a",
+                1_050,
+                1,
+                Some(0),
+                false,
+                9.0,
+            ),
+        );
+        m4_fixture_feed_then_session(
+            &mut guard,
+            des_tx(
+                pool_a,
+                cross_b,
+                "sig-delta-cpv-seed-b",
+                1_060,
+                2,
+                Some(0),
+                false,
+                9.5,
+            ),
+        );
     }
 
     let mut tx_with_side = |signer: Pubkey,
@@ -883,69 +922,67 @@ fn materialize_features_populates_decision_series_and_temporal_deltas_from_sessi
 
     let features = {
         let mut guard = session_b.write();
-        let _ = guard.ingest_transaction(tx_with_side(
-            cross_a,
-            "sig-delta-cross-a-buy",
-            1_200,
-            3,
-            true,
-            10.0,
-            true,
-        ));
-        let _ = guard.ingest_transaction(tx_with_side(
-            local_a,
-            "sig-delta-local-a-buy",
-            1_400,
-            4,
-            true,
-            11.0,
-            false,
-        ));
-        let _ = guard.ingest_transaction(tx_with_side(
-            local_b,
-            "sig-delta-local-b-buy",
-            1_700,
-            5,
-            true,
-            12.0,
-            false,
-        ));
-        let _ = guard.ingest_transaction(tx_with_side(
-            cross_b,
-            "sig-delta-cross-b-buy",
-            2_400,
-            6,
-            true,
-            14.0,
-            true,
-        ));
-        let _ = guard.ingest_transaction(tx_with_side(
-            cross_a,
-            "sig-delta-cross-a-sell",
-            2_700,
-            7,
-            false,
-            13.0,
-            false,
-        ));
-        let _ = guard.ingest_transaction(tx_with_side(
-            local_c,
-            "sig-delta-local-c-buy",
-            3_400,
-            8,
-            true,
-            16.0,
-            true,
-        ));
-        let _ = guard.ingest_transaction(tx_with_side(
-            local_d,
-            "sig-delta-local-d-buy",
-            4_200,
-            9,
-            true,
-            17.0,
-            false,
-        ));
+        m4_fixture_feed_then_session(
+            &mut guard,
+            tx_with_side(cross_a, "sig-delta-cross-a-buy", 1_200, 3, true, 10.0, true),
+        );
+        m4_fixture_feed_then_session(
+            &mut guard,
+            tx_with_side(
+                local_a,
+                "sig-delta-local-a-buy",
+                1_400,
+                4,
+                true,
+                11.0,
+                false,
+            ),
+        );
+        m4_fixture_feed_then_session(
+            &mut guard,
+            tx_with_side(
+                local_b,
+                "sig-delta-local-b-buy",
+                1_700,
+                5,
+                true,
+                12.0,
+                false,
+            ),
+        );
+        m4_fixture_feed_then_session(
+            &mut guard,
+            tx_with_side(cross_b, "sig-delta-cross-b-buy", 2_400, 6, true, 14.0, true),
+        );
+        m4_fixture_feed_then_session(
+            &mut guard,
+            tx_with_side(
+                cross_a,
+                "sig-delta-cross-a-sell",
+                2_700,
+                7,
+                false,
+                13.0,
+                false,
+            ),
+        );
+        m4_fixture_feed_then_session(
+            &mut guard,
+            tx_with_side(local_c, "sig-delta-local-c-buy", 3_400, 8, true, 16.0, true),
+        );
+        m4_fixture_feed_then_session(
+            &mut guard,
+            tx_with_side(
+                local_d,
+                "sig-delta-local-d-buy",
+                4_200,
+                9,
+                true,
+                17.0,
+                false,
+            ),
+        );
+        m4_fixture_source_complete(&guard, guard.highest_seen_ts_ms.max(4200));
         guard.materialize_features()
     };
 
@@ -994,6 +1031,73 @@ fn materialize_features_populates_decision_series_and_temporal_deltas_from_sessi
         .delta_signer_cross_pool_velocity_1s_to_2s
         .expect("CPV delta should materialize from shared session index");
     assert!((cpv_delta - (1.0 / 6.0)).abs() < 1e-12);
+
+    // Zapisane anchory 1s/2s/3s nie są przepisywane przez spóźnioną historię.
+    // Ten rekord zmieniłby co najmniej wcześniejszy CPV przy ponownym obliczeniu.
+    let temporal_cpv_before = (
+        features
+            .temporal_deltas
+            .anchor_1s
+            .signer_cross_pool_velocity,
+        features
+            .temporal_deltas
+            .anchor_2s
+            .signer_cross_pool_velocity,
+        features
+            .temporal_deltas
+            .anchor_3s
+            .signer_cross_pool_velocity,
+        features
+            .temporal_deltas
+            .delta_signer_cross_pool_velocity_1s_to_2s,
+        features
+            .temporal_deltas
+            .delta_signer_cross_pool_velocity_1s_to_3s,
+    );
+    let cpv_evidence_before =
+        serde_json::to_value(&features.sybil_resistance.cpv_evidence).unwrap();
+    let cpv_config = session_b.read().cross_pool_velocity_config;
+    manager.cross_pool_velocity_index().observe_buy(
+        &pool_a.to_string(),
+        &local_a.to_string(),
+        1_500,
+        &cpv_config,
+    );
+    let after_late_history = session_b.read().materialize_features();
+    assert_eq!(
+        (
+            after_late_history
+                .temporal_deltas
+                .anchor_1s
+                .signer_cross_pool_velocity,
+            after_late_history
+                .temporal_deltas
+                .anchor_2s
+                .signer_cross_pool_velocity,
+            after_late_history
+                .temporal_deltas
+                .anchor_3s
+                .signer_cross_pool_velocity,
+            after_late_history
+                .temporal_deltas
+                .delta_signer_cross_pool_velocity_1s_to_2s,
+            after_late_history
+                .temporal_deltas
+                .delta_signer_cross_pool_velocity_1s_to_3s,
+        ),
+        temporal_cpv_before
+    );
+    assert_eq!(
+        after_late_history
+            .sybil_resistance
+            .signer_cross_pool_velocity,
+        Some(0.5)
+    );
+    assert_eq!(
+        serde_json::to_value(&features.sybil_resistance.cpv_evidence).unwrap(),
+        cpv_evidence_before
+    );
+
     let flipper_delta = features
         .temporal_deltas
         .delta_flipper_presence_ratio_1s_to_2s
@@ -1430,7 +1534,7 @@ fn session_admission_keeps_same_signature_with_different_event_ordinals_distinct
 }
 
 #[test]
-fn session_admission_preserves_tx_key_timestamp_drift_semantics() {
+fn r1_session_redelivery_does_not_recount_due_to_ingress_timestamp_drift() {
     let manager = SessionManager::default();
     let pool_id = Pubkey::new_unique();
     let session = open_session(
@@ -1456,12 +1560,12 @@ fn session_admission_preserves_tx_key_timestamp_drift_semantics() {
     let guard = session.read();
     assert_eq!(
         guard.tx_keys_seen.len(),
-        2,
-        "TxKey intentionally treats normalized event timestamp as identity/order state"
+        1,
+        "Redostawa zachowanego eventu nie tworzy nowej mutacji pomimo zmiany ingress time"
     );
-    assert_eq!(guard.diagnostics.total_tx_seen, 2);
-    assert_eq!(guard.tx_intel_features.tx_count, 2);
-    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 2);
+    assert_eq!(guard.diagnostics.total_tx_seen, 1);
+    assert_eq!(guard.tx_intel_features.tx_count, 1);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 1);
 }
 
 #[test]
@@ -2473,4 +2577,400 @@ fn session_materialization_keeps_curve_known_after_trailing_unknown_curve_point(
         "bonding progress should remain available after a trailing unknown point, got {}",
         features.account_features.bonding_progress
     );
+}
+
+fn r1_full_metric_batch(pool: Pubkey, t0: u64) -> Vec<Arc<PoolTransaction>> {
+    (0..3)
+        .map(|i| {
+            let mut tx = (*test_tx(
+                pool,
+                &solana_sdk::signature::Signature::new_unique().to_string(),
+                t0 + i,
+            ))
+            .clone();
+            tx.tx_index = Some(i as u32);
+            tx.event_time =
+                ghost_core::EventTimeMetadata::new(Some(t0 + i), Some(t0 + i), Some(t0 + i));
+            tx.is_dev_buy = i == 0;
+            tx.toolchain_fingerprint = dbia_fingerprint(12, 3, true, true, 2, (i as u32, 0));
+            tx.signer_pre_balance_lamports = Some(100);
+            tx.signer_post_balance_lamports = Some(90 - 20 * i);
+            Arc::new(tx)
+        })
+        .collect()
+}
+
+#[test]
+fn r1_session_enriched_same_event_recovers_all_metrics_without_recounting() {
+    let manager = SessionManager::default();
+    let pool = Pubkey::new_unique();
+    let t0 = seer::types::ingress_epoch_ms().saturating_sub(100);
+    let session = open_session_with_deadline_and_gatekeeper_config(
+        &manager,
+        pool,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        t0,
+        t0 + 10_000,
+        GatekeeperV2Config::default(),
+    );
+    let full = r1_full_metric_batch(pool, t0);
+    let mut partial = (*full[0]).clone();
+    partial.signer_post_balance_lamports = None;
+    partial.metadata_availability.inner_instructions_known = false;
+    partial.toolchain_fingerprint = Default::default();
+    let mut guard = session.write();
+    guard.dev_wallet = Some(full[0].signer.parse().unwrap());
+    guard.ingest_transaction(Arc::new(partial));
+    guard.ingest_transaction(full[1].clone());
+    guard.ingest_transaction(full[2].clone());
+    let before = guard.try_materialize_features().unwrap();
+    let frozen = serde_json::to_value(&before.sybil_resistance).unwrap();
+    assert!(before
+        .sybil_resistance
+        .degraded_reasons
+        .iter()
+        .any(|v| v.starts_with("SFD_")));
+    for _ in 0..3 {
+        guard.ingest_transaction(full[0].clone());
+    }
+    let after = guard.try_materialize_features().unwrap();
+    assert_eq!(after.sybil_resistance.buy_sample_count, 3);
+    assert_eq!(after.sybil_resistance.signer_sample_count, 3);
+    assert_eq!(
+        after.sybil_resistance.fee_topology_diversity_index,
+        Some(1.0)
+    ); // nadal kontrakt K/N
+    assert!(
+        (after
+            .sybil_resistance
+            .dev_buyer_infrastructure_affinity
+            .unwrap()
+            - 0.8)
+            .abs()
+            < 1e-12
+    );
+    assert!((after.sybil_resistance.spend_fraction_divergence.unwrap() - 0.2).abs() < 1e-12);
+    for metric in ["FTDI_", "DBIA_", "SFD_"] {
+        assert!(!after
+            .sybil_resistance
+            .degraded_reasons
+            .iter()
+            .any(|v| v.starts_with(metric)));
+    }
+    assert_eq!(guard.diagnostics.total_tx_seen, 3);
+    assert_eq!(guard.tx_buffer.len(), 3);
+    assert_eq!(guard.tx_keys_seen.len(), 3);
+    assert_eq!(guard.tx_intel_features.tx_count, 3);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 3);
+    assert_eq!(
+        serde_json::to_value(&before.sybil_resistance).unwrap(),
+        frozen
+    );
+    guard.close();
+    let mut conflict = (*full[0]).clone();
+    conflict.signer_post_balance_lamports = Some(1);
+    guard.ingest_transaction(Arc::new(conflict));
+    let closed = guard.try_materialize_features().unwrap();
+    assert!(
+        closed.sybil_resistance.measurement_cutoff_received_ms
+            >= after.sybil_resistance.measurement_cutoff_received_ms
+    );
+    // Nowy odczyt ma własny cutoff odbiorcy; zamknięcie nie zmienia żadnego
+    // pomiaru, licznika ani historycznego obiektu po odrzuconej redostawie.
+    let mut expected = after.sybil_resistance.clone();
+    expected.measurement_cutoff_received_ms =
+        closed.sybil_resistance.measurement_cutoff_received_ms;
+    assert_eq!(closed.sybil_resistance, expected);
+}
+
+#[test]
+fn r1_session_same_receipt_permutations_preserve_metric_result() {
+    let pool = Pubkey::new_unique();
+    let t0 = seer::types::ingress_epoch_ms().saturating_sub(100);
+    let full = r1_full_metric_batch(pool, t0);
+    let mut partial = (*full[0]).clone();
+    partial.metadata_availability.inner_instructions_known = false;
+    partial.toolchain_fingerprint = Default::default();
+    partial.signer_post_balance_lamports = None;
+    let partial = Arc::new(partial);
+    let mut previous = None;
+    for views in [
+        [partial.clone(), full[0].clone()],
+        [full[0].clone(), partial.clone()],
+    ] {
+        let manager = SessionManager::default();
+        let session = open_session_with_deadline_and_gatekeeper_config(
+            &manager,
+            pool,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            t0,
+            t0 + 10_000,
+            GatekeeperV2Config::default(),
+        );
+        let mut guard = session.write();
+        guard.dev_wallet = Some(full[0].signer.parse().unwrap());
+        for tx in views.into_iter().chain([full[1].clone(), full[2].clone()]) {
+            guard.ingest_transaction(tx);
+        }
+        let mfs = guard.try_materialize_features().unwrap();
+        let result = (
+            mfs.sybil_resistance.fee_topology_diversity_index,
+            mfs.sybil_resistance.dev_buyer_infrastructure_affinity,
+            mfs.sybil_resistance.spend_fraction_divergence,
+            mfs.sybil_resistance.buy_sample_count,
+            mfs.sybil_resistance.signer_sample_count,
+        );
+        if let Some(prev) = previous {
+            assert_eq!(result, prev);
+        }
+        previous = Some(result);
+        assert_eq!(guard.tx_intel_features.tx_count, 3);
+        assert_eq!(guard.tx_buffer.len(), 3);
+    }
+}
+
+#[test]
+fn r1_redelivery_capacity_loss_is_visible_in_mfs_without_recounting() {
+    let manager = SessionManager::default();
+    let pool = Pubkey::new_unique();
+    let t0 = seer::types::ingress_epoch_ms().saturating_sub(100);
+    let mut config = GatekeeperV2Config::default();
+    config.decision_time_series_tx_capacity = 3;
+    let session = open_session_with_deadline_and_gatekeeper_config(
+        &manager,
+        pool,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        t0,
+        t0 + 10_000,
+        config,
+    );
+    let full = r1_full_metric_batch(pool, t0);
+    let mut guard = session.write();
+    guard.dev_wallet = Some(full[0].signer.parse().unwrap());
+    for tx in &full {
+        guard.ingest_transaction(tx.clone());
+    }
+    for n in 0..10 {
+        let mut changed = (*full[0]).clone();
+        changed.signer_post_balance_lamports = Some(n);
+        changed.event_time.ingress_wall_ts_ms = Some(t0 + 10 + n);
+        guard.ingest_transaction(Arc::new(changed));
+    }
+    let loss = guard.try_materialize_features().unwrap();
+    assert!(loss
+        .sybil_resistance
+        .degraded_reasons
+        .contains(&"SFD_INPUT_VIEW_HISTORY_UNAVAILABLE".to_string()));
+    assert_eq!(guard.tx_intel_features.tx_count, 3);
+    assert_eq!(guard.tx_buffer.len(), 3);
+}
+
+// Reprodukcja RR1: retencja próbki nie usuwa dowodu admission.
+#[test]
+fn rr1_evicted_event_redelivery_does_not_reenter_reducers() {
+    let manager = SessionManager::default();
+    let pool = Pubkey::new_unique();
+    let t0 = seer::types::ingress_epoch_ms().saturating_sub(1000);
+    let mut config = GatekeeperV2Config::default();
+    config.decision_time_series_tx_capacity = 3;
+    let session = open_session_with_deadline_and_gatekeeper_config(
+        &manager,
+        pool,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        t0,
+        t0 + 10000,
+        config,
+    );
+    let batch = r1_full_metric_batch(pool, t0);
+    let mut original = (*batch[0]).clone();
+    original.event_time = ghost_core::EventTimeMetadata::new(None, Some(t0), Some(t0));
+    let mut guard = session.write();
+    guard.ingest_transaction(Arc::new(original.clone()));
+    guard.ingest_transaction(batch[1].clone());
+    guard.ingest_transaction(batch[2].clone());
+    for (i, tx) in r1_full_metric_batch(pool, t0 + 10).into_iter().enumerate() {
+        let mut unique = (*tx).clone();
+        unique.tx_index = Some(3 + i as u32);
+        unique.is_dev_buy = false;
+        guard.ingest_transaction(Arc::new(unique));
+    }
+    assert_eq!(guard.tx_intel_features.tx_count, 6);
+    assert!(!guard
+        .tx_buffer
+        .iter()
+        .any(|t| t.signature == original.signature));
+    guard.ingest_transaction(Arc::new(original.clone()));
+    assert_eq!(
+        guard.tx_intel_features.tx_count, 6,
+        "identyczny timestamp nadal chroni TxKey"
+    );
+    let mut redelivery = original.clone();
+    redelivery.timestamp_ms = t0 + 50;
+    redelivery.event_time = ghost_core::EventTimeMetadata::new(None, Some(t0 + 50), Some(t0 + 50));
+    redelivery.arrival_ts_ms = t0 + 50;
+    guard.ingest_transaction(Arc::new(redelivery));
+    println!(
+        "EVICTED SAME EVENT: txintel={} gatekeeper={} diagnostics={} retained={} keys={}",
+        guard.tx_intel_features.tx_count,
+        guard.gatekeeper_buffer().total_tx_count(),
+        guard.diagnostics.total_tx_seen,
+        guard.tx_buffer.len(),
+        guard.tx_keys_seen.len()
+    );
+    assert_eq!(
+        guard.tx_intel_features.tx_count, 6,
+        "redostawa nie może być siódmą transakcją po usunięciu tylko jej próbki"
+    );
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 6);
+    assert_eq!(guard.diagnostics.total_tx_seen, 6);
+}
+
+#[test]
+fn rr1_admission_limit_never_evicts_proof_or_silently_accepts_more_input() {
+    use ghost_launcher::session::observation::MetricContractMaterializationErrorV1;
+    let manager = SessionManager::default();
+    let pool = Pubkey::new_unique();
+    let t0 = seer::types::ingress_epoch_ms().saturating_sub(10_000);
+    let mut config = GatekeeperV2Config::default();
+    // Dokładnie istniejąca pojemność dedup Gatekeepera, niezależna od próbek.
+    let limit = config.min_tx_count.saturating_mul(8).max(256);
+    config.decision_time_series_tx_capacity = limit;
+    let session = open_session_with_deadline_and_gatekeeper_config(
+        &manager,
+        pool,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        t0,
+        t0 + 30_000,
+        config,
+    );
+    let template = r1_full_metric_batch(pool, t0)[0].clone();
+    let mut guard = session.write();
+    let mut first = None;
+    for i in 0..limit {
+        let mut tx = (*template).clone();
+        tx.signature = solana_sdk::signature::Signature::new_unique().to_string();
+        tx.tx_index = Some(i as u32);
+        tx.timestamp_ms = t0 + i as u64;
+        tx.event_time =
+            ghost_core::EventTimeMetadata::new(None, Some(tx.timestamp_ms), Some(tx.timestamp_ms));
+        if i == 0 {
+            first = Some(tx.clone());
+        }
+        guard.ingest_transaction(Arc::new(tx));
+    }
+    assert_eq!(guard.tx_keys_seen.len(), limit);
+    assert_eq!(guard.tx_intel_features.tx_count, limit as u64);
+    assert!(guard.try_materialize_features().is_ok());
+    let keys = guard.tx_keys_seen.clone();
+    let mut duplicate = first.unwrap();
+    duplicate.timestamp_ms = t0 + limit as u64 + 1;
+    duplicate.event_time = ghost_core::EventTimeMetadata::new(
+        None,
+        Some(duplicate.timestamp_ms),
+        Some(duplicate.timestamp_ms),
+    );
+    // Pełny zbiór nie blokuje rozpoznania istniejącej tożsamości.
+    guard.ingest_transaction(Arc::new(duplicate.clone()));
+    assert_eq!(guard.tx_keys_seen, keys);
+    assert!(guard.try_materialize_features().is_ok());
+    for _ in 0..(limit + 2) {
+        let mut beyond_limit = duplicate.clone();
+        beyond_limit.signature = solana_sdk::signature::Signature::new_unique().to_string();
+        guard.ingest_transaction(Arc::new(beyond_limit));
+    }
+    assert_eq!(guard.tx_keys_seen, keys);
+    assert_eq!(guard.tx_intel_features.tx_count, limit as u64);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), limit);
+    assert_eq!(guard.diagnostics.total_tx_seen, limit as u64);
+    assert_eq!(guard.tx_buffer.len(), limit);
+    assert_eq!(
+        guard
+            .diagnostics
+            .reject_reasons
+            .iter()
+            .filter(|r| r.as_str() == "SESSION_ADMISSION_CAPACITY_EXHAUSTED")
+            .count(),
+        1
+    );
+    assert!(matches!(guard.try_materialize_features(),
+        Err(MetricContractMaterializationErrorV1::AdmissionCapacityExhausted { capacity }) if capacity == limit));
+    guard.ingest_transaction(Arc::new(duplicate));
+    assert_eq!(guard.tx_keys_seen, keys);
+    guard.close();
+    let diagnostics = guard.diagnostics.clone();
+    guard.ingest_transaction(template);
+    assert_eq!(guard.diagnostics, diagnostics);
+    assert_eq!(guard.tx_keys_seen, keys);
+}
+
+#[test]
+fn rr1_distinct_local_ordinals_remain_distinct_admissions() {
+    let manager = SessionManager::default();
+    let pool = Pubkey::new_unique();
+    let t0 = seer::types::ingress_epoch_ms().saturating_sub(1_000);
+    let session = open_session_with_deadline_and_gatekeeper_config(
+        &manager,
+        pool,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        t0,
+        t0 + 10_000,
+        GatekeeperV2Config::default(),
+    );
+    let mut first = (*r1_full_metric_batch(pool, t0)[0]).clone();
+    first.event_time = ghost_core::EventTimeMetadata::new(None, Some(t0), Some(t0));
+    let mut second = first.clone();
+    second.event_ordinal = Some(first.event_ordinal.unwrap() + 1);
+    let mut guard = session.write();
+    guard.ingest_transaction(Arc::new(first.clone()));
+    guard.ingest_transaction(Arc::new(second.clone()));
+    for mut tx in [second, first] {
+        tx.timestamp_ms += 50;
+        tx.event_time =
+            ghost_core::EventTimeMetadata::new(None, Some(tx.timestamp_ms), Some(tx.timestamp_ms));
+        guard.ingest_transaction(Arc::new(tx));
+    }
+    assert_eq!(guard.tx_keys_seen.len(), 2);
+    assert_eq!(guard.tx_intel_features.tx_count, 2);
+    assert_eq!(guard.gatekeeper_buffer().total_tx_count(), 2);
+    assert_eq!(guard.diagnostics.total_tx_seen, 2);
+}
+
+fn m4_fixture_feed_then_session(
+    session: &mut ghost_launcher::session::observation::PoolObservationSession,
+    tx: Arc<PoolTransaction>,
+) {
+    use solana_sdk::signature::Signature;
+    let mut tx = (*tx).clone();
+    if tx.signature.parse::<Signature>().is_err() {
+        let digest = solana_sdk::hash::hash(tx.signature.as_bytes()).to_bytes();
+        let mut bytes = [0u8; 64];
+        bytes[..32].copy_from_slice(&digest);
+        bytes[32..].copy_from_slice(&digest);
+        tx.signature = Signature::from(bytes).to_string();
+    }
+    session.cross_pool_velocity_index.observe_transaction(
+        &tx.pool_amm_id,
+        &tx,
+        &session.cross_pool_velocity_config,
+    );
+    session.ingest_transaction(Arc::new(tx));
+}
+
+fn m4_fixture_source_complete(
+    session: &ghost_launcher::session::observation::PoolObservationSession,
+    end: u64,
+) {
+    let config = &session.cross_pool_velocity_config;
+    session
+        .cross_pool_velocity_index
+        .observe_source_progress(1, 0, 1, 1, config);
+    session
+        .cross_pool_velocity_index
+        .observe_source_progress(1, end, end, end, config);
 }

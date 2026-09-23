@@ -225,6 +225,10 @@ fn candidate_carrier(signature: Signature, pool: Pubkey, mint: Pubkey) -> Candid
 
 fn trade_carrier(signature: Signature, pool: Pubkey, mint: Pubkey, ordinal: u32) -> TradeEvent {
     TradeEvent {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
         semantic: Default::default(),
         provider_id: Some("primary".to_string()),
         provider_role: Some(RawProviderRoleV1::PrimaryAuthority),

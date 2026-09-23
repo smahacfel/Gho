@@ -109,6 +109,22 @@ pub const CYCLIC_LOG_SCHEMA_VERSION: u32 = 1;
 /// v33 adds `top3_signer_volume_ratio` while preserving legacy
 /// `top3_volume_pct` as a ratio-scale compatibility alias.
 pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 33;
+
+/// Jedna kopia gotowych pomiarów; nie zawiera rekalkulacji ani nowej gałęzi FSC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SybilMeasurementsLogV2 {
+    pub fee_topology_diversity_v2: Option<ghost_core::tx_intelligence::types::FtdiEvidenceV2>,
+    pub dbia_evidence_v1: Option<ghost_core::tx_intelligence::types::DbiaEvidenceV1>,
+    pub sfd_evidence_v1: Option<ghost_core::tx_intelligence::types::SfdEvidenceV1>,
+    pub demand_elasticity_v2: Option<ghost_core::tx_intelligence::types::DesEvidenceV2>,
+    pub cpv_evidence: ghost_core::checkpoint::CpvEvidenceContext,
+    pub cutoff_received_ms: Option<u64>,
+    pub thresholds: crate::config::ghost_brain_config::SybilThresholdsV2Config,
+    pub aps_ftdi_gini_simpson_v2_min: Option<f64>,
+    pub comparison_reasons: Vec<String>,
+}
+
 /// Gatekeeper version string embedded in every V2.5 shadow BUY log for traceability.
 pub const GATEKEEPER_VERSION: &str = "v2.5";
 /// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
@@ -828,6 +844,10 @@ pub struct SelectorShadowScoreSidecarLog {
     pub feature_cutoff_ts_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector_shadow_score: Option<f64>,
+    /// Historyczny selector nie ma kalibracji dla nowych definicji FTDI/DES.
+    /// Oddzielna diagnostyka bez zmiany wag ani wzoru scoringu.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metric_comparison_disabled_reasons: Vec<String>,
     pub score_validity_status: String,
     pub score_valid: bool,
     pub score_degraded: bool,
@@ -1922,7 +1942,10 @@ pub struct GatekeeperBuyLog {
     // ═══════════════════════════════════════════
     // Sybil Resistance Metrics (canonical feature bundle)
     // ═══════════════════════════════════════════
-    /// Fee Topology Diversity Index.
+    /// Pięć pomiarów M6, ich coverage/cutoff oraz progi przypisane nowym definicjom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sybil_measurements_v2: Option<SybilMeasurementsLogV2>,
+    /// Historyczny FTDI K/N; pole nie jest aliasem Gini–Simpson.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_topology_diversity_index: Option<f64>,
     #[serde(default)]
@@ -3928,6 +3951,49 @@ fn selector_shadow_median(values: &[f64]) -> Option<f64> {
 }
 
 fn selector_shadow_runtime_feature_value(log: &GatekeeperBuyLog, feature: &str) -> Option<f64> {
+    if let Some(measurements) = &log.sybil_measurements_v2 {
+        // Zakresy normalizacji selectora są historyczne i nie są progami policy
+        // sybil_thresholds_v2. Bez odrębnej kalibracji nie reinterpretujemy V2.
+        // Brak jednej cechy nie usuwa innych dostępnych pomiarów.
+        match feature {
+            "gk_fee_topology_diversity_index" | "gk_demand_elasticity_score" => return None,
+            "gk_dev_buyer_infrastructure_affinity" => {
+                let evidence = measurements.dbia_evidence_v1.as_ref()?;
+                return (evidence.has_full_quality()
+                    && evidence.dev_buyer_infrastructure_affinity
+                        == log.dev_buyer_infrastructure_affinity)
+                    .then_some(evidence.dev_buyer_infrastructure_affinity)
+                    .flatten();
+            }
+            "gk_spend_fraction_divergence" => {
+                let evidence = measurements.sfd_evidence_v1.as_ref()?;
+                return (evidence.has_full_quality()
+                    && evidence.spend_fraction_divergence == log.spend_fraction_divergence)
+                    .then_some(evidence.spend_fraction_divergence)
+                    .flatten();
+            }
+            "gk_signer_cross_pool_velocity" => {
+                let evidence = &measurements.cpv_evidence;
+                let usable = evidence.source
+                    == ghost_core::checkpoint::CpvMetricSource::SuccessfulBuyRollingIndex
+                    && evidence.quality == ghost_core::checkpoint::MetricEvidenceQuality::Clean
+                    && evidence.rolling_state_available == Some(true)
+                    && evidence
+                        .sample_count
+                        .zip(evidence.required_clean_sample_count)
+                        .is_some_and(|(actual, required)| required > 0 && actual >= required)
+                    && evidence.degraded_reasons.is_empty()
+                    && evidence.signer_cross_pool_velocity == log.signer_cross_pool_velocity
+                    && evidence
+                        .signer_cross_pool_velocity
+                        .is_some_and(|v| v.is_finite() && (0.0..=1.0).contains(&v));
+                return usable
+                    .then_some(evidence.signer_cross_pool_velocity)
+                    .flatten();
+            }
+            _ => {}
+        }
+    }
     let value = match feature {
         "net_quote_in_15s" => log.net_quote_in_15s,
         "net_quote_in_30s" => log.net_quote_in_30s,
@@ -4365,6 +4431,14 @@ fn build_selector_shadow_score_sidecar(log: &GatekeeperBuyLog) -> SelectorShadow
             .or(log.first_seen_ts_ms),
         feature_cutoff_ts_ms: log.observation_end_ts_ms,
         selector_shadow_score,
+        metric_comparison_disabled_reasons: if log.sybil_measurements_v2.is_some() {
+            vec![
+                "FTDI_SELECTOR_COMPARISON_DEFINITION_MISMATCH".into(),
+                "DES_SELECTOR_COMPARISON_DEFINITION_MISMATCH".into(),
+            ]
+        } else {
+            Vec::new()
+        },
         score_validity_status,
         score_valid,
         score_degraded,
@@ -5348,6 +5422,7 @@ mod tests {
             dev_sold_within_5s: Some(true),
             fingerprint_degraded: false,
             fingerprint_reason: None,
+            sybil_measurements_v2: None,
             fee_topology_diversity_index: Some(0.42),
             min_fee_topology_diversity_index: 0.0,
             dev_buyer_infrastructure_affinity: Some(0.31),
@@ -5938,6 +6013,7 @@ mod tests {
             dev_sold_within_5s: None,
             fingerprint_degraded: false,
             fingerprint_reason: None,
+            sybil_measurements_v2: None,
             fee_topology_diversity_index: Some(0.42),
             min_fee_topology_diversity_index: 0.0,
             dev_buyer_infrastructure_affinity: Some(0.31),
@@ -7917,5 +7993,126 @@ mod tests {
         assert!(stats.snapshot().evidence_run_invalid);
         assert!(logger.v33_writer_task.lock().await.is_none());
         assert!(logger.metric_contract_writer_task.lock().await.is_none());
+    }
+
+    #[test]
+    fn m6_selector_preserves_legacy_scales_and_uses_individual_quality() {
+        use ghost_core::checkpoint::{CpvEvidenceContext, CpvMetricSource, MetricEvidenceQuality};
+        use ghost_core::tx_intelligence::types::{DbiaEvidenceV1, SfdEvidenceV1};
+        let mut log = create_test_buy_log();
+        let legacy_ftdi =
+            selector_shadow_runtime_feature_value(&log, "gk_fee_topology_diversity_index");
+        assert_eq!(legacy_ftdi, log.fee_topology_diversity_index);
+        log.dev_buyer_infrastructure_affinity = Some(0.8);
+        log.spend_fraction_divergence = Some(0.2);
+        log.signer_cross_pool_velocity = Some(0.4);
+        log.sybil_measurements_v2 = Some(SybilMeasurementsLogV2 {
+            fee_topology_diversity_v2: None,
+            demand_elasticity_v2: None,
+            dbia_evidence_v1: Some(DbiaEvidenceV1 {
+                dev_buyer_infrastructure_affinity: Some(0.8),
+                buy_sample_count: 5,
+                signer_sample_count: 5,
+                represented_signer_count: 5,
+                degraded_reasons: vec![],
+            }),
+            sfd_evidence_v1: Some(SfdEvidenceV1 {
+                spend_fraction_divergence: Some(0.2),
+                buy_sample_count: 5,
+                signer_sample_count: 5,
+                represented_signer_count: 5,
+                degraded_reasons: vec![],
+            }),
+            cpv_evidence: CpvEvidenceContext {
+                source: CpvMetricSource::SuccessfulBuyRollingIndex,
+                quality: MetricEvidenceQuality::Clean,
+                signer_cross_pool_velocity: Some(0.4),
+                sample_count: Some(5),
+                required_clean_sample_count: Some(3),
+                rolling_state_available: Some(true),
+                ..Default::default()
+            },
+            cutoff_received_ms: Some(1_000),
+            thresholds: Default::default(),
+            aps_ftdi_gini_simpson_v2_min: None,
+            comparison_reasons: vec![],
+        });
+        let original = serde_json::to_vec(&log).unwrap();
+        assert_eq!(
+            selector_shadow_runtime_feature_value(&log, "gk_fee_topology_diversity_index"),
+            None
+        );
+        assert_eq!(
+            selector_shadow_runtime_feature_value(&log, "gk_demand_elasticity_score"),
+            None
+        );
+        assert_eq!(
+            selector_shadow_runtime_feature_value(&log, "gk_dev_buyer_infrastructure_affinity"),
+            Some(0.8)
+        );
+        assert_eq!(
+            selector_shadow_runtime_feature_value(&log, "gk_spend_fraction_divergence"),
+            Some(0.2)
+        );
+        assert_eq!(
+            selector_shadow_runtime_feature_value(&log, "gk_signer_cross_pool_velocity"),
+            Some(0.4)
+        );
+        assert_eq!(serde_json::to_vec(&log).unwrap(), original);
+        log.sybil_measurements_v2
+            .as_mut()
+            .unwrap()
+            .sfd_evidence_v1
+            .as_mut()
+            .unwrap()
+            .represented_signer_count = 4;
+        assert_eq!(
+            selector_shadow_runtime_feature_value(&log, "gk_spend_fraction_divergence"),
+            None
+        );
+        assert_eq!(
+            selector_shadow_runtime_feature_value(&log, "gk_dev_buyer_infrastructure_affinity"),
+            Some(0.8)
+        );
+        assert_eq!(
+            selector_shadow_runtime_feature_value(&log, "gk_signer_cross_pool_velocity"),
+            Some(0.4)
+        );
+        let row = build_selector_shadow_score_sidecar(&log);
+        assert_eq!(
+            row.metric_comparison_disabled_reasons,
+            [
+                "FTDI_SELECTOR_COMPARISON_DEFINITION_MISMATCH",
+                "DES_SELECTOR_COMPARISON_DEFINITION_MISMATCH"
+            ]
+        );
+        assert!(row
+            .reason_vector
+            .missing
+            .iter()
+            .any(|r| r == "gk_spend_fraction_divergence"));
+        assert!(!row
+            .reason_vector
+            .negative
+            .iter()
+            .any(|r| r.contains("spend_fraction_divergence")));
+        assert!(!row
+            .reason_vector
+            .positive
+            .iter()
+            .any(|r| r.contains("spend_fraction_divergence")));
+        log.sybil_measurements_v2
+            .as_mut()
+            .unwrap()
+            .cpv_evidence
+            .quality = MetricEvidenceQuality::UnavailableSource;
+        assert_eq!(
+            selector_shadow_runtime_feature_value(&log, "gk_signer_cross_pool_velocity"),
+            None
+        );
+        assert_eq!(
+            selector_shadow_runtime_feature_value(&log, "gk_dev_buyer_infrastructure_affinity"),
+            Some(0.8)
+        );
     }
 }

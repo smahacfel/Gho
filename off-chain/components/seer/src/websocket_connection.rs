@@ -764,6 +764,13 @@ impl WebSocketConnection {
                                                     account_data,
                                                     pre_balances,
                                                     post_balances,
+                                                    metadata_availability: crate::types::TransactionMetadataAvailability {
+                                                        status_known: true,
+                                                        inner_instructions_known: matches!(
+                                                            &meta.inner_instructions,
+                                                            solana_transaction_status::option_serializer::OptionSerializer::Some(_)
+                                                        ),
+                                                    },
                                                     success,
                                                     error_code,
                                                     compute_units_consumed,

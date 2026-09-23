@@ -41,6 +41,7 @@ fn create_test_config(
         bonk_program_id: TEST_BONK_PROGRAM_ID.to_string(),
         metrics_port: 9090,
         ipc_buffer_size: 10000,
+        ingress_queue_capacity: 2_048,
         ipc_backpressure_policy: "block".to_string(),
         stream_mode: "single_global".to_string(),
         tx_filter_strategy: "per_pool".to_string(),

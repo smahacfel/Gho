@@ -821,6 +821,7 @@ impl HeliusWebSocketAdapter {
                             account_data,
                             pre_balances,
                             post_balances,
+                            metadata_availability: crate::types::TransactionMetadataAvailability { status_known: true, inner_instructions_known: false },
                             success: meta.err.is_none(),
                             error_code: meta.err.as_ref().map(|err| format!("{:?}", err)),
                             compute_units_consumed: meta.compute_units_consumed.clone().into(),

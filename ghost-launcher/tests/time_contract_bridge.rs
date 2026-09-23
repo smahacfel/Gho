@@ -6,6 +6,15 @@ use solana_sdk::{pubkey::Pubkey, signature::Signature};
 
 fn make_trade(event_time: EventTimeMetadata, legacy_timestamp_ms: u64) -> TradeEvent {
     TradeEvent {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         semantic: EventSemanticEnvelope::default(),
         provider_id: None,
         provider_role: None,
@@ -61,12 +70,17 @@ fn make_trade(event_time: EventTimeMetadata, legacy_timestamp_ms: u64) -> TradeE
 
 fn make_pool_tx(event_time: EventTimeMetadata, legacy_timestamp_ms: u64) -> PoolTransaction {
     PoolTransaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
         semantic: EventSemanticEnvelope::default(),
         pool_amm_id: Pubkey::new_unique().to_string(),
         slot: Some(9),
         event_ordinal: Some(0),
         tx_index: None,
         outer_instruction_index: None,
+        inner_instruction_path: None,
         inner_group_index: None,
         outer_program_id: None,
         cpi_stack_height: None,
@@ -93,6 +107,11 @@ fn make_pool_tx(event_time: EventTimeMetadata, legacy_timestamp_ms: u64) -> Pool
         token_mint: Some(Pubkey::new_unique().to_string()),
         v_tokens_in_bonding_curve: None,
         v_sol_in_bonding_curve: None,
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         market_cap_sol: None,
         global_config: None,
         fee_recipient: None,

@@ -3432,6 +3432,25 @@ impl GatekeeperAssessment {
             dev_sold_within_5s: fp.and_then(|f| f.dev_sold_within_5s),
             fingerprint_degraded: fp.map_or(false, |f| f.fingerprint_degraded),
             fingerprint_reason: fp.and_then(|f| f.fingerprint_reason.clone()),
+            sybil_measurements_v2: (sybil.fee_topology_diversity_v2.is_some()
+                || sybil.demand_elasticity_v2.is_some()
+                || sybil.dbia_evidence_v1.is_some()
+                || sybil.sfd_evidence_v1.is_some())
+            .then(
+                || ghost_brain::oracle::decision_logger::SybilMeasurementsLogV2 {
+                    fee_topology_diversity_v2: sybil.fee_topology_diversity_v2.clone(),
+                    dbia_evidence_v1: sybil.dbia_evidence_v1.clone(),
+                    sfd_evidence_v1: sybil.sfd_evidence_v1.clone(),
+                    demand_elasticity_v2: sybil.demand_elasticity_v2.clone(),
+                    cpv_evidence: sybil.cpv_evidence.clone(),
+                    cutoff_received_ms: sybil.measurement_cutoff_received_ms,
+                    thresholds: config.sybil_thresholds_v2.clone(),
+                    aps_ftdi_gini_simpson_v2_min: config.aps.ftdi_gini_simpson_v2_min,
+                    comparison_reasons: super::gatekeeper_policy::sybil_comparison_reasons(
+                        sybil, config,
+                    ),
+                },
+            ),
             fee_topology_diversity_index: sybil.fee_topology_diversity_index,
             min_fee_topology_diversity_index: config.min_fee_topology_diversity_index,
             dev_buyer_infrastructure_affinity: sybil.dev_buyer_infrastructure_affinity,
@@ -3450,7 +3469,9 @@ impl GatekeeperAssessment {
             shadow_fsc_v2_policy_signal: shadow_fsc_v2.policy_signal,
             shadow_fsc_v2_soft_points_if_enabled: shadow_fsc_v2.soft_points_if_enabled,
             shadow_fsc_v2_reason_if_enabled: shadow_fsc_v2.reason_if_enabled,
-            sybil_metric_degraded_reasons: sybil.degraded_reasons.clone(),
+            sybil_metric_degraded_reasons: super::gatekeeper_policy::sybil_comparison_reasons(
+                sybil, config,
+            ),
 
             // A/B Window – defaults; enriched by oracle_runtime before logging
             ab_window_ms: None,
@@ -5263,6 +5284,11 @@ impl GatekeeperBuffer {
     #[must_use]
     pub fn unique_tx_key_count(&self) -> usize {
         self.tx_keys_seen.len()
+    }
+
+    /// Istniejący limit pamięci dedup, również dla dowodów admission sesji.
+    pub(crate) const fn tx_key_capacity(&self) -> usize {
+        self.tx_keys_capacity
     }
 
     #[must_use]
@@ -9094,12 +9120,17 @@ mod tests {
 
     fn create_v2_mock_tx(timestamp_ms: u64, signature: &str) -> PoolTransaction {
         PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             pool_amm_id: "pool1".to_string(),
             slot: Some(100),
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -15023,6 +15054,7 @@ mod tests {
             dev_buyer_infrastructure_affinity: Some(0.19),
             spend_fraction_divergence: Some(0.27),
             demand_elasticity_score: Some(-0.25),
+            demand_elasticity_v2: None,
             signer_cross_pool_velocity: Some(0.44),
             cpv_other_pool_activity: Some(0.32),
             cpv_evidence: Default::default(),
@@ -15054,6 +15086,7 @@ mod tests {
             degraded_reasons: vec!["FTDI_INSUFFICIENT_BUYS".to_string()],
             buy_sample_count: 5,
             signer_sample_count: 5,
+            ..Default::default()
         };
         feature_snapshot.temporal_deltas = ghost_core::checkpoint::TemporalDeltaFeatures {
             delta_mcap_1s_to_2s: Some(0.5),

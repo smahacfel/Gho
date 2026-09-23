@@ -1,6 +1,6 @@
 use ghost_core::checkpoint::{EvidenceStatus, MaterializedEvidenceStatus};
 use ghost_core::metric_contracts::*;
-use ghost_core::tx_intelligence::types::FscEvidenceStatus;
+use ghost_core::tx_intelligence::types::{FscEvidenceStatus, FtdiDefinitionV2, FtdiEvidenceV2};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -326,6 +326,7 @@ fn pr2a_evidence() -> (
     let mut legacy_actionability_envelope = measured(MetricSurfaceId::FtdiLegacyBuyTxActionability);
     legacy_actionability_envelope.policy_actionable = true;
     let ftdi = FtdiEvidenceV1 {
+        gini_simpson_v2: None,
         legacy_value: ftdi_measurement(MetricSurfaceId::TxIntelFeeTopologyDiversityLegacy),
         value_v1: ftdi_measurement(MetricSurfaceId::FtdiValueEvidenceV1),
         legacy_actionability_envelope,
@@ -1501,4 +1502,124 @@ fn projection_contains_no_owner_or_event_heavy_audit_collections() {
             "forbidden projection detail: {forbidden}"
         );
     }
+}
+
+fn m6_projection_with_ftdi_histogram(
+    unique_topologies: u32,
+    hhi: f64,
+) -> MetricContractDecisionEvidenceProjectionV1 {
+    let mut projection = complete_projection();
+    let ftdi = &mut projection.fee_topology_diversity_index;
+    ftdi.legacy_value.value = CanonicalNullableV1::Value(unique_topologies as f64 / 5.0);
+    ftdi.value_v1.value = CanonicalNullableV1::Value(unique_topologies as f64 / 5.0);
+    ftdi.unique_topology_count = unique_topologies;
+    ftdi.unique_buyer_sample_count = 5;
+    ftdi.buy_transaction_sample_count = 5;
+    ftdi.legacy_buy_tx_actionability.value = CanonicalNullableV1::Value(true);
+    ftdi.unique_buyer_actionability_v2.value = CanonicalNullableV1::Value(true);
+    ftdi.gini_simpson_v2 = Some(FtdiEvidenceV2 {
+        definition: FtdiDefinitionV2::GiniSimpson,
+        fee_topology_diversity_index: Some(1.0 - hhi),
+        coordination_hhi: Some(hhi),
+        unique_topology_count: u64::from(unique_topologies),
+        buy_sample_count: 5,
+        signer_sample_count: 5,
+        represented_signer_count: 5,
+        degraded_reasons: Vec::new(),
+    });
+    projection
+}
+
+#[test]
+fn m6_projection_and_wire_reject_cross_view_ftdi_topology_drift() {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config();
+    let context = projection_context(&profile, &config);
+
+    let consistent = m6_projection_with_ftdi_histogram(2, 17.0 / 25.0);
+    consistent.validate_context(&context).unwrap();
+    consistent.validated_canonical_hash(&context).unwrap();
+    let control_wire =
+        MetricContractDecisionProjectionWireV1::try_from_domain(&consistent).unwrap();
+    assert_eq!(control_wire.try_into_domain().unwrap(), consistent);
+
+    let mut contradictory = consistent;
+    let v2 = contradictory
+        .fee_topology_diversity_index
+        .gini_simpson_v2
+        .as_mut()
+        .unwrap();
+    v2.unique_topology_count = 3;
+    v2.coordination_hhi = Some(11.0 / 25.0);
+    v2.fee_topology_diversity_index = Some(14.0 / 25.0);
+    assert!(v2.has_full_quality());
+
+    let wire = MetricContractDecisionProjectionWireV1::try_from_domain(&contradictory).unwrap();
+    let restored = wire.try_into_domain().unwrap();
+    assert!(matches!(
+        restored.validate_context(&context),
+        Err(MetricContractProjectionErrorV1::FamilyInvariant(
+            "FTDI V2 unique-topology parity"
+        ))
+    ));
+    assert!(restored.validated_canonical_hash(&context).is_err());
+}
+
+#[test]
+fn m6_projection_accepts_consistent_degraded_v2_without_reinterpreting_it() {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config();
+    let context = projection_context(&profile, &config);
+    let mut projection = m6_projection_with_ftdi_histogram(2, 17.0 / 25.0);
+    projection
+        .fee_topology_diversity_index
+        .gini_simpson_v2
+        .as_mut()
+        .unwrap()
+        .degraded_reasons
+        .push("FTDI_INPUT_STATUS_UNAVAILABLE".into());
+    projection.validate_context(&context).unwrap();
+}
+
+#[test]
+fn m6_projection_accepts_unavailable_historical_view_with_low_sample_v2() {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config();
+    let context = projection_context(&profile, &config);
+    let mut projection = complete_projection();
+    {
+        let ftdi = &mut projection.fee_topology_diversity_index;
+        ftdi.legacy_value.value = CanonicalNullableV1::Null;
+        ftdi.legacy_value.envelope.availability = MetricAvailabilityV1::Unavailable;
+        ftdi.legacy_value.envelope.measurement_quality = MetricMeasurementQualityV1::NotApplicable;
+        ftdi.legacy_value.envelope.policy_actionable = false;
+        ftdi.value_v1.value = CanonicalNullableV1::Null;
+        ftdi.value_v1.envelope.availability = MetricAvailabilityV1::Unavailable;
+        ftdi.value_v1.envelope.measurement_quality = MetricMeasurementQualityV1::NotApplicable;
+        ftdi.value_v1.envelope.policy_actionable = false;
+        ftdi.unique_topology_count = 0;
+        ftdi.unique_buyer_sample_count = 1;
+        ftdi.buy_transaction_sample_count = 1;
+        ftdi.legacy_buy_tx_actionability.value = CanonicalNullableV1::Value(false);
+        ftdi.legacy_buy_tx_actionability.envelope.policy_actionable = false;
+        ftdi.unique_buyer_actionability_v2.value = CanonicalNullableV1::Value(false);
+        ftdi.gini_simpson_v2 = Some(FtdiEvidenceV2 {
+            definition: FtdiDefinitionV2::GiniSimpson,
+            fee_topology_diversity_index: Some(0.0),
+            coordination_hhi: Some(1.0),
+            unique_topology_count: 1,
+            buy_sample_count: 1,
+            signer_sample_count: 1,
+            represented_signer_count: 1,
+            degraded_reasons: vec!["FTDI_INSUFFICIENT_BUYS".into()],
+        });
+    }
+
+    projection.validate_context(&context).unwrap();
+    assert!(!projection
+        .fee_topology_diversity_index
+        .gini_simpson_v2
+        .as_ref()
+        .unwrap()
+        .has_full_quality());
 }
