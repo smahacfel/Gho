@@ -579,6 +579,10 @@ mod tests {
         let registry = Registry::new();
         register_oracle_metrics(&registry).expect("register oracle metrics");
 
+        let cpv_evictions_before = CPV_INDEX_EVICTIONS_TOTAL.get();
+        let cpv_hits_before = CPV_LOOKUP_HITS_TOTAL.get();
+        let cpv_misses_before = CPV_LOOKUP_MISSES_TOTAL.get();
+
         record_eventbus_active_receivers(4);
         record_eventbus_lag("oracle_runtime", 3);
         record_cpv_index_entries(7);
@@ -652,9 +656,18 @@ mod tests {
             "expected eventbus_lag_total counter to be incremented"
         );
         assert_eq!(CPV_INDEX_ENTRIES.get(), 7);
-        assert_eq!(CPV_INDEX_EVICTIONS_TOTAL.get(), 2);
-        assert_eq!(CPV_LOOKUP_HITS_TOTAL.get(), 4);
-        assert_eq!(CPV_LOOKUP_MISSES_TOTAL.get(), 1);
+        assert_eq!(
+            CPV_INDEX_EVICTIONS_TOTAL.get(),
+            cpv_evictions_before.saturating_add(2)
+        );
+        assert_eq!(
+            CPV_LOOKUP_HITS_TOTAL.get(),
+            cpv_hits_before.saturating_add(4)
+        );
+        assert_eq!(
+            CPV_LOOKUP_MISSES_TOTAL.get(),
+            cpv_misses_before.saturating_add(1)
+        );
         assert_eq!(FSC_INDEX_ENTRIES.get(), 5);
         assert_eq!(FSC_INDEX_PER_RECIPIENT_OVERFLOWS_TOTAL.get(), 3);
         assert_eq!(FSC_INDEX_GLOBAL_EVICTIONS_TOTAL.get(), 2);

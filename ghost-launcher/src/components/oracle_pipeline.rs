@@ -1167,12 +1167,17 @@ mod tests {
     ) -> PoolTransaction {
         use crate::events::RawBytesMissingReason;
         PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             pool_amm_id: "test_pool".to_string(),
             slot: None,
             event_ordinal: None,
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,

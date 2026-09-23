@@ -2766,12 +2766,17 @@ mod tests {
 
     fn buy(slot: u64, index: u32, signer: &str, amount: f64) -> PoolTransaction {
         PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: EventSemanticEnvelope::default(),
             pool_amm_id: "pool".to_string(),
             slot: Some(slot),
             event_ordinal: Some(0),
             tx_index: Some(index),
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,

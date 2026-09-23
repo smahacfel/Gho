@@ -3,7 +3,9 @@ use ghost_core::checkpoint::{
     MetricEvidenceQuality,
 };
 use ghost_core::metric_contracts::*;
-use ghost_core::tx_intelligence::types::{FscEvidenceStatus, FscExcludedReason};
+use ghost_core::tx_intelligence::types::{
+    FscEvidenceStatus, FscExcludedReason, FtdiDefinitionV2, FtdiEvidenceV2,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeSet, HashSet};
@@ -182,6 +184,7 @@ fn complete_contract_evidence() -> MetricContractsEvidenceSetV1 {
 
     MetricContractsEvidenceSetV1 {
         fee_topology_diversity_index: FtdiEvidenceV1 {
+            gini_simpson_v2: None,
             legacy_value: FtdiValueMeasurementV1 {
                 envelope: measured_surface_envelope(
                     MetricSurfaceId::TxIntelFeeTopologyDiversityLegacy,
@@ -1418,4 +1421,143 @@ fn manipulation_presence_distinguishes_absent_from_measured_zero() {
     let decoded: ManipulationNumericEvidenceV2 = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded.fields[0].value, CanonicalNullableV1::Null);
     assert_eq!(decoded.fields[1].value, CanonicalNullableV1::Value(0.0));
+}
+
+fn m6_set_ftdi_histogram(
+    evidence: &mut MetricContractsEvidenceSetV1,
+    unique_topologies: u32,
+    hhi: f64,
+) {
+    let ftdi = &mut evidence.fee_topology_diversity_index;
+    for historical in [&mut ftdi.legacy_value, &mut ftdi.value_v1] {
+        historical.value = CanonicalNullableV1::Value(unique_topologies as f64 / 5.0);
+        historical.unique_topology_count = unique_topologies;
+        historical.unique_buyer_sample_count = 5;
+        historical.buy_transaction_sample_count = 5;
+    }
+    ftdi.coordination_hhi = CanonicalNullableV1::Value(hhi);
+    ftdi.gini_simpson_v2 = Some(FtdiEvidenceV2 {
+        definition: FtdiDefinitionV2::GiniSimpson,
+        fee_topology_diversity_index: Some(1.0 - hhi),
+        coordination_hhi: Some(hhi),
+        unique_topology_count: u64::from(unique_topologies),
+        buy_sample_count: 5,
+        signer_sample_count: 5,
+        represented_signer_count: 5,
+        degraded_reasons: Vec::new(),
+    });
+}
+
+#[test]
+fn m6_full_evidence_rejects_ftdi_cross_view_topology_and_hhi_drift() {
+    let mut topology_drift = complete_contract_evidence();
+    m6_set_ftdi_histogram(&mut topology_drift, 1, 1.0);
+    topology_drift.validate_semantics().unwrap();
+    let v2 = topology_drift
+        .fee_topology_diversity_index
+        .gini_simpson_v2
+        .as_mut()
+        .unwrap();
+    v2.unique_topology_count = 2;
+    v2.coordination_hhi = Some(13.0 / 25.0);
+    v2.fee_topology_diversity_index = Some(12.0 / 25.0);
+    assert!(v2.has_full_quality());
+    assert!(matches!(
+        topology_drift.validate_semantics(),
+        Err(MetricContractEvidenceSemanticErrorV1::CountInvariant(
+            "ftdi_v2.unique_topology_parity"
+        ))
+    ));
+}
+
+#[test]
+fn m6_full_evidence_rejects_ftdi_cross_view_hhi_drift_with_same_k() {
+    let mut evidence = complete_contract_evidence();
+    m6_set_ftdi_histogram(&mut evidence, 2, 17.0 / 25.0);
+    evidence.validate_semantics().unwrap();
+    let v2 = evidence
+        .fee_topology_diversity_index
+        .gini_simpson_v2
+        .as_mut()
+        .unwrap();
+    v2.coordination_hhi = Some(13.0 / 25.0);
+    v2.fee_topology_diversity_index = Some(12.0 / 25.0);
+    assert!(v2.has_full_quality());
+    assert!(matches!(
+        evidence.validate_semantics(),
+        Err(MetricContractEvidenceSemanticErrorV1::DerivedRatioMismatch(
+            "ftdi_v2.coordination_hhi_parity"
+        ))
+    ));
+}
+
+#[test]
+fn m6_full_evidence_preserves_ftdi_empty_partial_and_low_sample_semantics() {
+    let mut empty = complete_contract_evidence();
+    let ftdi = &mut empty.fee_topology_diversity_index;
+    for historical in [&mut ftdi.legacy_value, &mut ftdi.value_v1] {
+        historical.value = CanonicalNullableV1::Null;
+        historical.unique_topology_count = 0;
+        historical.unique_buyer_sample_count = 0;
+        historical.buy_transaction_sample_count = 0;
+    }
+    ftdi.coordination_hhi = CanonicalNullableV1::Null;
+    ftdi.gini_simpson_v2 = Some(FtdiEvidenceV2 {
+        definition: FtdiDefinitionV2::GiniSimpson,
+        fee_topology_diversity_index: None,
+        coordination_hhi: None,
+        unique_topology_count: 0,
+        buy_sample_count: 0,
+        signer_sample_count: 0,
+        represented_signer_count: 0,
+        degraded_reasons: vec!["FTDI_INSUFFICIENT_BUYS".into()],
+    });
+    empty.validate_semantics().unwrap();
+}
+
+#[test]
+fn m6_full_evidence_preserves_consistent_partial_and_low_sample_v2() {
+    let mut partial = complete_contract_evidence();
+    m6_set_ftdi_histogram(&mut partial, 2, 17.0 / 25.0);
+    partial
+        .fee_topology_diversity_index
+        .gini_simpson_v2
+        .as_mut()
+        .unwrap()
+        .degraded_reasons
+        .push("FTDI_INPUT_STATUS_UNAVAILABLE".into());
+    partial.validate_semantics().unwrap();
+    assert!(!partial
+        .fee_topology_diversity_index
+        .gini_simpson_v2
+        .as_ref()
+        .unwrap()
+        .has_full_quality());
+
+    let mut low = complete_contract_evidence();
+    let ftdi = &mut low.fee_topology_diversity_index;
+    for historical in [&mut ftdi.legacy_value, &mut ftdi.value_v1] {
+        historical.value = CanonicalNullableV1::Null;
+        historical.unique_topology_count = 0;
+        historical.unique_buyer_sample_count = 1;
+        historical.buy_transaction_sample_count = 1;
+    }
+    ftdi.coordination_hhi = CanonicalNullableV1::Null;
+    ftdi.gini_simpson_v2 = Some(FtdiEvidenceV2 {
+        definition: FtdiDefinitionV2::GiniSimpson,
+        fee_topology_diversity_index: Some(0.0),
+        coordination_hhi: Some(1.0),
+        unique_topology_count: 1,
+        buy_sample_count: 1,
+        signer_sample_count: 1,
+        represented_signer_count: 1,
+        degraded_reasons: vec!["FTDI_INSUFFICIENT_BUYS".into()],
+    });
+    low.validate_semantics().unwrap();
+    assert!(!low
+        .fee_topology_diversity_index
+        .gini_simpson_v2
+        .as_ref()
+        .unwrap()
+        .has_full_quality());
 }

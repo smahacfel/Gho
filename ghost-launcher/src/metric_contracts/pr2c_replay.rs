@@ -5,6 +5,7 @@ use ghost_core::metric_contracts::{
     MetricContractProfileV1, MetricContractProjectionErrorV1, MetricContractProjectionWireErrorV1,
     MetricContractProjectionWireV1SchemaManifest, MetricDecisionProjectionBuildContextV1,
     ResolvedMetricContractEffectiveConfigV1, METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1,
+    METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V2,
     METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1,
     METRIC_CONTRACT_PROJECTION_WIRE_V1_SCHEMA_MANIFEST_BLAKE3,
 };
@@ -132,8 +133,11 @@ pub fn replay_metric_contract_record_v2(
         return Err(Pr2cReplayErrorV2::ProjectionHashMismatch);
     }
     let wire = MetricContractDecisionProjectionWireV1::try_from_domain(&rebuilt_projection)?;
-    if wire.w != METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1
-        || wire.clone().try_into_domain()? != rebuilt_projection
+    if !matches!(
+        wire.w,
+        METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V1
+            | METRIC_CONTRACT_DECISION_PROJECTION_WIRE_VERSION_V2
+    ) || wire.clone().try_into_domain()? != rebuilt_projection
     {
         return Err(Pr2cReplayErrorV2::ProjectionFullEvidenceMismatch);
     }

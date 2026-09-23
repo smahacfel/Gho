@@ -4,9 +4,10 @@ use crate::components::gatekeeper::{
     GatekeeperBuffer, GatekeeperIngressOutcome, PUMP_TOKEN_TOTAL_SUPPLY,
 };
 use crate::events::PoolTransaction;
+use crate::tx_intelligence::sybil_metrics::{same_sybil_view, sybil_event_key, SybilEventKey};
 use crate::tx_intelligence::{
-    compute_sybil_resistance_with_ftdi, compute_velocity_profile, CrossPoolVelocityConfig,
-    CrossPoolVelocityIndex, FundingSourceConfig, FundingSourceIndex,
+    compute_sybil_resistance_with_ftdi_at_cutoff, compute_velocity_profile, CpvQueryWindow,
+    CrossPoolVelocityConfig, CrossPoolVelocityIndex, FundingSourceConfig, FundingSourceIndex,
     FundingSourceProducerConfigSnapshotV1, TxIntelligenceConfig, TxIntelligenceEngine,
     TxTimingProducerSnapshotV1,
 };
@@ -50,6 +51,8 @@ pub(crate) const RCE_RECENT_WINDOW_MS_V1: u64 = 10_000;
 
 #[derive(Debug, Error)]
 pub enum MetricContractMaterializationErrorV1 {
+    #[error("session transaction admission capacity exhausted (limit: {capacity})")]
+    AdmissionCapacityExhausted { capacity: usize },
     #[error("metric-contract materialization context is unavailable: {0}")]
     MissingContext(&'static str),
     #[error(transparent)]
@@ -115,10 +118,29 @@ struct DecisionSeriesAccountPriceObservation {
     price_sol: f64,
 }
 
+/// Dowód admission, niezależny od retencji próbek i zegara redostawy.
+/// Legacy jest wyłącznie dotychczasowym fallbackiem, gdy brak stabilnej tożsamości.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SessionTransactionKey {
+    Stable(ghost_core::metric_contracts::StableEventIdentityV1, u32),
+    Legacy(TxKey),
+}
+
+impl SessionTransactionKey {
+    fn for_transaction(tx: &PoolTransaction) -> Option<Self> {
+        if let Some((identity, ordinal)) = sybil_event_key(tx) {
+            Some(Self::Stable(identity, ordinal))
+        } else {
+            GatekeeperBuffer::tx_key_for(tx).map(Self::Legacy)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionTransactionAdmission {
     Accepted,
     Duplicate { event_ts_ms: u64 },
+    CapacityExhausted,
     Unkeyable,
     Terminal,
 }
@@ -150,7 +172,14 @@ pub struct PoolObservationSession {
     pub deadline_wall_ms: u64,
     pub status: SessionStatus,
     pub tx_buffer: VecDeque<Arc<PoolTransaction>>,
-    pub tx_keys_seen: HashSet<TxKey>,
+    /// Zachowane do końca sesji, bez usuwania przy eksmisji z tx_buffer.
+    /// Limit dowodów pokrywa oba istniejące limity: dedup Gatekeepera i próbek.
+    pub tx_keys_seen: HashSet<SessionTransactionKey>,
+    admission_capacity_exhausted: bool,
+    // Raw widoki metryk: indeks tylko zdarzeń zachowanych w tx_buffer.
+    sybil_event_index: HashMap<SybilEventKey, Arc<PoolTransaction>>,
+    sybil_redelivery_views: VecDeque<Arc<PoolTransaction>>,
+    sybil_view_losses: HashMap<SybilEventKey, u64>,
     pub highest_seen_ts_ms: u64,
     pub account_state_core: Arc<AccountStateReducer>,
     pub account_features: AccountStateFeatures,
@@ -159,6 +188,9 @@ pub struct PoolObservationSession {
     pub tx_intel_features: TxIntelFeatures,
     pub cross_pool_velocity_index: Arc<CrossPoolVelocityIndex>,
     pub cross_pool_velocity_config: CrossPoolVelocityConfig,
+    /// Zamrożone snapshoty historycznych anchorów 1s/2s/3s.
+    /// Każdy wynik zachowuje swój cutoff; odczyt nie naprawia go późnymi danymi.
+    cpv_temporal_snapshots: Mutex<[Option<(u64, Option<f64>)>; 3]>,
     pub funding_source_index: Arc<FundingSourceIndex>,
     pub funding_source_config: FundingSourceConfig,
     metric_contract_effective_config: Option<Arc<ResolvedMetricContractEffectiveConfigV1>>,
@@ -272,6 +304,10 @@ impl PoolObservationSession {
             status: SessionStatus::Created,
             tx_buffer: VecDeque::with_capacity(decision_time_series_tx_capacity),
             tx_keys_seen: HashSet::new(),
+            admission_capacity_exhausted: false,
+            sybil_event_index: HashMap::new(),
+            sybil_redelivery_views: VecDeque::new(),
+            sybil_view_losses: HashMap::new(),
             highest_seen_ts_ms: 0,
             account_state_core,
             account_features: AccountStateFeatures::default(),
@@ -282,6 +318,7 @@ impl PoolObservationSession {
             cross_pool_velocity_config: CrossPoolVelocityConfig::from_gatekeeper_config(
                 gatekeeper_config,
             ),
+            cpv_temporal_snapshots: Mutex::new([None, None, None]),
             funding_source_index: Arc::new(FundingSourceIndex::new()),
             funding_source_config: default_funding_source_config,
             metric_contract_effective_config: local_metric_contract_context
@@ -317,9 +354,87 @@ impl PoolObservationSession {
                     self.max_evicted_decision_tx_event_ts_ms
                         .map_or(evicted_ts_ms, |previous| previous.max(evicted_ts_ms)),
                 );
+                if let Some(key) = sybil_event_key(evicted.as_ref()) {
+                    self.sybil_event_index.remove(&key);
+                    self.sybil_view_losses.remove(&key);
+                    self.sybil_redelivery_views
+                        .retain(|v| sybil_event_key(v).as_ref() != Some(&key));
+                }
             }
         }
+        if let Some(key) = sybil_event_key(&tx) {
+            self.sybil_event_index.insert(key, tx.clone());
+        }
         self.tx_buffer.push_back(tx);
+    }
+
+    fn retain_sybil_redelivery(&mut self, tx: Arc<PoolTransaction>) {
+        let Some(key) = sybil_event_key(&tx) else {
+            return;
+        };
+        let Some(original) = self.sybil_event_index.get(&key) else {
+            return;
+        };
+        let received = tx.event_time.ingress_wall_ts_ms;
+        let redundant = |old: &PoolTransaction| {
+            same_sybil_view(old, &tx)
+                && match (old.event_time.ingress_wall_ts_ms, received) {
+                    (Some(a), Some(b)) => a <= b,
+                    (None, None) => true,
+                    _ => false,
+                }
+        };
+        if redundant(original)
+            || self
+                .sybil_redelivery_views
+                .iter()
+                .filter(|v| sybil_event_key(v).as_ref() == Some(&key))
+                .any(|v| redundant(v))
+        {
+            return;
+        }
+        while self.sybil_redelivery_views.len() >= self.decision_time_series_tx_capacity {
+            if let Some(dropped) = self.sybil_redelivery_views.pop_front() {
+                if let Some(lost_key) = sybil_event_key(&dropped) {
+                    let at = dropped.event_time.ingress_wall_ts_ms.unwrap_or(0);
+                    self.sybil_view_losses
+                        .entry(lost_key)
+                        .and_modify(|old| *old = (*old).min(at))
+                        .or_insert(at);
+                }
+            }
+        }
+        self.sybil_redelivery_views.push_back(tx);
+    }
+
+    fn sybil_transaction_views(&self) -> impl Iterator<Item = &PoolTransaction> {
+        self.tx_buffer
+            .iter()
+            .chain(self.sybil_redelivery_views.iter())
+            .map(AsRef::as_ref)
+    }
+
+    fn materialize_sybil_at_cutoff(
+        &self,
+        cutoff: u64,
+    ) -> crate::tx_intelligence::SybilResistanceComputationV1 {
+        let sybil_dev_wallet = self.dev_wallet.map(|value| value.to_string());
+        let mut sybil_computation = compute_sybil_resistance_with_ftdi_at_cutoff(
+            self.sybil_transaction_views(),
+            sybil_dev_wallet.as_deref(),
+            cutoff,
+        );
+        if self.sybil_view_losses.values().any(|at| *at <= cutoff) {
+            sybil_computation.mark_view_history_unavailable();
+        }
+        sybil_computation
+    }
+
+    fn transaction_admission_capacity(&self) -> usize {
+        // Dowody nie mogą mieć krótszego zakresu niż zachowane próbki. Mała
+        // retencja próbki nie obniża istniejącego limitu dedup Gatekeepera.
+        self.decision_time_series_tx_capacity
+            .max(self.gatekeeper_buffer.tx_key_capacity())
     }
 
     /// Canonical session-local admission boundary for decision-plane transaction evidence.
@@ -335,23 +450,40 @@ impl PoolObservationSession {
             return SessionTransactionAdmission::Terminal;
         }
 
-        // Admission intentionally inherits the existing TxKey contract: normalized event time is
-        // part of equality/order. Therefore the same signature and ordinal with a different
-        // normalized timestamp remains a distinct event unless that global TxKey contract is
-        // changed in a separate migration.
-        let Some(tx_key) = GatekeeperBuffer::tx_key_for(tx) else {
-            // Preserve the existing fallback behavior for an event that cannot be keyed. The
-            // downstream reducers retain their own defensive validation for this degraded case.
+        // Zbiór admission nie jest indeksem próbek: wpis nie znika przy eksmisji.
+        let key = SessionTransactionKey::for_transaction(tx);
+        if key
+            .as_ref()
+            .is_some_and(|key| self.tx_keys_seen.contains(key))
+        {
+            return SessionTransactionAdmission::Duplicate {
+                event_ts_ms: tx.effective_event_ts_ms().unwrap_or(tx.timestamp_ms),
+            };
+        }
+        // Nie wolno eksmitować dowodu i później uznać redostawy za nowe zdarzenie.
+        // Po osiągnięciu twardego limitu zatrzymujemy nowe admission i ujawniamy
+        // utratę dalszego wejścia w fallible materialization. Duplikaty nadal są
+        // rozpoznawane; nie przedłużają retencji ani nie zużywają dodatkowych wpisów.
+        if self.tx_keys_seen.len() >= self.transaction_admission_capacity() {
+            if !self.admission_capacity_exhausted {
+                self.admission_capacity_exhausted = true;
+                self.diagnostics
+                    .reject_reasons
+                    .push("SESSION_ADMISSION_CAPACITY_EXHAUSTED".to_string());
+            }
+            return SessionTransactionAdmission::CapacityExhausted;
+        }
+        let Some(key) = key else {
+            // Zachowany dotychczasowy kontrakt zdarzeń bez klucza.
             return SessionTransactionAdmission::Unkeyable;
         };
-
-        if self.tx_keys_seen.insert(tx_key.clone()) {
-            SessionTransactionAdmission::Accepted
-        } else {
-            SessionTransactionAdmission::Duplicate {
-                event_ts_ms: tx_key.timestamp_ms,
-            }
+        // Zachowujemy istniejące kryterium keyability (w tym fallback zegara).
+        // Stabilna tożsamość nie legalizuje jawnie odrzuconego TxKey, np. z czasem 0.
+        if GatekeeperBuffer::tx_key_for(tx).is_none() {
+            return SessionTransactionAdmission::Unkeyable;
         }
+        self.tx_keys_seen.insert(key);
+        SessionTransactionAdmission::Accepted
     }
 
     fn duplicate_ingress_outcome(&mut self, event_ts_ms: u64) -> GatekeeperIngressOutcome {
@@ -386,14 +518,8 @@ impl PoolObservationSession {
         let accepted_unique = self.gatekeeper_buffer.total_tx_count() > prior_total_tx_count;
 
         if accepted_unique {
-            let pool_id = self.pool_amm_id.to_string();
-            self.cross_pool_velocity_index.observe_transaction(
-                pool_id.as_str(),
-                tx.as_ref(),
-                &self.cross_pool_velocity_config,
-            );
-            if let Some(tx_key) = GatekeeperBuffer::tx_key_for(tx.as_ref()) {
-                self.tx_keys_seen.insert(tx_key);
+            if let Some(key) = SessionTransactionKey::for_transaction(tx.as_ref()) {
+                self.tx_keys_seen.insert(key);
             }
             self.retain_decision_series_tx(tx);
             self.diagnostics.total_tx_seen = self.diagnostics.total_tx_seen.saturating_add(1);
@@ -430,9 +556,16 @@ impl PoolObservationSession {
             SessionTransactionAdmission::Accepted => false,
             SessionTransactionAdmission::Unkeyable => true,
             SessionTransactionAdmission::Duplicate { event_ts_ms } => {
+                self.retain_sybil_redelivery(tx.clone());
                 return PoolTransactionIngestResultV1 {
                     ingress: self.duplicate_ingress_outcome(event_ts_ms),
                     apply: CanonicalMutationApplyOutcomeV1::Duplicate,
+                };
+            }
+            SessionTransactionAdmission::CapacityExhausted => {
+                return PoolTransactionIngestResultV1 {
+                    ingress: GatekeeperIngressOutcome::TriggerEvaluation,
+                    apply: CanonicalMutationApplyOutcomeV1::Failed,
                 };
             }
             SessionTransactionAdmission::Terminal => {
@@ -453,14 +586,6 @@ impl PoolObservationSession {
         let accepted_unique = self.gatekeeper_buffer.total_tx_count() > prior_total_tx_count;
 
         if accepted_unique {
-            let pool_id = self.pool_amm_id.to_string();
-            if tx.success {
-                self.cross_pool_velocity_index.observe_transaction(
-                    pool_id.as_str(),
-                    tx.as_ref(),
-                    &self.cross_pool_velocity_config,
-                );
-            }
             self.retain_decision_series_tx(tx);
             self.diagnostics.total_tx_seen = self.diagnostics.total_tx_seen.saturating_add(1);
             if matches!(self.status, SessionStatus::Created) {
@@ -918,69 +1043,57 @@ impl PoolObservationSession {
             evidence_unavailable(vec![EvidenceUnavailableReason::CurveDataMissing])
         };
 
-        let sybil_metric_available = materialized
-            .sybil_resistance
-            .fee_topology_diversity_index
-            .is_some()
-            || materialized
-                .sybil_resistance
-                .dev_buyer_infrastructure_affinity
-                .is_some()
-            || materialized
-                .sybil_resistance
-                .spend_fraction_divergence
-                .is_some()
-            || materialized
-                .sybil_resistance
-                .demand_elasticity_score
-                .is_some()
-            || materialized
-                .sybil_resistance
-                .signer_cross_pool_velocity
-                .is_some()
-            || materialized
-                .sybil_resistance
-                .cpv_other_pool_activity
-                .is_some()
-            || materialized
-                .sybil_resistance
-                .funding_source_concentration
-                .is_some();
+        let measurements = &materialized.sybil_resistance;
+        let ftdi_present = measurements.fee_topology_diversity_v2.as_ref().map_or(
+            measurements.fee_topology_diversity_index.is_some(),
+            |value| value.fee_topology_diversity_index.is_some(),
+        );
+        let des_present = measurements
+            .demand_elasticity_v2
+            .as_ref()
+            .map_or(measurements.demand_elasticity_score.is_some(), |value| {
+                value.demand_elasticity_score.is_some()
+            });
+        let sybil_metric_available = ftdi_present
+            || des_present
+            || measurements.dev_buyer_infrastructure_affinity.is_some()
+            || measurements.spend_fraction_divergence.is_some()
+            || measurements.signer_cross_pool_velocity.is_some()
+            || measurements.cpv_other_pool_activity.is_some()
+            || measurements.funding_source_concentration.is_some();
+        // Jakość pomiaru nie zależy od obecności progu dla nowej definicji.
+        // Zbiorcza diagnostyka nie zastępuje indywidualnych bramek policy.
         let sybil_available_metrics = [
-            materialized
-                .sybil_resistance
-                .fee_topology_diversity_index
-                .is_some(),
-            materialized
-                .sybil_resistance
-                .dev_buyer_infrastructure_affinity
-                .is_some(),
-            materialized
-                .sybil_resistance
-                .spend_fraction_divergence
-                .is_some(),
-            materialized
-                .sybil_resistance
-                .demand_elasticity_score
-                .is_some(),
-            materialized
-                .sybil_resistance
-                .signer_cross_pool_velocity
-                .is_some(),
-            materialized
-                .sybil_resistance
-                .cpv_other_pool_activity
-                .is_some(),
-            materialized
-                .sybil_resistance
-                .funding_source_concentration
-                .is_some(),
+            measurements
+                .fee_topology_diversity_v2
+                .as_ref()
+                .map_or(ftdi_present, |v| v.has_full_quality()),
+            measurements.dbia_evidence_v1.as_ref().map_or(
+                measurements.dev_buyer_infrastructure_affinity.is_some(),
+                |v| v.has_full_quality(),
+            ),
+            measurements
+                .sfd_evidence_v1
+                .as_ref()
+                .map_or(measurements.spend_fraction_divergence.is_some(), |v| {
+                    v.has_full_quality()
+                }),
+            measurements
+                .demand_elasticity_v2
+                .as_ref()
+                .map_or(des_present, |v| v.has_full_quality()),
+            measurements.signer_cross_pool_velocity.is_some(),
+            measurements.cpv_other_pool_activity.is_some(),
+            measurements.funding_source_concentration.is_some(),
         ];
         let sybil_available_count = sybil_available_metrics
             .iter()
             .filter(|available| **available)
             .count();
-        let sybil = if !materialized.sybil_resistance.degraded_reasons.is_empty() {
+        let sybil = if measurements.degraded_reasons.iter().any(|reason| {
+            reason != ghost_core::tx_intelligence::types::DES_COMPARISON_DEFINITION_MISMATCH_REASON
+                && reason != ghost_core::tx_intelligence::types::FTDI_COMPARISON_DEFINITION_MISMATCH_REASON
+        }) {
             evidence_degraded(vec![EvidenceDegradedReason::SybilEvidencePartial])
         } else if sybil_available_count > 0 && sybil_available_count < sybil_available_metrics.len()
         {
@@ -1202,8 +1315,20 @@ impl PoolObservationSession {
                 configured_window_ms,
             );
             let cutoff_ts_ms = first_event_ts_ms.saturating_add(anchor_ms);
-            let raw_values =
+            let mut raw_values =
                 self.temporal_anchor_raw_values(&sorted_txs, cutoff_ts_ms, anchor_ms, first_price);
+            if reached_by != TemporalAnchorReachedBy::NotReached {
+                let mut saved = self.cpv_temporal_snapshots.lock();
+                let index = (anchor_ms / 1_000 - 1) as usize;
+                raw_values.signer_cross_pool_velocity = match saved[index] {
+                    Some((saved_anchor, value)) if saved_anchor == cutoff_ts_ms => value,
+                    Some(_) => None, // zmieniony początek osi nie podmienia zapisanego anchora
+                    None => {
+                        saved[index] = Some((cutoff_ts_ms, raw_values.signer_cross_pool_velocity));
+                        raw_values.signer_cross_pool_velocity
+                    }
+                };
+            }
             let anchor = self.build_temporal_anchor(
                 anchor_ms,
                 reached_by,
@@ -1960,10 +2085,19 @@ impl PoolObservationSession {
         anchor_ts_ms: u64,
     ) -> Option<f64> {
         let pool_id = self.pool_amm_id.to_string();
-        let cpv = self.cross_pool_velocity_index.compute_for_transactions(
+        let start = anchor_txs
+            .iter()
+            .filter_map(|tx| tx.event_time.compat_event_ts_ms(None))
+            .min()
+            .unwrap_or(anchor_ts_ms);
+        let cpv = self.cross_pool_velocity_index.compute_for_transactions_at(
             pool_id.as_str(),
             anchor_txs.iter().copied(),
-            Some(anchor_ts_ms),
+            CpvQueryWindow {
+                signer_window_start_ms: start,
+                anchor_ms: anchor_ts_ms,
+                cutoff_received_ms: ::seer::types::ingress_epoch_ms(),
+            },
             &self.cross_pool_velocity_config,
         );
         (cpv.status == MetricEvidenceQuality::Clean)
@@ -2833,6 +2967,14 @@ impl PoolObservationSession {
     pub fn try_materialize_features(
         &self,
     ) -> Result<MaterializedFeatureSet, MetricContractMaterializationErrorV1> {
+        if self.admission_capacity_exhausted {
+            return Err(
+                MetricContractMaterializationErrorV1::AdmissionCapacityExhausted {
+                    capacity: self.transaction_admission_capacity(),
+                },
+            );
+        }
+        let sybil_cutoff_ingress_wall_ms = ::seer::types::ingress_epoch_ms();
         let account_features = self.current_account_features();
         let mut materialized = self.feature_builder.materialize(
             account_features.clone(),
@@ -2918,16 +3060,7 @@ impl PoolObservationSession {
             };
         }
 
-        let sybil_dev_wallet = self.dev_wallet.map(|value| value.to_string()).or_else(|| {
-            self.tx_buffer
-                .iter()
-                .find(|tx| tx.is_buy && tx.success && tx.is_dev_buy)
-                .map(|tx| tx.signer.clone())
-        });
-        let sybil_computation = compute_sybil_resistance_with_ftdi(
-            self.tx_buffer.iter().map(AsRef::as_ref),
-            sybil_dev_wallet.as_deref(),
-        );
+        let sybil_computation = self.materialize_sybil_at_cutoff(sybil_cutoff_ingress_wall_ms);
         let sybil = &sybil_computation.features;
         materialized.sybil_resistance.fee_topology_diversity_index =
             sybil.fee_topology_diversity_index;
@@ -2936,27 +3069,45 @@ impl PoolObservationSession {
             .dev_buyer_infrastructure_affinity = sybil.dev_buyer_infrastructure_affinity;
         materialized.sybil_resistance.spend_fraction_divergence = sybil.spend_fraction_divergence;
         materialized.sybil_resistance.demand_elasticity_score = sybil.demand_elasticity_score;
+        materialized.sybil_resistance.demand_elasticity_v2 = sybil.demand_elasticity_v2.clone();
+        materialized.sybil_resistance.fee_topology_diversity_v2 =
+            sybil.fee_topology_diversity_v2.clone();
+        materialized.sybil_resistance.dbia_evidence_v1 = sybil.dbia_evidence_v1.clone();
+        materialized.sybil_resistance.sfd_evidence_v1 = sybil.sfd_evidence_v1.clone();
+        materialized.sybil_resistance.measurement_cutoff_received_ms =
+            Some(sybil_cutoff_ingress_wall_ms);
         materialized.sybil_resistance.degraded_reasons = sybil.degraded_reasons.clone();
         materialized.sybil_resistance.buy_sample_count = sybil.buy_sample_count;
         materialized.sybil_resistance.signer_sample_count = sybil.signer_sample_count;
 
-        let cpv_anchor_ts_ms = self.highest_seen_ts_ms.max(
+        let pool_id = self.pool_amm_id.to_string();
+        let available_event_times: Vec<_> = self
+            .tx_buffer
+            .iter()
+            .filter(|tx| {
+                tx.event_time
+                    .ingress_wall_ts_ms
+                    .is_some_and(|t| t <= sybil_cutoff_ingress_wall_ms)
+            })
+            .filter_map(|tx| tx.event_time.compat_event_ts_ms(None))
+            .collect();
+        let cpv_window = CpvQueryWindow {
+            signer_window_start_ms: available_event_times.iter().copied().min().unwrap_or(0),
+            anchor_ms: available_event_times.iter().copied().max().unwrap_or(0),
+            cutoff_received_ms: sybil_cutoff_ingress_wall_ms,
+        };
+        // Bieżący MFS jest nową materializacją aktualnej wiedzy, a nie odczytem
+        // wcześniej zamrożonego punktu historycznego. Taki sam event-time zakres
+        // może mieć inną populację lub inny stan kompletności źródła przy nowszym
+        // cutoff, więc wynik musi być liczony z aktualnego wejścia. Zamrożenie
+        // dotyczy wyłącznie historycznych anchorów 1s/2s/3s powyżej.
+        let cpv = self.cross_pool_velocity_index.compute_for_transactions_at(
+            &pool_id,
             self.tx_buffer
                 .iter()
-                .filter(|tx| tx.is_buy && tx.success)
-                .map(|tx| {
-                    tx.event_time
-                        .compat_event_ts_ms(Some(tx.timestamp_ms))
-                        .unwrap_or(tx.timestamp_ms)
-                })
-                .max()
-                .unwrap_or_default(),
-        );
-        let pool_id = self.pool_amm_id.to_string();
-        let cpv = self.cross_pool_velocity_index.compute_for_transactions(
-            pool_id.as_str(),
-            self.tx_buffer.iter().map(AsRef::as_ref),
-            Some(cpv_anchor_ts_ms),
+                .chain(self.sybil_redelivery_views.iter())
+                .map(AsRef::as_ref),
+            cpv_window,
             &self.cross_pool_velocity_config,
         );
         let cpv_can_emit_value = match cpv.status {
@@ -3517,5 +3668,199 @@ mod metric_contract_recent_window_tests {
         assert_eq!(stats.tx_count, 0);
         assert_eq!(stats.same_ms_extra_count, 0);
         assert_eq!(stats.same_ms_tx_ratio, None);
+    }
+}
+
+#[cfg(test)]
+mod review_redelivery_state_tests {
+    use super::*;
+    use crate::tx_intelligence::sybil_metrics::review_r1_r3_regressions::full_batch;
+
+    fn session_and_batch() -> (PoolObservationSession, Vec<Arc<PoolTransaction>>) {
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut config = GatekeeperV2Config::default();
+        config.decision_time_series_tx_capacity = 3;
+        let candidate = EnhancedCandidate {
+            pool_amm_id: pool,
+            base_mint: mint,
+            bonding_curve: pool,
+            timestamp: 1000,
+            ..Default::default()
+        };
+        let session = PoolObservationSession::new(
+            SessionId(1),
+            pool,
+            mint,
+            pool,
+            None,
+            candidate,
+            1000,
+            5000,
+            &config,
+            TxIntelligenceConfig::default(),
+        );
+        let txs = full_batch()
+            .into_iter()
+            .map(|mut tx| {
+                tx.pool_amm_id = pool.to_string();
+                Arc::new(tx)
+            })
+            .collect();
+        (session, txs)
+    }
+
+    #[test]
+    fn r1_session_preserves_both_view_cutoffs_in_either_arrival_order() {
+        for reverse in [false, true] {
+            let (mut session, full) = session_and_batch();
+            let mut partial = (*full[0]).clone();
+            partial.signer_post_balance_lamports = None;
+            let mut rich = (*full[0]).clone();
+            rich.event_time.ingress_wall_ts_ms = Some(1001);
+            let views = if reverse {
+                vec![Arc::new(rich), Arc::new(partial)]
+            } else {
+                vec![Arc::new(partial), Arc::new(rich)]
+            };
+            for view in views.into_iter().chain([full[1].clone(), full[2].clone()]) {
+                session.ingest_transaction(view);
+            }
+            let before = session.materialize_sybil_at_cutoff(1000);
+            let after = session.materialize_sybil_at_cutoff(1001);
+            assert_eq!(before.sfd.represented_signer_count, 2);
+            assert!(!before.sfd.has_full_quality());
+            assert_eq!(after.sfd.represented_signer_count, 3);
+            assert!(after.sfd.has_full_quality());
+            assert_eq!(session.tx_buffer.len(), 3);
+            assert_eq!(session.tx_intel_features.tx_count, 3);
+            assert_eq!(session.sybil_redelivery_views.len(), 1);
+            assert_eq!(session.materialize_sybil_at_cutoff(1000), before);
+        }
+    }
+
+    #[test]
+    fn r1_session_view_state_is_bounded_and_loss_expires_with_owning_event() {
+        let (mut session, full) = session_and_batch();
+        for tx in &full {
+            session.ingest_transaction(tx.clone());
+        }
+        for n in 0..100 {
+            let mut changed = (*full[0]).clone();
+            changed.signer_post_balance_lamports = Some(n);
+            changed.event_time.ingress_wall_ts_ms = Some(1010 + n);
+            session.ingest_transaction(Arc::new(changed));
+            assert!(session.sybil_redelivery_views.len() <= 3);
+            assert!(session.sybil_view_losses.len() <= 3);
+            assert!(session.sybil_event_index.len() <= 3);
+        }
+        assert!(session
+            .materialize_sybil_at_cutoff(1000)
+            .sfd
+            .has_full_quality());
+        assert!(!session
+            .materialize_sybil_at_cutoff(1200)
+            .sfd
+            .has_full_quality());
+        assert!(session
+            .materialize_sybil_at_cutoff(1200)
+            .sfd
+            .degraded_reasons
+            .contains(&"SFD_INPUT_VIEW_HISTORY_UNAVAILABLE".to_string()));
+        for (index, original) in full.iter().enumerate() {
+            let mut tx = (**original).clone();
+            tx.signature = solana_sdk::signature::Signature::new_unique().to_string();
+            tx.timestamp_ms = 1300 + index as u64;
+            tx.event_time = ghost_core::EventTimeMetadata::new(
+                Some(tx.timestamp_ms),
+                Some(tx.timestamp_ms),
+                Some(tx.timestamp_ms),
+            );
+            session.ingest_transaction(Arc::new(tx));
+        }
+        assert!(session.sybil_redelivery_views.is_empty());
+        assert!(session.sybil_view_losses.is_empty());
+        assert_eq!(session.sybil_event_index.len(), 3);
+        assert_eq!(session.tx_intel_features.tx_count, 6);
+        assert!(session
+            .materialize_sybil_at_cutoff(1400)
+            .sfd
+            .has_full_quality());
+    }
+    #[test]
+    fn rr1_stable_identity_preserves_existing_keyability_and_zero_time_rejection() {
+        let (mut session, full) = session_and_batch();
+        let mut zero_time = (*full[0]).clone();
+        zero_time.timestamp_ms = 0;
+        zero_time.event_time = ghost_core::EventTimeMetadata::new(Some(0), None, None);
+        assert!(GatekeeperBuffer::tx_key_for(&zero_time).is_none());
+        assert_eq!(
+            session.admit_transaction(&zero_time),
+            SessionTransactionAdmission::Unkeyable
+        );
+        assert!(session.tx_keys_seen.is_empty());
+        assert_eq!(
+            session
+                .ingest_transaction_with_apply_result(full[0].clone())
+                .apply,
+            CanonicalMutationApplyOutcomeV1::AppliedNewMutation
+        );
+        assert_eq!(
+            session
+                .ingest_transaction_with_apply_result(Arc::new(zero_time))
+                .apply,
+            CanonicalMutationApplyOutcomeV1::Duplicate
+        );
+        assert_eq!(session.tx_intel_features.tx_count, 1);
+        assert_eq!(session.tx_keys_seen.len(), 1);
+        // Brak osi czasu to inny przypadek niż jawne zero: dawny Gatekeeper
+        // nadaje mu fallback now_wall_ms. RR1 nie zmienia tego kontraktu.
+        let (mut fallback_session, full) = session_and_batch();
+        let mut fallback = (*full[0]).clone();
+        fallback.timestamp_ms = 0;
+        fallback.event_time = ghost_core::EventTimeMetadata::default();
+        assert!(GatekeeperBuffer::tx_key_for(&fallback).is_some());
+        assert_eq!(
+            fallback_session.admit_transaction(&fallback),
+            SessionTransactionAdmission::Accepted
+        );
+        assert!(matches!(
+            fallback_session.admit_transaction(&fallback),
+            SessionTransactionAdmission::Duplicate { .. }
+        ));
+        assert_eq!(fallback_session.tx_keys_seen.len(), 1);
+    }
+
+    #[test]
+    fn rr1_dust_admission_proof_does_not_require_a_retained_metric_sample() {
+        let (mut session, full) = session_and_batch();
+        let mut dust = (*full[0]).clone();
+        dust.volume_sol = 0.0;
+        dust.sol_amount_lamports = Some(0);
+        dust.event_time = ghost_core::EventTimeMetadata::new(None, Some(1000), Some(1000));
+        assert_eq!(
+            session
+                .ingest_transaction_with_apply_result(Arc::new(dust.clone()))
+                .apply,
+            CanonicalMutationApplyOutcomeV1::AppliedNewMutation
+        );
+        assert!(session.tx_buffer.is_empty());
+        assert!(session.sybil_event_index.is_empty());
+        let counters = serde_json::to_value(&session.tx_intel_features).unwrap();
+        dust.timestamp_ms = 1100;
+        dust.event_time = ghost_core::EventTimeMetadata::new(None, Some(1100), Some(1100));
+        assert_eq!(
+            session
+                .ingest_transaction_with_apply_result(Arc::new(dust))
+                .apply,
+            CanonicalMutationApplyOutcomeV1::Duplicate
+        );
+        assert_eq!(
+            serde_json::to_value(&session.tx_intel_features).unwrap(),
+            counters
+        );
+        assert_eq!(session.tx_keys_seen.len(), 1);
+        assert_eq!(session.gatekeeper_buffer.total_tx_count(), 0);
+        assert_eq!(session.diagnostics.total_tx_seen, 0);
     }
 }

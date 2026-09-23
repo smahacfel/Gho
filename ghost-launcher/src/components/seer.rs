@@ -2400,6 +2400,84 @@ fn trade_matches_primary_observation(
         && observation.claims.instruction_limit == launcher_trade_instruction_limit(trade, route)
 }
 
+/// Zachowuje walidację źródła/ledger; tylko metric-only handoff przed
+/// SessionPoolTradeBridge. Witness/niepełne lub sprzeczne dane nie uzyskują CPV.
+#[derive(Debug, Clone, Copy, Default)]
+struct CpvSourceValidation {
+    valid: bool,
+    duplicate: bool,
+}
+
+fn cpv_feed_from_validated_trade(
+    trade: &seer::types::TradeEvent,
+    observation: Option<&ObservedPumpMutationV1>,
+    primary_provider_id: &str,
+    source: CpvSourceValidation,
+) -> Option<crate::events::CpvFeedEvent> {
+    use crate::events::{CpvFeedEvent, CpvFeedEventKind};
+    if trade.provider_role != Some(RawProviderRoleV1::PrimaryAuthority)
+        || trade.provider_id.as_deref() != Some(primary_provider_id)
+    {
+        return None;
+    }
+    if !source.valid {
+        return Some(CpvFeedEvent(CpvFeedEventKind::Gap {
+            received_ms: seer::types::ingress_epoch_ms(),
+        }));
+    }
+    // Istniejący raw ledger już rozstrzygnął tożsamość; dokładna redostawa
+    // nigdy nie odnawia CPV nawet gdy jego próbka zdążyła opuścić retencję.
+    if source.duplicate
+        || !trade.is_buy
+        || (trade.metadata_availability.status_known && !trade.success)
+    {
+        return None;
+    }
+    let validated = observation.is_some_and(|obs| {
+        obs.provenance.source_family == ObservationSourceFamilyV1::RawYellowstone
+            && trade_matches_primary_observation(trade, obs)
+    }) && source.valid;
+    if !validated
+        || !trade.metadata_availability.status_known
+        || !trade_has_forwardable_identity(trade)
+    {
+        return Some(CpvFeedEvent(CpvFeedEventKind::Gap {
+            received_ms: seer::types::ingress_epoch_ms(),
+        }));
+    }
+    Some(CpvFeedEvent(CpvFeedEventKind::Trade(Arc::new(
+        trade_event_to_pool_transaction(trade),
+    ))))
+}
+
+fn cpv_gap_generation_changed(
+    state: &seer::ipc::LocalCoverageGapStateV1,
+    primary_provider_id: &str,
+    seen: &mut (u64, u64),
+) -> bool {
+    let current = (
+        state
+            .cpv_gap_generations
+            .iter()
+            .find(|(id, _)| id == primary_provider_id)
+            .map_or(0, |(_, generation)| *generation),
+        state.cpv_overflow_generation,
+    );
+    let changed = current != *seen;
+    *seen = current;
+    changed
+}
+
+fn emit_cpv_gap(bus: &Option<EventBusSender>) {
+    if let Some(bus) = bus {
+        let _ = bus.send(GhostEvent::CpvFeed(Arc::new(crate::events::CpvFeedEvent(
+            crate::events::CpvFeedEventKind::Gap {
+                received_ms: seer::types::ingress_epoch_ms(),
+            },
+        ))));
+    }
+}
+
 fn route_compatible_trade_bcv2_context(
     trade: &seer::types::TradeEvent,
 ) -> Option<SessionBcv2Context> {
@@ -4399,6 +4477,27 @@ pub(crate) fn ingest_pump_observation(
     boundary_payload_aligned: bool,
     missing_primary_signal: Option<CandidateIntegritySignalV1>,
 ) -> CanonicalRuntimeAdmissionV1 {
+    ingest_pump_observation_with_source_status(
+        ledger,
+        candidate_integrity_registry,
+        observation,
+        now_monotonic_ns,
+        boundary_payload_aligned,
+        missing_primary_signal,
+        &mut CpvSourceValidation::default(),
+    )
+}
+
+fn ingest_pump_observation_with_source_status(
+    ledger: &Arc<Mutex<PumpObservationLedgerV1>>,
+    candidate_integrity_registry: &Arc<CandidateIntegrityRegistry>,
+    observation: Option<ObservedPumpMutationV1>,
+    now_monotonic_ns: u64,
+    boundary_payload_aligned: bool,
+    missing_primary_signal: Option<CandidateIntegritySignalV1>,
+    source: &mut CpvSourceValidation,
+) -> CanonicalRuntimeAdmissionV1 {
+    *source = CpvSourceValidation::default();
     let Some(observation) = observation else {
         ::metrics::counter!(
             "pump_observation_ledger_missing_transport_observation_total",
@@ -4470,9 +4569,28 @@ pub(crate) fn ingest_pump_observation(
         }
     }
 
+    // To status istniejącej walidacji raw/ledger, sprzed stage_canonical_mutation
+    // i selekcji kandydata. Dane CPV nie zależą od prawa otwarcia sesji.
+    source.valid = observation_is_declared_primary
+        && boundary_payload_aligned
+        && (result.observation_decision.canonical_mutation.is_some()
+            || result.observation_decision.classification
+                == PumpObservationClassificationV1::ExactDuplicate);
+
+    source.duplicate = result.observation_decision.classification
+        == PumpObservationClassificationV1::ExactDuplicate;
+
     let decisions = std::iter::once(&result.observation_decision)
         .chain(result.derived_decisions.iter())
         .collect::<Vec<_>>();
+    source.valid &= !decisions.iter().any(|decision| {
+        matches!(
+            decision.classification,
+            PumpObservationClassificationV1::SourceReconciliationConflict
+                | PumpObservationClassificationV1::PrimaryRawCoverageIncomplete
+                | PumpObservationClassificationV1::EvidenceCapacityExceeded
+        )
+    });
     let Some(canonical) = result.observation_decision.canonical_mutation.as_ref() else {
         for decision in decisions.iter().copied() {
             let _ = emit_pump_observation_decision(candidate_integrity_registry, decision);
@@ -5828,6 +5946,7 @@ pub async fn run(
         // itself a fail-closed condition because a primary gap can no longer
         // be disproven.
         let mut handled_local_coverage_gap_notices = 0usize;
+        let mut cpv_gap_generations_seen = (0u64, 0u64);
         let mut local_coverage_gap_control_overflow_handled = false;
         info!("Seer: Starting IPC event processing");
         info!("Seer: IPC receiver task is now listening for pool detection events from Seer core");
@@ -5838,8 +5957,13 @@ pub async fn run(
                     match gap_changed {
                         Ok(()) => {
                             let gap_state = local_coverage_gap_rx.borrow_and_update().clone();
+                            if cpv_gap_generation_changed(&gap_state, &primary_raw_provider_id,
+                                &mut cpv_gap_generations_seen) {
+                                emit_cpv_gap(&event_bus_tx);
+                            }
                             if gap_state.overflowed && !local_coverage_gap_control_overflow_handled {
                                 local_coverage_gap_control_overflow_handled = true;
+                                emit_cpv_gap(&event_bus_tx);
                                 error!(
                                     "Seer: bounded local coverage-gap control retention overflowed; closing new candidate admission"
                                 );
@@ -5853,6 +5977,9 @@ pub async fn run(
                                 .iter()
                                 .skip(handled_local_coverage_gap_notices)
                             {
+                                if notice.provider_id == primary_raw_provider_id {
+                                    emit_cpv_gap(&event_bus_tx);
+                                }
                                 let _ = handle_local_coverage_gap_notice(
                                     candidate_integrity_registry_ipc.as_ref(),
                                     &primary_raw_provider_id,
@@ -5864,6 +5991,7 @@ pub async fn run(
                         }
                         Err(_) => {
                             warn!("Seer: local coverage-gap control channel closed");
+                            emit_cpv_gap(&event_bus_tx);
                             candidate_integrity_registry_ipc
                                 .close_candidate_admission_with_integrity_invalidation(
                                     "local_coverage_gap_control_channel_closed",
@@ -5903,7 +6031,7 @@ pub async fn run(
                 }
                 maybe_event = ipc_receiver.recv() => match maybe_event {
                     Some(event) => event,
-                    None => break,
+                    None => { emit_cpv_gap(&event_bus_tx); break; },
                 }
             };
 
@@ -5912,7 +6040,26 @@ pub async fn run(
                 h.mark_ipc_event();
             }
 
+            let cpv_control = local_coverage_gap_rx.borrow().clone();
+            if cpv_gap_generation_changed(
+                &cpv_control,
+                &primary_raw_provider_id,
+                &mut cpv_gap_generations_seen,
+            ) {
+                emit_cpv_gap(&event_bus_tx);
+            }
             match seer_event {
+                seer::ipc::SeerEvent::PrimaryTradeFeedProgress(event) => {
+                    if event.progress.provider_id == primary_raw_provider_id {
+                        if let Some(bus) = event_bus_tx.as_ref() {
+                            let _ = bus.send(GhostEvent::CpvFeed(Arc::new(
+                                crate::events::CpvFeedEvent(
+                                    crate::events::CpvFeedEventKind::Progress(event.progress),
+                                ),
+                            )));
+                        }
+                    }
+                }
                 seer::ipc::SeerEvent::PoolDetected(event) => {
                     let candidate = &event.candidate;
                     let primary_raw = is_primary_raw_runtime_authority(candidate.provider_role);
@@ -6279,7 +6426,8 @@ pub async fn run(
                         trade_event.observation.as_ref().is_some_and(|observation| {
                             trade_matches_primary_observation(trade, observation)
                         });
-                    let admission = ingest_pump_observation(
+                    let mut cpv_source_valid = CpvSourceValidation::default();
+                    let admission = ingest_pump_observation_with_source_status(
                         &pump_observation_ledger_ipc,
                         &candidate_integrity_registry_ipc,
                         trade_event.observation.clone(),
@@ -6297,7 +6445,18 @@ pub async fn run(
                                 Some(trade.signature),
                             )
                         }),
+                        &mut cpv_source_valid,
                     );
+                    if let Some(feed) = cpv_feed_from_validated_trade(
+                        trade,
+                        trade_event.observation.as_ref(),
+                        &primary_raw_provider_id,
+                        cpv_source_valid,
+                    ) {
+                        if let Some(bus) = event_bus_tx.as_ref() {
+                            let _ = bus.send(GhostEvent::CpvFeed(Arc::new(feed)));
+                        }
+                    }
                     if !primary_raw {
                         debug!(
                             pool = %trade.pool_amm_id,
@@ -6643,6 +6802,10 @@ pub fn trade_event_to_pool_transaction(
             .provenance
             .as_ref()
             .and_then(|value| value.outer_instruction_index),
+        inner_instruction_path: trade
+            .provenance
+            .as_ref()
+            .and_then(|value| value.inner_instruction_path.clone()),
         inner_group_index: trade
             .provenance
             .as_ref()
@@ -6679,7 +6842,8 @@ pub fn trade_event_to_pool_transaction(
             0
         },
         signature: trade.signature.to_string(),
-        success: trade.success,
+        metadata_availability: trade.metadata_availability,
+        success: trade.metadata_availability.status_known && trade.success,
         error_code: trade.error_code.clone(),
         compute_units_consumed: trade.compute_units_consumed,
         owner_token_deltas: trade.owner_token_deltas.clone(),
@@ -8696,6 +8860,10 @@ mod tests {
 
     fn make_trade(pool: Pubkey, mint: Pubkey) -> TradeEvent {
         TradeEvent {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -8752,6 +8920,415 @@ mod tests {
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
         }
+    }
+
+    fn m4_raw_primary_buy(
+        pool: Pubkey,
+        mint: Pubkey,
+        user: Pubkey,
+        time: u64,
+        index: u64,
+    ) -> (TradeEvent, ObservedPumpMutationV1) {
+        use seer::{
+            binary_parser::{BinaryParser, DISC_BUY},
+            types::{GeyserEvent, RawInstruction, TransactionMetadataAvailability},
+        };
+        let signature = Signature::new_unique();
+        let mut accounts = vec![Pubkey::new_unique(); 12];
+        accounts[2] = mint;
+        accounts[3] = pool;
+        accounts[6] = user;
+        accounts[8] = Pubkey::from_str(TOKEN_PROGRAM_ID).unwrap();
+        let mut data = DISC_BUY.to_vec();
+        data.extend_from_slice(&1_000_000u64.to_le_bytes());
+        data.extend_from_slice(&50_000_000u64.to_le_bytes());
+        let source = GeyserEvent::Transaction {
+            metadata_availability: TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
+            provider_id: Some("primary".into()),
+            provider_role: Some(RawProviderRoleV1::PrimaryAuthority),
+            observation_provenance: Some(ObservationProvenanceV1 {
+                source_family: ObservationSourceFamilyV1::RawYellowstone,
+                source_id: "grpc_global_stream".into(),
+                provider_id: "primary".into(),
+                schema_id: "m4_raw_fixture".into(),
+                payload_hash_blake3:
+                    ObservationProvenanceV1::payload_hash_for_captured_provider_payload(
+                        signature.as_ref(),
+                    ),
+                received_at_monotonic_ns: index + 1,
+            }),
+            slot: Some(42 + index),
+            tx_index: Some(index as u32),
+            event_ts_ms: Some(time),
+            arrival_ts_ms: Some(time),
+            event_time: ghost_core::EventTimeMetadata::new(None, Some(time), Some(time)),
+            signature,
+            accounts,
+            instructions: vec![RawInstruction {
+                program_id: Pubkey::from_str(seer::grpc_connection::PUMP_FUN_PROGRAM_ID).unwrap(),
+                account_indices: (0..12).collect(),
+                data,
+            }],
+            logs: vec![],
+            block_time: None,
+            account_data: std::collections::HashMap::new(),
+            pre_balances: vec![1_500_000_000; 12],
+            post_balances: {
+                let mut balances = vec![1_500_000_000; 12];
+                // Raw fixture is economically coherent: the Pump.fun curve
+                // receives exactly the instruction's 0.05 SOL bound and the
+                // recognized user pays that amount.
+                balances[3] = 1_550_000_000;
+                balances[6] = 1_450_000_000;
+                balances
+            },
+            success: true,
+            error_code: None,
+            compute_units_consumed: None,
+            synthetic: false,
+            source: "grpc_global_stream".into(),
+            mpcf_payload_bytes: None,
+            mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+        };
+        let mut bundle = BinaryParser::new(false)
+            .parse_transaction_bundle(&source)
+            .unwrap();
+        assert_eq!(bundle.trades.len(), 1);
+        assert_eq!(bundle.trades[0].max_sol_cost, 50_000_000);
+        assert_eq!(
+            bundle.trades[0].signer_pre_balance_lamports,
+            Some(1_500_000_000)
+        );
+        assert_eq!(
+            bundle.trades[0].signer_post_balance_lamports,
+            Some(1_450_000_000)
+        );
+        (
+            bundle.trades.remove(0),
+            bundle.trade_observations.remove(0).unwrap(),
+        )
+    }
+
+    #[test]
+    fn m4_validated_feed_reaches_cpv_before_unknown_or_rejected_pool_selection() {
+        use crate::events::{CpvFeedEvent, CpvFeedEventKind};
+        use crate::tx_intelligence::{
+            CpvQueryWindow, CrossPoolVelocityConfig, CrossPoolVelocityIndex,
+        };
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let index = CrossPoolVelocityIndex::new();
+        let config = CrossPoolVelocityConfig {
+            lookback_window_ms: 1000,
+            per_signer_cap: 8,
+            global_signer_cap: 16,
+            min_successful_buy_signers_clean: 3,
+            min_successful_buy_signers_degraded: 2,
+            emit_degraded_low_sample: false,
+        };
+        let rejected_pool = Pubkey::new_unique();
+        let target = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let shared = Pubkey::new_unique();
+        let (trade, observation) =
+            m4_raw_primary_buy(rejected_pool, Pubkey::new_unique(), shared, 1500, 0);
+        assert!(trade_matches_primary_observation(&trade, &observation));
+        let mut source_valid = super::CpvSourceValidation::default();
+        let admission = super::ingest_pump_observation_with_source_status(
+            &ledger,
+            &registry,
+            Some(observation.clone()),
+            1,
+            true,
+            None,
+            &mut source_valid,
+        );
+        assert!(source_valid.valid);
+        let feed = super::cpv_feed_from_validated_trade(
+            &trade,
+            Some(&observation),
+            "primary",
+            source_valid,
+        )
+        .unwrap();
+        index.observe_feed_event(&feed, 1500, &config);
+        let permit = expect_runtime_permit(admission);
+        // Rejestr sesji nie zna tego poola: normalny runtime nie dostaje jego BUY.
+        let mut gate =
+            SessionPoolTradeBridge::new(Duration::from_secs(1), 4, 16, Duration::from_secs(60), 32);
+        assert_eq!(
+            gate.ingest_trade(&trade, permit, Instant::now()).decision,
+            SessionTradeDecision::Buffered
+        );
+        let mut current = Vec::new();
+        for (i, user) in [shared, Pubkey::new_unique(), Pubkey::new_unique()]
+            .into_iter()
+            .enumerate()
+        {
+            let (trade, observation) =
+                m4_raw_primary_buy(target, mint, user, 1900 + i as u64, 1 + i as u64);
+            let mut source_valid = super::CpvSourceValidation::default();
+            let admission = super::ingest_pump_observation_with_source_status(
+                &ledger,
+                &registry,
+                Some(observation.clone()),
+                10 + i as u64,
+                true,
+                None,
+                &mut source_valid,
+            );
+            let feed = super::cpv_feed_from_validated_trade(
+                &trade,
+                Some(&observation),
+                "primary",
+                source_valid,
+            )
+            .unwrap();
+            index.observe_feed_event(&feed, 1900 + i as u64, &config);
+            current.push(trade_event_to_pool_transaction(&trade));
+        }
+        for time in [0, 2000] {
+            index.observe_feed_event(
+                &CpvFeedEvent(CpvFeedEventKind::Progress(
+                    seer::types::PrimaryTradeFeedProgressV1 {
+                        provider_id: "primary".into(),
+                        epoch: 1,
+                        event_ms: time,
+                        received_ms: time.max(1),
+                        gap: false,
+                    },
+                )),
+                time.max(1),
+                &config,
+            );
+        }
+        let result = index.compute_for_transactions_at(
+            &target.to_string(),
+            &current,
+            CpvQueryWindow {
+                signer_window_start_ms: 1800,
+                anchor_ms: 2000,
+                cutoff_received_ms: 2000,
+            },
+            &config,
+        );
+        assert_eq!(result.signer_cross_pool_velocity, Some(1.0 / 3.0));
+        assert_eq!(
+            result.status,
+            ghost_core::checkpoint::MetricEvidenceQuality::Clean
+        );
+        assert_eq!(gate.pending_total(), 1); // indeks nie otworzył sesji ani nie zmienił gate
+    }
+
+    #[test]
+    fn m4_cpv_feed_does_not_bypass_provider_payload_or_ledger_validation() {
+        use crate::events::CpvFeedEventKind;
+        let (trade, observation) = m4_raw_primary_buy(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            1000,
+            1,
+        );
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let mut source_valid = super::CpvSourceValidation::default();
+        let _ = super::ingest_pump_observation_with_source_status(
+            &ledger,
+            &registry,
+            Some(observation.clone()),
+            1,
+            true,
+            None,
+            &mut source_valid,
+        );
+        assert!(source_valid.valid);
+        assert!(matches!(
+            super::cpv_feed_from_validated_trade(
+                &trade,
+                Some(&observation),
+                "primary",
+                source_valid
+            )
+            .unwrap()
+            .0,
+            CpvFeedEventKind::Trade(_)
+        ));
+        assert!(super::cpv_feed_from_validated_trade(
+            &trade,
+            Some(&observation),
+            "different-primary",
+            source_valid
+        )
+        .is_none());
+        let mut witness = trade.clone();
+        witness.provider_role = Some(RawProviderRoleV1::SecondaryWitness);
+        assert!(super::cpv_feed_from_validated_trade(
+            &witness,
+            Some(&observation),
+            "primary",
+            source_valid
+        )
+        .is_none());
+        let mut mismatch = trade.clone();
+        mismatch.amount += 1;
+        assert!(matches!(
+            super::cpv_feed_from_validated_trade(
+                &mismatch,
+                Some(&observation),
+                "primary",
+                source_valid
+            )
+            .unwrap()
+            .0,
+            CpvFeedEventKind::Gap { .. }
+        ));
+        assert!(matches!(
+            super::cpv_feed_from_validated_trade(&trade, None, "primary", source_valid)
+                .unwrap()
+                .0,
+            CpvFeedEventKind::Gap { .. }
+        ));
+        assert!(matches!(
+            super::cpv_feed_from_validated_trade(
+                &trade,
+                Some(&observation),
+                "primary",
+                super::CpvSourceValidation::default()
+            )
+            .unwrap()
+            .0,
+            CpvFeedEventKind::Gap { .. }
+        ));
+    }
+
+    #[test]
+    fn m4_closed_candidate_admission_does_not_disable_validated_feed_history() {
+        use crate::events::CpvFeedEventKind;
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        registry.close_candidate_admission("m4_test_no_new_sessions");
+        let (trade, observation) = m4_raw_primary_buy(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            1000,
+            1,
+        );
+        let mut source_valid = super::CpvSourceValidation::default();
+        let result = super::ingest_pump_observation_with_source_status(
+            &ledger,
+            &registry,
+            Some(observation.clone()),
+            1,
+            trade_matches_primary_observation(&trade, &observation),
+            None,
+            &mut source_valid,
+        );
+        assert!(matches!(result, CanonicalRuntimeAdmissionV1::Blocked(_)));
+        assert!(source_valid.valid); // dowód source nie jest uprawnieniem otwarcia sesji
+        assert!(matches!(
+            super::cpv_feed_from_validated_trade(
+                &trade,
+                Some(&observation),
+                "primary",
+                source_valid
+            )
+            .unwrap()
+            .0,
+            CpvFeedEventKind::Trade(_)
+        ));
+        assert!(!registry.candidate_admission_open());
+    }
+
+    #[test]
+    fn m4_primary_gap_generation_detects_repeated_loss_and_ignores_witness_and_funding() {
+        let mut state = seer::ipc::LocalCoverageGapStateV1::default();
+        let mut seen = (0, 0);
+        assert!(!super::cpv_gap_generation_changed(
+            &state, "primary", &mut seen
+        ));
+        state.cpv_gap_generations.push(("witness".into(), 8));
+        state.notices.push(LocalCoverageGapNoticeV1 {
+            provider_id: "funding".into(),
+            reason: LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
+        });
+        assert!(!super::cpv_gap_generation_changed(
+            &state, "primary", &mut seen
+        ));
+        state.cpv_gap_generations.push(("primary".into(), 1));
+        assert!(super::cpv_gap_generation_changed(
+            &state, "primary", &mut seen
+        ));
+        assert!(!super::cpv_gap_generation_changed(
+            &state, "primary", &mut seen
+        ));
+        state.cpv_gap_generations[1].1 = 2;
+        assert!(super::cpv_gap_generation_changed(
+            &state, "primary", &mut seen
+        ));
+        state.cpv_overflow_generation = 1;
+        assert!(super::cpv_gap_generation_changed(
+            &state, "primary", &mut seen
+        ));
+    }
+
+    #[test]
+    fn m4_exact_raw_redelivery_is_not_reemitted_after_cpv_history_retention() {
+        let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+        let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let (trade, observation) = m4_raw_primary_buy(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            1000,
+            1,
+        );
+        let mut status = super::CpvSourceValidation::default();
+        let _ = super::ingest_pump_observation_with_source_status(
+            &ledger,
+            &registry,
+            Some(observation.clone()),
+            1,
+            true,
+            None,
+            &mut status,
+        );
+        assert!(status.valid && !status.duplicate);
+        assert!(super::cpv_feed_from_validated_trade(
+            &trade,
+            Some(&observation),
+            "primary",
+            status
+        )
+        .is_some());
+        let _ = super::ingest_pump_observation_with_source_status(
+            &ledger,
+            &registry,
+            Some(observation.clone()),
+            2,
+            true,
+            None,
+            &mut status,
+        );
+        assert!(status.valid && status.duplicate);
+        let mut redelivery = trade.clone();
+        redelivery.timestamp_ms = 100_000;
+        redelivery.event_time =
+            ghost_core::EventTimeMetadata::new(None, Some(100_000), Some(100_000));
+        assert!(super::cpv_feed_from_validated_trade(
+            &redelivery,
+            Some(&observation),
+            "primary",
+            status
+        )
+        .is_none());
     }
 
     fn make_funding_transfer() -> FundingTransferEvent {

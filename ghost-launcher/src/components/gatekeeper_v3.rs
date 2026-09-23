@@ -298,7 +298,7 @@ pub fn v3_feature_snapshot_hash(
     let organic = &features.organic_broadening;
     let manipulation = &features.manipulation_contradictions;
 
-    let payload = json!({
+    let mut payload = json!({
         "materialization_version": materialization_version,
         "account_features": {
             "bonding_progress_bits": f64_bits(account.bonding_progress),
@@ -521,6 +521,22 @@ pub fn v3_feature_snapshot_hash(
         }
     });
 
+    // Rekordy sprzed M6 zachowują stary hash. Nowe definicje i coverage są
+    // częścią tożsamości nowego snapshotu, także gdy wartość pozostaje taka sama.
+    if sybil.fee_topology_diversity_v2.is_some()
+        || sybil.demand_elasticity_v2.is_some()
+        || sybil.dbia_evidence_v1.is_some()
+        || sybil.sfd_evidence_v1.is_some()
+    {
+        payload["sybil_measurements_v2"] = json!({
+            "fee_topology_diversity_v2": sybil.fee_topology_diversity_v2,
+            "dbia_evidence_v1": sybil.dbia_evidence_v1,
+            "sfd_evidence_v1": sybil.sfd_evidence_v1,
+            "demand_elasticity_v2": sybil.demand_elasticity_v2,
+            "cpv_evidence": sybil.cpv_evidence,
+            "cutoff_received_ms": sybil.measurement_cutoff_received_ms,
+        });
+    }
     let bytes = serde_json::to_vec(&payload).expect("canonical V3 feature snapshot serializes");
     blake3::hash(&bytes).to_hex().to_string()
 }

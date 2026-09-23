@@ -20,6 +20,10 @@ fn tas_enabled_config() -> GatekeeperV2Config {
 
 fn make_tx(signer: &str, ts_ms: u64, is_buy: bool, vol_sol: f64) -> PoolTransaction {
     PoolTransaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
         semantic: EventSemanticEnvelope::default(),
         pool_amm_id: "pool1".to_string(),
         signer: signer.to_string(),
@@ -32,6 +36,7 @@ fn make_tx(signer: &str, ts_ms: u64, is_buy: bool, vol_sol: f64) -> PoolTransact
         event_ordinal: Some(0),
         tx_index: None,
         outer_instruction_index: None,
+        inner_instruction_path: None,
         inner_group_index: None,
         outer_program_id: None,
         cpi_stack_height: None,
@@ -52,6 +57,11 @@ fn make_tx(signer: &str, ts_ms: u64, is_buy: bool, vol_sol: f64) -> PoolTransact
         mpcf_payload_missing_reason: ghost_launcher::events::RawBytesMissingReason::Unknown,
         v_tokens_in_bonding_curve: None,
         v_sol_in_bonding_curve: None,
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         market_cap_sol: None,
         global_config: None,
         fee_recipient: None,

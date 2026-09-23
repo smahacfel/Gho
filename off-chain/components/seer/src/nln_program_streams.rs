@@ -354,6 +354,7 @@ impl NlnPumpFunTradeEvent {
             amount: self.token_amount_units,
             max_sol_cost: if is_buy { self.sol_amount_lamports } else { 0 },
             min_sol_output: if is_buy { 0 } else { self.sol_amount_lamports },
+            metadata_availability: crate::types::TransactionMetadataAvailability::default(),
             success: true,
             error_code: None,
             compute_units_consumed: None,

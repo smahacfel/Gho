@@ -173,6 +173,39 @@ pub fn record_trade_outcome_metric(outcome: TradeOutcome) {
     ::metrics::increment_counter!("seer_trade_outcome_total", "outcome" => outcome.as_str());
 }
 
+/// Dostępność metadata źródłowej transakcji, niezależna od jej wyniku.
+/// Brak pola w starym rekordzie oznacza brak dowodu kompletności.
+/// `inner_instructions_known` wraz z listą/grupami odróżnia brak od pustej listy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionMetadataAvailability {
+    #[serde(default)]
+    pub status_known: bool,
+    #[serde(default)]
+    pub inner_instructions_known: bool,
+}
+
+impl TransactionMetadataAvailability {
+    pub const fn is_unknown(&self) -> bool {
+        !self.status_known && !self.inner_instructions_known
+    }
+
+    pub const fn has_inner_instructions(self) -> bool {
+        self.status_known && self.inner_instructions_known
+    }
+}
+
+/// Kontrola postępu wyłącznie obsługiwanego primary raw feedu transakcji.
+/// Nie jest health FSC ani uprawnieniem wykonania. `event_ms` jest osią czasu
+/// normalizatora primary (epoch ingest), `received_ms` czasem raw otrzymania.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrimaryTradeFeedProgressV1 {
+    pub provider_id: String,
+    pub epoch: u64,
+    pub event_ms: u64,
+    pub received_ms: u64,
+    pub gap: bool,
+}
+
 /// Represents a raw event from the Geyser/WebSocket stream
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GeyserEvent {
@@ -230,6 +263,9 @@ pub enum GeyserEvent {
         /// Post-transaction lamport balances for all accounts
         #[serde(default)]
         post_balances: Vec<u64>,
+        /// Jawna dostępność źródła; nie wynika z pustych wektorów.
+        #[serde(default)]
+        metadata_availability: TransactionMetadataAvailability,
         /// True when transaction succeeded (meta.err is None)
         success: bool,
         /// Parsed error code if transaction failed
@@ -328,6 +364,8 @@ pub enum GeyserEvent {
         /// Raw SubscribeUpdateEntry proto bytes for CPI scanning (may be empty).
         raw: Vec<u8>,
     },
+    /// Bariera kolejki primary, nie dane rynkowe.
+    PrimaryTradeFeedProgress(PrimaryTradeFeedProgressV1),
 }
 
 /// Raw instruction data from a transaction
@@ -666,6 +704,12 @@ pub struct TradeEvent {
     /// For Buy: 0
     pub min_sol_output: u64,
 
+    /// Dostępność metadata zachowana z normalizatora.
+    #[serde(
+        default,
+        skip_serializing_if = "TransactionMetadataAvailability::is_unknown"
+    )]
+    pub metadata_availability: TransactionMetadataAvailability,
     /// True when transaction succeeded (meta.err is None)
     pub success: bool,
 
@@ -1173,6 +1217,10 @@ mod tests {
 
     fn grpc_transaction_event(event_ts_ms: Option<u64>, block_time: Option<i64>) -> GeyserEvent {
         GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,

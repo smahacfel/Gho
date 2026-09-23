@@ -2121,6 +2121,8 @@ impl PumpParser {
         complete_tracker: &CompleteTracker, // [FIX-4]
     ) -> Vec<ParsedPumpEvent> {
         match ev {
+            PumpEvent::PrimaryTradeFeedProgress { .. } => Vec::new(), // kontrola transportu, nie instrukcja
+
             PumpEvent::Transaction {
                 signature,
                 slot,
@@ -3902,6 +3904,7 @@ const JITO_TIP_ACCOUNTS: &[&str] = &[
 struct RuntimeTradeContext {
     timestamp_ms: Option<u64>,
     event_time: ghost_core::EventTimeMetadata,
+    metadata_availability: crate::types::TransactionMetadataAvailability,
     success: bool,
     error_code: Option<String>,
     compute_units_consumed: Option<u64>,
@@ -3946,10 +3949,14 @@ fn transaction_observation_provenance(event: &GeyserEvent) -> Option<&Observatio
 fn transaction_outcome(event: &GeyserEvent) -> (Option<bool>, Option<String>) {
     match event {
         GeyserEvent::Transaction {
+            metadata_availability,
             success,
             error_code,
             ..
-        } => (Some(*success), error_code.clone()),
+        } => (
+            metadata_availability.status_known.then_some(*success),
+            error_code.clone(),
+        ),
         _ => (None, None),
     }
 }
@@ -4114,7 +4121,10 @@ fn observed_trade_mutation(
             } else {
                 PumpTradeSideV1::Sell
             }),
-            success: Some(trade.success),
+            success: trade
+                .metadata_availability
+                .status_known
+                .then_some(trade.success),
             error_code: trade.error_code.clone(),
             token_amount_units: Some(trade.amount),
             instruction_limit: trade_instruction_limit(trade, route_variant),
@@ -5818,6 +5828,7 @@ impl BinaryParser {
                         } else {
                             0
                         },
+                        metadata_availability: runtime_ctx.metadata_availability,
                         success: runtime_ctx.success,
                         error_code: runtime_ctx.error_code.clone(),
                         compute_units_consumed: runtime_ctx.compute_units_consumed,
@@ -5913,6 +5924,7 @@ impl BinaryParser {
                         amount: et.token_amount,
                         max_sol_cost: if et.is_buy { et.sol_amount } else { 0 },
                         min_sol_output: if !et.is_buy { et.sol_amount } else { 0 },
+                        metadata_availability: runtime_ctx.metadata_availability,
                         success: runtime_ctx.success,
                         error_code: runtime_ctx.error_code.clone(),
                         compute_units_consumed: runtime_ctx.compute_units_consumed,
@@ -6022,6 +6034,7 @@ impl BinaryParser {
                         amount: base_amount,
                         max_sol_cost: if effective_is_buy { quote_amount } else { 0 },
                         min_sol_output: if effective_is_buy { 0 } else { quote_amount },
+                        metadata_availability: runtime_ctx.metadata_availability,
                         success: runtime_ctx.success,
                         error_code: runtime_ctx.error_code.clone(),
                         compute_units_consumed: runtime_ctx.compute_units_consumed,
@@ -6109,6 +6122,7 @@ impl BinaryParser {
                         amount: token_amount,
                         max_sol_cost: sol_amount,
                         min_sol_output: 0,
+                        metadata_availability: runtime_ctx.metadata_availability,
                         success: runtime_ctx.success,
                         error_code: runtime_ctx.error_code.clone(),
                         compute_units_consumed: runtime_ctx.compute_units_consumed,
@@ -6229,6 +6243,7 @@ impl BinaryParser {
                         amount: token_amount,
                         max_sol_cost: if is_buy { sol_amount } else { 0 },
                         min_sol_output: if is_buy { 0 } else { sol_amount },
+                        metadata_availability: runtime_ctx.metadata_availability,
                         success: runtime_ctx.success,
                         error_code: runtime_ctx.error_code.clone(),
                         compute_units_consumed: runtime_ctx.compute_units_consumed,
@@ -6349,6 +6364,7 @@ impl BinaryParser {
                         amount: token_amount,
                         max_sol_cost: if is_buy { sol_amount } else { 0 },
                         min_sol_output: if is_buy { 0 } else { sol_amount },
+                        metadata_availability: runtime_ctx.metadata_availability,
                         success: runtime_ctx.success,
                         error_code: runtime_ctx.error_code.clone(),
                         compute_units_consumed: runtime_ctx.compute_units_consumed,
@@ -6410,6 +6426,9 @@ impl BinaryParser {
         }
         let mut deduped = dedup_trade_candidates(&self.curve_mint_reg, trades);
         for trade in &mut deduped {
+            // Użytkownik został już rozpoznany z instrukcji. Jego raw saldo
+            // nie wymaga heurystyki ownera ani przynależności do krzywej.
+            populate_known_user_balances(event, trade);
             enrich_trade_optional_accounts_from_source_ix(event, trade);
             populate_trade_toolchain_fingerprint_from_source_tx(event, trade);
             register_route_compatible_observed_bcv2(
@@ -6509,6 +6528,7 @@ impl BinaryParser {
                 } else {
                     inferred.sol_amount
                 },
+                metadata_availability: runtime_ctx.metadata_availability,
                 success: runtime_ctx.success,
                 error_code: runtime_ctx.error_code.clone(),
                 compute_units_consumed: runtime_ctx.compute_units_consumed,
@@ -6858,6 +6878,7 @@ fn extract_runtime_trade_context(event: &GeyserEvent) -> RuntimeTradeContext {
         pre_balances,
         post_balances,
         compute_units_consumed,
+        metadata_availability,
         success,
         error_code,
         inner_instructions,
@@ -6870,7 +6891,11 @@ fn extract_runtime_trade_context(event: &GeyserEvent) -> RuntimeTradeContext {
     let (compute_unit_limit, cu_price_micro_lamports, jito_tip_detected) =
         extract_compute_and_jito_profile(accounts, instructions);
     let (inner_ix_count, cpi_depth, ata_create_count) =
-        extract_inner_instruction_stats(inner_instructions);
+        if metadata_availability.has_inner_instructions() {
+            extract_inner_instruction_stats(inner_instructions)
+        } else {
+            (None, None, None)
+        };
 
     let mut signer_pre_balance_lamports = HashMap::new();
     for (account, lamports) in accounts.iter().zip(pre_balances.iter()) {
@@ -6889,7 +6914,8 @@ fn extract_runtime_trade_context(event: &GeyserEvent) -> RuntimeTradeContext {
     RuntimeTradeContext {
         timestamp_ms,
         event_time: crate::types::transaction_event_time(event),
-        success: *success,
+        metadata_availability: *metadata_availability,
+        success: metadata_availability.status_known && *success,
         error_code: error_code.clone(),
         compute_units_consumed: *compute_units_consumed,
         cu_price_micro_lamports,
@@ -8113,6 +8139,37 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
     );
 }
 
+fn populate_known_user_balances(event: &GeyserEvent, trade: &mut TradeEvent) {
+    let GeyserEvent::Transaction {
+        accounts,
+        pre_balances,
+        post_balances,
+        metadata_availability,
+        ..
+    } = event
+    else {
+        return;
+    };
+    trade.signer_pre_balance_lamports = None;
+    trade.signer_post_balance_lamports = None;
+    if !metadata_availability.status_known {
+        return;
+    }
+    let mut matches = accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| **key == trade.signer);
+    let Some((index, _)) = matches.next() else {
+        return;
+    };
+    // Nie wybieramy przypadkowego indeksu w wadliwym źródle.
+    if matches.next().is_some() {
+        return;
+    }
+    trade.signer_pre_balance_lamports = pre_balances.get(index).copied();
+    trade.signer_post_balance_lamports = post_balances.get(index).copied();
+}
+
 fn populate_trade_toolchain_fingerprint_from_source_tx(
     event: &GeyserEvent,
     trade: &mut TradeEvent,
@@ -8121,12 +8178,15 @@ fn populate_trade_toolchain_fingerprint_from_source_tx(
         accounts,
         instructions,
         inner_instructions,
+        metadata_availability,
         ..
     } = event
     else {
         return;
     };
 
+    trade.metadata_availability = *metadata_availability;
+    let inner_known = metadata_availability.has_inner_instructions();
     let (
         internal_fee_transfer_count,
         external_fee_transfer_count,
@@ -8134,16 +8194,17 @@ fn populate_trade_toolchain_fingerprint_from_source_tx(
     ) = count_trade_fee_transfers(accounts, inner_instructions, trade);
 
     trade.toolchain_fingerprint = ToolchainFingerprintInput {
-        account_keys_len: Some(u32::try_from(accounts.len()).unwrap_or(u32::MAX)),
+        account_keys_len: metadata_availability
+            .status_known
+            .then(|| u32::try_from(accounts.len()).unwrap_or(u32::MAX)),
         outer_instruction_count: Some(u32::try_from(instructions.len()).unwrap_or(u32::MAX)),
-        inner_instruction_group_count: Some(
-            u32::try_from(inner_instructions.len()).unwrap_or(u32::MAX),
-        ),
+        inner_instruction_group_count: inner_known
+            .then(|| u32::try_from(inner_instructions.len()).unwrap_or(u32::MAX)),
         has_set_compute_unit_limit: Some(trade.compute_unit_limit.is_some()),
         has_set_compute_unit_price: Some(trade.cu_price_micro_lamports.is_some()),
-        internal_fee_transfer_count: Some(internal_fee_transfer_count),
-        external_fee_transfer_count: Some(external_fee_transfer_count),
-        filtered_wsol_self_transfer_count: Some(filtered_wsol_self_transfer_count),
+        internal_fee_transfer_count: inner_known.then_some(internal_fee_transfer_count),
+        external_fee_transfer_count: inner_known.then_some(external_fee_transfer_count),
+        filtered_wsol_self_transfer_count: inner_known.then_some(filtered_wsol_self_transfer_count),
     };
 }
 
@@ -8287,7 +8348,7 @@ fn count_trade_fee_transfers(
                 continue;
             };
 
-            if is_signer_wsol_self_transfer(accounts, trade.signer, source, destination) {
+            if is_signer_wsol_self_transfer(trade.signer, source, destination) {
                 filtered_wsol_self_transfer_count =
                     filtered_wsol_self_transfer_count.saturating_add(1);
                 continue;
@@ -8319,23 +8380,37 @@ fn is_trade_internal_fee_destination(trade: &TradeEvent, destination: &Pubkey) -
         || trade
             .associated_bonding_curve
             .is_some_and(|associated_bonding_curve| associated_bonding_curve == *destination)
+        || trade
+            .creator_vault
+            .is_some_and(|vault| vault == *destination)
+        || trade
+            .global_config
+            .is_some_and(|config| config == *destination)
+        || trade
+            .bonding_curve_v2
+            .is_some_and(|curve| curve == *destination)
 }
 
-fn is_signer_wsol_self_transfer(
-    accounts: &[Pubkey],
-    signer: Pubkey,
-    source: &Pubkey,
-    destination: &Pubkey,
-) -> bool {
-    (*source == signer && is_signer_owned_wsol_ata(accounts, &signer, destination))
-        || (*destination == signer && is_signer_owned_wsol_ata(accounts, &signer, source))
+fn is_signer_wsol_self_transfer(signer: Pubkey, source: &Pubkey, destination: &Pubkey) -> bool {
+    (*source == signer && is_signer_owned_wsol_ata(&signer, destination))
+        || (*destination == signer && is_signer_owned_wsol_ata(&signer, source))
 }
 
-fn is_signer_owned_wsol_ata(accounts: &[Pubkey], signer: &Pubkey, candidate: &Pubkey) -> bool {
-    let Ok(wsol_mint) = Pubkey::from_str(WSOL_MINT) else {
+fn is_signer_owned_wsol_ata(signer: &Pubkey, candidate: &Pubkey) -> bool {
+    let (Ok(mint), Ok(token_program), Ok(ata_program)) = (
+        Pubkey::from_str(WSOL_MINT),
+        Pubkey::from_str(ProgramIds::TOKEN_PROGRAM),
+        Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID),
+    ) else {
         return false;
     };
-    resolve_ata_owner(accounts, candidate, &wsol_mint) == Some(*signer)
+    // WSOL_MINT jest natywnym mintem Tokenkeg, nie Token-2022.
+    // Wyprowadzamy ATA konkretnego użytkownika instrukcji, również gdy jest PDA.
+    Pubkey::find_program_address(
+        &[signer.as_ref(), token_program.as_ref(), mint.as_ref()],
+        &ata_program,
+    )
+    .0 == *candidate
 }
 
 fn resolve_ata_owner(accounts: &[Pubkey], token_account: &Pubkey, mint: &Pubkey) -> Option<Pubkey> {
@@ -8759,6 +8834,10 @@ mod tests {
         inner_instructions: Vec<crate::types::InnerInstructionGroup>,
     ) -> GeyserEvent {
         GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -8810,6 +8889,10 @@ mod tests {
         event_ordinal: Option<u32>,
     ) -> TradeEvent {
         TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -8959,6 +9042,10 @@ mod tests {
         post_balances[PUMP_IDX_USER] = 1_450_000_000;
 
         GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -10371,6 +10458,10 @@ mod tests {
         data.extend_from_slice(&123_000_000u64.to_le_bytes());
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -10423,6 +10514,10 @@ mod tests {
         accounts[PUMP_IDX_BONDING_CURVE] = curve;
         accounts[PUMP_IDX_USER] = user;
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -10477,6 +10572,10 @@ mod tests {
         parser.account_reg.insert_curve(curve.to_string());
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -10582,6 +10681,10 @@ mod tests {
         parser.account_reg.insert_curve(curve.to_string());
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -10680,6 +10783,10 @@ mod tests {
         parser.account_reg.insert_curve(curve.to_string());
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -10786,6 +10893,10 @@ mod tests {
         post_balances[3] = 1_350_000_000;
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -10858,6 +10969,10 @@ mod tests {
         let wsol_mint = Pubkey::from_str(WSOL_MINT).unwrap();
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -11005,6 +11120,10 @@ mod tests {
         data.extend_from_slice(&encode_swap_sell_event(&sell_event));
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -11152,6 +11271,10 @@ mod tests {
         data.extend_from_slice(&encode_swap_sell_event(&sell_event));
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -11319,6 +11442,10 @@ mod tests {
         data.extend_from_slice(&encode_swap_sell_event(&sell_event));
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -11464,6 +11591,10 @@ mod tests {
         data.extend_from_slice(&encode_swap_sell_event(&sell_event));
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -12500,6 +12631,10 @@ mod tests {
         }));
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -12634,6 +12769,10 @@ mod tests {
         let signature = solana_sdk::signature::Signature::new_unique();
 
         let resolved = TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -12696,6 +12835,10 @@ mod tests {
         };
 
         let unresolved = TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -12771,6 +12914,10 @@ mod tests {
         let signature = solana_sdk::signature::Signature::new_unique();
 
         let trade_a = TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -12930,6 +13077,10 @@ mod tests {
         let token_program = Pubkey::new_unique();
 
         let weak = TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -13115,6 +13266,10 @@ mod tests {
         );
 
         let mut trade = TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -13698,6 +13853,10 @@ mod tests {
         );
 
         let mut trade = TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -13808,6 +13967,10 @@ mod tests {
         );
 
         let mut trade = TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -13928,6 +14091,10 @@ mod tests {
         );
 
         let mut trade = TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -14031,6 +14198,10 @@ mod tests {
         );
 
         let mut trade = TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -14148,6 +14319,10 @@ mod tests {
         );
 
         let mut trade = TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -14787,6 +14962,10 @@ mod tests {
         }));
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -14885,6 +15064,10 @@ mod tests {
         }));
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -14983,6 +15166,10 @@ mod tests {
         let pump_idx = accounts.iter().position(|p| *p == pumpswap).unwrap() as u8;
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -15046,5 +15233,296 @@ mod tests {
         );
         assert_eq!(trade.max_sol_cost, base_amount_in);
         assert_eq!(trade.min_sol_output, 0);
+    }
+    #[test]
+    fn m1_creator_fee_is_internal() {
+        let mut event = make_ftdi_buy_event(0, false);
+        if let GeyserEvent::Transaction {
+            accounts,
+            inner_instructions,
+            ..
+        } = &mut event
+        {
+            inner_instructions.push(crate::types::InnerInstructionGroup {
+                index: 0,
+                instructions: vec![crate::types::InnerIx {
+                    program_id_index: (accounts.len() - 1) as u8,
+                    accounts: vec![PUMP_IDX_USER as u8, PUMP_IDX_CREATOR_VAULT as u8],
+                    data: system_transfer_data(500_000),
+                    stack_height: Some(2),
+                }],
+            });
+        }
+        let trades = BinaryParser::new(false).parse_trades(&event).unwrap();
+        assert_eq!(trades.len(), 1);
+        let trade = &trades[0];
+        println!(
+            "CREATOR FEE: creator={:?} topology={:?}",
+            trade.creator_vault,
+            trade.toolchain_fingerprint.fee_topology()
+        );
+        assert!(
+            trade.creator_vault.is_some(),
+            "fixture must supply creator vault"
+        );
+        assert_eq!(trade.toolchain_fingerprint.fee_topology(), Some((0, 1)));
+        let mut known_roles = trade.clone();
+        known_roles.global_config = Some(Pubkey::new_unique());
+        known_roles.bonding_curve_v2 = Some(Pubkey::new_unique());
+        for destination in [known_roles.global_config, known_roles.bonding_curve_v2] {
+            assert!(is_trade_internal_fee_destination(
+                &known_roles,
+                &destination.unwrap()
+            ));
+        }
+        assert!(!is_trade_internal_fee_destination(
+            &known_roles,
+            &Pubkey::new_unique()
+        ));
+    }
+    #[test]
+    fn m1_pda_owned_wsol_wrap_is_not_external_fee() {
+        use crate::types::{InnerIx, RawInstruction};
+        let mut event = make_ftdi_buy_event(0, true);
+        let wrapper_program = Pubkey::new_unique();
+        let pda = Pubkey::find_program_address(&[b"audit-user"], &wrapper_program).0;
+        assert!(!pda.is_on_curve());
+        if let GeyserEvent::Transaction {
+            accounts,
+            instructions,
+            inner_instructions,
+            ..
+        } = &mut event
+        {
+            accounts[PUMP_IDX_USER] = pda;
+            accounts[12] = derived_wsol_ata(&pda);
+            let pump_index = accounts.len() as u8;
+            accounts.push(Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap());
+            accounts.push(wrapper_program);
+            let buy = instructions[0].clone();
+            instructions[0] = RawInstruction {
+                program_id: wrapper_program,
+                account_indices: (0..accounts.len() as u8).collect(),
+                data: vec![0],
+            };
+            inner_instructions[0].instructions[0].stack_height = Some(3);
+            inner_instructions[0].instructions.insert(
+                0,
+                InnerIx {
+                    program_id_index: pump_index,
+                    accounts: buy.account_indices,
+                    data: buy.data,
+                    stack_height: Some(2),
+                },
+            );
+        }
+        let trades = BinaryParser::new(false).parse_trades(&event).unwrap();
+        assert_eq!(trades.len(), 1);
+        let trade = &trades[0];
+        assert_eq!(trade.signer, pda, "parser uses instruction user role");
+        println!(
+            "PDA WRAP: topology={:?} filtered={:?}",
+            trade.toolchain_fingerprint.fee_topology(),
+            trade
+                .toolchain_fingerprint
+                .filtered_wsol_self_transfer_count
+        );
+        assert_eq!(trade.toolchain_fingerprint.fee_topology(), Some((0, 0)));
+        assert_eq!(
+            trade
+                .toolchain_fingerprint
+                .filtered_wsol_self_transfer_count,
+            Some(1)
+        );
+    }
+
+    mod m1_metadata {
+        use super::*;
+        use yellowstone_grpc_proto::prelude as proto;
+        fn proto_fixture(
+            meta: Option<proto::TransactionStatusMeta>,
+        ) -> proto::SubscribeUpdateTransaction {
+            let GeyserEvent::Transaction {
+                mut accounts,
+                instructions,
+                signature,
+                ..
+            } = make_ftdi_buy_event(0, false)
+            else {
+                unreachable!()
+            };
+            let program_id_index = accounts.len() as u32;
+            accounts.push(instructions[0].program_id);
+            proto::SubscribeUpdateTransaction {
+                slot: 42,
+                transaction: Some(proto::SubscribeUpdateTransactionInfo {
+                    signature: signature.as_ref().to_vec(),
+                    index: 0,
+                    transaction: Some(proto::Transaction {
+                        signatures: vec![signature.as_ref().to_vec()],
+                        message: Some(proto::Message {
+                            account_keys: accounts.iter().map(|p| p.to_bytes().to_vec()).collect(),
+                            instructions: vec![proto::CompiledInstruction {
+                                program_id_index,
+                                accounts: instructions[0].account_indices.clone(),
+                                data: instructions[0].data.clone(),
+                            }],
+                            ..Default::default()
+                        }),
+                    }),
+                    meta,
+                    ..Default::default()
+                }),
+            }
+        }
+        fn decoded_proto_fixture(meta: Option<proto::TransactionStatusMeta>) -> GeyserEvent {
+            crate::grpc_connection::route_update_for_hot_path_harness(proto::SubscribeUpdate {
+                update_oneof: Some(proto::subscribe_update::UpdateOneof::Transaction(
+                    proto_fixture(meta),
+                )),
+                ..Default::default()
+            })
+            .expect("real Yellowstone normalization")
+        }
+        #[test]
+        fn absent_transaction_meta_must_not_be_known_successful_zero_fee_topology() {
+            let event = decoded_proto_fixture(None);
+            let trades = BinaryParser::new(false).parse_trades(&event).unwrap();
+            assert_eq!(trades.len(), 1);
+            println!(
+                "ABSENT META: success={} fingerprint={:?}",
+                trades[0].success, trades[0].toolchain_fingerprint
+            );
+            assert!(!trades[0].success);
+            assert!(!trades[0].metadata_availability.status_known);
+            assert_eq!(trades[0].toolchain_fingerprint.fee_topology(), None);
+            assert_eq!(
+                trades[0]
+                    .toolchain_fingerprint
+                    .inner_instruction_group_count,
+                None
+            );
+        }
+        #[test]
+        fn unavailable_inner_instructions_must_not_be_known_zero_fee_topology() {
+            let event = decoded_proto_fixture(Some(proto::TransactionStatusMeta {
+                inner_instructions_none: true,
+                ..Default::default()
+            }));
+            let trades = BinaryParser::new(false).parse_trades(&event).unwrap();
+            assert_eq!(trades.len(), 1);
+            println!(
+                "INNER UNKNOWN: fingerprint={:?}",
+                trades[0].toolchain_fingerprint
+            );
+            assert_eq!(trades[0].toolchain_fingerprint.fee_topology(), None);
+        }
+        #[test]
+        fn explicitly_present_empty_inner_instructions_control() {
+            let event = decoded_proto_fixture(Some(proto::TransactionStatusMeta {
+                inner_instructions_none: false,
+                ..Default::default()
+            }));
+            let trades = BinaryParser::new(false).parse_trades(&event).unwrap();
+            assert_eq!(trades.len(), 1);
+            assert!(trades[0].success);
+            assert!(trades[0].metadata_availability.has_inner_instructions());
+            assert_eq!(
+                trades[0]
+                    .toolchain_fingerprint
+                    .inner_instruction_group_count,
+                Some(0)
+            );
+            assert_eq!(trades[0].toolchain_fingerprint.fee_topology(), Some((0, 0)));
+        }
+        #[test]
+        fn present_nonempty_inner_metadata_is_preserved() {
+            let event = decoded_proto_fixture(Some(proto::TransactionStatusMeta {
+                inner_instructions: vec![proto::InnerInstructions {
+                    index: 0,
+                    instructions: vec![],
+                }],
+                ..Default::default()
+            }));
+            let trade = BinaryParser::new(false)
+                .parse_trades(&event)
+                .unwrap()
+                .remove(0);
+            assert!(trade.metadata_availability.has_inner_instructions());
+            assert_eq!(
+                trade.toolchain_fingerprint.inner_instruction_group_count,
+                Some(1)
+            );
+        }
+        #[test]
+        fn unknown_inner_flag_wins_over_unusable_payload() {
+            let event = decoded_proto_fixture(Some(proto::TransactionStatusMeta {
+                inner_instructions_none: true,
+                inner_instructions: vec![proto::InnerInstructions {
+                    index: 0,
+                    instructions: vec![],
+                }],
+                ..Default::default()
+            }));
+            let trade = BinaryParser::new(false)
+                .parse_trades(&event)
+                .unwrap()
+                .remove(0);
+            assert!(trade.metadata_availability.status_known);
+            assert!(!trade.metadata_availability.has_inner_instructions());
+            assert_eq!(trade.toolchain_fingerprint.fee_topology(), None);
+        }
+        #[test]
+        fn old_record_without_metadata_never_implies_completeness() {
+            let event = decoded_proto_fixture(Some(proto::TransactionStatusMeta::default()));
+            let mut json = serde_json::to_value(&event).unwrap();
+            json["Transaction"]
+                .as_object_mut()
+                .unwrap()
+                .remove("metadata_availability");
+            let old: GeyserEvent = serde_json::from_value(json).unwrap();
+            let trade = BinaryParser::new(false)
+                .parse_trades(&old)
+                .unwrap()
+                .remove(0);
+            assert!(!trade.success);
+            assert!(trade.metadata_availability.is_unknown());
+            assert_eq!(trade.toolchain_fingerprint.fee_topology(), None);
+        }
+        #[test]
+        fn failed_status_is_known_not_missing() {
+            let event = decoded_proto_fixture(Some(proto::TransactionStatusMeta {
+                err: Some(Default::default()),
+                ..Default::default()
+            }));
+            let trade = BinaryParser::new(false)
+                .parse_trades(&event)
+                .unwrap()
+                .remove(0);
+            assert!(!trade.success);
+            assert!(trade.metadata_availability.status_known);
+        }
+    }
+
+    #[test]
+    fn m1_self_wrap_requires_the_known_owner_and_correct_token_program() {
+        use solana_sdk::signature::{Keypair, Signer};
+        let owner = Keypair::new().pubkey();
+        let pda = Pubkey::find_program_address(&[b"known-owner"], &Pubkey::new_unique()).0;
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let ata_program = Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID).unwrap();
+        let token_2022 = Pubkey::from_str(ProgramIds::TOKEN_2022_PROGRAM).unwrap();
+        for known in [owner, pda] {
+            let correct = derived_wsol_ata(&known);
+            assert!(is_signer_owned_wsol_ata(&known, &correct));
+            assert!(!is_signer_owned_wsol_ata(&Pubkey::new_unique(), &correct));
+            let wrong = Pubkey::find_program_address(
+                &[known.as_ref(), token_2022.as_ref(), wsol.as_ref()],
+                &ata_program,
+            )
+            .0;
+            assert!(!is_signer_owned_wsol_ata(&known, &wrong));
+            assert!(!is_signer_owned_wsol_ata(&known, &Pubkey::new_unique()));
+        }
     }
 }

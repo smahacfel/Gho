@@ -354,12 +354,14 @@ fn create_test_transactions(
         raw_tx[2..6].copy_from_slice(&(timestamp_ms as u32).to_le_bytes());
 
         transactions.push(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability::default(),
             semantic: ghost_core::EventSemanticEnvelope::default(),
             pool_amm_id: pool.pool_amm_id.clone(),
             slot: pool.slot.map(|s| s + i as u64),
             event_ordinal: Some(i as u32),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,

@@ -51,6 +51,15 @@ pub enum SeerEvent {
     /// loadability, or transport provenance for a specific account pubkey/role
     /// without mutating canonical pool reserve state.
     ExecutionAccountEvidence(DetectedExecutionAccountEvidenceEvent),
+    /// Bariera primary transakcji po ukończeniu wcześniejszych workerów.
+    PrimaryTradeFeedProgress(DetectedPrimaryTradeFeedProgress),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedPrimaryTradeFeedProgress {
+    pub progress: crate::types::PrimaryTradeFeedProgressV1,
+    pub detected_at: std::time::SystemTime,
+    pub sequence_number: u64,
 }
 
 /// Bounded control-plane notice that an unrecovered local coverage gap was
@@ -76,6 +85,10 @@ pub struct LocalCoverageGapNoticeV1 {
 pub struct LocalCoverageGapStateV1 {
     pub notices: Vec<LocalCoverageGapNoticeV1>,
     pub overflowed: bool,
+    /// Powtarzalne straty Trade/control nie giną przez dedup starego notice.
+    /// Odrębne od FSC/AccountUpdate; jeden licznik na provider, ten sam cap 64.
+    pub cpv_gap_generations: Vec<(String, u64)>,
+    pub cpv_overflow_generation: u64,
 }
 
 const MAX_RETAINED_LOCAL_COVERAGE_GAP_NOTICES: usize = 64;
@@ -957,6 +970,7 @@ impl IpcEgressQueue {
 
 fn seer_event_sequence(event: &SeerEvent) -> u64 {
     match event {
+        SeerEvent::PrimaryTradeFeedProgress(event) => event.sequence_number,
         SeerEvent::PoolDetected(event) => event.sequence_number,
         SeerEvent::Trade(event) => event.sequence_number,
         SeerEvent::FundingTransfer(event) => event.sequence_number,
@@ -967,6 +981,7 @@ fn seer_event_sequence(event: &SeerEvent) -> u64 {
 
 fn set_seer_event_sequence(event: &mut SeerEvent, sequence: u64) {
     match event {
+        SeerEvent::PrimaryTradeFeedProgress(event) => event.sequence_number = sequence,
         SeerEvent::PoolDetected(event) => event.sequence_number = sequence,
         SeerEvent::Trade(event) => event.sequence_number = sequence,
         SeerEvent::FundingTransfer(event) => event.sequence_number = sequence,
@@ -1051,9 +1066,41 @@ impl IpcSender {
         });
     }
 
+    fn report_cpv_gap(&self, provider_id: &str) {
+        self.local_coverage_gap_tx.send_modify(|state| {
+            if let Some((_, generation)) = state
+                .cpv_gap_generations
+                .iter_mut()
+                .find(|(provider, _)| provider == provider_id)
+            {
+                *generation = generation.saturating_add(1);
+            } else if state.cpv_gap_generations.len() < MAX_RETAINED_LOCAL_COVERAGE_GAP_NOTICES {
+                state.cpv_gap_generations.push((provider_id.to_string(), 1));
+            } else {
+                state.cpv_overflow_generation = state.cpv_overflow_generation.saturating_add(1);
+            }
+        });
+    }
+
     #[cfg(test)]
     pub(crate) fn dispatcher_queue_len(&self) -> usize {
         self.egress.len()
+    }
+
+    pub async fn send_primary_trade_feed_progress(
+        &self,
+        progress: crate::types::PrimaryTradeFeedProgressV1,
+    ) -> Result<(), IpcError> {
+        self.send_event_with_policy(
+            SeerEvent::PrimaryTradeFeedProgress(DetectedPrimaryTradeFeedProgress {
+                progress,
+                detected_at: std::time::SystemTime::now(),
+                sequence_number: 0,
+            }),
+            EventPriority::Normal,
+            BackpressurePolicy::Block,
+        )
+        .await
     }
 
     /// Send a pool detection event through the channel with backpressure handling
@@ -1281,6 +1328,10 @@ impl IpcSender {
 
         let boundary = ipc_event_boundary(&event);
         let provider_id = ipc_event_provider_id(&event);
+        let cpv_relevant = matches!(
+            &event,
+            SeerEvent::Trade(_) | SeerEvent::PrimaryTradeFeedProgress(_)
+        );
         let send_result = match self.egress.try_enqueue(event) {
             Ok(()) => {
                 self.local_gap.observe_admitted(boundary);
@@ -1306,7 +1357,7 @@ impl IpcSender {
                         "reason" => "ipc_egress_queue_saturated"
                     );
                     self.report_local_coverage_gap(
-                        provider_id,
+                        provider_id.clone(),
                         ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
                     );
                     Err(IpcError::LocalProcessingGap)
@@ -1317,6 +1368,9 @@ impl IpcSender {
             )),
         };
 
+        if send_result.is_err() && cpv_relevant {
+            self.report_cpv_gap(&provider_id);
+        }
         match send_result {
             Ok(_) => {
                 self.metrics.events_sent.inc();
@@ -1409,6 +1463,7 @@ pub struct IpcReceiver {
 /// Extract the `detected_at` timestamp from any `SeerEvent` variant.
 fn event_detected_at(event: &SeerEvent) -> &std::time::SystemTime {
     match event {
+        SeerEvent::PrimaryTradeFeedProgress(e) => &e.detected_at,
         SeerEvent::PoolDetected(e) => &e.detected_at,
         SeerEvent::Trade(e) => &e.detected_at,
         SeerEvent::FundingTransfer(e) => &e.detected_at,
@@ -1419,6 +1474,7 @@ fn event_detected_at(event: &SeerEvent) -> &std::time::SystemTime {
 
 fn ipc_event_provider_id(event: &SeerEvent) -> String {
     match event {
+        SeerEvent::PrimaryTradeFeedProgress(event) => event.progress.provider_id.clone(),
         SeerEvent::PoolDetected(event) => event
             .candidate
             .provider_id
@@ -2154,6 +2210,10 @@ mod tests {
         use solana_sdk::signature::Signature;
 
         crate::types::TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -2932,5 +2992,84 @@ mod tests {
             state.overflowed,
             "an unretained provider gap must be explicit so launcher can fail closed"
         );
+    }
+    #[tokio::test]
+    async fn m4_repeated_ipc_trade_losses_are_counted_after_recovery_without_funding_dependency() {
+        let config = IpcChannelConfig {
+            buffer_size: 2,
+            log_drops: false,
+            ..Default::default()
+        };
+        let (sender, mut receiver, _metrics) = create_ipc_channel(config);
+        let mut gap_rx = receiver.local_coverage_gap_receiver();
+        let mut trade = create_test_trade_event(true);
+        trade.provider_id = Some("primary".into());
+        let saturated = |sender: IpcSender, trade: crate::types::TradeEvent| async move {
+            sender.send_trade(trade, EventPriority::Normal).await
+        };
+        // Kolejka downstream=2 + jeden rekord dispatchera + egress=2.
+        for expected in 1..=2 {
+            saturated(sender.clone(), trade.clone()).await.unwrap();
+            wait_for_downstream_len(&receiver, expected).await;
+        }
+        saturated(sender.clone(), trade.clone()).await.unwrap();
+        wait_for_dispatcher_len(&sender, 0).await;
+        for expected in 1..=2 {
+            saturated(sender.clone(), trade.clone()).await.unwrap();
+            wait_for_dispatcher_len(&sender, expected).await;
+        }
+        for generation in 1..=2 {
+            assert!(saturated(sender.clone(), trade.clone()).await.is_err());
+            let state = gap_rx.borrow_and_update().clone();
+            assert_eq!(
+                state.cpv_gap_generations,
+                vec![("primary".into(), generation)]
+            );
+            assert_eq!(state.notices.len(), 1); // stare notices dedupują, nowe straty nie giną
+        }
+        for _ in 0..5 {
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let progress = crate::types::PrimaryTradeFeedProgressV1 {
+            provider_id: "primary".into(),
+            epoch: 1,
+            event_ms: 1000,
+            received_ms: 1000,
+            gap: false,
+        };
+        sender
+            .send_primary_trade_feed_progress(progress)
+            .await
+            .unwrap();
+        let event = receiver.recv().await.unwrap();
+        assert!(matches!(event,SeerEvent::PrimaryTradeFeedProgress(e) if !e.progress.gap));
+        // Segmentowa flaga bezpieczeństwa zachowuje starą semantykę, CPV używa
+        // dowodu nowego postępu zamiast wiecznej degradacji po tej fladze.
+        assert!(sender.has_unrecovered_local_gap());
+        sender.report_local_coverage_gap(
+            "funding",
+            ghost_core::LocalCoverageGapReasonV1::IpcEgressQueueSaturated,
+        );
+        assert_eq!(
+            gap_rx.borrow().cpv_gap_generations,
+            vec![("primary".into(), 2)]
+        );
+        sender.report_cpv_gap("primary");
+        assert_eq!(
+            gap_rx.borrow().cpv_gap_generations,
+            vec![("primary".into(), 3)]
+        );
+        for id in 0..256 {
+            sender.report_cpv_gap(&format!("provider-{id}"));
+        }
+        let state = gap_rx.borrow();
+        assert_eq!(
+            state.cpv_gap_generations.len(),
+            MAX_RETAINED_LOCAL_COVERAGE_GAP_NOTICES
+        );
+        assert!(state.cpv_overflow_generation > 0);
     }
 }

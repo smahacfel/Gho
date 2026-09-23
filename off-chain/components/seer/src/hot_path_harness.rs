@@ -57,6 +57,11 @@ const BASELINE_LEGACY_CANONICAL_PARITY_DIGEST_V1: &str =
 const BASELINE_FULL_PR1D_PARSER_SNAPSHOT_DIGEST_V2: &str =
     "02136d691e399dace85b112cc5b6d50c79323a2f24adcb3e7569ac68b40654a6";
 
+/// Receipt nowej projekcji V3 z poprawnymi raw saldami znanego użytkownika.
+/// Ustalony po sprawdzeniu każdej pary względem źródła, nie zamiast starych hashy.
+const CURRENT_KNOWN_USER_BALANCES_DIGEST_V3: &str =
+    "8bbab81dc77611bb5649a0c01405c896005fe713e2be3124afcec437e141d18f";
+
 /// Immutable raw source bytes for the legacy `global:create` fixture used by
 /// the pre-existing PR1D corpus.  Keep this literal rather than deriving it
 /// from a parser alias so a future instruction-name correction cannot silently
@@ -433,6 +438,20 @@ fn normalized_parity_events(
     (initialize_pool, trades)
 }
 
+/// Wyłącznie historyczna projekcja testowa PR1D, nigdy wejście runtime.
+/// V1/V2 nie miały pola dostępności M1 i odrzucały salda użytkowników off-curve.
+/// R3 poprawnie je zachowuje: aktualna semantyka jest kontrolowana osobno w V3.
+/// Pozostałe pola ekonomiczne, salda on-curve i provenance pozostają nietknięte.
+fn project_historical_trade_balances_v1_v2(trades: &mut [TradeEvent]) {
+    for trade in trades {
+        trade.metadata_availability = crate::types::TransactionMetadataAvailability::default();
+        if !trade.signer.is_on_curve() {
+            trade.signer_pre_balance_lamports = None;
+            trade.signer_post_balance_lamports = None;
+        }
+    }
+}
+
 /// Legacy V1 projection: exactly the serialized event fields available before
 /// PR1D.  This preserves the parent digest without treating the new structural
 /// evidence as a regression in pre-existing parser semantics.
@@ -441,6 +460,7 @@ fn legacy_canonical_parser_projection_v1(
     bundle: &ParsedTransactionBundle,
 ) -> LegacyCanonicalParserProjectionV1 {
     let (initialize_pool, mut trades) = normalized_parity_events(bundle);
+    project_historical_trade_balances_v1_v2(&mut trades);
     for trade in &mut trades {
         if let Some(provenance) = trade.provenance.as_mut() {
             // `inner_instruction_path` is the PR1D addition to the existing
@@ -467,6 +487,18 @@ struct FullPr1dParserSnapshotV2 {
     trade_observations: Vec<Option<ObservedPumpMutationV1>>,
 }
 
+/// Aktualny kontrakt testowy: pełne pola parsera, w tym raw salda znanego PDA.
+/// To nowy schemat snapshotu testowego, nie wersja metryk FTDI/DES z M6.
+#[derive(Clone, Debug, Serialize)]
+struct CurrentParserSnapshotV3 {
+    schema: &'static str,
+    fixture: String,
+    initialize_pool: Option<FullPr1dInitializePoolProjectionV2>,
+    initialize_pool_observation: Option<ObservedPumpMutationV1>,
+    trades: Vec<TradeEvent>,
+    trade_observations: Vec<Option<ObservedPumpMutationV1>>,
+}
+
 fn normalize_observation_provenance_time(observation: &mut ObservedPumpMutationV1) {
     // This timestamp is explicitly diagnostic-only and must not enter a
     // deterministic parser parity digest.
@@ -480,6 +512,23 @@ fn full_pr1d_parser_snapshot_v2(
     name: &str,
     bundle: &ParsedTransactionBundle,
 ) -> FullPr1dParserSnapshotV2 {
+    let current = current_parser_snapshot_v3(name, bundle);
+    let mut trades = current.trades;
+    project_historical_trade_balances_v1_v2(&mut trades);
+    FullPr1dParserSnapshotV2 {
+        schema: "canonical_parser_full_pr1d_snapshot_v2",
+        fixture: current.fixture,
+        initialize_pool: current.initialize_pool,
+        initialize_pool_observation: current.initialize_pool_observation,
+        trades,
+        trade_observations: current.trade_observations,
+    }
+}
+
+fn current_parser_snapshot_v3(
+    name: &str,
+    bundle: &ParsedTransactionBundle,
+) -> CurrentParserSnapshotV3 {
     let (initialize_pool, trades) = normalized_parity_events(bundle);
     let mut initialize_pool_observation = bundle.initialize_pool_observation.clone();
     if let Some(observation) = initialize_pool_observation.as_mut() {
@@ -490,8 +539,8 @@ fn full_pr1d_parser_snapshot_v2(
         normalize_observation_provenance_time(observation);
     }
 
-    FullPr1dParserSnapshotV2 {
-        schema: "canonical_parser_full_pr1d_snapshot_v2",
+    CurrentParserSnapshotV3 {
+        schema: "canonical_parser_known_user_balances_snapshot_v3",
         fixture: name.to_string(),
         initialize_pool: initialize_pool.map(Into::into),
         initialize_pool_observation,
@@ -1158,4 +1207,193 @@ async fn pr1b_hot_path_harness() {
         "PR1B_HOT_PATH_REPORT={}",
         serde_json::to_string_pretty(&report).expect("serialize report")
     );
+}
+
+#[test]
+fn rr1_current_parser_v3_keeps_exact_raw_balances_and_separate_legacy_contracts() {
+    let parser = BinaryParser::new(false);
+    let fixtures = [
+        ("ordinary_pump_buy", FixtureKind::PumpBuy, 1_u8),
+        ("ordinary_pump_sell", FixtureKind::PumpSell, 2_u8),
+        (
+            "create_and_initial_buy",
+            FixtureKind::CreateAndInitialBuy,
+            3_u8,
+        ),
+        (
+            "multiple_pump_mutations",
+            FixtureKind::MultiplePumpMutations,
+            4_u8,
+        ),
+        (
+            "pumpswap_trade_with_inner_instructions",
+            FixtureKind::PumpSwapInnerTrade,
+            5_u8,
+        ),
+    ];
+    let mut current_snapshots = Vec::new();
+    let mut offcurve_records = 0;
+    for (name, kind, seed) in fixtures {
+        let event = normalize_transaction(seed, kind);
+        let bundle = parser.parse_transaction_bundle(&event).unwrap();
+        let current = current_parser_snapshot_v3(name, &bundle);
+        let historical = full_pr1d_parser_snapshot_v2(name, &bundle);
+        let GeyserEvent::Transaction {
+            accounts,
+            pre_balances,
+            post_balances,
+            ..
+        } = &event
+        else {
+            panic!("fixture transakcji");
+        };
+        for (trade, old) in current.trades.iter().zip(&historical.trades) {
+            let index = accounts
+                .iter()
+                .position(|account| *account == trade.signer)
+                .unwrap();
+            assert_eq!(
+                trade.signer_pre_balance_lamports,
+                pre_balances.get(index).copied()
+            );
+            assert_eq!(
+                trade.signer_post_balance_lamports,
+                post_balances.get(index).copied()
+            );
+            assert!(trade.metadata_availability.status_known);
+            if !trade.signer.is_on_curve() {
+                offcurve_records += 1;
+                assert_eq!(trade.signer_pre_balance_lamports, Some(10_000_000_000));
+                assert_eq!(trade.signer_post_balance_lamports, Some(9_900_000_000));
+                assert_eq!(
+                    (
+                        old.signer_pre_balance_lamports,
+                        old.signer_post_balance_lamports
+                    ),
+                    (None, None)
+                );
+            } else {
+                assert_eq!(
+                    (
+                        trade.signer_pre_balance_lamports,
+                        trade.signer_post_balance_lamports
+                    ),
+                    (
+                        old.signer_pre_balance_lamports,
+                        old.signer_post_balance_lamports
+                    )
+                );
+            }
+            let mut now = serde_json::to_value(trade).unwrap();
+            let mut then = serde_json::to_value(old).unwrap();
+            // Jawnie wyliczona, minimalna różnica kontraktów. Wszystko inne
+            // (kwoty, rezerwy, opłaty, provenance, tożsamość) musi być identyczne.
+            for value in [&mut now, &mut then] {
+                for field in [
+                    "metadata_availability",
+                    "signer_pre_balance_lamports",
+                    "signer_post_balance_lamports",
+                ] {
+                    value.as_object_mut().unwrap().remove(field);
+                }
+            }
+            assert_eq!(now, then);
+        }
+        current_snapshots.push(current);
+    }
+    assert_eq!(offcurve_records, 5);
+    assert_eq!(
+        canonical_parity_digest(&current_snapshots),
+        CURRENT_KNOWN_USER_BALANCES_DIGEST_V3
+    );
+}
+
+#[test]
+fn rr1_current_snapshot_detects_balance_and_economic_drift_without_changing_history() {
+    let parser = BinaryParser::new(false);
+    let event = normalize_transaction(7, FixtureKind::PumpBuy);
+    let mut bundle = parser.parse_transaction_bundle(&event).unwrap();
+    assert!(!bundle.trades[0].signer.is_on_curve());
+    let actual = current_parser_snapshot_v3("pump_buy", &bundle);
+    let current_digest = canonical_parity_digest(std::slice::from_ref(&actual));
+    let old_v1 =
+        canonical_parity_digest(&[legacy_canonical_parser_projection_v1("pump_buy", &bundle)]);
+    let old_v2 = canonical_parity_digest(&[full_pr1d_parser_snapshot_v2("pump_buy", &bundle)]);
+    for remove_pre in [true, false] {
+        let mut changed = bundle.clone();
+        if remove_pre {
+            changed.trades[0].signer_pre_balance_lamports = None;
+        } else {
+            changed.trades[0].signer_post_balance_lamports = Some(9_800_000_000);
+        }
+        assert_ne!(
+            current_digest,
+            canonical_parity_digest(&[current_parser_snapshot_v3("pump_buy", &changed)])
+        );
+        assert_eq!(
+            old_v1,
+            canonical_parity_digest(&[legacy_canonical_parser_projection_v1("pump_buy", &changed)])
+        );
+        assert_eq!(
+            old_v2,
+            canonical_parity_digest(&[full_pr1d_parser_snapshot_v2("pump_buy", &changed)])
+        );
+    }
+    bundle.trades[0].amount += 1;
+    assert_ne!(
+        current_digest,
+        canonical_parity_digest(&[current_parser_snapshot_v3("pump_buy", &bundle)])
+    );
+    assert_ne!(
+        old_v1,
+        canonical_parity_digest(&[legacy_canonical_parser_projection_v1("pump_buy", &bundle)])
+    );
+    assert_ne!(
+        old_v2,
+        canonical_parity_digest(&[full_pr1d_parser_snapshot_v2("pump_buy", &bundle)])
+    );
+}
+
+#[test]
+fn rr1_legacy_projection_still_checks_oncurve_balances() {
+    use solana_sdk::signature::{Keypair, Signer};
+    let parser = BinaryParser::new(false);
+    let mut event = normalize_transaction(7, FixtureKind::PumpBuy);
+    let GeyserEvent::Transaction { accounts, .. } = &mut event else {
+        panic!("fixture transakcji");
+    };
+    accounts[6] = Keypair::new().pubkey();
+    let mut bundle = parser.parse_transaction_bundle(&event).unwrap();
+    assert!(bundle.trades[0].signer.is_on_curve());
+    for trade in [
+        legacy_canonical_parser_projection_v1("pump_buy", &bundle)
+            .trades
+            .remove(0),
+        full_pr1d_parser_snapshot_v2("pump_buy", &bundle)
+            .trades
+            .remove(0),
+        current_parser_snapshot_v3("pump_buy", &bundle)
+            .trades
+            .remove(0),
+    ] {
+        assert_eq!(trade.signer_pre_balance_lamports, Some(10_000_000_000));
+        assert_eq!(trade.signer_post_balance_lamports, Some(9_900_000_000));
+    }
+    let legacy =
+        canonical_parity_digest(&[legacy_canonical_parser_projection_v1("pump_buy", &bundle)]);
+    let full = canonical_parity_digest(&[full_pr1d_parser_snapshot_v2("pump_buy", &bundle)]);
+    bundle.trades[0].signer_post_balance_lamports = None;
+    assert_ne!(
+        legacy,
+        canonical_parity_digest(&[legacy_canonical_parser_projection_v1("pump_buy", &bundle)])
+    );
+    assert_ne!(
+        full,
+        canonical_parity_digest(&[full_pr1d_parser_snapshot_v2("pump_buy", &bundle)])
+    );
+}
+
+/// Istniejący raw fixture dla testu granicy CPV; nie zmienia frozen projekcji.
+pub(crate) fn pumpswap_primary_fixture_for_cpv() -> GeyserEvent {
+    normalize_transaction(5, FixtureKind::PumpSwapInnerTrade)
 }

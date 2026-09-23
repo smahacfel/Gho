@@ -34,6 +34,9 @@ pub struct FtdiValueMeasurementV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FtdiEvidenceV1 {
+    /// Nowy wzór ma osobny, jawnie wersjonowany rekord. Pola V1 nadal oznaczają K/N.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gini_simpson_v2: Option<crate::tx_intelligence::types::FtdiEvidenceV2>,
     pub legacy_value: FtdiValueMeasurementV1,
     pub value_v1: FtdiValueMeasurementV1,
     pub legacy_actionability_envelope: CanonicalMetricEnvelopeV1,
@@ -810,6 +813,40 @@ impl MetricContractsEvidenceSetV1 {
             &self.fee_topology_diversity_index.legacy_value,
         )?;
         validate_ftdi_measurement("ftdi_value_v1", &self.fee_topology_diversity_index.value_v1)?;
+        if let Some(v2) = &self.fee_topology_diversity_index.gini_simpson_v2 {
+            let ftdi = &self.fee_topology_diversity_index;
+            v2.validate()
+                .map_err(MetricContractEvidenceSemanticErrorV1::DerivedRatioMismatch)?;
+            if v2.buy_sample_count != u64::from(ftdi.value_v1.buy_transaction_sample_count)
+                || v2.signer_sample_count != u64::from(ftdi.value_v1.unique_buyer_sample_count)
+            {
+                return Err(MetricContractEvidenceSemanticErrorV1::CountInvariant(
+                    "ftdi_v2.population_parity",
+                ));
+            }
+
+            if v2.fee_topology_diversity_index.is_some() {
+                for historical in [&ftdi.legacy_value, &ftdi.value_v1] {
+                    if matches!(historical.value, CanonicalNullableV1::Value(_))
+                        && v2.unique_topology_count != u64::from(historical.unique_topology_count)
+                    {
+                        return Err(MetricContractEvidenceSemanticErrorV1::CountInvariant(
+                            "ftdi_v2.unique_topology_parity",
+                        ));
+                    }
+                }
+            }
+
+            if let (CanonicalNullableV1::Value(export_hhi), Some(v2_hhi)) =
+                (&ftdi.coordination_hhi, v2.coordination_hhi)
+            {
+                if export_hhi.to_bits() != v2_hhi.to_bits() {
+                    return Err(MetricContractEvidenceSemanticErrorV1::DerivedRatioMismatch(
+                        "ftdi_v2.coordination_hhi_parity",
+                    ));
+                }
+            }
+        }
 
         validate_dev_buy(
             "tx_intel_dev_first_observed",

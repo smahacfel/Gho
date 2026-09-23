@@ -2883,25 +2883,62 @@ impl Seer {
         info!("Seer is now listening for InitializePool events...");
 
         let mut workers = JoinSet::new();
+        let mut cpv_worker_gap = false;
+        let mut last_primary_progress: Option<types::PrimaryTradeFeedProgressV1> = None;
         while let Some(event_result) = event_stream.next().await {
             while workers.len() >= event_worker_concurrency {
                 if let Some(joined) = workers.join_next().await {
-                    if let Err(join_err) = joined {
-                        error!("Seer worker task failed: {}", join_err);
+                    if !matches!(joined, Ok(true)) {
+                        cpv_worker_gap = true;
+                        error!(
+                            "Seer worker failed before primary feed progress: {:?}",
+                            joined
+                        );
                     }
                 }
             }
 
             match event_result {
+                Ok(types::GeyserEvent::PrimaryTradeFeedProgress(mut progress)) => {
+                    // Bariera: progress nie może wyprzedzić Trade w równoległych
+                    // workerach ani w bounded IPC. Nie zmieniamy ich współbieżności.
+                    progress = Self::primary_trade_worker_barrier(
+                        &mut workers,
+                        progress,
+                        &mut cpv_worker_gap,
+                    )
+                    .await;
+                    last_primary_progress = Some(progress.clone());
+                    if let Err(error) = self
+                        .process_event(types::GeyserEvent::PrimaryTradeFeedProgress(progress))
+                        .await
+                    {
+                        cpv_worker_gap = true;
+                        error!(%error, "Primary feed progress could not reach IPC");
+                    }
+                }
                 Ok(event) => {
+                    let cpv_relevant = matches!(
+                        &event,
+                        types::GeyserEvent::Transaction {
+                            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+                            synthetic: false,
+                            ..
+                        }
+                    );
                     let seer = Arc::clone(&self);
                     workers.spawn(async move {
-                        if let Err(e) = seer.process_event(event).await {
-                            error!("Error processing event: {}", e);
+                        match seer.process_event(event).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                error!("Error processing event: {}", e);
+                                !cpv_relevant
+                            }
                         }
                     });
                 }
                 Err(e) => {
+                    cpv_worker_gap = true;
                     error!("Error receiving event: {}", e);
                     // Stream-level decode/provider failures must not kill Seer.
                     // The underlying connection handles reconnects independently.
@@ -2914,6 +2951,15 @@ impl Seer {
             if let Err(join_err) = joined {
                 error!("Seer worker task failed after stream end: {}", join_err);
             }
+        }
+
+        if let Some(mut progress) = last_primary_progress {
+            progress.gap = true;
+            progress.received_ms = types::ingress_epoch_ms();
+            progress.event_ms = progress.received_ms;
+            let _ = self
+                .process_event(types::GeyserEvent::PrimaryTradeFeedProgress(progress))
+                .await;
         }
 
         if let Some(funding_lane_task) = funding_lane_task {
@@ -4847,7 +4893,11 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             trade.slot.is_some(),
             inferred_timestamp_quality,
         );
-        self.hydrate_trade_mapping(&mut trade);
+        // Primary raw posiada tożsamość w dowodzie. Nie podmieniamy jej aliasem
+        // istniejącej sesji przed walidacją; starsze/syntetyczne ścieżki zachowują hydrate.
+        if !Self::is_complete_raw_observation(observation.as_ref()) {
+            self.hydrate_trade_mapping(&mut trade);
+        }
         let trade_ts_ms = trade
             .compat_event_ts_ms()
             .unwrap_or_else(types::ingress_epoch_ms);
@@ -4915,7 +4965,11 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         // but before we decide to buffer a mint=default trade. Re-check once here
         // to avoid buffering a trade when the mapping is already known (which could
         // otherwise miss the replay window if CREATE already drained an empty buffer).
-        self.hydrate_trade_mapping(&mut trade);
+        // Primary raw posiada tożsamość w dowodzie. Nie podmieniamy jej aliasem
+        // istniejącej sesji przed walidacją; starsze/syntetyczne ścieżki zachowują hydrate.
+        if !Self::is_complete_raw_observation(observation.as_ref()) {
+            self.hydrate_trade_mapping(&mut trade);
+        }
 
         match self.should_forward_trade_with_observation(
             &trade,
@@ -5058,7 +5112,11 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                         observations = observations.len(),
                         "Seer parser violated aligned trade-observation bundle invariant"
                     );
+                    self.cpv_primary_input_gap(event).await;
                     return (0, false);
+                }
+                if has_trade_candidate && parsed_trade_count == 0 {
+                    self.cpv_primary_input_gap(event).await;
                 }
                 if is_coverage_source && (has_trade_candidate || parsed_trade_count > 0) {
                     self.coverage.trade_candidate_total.fetch_add(1, Relaxed);
@@ -5091,7 +5149,9 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 // mapping/replay future.
                 let mut emitted_any = false;
                 for (trade, observation) in trades.into_iter().zip(observations) {
-                    emitted_any |= self
+                    let successful_buy = trade.is_buy
+                        && (!trade.metadata_availability.status_known || trade.success);
+                    let emitted = self
                         .handle_trade_event_with_observation(
                             trade,
                             observation,
@@ -5099,6 +5159,10 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                             is_coverage_source,
                         )
                         .await;
+                    if successful_buy && !emitted {
+                        self.cpv_primary_input_gap(event).await;
+                    }
+                    emitted_any |= emitted;
                 }
 
                 if is_coverage_source && emitted_any {
@@ -5127,7 +5191,72 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
     // A pool is only registered when its CREATE instruction is seen in the live stream.
 
     #[cfg_attr(test, allow(dead_code))]
+    async fn primary_trade_worker_barrier(
+        workers: &mut JoinSet<bool>,
+        mut progress: types::PrimaryTradeFeedProgressV1,
+        preceding_worker_gap: &mut bool,
+    ) -> types::PrimaryTradeFeedProgressV1 {
+        progress.gap |= *preceding_worker_gap;
+        while let Some(joined) = workers.join_next().await {
+            progress.gap |= !matches!(joined, Ok(true));
+        }
+        *preceding_worker_gap = false;
+        progress
+    }
+
+    async fn cpv_primary_input_gap(&self, event: &types::GeyserEvent) {
+        let types::GeyserEvent::Transaction {
+            provider_id: Some(provider_id),
+            provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
+            synthetic: false,
+            source,
+            metadata_availability,
+            success,
+            ..
+        } = event
+        else {
+            return;
+        };
+        if source != GRPC_GLOBAL_STREAM_SOURCE_LABEL
+            || (metadata_availability.status_known && !success)
+        {
+            return;
+        }
+        if let Some(ipc) = self.ipc_sender.as_ref() {
+            let now = types::ingress_epoch_ms();
+            let _ = ipc
+                .send_primary_trade_feed_progress(types::PrimaryTradeFeedProgressV1 {
+                    provider_id: provider_id.clone(),
+                    epoch: 0,
+                    event_ms: now,
+                    received_ms: now,
+                    gap: true,
+                })
+                .await;
+        }
+    }
+
     pub async fn process_event(&self, event: types::GeyserEvent) -> SeerResult<()> {
+        if let types::GeyserEvent::PrimaryTradeFeedProgress(mut progress) = event {
+            // Historyczna flaga IPC ma semantykę całego segmentu. Nie wolno nią
+            // na zawsze blokować CPV po pojedynczej stracie: nowe straty Trade
+            // docierają niezależnym, licznikowym control-plane, a okno się odbudowuje.
+            // Local segment flag pozostaje: ten stan rzeczywiście blokuje parser.
+            progress.gap |= self.local_segment_unreliable.load(Acquire);
+            if let Some(ipc) = self.ipc_sender.as_ref() {
+                ipc.send_primary_trade_feed_progress(progress)
+                    .await
+                    .map_err(|error| SeerError::ChannelSendError(error.to_string()))?;
+            }
+            return Ok(());
+        }
+        if matches!(&event, types::GeyserEvent::Transaction { metadata_availability, .. }
+            if !metadata_availability.status_known || !metadata_availability.inner_instructions_known)
+        {
+            // Nieznane inner instructions mogą ukrywać inne BUY (np. przez wrapper).
+            // To brak pokrycia feedu CPV, nie powód wyłączenia znanych danych M1–M3.
+            self.cpv_primary_input_gap(&event).await;
+        }
         if let types::GeyserEvent::LocalCoverageGap { gap } = &event {
             self.local_segment_unreliable.store(true, Release);
             if let Some(ipc_sender) = self.ipc_sender.as_ref() {
@@ -6120,6 +6249,10 @@ mod tests {
             accounts.push(Pubkey::new_unique());
         }
         types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -6408,6 +6541,10 @@ mod tests {
 
     fn test_trade(pool_amm_id: Pubkey, mint: Pubkey) -> types::TradeEvent {
         types::TradeEvent {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -6493,6 +6630,10 @@ mod tests {
         let payload = bincode::serialize(&types::SyntheticPayload::InitializePool(pool.clone()))
             .expect("serialize synthetic pool");
         types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -6582,6 +6723,10 @@ mod tests {
         };
 
         types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: Some("raw-primary".to_string()),
             provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
             observation_provenance: Some(observation_provenance),
@@ -6645,6 +6790,10 @@ mod tests {
 
         (
             types::GeyserEvent::Transaction {
+                metadata_availability: crate::types::TransactionMetadataAvailability {
+                    status_known: true,
+                    inner_instructions_known: true,
+                },
                 provider_id: None,
                 provider_role: None,
                 observation_provenance: None,
@@ -7297,6 +7446,10 @@ mod tests {
         let source = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
         let event = types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -7352,6 +7505,10 @@ mod tests {
         let recipient_owner = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let event = types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -8053,6 +8210,10 @@ mod tests {
         let payload = bincode::serialize(&types::SyntheticPayload::InitializePool(pool))
             .expect("serialize synthetic pool");
         let event = types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -8112,6 +8273,10 @@ mod tests {
             .expect("serialize synthetic trade");
 
         seer.process_event(types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -9346,6 +9511,10 @@ mod tests {
         let pumpswap_program =
             Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
         let event = types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -9388,6 +9557,10 @@ mod tests {
         let pumpfun_program =
             Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
         let event = types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -9436,6 +9609,10 @@ mod tests {
         let jupiter_program =
             Pubkey::from_str("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4").unwrap();
         let event = types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -9476,6 +9653,10 @@ mod tests {
         let dflow_program =
             Pubkey::from_str("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH").unwrap();
         let event = types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -9516,6 +9697,10 @@ mod tests {
         let pumpfun_program =
             Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
         let event = types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -9559,6 +9744,10 @@ mod tests {
         let pumpswap_program =
             Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
         let event = types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -10513,6 +10702,10 @@ mod tests {
         let trade = test_trade(Pubkey::new_unique(), Pubkey::new_unique());
         let payload = bincode::serialize(&types::SyntheticPayload::Trade(trade.clone())).unwrap();
         let event = types::GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,
@@ -11366,5 +11559,88 @@ mod tests {
                 .contains_key(&PendingTradeKey::ByCurve(curve.to_bytes())),
             "pending-trades buffer must drain after register_curve_mapping"
         );
+    }
+    #[tokio::test]
+    async fn m4_primary_progress_barrier_waits_for_prior_trade_and_reports_worker_failure() {
+        let (sender, mut receiver, _metrics) =
+            ipc::create_ipc_channel(ipc::IpcChannelConfig::default());
+        let sender2 = sender.clone();
+        let trade = test_trade(Pubkey::new_unique(), Pubkey::new_unique());
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let ready2 = ready.clone();
+        let mut workers = JoinSet::new();
+        workers.spawn(async move {
+            ready2.notified().await;
+            sender2
+                .send_trade_with_observation(trade, None, ipc::EventPriority::Normal)
+                .await
+                .is_ok()
+        });
+        let progress = types::PrimaryTradeFeedProgressV1 {
+            provider_id: "primary".into(),
+            epoch: 1,
+            event_ms: 2000,
+            received_ms: 2000,
+            gap: false,
+        };
+        ready.notify_one();
+        let mut gap = false;
+        let proof =
+            Seer::primary_trade_worker_barrier(&mut workers, progress.clone(), &mut gap).await;
+        assert!(workers.is_empty());
+        assert!(!proof.gap);
+        sender
+            .send_primary_trade_feed_progress(proof)
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ipc::SeerEvent::Trade(_))
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ipc::SeerEvent::PrimaryTradeFeedProgress(_))
+        ));
+        workers.spawn(async { false });
+        let bad =
+            Seer::primary_trade_worker_barrier(&mut workers, progress.clone(), &mut gap).await;
+        assert!(bad.gap);
+        assert!(!gap);
+        let next = Seer::primary_trade_worker_barrier(&mut workers, progress, &mut gap).await;
+        assert!(!next.gap); // nowa ciągłość może zacząć się, ale CPV wymaga całego okna
+    }
+    #[tokio::test]
+    async fn m4_complete_raw_trade_keeps_source_pool_despite_existing_session_alias() {
+        let (sender, mut receiver, _) = create_ipc_channel(IpcChannelConfig::default());
+        let seer = Seer::new_with_ipc(SeerConfig::default(), sender);
+        let raw = crate::hot_path_harness::pumpswap_primary_fixture_for_cpv();
+        let mut bundle = binary_parser::BinaryParser::new(false)
+            .parse_transaction_bundle(&raw)
+            .unwrap();
+        let trade = bundle.trades.remove(0);
+        let observation = bundle.trade_observations.remove(0).unwrap();
+        assert!(trade.is_pumpswap);
+        assert!(Seer::is_complete_raw_observation(Some(&observation)));
+        let actual = trade.pool_amm_id;
+        let mint = trade.mint;
+        let alias = Pubkey::new_unique();
+        seer.set_curve_mapping(alias, mint, "test", true);
+        let mut legacy = trade.clone();
+        seer.hydrate_trade_mapping(&mut legacy);
+        assert_eq!(legacy.pool_amm_id, alias);
+        assert_ne!(actual, alias);
+        assert!(
+            seer.handle_trade_event_with_observation(
+                trade,
+                Some(observation),
+                "grpc_global_stream",
+                false
+            )
+            .await
+        );
+        let SeerEvent::Trade(event) = receiver.recv().await.unwrap() else {
+            panic!("trade");
+        };
+        assert_eq!(event.trade.pool_amm_id, actual);
     }
 }

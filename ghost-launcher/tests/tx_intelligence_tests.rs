@@ -38,12 +38,22 @@ fn test_tx(
     is_dev_buy: bool,
 ) -> PoolTransaction {
     PoolTransaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         semantic: EventSemanticEnvelope::default(),
         pool_amm_id: pool_id.to_string(),
         slot: Some(1),
         event_ordinal: Some(ordinal),
         tx_index: None,
         outer_instruction_index: None,
+        inner_instruction_path: None,
         inner_group_index: None,
         outer_program_id: None,
         cpi_stack_height: None,
@@ -74,11 +84,6 @@ fn test_tx(
         token_mint: None,
         v_tokens_in_bonding_curve: None,
         v_sol_in_bonding_curve: None,
-        virtual_sol_reserves: None,
-        virtual_token_reserves: None,
-        real_sol_reserves: None,
-        real_token_reserves: None,
-        complete: None,
         market_cap_sol: None,
         global_config: None,
         fee_recipient: None,
@@ -597,6 +602,75 @@ fn session_decision_time_series_retains_beyond_gatekeeper_dedupe_fifo_capacity()
         tx_count as u64
     );
     assert_eq!(features.decision_time_series.dropped_oldest_count, 0);
+}
+
+#[test]
+fn des_v2_complete_value_reaches_real_mfs_without_recompute() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let bonding_curve = Pubkey::new_unique();
+    let gatekeeper_config = GatekeeperV2Config::default();
+    let funding_source_config = FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis() as u64;
+
+    manager
+        .open_session(OpenSessionRequest {
+            pool_amm_id: pool_id,
+            base_mint,
+            bonding_curve,
+            dev_wallet: Some(Pubkey::new_unique()),
+            candidate_snapshot: candidate(pool_id, base_mint, bonding_curve),
+            created_at_wall_ms: now_ms,
+            deadline_wall_ms: Some(now_ms + 60_000),
+            gatekeeper_config,
+            funding_source_config,
+            fingerprint_config: EarlyFingerprintConfig::default(),
+        })
+        .expect("session should open");
+    let session = manager
+        .get_session(&pool_id)
+        .expect("session should be retrievable");
+
+    let reserves = [10_000u64, 11_000, 13_200, 17_160, 24_024];
+    let slots = [10u64, 11, 13, 16, 20];
+    let mut txs = Vec::new();
+    for index in 0..5 {
+        let mut tx = test_tx(
+            pool_id,
+            Pubkey::new_unique(),
+            &solana_sdk::signature::Signature::new_unique().to_string(),
+            index as u32,
+            now_ms + index as u64,
+            true,
+            1.0,
+            false,
+        );
+        tx.slot = Some(slots[index]);
+        tx.tx_index = Some(index as u32);
+        tx.virtual_sol_reserves = Some(reserves[index]);
+        tx.virtual_token_reserves = Some(1_000);
+        tx.token_mint = Some(base_mint.to_string());
+        txs.push(tx);
+    }
+
+    let expected = ghost_launcher::tx_intelligence::compute_des(&txs);
+    assert_eq!(expected.demand_elasticity_score, Some(1.0));
+    assert!(expected.has_full_quality());
+
+    for tx in txs {
+        session.write().ingest_transaction(Arc::new(tx));
+    }
+    let features = session.read().try_materialize_features().unwrap();
+
+    assert_eq!(features.sybil_resistance.demand_elasticity_score, None);
+    assert_eq!(
+        features.sybil_resistance.demand_elasticity_v2,
+        Some(expected)
+    );
 }
 
 #[test]

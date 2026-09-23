@@ -205,6 +205,10 @@ fn organic_tx(
     is_buy: bool,
 ) -> PoolTransaction {
     PoolTransaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
         semantic: ghost_core::EventSemanticEnvelope::default(),
         pool_amm_id: pool_id.to_string(),
         signer: signer.to_string(),
@@ -217,6 +221,7 @@ fn organic_tx(
         event_ordinal: Some(0),
         tx_index: None,
         outer_instruction_index: None,
+        inner_instruction_path: None,
         inner_group_index: None,
         outer_program_id: None,
         cpi_stack_height: None,
@@ -237,6 +242,11 @@ fn organic_tx(
         mpcf_payload_missing_reason: RawBytesMissingReason::NotMissing,
         v_tokens_in_bonding_curve: None,
         v_sol_in_bonding_curve: None,
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         market_cap_sol: None,
         global_config: None,
         fee_recipient: None,

@@ -29,7 +29,7 @@ use ghost_core::tx_intelligence::types::{
     DES_INSUFFICIENT_BUYS_REASON, DES_SLOT_ORDER_UNAVAILABLE_REASON,
     FSC_FUNDING_STREAM_UNAVAILABLE_REASON, FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
     FSC_ROLLING_STATE_UNAVAILABLE_REASON, FTDI_INSUFFICIENT_BUYS_REASON,
-    FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON, SFD_INSUFFICIENT_BUYS_REASON,
+    FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON,
 };
 use ghost_core::ShadowLedgerStaleFallback;
 use seer::early_fingerprint::EarlyFingerprintMetrics;
@@ -1274,7 +1274,21 @@ fn evaluate_prosperity_filter(
         .as_ref()
         .map(|diversity| diversity.hhi)
         .unwrap_or(assessment.feature_snapshot.tx_intel_features.hhi);
-    let fee_topology_diversity_index = sybil.fee_topology_diversity_index;
+    let branch3_ftdi = ftdi_comparison_value(
+        sybil,
+        config.prosperity_branch3_min_fee_topology_diversity_index,
+        config
+            .sybil_thresholds_v2
+            .prosperity_branch3_ftdi_gini_simpson_min,
+    );
+    let overlay_ftdi = ftdi_comparison_value(
+        sybil,
+        config.prosperity_overlay_min_fee_topology_diversity_index,
+        config
+            .sybil_thresholds_v2
+            .prosperity_overlay_ftdi_gini_simpson_min,
+    );
+    let ftdi_actionable = branch3_ftdi.is_some();
 
     let branch1_pass = block0_sniped_supply_pct
         .is_some_and(|value| value >= config.prosperity_branch1_min_block0_sniped_supply_pct)
@@ -1285,21 +1299,24 @@ fn evaluate_prosperity_filter(
             value >= config.prosperity_branch2_min_early_slot_volume_dominance_buy
         });
     let branch3_pass = hhi <= config.prosperity_branch3_max_hhi
-        && fee_topology_diversity_index.is_some_and(|value| {
-            value >= config.prosperity_branch3_min_fee_topology_diversity_index
-        });
+        && branch3_ftdi.is_some_and(|(value, threshold)| value >= threshold);
 
     let overlay_price_change_pass = overlay_enabled
         .then_some(curve.price_change_ratio <= config.prosperity_overlay_max_price_change_ratio);
     let overlay_bonding_progress_pass = overlay_enabled.then_some(
         curve.bonding_progress_pct <= config.prosperity_overlay_max_bonding_progress_pct,
     );
+    // Brak uzgodnionego progu nowej definicji wyłącza wyłącznie to porównanie.
+    // Nie udajemy zaliczenia FTDI ani braku pomiaru; pozostałe bramki działają.
+    let overlay_ftdi_comparison_disabled = sybil.fee_topology_diversity_v2.is_some()
+        && config
+            .sybil_thresholds_v2
+            .prosperity_overlay_ftdi_gini_simpson_min
+            .is_none();
     let overlay_ftdi_actionable =
-        !overlay_enabled || sybil_metric_is_actionable(sybil, SybilMetric::Ftdi);
-    let overlay_fee_topology_diversity_pass = if overlay_enabled && overlay_ftdi_actionable {
-        Some(fee_topology_diversity_index.is_some_and(|value| {
-            value >= config.prosperity_overlay_min_fee_topology_diversity_index
-        }))
+        !overlay_enabled || overlay_ftdi_comparison_disabled || overlay_ftdi.is_some();
+    let overlay_fee_topology_diversity_pass = if overlay_enabled {
+        overlay_ftdi.map(|(value, threshold)| value >= threshold)
     } else {
         None
     };
@@ -1330,7 +1347,8 @@ fn evaluate_prosperity_filter(
     let overlay_globals_pass = !overlay_enabled
         || (overlay_price_change_pass == Some(true)
             && overlay_bonding_progress_pass == Some(true)
-            && overlay_fee_topology_diversity_pass == Some(true));
+            && (overlay_ftdi_comparison_disabled
+                || overlay_fee_topology_diversity_pass == Some(true)));
     let overlay_branch23_pass = !overlay_enabled || overlay_branch23_sell_buy_pass == Some(true);
     let overlay_branch2_price_pass =
         !overlay_enabled || overlay_branch2_price_change_pass == Some(true);
@@ -1406,7 +1424,7 @@ fn evaluate_prosperity_filter(
         cpv_pass: Some(cpv_pass),
         branch1_pass: Some(branch1_pass),
         branch2_pass: Some(branch2_pass),
-        branch3_pass: Some(branch3_pass),
+        branch3_pass: ftdi_actionable.then_some(branch3_pass),
         overlay_enabled,
         overlay_pass,
         overlay_price_change_pass,
@@ -2778,7 +2796,7 @@ pub fn build_timeout_decision_from_assessment(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SybilMetric {
+pub(super) enum SybilMetric {
     Ftdi,
     Dbia,
     Sfd,
@@ -3005,11 +3023,79 @@ fn has_degraded_reason(reasons: &[String], target: &str) -> bool {
     reasons.iter().any(|reason| reason == target)
 }
 
-fn sybil_metric_is_actionable(sybil: &SybilResistanceFeatures, metric: SybilMetric) -> bool {
+pub(super) fn sybil_metric_is_actionable(
+    sybil: &SybilResistanceFeatures,
+    metric: SybilMetric,
+) -> bool {
+    // Ten helper zachowuje historyczne porównania FTDI/DES. Nowe definicje
+    // przechodzą wyłącznie przez resolver wiążący pomiar z jawnym progiem V2.
+    if (matches!(metric, SybilMetric::Des) && sybil.demand_elasticity_v2.is_some())
+        || (matches!(metric, SybilMetric::Ftdi) && sybil.fee_topology_diversity_v2.is_some())
+    {
+        return false;
+    }
+    match metric {
+        SybilMetric::Dbia if sybil.dbia_evidence_v1.is_some() => {
+            let evidence = sybil.dbia_evidence_v1.as_ref().unwrap();
+            return evidence.has_full_quality()
+                && evidence.dev_buyer_infrastructure_affinity
+                    == sybil.dev_buyer_infrastructure_affinity;
+        }
+        SybilMetric::Sfd if sybil.sfd_evidence_v1.is_some() => {
+            let evidence = sybil.sfd_evidence_v1.as_ref().unwrap();
+            return evidence.has_full_quality()
+                && evidence.spend_fraction_divergence == sybil.spend_fraction_divergence;
+        }
+        SybilMetric::Cpv
+            if sybil.cpv_evidence.source
+                != ghost_core::checkpoint::CpvMetricSource::Unavailable
+                || sybil.cpv_evidence.sample_count.is_some()
+                || sybil.measurement_cutoff_received_ms.is_some() =>
+        {
+            let evidence = &sybil.cpv_evidence;
+            return evidence.source
+                == ghost_core::checkpoint::CpvMetricSource::SuccessfulBuyRollingIndex
+                && evidence.quality == ghost_core::checkpoint::MetricEvidenceQuality::Clean
+                && evidence.rolling_state_available == Some(true)
+                && evidence
+                    .sample_count
+                    .zip(evidence.required_clean_sample_count)
+                    .is_some_and(|(actual, required)| required > 0 && actual >= required)
+                && evidence.degraded_reasons.is_empty()
+                && evidence.signer_cross_pool_velocity == sybil.signer_cross_pool_velocity
+                && evidence
+                    .signer_cross_pool_velocity
+                    .is_some_and(|v| v.is_finite() && (0.0..=1.0).contains(&v));
+        }
+        // Współczesny snapshot nie może odzyskać jakości przez usunięcie evidence.
+        SybilMetric::Ftdi | SybilMetric::Dbia | SybilMetric::Sfd | SybilMetric::Des
+            if sybil.measurement_cutoff_received_ms.is_some() =>
+        {
+            return false
+        }
+        _ => {}
+    }
+    let input_prefix = match metric {
+        SybilMetric::Ftdi => Some("FTDI_INPUT_"),
+        SybilMetric::Dbia => Some("DBIA_INPUT_"),
+        SybilMetric::Sfd => Some("SFD_INPUT_"),
+        SybilMetric::Des => Some("DES_INPUT_"),
+        SybilMetric::Cpv | SybilMetric::Fsc => None,
+    };
+    if input_prefix.is_some_and(|prefix| {
+        sybil
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason.starts_with(prefix))
+    }) {
+        return false;
+    }
     let value_present = match metric {
         SybilMetric::Ftdi => sybil.fee_topology_diversity_index.is_some(),
         SybilMetric::Dbia => sybil.dev_buyer_infrastructure_affinity.is_some(),
-        SybilMetric::Sfd => sybil.spend_fraction_divergence.is_some(),
+        SybilMetric::Sfd => sybil
+            .spend_fraction_divergence
+            .is_some_and(|value| value.is_finite() && (0.0..=0.5).contains(&value)),
         SybilMetric::Des => sybil.demand_elasticity_score.is_some(),
         SybilMetric::Cpv => sybil.signer_cross_pool_velocity.is_some(),
         SybilMetric::Fsc => sybil.funding_source_concentration.is_some(),
@@ -3035,7 +3121,12 @@ fn sybil_metric_is_actionable(sybil: &SybilResistanceFeatures, metric: SybilMetr
                 )
         }
         SybilMetric::Sfd => {
-            has_degraded_reason(&sybil.degraded_reasons, SFD_INSUFFICIENT_BUYS_REASON)
+            // Częściowe salda i pominięci signerzy nie mogą dawać sygnału,
+            // premii ani kary; nie blokujemy z tego powodu innych metryk.
+            sybil
+                .degraded_reasons
+                .iter()
+                .any(|reason| reason.starts_with("SFD_"))
         }
         SybilMetric::Des => {
             has_degraded_reason(&sybil.degraded_reasons, DES_INSUFFICIENT_BUYS_REASON)
@@ -3066,16 +3157,106 @@ fn sybil_metric_is_actionable(sybil: &SybilResistanceFeatures, metric: SybilMetr
     !degraded
 }
 
+/// Para pochodzi wyłącznie z pasującej definicji. Brak V2 nie uruchamia progu V1.
+pub(super) fn ftdi_comparison_value(
+    sybil: &SybilResistanceFeatures,
+    legacy_threshold: f64,
+    gini_simpson_threshold: Option<f64>,
+) -> Option<(f64, f64)> {
+    if let Some(evidence) = &sybil.fee_topology_diversity_v2 {
+        let threshold =
+            gini_simpson_threshold.filter(|v| v.is_finite() && (0.0..=1.0).contains(v))?;
+        return evidence
+            .has_full_quality()
+            .then_some((evidence.fee_topology_diversity_index?, threshold));
+    }
+    sybil_metric_is_actionable(sybil, SybilMetric::Ftdi)
+        .then_some((sybil.fee_topology_diversity_index?, legacy_threshold))
+}
+
+fn des_comparison_value(
+    sybil: &SybilResistanceFeatures,
+    legacy_threshold: f64,
+    next_buy_slot_tau_b_threshold: Option<f64>,
+) -> Option<(f64, f64)> {
+    if let Some(evidence) = &sybil.demand_elasticity_v2 {
+        let threshold =
+            next_buy_slot_tau_b_threshold.filter(|v| v.is_finite() && (-1.0..=1.0).contains(v))?;
+        return evidence
+            .has_full_quality()
+            .then_some((evidence.demand_elasticity_score?, threshold));
+    }
+    sybil_metric_is_actionable(sybil, SybilMetric::Des)
+        .then_some((sybil.demand_elasticity_score?, legacy_threshold))
+}
+
+pub(super) fn sybil_comparison_reasons(
+    sybil: &SybilResistanceFeatures,
+    config: &GatekeeperV2Config,
+) -> Vec<String> {
+    use ghost_core::tx_intelligence::types::{
+        DES_COMPARISON_DEFINITION_MISMATCH_REASON, FTDI_COMPARISON_DEFINITION_MISMATCH_REASON,
+    };
+    let mut reasons: Vec<_> = sybil
+        .degraded_reasons
+        .iter()
+        .filter(|r| {
+            r.as_str() != DES_COMPARISON_DEFINITION_MISMATCH_REASON
+                && r.as_str() != FTDI_COMPARISON_DEFINITION_MISMATCH_REASON
+        })
+        .cloned()
+        .collect();
+    for (present, threshold, minimum, reason) in [
+        (
+            sybil.fee_topology_diversity_v2.is_some(),
+            config.sybil_thresholds_v2.ftdi_gini_simpson_min,
+            0.0,
+            FTDI_COMPARISON_DEFINITION_MISMATCH_REASON,
+        ),
+        (
+            sybil.demand_elasticity_v2.is_some(),
+            config.sybil_thresholds_v2.des_next_buy_slot_tau_b_min,
+            -1.0,
+            DES_COMPARISON_DEFINITION_MISMATCH_REASON,
+        ),
+        (
+            sybil.fee_topology_diversity_v2.is_some() && config.enable_prosperity_filter,
+            config
+                .sybil_thresholds_v2
+                .prosperity_branch3_ftdi_gini_simpson_min,
+            0.0,
+            "FTDI_PROSPERITY_BRANCH3_COMPARISON_DEFINITION_MISMATCH",
+        ),
+        (
+            sybil.fee_topology_diversity_v2.is_some()
+                && config.enable_prosperity_filter
+                && config.enable_prosperity_overlay,
+            config
+                .sybil_thresholds_v2
+                .prosperity_overlay_ftdi_gini_simpson_min,
+            0.0,
+            "FTDI_PROSPERITY_OVERLAY_COMPARISON_DEFINITION_MISMATCH",
+        ),
+    ] {
+        if present && !threshold.is_some_and(|v| v.is_finite() && (minimum..=1.0).contains(&v)) {
+            reasons.push(reason.to_string());
+        }
+    }
+    reasons
+}
+
 fn compute_sybil_soft_signals(
     sybil: &SybilResistanceFeatures,
     config: &GatekeeperV2Config,
 ) -> SybilSoftSignals {
     let mut signals = SybilSoftSignals::default();
 
-    if sybil_metric_is_actionable(sybil, SybilMetric::Ftdi) {
-        signals.low_ftdi = sybil
-            .fee_topology_diversity_index
-            .is_some_and(|value| value < config.min_fee_topology_diversity_index);
+    if let Some((value, threshold)) = ftdi_comparison_value(
+        sybil,
+        config.min_fee_topology_diversity_index,
+        config.sybil_thresholds_v2.ftdi_gini_simpson_min,
+    ) {
+        signals.low_ftdi = value < threshold;
     }
     if sybil_metric_is_actionable(sybil, SybilMetric::Dbia) {
         signals.high_dbia = sybil
@@ -3087,10 +3268,12 @@ fn compute_sybil_soft_signals(
             .spend_fraction_divergence
             .is_some_and(|value| value < config.min_spend_fraction_divergence);
     }
-    if sybil_metric_is_actionable(sybil, SybilMetric::Des) {
-        signals.low_des = sybil
-            .demand_elasticity_score
-            .is_some_and(|value| value < config.min_demand_elasticity_score);
+    if let Some((value, threshold)) = des_comparison_value(
+        sybil,
+        config.min_demand_elasticity_score,
+        config.sybil_thresholds_v2.des_next_buy_slot_tau_b_min,
+    ) {
+        signals.low_des = value < threshold;
     }
     if sybil_metric_is_actionable(sybil, SybilMetric::Cpv) {
         signals.high_cpv = sybil
@@ -3330,7 +3513,7 @@ pub(crate) fn build_sybil_policy_diagnostics(
         lead_signal: select_sybil_lead_signal(&component_activity),
         interference_patterns,
         meta_score: config.emit_sybil_meta_score.then_some(soft_points),
-        metric_degraded_reasons: sybil.degraded_reasons.clone(),
+        metric_degraded_reasons: sybil_comparison_reasons(sybil, config),
     }
 }
 
@@ -3573,7 +3756,8 @@ mod tests {
         TxSegmentSequence,
     };
     use ghost_core::tx_intelligence::types::{
-        SFD_PARTIAL_BALANCE_COVERAGE_REASON, SFD_ZERO_PREBALANCE_SKIPPED_REASON,
+        SFD_INSUFFICIENT_BUYS_REASON, SFD_PARTIAL_BALANCE_COVERAGE_REASON,
+        SFD_ZERO_PREBALANCE_SKIPPED_REASON,
     };
     use solana_sdk::pubkey::Pubkey;
 
@@ -3791,6 +3975,7 @@ mod tests {
             cpv_other_pool_activity: Some(0.50),
             cpv_evidence: CpvEvidenceContext {
                 quality: MetricEvidenceQuality::Clean,
+                source: ghost_core::checkpoint::CpvMetricSource::SuccessfulBuyRollingIndex,
                 signer_cross_pool_velocity: Some(0.12),
                 cpv_other_pool_activity: Some(0.50),
                 sample_count: Some(3),
@@ -3813,6 +3998,7 @@ mod tests {
             .signer_cross_pool_velocity = value;
         assessment.feature_snapshot.sybil_resistance.cpv_evidence = CpvEvidenceContext {
             quality: MetricEvidenceQuality::DegradedLowSample,
+            source: ghost_core::checkpoint::CpvMetricSource::SuccessfulBuyRollingIndex,
             signer_cross_pool_velocity: value,
             cpv_other_pool_activity: Some(0.40),
             sample_count: Some(2),
@@ -4726,7 +4912,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_balance_coverage_keeps_sfd_actionable() {
+    fn partial_balance_coverage_blocks_sfd_actionability() {
         let mut config = GatekeeperV2Config::default();
         config.min_spend_fraction_divergence = 0.25;
 
@@ -4740,12 +4926,12 @@ mod tests {
 
         let diagnostics = build_sybil_policy_diagnostics(&assessment, &config, false);
 
-        assert!(diagnostics.soft_signals.low_sfd);
-        assert_eq!(diagnostics.soft_points, config.soft_penalty_low_sfd as u16);
+        assert!(!diagnostics.soft_signals.low_sfd);
+        assert_eq!(diagnostics.soft_points, 0);
     }
 
     #[test]
-    fn zero_prebalance_skip_keeps_sfd_actionable() {
+    fn zero_prebalance_skip_blocks_sfd_actionability() {
         let mut config = GatekeeperV2Config::default();
         config.min_spend_fraction_divergence = 0.25;
 
@@ -4759,8 +4945,8 @@ mod tests {
 
         let diagnostics = build_sybil_policy_diagnostics(&assessment, &config, false);
 
-        assert!(diagnostics.soft_signals.low_sfd);
-        assert_eq!(diagnostics.soft_points, config.soft_penalty_low_sfd as u16);
+        assert!(!diagnostics.soft_signals.low_sfd);
+        assert_eq!(diagnostics.soft_points, 0);
     }
 
     #[test]
@@ -4930,5 +5116,278 @@ mod tests {
         assert_eq!(decision.verdict_type, GatekeeperVerdictType::Buy);
         assert_eq!(decision.alpha_gate.pass, None);
         assert!(!decision.alpha_gate.enabled);
+    }
+    #[test]
+    fn m1_input_quality_is_checked_per_metric_not_by_value_presence() {
+        let full = SybilResistanceFeatures {
+            fee_topology_diversity_index: Some(0.5),
+            dev_buyer_infrastructure_affinity: Some(1.0),
+            spend_fraction_divergence: Some(0.1),
+            demand_elasticity_score: Some(0.5),
+            ..Default::default()
+        };
+        for (blocked, reason) in [
+            (SybilMetric::Ftdi, "FTDI_INPUT_STATUS_UNAVAILABLE"),
+            (SybilMetric::Dbia, "DBIA_INPUT_ORDER_UNAVAILABLE"),
+            (SybilMetric::Sfd, "SFD_INPUT_RECEIPT_TIME_UNAVAILABLE"),
+            (SybilMetric::Des, "DES_INPUT_EVENT_IDENTITY_UNAVAILABLE"),
+        ] {
+            assert!(sybil_metric_is_actionable(&full, blocked));
+            let mut partial = full.clone();
+            partial.degraded_reasons.push(reason.to_string());
+            assert!(!sybil_metric_is_actionable(&partial, blocked));
+            for other in [
+                SybilMetric::Ftdi,
+                SybilMetric::Dbia,
+                SybilMetric::Sfd,
+                SybilMetric::Des,
+            ] {
+                if std::mem::discriminant(&other) != std::mem::discriminant(&blocked) {
+                    assert!(sybil_metric_is_actionable(&partial, other));
+                }
+            }
+        }
+    }
+    #[test]
+    fn m5_des_v2_does_not_use_legacy_v1_threshold_contract() {
+        use ghost_core::tx_intelligence::types::{
+            DesDefinitionV2, DesEvidenceV2, DesIntervalUnitV2, DesPriceSourceV2,
+        };
+
+        let legacy_only = SybilResistanceFeatures {
+            demand_elasticity_score: Some(-0.5),
+            ..Default::default()
+        };
+        assert!(sybil_metric_is_actionable(&legacy_only, SybilMetric::Des));
+
+        let v2 = DesEvidenceV2 {
+            definition: DesDefinitionV2::NextBuySlotTauB,
+            interval_unit: DesIntervalUnitV2::Slots,
+            price_source: DesPriceSourceV2::PumpVirtualPostTradeReserves,
+            demand_elasticity_score: Some(1.0),
+            degraded_reasons: Vec::new(),
+            buy_sample_count: 5,
+            signer_sample_count: 5,
+            priced_buy_count: 5,
+            candidate_triple_count: 3,
+            closed_triple_count: 3,
+        };
+        let v2_present = SybilResistanceFeatures {
+            demand_elasticity_score: None,
+            demand_elasticity_v2: Some(v2),
+            ..Default::default()
+        };
+        assert!(!sybil_metric_is_actionable(&v2_present, SybilMetric::Des));
+    }
+
+    #[test]
+    fn m1_prosperity_branch_does_not_reward_incomplete_ftdi() {
+        let mut config = GatekeeperV2Config::default();
+        config.enable_prosperity_filter = true;
+        config.enable_prosperity_overlay = false;
+        config.prosperity_branch2_min_market_cap_sol = f64::MAX;
+        config.prosperity_branch3_max_hhi = 1.0;
+        config.prosperity_branch3_min_fee_topology_diversity_index = 0.1;
+        let mut assessment = strict_ready_assessment();
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .fee_topology_diversity_index = Some(0.5);
+        let measured = evaluate_prosperity_filter(&assessment, &config);
+        assert_eq!(measured.branch3_pass, Some(true));
+        assert!(measured.matched_branches.contains(&"organic_structure"));
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .degraded_reasons
+            .push("FTDI_INPUT_STATUS_UNAVAILABLE".to_string());
+        let incomplete = evaluate_prosperity_filter(&assessment, &config);
+        assert_eq!(incomplete.branch3_pass, None);
+        assert!(!incomplete.matched_branches.contains(&"organic_structure"));
+        assert_eq!(incomplete.cpv_pass, measured.cpv_pass);
+        assert_eq!(incomplete.branch1_pass, measured.branch1_pass);
+        assert_eq!(incomplete.branch2_pass, measured.branch2_pass);
+    }
+    #[test]
+    fn m3_sfd_quality_gate_blocks_all_missing_balance_causes_but_not_other_metrics() {
+        use ghost_core::tx_intelligence::types::{
+            SFD_INVALID_BALANCE_PAIR_REASON, SFD_POSTBALANCE_UNAVAILABLE_REASON,
+        };
+        let mut config = GatekeeperV2Config::default();
+        config.min_spend_fraction_divergence = 0.25;
+        config.soft_penalty_low_sfd = 2;
+        config.min_demand_elasticity_score = 0.0;
+        config.soft_penalty_inelastic_demand = 3;
+        let full = SybilResistanceFeatures {
+            spend_fraction_divergence: Some(0.1),
+            demand_elasticity_score: Some(-0.5),
+            signer_sample_count: 3,
+            buy_sample_count: 3,
+            ..Default::default()
+        };
+        for reason in [
+            SFD_PARTIAL_BALANCE_COVERAGE_REASON,
+            SFD_POSTBALANCE_UNAVAILABLE_REASON,
+            SFD_INVALID_BALANCE_PAIR_REASON,
+            SFD_ZERO_PREBALANCE_SKIPPED_REASON,
+            SFD_INSUFFICIENT_BUYS_REASON,
+            "SFD_INPUT_ORDER_UNAVAILABLE",
+            "SFD_INPUT_STATUS_UNAVAILABLE",
+        ] {
+            let mut partial = full.clone();
+            partial.degraded_reasons.push(reason.to_string());
+            let assessment = assessment_with_sybil(partial);
+            let diagnostics = build_sybil_policy_diagnostics(&assessment, &config, false);
+            assert!(!diagnostics.soft_signals.low_sfd, "{reason}");
+            assert!(diagnostics.soft_signals.low_des, "{reason}");
+            assert_eq!(diagnostics.soft_points, 3, "{reason}");
+        }
+        let mut other_degraded = full.clone();
+        other_degraded
+            .degraded_reasons
+            .push("FTDI_INPUT_STATUS_UNAVAILABLE".to_string());
+        assert!(sybil_metric_is_actionable(
+            &other_degraded,
+            SybilMetric::Sfd
+        ));
+        let diagnostics =
+            build_sybil_policy_diagnostics(&assessment_with_sybil(full), &config, false);
+        assert!(diagnostics.soft_signals.low_sfd);
+        assert_eq!(diagnostics.soft_points, 5);
+    }
+
+    #[test]
+    fn m3_sfd_policy_does_not_accept_out_of_range_legacy_fallback_values() {
+        for value in [1.9, -0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let sybil = SybilResistanceFeatures {
+                spend_fraction_divergence: Some(value),
+                signer_sample_count: 3,
+                buy_sample_count: 3,
+                ..Default::default()
+            };
+            assert!(!sybil_metric_is_actionable(&sybil, SybilMetric::Sfd));
+        }
+        for value in [0.0, 0.5] {
+            let sybil = SybilResistanceFeatures {
+                spend_fraction_divergence: Some(value),
+                signer_sample_count: 3,
+                buy_sample_count: 3,
+                ..Default::default()
+            };
+            assert!(sybil_metric_is_actionable(&sybil, SybilMetric::Sfd));
+        }
+    }
+
+    #[test]
+    fn m6_prosperity_branch3_and_overlay_require_their_own_v2_thresholds() {
+        use ghost_core::tx_intelligence::types::{FtdiDefinitionV2, FtdiEvidenceV2};
+        let mut config = GatekeeperV2Config::default();
+        config.enable_prosperity_filter = true;
+        config.enable_prosperity_overlay = false;
+        config.prosperity_branch1_min_block0_sniped_supply_pct = f64::MAX;
+        config.prosperity_branch2_min_market_cap_sol = f64::MAX;
+        config.prosperity_branch3_max_hhi = 1.0;
+        config.prosperity_branch3_min_fee_topology_diversity_index = 0.1;
+        let mut assessment = strict_ready_assessment();
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .fee_topology_diversity_index = Some(0.2);
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .fee_topology_diversity_v2 = Some(FtdiEvidenceV2 {
+            definition: FtdiDefinitionV2::GiniSimpson,
+            fee_topology_diversity_index: Some(0.0),
+            coordination_hhi: Some(1.0),
+            unique_topology_count: 1,
+            buy_sample_count: 5,
+            signer_sample_count: 5,
+            represented_signer_count: 5,
+            degraded_reasons: vec![],
+        });
+        assert_eq!(
+            evaluate_prosperity_filter(&assessment, &config).branch3_pass,
+            None
+        );
+        config
+            .sybil_thresholds_v2
+            .prosperity_branch3_ftdi_gini_simpson_min = Some(0.0);
+        assert_eq!(
+            evaluate_prosperity_filter(&assessment, &config).branch3_pass,
+            Some(true)
+        );
+        config
+            .sybil_thresholds_v2
+            .prosperity_branch3_ftdi_gini_simpson_min = Some(0.1);
+        assert_eq!(
+            evaluate_prosperity_filter(&assessment, &config).branch3_pass,
+            Some(false)
+        );
+        config.enable_prosperity_overlay = true;
+        assert_eq!(
+            evaluate_prosperity_filter(&assessment, &config).overlay_fee_topology_diversity_pass,
+            None
+        );
+        config
+            .sybil_thresholds_v2
+            .prosperity_overlay_ftdi_gini_simpson_min = Some(0.0);
+        let result = evaluate_prosperity_filter(&assessment, &config);
+        assert_eq!(result.overlay_fee_topology_diversity_pass, Some(true));
+        assert_eq!(result.branch3_pass, Some(false));
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .degraded_reasons
+            .push("SFD_INPUT_STATUS_UNAVAILABLE".into());
+        assert_eq!(
+            evaluate_prosperity_filter(&assessment, &config).overlay_fee_topology_diversity_pass,
+            Some(true)
+        );
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .fee_topology_diversity_v2
+            .as_mut()
+            .unwrap()
+            .degraded_reasons
+            .push("FTDI_INPUT_STATUS_UNAVAILABLE".into());
+        let result = evaluate_prosperity_filter(&assessment, &config);
+        assert_eq!(result.branch3_pass, None);
+        assert_eq!(result.overlay_fee_topology_diversity_pass, None);
+
+        // Niezależna B1 nadal ma własny pozytywny dowód, nawet gdy porównanie
+        // FTDI overlay nie ma skonfigurowanego progu. None nie jest premią FTDI.
+        let fingerprint = assessment
+            .early_fingerprint
+            .get_or_insert_with(Default::default);
+        fingerprint.block0_sniped_supply_pct = Some(0.5);
+        fingerprint.sell_buy_ratio = Some(0.0);
+        config.prosperity_branch1_min_block0_sniped_supply_pct = 0.1;
+        config.prosperity_branch1_max_sell_buy_ratio = 1.0;
+        config.prosperity_overlay_max_price_change_ratio = 10.0;
+        config.prosperity_overlay_max_bonding_progress_pct = 100.0;
+        config
+            .sybil_thresholds_v2
+            .prosperity_overlay_ftdi_gini_simpson_min = None;
+        let disabled = evaluate_prosperity_filter(&assessment, &config);
+        assert_eq!(disabled.branch1_pass, Some(true));
+        assert_eq!(disabled.overlay_fee_topology_diversity_pass, None);
+        assert_eq!(disabled.pass, Some(true));
+        assert!(
+            sybil_comparison_reasons(&assessment.feature_snapshot.sybil_resistance, &config)
+                .iter()
+                .any(|r| r == "FTDI_PROSPERITY_OVERLAY_COMPARISON_DEFINITION_MISMATCH")
+        );
+        // Próg skonfigurowany, lecz pomiar niepełny: dawna bramka fail-closed zostaje.
+        config
+            .sybil_thresholds_v2
+            .prosperity_overlay_ftdi_gini_simpson_min = Some(0.0);
+        let unavailable = evaluate_prosperity_filter(&assessment, &config);
+        assert_eq!(unavailable.pass, Some(false));
+        assert_eq!(
+            unavailable.reject_trigger,
+            Some(ProsperityRejectTrigger::MissingFeeTopologyDiversityIndex)
+        );
     }
 }

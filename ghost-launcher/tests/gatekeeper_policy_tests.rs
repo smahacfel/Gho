@@ -353,6 +353,7 @@ fn neutral_sybil_defaults_preserve_buy_and_reject_verdicts() {
         dev_buyer_infrastructure_affinity: Some(1.0),
         spend_fraction_divergence: Some(0.0),
         demand_elasticity_score: Some(-1.0),
+        demand_elasticity_v2: None,
         signer_cross_pool_velocity: Some(1.0),
         cpv_other_pool_activity: None,
         cpv_evidence: Default::default(),
@@ -362,6 +363,7 @@ fn neutral_sybil_defaults_preserve_buy_and_reject_verdicts() {
         degraded_reasons: vec!["FTDI_INSUFFICIENT_BUYS".to_string()],
         buy_sample_count: 24,
         signer_sample_count: 18,
+        ..Default::default()
     };
 
     let buy_baseline = evaluate(base_feature_set(), &config);
@@ -575,7 +577,7 @@ fn zero_penalty_sybil_patterns_remain_telemetry_only_without_lead_signal() {
 }
 
 #[test]
-fn partial_sfd_coverage_remains_actionable_when_value_is_present() {
+fn partial_sfd_coverage_is_diagnostic_only_even_when_value_is_present() {
     let mut config = policy_test_config();
     config.min_spend_fraction_divergence = 0.30;
     config.soft_penalty_low_sfd = 2;
@@ -593,13 +595,13 @@ fn partial_sfd_coverage_remains_actionable_when_value_is_present() {
 
     let decision = evaluate(features, &config);
 
-    assert!(!decision.verdict_buy);
-    assert_eq!(
+    assert!(decision.verdict_buy);
+    assert_ne!(
         decision.verdict_type,
         GatekeeperVerdictType::RejectSybilSoftExcess
     );
-    assert!(decision.sybil_policy.soft_signals.low_sfd);
-    assert_eq!(decision.sybil_policy.soft_points, 2);
+    assert!(!decision.sybil_policy.soft_signals.low_sfd);
+    assert_eq!(decision.sybil_policy.soft_points, 0);
 }
 
 #[test]
@@ -843,6 +845,15 @@ fn curve_tx(
     v_tokens: f64,
 ) -> Arc<PoolTransaction> {
     Arc::new(PoolTransaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         semantic: EventSemanticEnvelope::default(),
         pool_amm_id: pool_id.to_string(),
         signer: signer.to_string(),
@@ -855,6 +866,7 @@ fn curve_tx(
         event_ordinal: Some(0),
         tx_index: None,
         outer_instruction_index: None,
+        inner_instruction_path: None,
         inner_group_index: None,
         outer_program_id: None,
         cpi_stack_height: None,

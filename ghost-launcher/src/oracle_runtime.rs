@@ -25000,6 +25000,13 @@ fn build_seer_geyser_event_from_confirmed_tx(
         account_data: HashMap::new(),
         pre_balances,
         post_balances,
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: matches!(
+                &meta.inner_instructions,
+                solana_transaction_status::option_serializer::OptionSerializer::Some(_)
+            ),
+        },
         success: meta.err.is_none(),
         error_code: meta.err.as_ref().map(|err| format!("{:?}", err)),
         compute_units_consumed: Option::<u64>::from(meta.compute_units_consumed.clone()),
@@ -27354,6 +27361,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                     Ok(e) => e,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!("LAG ORACLE by {} messages", n);
+                        ctx.session_manager.cross_pool_velocity_index().mark_stream_gap(current_time_ms());
                         if let Err(error) = oracle_runtime
                             .candidate_integrity_registry
                             .invalidate_pending_canonical_applies()
@@ -27383,10 +27391,18 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         }
                         continue;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        ctx.session_manager.cross_pool_velocity_index().mark_stream_gap(current_time_ms());
+                        break;
+                    },
                 };
 
                 match event {
+                    GhostEvent::CpvFeed(feed) => {
+                        // Nie otwiera sesji, nie zmienia receiptów ani decyzji o poolu.
+                        ctx.session_manager.cross_pool_velocity_index().observe_feed_event(
+                            &feed, current_time_ms(), &ctx.cross_pool_velocity_config);
+                    }
                     GhostEvent::CandidateIntegrity(signal) => {
                         oracle_runtime.record_candidate_integrity_signal((*signal).clone());
                     }
@@ -27936,14 +27952,6 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                         .effective_runtime_pool_state(&pool_id, Some(&mint))
                                     {
                                         if runtime_state.allows_runtime_relay() && tx.success {
-                                            let pool_id_string = pool_id.to_string();
-                                            ctx.session_manager
-                                                .cross_pool_velocity_index()
-                                                .observe_transaction(
-                                                    pool_id_string.as_str(),
-                                                    &tx,
-                                                    &ctx.cross_pool_velocity_config,
-                                                );
                                             let event_ts_ms = tx_event_ts_ms(&tx);
                                             let apply_outcome = oracle_runtime
                                                 .forward_approved_tx_to_commit_or_live_pipeline(
@@ -35352,6 +35360,10 @@ mod tests {
 
     fn test_pool_observation_tx(signature: &str) -> Arc<PoolTransaction> {
         Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope {
                 slot_quality: ghost_core::SlotQuality::Present,
                 ..Default::default()
@@ -35362,6 +35374,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -42279,6 +42292,10 @@ mod tests {
 
         let mut truth = HashMap::new();
         let success_trade = TradeEvent {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             provider_id: None,
             provider_role: None,
@@ -42378,6 +42395,10 @@ mod tests {
         use std::sync::Arc;
 
         let failed_buy = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: "pool".to_string(),
@@ -42385,6 +42406,7 @@ mod tests {
             event_ordinal: None,
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -42444,6 +42466,10 @@ mod tests {
         let expected_token = Pubkey::new_unique();
         let expected_assoc_curve = Pubkey::new_unique();
         let successful_buy = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: "pool".to_string(),
@@ -42451,6 +42477,7 @@ mod tests {
             event_ordinal: None,
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -42543,6 +42570,10 @@ mod tests {
         let known_bad =
             Pubkey::from_str(KNOWN_BAD_LEGACY_FEE_RECIPIENT).expect("known bad fee recipient");
         let successful_buy = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: "pool".to_string(),
@@ -42550,6 +42581,7 @@ mod tests {
             event_ordinal: None,
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -42701,6 +42733,10 @@ mod tests {
         let current_fee = Pubkey::from_str("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
             .expect("primary global fee recipient");
         let successful_buy = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: "pool".to_string(),
@@ -42708,6 +42744,7 @@ mod tests {
             event_ordinal: None,
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -42782,6 +42819,10 @@ mod tests {
         let reserved_fee = Pubkey::from_str("GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS")
             .expect("reserved fee recipient");
         let successful_buy = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: "pool".to_string(),
@@ -42789,6 +42830,7 @@ mod tests {
             event_ordinal: None,
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -42861,6 +42903,10 @@ mod tests {
         use std::sync::Arc;
 
         let successful_buy = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: "pool".to_string(),
@@ -42868,6 +42914,7 @@ mod tests {
             event_ordinal: None,
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -42940,6 +42987,10 @@ mod tests {
         use std::sync::Arc;
 
         let successful_buy = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: "pool".to_string(),
@@ -42947,6 +42998,7 @@ mod tests {
             event_ordinal: None,
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -44416,6 +44468,10 @@ mod tests {
         runtime.mark_pool_committed(pool_id);
 
         let tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -44423,6 +44479,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -44561,6 +44618,10 @@ mod tests {
         );
 
         let tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -44568,6 +44629,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -44798,6 +44860,10 @@ mod tests {
 
         // Create a PoolTransaction with NO reserve data (simulates gRPC source)
         let tx = Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -44805,6 +44871,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -44911,6 +44978,10 @@ mod tests {
 
         // Create a PoolTransaction WITH existing reserve data (e.g., PumpPortal source)
         let tx = Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -44918,6 +44989,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -44998,6 +45070,10 @@ mod tests {
 
         // No curve in ShadowLedger for this pool
         let tx = Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -45005,6 +45081,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -45099,6 +45176,10 @@ mod tests {
         ledger.insert_with_slot_at(pool_id, curve, 1000, old_ts);
 
         let tx = Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -45106,6 +45187,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -45237,6 +45319,10 @@ mod tests {
         ledger.insert_with_slot(pool_id, shadow_curve, 1000);
 
         let tx = Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -45244,6 +45330,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -45342,6 +45429,10 @@ mod tests {
         );
 
         let tx = Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -45349,6 +45440,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -48061,6 +48153,10 @@ mod tests {
         // which is required by normalize_dev_pubkey_str's is_on_curve() check.
         let signer = Keypair::new().pubkey();
         let tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -48068,6 +48164,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -48133,6 +48230,10 @@ mod tests {
     fn test_build_fallback_observation_identity_ignores_legacy_only_timestamp() {
         let pool_id = Pubkey::new_unique();
         let tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -48140,6 +48241,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -48281,6 +48383,10 @@ mod tests {
         // which is required by normalize_dev_pubkey_str's is_on_curve() check.
         let signer = Keypair::new().pubkey();
         let tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -48288,6 +48394,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -48368,6 +48475,10 @@ mod tests {
         let token_mint = Pubkey::new_unique();
         let signer = Keypair::new().pubkey();
         let tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -48375,6 +48486,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -48453,6 +48565,10 @@ mod tests {
     #[test]
     fn test_normalize_gatekeeper_event_time_prefers_canonical_event_time() {
         let tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: Pubkey::new_unique().to_string(),
@@ -48460,6 +48576,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -48522,6 +48639,10 @@ mod tests {
     #[test]
     fn test_tx_event_ts_ms_prefers_effective_event_time_then_wallclock() {
         let mut tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: Pubkey::new_unique().to_string(),
@@ -48529,6 +48650,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -48597,6 +48719,10 @@ mod tests {
     #[test]
     fn test_runtime_tx_time_source_info_distinguishes_legacy_rejection_from_real_fallback() {
         let mut tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: Pubkey::new_unique().to_string(),
@@ -48604,6 +48730,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -48762,6 +48889,10 @@ mod tests {
     #[test]
     fn test_normalize_gatekeeper_event_time_monotonic_with_chain_time() {
         let tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: Pubkey::new_unique().to_string(),
@@ -48769,6 +48900,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -48831,6 +48963,10 @@ mod tests {
     #[test]
     fn test_normalize_gatekeeper_event_time_legacy_timestamp_is_not_chain_time() {
         let tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: Pubkey::new_unique().to_string(),
@@ -48838,6 +48974,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -49039,6 +49176,10 @@ mod tests {
         // ── Precondition 4: forward_approved_tx_to_commit_or_live_pipeline routes to LivePipeline ──
         // (end-to-end: this is exactly what the fast path calls)
         let tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -49046,6 +49187,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -49353,6 +49495,10 @@ mod tests {
 
         // Simulate a hot-pool tx arriving after commitment.
         let tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -49360,6 +49506,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -50674,6 +50821,10 @@ mod tests {
 
         // TX with no token_mint and no signer — will always fail to promote.
         let tx = Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -50681,6 +50832,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -50800,6 +50952,10 @@ mod tests {
 
         // TX that carries a valid token_mint → should succeed
         let tx = Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -50807,6 +50963,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -50953,6 +51110,10 @@ mod tests {
 
         // TX without identity data — always fails to promote.
         let tx = Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -50960,6 +51121,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -51119,6 +51281,10 @@ mod tests {
 
         // TX #1: has token_mint but NO signer → only base_mint is promoted.
         let tx_mint_only = Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -51126,6 +51292,7 @@ mod tests {
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -51211,6 +51378,10 @@ mod tests {
 
         // TX #2: has valid signer but mint is already known → fills dev_pubkey.
         let tx_signer = Arc::new(PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: Default::default(),
             curve_finality: CurveFinality::Speculative,
             pool_amm_id: pool_id.to_string(),
@@ -51218,6 +51389,7 @@ mod tests {
             event_ordinal: Some(1),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,

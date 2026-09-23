@@ -160,6 +160,10 @@ mod tests {
         };
 
         let event = GeyserEvent::Transaction {
+            metadata_availability: crate::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             provider_id: None,
             provider_role: None,
             observation_provenance: None,

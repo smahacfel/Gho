@@ -62,7 +62,7 @@ async fn test_subscription_before_emission_receives_all_events() {
     let mut received_count = 0;
     for _ in 0..3 {
         match timeout(Duration::from_millis(100), subscriber.recv()).await {
-            Ok(Ok(GhostEvent::NewPoolDetected(_))) => {
+            Ok(Ok(GhostEvent::NewPoolDetected(..))) => {
                 received_count += 1;
             }
             Ok(Ok(other)) => {
@@ -180,14 +180,14 @@ async fn test_multiple_subscribers_before_emission() {
 
     // Both subscribers should receive the event
     match timeout(Duration::from_millis(100), subscriber1.recv()).await {
-        Ok(Ok(GhostEvent::NewPoolDetected(_))) => {
+        Ok(Ok(GhostEvent::NewPoolDetected(..))) => {
             println!("✅ Subscriber 1 received event");
         }
         _ => panic!("Subscriber 1 failed to receive event"),
     }
 
     match timeout(Duration::from_millis(100), subscriber2.recv()).await {
-        Ok(Ok(GhostEvent::NewPoolDetected(_))) => {
+        Ok(Ok(GhostEvent::NewPoolDetected(..))) => {
             println!("✅ Subscriber 2 received event");
         }
         _ => panic!("Subscriber 2 failed to receive event"),

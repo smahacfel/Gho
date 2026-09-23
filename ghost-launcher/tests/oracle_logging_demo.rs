@@ -78,6 +78,10 @@ fn generate_synthetic_history(
         let is_buy = (seed & 1) == 0;
 
         history.push(TradeEvent {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -105,6 +109,11 @@ fn generate_synthetic_history(
             owner_token_deltas: vec![],
             v_tokens_in_bonding_curve: None,
             v_sol_in_bonding_curve: None,
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: None,
             global_config: None,
             fee_recipient: None,
@@ -267,12 +276,17 @@ async fn test_oracle_logging_demo() {
         let market_cap_sol = (v_sol / v_tokens) * 1_000_000_000.0;
 
         let pool_tx = PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             pool_amm_id: pool_pubkey.to_string(),
             slot: Some(12345 + i),
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,
@@ -299,6 +313,11 @@ async fn test_oracle_logging_demo() {
             token_mint: Some(base_mint.to_string()),
             v_tokens_in_bonding_curve: Some(v_tokens),
             v_sol_in_bonding_curve: Some(v_sol),
+            virtual_sol_reserves: None,
+            virtual_token_reserves: None,
+            real_sol_reserves: None,
+            real_token_reserves: None,
+            complete: None,
             market_cap_sol: Some(market_cap_sol),
             global_config: None,
             fee_recipient: None,
@@ -426,6 +445,7 @@ async fn test_synthetic_history_prevents_data_starvation() {
         provider_role: None,
         slot: Some(123_456),
         tx_index: None,
+        birth_canonical_order: None,
         event_ts_ms: Some(1_700_000_100_000),
         event_time: ghost_core::EventTimeMetadata::default(),
         signature: "synthetic_sig".to_string(),
@@ -433,11 +453,13 @@ async fn test_synthetic_history_prevents_data_starvation() {
         pool_amm_id,
         base_mint,
         quote_mint,
+        creation_regime: Default::default(),
         bonding_curve,
         creator,
         timestamp: 1_700_000_100,
         bonding_curve_progress: None,
         initial_liquidity_sol: Some(12.0),
+        initial_virtual_quote_reserves: None,
         token_total_supply: Some(1_000_000_000),
         block_time: Some(1_700_000_000),
     };

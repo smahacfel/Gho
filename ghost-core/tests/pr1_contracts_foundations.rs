@@ -274,6 +274,7 @@ fn materialized_feature_set_contains_complete_inputs() {
             dev_buyer_infrastructure_affinity: Some(0.18),
             spend_fraction_divergence: None,
             demand_elasticity_score: Some(0.55),
+            demand_elasticity_v2: None,
             signer_cross_pool_velocity: None,
             cpv_other_pool_activity: None,
             cpv_evidence: Default::default(),
@@ -283,6 +284,7 @@ fn materialized_feature_set_contains_complete_inputs() {
             degraded_reasons: vec!["DBIA_NO_DEV_BUY".to_string()],
             buy_sample_count: 9,
             signer_sample_count: 5,
+            ..Default::default()
         },
         alpha_fingerprint: Default::default(),
         ..Default::default()

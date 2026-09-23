@@ -258,6 +258,9 @@ impl Default for PumpAndDumpDetectorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AdaptiveProsperityConfig {
+    /// Jawny próg nowego FTDI dla porównania shadow B3; bez dziedziczenia 0.0909.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ftdi_gini_simpson_v2_min: Option<f64>,
     pub enabled: bool,
 
     /// Whether adaptive thresholds are applied live (requires promotion).
@@ -295,6 +298,7 @@ pub struct AdaptiveProsperityConfig {
 impl Default for AdaptiveProsperityConfig {
     fn default() -> Self {
         Self {
+            ftdi_gini_simpson_v2_min: None,
             enabled: false,
             adaptive_enabled: false,
             shadow_suggestions_enabled: true,

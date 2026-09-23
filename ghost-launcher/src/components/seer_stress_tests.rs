@@ -109,6 +109,10 @@ mod stress_tests {
 
     fn make_atomic_dev_buy(pool: Pubkey, mint: Pubkey) -> TradeEvent {
         TradeEvent {
+            metadata_availability: seer::types::TransactionMetadataAvailability {
+                status_known: true,
+                inner_instructions_known: true,
+            },
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,

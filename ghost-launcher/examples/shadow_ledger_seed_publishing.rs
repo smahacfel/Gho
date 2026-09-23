@@ -194,12 +194,14 @@ fn publish_synthetic_transactions_to_eventbus(
     for (idx, tx) in synthetic_txs.iter().enumerate() {
         // Create a synthetic PoolTransaction event
         let pool_tx = ghost_launcher::events::PoolTransaction {
+            metadata_availability: seer::types::TransactionMetadataAvailability::default(),
             semantic: ghost_core::EventSemanticEnvelope::default(),
             pool_amm_id: pool_mint.to_string(),
             slot: Some(slot),
             event_ordinal: Some(idx as u32),
             tx_index: None,
             outer_instruction_index: None,
+            inner_instruction_path: None,
             inner_group_index: None,
             outer_program_id: None,
             cpi_stack_height: None,

@@ -24,6 +24,8 @@ dashboard.py
 # Globalna blokada logów i ciężkich zrzutów danych
 *.log
 *.jsonl
+# Required frozen PR1D test corpus (hash pinned in PR1E manifest).
+!ghost-core/tests/fixtures/pump_observation_ledger_v1/pump_observation_differential_corpus_v1.jsonl
 *.json
 # The V2 prospective tape has two versioned, public authority inputs.  Keep
 # the broad protection for generated/operational JSON, but track this exact

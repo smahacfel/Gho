@@ -35,12 +35,22 @@ fn tx(
         toolchain_fingerprint.internal_fee_transfer_count = Some(internal);
     }
     PoolTransaction {
+        metadata_availability: seer::types::TransactionMetadataAvailability {
+            status_known: true,
+            inner_instructions_known: true,
+        },
+        virtual_sol_reserves: None,
+        virtual_token_reserves: None,
+        real_sol_reserves: None,
+        real_token_reserves: None,
+        complete: None,
         semantic: EventSemanticEnvelope::default(),
         pool_amm_id: Pubkey::new_unique().to_string(),
         slot: Some(timestamp_ms / 10 + 1),
         event_ordinal: Some((timestamp_ms % 10) as u32),
         tx_index: Some((timestamp_ms % 10) as u32),
         outer_instruction_index: None,
+        inner_instruction_path: None,
         inner_group_index: None,
         outer_program_id: None,
         cpi_stack_height: None,
@@ -261,7 +271,9 @@ fn ftdi_preserves_value_population_and_splits_legacy_from_corrected_actionabilit
     assert_eq!(computation.buy_sample_count, 3);
     assert_eq!(computation.signer_sample_count, 2);
     assert_eq!(computation.unique_topology_count, 1);
-    assert_eq!(computation.fee_topology_diversity_index, Some(0.5));
+    assert_eq!(computation.fee_topology_diversity_index, Some(0.0));
+    assert!(!computation.has_full_quality());
+    assert_eq!(computation.represented_signer_count, 2);
     assert_eq!(computation.coordination_hhi, Some(1.0));
     assert!(computation.legacy_buy_tx_actionable);
     assert!(!computation.unique_buyer_actionable_v2);
@@ -1721,4 +1733,95 @@ fn projection_builders_consume_one_frozen_producer_result_without_recompute() {
         FtdiDecisionProjectionV1::try_from_evidence(&evidence, &projection_context).unwrap();
     assert_eq!(first, second);
     assert_eq!(calls, 1);
+}
+
+#[test]
+fn m2_gini_simpson_never_enters_the_old_mfs_or_evidence_contract() {
+    let (profile, resolved, ..) = runtime_contract_context();
+    let context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved,
+    };
+    for n in [5usize, 100] {
+        let txs: Vec<_> = (0..n)
+            .map(|index| {
+                tx(
+                    Pubkey::new_unique(),
+                    Signature::new_unique(),
+                    1_000 + index as u64,
+                    1.0,
+                    true,
+                    true,
+                    Some(((index % 5) as u32, 0)),
+                )
+            })
+            .collect();
+        let result =
+            ghost_launcher::tx_intelligence::compute_sybil_resistance_with_ftdi(&txs, None);
+        assert_eq!(result.ftdi.fee_topology_diversity_index, Some(0.8));
+        assert!(result.ftdi.has_full_quality());
+        let legacy = Some(5.0 / n as f64);
+        assert_eq!(result.features.fee_topology_diversity_index, legacy);
+        let evidence = build_ftdi_evidence_v1(&result.ftdi, &context).unwrap();
+        assert_eq!(evidence.legacy_value.value, legacy.into());
+        assert_eq!(evidence.value_v1.value, legacy.into());
+        assert_eq!(evidence.coordination_hhi, Some(0.2).into());
+        let stored = serde_json::to_vec(&evidence).unwrap();
+        let decoded: ghost_core::metric_contracts::FtdiEvidenceV1 =
+            serde_json::from_slice(&stored).unwrap();
+        assert_eq!(decoded, evidence);
+    }
+}
+
+#[test]
+fn m2_compatibility_boundary_validates_new_value_and_keeps_input_degradation() {
+    let (profile, resolved, ..) = runtime_contract_context();
+    let context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved,
+    };
+    let mut txs: Vec<_> = (0..3)
+        .map(|index| {
+            tx(
+                Pubkey::new_unique(),
+                Signature::new_unique(),
+                1_000 + index,
+                1.0,
+                true,
+                true,
+                Some((0, 0)),
+            )
+        })
+        .collect();
+    let complete = compute_ftdi(&txs);
+    assert!(complete.has_full_quality());
+    let mut corrupted = complete.clone();
+    corrupted.fee_topology_diversity_index = Some(0.75);
+    assert!(build_ftdi_evidence_v1(&corrupted, &context).is_err());
+    corrupted = complete.clone();
+    corrupted.represented_signer_count = 2;
+    assert!(build_ftdi_evidence_v1(&corrupted, &context).is_err());
+    corrupted = complete.clone();
+    corrupted.legacy_buy_tx_actionable = false;
+    assert!(build_ftdi_evidence_v1(&corrupted, &context).is_err());
+    let mut unknown = tx(
+        Pubkey::new_unique(),
+        Signature::new_unique(),
+        1_010,
+        1.0,
+        true,
+        true,
+        Some((0, 0)),
+    );
+    unknown.metadata_availability.status_known = false;
+    txs.push(unknown);
+    let partial = compute_ftdi(&txs);
+    assert_eq!(partial.fee_topology_diversity_index, Some(0.0));
+    assert!(!partial.has_full_quality());
+    let evidence = build_ftdi_evidence_v1(&partial, &context).unwrap();
+    assert_eq!(evidence.legacy_value.value, Some(1.0 / 3.0).into());
+    assert!(!evidence.legacy_buy_tx_actionable);
+    assert!(!evidence.legacy_value.envelope.policy_actionable);
 }
