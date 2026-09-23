@@ -18503,12 +18503,8 @@ fn try_evaluate_feature_driven_terminal_verdict(
     }
     begin_candidate_integrity_evaluation(integrity_guard.as_ref())?;
     if force_deadline {
-        let phase1_passed = features.tx_intel_features.tx_count
-            >= gatekeeper_config.min_tx_count as u64
-            && features.tx_intel_features.unique_signers
-                >= gatekeeper_config.min_unique_signers as u64
-            && features.tx_intel_features.buy_count >= gatekeeper_config.min_buy_count as u64
-            && features.tx_intel_features.sell_count >= gatekeeper_config.min_sell_count as u64;
+        let phase1_passed =
+            crate::components::gatekeeper_policy::phase1_passes(&features, gatekeeper_config);
         if !phase1_passed {
             if session.canonical_update_count() == 0 {
                 ::metrics::counter!("timeout_without_canonical_updates_total", 1u64);
@@ -27885,6 +27881,17 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                     if apply_outcome
                                         == CanonicalMutationApplyOutcomeV1::AppliedNewMutation
                                     {
+                                        if let Err(error) = oracle_runtime.candidate_integrity_registry
+                                            .claim_oracle_session(&runtime_permit.apply_receipt)
+                                        {
+                                            warn!(pool = %pool_id, error = %error,
+                                                "CandidateIntegrity session ownership rejected before spawn");
+                                            resolve_canonical_apply(ctx.as_ref(), apply_receipt.as_ref(),
+                                                CanonicalMutationApplyOutcomeV1::Failed);
+                                            oracle_runtime.remove_pool_with_reason(pool_id,
+                                                "candidate_session_ownership_failed");
+                                            continue;
+                                        }
                                         // Spawn per-pool observation task
                                         let (task_tx, task_rx) = tokio::sync::mpsc::channel(
                                             POOL_TASK_CHANNEL_CAPACITY,
@@ -42878,6 +42885,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 1,
+            instruction_limit: None,
             max_sol_cost: 1,
             min_sol_output: 0,
             success: true,

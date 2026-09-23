@@ -1519,6 +1519,11 @@ fn alpha_confidence_skip_reason(alpha: &AlphaGateDiagnostics) -> &'static str {
 }
 
 impl GatekeeperAssessment {
+    /// Liczba sprzedaży z tego samego niezmiennego snapshotu co decyzja.
+    pub fn sell_count(&self) -> usize {
+        self.feature_snapshot.tx_intel_features.sell_count as usize
+    }
+
     fn gate_trace_entry(
         order_idx: u32,
         gate: &str,
@@ -2693,7 +2698,7 @@ impl GatekeeperAssessment {
                     config.min_unique_signers,
                     self.buy_count,
                     config.min_buy_count,
-                    self.total_tx_evaluated.saturating_sub(self.buy_count),
+                    self.sell_count(),
                     config.min_sell_count,
                 )
             } else {
@@ -2843,6 +2848,8 @@ impl GatekeeperAssessment {
             min_unique_signers: config.min_unique_signers,
             buy_count,
             min_buy_count: config.min_buy_count,
+            sell_count: self.sell_count(),
+            min_sell_count: config.min_sell_count,
 
             // Phase 2: Velocity Profile
             phase2_passed: self.phase2_passed,
@@ -6683,9 +6690,7 @@ impl GatekeeperBuffer {
                     cfg.min_unique_signers,
                     assessment.buy_count,
                     cfg.min_buy_count,
-                    assessment
-                        .total_tx_evaluated
-                        .saturating_sub(assessment.buy_count),
+                    assessment.sell_count(),
                     cfg.min_sell_count,
                 ),
                 GatekeeperReasonCode::RejectCoreFail,

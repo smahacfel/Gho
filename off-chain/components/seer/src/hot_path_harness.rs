@@ -43,20 +43,15 @@ const BURST_BATCH_EVENTS: usize = 128;
 const BURST_BATCH_INTERVAL: Duration = Duration::from_millis(50);
 const QUEUE_DWELL_P99_SLA_NS: u64 = 250_000_000;
 const QUEUE_OLDEST_EVENT_SLA_NS: u64 = 500_000_000;
-/// Frozen legacy projection from the PR1C parent.  It intentionally excludes
-/// fields introduced by PR1D while retaining the exact pre-PR1D JSON shape.
-const BASELINE_LEGACY_CANONICAL_PARITY_DIGEST_V1: &str =
-    "549d66a347a3e56b516bc5b77a5f22929604442d409ece7eb1a55525eaa51202";
-/// Frozen full PR1D parser snapshot, including locator/order/provenance and
-/// raw transaction inventory evidence.
-///
-/// Its source receipt was corrected in CS0: the former fixture built bytes
-/// through the mutable `DISC_CREATE` alias while that alias incorrectly named
-/// `d6…` as legacy Create.  The fixture now owns the canonical legacy bytes
-/// below, and this digest is the one immutable receipt for that corrected,
-/// source-valid fixture.  The V1 semantic digest above remains unchanged.
-const BASELINE_FULL_PR1D_PARSER_SNAPSHOT_DIGEST_V2: &str =
-    "02136d691e399dace85b112cc5b6d50c79323a2f24adcb3e7569ac68b40654a6";
+// Rewizja R21 wyników parsera na niezmienionych surowych fixtures.
+// Zmiany: trasa SELL, token_program SELL (indeks 9) oraz oddzielny literalny
+// instruction_limit dla BUY/SELL z właściwej instrukcji. Szczegóły i stare
+// hashe: docs/ADR/ADR_8D_R21_PUMP_TRADE_ROUTES_SESSION_OWNERSHIP_MIN_SELL_20260922.md.
+// To nowy oczekiwany wynik naprawionego parsera, nie podmiana historycznego receipt.
+const R21_LEGACY_CANONICAL_PARITY_DIGEST_V1: &str =
+    "302df87c36e23b3b3dd7189828aba9ded44582304e768450427d7694b33f7459";
+const R21_FULL_PR1D_PARSER_SNAPSHOT_DIGEST_V2: &str =
+    "581d8bc83036054f7e24dce1e23dce01d0edbd31dae4a08d95eb34d5005fd1fc";
 
 /// Immutable raw source bytes for the legacy `global:create` fixture used by
 /// the pre-existing PR1D corpus.  Keep this literal rather than deriving it
@@ -443,6 +438,8 @@ fn legacy_canonical_parser_projection_v1(
 ) -> LegacyCanonicalParserProjectionV1 {
     let (initialize_pool, mut trades) = normalized_parity_events(bundle);
     for trade in &mut trades {
+        // V1 zachowuje dawny kształt JSON; literalny limit jest nowym polem R21.
+        trade.instruction_limit = None;
         if let Some(provenance) = trade.provenance.as_mut() {
             // `inner_instruction_path` is the PR1D addition to the existing
             // nested provenance object and is serde-skipped when absent.
@@ -842,7 +839,7 @@ fn frozen_legacy_create_fixture_owns_its_canonical_source_discriminator() {
 }
 
 #[test]
-fn pr1d_v1_v2_parser_digests_remain_frozen() {
+fn parser_v1_v2_digests_match_r21_trade_route_revision() {
     let parser = BinaryParser::new(false);
     let fixtures = [
         ("ordinary_pump_buy", FixtureKind::PumpBuy, 1_u8),
@@ -875,11 +872,11 @@ fn pr1d_v1_v2_parser_digests_remain_frozen() {
 
     assert_eq!(
         canonical_parity_digest(&legacy_v1),
-        BASELINE_LEGACY_CANONICAL_PARITY_DIGEST_V1
+        R21_LEGACY_CANONICAL_PARITY_DIGEST_V1
     );
     assert_eq!(
         canonical_parity_digest(&full_pr1d_v2),
-        BASELINE_FULL_PR1D_PARSER_SNAPSHOT_DIGEST_V2
+        R21_FULL_PR1D_PARSER_SNAPSHOT_DIGEST_V2
     );
 }
 
@@ -1114,13 +1111,13 @@ async fn pr1b_hot_path_harness() {
 
     let legacy_business_digest = canonical_parity_digest(&legacy_business);
     assert_eq!(
-        legacy_business_digest, BASELINE_LEGACY_CANONICAL_PARITY_DIGEST_V1,
-        "PR1D legacy projection must preserve the frozen pre-PR1D parser snapshot"
+        legacy_business_digest, R21_LEGACY_CANONICAL_PARITY_DIGEST_V1,
+        "Projekcja legacy musi odpowiadać jawnej rewizji parsera R21"
     );
     let full_pr1d_business_digest = canonical_parity_digest(&full_pr1d_business);
     assert_eq!(
-        full_pr1d_business_digest, BASELINE_FULL_PR1D_PARSER_SNAPSHOT_DIGEST_V2,
-        "PR1D full snapshot must preserve locator/order/provenance/inventory evidence"
+        full_pr1d_business_digest, R21_FULL_PR1D_PARSER_SNAPSHOT_DIGEST_V2,
+        "Pełny snapshot musi odpowiadać rewizji R21 z dowodami locator/order/provenance/inventory"
     );
     let fixture_summary = legacy_business
         .iter()

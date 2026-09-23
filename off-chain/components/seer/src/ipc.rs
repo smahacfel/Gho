@@ -2261,6 +2261,7 @@ mod tests {
             is_buy,
             is_dev_buy: false,
             amount: 1000000,
+            instruction_limit: None,
             max_sol_cost: if is_buy { 5000000 } else { 0 },
             min_sol_output: if is_buy { 0 } else { 3000000 },
             success: true,

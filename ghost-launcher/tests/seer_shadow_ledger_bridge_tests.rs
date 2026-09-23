@@ -40,7 +40,8 @@ fn make_buy_trade(pool: Pubkey, mint: Pubkey) -> TradeEvent {
         signer: Pubkey::new_unique(),
         is_buy: true,
         is_dev_buy: false,
-        amount: 1_000_000,           // 1M token units out
+        amount: 1_000_000, // 1M token units out
+        instruction_limit: None,
         max_sol_cost: 2_000_000_000, // 2 SOL in (lamports)
         min_sol_output: 0,
         success: true,

@@ -126,6 +126,7 @@ mod stress_tests {
             is_buy: true,
             is_dev_buy: true,
             amount: 100_000_000_000,
+            instruction_limit: None,
             max_sol_cost: 5_000_000_000,
             min_sol_output: 0,
             success: true,

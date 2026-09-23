@@ -352,6 +352,7 @@ impl NlnPumpFunTradeEvent {
             is_buy,
             is_dev_buy: false,
             amount: self.token_amount_units,
+            instruction_limit: None,
             max_sol_cost: if is_buy { self.sol_amount_lamports } else { 0 },
             min_sol_output: if is_buy { 0 } else { self.sol_amount_lamports },
             success: true,

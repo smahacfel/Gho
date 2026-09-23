@@ -933,6 +933,7 @@ impl PumpPortalConnection {
             .map(|ib| ib.saturating_mul(PUMPFUN_TOKEN_BASE_UNITS));
 
         let trade_event = TradeEvent {
+            instruction_limit: None,
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
@@ -1105,6 +1106,7 @@ impl PumpPortalConnection {
         };
 
         let trade_event = TradeEvent {
+            instruction_limit: None,
             semantic: ghost_core::EventSemanticEnvelope::default(),
             provider_id: None,
             provider_role: None,
