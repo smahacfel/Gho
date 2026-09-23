@@ -5740,6 +5740,7 @@ pub async fn run_with_oracle(
                                         "pr1_runtime_bypass_attempt_total",
                                         1u64
                                     );
+                                    crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
                                     warn!(
                                         "Trigger: rejected NewPoolDetected without canonical PR1 permit"
                                     );
@@ -5770,6 +5771,10 @@ pub async fn run_with_oracle(
                                     ::metrics::counter!(
                                         "pr1_runtime_bypass_attempt_total",
                                         1u64
+                                    );
+                                    crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
+                                    warn!(
+                                        "Trigger: rejected PoolTransaction without canonical PR1 permit"
                                     );
                                 }
                                 GhostEvent::FundingTransferObserved(_) => {

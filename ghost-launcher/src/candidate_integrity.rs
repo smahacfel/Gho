@@ -391,10 +391,37 @@ pub struct CandidateIntegrityRegistry {
     /// global ingest-integrity failure must invalidate every not-yet-started
     /// candidate action without rewriting terminal submit/confirmation state.
     authority_admission_generation: AtomicU64,
+    /// A poisoned state mutex may be encountered through more than one
+    /// fail-closed call path. Emit the diagnostic marker once for the first
+    /// observed `PoisonError`; admission behavior remains unchanged.
+    state_mutex_poison_marker_emitted: AtomicBool,
     #[cfg(test)]
     transition_before_commit_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
     #[cfg(test)]
     close_after_state_lock_hook: Mutex<Option<TransitionBeforeCommitHookV1>>,
+    #[cfg(test)]
+    diagnostic_admission_close_markers: Mutex<Vec<CandidateIntegrityAdmissionCloseMarkerV1>>,
+    #[cfg(test)]
+    diagnostic_state_mutex_poison_markers: Mutex<Vec<CandidateIntegrityStateMutexPoisonMarkerV1>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CandidateIntegrityAdmissionCloseMarkerV1 {
+    reason: &'static str,
+    close_path: &'static str,
+    authority_epoch_id: u64,
+    admission_generation: u64,
+    registry_available: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CandidateIntegrityStateMutexPoisonMarkerV1 {
+    authority_epoch_id: u64,
+    admission_generation: u64,
+    candidate_admission_open: bool,
+    registry_available: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -405,7 +432,7 @@ pub struct CandidateIntegritySignalResultV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum CandidateIntegrityErrorV1 {
-    #[error("candidate integrity registry mutex is poisoned")]
+    #[error("candidate integrity registry is unavailable")]
     RegistryUnavailable,
     #[error("candidate integrity registry capacity exceeded")]
     RegistryCapacityExceeded,
@@ -628,10 +655,15 @@ impl CandidateIntegrityRegistry {
             available: AtomicBool::new(true),
             candidate_admission_open: AtomicBool::new(true),
             authority_admission_generation: AtomicU64::new(1),
+            state_mutex_poison_marker_emitted: AtomicBool::new(false),
             #[cfg(test)]
             transition_before_commit_hook: Mutex::new(None),
             #[cfg(test)]
             close_after_state_lock_hook: Mutex::new(None),
+            #[cfg(test)]
+            diagnostic_admission_close_markers: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            diagnostic_state_mutex_poison_markers: Mutex::new(Vec::new()),
         }
     }
 
@@ -942,6 +974,39 @@ impl CandidateIntegrityRegistry {
         Ok(())
     }
 
+    /// Resolve the canonical-apply obligations that still belong to one
+    /// terminal Oracle candidate.
+    ///
+    /// The caller has already proved that the per-pool observation task is
+    /// terminal, so no remaining receipt can receive a downstream apply
+    /// acknowledgement from that task.  This intentionally delegates every
+    /// individual transition to [`Self::fail_canonical_apply`]: it does not
+    /// delete fence entries, bypass identity checks, or weaken the bounded
+    /// receipt/proof lifecycle.
+    pub(crate) fn fail_pending_canonical_applies_for_candidate(
+        &self,
+        candidate: PumpCandidateIdentityV1,
+    ) -> Result<usize, CandidateIntegrityErrorV1> {
+        self.require_available()?;
+        let pending = {
+            let state = self.lock_state()?;
+            state
+                .canonical_apply_fence
+                .receipts_by_runtime_key
+                .values()
+                .filter(|entry| {
+                    entry.receipt.candidate == candidate && !entry.applied && !entry.failed
+                })
+                .map(|entry| entry.receipt.clone())
+                .collect::<Vec<_>>()
+        };
+
+        for receipt in &pending {
+            self.fail_canonical_apply(receipt)?;
+        }
+        Ok(pending.len())
+    }
+
     pub(crate) fn fail_ready_release(
         &self,
         release: &CandidateIntegrityReadyReleaseV1,
@@ -1211,13 +1276,7 @@ impl CandidateIntegrityRegistry {
         signal: CandidateIntegritySignalV1,
     ) -> Result<CandidateIntegritySignalResultV1, CandidateIntegrityErrorV1> {
         self.require_available()?;
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => {
-                self.mark_unavailable("registry_mutex_poisoned");
-                return Err(CandidateIntegrityErrorV1::RegistryUnavailable);
-            }
-        };
+        let mut state = self.lock_state()?;
         if let Some(record) = state.terminal_tombstones.get_mut(signal.candidate) {
             // A retired identity remains immutable evidence, never a route
             // back into active candidate admission. Preserve the late signal
@@ -1582,6 +1641,11 @@ impl CandidateIntegrityRegistry {
         self.candidate_admission_open.load(Ordering::Acquire)
     }
 
+    #[must_use]
+    pub fn admission_generation(&self) -> u64 {
+        self.authority_admission_generation.load(Ordering::Acquire)
+    }
+
     pub fn close_candidate_admission(&self, reason: &'static str) {
         // `state` is the common linearization lock for global closure and a
         // guard phase transition.  A transition which owns this lock and has
@@ -1593,7 +1657,7 @@ impl CandidateIntegrityRegistry {
         let state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => {
-                self.force_close_candidate_admission_without_state(reason);
+                self.handle_state_mutex_poison(reason);
                 return;
             }
         };
@@ -1607,12 +1671,14 @@ impl CandidateIntegrityRegistry {
         if self.candidate_admission_open.swap(false, Ordering::AcqRel) {
             self.authority_admission_generation
                 .fetch_add(1, Ordering::AcqRel);
+            crate::oracle_metrics::record_pr1_runtime_candidate_admission_closed();
             ::metrics::gauge!(
                 "pr1_runtime_candidate_admission_closed",
                 1.0,
                 "authority_epoch_id" => self.authority_epoch.epoch_id.to_string(),
                 "reason" => reason
             );
+            self.emit_candidate_admission_closed_marker(reason, "state_locked");
         }
     }
 
@@ -1623,13 +1689,79 @@ impl CandidateIntegrityRegistry {
         if self.candidate_admission_open.swap(false, Ordering::AcqRel) {
             self.authority_admission_generation
                 .fetch_add(1, Ordering::AcqRel);
+            crate::oracle_metrics::record_pr1_runtime_candidate_admission_closed();
             ::metrics::gauge!(
                 "pr1_runtime_candidate_admission_closed",
                 1.0,
                 "authority_epoch_id" => self.authority_epoch.epoch_id.to_string(),
                 "reason" => reason
             );
+            self.emit_candidate_admission_closed_marker(reason, "mutex_poison_fallback");
         }
+    }
+
+    fn emit_candidate_admission_closed_marker(
+        &self,
+        reason: &'static str,
+        close_path: &'static str,
+    ) {
+        let authority_epoch_id = self.authority_epoch.epoch_id;
+        let admission_generation = self.admission_generation();
+        let registry_available = self.is_available();
+        tracing::error!(
+            reason,
+            close_path,
+            authority_epoch_id,
+            admission_generation,
+            registry_available,
+            "CANDIDATE_INTEGRITY_ADMISSION_CLOSED"
+        );
+        #[cfg(test)]
+        self.diagnostic_admission_close_markers
+            .lock()
+            .expect("test diagnostic admission-close marker mutex")
+            .push(CandidateIntegrityAdmissionCloseMarkerV1 {
+                reason,
+                close_path,
+                authority_epoch_id,
+                admission_generation,
+                registry_available,
+            });
+    }
+
+    /// The only path that may emit the poison marker.  It never recovers the
+    /// poisoned mutex: registry availability and candidate admission remain
+    /// fail-closed through the existing atomic fallback.
+    fn handle_state_mutex_poison(&self, close_reason: &'static str) {
+        self.available.store(false, Ordering::Release);
+        self.force_close_candidate_admission_without_state(close_reason);
+        if self
+            .state_mutex_poison_marker_emitted
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let authority_epoch_id = self.authority_epoch.epoch_id;
+        let admission_generation = self.admission_generation();
+        let candidate_admission_open = self.candidate_admission_open();
+        let registry_available = self.is_available();
+        tracing::error!(
+            authority_epoch_id,
+            admission_generation,
+            candidate_admission_open,
+            registry_available,
+            "CANDIDATE_INTEGRITY_STATE_MUTEX_POISONED"
+        );
+        #[cfg(test)]
+        self.diagnostic_state_mutex_poison_markers
+            .lock()
+            .expect("test diagnostic mutex-poison marker mutex")
+            .push(CandidateIntegrityStateMutexPoisonMarkerV1 {
+                authority_epoch_id,
+                admission_generation,
+                candidate_admission_open,
+                registry_available,
+            });
     }
 
     /// Close new-candidate admission and synchronously turn every mutable
@@ -1645,7 +1777,7 @@ impl CandidateIntegrityRegistry {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => {
-                self.available.store(false, Ordering::Release);
+                self.handle_state_mutex_poison(reason);
                 return;
             }
         };
@@ -1748,8 +1880,7 @@ impl CandidateIntegrityRegistry {
         match self.state.lock() {
             Ok(state) => Ok(state),
             Err(_) => {
-                self.available.store(false, Ordering::Release);
-                self.force_close_candidate_admission_without_state("registry_mutex_poisoned");
+                self.handle_state_mutex_poison("registry_mutex_poisoned");
                 Err(CandidateIntegrityErrorV1::RegistryUnavailable)
             }
         }
@@ -1835,6 +1966,24 @@ impl CandidateIntegrityRegistry {
         if let Some(hook) = hook {
             (hook.0)();
         }
+    }
+
+    #[cfg(test)]
+    fn diagnostic_admission_close_markers(&self) -> Vec<CandidateIntegrityAdmissionCloseMarkerV1> {
+        self.diagnostic_admission_close_markers
+            .lock()
+            .expect("test diagnostic admission-close marker mutex")
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn diagnostic_state_mutex_poison_markers(
+        &self,
+    ) -> Vec<CandidateIntegrityStateMutexPoisonMarkerV1> {
+        self.diagnostic_state_mutex_poison_markers
+            .lock()
+            .expect("test diagnostic mutex-poison marker mutex")
+            .clone()
     }
 
     fn check_guard(
@@ -3023,6 +3172,7 @@ mod tests {
     #[test]
     fn poisoned_registry_cannot_issue_evaluation_or_submit_authority() {
         let registry = Arc::new(CandidateIntegrityRegistry::default());
+        let authority_epoch_id = registry.authority_epoch().epoch_id;
         let poison_target = Arc::clone(&registry);
         assert!(std::thread::spawn(move || {
             let _guard = poison_target.state.lock().expect("lock before poison");
@@ -3037,6 +3187,50 @@ mod tests {
         ));
         assert!(!registry.is_available());
         assert!(!registry.candidate_admission_open());
+        assert_eq!(
+            registry.diagnostic_state_mutex_poison_markers(),
+            vec![CandidateIntegrityStateMutexPoisonMarkerV1 {
+                authority_epoch_id,
+                admission_generation: 2,
+                candidate_admission_open: false,
+                registry_available: false,
+            }]
+        );
+        assert_eq!(
+            registry.diagnostic_admission_close_markers(),
+            vec![CandidateIntegrityAdmissionCloseMarkerV1 {
+                reason: "registry_mutex_poisoned",
+                close_path: "mutex_poison_fallback",
+                authority_epoch_id,
+                admission_generation: 2,
+                registry_available: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn first_normal_admission_close_is_recorded_once_and_preserves_its_reason() {
+        let registry = CandidateIntegrityRegistry::default();
+        let authority_epoch_id = registry.authority_epoch().epoch_id;
+
+        registry.close_candidate_admission("first_integrity_failure");
+        registry.close_candidate_admission("later_idempotent_close");
+
+        assert!(!registry.candidate_admission_open());
+        assert_eq!(
+            registry.diagnostic_admission_close_markers(),
+            vec![CandidateIntegrityAdmissionCloseMarkerV1 {
+                reason: "first_integrity_failure",
+                close_path: "state_locked",
+                authority_epoch_id,
+                admission_generation: 2,
+                registry_available: true,
+            }]
+        );
+        assert_eq!(
+            CandidateIntegrityErrorV1::RegistryUnavailable.to_string(),
+            "candidate integrity registry is unavailable"
+        );
     }
 
     #[test]

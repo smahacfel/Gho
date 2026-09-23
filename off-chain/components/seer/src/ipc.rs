@@ -18,7 +18,7 @@ use std::{
     str::FromStr,
     sync::{Arc, Condvar, Mutex},
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -79,6 +79,7 @@ pub struct LocalCoverageGapStateV1 {
 }
 
 const MAX_RETAINED_LOCAL_COVERAGE_GAP_NOTICES: usize = 64;
+const IPC_DOWNSTREAM_FULL_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Runtime disposition attached to a raw pool-initialization observation.
 ///
@@ -822,8 +823,23 @@ pub enum IpcError {
 
 #[derive(Debug)]
 enum IpcQueueError {
-    Full(SeerEvent),
+    Full {
+        event: SeerEvent,
+        snapshot: IpcEgressQueueSnapshot,
+    },
     Closed(SeerEvent),
+}
+
+/// Exact egress-lane occupancy observed while holding the queue lock.
+///
+/// This is diagnostic evidence only. It is captured on the saturation path
+/// and never participates in scheduling, admission, or backpressure policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IpcEgressQueueSnapshot {
+    normal_len: usize,
+    normal_capacity: usize,
+    account_update_len: usize,
+    account_update_capacity: usize,
 }
 
 struct IpcEgressState {
@@ -871,10 +887,26 @@ impl IpcEgressQueue {
 
         if matches!(event, SeerEvent::AccountUpdate(_)) {
             if state.account_updates.len() >= self.account_update_capacity {
-                return Err(IpcQueueError::Full(event));
+                return Err(IpcQueueError::Full {
+                    event,
+                    snapshot: IpcEgressQueueSnapshot {
+                        normal_len: state.normal.len(),
+                        normal_capacity: self.normal_capacity,
+                        account_update_len: state.account_updates.len(),
+                        account_update_capacity: self.account_update_capacity,
+                    },
+                });
             }
         } else if state.normal.len() >= self.normal_capacity {
-            return Err(IpcQueueError::Full(event));
+            return Err(IpcQueueError::Full {
+                event,
+                snapshot: IpcEgressQueueSnapshot {
+                    normal_len: state.normal.len(),
+                    normal_capacity: self.normal_capacity,
+                    account_update_len: state.account_updates.len(),
+                    account_update_capacity: self.account_update_capacity,
+                },
+            });
         }
 
         // Sequence allocation and queue insertion share the same lock. This is
@@ -983,6 +1015,11 @@ pub struct IpcSender {
     egress: Arc<IpcEgressQueue>,
     dispatcher: Arc<Mutex<Option<JoinHandle<()>>>>,
 
+    /// Diagnostic-only clone of the fixed downstream sender. It exposes
+    /// capacity at the instant an egress-lane saturation is observed; it is
+    /// never used to send, receive, wait, or alter dispatch behavior.
+    downstream_diagnostics: mpsc::Sender<SeerEvent>,
+
     /// Configuration
     config: IpcChannelConfig,
 
@@ -999,6 +1036,7 @@ impl IpcSender {
     fn new(
         egress: Arc<IpcEgressQueue>,
         dispatcher: Arc<Mutex<Option<JoinHandle<()>>>>,
+        downstream_diagnostics: mpsc::Sender<SeerEvent>,
         config: IpcChannelConfig,
         metrics: Arc<IpcMetrics>,
         local_gap_audit: Arc<crate::local_gap::LocalGapAuditRouter>,
@@ -1007,6 +1045,7 @@ impl IpcSender {
         Self {
             egress,
             dispatcher,
+            downstream_diagnostics,
             config,
             metrics,
             local_gap: Arc::new(crate::local_gap::LocalGapTracker::new(
@@ -1281,13 +1320,17 @@ impl IpcSender {
 
         let boundary = ipc_event_boundary(&event);
         let provider_id = ipc_event_provider_id(&event);
+        let event_kind = seer_event_kind(&event);
         let send_result = match self.egress.try_enqueue(event) {
             Ok(()) => {
                 self.local_gap.observe_admitted(boundary);
                 self.local_gap.flush_completed_to(&self.local_gap_audit);
                 Ok(())
             }
-            Err(IpcQueueError::Full(_event)) => {
+            Err(IpcQueueError::Full {
+                event: _event,
+                snapshot,
+            }) => {
                 if matches!(policy, BackpressurePolicy::DropNew)
                     || matches!(policy, BackpressurePolicy::DropByPriority)
                         && priority == EventPriority::Low
@@ -1295,12 +1338,28 @@ impl IpcSender {
                     self.metrics.record_drop(priority);
                     Err(IpcError::EventDropped { policy, priority })
                 } else {
-                    self.local_gap.observe_saturation(
+                    let first_saturation = self.local_gap.observe_saturation(
                         provider_id.clone(),
                         0,
                         boundary,
                         current_queue_length.max(self.config.buffer_size),
                     );
+                    if first_saturation {
+                        warn!(
+                            event_kind,
+                            provider_id = %provider_id,
+                            normal_len = snapshot.normal_len,
+                            normal_capacity = snapshot.normal_capacity,
+                            account_update_len = snapshot.account_update_len,
+                            account_update_capacity = snapshot.account_update_capacity,
+                            downstream_remaining_capacity = self.downstream_diagnostics.capacity(),
+                            downstream_max_capacity = self.downstream_diagnostics.max_capacity(),
+                            events_sent = self.metrics.events_sent.get(),
+                            events_received = self.metrics.events_received.get(),
+                            timestamp_unix_ms = ipc_timestamp_unix_ms(),
+                            "IPC_EGRESS_SATURATED"
+                        );
+                    }
                     ::metrics::increment_counter!(
                         "seer_local_coverage_gap_opened_total",
                         "reason" => "ipc_egress_queue_saturated"
@@ -1403,6 +1462,9 @@ pub struct IpcReceiver {
 
     /// Metrics
     metrics: Arc<IpcMetrics>,
+    /// Read-only view of the fixed egress FIFO for consumer-boundary
+    /// diagnostics. It is never used to dequeue, enqueue, or steer delivery.
+    egress_diagnostics: Option<Arc<IpcEgressQueue>>,
     local_coverage_gap_rx: watch::Receiver<LocalCoverageGapStateV1>,
 }
 
@@ -1437,6 +1499,59 @@ fn ipc_event_provider_id(event: &SeerEvent) -> String {
     }
 }
 
+const fn seer_event_kind(event: &SeerEvent) -> &'static str {
+    match event {
+        SeerEvent::PoolDetected(_) => "pool_detected",
+        SeerEvent::Trade(_) => "trade",
+        SeerEvent::FundingTransfer(_) => "funding_transfer",
+        SeerEvent::AccountUpdate(_) => "account_update",
+        SeerEvent::ExecutionAccountEvidence(_) => "execution_account_evidence",
+    }
+}
+
+fn ipc_timestamp_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn should_emit_downstream_full_marker(last_emitted: Option<Instant>, now: Instant) -> bool {
+    last_emitted.is_none_or(|last| now.duration_since(last) >= IPC_DOWNSTREAM_FULL_LOG_INTERVAL)
+}
+
+/// Diagnostic-only state for one downstream-full episode.
+///
+/// A single successful `try_send` may free exactly one downstream slot while
+/// the dispatcher still has an egress backlog.  Treating that success as a
+/// new episode would turn a sustained pressure condition into a log per slot.
+/// The episode therefore ends only once the egress has drained.
+#[derive(Debug, Default)]
+struct DownstreamFullEpisode {
+    started_at: Option<Instant>,
+    last_logged_at: Option<Instant>,
+}
+
+impl DownstreamFullEpisode {
+    fn observe_full(&mut self, now: Instant) -> Option<Duration> {
+        let started_at = *self.started_at.get_or_insert(now);
+        if should_emit_downstream_full_marker(self.last_logged_at, now) {
+            self.last_logged_at = Some(now);
+            Some(now.duration_since(started_at))
+        } else {
+            None
+        }
+    }
+
+    fn observe_delivery(&mut self, egress_is_empty: bool) {
+        if egress_is_empty {
+            self.started_at = None;
+            self.last_logged_at = None;
+        }
+    }
+}
+
 fn ipc_event_boundary(event: &SeerEvent) -> ghost_core::LocalCoverageBoundaryV1 {
     match event {
         SeerEvent::PoolDetected(event) => ghost_core::LocalCoverageBoundaryV1 {
@@ -1465,6 +1580,21 @@ impl IpcReceiver {
         Self {
             receiver,
             metrics,
+            egress_diagnostics: None,
+            local_coverage_gap_rx,
+        }
+    }
+
+    fn with_egress_diagnostics(
+        receiver: mpsc::Receiver<SeerEvent>,
+        metrics: Arc<IpcMetrics>,
+        egress_diagnostics: Arc<IpcEgressQueue>,
+        local_coverage_gap_rx: watch::Receiver<LocalCoverageGapStateV1>,
+    ) -> Self {
+        Self {
+            receiver,
+            metrics,
+            egress_diagnostics: Some(egress_diagnostics),
             local_coverage_gap_rx,
         }
     }
@@ -1475,6 +1605,27 @@ impl IpcReceiver {
     #[must_use]
     pub fn local_coverage_gap_receiver(&self) -> watch::Receiver<LocalCoverageGapStateV1> {
         self.local_coverage_gap_rx.clone()
+    }
+
+    /// Number of events currently waiting in the bounded downstream hand-off.
+    ///
+    /// This is diagnostic-only and does not participate in receive ordering,
+    /// backpressure, or admission policy.
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.receiver.len()
+    }
+
+    /// Number of events still waiting before the fixed egress dispatcher.
+    ///
+    /// This is a diagnostic-only snapshot used to distinguish a delayed
+    /// receiver from an empty producer egress. It does not alter IPC
+    /// ordering, capacity, backpressure, or fail-closed handling.
+    #[must_use]
+    pub fn egress_pending_len(&self) -> usize {
+        self.egress_diagnostics
+            .as_ref()
+            .map_or(0, |egress| egress.len())
     }
 
     /// Record handling latency for the given event using the shared helper.
@@ -1510,6 +1661,7 @@ impl IpcReceiver {
 /// Create a new IPC channel with the given configuration
 pub fn create_ipc_channel(config: IpcChannelConfig) -> (IpcSender, IpcReceiver, Arc<IpcMetrics>) {
     let (downstream_tx, rx) = mpsc::channel(config.buffer_size);
+    let downstream_diagnostics = downstream_tx.clone();
     let metrics = IpcMetrics::new();
     let local_gap_audit = Arc::new(crate::local_gap::LocalGapAuditRouter::new());
     let (local_coverage_gap_tx, local_coverage_gap_rx) =
@@ -1524,14 +1676,30 @@ pub fn create_ipc_channel(config: IpcChannelConfig) -> (IpcSender, IpcReceiver, 
         .name("seer-ipc-egress".to_string())
         .spawn(move || {
             let mut pending = None;
+            let mut downstream_full_episode = DownstreamFullEpisode::default();
             loop {
                 let event = match pending.take().or_else(|| worker_egress.next_event()) {
                     Some(event) => event,
                     None => break,
                 };
                 match downstream_tx.try_send(event) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        downstream_full_episode.observe_delivery(worker_egress.len() == 0);
+                    }
                     Err(mpsc::error::TrySendError::Full(event)) => {
+                        let now = Instant::now();
+                        if let Some(continuous_full_duration) =
+                            downstream_full_episode.observe_full(now)
+                        {
+                            warn!(
+                                pending_event_kind = seer_event_kind(&event),
+                                continuous_full_duration_ms = continuous_full_duration
+                                    .as_millis()
+                                    .min(u128::from(u64::MAX))
+                                    as u64,
+                                "IPC_DOWNSTREAM_FULL"
+                            );
+                        }
                         pending = Some(event);
                         if worker_egress.shutdown_deadline_expired() {
                             worker_egress.mark_delivery_failed(true);
@@ -1550,14 +1718,20 @@ pub fn create_ipc_channel(config: IpcChannelConfig) -> (IpcSender, IpcReceiver, 
     let dispatcher = Arc::new(Mutex::new(Some(handle)));
 
     let sender = IpcSender::new(
-        egress,
+        Arc::clone(&egress),
         dispatcher,
+        downstream_diagnostics,
         config.clone(),
         Arc::clone(&metrics),
         local_gap_audit,
         local_coverage_gap_tx,
     );
-    let receiver = IpcReceiver::new(rx, Arc::clone(&metrics), local_coverage_gap_rx);
+    let receiver = IpcReceiver::with_egress_diagnostics(
+        rx,
+        Arc::clone(&metrics),
+        egress,
+        local_coverage_gap_rx,
+    );
 
     (sender, receiver, metrics)
 }
@@ -1581,6 +1755,75 @@ mod tests {
         assert_eq!(
             decoded.account_update_queue_capacity,
             IpcChannelConfig::default().account_update_queue_capacity
+        );
+    }
+
+    #[test]
+    fn normal_lane_saturation_captures_exact_lane_occupancy() {
+        let queue = IpcEgressQueue::new(1, 3);
+        let event = || {
+            SeerEvent::PoolDetected(DetectedPoolEvent {
+                candidate: create_test_candidate(),
+                observation: None,
+                runtime_disposition: PoolDetectionRuntimeDispositionV1::CandidateAdmission,
+                continuity_observation_pool: None,
+                detected_at: SystemTime::now(),
+                sequence_number: 0,
+                priority: EventPriority::Normal,
+            })
+        };
+        queue.try_enqueue(event()).expect("first event fits");
+
+        match queue.try_enqueue(event()) {
+            Err(IpcQueueError::Full { snapshot, .. }) => {
+                assert_eq!(snapshot.normal_len, 1);
+                assert_eq!(snapshot.normal_capacity, 1);
+                assert_eq!(snapshot.account_update_len, 0);
+                assert_eq!(snapshot.account_update_capacity, 3);
+            }
+            other => panic!("expected normal-lane saturation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn downstream_full_marker_is_emitted_first_and_then_rate_limited() {
+        let started = Instant::now();
+        assert!(should_emit_downstream_full_marker(None, started));
+        assert!(!should_emit_downstream_full_marker(Some(started), started));
+        assert!(!should_emit_downstream_full_marker(
+            Some(started),
+            started + IPC_DOWNSTREAM_FULL_LOG_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(should_emit_downstream_full_marker(
+            Some(started),
+            started + IPC_DOWNSTREAM_FULL_LOG_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn downstream_full_episode_survives_one_slot_delivery_with_egress_backlog() {
+        let started = Instant::now();
+        let mut episode = DownstreamFullEpisode::default();
+
+        assert_eq!(episode.observe_full(started), Some(Duration::ZERO));
+        episode.observe_delivery(false);
+        assert_eq!(
+            episode.observe_full(started + Duration::from_millis(999)),
+            None,
+            "one successful downstream delivery must not reset a full episode while egress remains backlogged"
+        );
+        assert_eq!(
+            episode.observe_full(started + IPC_DOWNSTREAM_FULL_LOG_INTERVAL),
+            Some(IPC_DOWNSTREAM_FULL_LOG_INTERVAL)
+        );
+
+        episode.observe_delivery(true);
+        assert_eq!(
+            episode.observe_full(
+                started + IPC_DOWNSTREAM_FULL_LOG_INTERVAL + Duration::from_millis(1)
+            ),
+            Some(Duration::ZERO),
+            "an empty egress queue begins a new downstream-full episode"
         );
     }
 

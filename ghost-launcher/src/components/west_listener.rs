@@ -150,6 +150,7 @@ pub async fn run(
                                     "pr1_runtime_bypass_attempt_total",
                                     1u64
                                 );
+                                crate::oracle_metrics::record_pr1_runtime_bypass_attempt();
                                 warn!(
                                     "WestListener: rejected structural event without canonical PR1 permit"
                                 );
