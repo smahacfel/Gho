@@ -50,6 +50,8 @@ pub const DISC_CREATE: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77
 /// index 5 (zero based), while the legacy `create` user is index 7.
 pub const DISC_CREATE_V2: [u8; 8] = [0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x31, 0xb4];
 pub const DISC_BUY: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
+pub const DISC_BUY_V2: [u8; 8] = [0xb8, 0x17, 0xee, 0x61, 0x67, 0xc5, 0xd3, 0x3d];
+pub const DISC_SELL_V2: [u8; 8] = [0x5d, 0xf6, 0x82, 0x3c, 0xe7, 0xe9, 0x40, 0xb2];
 pub const DISC_SELL: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
 pub const DISC_WITHDRAW: [u8; 8] = [0xb7, 0x12, 0x46, 0x9c, 0x94, 0x6d, 0xa1, 0x22];
 // sha256("global:migrate")[..8]
@@ -127,6 +129,76 @@ const PUMP_IDX_CREATOR_VAULT: usize = 9;
 const PUMP_IDX_BONDING_CURVE_V2: usize = 16;
 const PUMP_BUY_FIXED_ACCOUNT_COUNT: usize = 16;
 const PUMP_BUYBACK_REMAINING_ACCOUNT_COUNT: usize = 2;
+
+// Układ kont zależy od instrukcji; V2 nie używa indeksów legacy.
+// Źródło: pump-fun/pump-public-docs, idl/pump.json (manifest testów r21).
+#[derive(Clone, Copy)]
+struct PumpTradeIxLayout {
+    variant: &'static str,
+    is_buy: bool,
+    mint: usize,
+    curve: usize,
+    user: usize,
+    token_program: usize,
+    fee_recipient: usize,
+    associated_curve: usize,
+    creator_vault: usize,
+    min_accounts: usize,
+    quote_mint: Option<usize>,
+}
+
+fn pump_trade_ix_layout(data: &[u8]) -> Option<PumpTradeIxLayout> {
+    let disc: [u8; 8] = data.get(..8)?.try_into().ok()?;
+    let (variant, is_buy, v2) = match disc {
+        DISC_BUY => ("legacy_buy", true, false),
+        DISC_PUMP_BUY_ROUTED | DISC_SWAP_BUY_EXACT_QUOTE_IN => ("routed_exact_sol_in", true, false),
+        DISC_SELL => ("legacy_sell", false, false),
+        DISC_BUY_V2 => ("buy_v2", true, true),
+        DISC_SELL_V2 => ("sell_v2", false, true),
+        _ => return None,
+    };
+    Some(if v2 {
+        PumpTradeIxLayout {
+            variant,
+            is_buy,
+            mint: 1,
+            curve: 10,
+            user: 13,
+            token_program: 3,
+            fee_recipient: 6,
+            associated_curve: 11,
+            creator_vault: 16,
+            min_accounts: if is_buy { 27 } else { 26 },
+            quote_mint: Some(2),
+        }
+    } else {
+        PumpTradeIxLayout {
+            variant,
+            is_buy,
+            mint: PUMP_IDX_MINT,
+            curve: PUMP_IDX_BONDING_CURVE,
+            user: PUMP_IDX_USER,
+            token_program: if is_buy { 8 } else { 9 },
+            fee_recipient: PUMP_IDX_FEE_RECIPIENT,
+            associated_curve: PUMP_IDX_ASSOCIATED_BONDING_CURVE,
+            creator_vault: if is_buy { 9 } else { 8 },
+            min_accounts: PUMP_IDX_USER + 1,
+            quote_mint: None,
+        }
+    })
+}
+
+fn pump_trade_layout_matches_accounts(
+    layout: PumpTradeIxLayout,
+    accounts: &[String],
+    data: &[u8],
+) -> bool {
+    accounts.len() >= layout.min_accounts
+        && layout
+            .quote_mint
+            .is_none_or(|i| accounts.get(i).is_some_and(|q| q == WSOL_MINT))
+        && (layout.quote_mint.is_none() || data.len() == 24)
+}
 
 // Pump.fun legacy CREATE instruction layout (different from Buy/Sell!):
 //   0=Mint, 1=MintAuthority, 2=BondingCurve, 3=AssocBondingCurve, 4=Global,
@@ -3045,6 +3117,60 @@ impl PumpParser {
                 }
             }
 
+            DISC_BUY_V2 | DISC_SELL_V2 => {
+                if program != PUMP_FUN_PROGRAM_ID {
+                    return;
+                }
+                let Some(layout) = pump_trade_ix_layout(data) else {
+                    return;
+                };
+                if !pump_trade_layout_matches_accounts(layout, accounts, data) {
+                    return;
+                }
+                let Some(params) = borsh_read::<TradeParams>(payload) else {
+                    return;
+                };
+                let mint = acs(accounts, layout.mint);
+                let bonding_curve = acs(accounts, layout.curve);
+                let user = acs(accounts, layout.user);
+                if !is_valid_curve_role(&mint, &bonding_curve) {
+                    return;
+                }
+                cm_reg.insert(&bonding_curve, &mint);
+                ar_reg.insert_curve(bonding_curve.clone());
+                ar_reg.insert_mint(mint.clone());
+                let side = if layout.is_buy {
+                    TradeSide::Buy
+                } else {
+                    TradeSide::Sell
+                };
+                let enriched =
+                    enrich_trade(side, &bonding_curve, pre_balances, post_balances, all_keys);
+                ParsedEventKind::Trade {
+                    side,
+                    source: if from_cpi {
+                        TradeSource::CpiDirect
+                    } else {
+                        TradeSource::BondingCurve
+                    },
+                    mint,
+                    bonding_curve,
+                    user,
+                    global_config: Pubkey::from_str(&acs(accounts, 0)).ok(),
+                    fee_recipient: Pubkey::from_str(&acs(accounts, layout.fee_recipient)).ok(),
+                    token_program: Pubkey::from_str(&acs(accounts, layout.token_program)).ok(),
+                    token_amount: params.amount,
+                    sol_amount: enriched.sol_amount,
+                    virtual_token_reserves: 0,
+                    virtual_sol_reserves: 0,
+                    real_token_reserves: 0,
+                    real_sol_reserves: 0,
+                    market_cap_sol: 0.0,
+                    progress: 0.0,
+                    is_complete: false,
+                }
+            }
+
             // buy_exact_quote_in is Axiom Trade's variant of PumpSwap buy.
             // Same account layout as buy; CpiSwapBuy event is emitted on-chain.
             // Without this arm, the outer ix is Unknown and swap_deltas never run,
@@ -3326,8 +3452,7 @@ impl PumpParser {
                         .unwrap_or_default();
                     let fee_recipient = Pubkey::from_str(&acs(accounts, PUMP_IDX_FEE_RECIPIENT))
                         .unwrap_or_default();
-                    let token_program = Pubkey::from_str(&acs(accounts, PUMP_IDX_TOKEN_PROGRAM))
-                        .unwrap_or_default();
+                    let token_program = Pubkey::from_str(&acs(accounts, 9)).unwrap_or_default();
                     if !is_valid_curve_role(&mint, &bonding_curve) {
                         log_drop_role_mismatch(
                             "sell",
@@ -4095,6 +4220,11 @@ fn trade_instruction_limit(
     trade: &TradeEvent,
     route_variant: Option<PumpRouteVariant>,
 ) -> Option<PumpInstructionLimitV1> {
+    // Nowy parser niesie literalny limit. Starsze payloady bez tego pola
+    // zachowują dotychczasową projekcję kompatybilności.
+    if let Some(limit) = trade.instruction_limit.as_ref() {
+        return Some(limit.clone());
+    }
     match route_variant {
         Some(PumpRouteVariant::LegacyBuy | PumpRouteVariant::BuyV2) if trade.max_sol_cost > 0 => {
             Some(PumpInstructionLimitV1::MaxWalletDebitLamports(
@@ -5955,6 +6085,7 @@ impl BinaryParser {
                         is_buy: side == TradeSide::Buy,
                         is_dev_buy: false,
                         amount: token_amount,
+                        instruction_limit: None,
                         max_sol_cost: if side == TradeSide::Buy {
                             sol_amount
                         } else {
@@ -6058,6 +6189,7 @@ impl BinaryParser {
                         is_buy: et.is_buy,
                         is_dev_buy: false,
                         amount: et.token_amount,
+                        instruction_limit: None,
                         max_sol_cost: if et.is_buy { et.sol_amount } else { 0 },
                         min_sol_output: if !et.is_buy { et.sol_amount } else { 0 },
                         success: runtime_ctx.success,
@@ -6167,6 +6299,7 @@ impl BinaryParser {
                         is_buy: effective_is_buy,
                         is_dev_buy: false,
                         amount: base_amount,
+                        instruction_limit: None,
                         max_sol_cost: if effective_is_buy { quote_amount } else { 0 },
                         min_sol_output: if effective_is_buy { 0 } else { quote_amount },
                         success: runtime_ctx.success,
@@ -6254,6 +6387,7 @@ impl BinaryParser {
                         is_buy: true,
                         is_dev_buy: true,
                         amount: token_amount,
+                        instruction_limit: None,
                         max_sol_cost: sol_amount,
                         min_sol_output: 0,
                         success: runtime_ctx.success,
@@ -6387,6 +6521,7 @@ impl BinaryParser {
                         is_buy,
                         is_dev_buy: false,
                         amount: token_amount,
+                        instruction_limit: None,
                         max_sol_cost: if is_buy { sol_amount } else { 0 },
                         min_sol_output: if is_buy { 0 } else { sol_amount },
                         success: runtime_ctx.success,
@@ -6520,6 +6655,7 @@ impl BinaryParser {
                         is_buy,
                         is_dev_buy: false,
                         amount: token_amount,
+                        instruction_limit: None,
                         max_sol_cost: if is_buy { sol_amount } else { 0 },
                         min_sol_output: if is_buy { 0 } else { sol_amount },
                         success: runtime_ctx.success,
@@ -6672,6 +6808,7 @@ impl BinaryParser {
                 is_buy: inferred.is_buy,
                 is_dev_buy: false,
                 amount: inferred.token_amount,
+                instruction_limit: None,
                 max_sol_cost: if inferred.is_buy {
                     inferred.sol_amount
                 } else {
@@ -7909,15 +8046,12 @@ fn trade_matches_pump_instruction(
         return false;
     }
 
-    let is_matching_discriminator = if trade.is_buy {
-        ix_data.starts_with(&DISC_BUY)
-            || ix_data.starts_with(&DISC_SWAP_BUY_EXACT_QUOTE_IN)
-            || ix_data.starts_with(&DISC_PUMP_BUY_ROUTED)
-    } else {
-        ix_data.starts_with(&DISC_SELL)
+    let Some(layout) = pump_trade_ix_layout(ix_data) else {
+        return false;
     };
-
-    if !is_matching_discriminator || ix_accounts.len() <= PUMP_IDX_BONDING_CURVE {
+    if layout.is_buy != trade.is_buy
+        || !pump_trade_layout_matches_accounts(layout, ix_accounts, ix_data)
+    {
         return false;
     }
 
@@ -7929,13 +8063,16 @@ fn trade_matches_pump_instruction(
     // from the instruction accounts.  Without this, buy_variant stays None for every
     // unresolved/buffered-tx-fallback pool, causing the builder to silently fall back to
     // RoutedExactSolIn for LegacyBuy pools → Custom(1) on-chain.
+    let user = Pubkey::from_str(&acs(ix_accounts, layout.user)).unwrap_or_default();
+    if user != trade.signer {
+        return false;
+    }
     if trade.pool_amm_id == Pubkey::default() || trade.mint == Pubkey::default() {
         return true;
     }
 
-    let mint = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_MINT)).unwrap_or_default();
-    let bonding_curve =
-        Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_BONDING_CURVE)).unwrap_or_default();
+    let mint = Pubkey::from_str(&acs(ix_accounts, layout.mint)).unwrap_or_default();
+    let bonding_curve = Pubkey::from_str(&acs(ix_accounts, layout.curve)).unwrap_or_default();
 
     mint == trade.mint && bonding_curve == trade.pool_amm_id
 }
@@ -7946,6 +8083,7 @@ fn trade_enrich_complete(trade: &TradeEvent) -> bool {
     trade.global_config.is_some()
         && trade.fee_recipient.is_some()
         && trade.token_program.is_some()
+        && trade.buy_variant.is_some()
         && (!trade.is_buy
             || (trade.buy_variant.is_some()
                 && trade.associated_bonding_curve.is_some()
@@ -7979,15 +8117,7 @@ struct ObservedIxAccountContext {
 }
 
 fn pump_buy_variant_from_ix_data(ix_data: &[u8]) -> Option<&'static str> {
-    if ix_data.starts_with(&DISC_PUMP_BUY_ROUTED)
-        || ix_data.starts_with(&DISC_SWAP_BUY_EXACT_QUOTE_IN)
-    {
-        Some("routed_exact_sol_in")
-    } else if ix_data.starts_with(&DISC_BUY) {
-        Some("legacy_buy")
-    } else {
-        None
-    }
+    pump_trade_ix_layout(ix_data).map(|layout| layout.variant)
 }
 
 fn pump_buy_variant_has_bcv2(ix_data: &[u8]) -> bool {
@@ -8091,26 +8221,48 @@ fn fill_trade_from_ix_accounts(
     ix_data: &[u8],
     context: &ObservedIxAccountContext,
 ) -> bool {
+    let Some(layout) = pump_trade_ix_layout(ix_data) else {
+        return false;
+    };
+    if !pump_trade_layout_matches_accounts(layout, ix_accounts, ix_data) {
+        return false;
+    }
+    if let (Some(first), Some(second)) = (
+        ix_data
+            .get(8..16)
+            .and_then(|v| v.try_into().ok())
+            .map(u64::from_le_bytes),
+        ix_data
+            .get(16..24)
+            .and_then(|v| v.try_into().ok())
+            .map(u64::from_le_bytes),
+    ) {
+        trade.instruction_limit = Some(match layout.variant {
+            "routed_exact_sol_in" => PumpInstructionLimitV1::ExactQuoteInputLamports(first),
+            _ if layout.is_buy => PumpInstructionLimitV1::MaxWalletDebitLamports(second),
+            _ => PumpInstructionLimitV1::MinWalletCreditLamports(second),
+        });
+    }
     if trade.global_config.is_none() {
         trade.global_config = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_GLOBAL_CONFIG)).ok();
     }
     if trade.fee_recipient.is_none() {
-        trade.fee_recipient = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_FEE_RECIPIENT)).ok();
+        trade.fee_recipient = Pubkey::from_str(&acs(ix_accounts, layout.fee_recipient)).ok();
     }
     if trade.token_program.is_none() {
-        trade.token_program = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_TOKEN_PROGRAM)).ok();
+        trade.token_program = Pubkey::from_str(&acs(ix_accounts, layout.token_program)).ok();
     }
-    if trade.is_buy && trade.buy_variant.is_none() {
+    if trade.buy_variant.is_none() {
         trade.buy_variant = pump_buy_variant_from_ix_data(ix_data).map(str::to_string);
     }
     if trade.is_buy && trade.associated_bonding_curve.is_none() {
         trade.associated_bonding_curve =
-            Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_ASSOCIATED_BONDING_CURVE))
+            Pubkey::from_str(&acs(ix_accounts, layout.associated_curve))
                 .ok()
                 .filter(|value| *value != Pubkey::default());
     }
     if trade.is_buy && trade.creator_vault.is_none() {
-        trade.creator_vault = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_CREATOR_VAULT))
+        trade.creator_vault = Pubkey::from_str(&acs(ix_accounts, layout.creator_vault))
             .ok()
             .filter(|value| *value != Pubkey::default());
     }
@@ -8146,6 +8298,21 @@ fn fill_trade_from_ix_accounts(
             .collect();
     }
     trade_enrich_complete(trade)
+}
+
+// Metadane trasy muszą pochodzić z instrukcji będącej przodkiem zdarzenia,
+// nie z innego wywołania dla tego samego mintu w tej transakcji.
+fn instruction_contains_trade(trade: &TradeEvent, outer_index: u32, path: &[u16]) -> bool {
+    let Some(provenance) = trade.provenance.as_ref() else {
+        return true;
+    };
+    provenance
+        .outer_instruction_index
+        .is_none_or(|index| index == outer_index)
+        && provenance
+            .inner_instruction_path
+            .as_ref()
+            .is_none_or(|trade_path| trade_path.starts_with(path))
 }
 
 fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mut TradeEvent) {
@@ -8187,6 +8354,9 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
         ObservedIxAccountContext,
     )> = None;
     for (outer_instruction_index, ix) in instructions.iter().enumerate() {
+        if !instruction_contains_trade(trade, outer_instruction_index as u32, &[]) {
+            continue;
+        }
         let ix_accounts = resolve_accounts(&ix.account_indices, &all_keys);
         if !trade_matches_pump_instruction(trade, &ix.program_id, &ix.data, &ix_accounts) {
             continue;
@@ -8233,7 +8403,23 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
             ObservedIxAccountContext,
         )> = None;
         for group in inner_instructions {
+            let mut current_path = SmallVec::<[u16; 8]>::new();
+            let mut next_sibling = SmallVec::<[u32; 8]>::from_slice(&[0]);
             for ix in &group.instructions {
+                let path = next_inner_instruction_path(
+                    ix.stack_height,
+                    &mut current_path,
+                    &mut next_sibling,
+                );
+                if path
+                    .as_ref()
+                    .is_some_and(|path| !instruction_contains_trade(trade, group.index, path))
+                {
+                    continue;
+                }
+                if !instruction_contains_trade(trade, group.index, &[]) {
+                    continue;
+                }
                 let prog_str = key_at(&all_keys, ix.program_id_index as usize);
                 let Ok(prog_pk) = Pubkey::from_str(&prog_str) else {
                     continue;
@@ -9002,6 +9188,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 123,
+            instruction_limit: None,
             max_sol_cost: 456,
             min_sol_output: 0,
             success: true,
@@ -12825,6 +13012,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 123_456,
+            instruction_limit: None,
             max_sol_cost: 789_000,
             min_sol_output: 0,
             success: true,
@@ -12887,6 +13075,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 123_456,
+            instruction_limit: None,
             max_sol_cost: 789_000,
             min_sol_output: 0,
             success: true,
@@ -12962,6 +13151,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 123,
+            instruction_limit: None,
             max_sol_cost: 456,
             min_sol_output: 0,
             success: true,
@@ -13121,6 +13311,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 123_456,
+            instruction_limit: None,
             max_sol_cost: 789_000,
             min_sol_output: 0,
             success: true,
@@ -13306,6 +13497,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 1_000_000,
+            instruction_limit: None,
             max_sol_cost: 50_000_000,
             min_sol_output: 0,
             success: true,
@@ -14139,6 +14331,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 1_000_000,
+            instruction_limit: None,
             max_sol_cost: 50_000_000,
             min_sol_output: 0,
             success: true,
@@ -14249,6 +14442,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 1_000_000,
+            instruction_limit: None,
             max_sol_cost: 50_000_000,
             min_sol_output: 0,
             success: true,
@@ -14369,6 +14563,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 1_000_000,
+            instruction_limit: None,
             max_sol_cost: 50_000_000,
             min_sol_output: 0,
             success: true,
@@ -14472,6 +14667,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 1_000_000,
+            instruction_limit: None,
             max_sol_cost: 50_000_000,
             min_sol_output: 0,
             success: true,
@@ -14589,6 +14785,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 1_000_000,
+            instruction_limit: None,
             max_sol_cost: 50_000_000,
             min_sol_output: 0,
             success: true,

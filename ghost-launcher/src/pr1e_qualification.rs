@@ -250,6 +250,7 @@ fn trade_carrier(signature: Signature, pool: Pubkey, mint: Pubkey, ordinal: u32)
         is_buy: true,
         is_dev_buy: false,
         amount: 1_000_000 + u64::from(ordinal),
+        instruction_limit: None,
         max_sol_cost: 10_000_000,
         min_sol_output: 0,
         success: true,

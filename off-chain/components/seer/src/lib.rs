@@ -6600,6 +6600,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 42,
+            instruction_limit: None,
             max_sol_cost: 1_000_000,
             min_sol_output: 0,
             success: true,

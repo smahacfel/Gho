@@ -2342,6 +2342,11 @@ fn launcher_trade_instruction_limit(
     trade: &seer::types::TradeEvent,
     route: Option<PumpRouteVariant>,
 ) -> Option<ghost_core::PumpInstructionLimitV1> {
+    // Nowy parser niesie literalny limit. Starsze payloady bez tego pola
+    // zachowują dotychczasową projekcję kompatybilności.
+    if let Some(limit) = trade.instruction_limit.as_ref() {
+        return Some(limit.clone());
+    }
     match route {
         Some(PumpRouteVariant::LegacyBuy | PumpRouteVariant::BuyV2) if trade.max_sol_cost > 0 => {
             Some(ghost_core::PumpInstructionLimitV1::MaxWalletDebitLamports(
@@ -7434,6 +7439,100 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::{broadcast, mpsc};
 
+    #[test]
+    fn r21_real_buy_sell_pass_parser_primary_boundary_and_ready_fence() {
+        use seer::{binary_parser::BinaryParser, types::GeyserEvent};
+        for ack_first in [false, true] {
+            let parser = BinaryParser::new(false);
+            let create: GeyserEvent = serde_json::from_str(include_str!(
+                "../../../off-chain/components/seer/tests/fixtures/r21/create_buy_v2.json"
+            ))
+            .unwrap();
+            let sell: GeyserEvent = serde_json::from_str(include_str!(
+                "../../../off-chain/components/seer/tests/fixtures/r21/sell_v2.json"
+            ))
+            .unwrap();
+            let registry = Arc::new(CandidateIntegrityRegistry::new(Default::default()));
+            let ledger = Arc::new(Mutex::new(PumpObservationLedgerV1::default()));
+            let bundle = parser.parse_transaction_bundle(&create).unwrap();
+            let obs = bundle.initialize_pool_observation.clone().unwrap();
+            let candidate = PumpCandidateIdentityV1 {
+                pool_amm_id: obs.claims.curve.unwrap(),
+                mint: obs.claims.mint.unwrap(),
+            };
+            let birth = expect_runtime_permit(ingest_pump_observation(
+                &ledger,
+                &registry,
+                Some(obs),
+                1,
+                true,
+                None,
+            ));
+            registry.claim_oracle_session(&birth.apply_receipt).unwrap();
+            if ack_first {
+                registry
+                    .mark_canonical_apply_succeeded(&birth.apply_receipt)
+                    .unwrap();
+            }
+            let trade = &bundle.trades[0];
+            let observation = bundle.trade_observations[0].clone().unwrap();
+            assert!(trade_matches_primary_observation(trade, &observation));
+            let buy = expect_runtime_permit(ingest_pump_observation(
+                &ledger,
+                &registry,
+                Some(observation),
+                2,
+                true,
+                None,
+            ));
+            registry
+                .mark_canonical_apply_succeeded(&buy.apply_receipt)
+                .unwrap();
+            if !ack_first {
+                registry
+                    .mark_canonical_apply_succeeded(&birth.apply_receipt)
+                    .unwrap();
+            }
+            registry
+                .evaluation_guard(candidate)
+                .unwrap()
+                .check_ready()
+                .unwrap();
+            let bundle = parser.parse_transaction_bundle(&sell).unwrap();
+            let trade = &bundle.trades[0];
+            let observation = bundle.trade_observations[0].clone().unwrap();
+            assert!(!trade.is_buy);
+            assert!(trade_matches_primary_observation(trade, &observation));
+            let sell = expect_runtime_permit(ingest_pump_observation(
+                &ledger,
+                &registry,
+                Some(observation.clone()),
+                3,
+                true,
+                None,
+            ));
+            registry
+                .mark_canonical_apply_succeeded(&sell.apply_receipt)
+                .unwrap();
+            registry
+                .evaluation_guard(candidate)
+                .unwrap()
+                .check_ready()
+                .unwrap();
+            // Naprawa nie przepuszcza sprzecznej strony z serializowanego wrappera.
+            let mut contradictory = trade.clone();
+            contradictory.is_buy = true;
+            assert!(!trade_matches_primary_observation(
+                &contradictory,
+                &observation
+            ));
+            let blocked =
+                ingest_pump_observation(&ledger, &registry, Some(observation), 4, false, None);
+            assert!(matches!(blocked, CanonicalRuntimeAdmissionV1::Blocked(_)));
+            assert!(registry.evaluation_guard(candidate).is_err());
+        }
+    }
+
     fn expect_runtime_permit(admission: CanonicalRuntimeAdmissionV1) -> CanonicalRuntimePermitV1 {
         match admission {
             CanonicalRuntimeAdmissionV1::Apply(permit) => permit,
@@ -9635,6 +9734,7 @@ mod tests {
             is_buy: true,
             is_dev_buy: false,
             amount: 42,
+            instruction_limit: None,
             max_sol_cost: 1_000_000_000,
             min_sol_output: 0,
             success: true,

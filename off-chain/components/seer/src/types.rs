@@ -658,12 +658,16 @@ pub struct TradeEvent {
     /// Amount of tokens/lamports being traded
     pub amount: u64,
 
-    /// For Buy: maximum SOL cost (in lamports)
-    /// For Sell: 0
+    /// Literalny limit z instrukcji będącej właścicielem zdarzenia, niezależny od przepływu SOL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_limit: Option<ghost_core::PumpInstructionLimitV1>,
+
+    /// Pole kompatybilności: przepływ SOL dla BUY w normalizacji zdarzeń (lamporty).
+    /// Dla SELL: 0. Literalny limit calldata jest w `instruction_limit`.
     pub max_sol_cost: u64,
 
-    /// For Sell: minimum SOL output (in lamports)
-    /// For Buy: 0
+    /// Pole kompatybilności: przepływ SOL dla SELL w normalizacji zdarzeń (lamporty).
+    /// Dla BUY: 0. Literalny limit calldata jest w `instruction_limit`.
     pub min_sol_output: u64,
 
     /// True when transaction succeeded (meta.err is None)
@@ -728,7 +732,7 @@ pub struct TradeEvent {
     #[serde(default)]
     pub token_program: Option<Pubkey>,
 
-    /// Observed on-chain buy variant name for Pump.fun (`legacy_buy` or `routed_exact_sol_in`).
+    /// Wariant instrukcji BUY/SELL; historyczna nazwa pola pozostaje dla zgodności.
     #[serde(default)]
     pub buy_variant: Option<String>,
 
