@@ -1796,7 +1796,7 @@ fn top_level_provenance(
 /// Each component is the sibling ordinal under its parent. A missing/invalid
 /// height makes only that path unknown; a later direct child of the outer
 /// instruction can establish a new valid root.
-fn next_inner_instruction_path(
+pub(crate) fn next_inner_instruction_path(
     stack_height: Option<u32>,
     current_path: &mut SmallVec<[u16; 8]>,
     next_sibling_by_depth: &mut SmallVec<[u32; 8]>,
@@ -4676,6 +4676,7 @@ pub struct BinaryParser {
     complete_tracker: CompleteTracker,
     ipc_sender: Option<IpcSender>,
     bcv2_hydrator: Option<Bcv2HydrationService>,
+    gate0_observation: bool,
 }
 
 /// Combined parser output used by the PR1B harness and, after the single-pass
@@ -5305,6 +5306,37 @@ impl PumpResearchInventoryBuilderV1 {
 }
 
 impl BinaryParser {
+    // Tylko Gate0: adres twórcy potwierdzony przez CreateEvent może być PDA.
+    // Zwykły runtime zachowuje wallet-only. Nie zgadujemy twórcy z payera/BUY.
+    fn observation_creator(&self, creator: Pubkey, event_creator: Option<[u8; 32]>) -> Pubkey {
+        if self.gate0_observation && event_creator == Some(creator.to_bytes()) {
+            let text = creator.to_string();
+            let excluded = [
+                SYSTEM_PROGRAM_ID,
+                ProgramIds::TOKEN_PROGRAM,
+                ProgramIds::TOKEN_2022_PROGRAM,
+                COMPUTE_BUDGET_PROGRAM_ID,
+                ASSOCIATED_TOKEN_PROGRAM_ID,
+                crate::grpc_connection::PUMP_FUN_FEE_ACCOUNT,
+                PUMP_FUN_PROGRAM_ID,
+                PUMP_SWAP_PROGRAM_ID,
+            ];
+            if creator != Pubkey::default() && !excluded.contains(&text.as_str()) {
+                return creator;
+            }
+            return Pubkey::default();
+        }
+        sanitize_creator_pubkey(creator)
+    }
+
+    /// Explicit observation-only opt-in. Defaults and active execution parsing
+    /// stay byte-compatible; Gate 0 does not perform RPC enrichment/backfill.
+    pub fn with_gate0_observation(mut self) -> Self {
+        self.gate0_observation = true;
+        self.bcv2_hydrator = None;
+        self
+    }
+
     pub fn new(verbose: bool) -> Self {
         Self::with_account_registry_and_bcv2_hydration(verbose, AccountRegistry::new(), None)
     }
@@ -5338,6 +5370,7 @@ impl BinaryParser {
             complete_tracker: CompleteTracker::new(),
             ipc_sender,
             bcv2_hydrator,
+            gate0_observation: false,
         }
     }
 
@@ -5508,7 +5541,10 @@ impl BinaryParser {
                     quote_mint,
                     creation_regime: regime,
                     bonding_curve: Pubkey::from_str(bonding_curve).unwrap_or_default(),
-                    creator: sanitize_creator_pubkey(creator),
+                    creator: self.observation_creator(
+                        creator,
+                        matching_event.and_then(|event| event.creator),
+                    ),
                     initial_virtual_token_reserves: matching_event
                         .and_then(|event| event.virtual_token_reserves),
                     initial_virtual_sol_reserves: matching_event
@@ -5552,12 +5588,13 @@ impl BinaryParser {
                     ),
                     bonding_curve: Pubkey::try_from(event.bonding_curve.as_slice())
                         .unwrap_or_default(),
-                    creator: sanitize_creator_pubkey(
+                    creator: self.observation_creator(
                         event
                             .creator
                             .or(Some(event.user))
                             .and_then(|value| Pubkey::try_from(value.as_slice()).ok())
                             .unwrap_or_default(),
+                        event.creator,
                     ),
                     initial_virtual_token_reserves: event.virtual_token_reserves,
                     initial_virtual_sol_reserves: event.virtual_sol_reserves,
@@ -5892,6 +5929,7 @@ impl BinaryParser {
                             virtual_token_reserves > 0,
                         ),
                         is_pumpswap: false,
+                        amm_observation: None,
                     });
                 }
                 ParsedEventKind::CpiTrade {
@@ -5980,6 +6018,7 @@ impl BinaryParser {
                         curve_data_known: true,
                         curve_finality: ghost_core::CurveFinality::Provisional,
                         is_pumpswap: false,
+                        amm_observation: None,
                     });
                 }
                 ParsedEventKind::SwapTrade {
@@ -6077,6 +6116,7 @@ impl BinaryParser {
                         curve_data_known: false,
                         curve_finality: ghost_core::CurveFinality::Speculative,
                         is_pumpswap: true,
+                        amm_observation: None,
                     });
                 }
                 ParsedEventKind::SwapPoolCreated {
@@ -6087,7 +6127,9 @@ impl BinaryParser {
                     quote_amount_in,
                     ..
                 } => {
-                    if has_explicit_trade {
+                    // Gate0 odbiera ten rekord jako stan CreatePool, nie jako
+                    // wolumen. Swap w tym samym TX nie może usuwać stanu migracji.
+                    if has_explicit_trade && !self.gate0_observation {
                         continue;
                     }
 
@@ -6165,6 +6207,7 @@ impl BinaryParser {
                         curve_data_known: false,
                         curve_finality: ghost_core::CurveFinality::Speculative,
                         is_pumpswap: true,
+                        amm_observation: None,
                     });
                 }
                 // PumpSwap BuyEvent — highest-fidelity source for AMM buys.
@@ -6288,6 +6331,7 @@ impl BinaryParser {
                             e.pool_base_token_reserves > 0,
                         ),
                         is_pumpswap: true,
+                        amm_observation: None,
                     });
                 }
                 // PumpSwap SellEvent — sell side mirror of BuyEvent.
@@ -6409,6 +6453,7 @@ impl BinaryParser {
                             e.pool_base_token_reserves > 0,
                         ),
                         is_pumpswap: true,
+                        amm_observation: None,
                     });
                 }
                 _ => {}
@@ -6426,6 +6471,9 @@ impl BinaryParser {
         }
         let mut deduped = dedup_trade_candidates(&self.curve_mint_reg, trades);
         for trade in &mut deduped {
+            if self.gate0_observation {
+                trade.amm_observation = crate::amm_observation::from_transaction(event, trade);
+            }
             // Użytkownik został już rozpoznany z instrukcji. Jego raw saldo
             // nie wymaga heurystyki ownera ani przynależności do krzywej.
             populate_known_user_balances(event, trade);
@@ -6571,6 +6619,7 @@ impl BinaryParser {
                 curve_data_known: false,
                 curve_finality: ghost_core::CurveFinality::Speculative,
                 is_pumpswap,
+                amm_observation: None,
             });
         }
 
@@ -8948,6 +8997,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         }
     }
 
@@ -10078,6 +10128,67 @@ mod tests {
     fn entry_anchor_slot_correct() {
         let evs = PumpParser::parse_entry_raw(&[], 999, Instant::now(), 7);
         assert_eq!(evs[0].slot, 999);
+    }
+
+    #[test]
+    fn gate0_create_event_retains_protocol_creator_pda_and_keeps_legacy_filter() {
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let user = Keypair::new().pubkey();
+        let program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap();
+        let (creator, _) = Pubkey::find_program_address(&[b"gate0-creator"], &program);
+        assert!(!creator.is_on_curve());
+        let payload = create_event_v2_payload(mint, curve, user, creator, Pubkey::default(), false);
+        let (create, _) = decode_event_create_with_len(&payload).unwrap();
+        let parsed = ParsedPumpEvent {
+            received_at: Instant::now(),
+            slot: 42,
+            signature: None,
+            event_ordinal: Some(1),
+            provenance: None,
+            kind: ParsedEventKind::CpiCreate(create),
+            from_cpi: true,
+            is_backfill: false,
+        };
+        let event = make_decoded_tx_event(vec![], vec![]);
+        let legacy = BinaryParser::new(false);
+        let observer = BinaryParser::new(false).with_gate0_observation();
+        assert_eq!(
+            legacy
+                .initialize_pool_from_parsed(&event, vec![parsed.clone()])
+                .unwrap()
+                .unwrap()
+                .creator,
+            Pubkey::default()
+        );
+        let pool = observer
+            .initialize_pool_from_parsed(&event, vec![parsed])
+            .unwrap()
+            .unwrap();
+        assert_eq!(pool.creator, creator);
+        assert_ne!(pool.creator, user);
+        let candidate: crate::types::CandidatePool = pool.into();
+        assert_eq!(candidate.creator, creator);
+        // Bez źródłowego dowodu PDA nie jest przyjmowane; programy także nie.
+        assert_eq!(
+            observer.observation_creator(creator, None),
+            Pubkey::default()
+        );
+        assert_eq!(
+            observer.observation_creator(creator, Some(user.to_bytes())),
+            Pubkey::default()
+        );
+        for reserved in [
+            Pubkey::default(),
+            program,
+            Pubkey::from_str(ProgramIds::TOKEN_2022_PROGRAM).unwrap(),
+        ] {
+            assert_eq!(
+                observer.observation_creator(reserved, Some(reserved.to_bytes())),
+                Pubkey::default()
+            );
+        }
+        assert_eq!(observer.observation_creator(user, None), user);
     }
 
     #[test]
@@ -11552,6 +11663,79 @@ mod tests {
         assert_eq!(trades[0].max_sol_cost, 0);
         assert_eq!(trades[0].min_sol_output, 19_991_266_600_511);
         assert!(trades[0].event_ordinal.is_some());
+        assert!(trades[0].amm_observation.is_none());
+
+        // Gate0 wymaga zgodności eventu z vaultami. Fixture powyżej celowo
+        // testuje sprzeczną named-side; poniżej nadajemy mu spójny stan cenowy.
+        let mut observed_event = event;
+        if let GeyserEvent::Transaction {
+            inner_instructions,
+            pre_token_balances,
+            post_token_balances,
+            ..
+        } = &mut observed_event
+        {
+            let data = &mut inner_instructions[0].instructions[0].data;
+            data.resize(16 + 409, 0);
+            for (offset, value) in [
+                (8, 10u64),
+                (40, 1_000),
+                (48, 10_000),
+                (96, 9),
+                (401, 1_000_000),
+            ] {
+                data[16 + offset..16 + offset + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            pre_token_balances[0].amount = 1_000;
+            post_token_balances[0].amount = 1_009;
+            pre_token_balances[1].amount = 100;
+            post_token_balances[1].amount = 90;
+            pre_token_balances[2].amount = 10_000;
+            pre_token_balances[3].amount = 1_000;
+            post_token_balances[2].amount = 9_991;
+            post_token_balances[3].amount = 1_010;
+        }
+        // Osobny spójny przypadek nie dziedziczy mapowania WSOL z celowo
+        // odwróconych sald pierwszego przypadku, który sprawdza named-side.
+        let ordinary = BinaryParser::new(false)
+            .parse_trades(&observed_event)
+            .unwrap();
+        assert_eq!(ordinary[0].mint, traded_mint);
+        let observer = BinaryParser::new(false).with_gate0_observation();
+        let mut observed = observer.parse_trades(&observed_event).unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(
+            observed[0].amm_observation.is_some(),
+            "spójny SELL wymaga dowodu AMM"
+        );
+        let evidence = observed[0].amm_observation.take().unwrap();
+        assert_eq!(evidence.pool, pool);
+        assert_eq!(evidence.base_reserves, 1_010);
+        assert_eq!(evidence.quote_reserves, 9_991);
+        assert_eq!(evidence.pre_base, Some(1_000));
+        assert_eq!(evidence.base_supply, Some(1_000_000));
+        // Kolejność ownerów pochodzi z HashMap; porównujemy wszystkie salda,
+        // lecz nie losową kolejność iteracji dwóch niezależnych parserów.
+        let canonical_trade = |trade: &TradeEvent| {
+            let mut value = serde_json::to_value(trade).unwrap();
+            value["owner_token_deltas"]
+                .as_array_mut()
+                .unwrap()
+                .sort_by_key(|delta| delta.to_string());
+            value
+        };
+        assert_eq!(
+            canonical_trade(&observed[0]),
+            canonical_trade(&ordinary[0])
+        );
+        if let GeyserEvent::Transaction {
+            post_token_balances,
+            ..
+        } = &mut observed_event
+        {
+            post_token_balances[3].owner = Some(Pubkey::new_unique().to_string());
+        }
+        assert!(crate::amm_observation::from_transaction(&observed_event, &ordinary[0]).is_none());
     }
 
     #[test]
@@ -12832,6 +13016,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         let unresolved = TradeEvent {
@@ -12894,6 +13079,7 @@ mod tests {
             curve_data_known: false,
             curve_finality: ghost_core::CurveFinality::Speculative,
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         let deduped = dedup_trade_candidates(&cm, vec![unresolved, resolved.clone()]);
@@ -12973,6 +13159,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         let mut trade_b = trade_a.clone();
@@ -13136,6 +13323,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         let mut rich = weak.clone();
@@ -13325,6 +13513,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         enrich_trade_optional_accounts_from_source_ix(&event, &mut trade);
@@ -13912,6 +14101,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         enrich_trade_optional_accounts_from_source_ix(&event, &mut trade);
@@ -14026,6 +14216,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         enrich_trade_optional_accounts_from_source_ix(&event, &mut trade);
@@ -14150,6 +14341,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         enrich_trade_optional_accounts_from_source_ix(&event, &mut trade);
@@ -14257,6 +14449,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         enrich_trade_optional_accounts_from_source_ix(&event, &mut trade);
@@ -14378,6 +14571,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         enrich_trade_optional_accounts_from_source_ix(&event, &mut trade);
@@ -14661,6 +14855,72 @@ mod tests {
         assert_eq!(trade.amount, 1_250_000_000);
         assert_eq!(trade.max_sol_cost, 85_000_000_000);
         assert_eq!(trade.timestamp_ms, 1_777_777_777_000);
+    }
+
+    #[test]
+    fn gate0_keeps_verified_create_pool_state_beside_explicit_swap() {
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let amm: Pubkey = PUMP_SWAP_PROGRAM_ID.parse().unwrap();
+        let wsol: Pubkey = WSOL_MINT.parse().unwrap();
+        let mut accounts = vec![Pubkey::new_unique(); 10];
+        accounts[0] = pool;
+        accounts[1] = Keypair::new().pubkey();
+        accounts[2] = Keypair::new().pubkey();
+        accounts[3] = mint;
+        accounts[4] = wsol;
+        accounts[9] = amm;
+        let mut create = DISC_SWAP_CREATE_POOL.to_vec();
+        create.extend(0u16.to_le_bytes());
+        create.extend(1_000_000_000_000u64.to_le_bytes());
+        create.extend(40_000_000_000u64.to_le_bytes());
+        create.extend([0u8; 32]);
+        let mut buy = DISC_SWAP_BUY.to_vec();
+        buy.extend(1_000u64.to_le_bytes());
+        buy.extend(2_000u64.to_le_bytes());
+        let mut payload = vec![0u8; 197];
+        payload[42..74].copy_from_slice(mint.as_ref());
+        payload[74..106].copy_from_slice(wsol.as_ref());
+        payload[106..108].copy_from_slice(&[6, 9]);
+        payload[124..132].copy_from_slice(&1_000_000_000_000u64.to_le_bytes());
+        payload[132..140].copy_from_slice(&40_000_000_000u64.to_le_bytes());
+        payload[165..197].copy_from_slice(pool.as_ref());
+        let mut event_data = DISC_SWAP_OUTER_WRAPPER.to_vec();
+        event_data.extend(&solana_sdk::hash::hash(b"event:CreatePoolEvent").to_bytes()[..8]);
+        event_data.extend(payload);
+        let event = make_decoded_tx_event_with_inner(
+            accounts,
+            vec![create, buy]
+                .into_iter()
+                .map(|data| crate::types::RawInstruction {
+                    program_id: amm,
+                    account_indices: (0..9).collect(),
+                    data,
+                })
+                .collect(),
+            vec![crate::types::InnerInstructionGroup {
+                index: 0,
+                instructions: vec![crate::types::InnerIx {
+                    program_id_index: 9,
+                    accounts: vec![],
+                    data: event_data,
+                    stack_height: Some(2),
+                }],
+            }],
+        );
+        let ordinary = BinaryParser::new(false).parse_trades(&event).unwrap();
+        assert_eq!(ordinary.len(), 1);
+        assert!(!ordinary[0].is_dev_buy);
+        let observed = BinaryParser::new(false)
+            .with_gate0_observation()
+            .parse_trades(&event)
+            .unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed[0].is_dev_buy);
+        let initial = observed.iter().find(|t| t.is_dev_buy).unwrap();
+        assert!(initial.amm_observation.as_ref().unwrap().initialization);
+        assert_eq!(initial.amm_observation.as_ref().unwrap().pool, pool);
+        assert_eq!(observed.iter().filter(|t| !t.is_dev_buy).count(), 1);
     }
 
     // ── [FIX-5] ResolveQueue cap raised ──────────────────────────────────────

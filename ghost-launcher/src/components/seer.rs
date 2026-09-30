@@ -8919,6 +8919,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         }
     }
 
@@ -9102,6 +9103,7 @@ mod tests {
                         event_ms: time,
                         received_ms: time.max(1),
                         gap: false,
+                        gap_reason: None,
                     },
                 )),
                 time.max(1),

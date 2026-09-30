@@ -1173,7 +1173,7 @@ fn compute_demand(features: &MaterializedFeatureSet) -> f64 {
     clamp01(base * fixed_size_penalty * flipper_penalty)
 }
 
-fn evaluate_alpha_gate(
+pub(crate) fn evaluate_alpha_gate(
     features: &MaterializedFeatureSet,
     config: &GatekeeperV2Config,
 ) -> AlphaGateDiagnostics {

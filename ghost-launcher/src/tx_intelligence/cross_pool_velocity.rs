@@ -468,6 +468,42 @@ impl CrossPoolVelocityIndex {
             && start >= inner.retained_from_ms;
         if !ready {
             reasons.push(CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string());
+            // Zachowujemy ogólny kod dla zgodności, lecz rozróżniamy realną
+            // lukę, rozgrzewanie i watermark spóźniony względem cutoffu.
+            if window.anchor_ms == 0 {
+                reasons.push("CPV_ANCHOR_UNAVAILABLE".into());
+            }
+            if window.signer_window_start_ms > window.anchor_ms {
+                reasons.push("CPV_QUERY_WINDOW_INVALID".into());
+            }
+            if !inner
+                .config
+                .as_ref()
+                .is_some_and(|stored| history_config_matches(stored, config))
+            {
+                reasons.push("CPV_HISTORY_CONFIG_UNAVAILABLE".into());
+            }
+            match inner.continuous_since {
+                None => reasons.push("CPV_SOURCE_CONTINUITY_UNAVAILABLE".into()),
+                Some(point) => {
+                    if point.event_ms > start {
+                        reasons.push("CPV_LOOKBACK_NOT_COVERED".into());
+                    }
+                    if point.event_ms > window.signer_window_start_ms {
+                        reasons.push("CPV_SIGNER_WINDOW_NOT_COVERED".into());
+                    }
+                    if point.received_ms > window.cutoff_received_ms {
+                        reasons.push("CPV_CONTINUITY_AFTER_CUTOFF".into());
+                    }
+                }
+            }
+            match proof {
+                None => reasons.push("CPV_PROGRESS_NOT_AVAILABLE_AT_CUTOFF".into()),
+                Some(point) if point.event_ms < window.anchor_ms => {
+                    reasons.push("CPV_PROGRESS_BEHIND_ANCHOR".into());
+                }
+                _ => {}
+            }
         }
         if start < inner.retained_from_ms {
             reasons.push("CPV_HISTORY_NOT_RETAINED".to_string());
@@ -555,6 +591,25 @@ impl CrossPoolVelocityIndex {
             },
             rolling_state_available: ready && !loss,
         }
+    }
+
+    pub(crate) fn source_diagnostics_at(&self, cutoff: u64) -> serde_json::Value {
+        let inner = self.inner.read();
+        let proof = inner
+            .progress
+            .iter()
+            .rev()
+            .find(|p| p.received_ms <= cutoff);
+        serde_json::json!({
+            "cutoff_received_ms":cutoff, "epoch":inner.epoch,
+            "continuous_since_event_ms":inner.continuous_since.map(|p| p.event_ms),
+            "continuous_since_received_ms":inner.continuous_since.map(|p| p.received_ms),
+            "proof_event_ms":proof.map(|p| p.event_ms),
+            "proof_received_ms":proof.map(|p| p.received_ms),
+            "gap_received_floor_ms":inner.gap_received_floor_ms,
+            "retained_from_ms":inner.retained_from_ms,
+            "signer_entries":inner.histories.len()
+        })
     }
 
     #[must_use]
@@ -711,6 +766,49 @@ mod tests {
     use super::*;
     use crate::events::RawBytesMissingReason;
     use ghost_core::{CurveFinality, EventSemanticEnvelope};
+
+    #[test]
+    fn consumer_time_before_raw_ingress_reproduces_false_gap_but_real_gap_stays_closed() {
+        let config = test_config();
+        let mut current = vec![
+            tx("local", "a", "a", 2000),
+            tx("local", "b", "b", 2000),
+            tx("local", "c", "c", 2000),
+        ];
+        // Event-time remains 2000; only its availability arrives at 2301.
+        current[2].event_time.chain_event_ts_ms = Some(2000);
+        current[2].event_time.ingress_wall_ts_ms = Some(2301);
+        let index = CrossPoolVelocityIndex::new();
+        index.observe_source_progress(1, 1000, 1000, 1000, &config);
+        index.observe_source_progress(1, 2300, 2300, 2300, &config);
+        index.observe_transaction_at("local", &current[2], 2300, &config);
+        let window = CpvQueryWindow {
+            signer_window_start_ms: 2000,
+            anchor_ms: 2000,
+            cutoff_received_ms: 2301,
+        };
+        assert!(
+            !index
+                .compute_for_transactions_at("local", &current, window, &config)
+                .rolling_state_available
+        );
+        let correct = CrossPoolVelocityIndex::new();
+        correct.observe_source_progress(1, 1000, 1000, 1000, &config);
+        correct.observe_source_progress(1, 2300, 2300, 2300, &config);
+        correct.observe_transaction_at("local", &current[2], 2301, &config);
+        assert_eq!(
+            correct
+                .compute_for_transactions_at("local", &current, window, &config)
+                .signer_cross_pool_velocity,
+            Some(0.0)
+        );
+        correct.mark_stream_gap(2302);
+        assert!(
+            !correct
+                .compute_for_transactions_at("local", &current, window, &config)
+                .rolling_state_available
+        );
+    }
 
     fn test_config() -> CrossPoolVelocityConfig {
         let mut gatekeeper_config = GatekeeperV2Config::default();
@@ -934,7 +1032,12 @@ mod tests {
         assert_eq!(computed.rolling_state_available, false);
         assert_eq!(
             computed.degraded_reasons,
-            vec![CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string()]
+            vec![
+                CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string(),
+                "CPV_HISTORY_CONFIG_UNAVAILABLE".into(),
+                "CPV_SOURCE_CONTINUITY_UNAVAILABLE".into(),
+                "CPV_PROGRESS_NOT_AVAILABLE_AT_CUTOFF".into(),
+            ]
         );
     }
 
@@ -1609,5 +1712,42 @@ mod tests {
         index.mark_stream_gap(4001);
         index.observe_source_progress(2, 9000, 5000, 5000, &config); // future proof rejected
         assert!(!index.is_ready());
+    }
+    #[test]
+    fn delayed_progress_is_named_and_never_backfills_an_earlier_cutoff() {
+        let index = CrossPoolVelocityIndex::new();
+        let config = test_config();
+        index.observe_source_progress(1, 0, 1, 1, &config);
+        index.observe_source_progress(1, 1999, 1999, 1999, &config);
+        let current = m4_current(2000);
+        let window = CpvQueryWindow {
+            signer_window_start_ms: 1500,
+            anchor_ms: 2000,
+            cutoff_received_ms: 2000,
+        };
+        let before = index.compute_for_transactions_at("p", &current, window, &config);
+        assert_eq!(before.signer_cross_pool_velocity, None);
+        assert_eq!(
+            before.degraded_reasons,
+            vec![
+                CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string(),
+                "CPV_PROGRESS_BEHIND_ANCHOR".into(),
+            ]
+        );
+        index.observe_source_progress(1, 2000, 2000, 2001, &config);
+        let frozen = index.compute_for_transactions_at("p", &current, window, &config);
+        assert_eq!(frozen.degraded_reasons, before.degraded_reasons);
+        assert_eq!(frozen.signer_cross_pool_velocity, None);
+        let after = index.compute_for_transactions_at(
+            "p",
+            &current,
+            CpvQueryWindow {
+                cutoff_received_ms: 2001,
+                ..window
+            },
+            &config,
+        );
+        assert_eq!(after.signer_cross_pool_velocity, Some(0.0));
+        assert!(after.degraded_reasons.is_empty());
     }
 }

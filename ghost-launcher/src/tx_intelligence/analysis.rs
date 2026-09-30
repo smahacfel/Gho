@@ -174,7 +174,7 @@ pub fn compute_gini(sorted_values: &[f64]) -> f64 {
 pub fn compute_signer_diversity(
     signer_stats: &HashMap<String, SignerStats>,
     total_tx: usize,
-    total_volume: f64,
+    _total_volume: f64,
     sorted_timestamps: &[u64],
 ) -> SignerDiversityProfile {
     if signer_stats.is_empty() {
@@ -206,15 +206,24 @@ pub fn compute_signer_diversity(
     volumes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let volume_gini = compute_gini(&volumes);
 
+    // Contract denominator is total absolute signer volume, not an external
+    // aggregate that may differ by attribution or floating-point summation order.
+    // For <=3 signers the top-three set is the full set by definition, so emit
+    // exactly 1.0 instead of dividing two differently ordered floating sums.
+    let signer_total_volume: f64 = volumes.iter().sum();
     let mut volumes_desc = volumes.clone();
     volumes_desc.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let top3_vol: f64 = volumes_desc.iter().take(3).sum();
-    let top3_volume_pct = if total_volume > 0.0 {
-        top3_vol / total_volume
+    let top3_volume_pct = if signer_total_volume > 0.0 {
+        if volumes_desc.len() <= 3 {
+            1.0
+        } else {
+            top3_vol / signer_total_volume
+        }
     } else {
         0.0
     };
-    let top3_signer_volume_ratio = (total_volume > 0.0).then_some(top3_volume_pct);
+    let top3_signer_volume_ratio = (signer_total_volume > 0.0).then_some(top3_volume_pct);
 
     let same_ms_tx_ratio = if sorted_timestamps.len() >= 2 {
         let mut clustered_count = 0usize;

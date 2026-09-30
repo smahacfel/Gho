@@ -289,6 +289,7 @@ impl PumpEvent {
 #[derive(Clone)]
 pub struct DualLaneChannel {
     queue: Sender<PumpEvent>,
+    queue_high_water: Arc<AtomicU64>,
     capture_live_payload: Arc<AtomicBool>,
     local_gap: Arc<crate::local_gap::LocalGapTracker>,
     stream_epoch: Arc<AtomicU64>,
@@ -320,6 +321,7 @@ impl DualLaneChannel {
         (
             Self {
                 queue,
+                queue_high_water: Arc::new(AtomicU64::new(0)),
                 capture_live_payload: Arc::new(AtomicBool::new(false)),
                 local_gap: Arc::clone(&local_gap),
                 stream_epoch: Arc::new(AtomicU64::new(0)),
@@ -345,6 +347,7 @@ impl DualLaneChannel {
         provider_id: &str,
         role: ghost_core::RawProviderRoleV1,
         gap: bool,
+        gap_reason: Option<crate::types::PrimaryTradeFeedGapReasonV1>,
         stats: &Arc<TransportStats>,
     ) {
         if role != ghost_core::RawProviderRoleV1::PrimaryAuthority {
@@ -359,6 +362,7 @@ impl DualLaneChannel {
                     event_ms: received_ms,
                     received_ms,
                     gap,
+                    gap_reason,
                 },
                 received_at: Instant::now(),
             },
@@ -377,10 +381,14 @@ impl DualLaneChannel {
         let boundary = ev.local_gap_boundary();
         match self.queue.try_send(ev) {
             Ok(()) => {
+                self.queue_high_water
+                    .fetch_max(self.queue.len() as u64, Ordering::Relaxed);
                 self.local_gap.observe_admitted(boundary);
                 true
             }
             Err(TrySendError::Full(ev)) => {
+                self.queue_high_water
+                    .fetch_max(self.queue.len() as u64, Ordering::Relaxed);
                 stats.bump_spill();
                 stats.bump_overflow_drop();
                 self.local_gap.observe_saturation(
@@ -404,6 +412,11 @@ impl DualLaneChannel {
     #[inline(always)]
     pub fn overflow_len(&self) -> usize {
         self.queue.len()
+    }
+
+    #[inline(always)]
+    pub fn high_water(&self) -> usize {
+        usize::try_from(self.queue_high_water.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
     }
 
     pub fn set_live_transaction_capture_enabled(&self, enabled: bool) {
@@ -1841,6 +1854,8 @@ const PUMP_RESEARCH_EXACT_STATE_V2_SOURCE_CAPTURE_LOG_NOTE: &str =
 pub enum GrpcSubscriptionProfile {
     #[default]
     PrimaryGlobal,
+    /// Tylko obserwator Gate0: udane i nieudane próby swapów, bez zmiany defaultów.
+    Gate0Observation,
     /// Standalone Pump Research Evidence Tape source profile.
     ///
     /// This path deliberately receives decoded Yellowstone source messages
@@ -1861,6 +1876,7 @@ impl GrpcSubscriptionProfile {
     pub const fn as_str(self) -> &'static str {
         match self {
             GrpcSubscriptionProfile::PrimaryGlobal => "primary_global",
+            Self::Gate0Observation => "gate0_observation",
             GrpcSubscriptionProfile::PumpResearchGlobalV1 => "pump_research_global_v1",
             GrpcSubscriptionProfile::PumpResearchExactStateV2 => "pump_research_exact_state_v2",
             GrpcSubscriptionProfile::FundingLanePumpFiltered => "funding_lane_pump_filtered",
@@ -1870,7 +1886,9 @@ impl GrpcSubscriptionProfile {
 
     pub const fn source_label(self) -> &'static str {
         match self {
-            GrpcSubscriptionProfile::PrimaryGlobal => GRPC_GLOBAL_STREAM_SOURCE_LABEL,
+            GrpcSubscriptionProfile::PrimaryGlobal | Self::Gate0Observation => {
+                GRPC_GLOBAL_STREAM_SOURCE_LABEL
+            }
             GrpcSubscriptionProfile::PumpResearchGlobalV1 => {
                 GRPC_PUMP_RESEARCH_GLOBAL_V1_SOURCE_LABEL
             }
@@ -1887,6 +1905,8 @@ impl GrpcSubscriptionProfile {
     }
 
     pub const fn uses_registry_filters(self) -> bool {
+        // Gate0 odbiera stan z filtrów globalnych. Lokalne konta wykonania
+        // nie mogą przebudowywać jego subskrypcji obserwacyjnej.
         matches!(self, GrpcSubscriptionProfile::PrimaryGlobal)
     }
 
@@ -1898,6 +1918,7 @@ impl GrpcSubscriptionProfile {
                 "pump_research_exact_state_v2_transactions"
             }
             GrpcSubscriptionProfile::PrimaryGlobal
+            | Self::Gate0Observation
             | GrpcSubscriptionProfile::FundingLanePumpFiltered => "pump_txs",
         }
     }
@@ -1909,6 +1930,7 @@ impl GrpcSubscriptionProfile {
                 vec![PUMP_FUN_PROGRAM_ID.to_string()]
             }
             GrpcSubscriptionProfile::PrimaryGlobal
+            | Self::Gate0Observation
             | GrpcSubscriptionProfile::FundingLanePumpFiltered => vec![
                 PUMP_FUN_PROGRAM_ID.to_string(),
                 PUMP_SWAP_PROGRAM_ID.to_string(),
@@ -1924,7 +1946,8 @@ impl GrpcSubscriptionProfile {
             // classification belongs to the offline materializer, never to
             // the provider-side source filter.
             GrpcSubscriptionProfile::PumpResearchGlobalV1
-            | GrpcSubscriptionProfile::PumpResearchExactStateV2 => None,
+            | GrpcSubscriptionProfile::PumpResearchExactStateV2
+            | Self::Gate0Observation => None,
             Self::PrimaryGlobal | Self::FundingLanePumpFiltered | Self::FundingLaneFullChain => {
                 Some(false)
             }
@@ -2548,7 +2571,17 @@ async fn connection_loop(
         .await;
 
         if research_capture_sink.is_none() {
-            channel.emit_primary_trade_progress(&prov.label, prov.role, true, &stats);
+            channel.emit_primary_trade_progress(
+                &prov.label,
+                prov.role,
+                true,
+                Some(if result.is_err() {
+                    crate::types::PrimaryTradeFeedGapReasonV1::SourceStreamInterrupted
+                } else {
+                    crate::types::PrimaryTradeFeedGapReasonV1::SourceStreamEnded
+                }),
+                &stats,
+            );
         }
         match result {
             Ok(()) => break,
@@ -2718,7 +2751,8 @@ fn tracked_exact_accounts_for_profile(
         GrpcSubscriptionProfile::PrimaryGlobal => {
             registry.snapshot_primary_global_exact_accounts(budget)
         }
-        GrpcSubscriptionProfile::PumpResearchGlobalV1
+        GrpcSubscriptionProfile::Gate0Observation
+        | GrpcSubscriptionProfile::PumpResearchGlobalV1
         | GrpcSubscriptionProfile::PumpResearchExactStateV2
         | GrpcSubscriptionProfile::FundingLanePumpFiltered
         | GrpcSubscriptionProfile::FundingLaneFullChain => Vec::new(),
@@ -2733,7 +2767,8 @@ fn tracked_exact_total_for_profile(
         GrpcSubscriptionProfile::PrimaryGlobal => {
             lanes.bcv2_accounts.len() + lanes.generic_accounts.len()
         }
-        GrpcSubscriptionProfile::PumpResearchGlobalV1
+        GrpcSubscriptionProfile::Gate0Observation
+        | GrpcSubscriptionProfile::PumpResearchGlobalV1
         | GrpcSubscriptionProfile::PumpResearchExactStateV2
         | GrpcSubscriptionProfile::FundingLanePumpFiltered
         | GrpcSubscriptionProfile::FundingLaneFullChain => 0,
@@ -2760,7 +2795,8 @@ fn exact_account_selection_counts_for_profile(
     let tracked_dropped = exact_total.saturating_sub(tracked_sent);
     let tracked_bcv2 = match subscription_profile {
         GrpcSubscriptionProfile::PrimaryGlobal => lanes.bcv2_accounts.len(),
-        GrpcSubscriptionProfile::PumpResearchGlobalV1
+        GrpcSubscriptionProfile::Gate0Observation
+        | GrpcSubscriptionProfile::PumpResearchGlobalV1
         | GrpcSubscriptionProfile::PumpResearchExactStateV2
         | GrpcSubscriptionProfile::FundingLanePumpFiltered
         | GrpcSubscriptionProfile::FundingLaneFullChain => 0,
@@ -2977,7 +3013,10 @@ fn build_subscribe_request_for_profile(
         tracked_dropped,
         bcv2_sent,
         bcv2_dropped,
-    ) = if subscription_profile.uses_registry_filters() {
+    ) = if matches!(
+        subscription_profile,
+        GrpcSubscriptionProfile::PrimaryGlobal | GrpcSubscriptionProfile::Gate0Observation
+    ) {
         let lanes = registry.snapshot_by_lane();
         let tracked_curve_count = lanes.curve_accounts.len();
         let tracked_pool_count = lanes.pool_accounts.len();
@@ -3281,11 +3320,15 @@ fn build_subscribe_request_for_profile(
             GrpcSubscriptionProfile::PumpResearchGlobalV1
             | GrpcSubscriptionProfile::PumpResearchExactStateV2 => "[PumpFun]",
             GrpcSubscriptionProfile::PrimaryGlobal
+            | GrpcSubscriptionProfile::Gate0Observation
             | GrpcSubscriptionProfile::FundingLanePumpFiltered => "[PumpFun,PumpSwap]",
         },
         match subscription_profile {
             GrpcSubscriptionProfile::PrimaryGlobal => {
                 "[global_curve_layouts,global_pool_layouts,generic_exact_only]"
+            }
+            GrpcSubscriptionProfile::Gate0Observation => {
+                "[global_curve_layouts,global_pool_layouts,static_fee_account]"
             }
             GrpcSubscriptionProfile::PumpResearchGlobalV1 => {
                 "[pump_owned_bonding_curve_discriminator,canonical_pump_global]"
@@ -3331,6 +3374,9 @@ fn build_subscribe_request_for_profile(
         match subscription_profile {
             GrpcSubscriptionProfile::PrimaryGlobal => {
                 "canonical_account_updates_via_global_layout_filters_generic_exact_only"
+            }
+            GrpcSubscriptionProfile::Gate0Observation => {
+                "gate0_static_source_no_execution_account_resubscribe"
             }
             GrpcSubscriptionProfile::FundingLanePumpFiltered => {
                 "dedicated_filtered_funding_lane_no_account_updates"
@@ -3548,7 +3594,13 @@ async fn stream_loop(
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
         channel.primary_trade_epoch.store(epoch, Ordering::Release);
-        channel.emit_primary_trade_progress(provider_id, provider_role, true, stats);
+        channel.emit_primary_trade_progress(
+            provider_id,
+            provider_role,
+            true,
+            Some(crate::types::PrimaryTradeFeedGapReasonV1::SourceEpochStarted),
+            stats,
+        );
     }
     if let Some(research_capture_sink) = research_capture_sink.as_ref() {
         research_capture_sink.source_stream_established(stream_epoch);
@@ -3557,6 +3609,7 @@ async fn stream_loop(
 
     let mut health_ticker = tokio::time::interval(Duration::from_secs(HEALTH_TICK_SECS));
     let mut ping_ticker = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut watchdog_ticker = tokio::time::interval(Duration::from_secs(WATCHDOG_TICK_SECS));
     let mut registry_resub_ticker =
         tokio::time::interval(Duration::from_millis(REGISTRY_RESUB_TICK_MS));
@@ -3588,6 +3641,28 @@ async fn stream_loop(
                 return Ok(());
             }
 
+            // W biased select gotowe dane nie mogą zagłodzić keepalive/watchdoga.
+            // ── Stall watchdog ────────────────────────────────────────────
+            // [FIX for "CONNECTED, 0 events"]
+            // TCP keepalive + gRPC ping confirm socket is open but NOT that data flows.
+            // This watchdog confirms actual data flow by checking last_msg_wall_ms.
+            _ = watchdog_ticker.tick() => {
+                if let Err(err) = handle_watchdog_tick(id, cfg, stats, breaker, last_msg_wall_ms) {
+                    return Err(err);
+                }
+            }
+
+            // ── Ping keepalive ────────────────────────────────────────────
+            _ = ping_ticker.tick() => {
+                ping_seq = ping_seq.wrapping_add(1);
+                if ping_seq > 1 && last_pong < ping_seq - 1 {
+                    warn!("[{id}] Missing pong for ping {} (last_pong={last_pong})", ping_seq - 1);
+                }
+                debug!("[{id}] → ping {ping_seq}");
+                send_request_with_timeout(&mut sink, build_ping(ping_seq), "ping").await?;
+                stats.bump_ping();
+            }
+
             // ── Incoming gRPC message ─────────────────────────────────────
             maybe = stream.next() => {
                 match maybe {
@@ -3612,16 +3687,18 @@ async fn stream_loop(
                             stats.bump_pong();
                             debug!("[{id}] ← pong {}", p.id);
                         } else if is_server_transport_control_update(&msg) {
-                            // A server-originated Yellowstone Ping is a
-                            // transport-control update, not raw market
-                            // evidence.  Keep it on the transport-control
-                            // path, not raw market evidence.  The
-                            // frozen generated schema's server Ping carries
-                            // no response identifier, so it is deliberately
-                            // filtered rather than guessed or persisted as a
-                            // V1 market record.
+                            // Serwerowy Ping nie zawiera ID: odpowiedź dostaje
+                            // kolejne ID klienta, tak jak okresowy keepalive.
+                            // Sam transport nie jest dowodem postępu rynku.
+                            ping_seq = ping_seq.wrapping_add(1);
+                            send_request_with_timeout(
+                                &mut sink,
+                                build_ping(ping_seq),
+                                "server ping response",
+                            ).await?;
+                            stats.bump_ping();
                             breaker.record_message_progress();
-                            debug!("[{id}] ← server ping (filtered from research tape)");
+                            debug!("[{id}] ← server ping; → response {ping_seq}");
                         } else if let Some(research_capture_sink) = research_capture_sink.as_ref() {
                             // This is the standalone research source tap.  It
                             // must retain the decoded protobuf before any
@@ -3663,27 +3740,6 @@ async fn stream_loop(
                         // async sink writes.
                     }
                 }
-            }
-
-            // ── Stall watchdog ────────────────────────────────────────────
-            // [FIX for "CONNECTED, 0 events"]
-            // TCP keepalive + gRPC ping confirm socket is open but NOT that data flows.
-            // This watchdog confirms actual data flow by checking last_msg_wall_ms.
-            _ = watchdog_ticker.tick() => {
-                if let Err(err) = handle_watchdog_tick(id, cfg, stats, breaker, last_msg_wall_ms) {
-                    return Err(err);
-                }
-            }
-
-            // ── Ping keepalive ────────────────────────────────────────────
-            _ = ping_ticker.tick() => {
-                ping_seq = ping_seq.wrapping_add(1);
-                if ping_seq > 1 && last_pong < ping_seq - 1 {
-                    warn!("[{id}] Missing pong for ping {} (last_pong={last_pong})", ping_seq - 1);
-                }
-                debug!("[{id}] → ping {ping_seq}");
-                send_request_with_timeout(&mut sink, build_ping(ping_seq), "ping").await?;
-                stats.bump_ping();
             }
 
             // ── Immediate resub when pool/generic account is registered ──
@@ -3790,6 +3846,8 @@ async fn stream_loop(
 
                 info!(
                     source_label = cfg.subscription_profile.source_label(),
+                    pings_sent = stats.pings_sent.load(Ordering::Relaxed),
+                    pongs_received = stats.pongs_received.load(Ordering::Relaxed),
                     "[{id}] recv={recv} spill={spill} overflow_depth={overflow_depth} overflow_dropped={overflow_dropped} gaps={gaps} \
                      entry={} inner={} watched={} last_slot={} silence={silence_ms}ms \
                      recon={} delayed_q={dq_depth} provider_state={} provider_stalls={} consecutive_stalls={}",
@@ -4019,7 +4077,7 @@ fn route_update(
         Some(UpdateOneof::BlockMeta(bm)) => {
             track_slot(slots, stats, bm.slot, gap_tx);
             // Marker idzie tym samym FIFO za wcześniej odebranymi transakcjami.
-            channel.emit_primary_trade_progress(provider_id, provider_role, false, stats);
+            channel.emit_primary_trade_progress(provider_id, provider_role, false, None, stats);
             if let Some(ts) = bm.block_time.as_ref().map(|t| t.timestamp) {
                 if ts > 0 {
                     latest_block_time_secs.fetch_max(ts, Ordering::Relaxed);
@@ -4181,6 +4239,15 @@ struct ManualBackfillConfig {
     max_addresses: usize,
     signature_limit_per_address: usize,
     max_transactions_per_gap: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngressQueueSnapshot {
+    pub depth: usize,
+    pub capacity: usize,
+    pub high_water: usize,
+    pub received: u64,
+    pub overflow_dropped: u64,
 }
 
 pub struct GrpcConnection {
@@ -4648,7 +4715,10 @@ impl GrpcConnection {
             info!("MANUAL_BACKFILL_DISABLED source=grpc_connection reason=config_flag_off");
         }
 
-        if self.config.subscription_profile.uses_registry_filters() {
+        // Sprzątanie lokalnej retencji jest potrzebne także przy stałych filtrach.
+        if self.config.subscription_profile.uses_registry_filters()
+            || self.config.subscription_profile == GrpcSubscriptionProfile::Gate0Observation
+        {
             let watched_curve_accounts = Arc::clone(&self.watched_curve_accounts);
             let watched_pool_accounts = Arc::clone(&self.watched_pool_accounts);
             let watched_mints = Arc::clone(&self.watched_mints);
@@ -4843,6 +4913,17 @@ impl GrpcConnection {
     /// Get transport stats (for metrics/diagnostics).
     pub fn transport_stats(&self) -> Arc<TransportStats> {
         Arc::clone(&self.stats)
+    }
+
+    #[must_use]
+    pub fn ingress_queue_snapshot(&self) -> IngressQueueSnapshot {
+        IngressQueueSnapshot {
+            depth: self.injector.overflow_len(),
+            capacity: self.config.ingress_queue_capacity,
+            high_water: self.injector.high_water(),
+            received: self.stats.msgs_received.load(Ordering::Relaxed),
+            overflow_dropped: self.stats.msgs_overflow_dropped.load(Ordering::Relaxed),
+        }
     }
 
     /// Buffer an AccountUpdate PumpEvent in the `DelayedAccountQueue` for
@@ -7100,6 +7181,35 @@ mod tests {
     }
 
     #[test]
+    fn gate0_observation_includes_failed_without_changing_primary() {
+        let registry = AccountRegistry::new();
+        let ordinary = build_subscribe_request(CommitmentLevel::Processed, &registry, 0);
+        let observation = build_subscribe_request_for_profile(
+            CommitmentLevel::Processed,
+            GrpcSubscriptionProfile::Gate0Observation,
+            &registry,
+            0,
+        );
+        assert_eq!(ordinary.transactions["pump_txs"].failed, Some(false));
+        assert_eq!(observation.transactions["pump_txs"].failed, None);
+        assert_eq!(observation.transactions["pump_txs"].vote, Some(false));
+        assert_eq!(
+            observation.transactions["pump_txs"].account_include,
+            ordinary.transactions["pump_txs"].account_include
+        );
+        assert_eq!(observation.accounts, ordinary.accounts);
+        assert!(observation.blocks.is_empty());
+        assert_eq!(observation.blocks_meta, ordinary.blocks_meta);
+        let again = build_subscribe_request_for_profile(
+            CommitmentLevel::Processed,
+            GrpcSubscriptionProfile::Gate0Observation,
+            &registry,
+            9,
+        );
+        assert_eq!(again.transactions["pump_txs"].failed, None);
+    }
+
+    #[test]
     fn subscribe_no_vote_no_failed() {
         let req = build_subscribe_request(CommitmentLevel::Processed, &AccountRegistry::new(), 0);
         let tf = req.transactions.get("pump_txs").unwrap();
@@ -8555,6 +8665,7 @@ mod tests {
             "witness",
             ghost_core::RawProviderRoleV1::SecondaryWitness,
             false,
+            None,
             &stats,
         );
         assert!(receiver.queue.try_recv().is_err());
@@ -8562,9 +8673,12 @@ mod tests {
             "primary",
             ghost_core::RawProviderRoleV1::PrimaryAuthority,
             false,
+            None,
             &stats,
         );
+        assert_eq!(channel.high_water(), 1);
         let event = receiver.queue.try_recv().unwrap();
+        assert_eq!(channel.high_water(), 1);
         let normalized = pump_event_to_geyser_event(event, GRPC_GLOBAL_STREAM_SOURCE_LABEL, None)
             .unwrap()
             .unwrap();
@@ -8579,6 +8693,7 @@ mod tests {
             "primary",
             ghost_core::RawProviderRoleV1::PrimaryAuthority,
             true,
+            Some(crate::types::PrimaryTradeFeedGapReasonV1::SourceStreamInterrupted),
             &stats,
         );
         assert!(
@@ -8586,3 +8701,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "grpc_keepalive_tests.rs"]
+mod keepalive_tests;

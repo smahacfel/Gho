@@ -194,6 +194,36 @@ impl TransactionMetadataAvailability {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimaryTradeFeedGapReasonV1 {
+    SourceEpochStarted,
+    SourceStreamInterrupted,
+    SourceStreamEnded,
+    WorkerProcessingGap,
+    ParserBundleMismatch,
+    TradeCandidateParseMiss,
+    SuccessfulBuyNotForwarded,
+    MetadataIncomplete,
+    LocalSegmentUnreliable,
+}
+
+impl PrimaryTradeFeedGapReasonV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceEpochStarted => "source_epoch_started",
+            Self::SourceStreamInterrupted => "source_stream_interrupted",
+            Self::SourceStreamEnded => "source_stream_ended",
+            Self::WorkerProcessingGap => "worker_processing_gap",
+            Self::ParserBundleMismatch => "parser_bundle_mismatch",
+            Self::TradeCandidateParseMiss => "trade_candidate_parse_miss",
+            Self::SuccessfulBuyNotForwarded => "successful_buy_not_forwarded",
+            Self::MetadataIncomplete => "metadata_incomplete",
+            Self::LocalSegmentUnreliable => "local_segment_unreliable",
+        }
+    }
+}
+
 /// Kontrola postępu wyłącznie obsługiwanego primary raw feedu transakcji.
 /// Nie jest health FSC ani uprawnieniem wykonania. `event_ms` jest osią czasu
 /// normalizatora primary (epoch ingest), `received_ms` czasem raw otrzymania.
@@ -204,6 +234,8 @@ pub struct PrimaryTradeFeedProgressV1 {
     pub event_ms: u64,
     pub received_ms: u64,
     pub gap: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_reason: Option<PrimaryTradeFeedGapReasonV1>,
 }
 
 /// Represents a raw event from the Geyser/WebSocket stream
@@ -872,6 +904,9 @@ pub struct TradeEvent {
     /// fee_recipient in the pump.fun sense) which is not applicable to AMM trades.
     #[serde(default)]
     pub is_pumpswap: bool,
+    /// Additional read-only evidence; never used as execution/account authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amm_observation: Option<crate::amm_observation::AmmObservation>,
 }
 
 /// Synthetic payload encoded into PumpPortal events.

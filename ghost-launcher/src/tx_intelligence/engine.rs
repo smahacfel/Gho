@@ -390,6 +390,15 @@ impl TxIntelligenceEngine {
 
     #[must_use]
     pub fn compute_features(&self) -> TxIntelFeatures {
+        self.compute_features_for_window(self.config.observation_window_ms)
+    }
+
+    /// Same cumulative producers, evaluated at an observation checkpoint width.
+    /// No retention or trading configuration is mutated.
+    pub(crate) fn compute_features_for_window(
+        &self,
+        observation_window_ms: u64,
+    ) -> TxIntelFeatures {
         let total_tx = self.state.total_tx as usize;
         let gatekeeper_signer_stats: HashMap<String, SignerStats> = self
             .signer_stats
@@ -397,10 +406,7 @@ impl TxIntelligenceEngine {
             .map(|(signer, stats)| (signer.clone(), stats.to_gatekeeper_stats()))
             .collect();
 
-        let velocity = compute_velocity_profile(
-            &self.tx_timestamps_sorted,
-            self.config.observation_window_ms,
-        );
+        let velocity = compute_velocity_profile(&self.tx_timestamps_sorted, observation_window_ms);
         let diversity = compute_signer_diversity(
             &gatekeeper_signer_stats,
             total_tx,
@@ -415,6 +421,7 @@ impl TxIntelligenceEngine {
             self.state.buy_volume_sol,
             self.max_consecutive_buys,
         );
+        let dev_volume_denominator = self.dev_volume_denominator();
         let dev = compute_dev_behavior(
             &self.dev_wallet,
             &self.first_signer,
@@ -425,7 +432,7 @@ impl TxIntelligenceEngine {
             self.state.dev_has_sold,
             self.dev_initial_buy_tokens,
             total_tx,
-            self.total_volume_sol,
+            dev_volume_denominator,
         );
 
         let tx_count = self.state.total_tx;
@@ -975,6 +982,25 @@ impl TxIntelligenceEngine {
         }
     }
 
+    fn dev_volume_denominator(&self) -> f64 {
+        let Some(dev_wallet) = self.dev_wallet.as_deref() else {
+            return self.total_volume_sol;
+        };
+        let dev_volume = self
+            .signer_stats
+            .get(dev_wallet)
+            .map_or(0.0, |stats| stats.total_volume_sol);
+        let non_dev_volume: f64 = self
+            .signer_stats
+            .iter()
+            .filter(|(signer, _)| signer.as_str() != dev_wallet)
+            .map(|(_, stats)| stats.total_volume_sol)
+            .sum();
+        // Same population and a construction that cannot put the denominator
+        // below the dev subset because every added volume is non-negative.
+        dev_volume + non_dev_volume
+    }
+
     fn refresh_dev_metrics_from_signer_stats(&mut self) {
         self.dev_buy_total_sol = 0.0;
         self.dev_buy_volume_total_sol = 0.0;
@@ -1332,6 +1358,120 @@ mod tests {
             curve_data_known: false,
             curve_finality: ghost_core::CurveFinality::Speculative,
         }
+    }
+
+    #[test]
+    fn dev_volume_denominator_is_built_from_the_same_signer_population() {
+        let dev = Pubkey::new_unique().to_string();
+        let other = Pubkey::new_unique().to_string();
+        let mut candidate = EnhancedCandidate::default();
+        candidate.timestamp = 1_000;
+        let mut engine =
+            TxIntelligenceEngine::new(TxIntelligenceConfig::default(), &candidate, None);
+        engine.dev_wallet = Some(dev.clone());
+        engine.signer_stats.insert(
+            dev,
+            SignerBehaviorStats {
+                total_volume_sol: 10.0,
+                ..Default::default()
+            },
+        );
+        engine.signer_stats.insert(
+            other,
+            SignerBehaviorStats {
+                total_volume_sol: 0.25,
+                ..Default::default()
+            },
+        );
+        // Deliberately poison the independent aggregate. The ratio denominator
+        // must still come from the signer population, not this accumulator.
+        engine.total_volume_sol = 9.999_999_999_999_998;
+        assert_eq!(engine.dev_volume_denominator(), 10.25);
+        assert!(engine.dev_volume_denominator() >= 10.0);
+    }
+
+    #[test]
+    fn top3_signer_ratio_uses_signer_volume_denominator_not_external_total() {
+        let stats = HashMap::from([
+            (
+                "a".to_string(),
+                SignerStats {
+                    tx_count: 1,
+                    buy_count: 1,
+                    sell_count: 0,
+                    total_volume_sol: 4.0,
+                },
+            ),
+            (
+                "b".to_string(),
+                SignerStats {
+                    tx_count: 1,
+                    buy_count: 1,
+                    sell_count: 0,
+                    total_volume_sol: 3.0,
+                },
+            ),
+            (
+                "c".to_string(),
+                SignerStats {
+                    tx_count: 1,
+                    buy_count: 1,
+                    sell_count: 0,
+                    total_volume_sol: 2.0,
+                },
+            ),
+            (
+                "d".to_string(),
+                SignerStats {
+                    tx_count: 1,
+                    buy_count: 1,
+                    sell_count: 0,
+                    total_volume_sol: 1.0,
+                },
+            ),
+        ]);
+        // Deliberately contradictory external total reproduces the old
+        // out-of-range failure (9/1). The metric contract denominator is the
+        // signer-volume universe itself: 9/10 = 0.9.
+        let profile = compute_signer_diversity(&stats, 4, 1.0, &[]);
+        assert_eq!(profile.top3_signer_volume_ratio, Some(0.9));
+        assert_eq!(profile.top3_volume_pct, 0.9);
+    }
+
+    #[test]
+    fn top3_signer_ratio_is_exact_one_when_top3_is_the_full_population() {
+        let stats = HashMap::from([
+            (
+                "a".to_string(),
+                SignerStats {
+                    tx_count: 1,
+                    buy_count: 1,
+                    sell_count: 0,
+                    total_volume_sol: 0.1,
+                },
+            ),
+            (
+                "b".to_string(),
+                SignerStats {
+                    tx_count: 1,
+                    buy_count: 1,
+                    sell_count: 0,
+                    total_volume_sol: 0.2,
+                },
+            ),
+            (
+                "c".to_string(),
+                SignerStats {
+                    tx_count: 1,
+                    buy_count: 1,
+                    sell_count: 0,
+                    total_volume_sol: 0.3,
+                },
+            ),
+        ]);
+        let profile = compute_signer_diversity(&stats, 3, 0.6000000000000001, &[]);
+        assert_eq!(profile.top3_signer_volume_ratio, Some(1.0));
+        assert_eq!(profile.top3_volume_pct, 1.0);
     }
 
     #[test]

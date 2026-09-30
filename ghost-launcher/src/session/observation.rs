@@ -127,7 +127,7 @@ pub enum SessionTransactionKey {
 }
 
 impl SessionTransactionKey {
-    fn for_transaction(tx: &PoolTransaction) -> Option<Self> {
+    pub(crate) fn for_transaction(tx: &PoolTransaction) -> Option<Self> {
         if let Some((identity, ordinal)) = sybil_event_key(tx) {
             Some(Self::Stable(identity, ordinal))
         } else {
@@ -209,6 +209,7 @@ pub struct PoolObservationSession {
     pub checkpoint_engine: CheckpointEngine,
     pub feature_builder: ObservationFeatureBuilder,
     pub checkpoints: Vec<SessionCheckpoint>,
+    gate0_market_prices: bool,
     pub diagnostics: SessionDiagnostics,
     pub active_risk_flags: Vec<RiskFlag>,
     pub verdict: Option<VerdictOutcome>,
@@ -337,6 +338,7 @@ impl PoolObservationSession {
             checkpoint_engine: CheckpointEngine::default(),
             feature_builder: ObservationFeatureBuilder,
             checkpoints: Vec::new(),
+            gate0_market_prices: false,
             diagnostics: SessionDiagnostics::default(),
             active_risk_flags: Vec::new(),
             verdict: None,
@@ -414,16 +416,28 @@ impl PoolObservationSession {
             .map(AsRef::as_ref)
     }
 
+    pub(crate) fn enable_gate0_market_prices(&mut self) {
+        self.gate0_market_prices = true;
+    }
+
     fn materialize_sybil_at_cutoff(
         &self,
         cutoff: u64,
     ) -> crate::tx_intelligence::SybilResistanceComputationV1 {
         let sybil_dev_wallet = self.dev_wallet.map(|value| value.to_string());
-        let mut sybil_computation = compute_sybil_resistance_with_ftdi_at_cutoff(
-            self.sybil_transaction_views(),
-            sybil_dev_wallet.as_deref(),
-            cutoff,
-        );
+        let mut sybil_computation = if self.gate0_market_prices {
+            crate::tx_intelligence::sybil_metrics::compute_observation_sybil_at_cutoff(
+                self.sybil_transaction_views(),
+                sybil_dev_wallet.as_deref(),
+                cutoff,
+            )
+        } else {
+            compute_sybil_resistance_with_ftdi_at_cutoff(
+                self.sybil_transaction_views(),
+                sybil_dev_wallet.as_deref(),
+                cutoff,
+            )
+        };
         if self.sybil_view_losses.values().any(|at| *at <= cutoff) {
             sybil_computation.mark_view_history_unavailable();
         }
@@ -2967,6 +2981,26 @@ impl PoolObservationSession {
     pub fn try_materialize_features(
         &self,
     ) -> Result<MaterializedFeatureSet, MetricContractMaterializationErrorV1> {
+        self.materialize_at_cutoff(::seer::types::ingress_epoch_ms(), None)
+    }
+
+    /// Read-only Gate 0 checkpoint. The caller owns the serialized admission
+    /// prefix and must call this before applying any later input.
+    pub(crate) fn try_materialize_features_at_cutoff(
+        &self,
+        sybil_cutoff_ingress_wall_ms: u64,
+    ) -> Result<MaterializedFeatureSet, MetricContractMaterializationErrorV1> {
+        self.materialize_at_cutoff(
+            sybil_cutoff_ingress_wall_ms,
+            Some(sybil_cutoff_ingress_wall_ms.saturating_sub(self.created_at_wall_ms)),
+        )
+    }
+
+    fn materialize_at_cutoff(
+        &self,
+        sybil_cutoff_ingress_wall_ms: u64,
+        observation_window_ms: Option<u64>,
+    ) -> Result<MaterializedFeatureSet, MetricContractMaterializationErrorV1> {
         if self.admission_capacity_exhausted {
             return Err(
                 MetricContractMaterializationErrorV1::AdmissionCapacityExhausted {
@@ -2974,11 +3008,13 @@ impl PoolObservationSession {
                 },
             );
         }
-        let sybil_cutoff_ingress_wall_ms = ::seer::types::ingress_epoch_ms();
         let account_features = self.current_account_features();
         let mut materialized = self.feature_builder.materialize(
             account_features.clone(),
-            self.tx_intel_features.clone(),
+            observation_window_ms.map_or_else(
+                || self.tx_intel_features.clone(),
+                |width| self.tx_intelligence.compute_features_for_window(width),
+            ),
             &self.checkpoints,
             self.active_risk_flags.clone(),
             self.session_metadata(),
