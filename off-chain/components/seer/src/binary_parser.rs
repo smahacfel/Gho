@@ -11724,10 +11724,7 @@ mod tests {
                 .sort_by_key(|delta| delta.to_string());
             value
         };
-        assert_eq!(
-            canonical_trade(&observed[0]),
-            canonical_trade(&ordinary[0])
-        );
+        assert_eq!(canonical_trade(&observed[0]), canonical_trade(&ordinary[0]));
         if let GeyserEvent::Transaction {
             post_token_balances,
             ..
