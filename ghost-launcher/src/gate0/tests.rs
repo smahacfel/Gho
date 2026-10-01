@@ -294,6 +294,72 @@ fn five_cumulative_snapshots_are_complete_immutable_and_deduplicated() {
     assert_eq!(r.last().unwrap()["gem"], false);
 }
 #[test]
+fn developer_buy_sell_rounding_does_not_abort_phase_materialization() {
+    let (mut g, m, p, t) = setup();
+    let dev = g
+        .sessions
+        .get_session(&p)
+        .unwrap()
+        .read()
+        .dev_wallet
+        .unwrap();
+    for (i, (is_buy, lamports)) in [
+        (true, 890_000_000),
+        (false, 370_000_000),
+        (true, 710_000_000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = t + 100 + i as u64;
+        let mut tx = trade(m, p, at);
+        tx.signer = dev;
+        tx.is_buy = is_buy;
+        tx.max_sol_cost = lamports;
+        tx.min_sol_output = lamports;
+        g.on_trade(&tx, at).unwrap();
+    }
+    // Snapshot poprzedza C: nawet token odrzucony przez C nie może przerwać runu.
+    g.tick(t + 30_000).unwrap();
+    let records = rows(&g);
+    let phase = records.iter().find(|x| x["kind"] == "phase").unwrap();
+    assert_eq!(phase["snapshot"]["metrics"]["dev_volume_ratio"], 1.0);
+    assert_eq!(records.last().unwrap()["reason"], "C");
+}
+
+#[test]
+fn developer_only_alternating_flow_survives_all_five_checkpoints() {
+    let (mut g, m, p, t) = setup();
+    let dev = g
+        .sessions
+        .get_session(&p)
+        .unwrap()
+        .read()
+        .dev_wallet
+        .unwrap();
+    for (i, age) in (200..600_000).step_by(200).enumerate() {
+        let (is_buy, lamports) = [
+            (true, 890_000_000),
+            (false, 370_000_000),
+            (true, 710_000_000),
+        ][i % 3];
+        let mut tx = trade(m, p, t + age);
+        tx.signer = dev;
+        tx.is_buy = is_buy;
+        tx.max_sol_cost = lamports;
+        tx.min_sol_output = lamports;
+        g.on_trade(&tx, t + age).unwrap();
+    }
+    g.tick(t + 600_000).unwrap();
+    let records = rows(&g);
+    assert_eq!(g.summary.phase_counts, [1; 5]);
+    assert_eq!(records.last().unwrap()["reason"], "completed");
+    for phase in records.iter().filter(|x| x["kind"] == "phase") {
+        assert_eq!(phase["snapshot"]["metrics"]["dev_volume_ratio"], 1.0);
+    }
+}
+
+#[test]
 fn admission_closes_at_ten_hours_but_last_token_gets_full_lifetime() {
     let start = seer::types::ingress_epoch_ms();
     let mut g = Gate0::new(Gate0Config::default(), "tail".into(), start, Vec::new()).unwrap();

@@ -778,7 +778,17 @@ impl<W: Write> Gate0<W> {
             .sessions
             .get_session(&t.pool)
             .ok_or_else(|| anyhow::anyhow!("missing session at checkpoint"))?;
-        let snapshot = metrics::build(&session.read(), t, at, &self.gatekeeper)?;
+        let snapshot =
+            metrics::build(&session.read(), t, at, &self.gatekeeper).map_err(|error| {
+                tracing::error!(
+                    mint = %mint,
+                    phase = t.next_phase + 1,
+                    cutoff_ms = at,
+                    error = %error,
+                    "GATE0_MATERIALIZATION_FAILED"
+                );
+                error
+            })?;
         let phase = t.next_phase;
         let frozen_jito = snapshot["metrics"]["jito_tip_intensity"].as_f64();
         self.emit(json!({"kind":"phase", "schema_version":1, "run_id":self.run_id, "mint":mint.to_string(),

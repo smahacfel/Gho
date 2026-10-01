@@ -854,6 +854,12 @@ pub fn build_manipulation_evidence_v2(
                     "manipulation contradiction_score range"
                 }
             };
+            tracing::error!(
+                field,
+                value,
+                value_bits = value.to_bits(),
+                "PR2B_MANIPULATION_VALUE_OUT_OF_RANGE"
+            );
             return Err(Pr2bProducerErrorV1::ProducerInvariant(field));
         }
     }

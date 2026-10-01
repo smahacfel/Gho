@@ -410,6 +410,9 @@ fn materialize_features_populates_ftdi_from_session_tx_buffer() {
             ghost_core::tx_intelligence::types::DES_COMPARISON_DEFINITION_MISMATCH_REASON
                 .to_string(),
             ghost_core::tx_intelligence::types::CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string(),
+            "CPV_HISTORY_CONFIG_UNAVAILABLE".to_string(),
+            "CPV_SOURCE_CONTINUITY_UNAVAILABLE".to_string(),
+            "CPV_PROGRESS_NOT_AVAILABLE_AT_CUTOFF".to_string(),
             ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
         ]
     );
@@ -486,6 +489,9 @@ fn materialize_features_populates_dbia_from_session_tx_buffer() {
             ghost_core::tx_intelligence::types::DES_COMPARISON_DEFINITION_MISMATCH_REASON
                 .to_string(),
             ghost_core::tx_intelligence::types::CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string(),
+            "CPV_HISTORY_CONFIG_UNAVAILABLE".to_string(),
+            "CPV_SOURCE_CONTINUITY_UNAVAILABLE".to_string(),
+            "CPV_PROGRESS_NOT_AVAILABLE_AT_CUTOFF".to_string(),
             ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
         ]
     );
@@ -575,6 +581,9 @@ fn materialize_features_populates_sfd_from_session_tx_buffer() {
             ghost_core::tx_intelligence::types::DES_COMPARISON_DEFINITION_MISMATCH_REASON
                 .to_string(),
             ghost_core::tx_intelligence::types::CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string(),
+            "CPV_HISTORY_CONFIG_UNAVAILABLE".to_string(),
+            "CPV_SOURCE_CONTINUITY_UNAVAILABLE".to_string(),
+            "CPV_PROGRESS_NOT_AVAILABLE_AT_CUTOFF".to_string(),
             ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
         ]
     );
@@ -721,6 +730,9 @@ fn materialize_features_populates_des_from_session_tx_buffer() {
             ghost_core::tx_intelligence::types::DES_COMPARISON_DEFINITION_MISMATCH_REASON
                 .to_string(),
             ghost_core::tx_intelligence::types::CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string(),
+            "CPV_HISTORY_CONFIG_UNAVAILABLE".to_string(),
+            "CPV_SOURCE_CONTINUITY_UNAVAILABLE".to_string(),
+            "CPV_PROGRESS_NOT_AVAILABLE_AT_CUTOFF".to_string(),
             ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
         ]
     );

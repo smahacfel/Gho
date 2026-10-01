@@ -1,3 +1,13 @@
+# Gate0 — 2026-10-01: naprawa dev_volume_ratio po przerwanym runie10h
+
+Pierwszy run10h gate0-1790810736215 zakończył się po6291s z dev_volume_ratio range. To unieważnia wynik tego runu jako pełnego datasetu; starszy odbiór1800 pozostaje historycznym technicznym PASS.
+
+Odtworzono dokładny błąd przez silnik oraz Gate0 snapshot: BUY0.89/SELL0.37/BUY0.71 tego samego dev dawały1.0000000000000002 przez różny porządek sum w liczniku/mianowniku. Mianownik teraz korzysta z identycznego subtotal BUY+SELL. Kontrola[0,1] bez epsilona i clampowania; log błędu zawiera wartość/bity oraz mint/fazę. Dotychczasowy guard CI FTDI poprawiono po potwierdzeniu fałszywego zliczania nazw adaptera i producenta.
+
+Walidacja i zakres: docs/ADR/ADR_8D_GATE0_DEV_VOLUME_RATIO_SUMOWANIE_20261001.md. Nowy run zachowa confirmed,Gem320,C/D/E,observe-only,admission10h+drain. Dokładny commit, binarka, PID i start w metadanych nowego runu; nie używać poniższych historycznych PID jako bieżącego stanu.
+
+---
+
 # Gate0 — publikacja i autoryzacja pierwszego runu 10 h
 
 Użytkownik zatwierdził commit całego dorobku Gate0, push i nowy PR, następnie start10h. Bieżący odbiór1800s PASS jest opisany niżej. Nowy run ma admission10h + drain do600s, bez flagi smoke, observe-only i Gem320SOL. Po jednorazowym potwierdzeniu startu pozostawić bez ingerencji do powrotu użytkownika. Stan commita/PR i PID/run zapiszą metadane publikacji oraz runu; poniższe LOCAL ONLY i zakazy startu są historią sprzed tej autoryzacji.
