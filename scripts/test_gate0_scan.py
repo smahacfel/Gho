@@ -80,6 +80,25 @@ class Gate0ScanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "transaction outcome conflict"):
             self.analyze(rows)
 
+    def test_quarantined_conflict_does_not_poison_other_tokens(self):
+        rows = fixture()
+        rows[0]["error_policy"] = "quarantine_and_continue"
+        rows.insert(-1, {"kind": "transaction_outcome_conflict", "run_id": "r", "mint": "0", "handling": "quarantine_token"})
+        rows.insert(-1, {"kind": "runtime_issue", "run_id": "r", "mint": "0", "code": "transaction_outcome_conflict", "handling": "quarantine_and_continue"})
+        for row in rows:
+            if row["kind"] == "terminal" and row["mint"] == "0":
+                row["gem"] = None
+                row["reason"] = "transaction_outcome_conflict"
+        result = self.analyze(rows)
+        self.assertEqual(result["gems"], 2)
+        self.assertEqual(result["label_unavailable"], 1)
+        self.assertEqual(result["data_quality"], "degraded")
+        self.assertTrue(all(m["gem"]["n"] <= 2 for m in result["metrics"]))
+        for row in rows:
+            if row["kind"] == "terminal" and row["mint"] == "0": row["gem"] = True
+        with self.assertRaisesRegex(ValueError, "not quarantined"):
+            self.analyze(rows)
+
     def test_wrong_cutoff_fails(self):
         rows = fixture()
         rows[2]["cutoff_ms"] += 1

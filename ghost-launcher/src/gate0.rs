@@ -8,7 +8,7 @@ use crate::{
     session::{OpenSessionRequest, SessionConfig, SessionManager},
     tx_intelligence::{CrossPoolVelocityConfig, FundingSourceConfig},
 };
-use anyhow::{bail, ensure, Result};
+use anyhow::{ensure, Result};
 use ghost_brain::{config::GatekeeperV2Config, fast_pipeline::EnhancedCandidate};
 use seer::{early_fingerprint::EarlyFingerprintConfig, ipc::DetectedPoolEvent, types::TradeEvent};
 use serde::{Deserialize, Serialize};
@@ -124,6 +124,7 @@ struct Token {
 #[derive(Debug, Default, Serialize)]
 pub struct RunSummary {
     pub admitted: u64,
+    pub runtime_issues: BTreeMap<String, u64>,
     pub phase_counts: [u64; 5],
     pub terminal_counts: BTreeMap<String, u64>,
     pub gems: u64,
@@ -189,7 +190,7 @@ impl<W: Write> Gate0<W> {
             "config":this.config, "phase_ages_ms":PHASES_MS, "observation_ms":OBSERVATION_MS,
             "gem_min_market_cap_sol":GEM_MIN_MARKET_CAP_SOL,
             "e_window_ms":30_000, "e_min_swaps":90, "clock":"consumer_epoch_nondecreasing_wall_and_monotonic",
-            "gate_population":{"C_D":"unique_successful_transactions","E":"unique_successful_swaps"}, "source_failed_transactions":true, "execution_enabled":false}),
+            "gate_population":{"C_D":"unique_successful_transactions","E":"unique_successful_swaps"}, "source_failed_transactions":true, "execution_enabled":false, "error_policy":"quarantine_and_continue"}),
         )?;
         Ok(this)
     }
@@ -197,6 +198,58 @@ impl<W: Write> Gate0<W> {
         serde_json::to_writer(&mut self.writer, &row)?;
         self.writer.write_all(b"\n")?;
         self.writer.flush()?;
+        Ok(())
+    }
+    /// Błędy danych kończą tylko dotknięte obserwacje. Błędu zapisu nie
+    /// ukrywamy: bez działającego wyjścia nie istnieje trwały zapis runu.
+    fn recover(
+        &mut self,
+        result: Result<()>,
+        mint: Option<Pubkey>,
+        now: u64,
+        code: &str,
+    ) -> Result<()> {
+        let Err(error) = result else {
+            return Ok(());
+        };
+        if error.downcast_ref::<std::io::Error>().is_some()
+            || error
+                .downcast_ref::<serde_json::Error>()
+                .is_some_and(|e| e.is_io())
+        {
+            return Err(error);
+        }
+        self.record_issue(now, code, mint, &error.to_string())?;
+        if let Some(mint) = mint {
+            if self.tokens.contains_key(&mint) {
+                self.finish_token(mint, now.max(self.now_ms), code)?;
+            }
+        } else {
+            self.censor_active(now.max(self.now_ms), code)?;
+        }
+        Ok(())
+    }
+    pub fn record_issue(
+        &mut self,
+        now: u64,
+        code: &str,
+        mint: Option<Pubkey>,
+        detail: &str,
+    ) -> Result<()> {
+        *self
+            .summary
+            .runtime_issues
+            .entry(code.to_string())
+            .or_default() += 1;
+        self.emit(json!({"kind":"runtime_issue", "run_id":self.run_id,
+            "at_ms":now, "code":code, "mint":mint.map(|m|m.to_string()), "detail":detail,
+            "handling":"quarantine_and_continue"}))
+    }
+    fn censor_active(&mut self, now: u64, reason: &str) -> Result<()> {
+        let mints: Vec<_> = self.tokens.keys().copied().collect();
+        for mint in mints {
+            self.finish_token(mint, now, reason)?;
+        }
         Ok(())
     }
     fn reject_pool(&mut self, reason: &str) {
@@ -207,6 +260,15 @@ impl<W: Write> Gate0<W> {
             .or_default() += 1;
     }
     pub fn on_pool(&mut self, event: &DetectedPoolEvent, now: u64) -> Result<()> {
+        let result = self.on_pool_inner(event, now);
+        self.recover(
+            result,
+            Some(event.candidate.base_mint),
+            now,
+            "on_pool_error",
+        )
+    }
+    fn on_pool_inner(&mut self, event: &DetectedPoolEvent, now: u64) -> Result<()> {
         self.advance(now, false)?;
         self.summary.pool_events_seen = self.summary.pool_events_seen.saturating_add(1);
         let c = &event.candidate;
@@ -360,6 +422,10 @@ impl<W: Write> Gate0<W> {
         Ok(())
     }
     pub fn on_trade(&mut self, trade: &TradeEvent, now: u64) -> Result<()> {
+        let result = self.on_trade_inner(trade, now);
+        self.recover(result, Some(trade.mint), now, "on_trade_error")
+    }
+    fn on_trade_inner(&mut self, trade: &TradeEvent, now: u64) -> Result<()> {
         self.advance(now, false)?;
         if trade.provider_role != Some(ghost_core::RawProviderRoleV1::PrimaryAuthority)
             || trade.semantic.is_synthetic()
@@ -391,7 +457,9 @@ impl<W: Write> Gate0<W> {
         let initialization = trade.is_pumpswap && trade.is_dev_buy;
         if !initialization {
             // Sprawdzamy sprzeczność przed mutacją wspólnego indeksu CPV.
-            self.check_transaction_outcome(trade, now)?;
+            if self.check_transaction_outcome(trade, now)? {
+                return Ok(());
+            }
             self.sessions
                 .cross_pool_velocity_index()
                 .observe_transaction_at(&tx.pool_amm_id, &tx, now, &self.cpv_config);
@@ -541,12 +609,12 @@ impl<W: Write> Gate0<W> {
         );
         Ok(())
     }
-    fn check_transaction_outcome(&mut self, trade: &TradeEvent, now: u64) -> Result<()> {
+    fn check_transaction_outcome(&mut self, trade: &TradeEvent, now: u64) -> Result<bool> {
         if !trade.metadata_availability.status_known {
-            return Ok(());
+            return Ok(false);
         }
         let Some(token) = self.tokens.get(&trade.mint) else {
-            return Ok(());
+            return Ok(false);
         };
         let expected_pool = if trade.is_pumpswap {
             canonical_amm(token.mint)
@@ -554,7 +622,7 @@ impl<W: Write> Gate0<W> {
             token.pool
         };
         if trade.pool_amm_id != expected_pool {
-            return Ok(());
+            return Ok(false);
         }
         let previous = if trade.success {
             token.failed_tx_signatures.get(&trade.signature)
@@ -567,14 +635,34 @@ impl<W: Write> Gate0<W> {
                 "kind":"transaction_outcome_conflict", "run_id":self.run_id,
                 "mint":trade.mint.to_string(), "pool":trade.pool_amm_id.to_string(),
                 "signature":trade.signature.to_string(), "provider_id":trade.provider_id,
+                "handling":"quarantine_token",
                 "first":previous, "conflicting":TransactionOutcome::from_trade(trade, now)
             }))?;
-            bail!("conflicting transaction outcome in Gate0: mint={} signature={} first_slot={:?} conflicting_slot={:?}",
-                trade.mint, trade.signature, previous.slot, trade.slot);
+            self.record_issue(
+                now,
+                "transaction_outcome_conflict",
+                Some(trade.mint),
+                "conflicting success/failed observations",
+            )?;
+            // Pierwsza obserwacja mogła zasilić wspólny CPV. Oznaczamy brak
+            // ciągłości tej metryki, bez zatrzymania pozostałych tokenów.
+            self.sessions
+                .cross_pool_velocity_index()
+                .mark_stream_gap(now);
+            self.finish_token(trade.mint, now, "transaction_outcome_conflict")?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
     pub fn on_progress(
+        &mut self,
+        p: &seer::types::PrimaryTradeFeedProgressV1,
+        now: u64,
+    ) -> Result<()> {
+        let result = self.on_progress_inner(p, now);
+        self.recover(result, None, now, "on_progress_error")
+    }
+    fn on_progress_inner(
         &mut self,
         p: &seer::types::PrimaryTradeFeedProgressV1,
         now: u64,
@@ -599,6 +687,14 @@ impl<W: Write> Gate0<W> {
         Ok(())
     }
     pub fn on_funding(
+        &mut self,
+        event: &seer::ipc::DetectedFundingTransferEvent,
+        now: u64,
+    ) -> Result<()> {
+        let result = self.on_funding_inner(event, now);
+        self.recover(result, None, now, "on_funding_error")
+    }
+    fn on_funding_inner(
         &mut self,
         event: &seer::ipc::DetectedFundingTransferEvent,
         now: u64,
@@ -637,6 +733,14 @@ impl<W: Write> Gate0<W> {
         self.sessions.set_funding_stream_available(available);
     }
     pub fn on_account(
+        &mut self,
+        a: &seer::ipc::DetectedAccountUpdateEvent,
+        now: u64,
+    ) -> Result<()> {
+        let result = self.on_account_inner(a, now);
+        self.recover(result, Some(a.base_mint), now, "on_account_error")
+    }
+    fn on_account_inner(
         &mut self,
         a: &seer::ipc::DetectedAccountUpdateEvent,
         now: u64,
@@ -682,6 +786,10 @@ impl<W: Write> Gate0<W> {
         Ok(())
     }
     pub fn tick(&mut self, now: u64) -> Result<()> {
+        let result = self.tick_inner(now);
+        self.recover(result, None, now, "tick_error")
+    }
+    fn tick_inner(&mut self, now: u64) -> Result<()> {
         self.advance(now, true)
     }
     pub fn drained(&self, now: u64) -> bool {
@@ -695,11 +803,8 @@ impl<W: Write> Gate0<W> {
             .cross_pool_velocity_index()
             .mark_stream_gap(now);
         self.sessions.set_funding_stream_available(false);
-        let mints: Vec<_> = self.tokens.keys().copied().collect();
-        for mint in mints {
-            self.finish_token(mint, now, reason)?;
-        }
-        bail!("Gate 0 stopped: {reason}")
+        self.record_issue(now, "source_gap", None, reason)?;
+        self.censor_active(now, "source_gap")
     }
     fn advance(&mut self, now: u64, inclusive: bool) -> Result<()> {
         ensure!(now >= self.now_ms, "non-monotonic Gate 0 clock");
@@ -742,7 +847,11 @@ impl<W: Write> Gate0<W> {
             }
             let t = self.tokens.get(&mint).unwrap();
             if PHASES_MS.get(t.next_phase) == Some(&age) {
-                self.emit_phase(mint, at)?;
+                let result = self.emit_phase(mint, at);
+                self.recover(result, Some(mint), at, "materialization_error")?;
+                if !self.tokens.contains_key(&mint) {
+                    continue;
+                }
             }
             let t = self.tokens.get_mut(&mint).unwrap();
             while t

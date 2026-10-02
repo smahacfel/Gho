@@ -50,6 +50,7 @@ def describe(values: list[float]) -> dict[str, Any]:
 
 def load(paths: list[Path]) -> tuple[dict, dict, dict, dict]:
     starts, ends, births, phases, labels = {}, {}, {}, {}, {}
+    quarantined, issues = set(), []
     for path in paths:
         with path.open(encoding="utf-8") as source:
             for line_no, line in enumerate(source, 1):
@@ -68,7 +69,15 @@ def load(paths: list[Path]) -> tuple[dict, dict, dict, dict]:
                 elif kind == "run_end":
                     target, key = ends, run
                 elif kind == "transaction_outcome_conflict":
-                    raise ValueError("transaction outcome conflict in source log; dataset is invalid")
+                    if row.get("handling") != "quarantine_token" or not row.get("mint"):
+                        raise ValueError("transaction outcome conflict in source log; dataset is invalid")
+                    quarantined.add(key)
+                    continue
+                elif kind == "runtime_issue":
+                    if row.get("handling") != "quarantine_and_continue" or not row.get("code"):
+                        raise ValueError("unhandled runtime issue")
+                    issues.append(row)
+                    continue
                 elif kind == "birth":
                     target = births
                 elif kind == "terminal":
@@ -93,6 +102,15 @@ def load(paths: list[Path]) -> tuple[dict, dict, dict, dict]:
                 f"run {run} is diagnostic/incomplete: root={end.get('reason')} "
                 f"shutdown={end.get('shutdown_error')}"
             )
+    for key in quarantined:
+        if starts.get(key[0], {}).get("error_policy") != "quarantine_and_continue":
+            raise ValueError("conflict without declared continuation policy")
+        label = labels.get(key, {})
+        if label.get("reason") != "transaction_outcome_conflict" or label.get("gem", False) is not None:
+            raise ValueError("conflicting token was not quarantined")
+    for issue in issues:
+        if issue["run_id"] not in starts or starts[issue["run_id"]].get("error_policy") != "quarantine_and_continue":
+            raise ValueError("runtime issue without declared continuation policy")
     if set(births) != set(labels):
         raise ValueError("birth/terminal population mismatch")
     if any(run not in starts or not mint for run, mint in births):
@@ -112,7 +130,12 @@ def load(paths: list[Path]) -> tuple[dict, dict, dict, dict]:
             raise ValueError("phase prefix is incomplete")
         if label["gem"] is True and (present != [1, 2, 3, 4, 5] or label["reason"] != "completed"):
             raise ValueError("Gem has no complete five-phase observation")
+    for run in starts:
+        starts[run]["observed_runtime_issues"] = dict(Counter(row["code"] for row in issues if row["run_id"] == run))
     return starts, births, phases, labels
+
+def quarantined_labels(labels: dict) -> bool:
+    return any(label.get("reason") == "transaction_outcome_conflict" for label in labels.values())
 
 def analyze(paths: list[Path], minimum: int = 20, max_overlap: float = .8, min_effect: float = .33) -> dict[str, Any]:
     starts, births, phases, labels = load(paths)
@@ -146,6 +169,8 @@ def analyze(paths: list[Path], minimum: int = 20, max_overlap: float = .8, min_e
     verdict = "GO" if candidates else "STOP" if enough else "INSUFFICIENT_DATA"
     return {"gate": verdict, "scope": "exploratory_univariate_scan_not_validated_evidence",
             "settings": {"min_class": minimum, "max_ovl": max_overlap, "min_abs_cliffs_delta": min_effect},
+            "runtime_issues": {run: start.get("observed_runtime_issues", {}) for run, start in starts.items()},
+            "data_quality": "degraded" if any(start.get("observed_runtime_issues") for start in starts.values()) or quarantined_labels(labels) else "clean",
             "runs": list(starts), "births": len(births), "phase_counts": dict(sorted(phase_counts.items())),
             "terminal_reasons": dict(Counter(row["reason"] for row in labels.values())),
             "gems": sum(row["gem"] is True for row in labels.values()),

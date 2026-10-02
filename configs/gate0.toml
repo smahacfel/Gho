@@ -15,6 +15,6 @@ max_events_per_token = 65536
 max_events_total = 131072
 max_tokens_per_run = 100000
 
-# Retention exhaustion is a visible technical stop, never a business rejection.
+# Błędy danych/limity cenzurują obserwację; zbieracz kontynuuje do deadline.
 # No extra candidates are admitted during the final at-most-600-second drain.
 # Network credentials are environment variables; never put wallets/keys here.

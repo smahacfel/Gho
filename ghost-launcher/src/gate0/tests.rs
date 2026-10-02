@@ -180,27 +180,37 @@ fn conflicting_redelivery_outcome_is_not_hidden_by_duplicate_gate() {
         g.on_trade(&tx, t + 100).unwrap();
         // Redostawa nie może nadpisać pierwszego dowodu.
         g.on_trade(&tx, t + 101).unwrap();
-        let retained = g.tokens[&m].retained_events;
         let entries = g.sessions.cross_pool_velocity_index().entry_count();
         tx.success = !first_success;
         tx.slot = Some(12);
         tx.signer = Pubkey::new_unique();
-        let error = g.on_trade(&tx, t + 102).unwrap_err().to_string();
-        assert!(error.contains("conflicting transaction outcome"));
-        assert!(error.contains(&tx.signature.to_string()));
-        assert_eq!(g.tokens[&m].retained_events, retained);
+        g.on_trade(&tx, t + 102).unwrap();
+        assert!(!g.tokens.contains_key(&m));
         assert_eq!(
             g.sessions.cross_pool_velocity_index().entry_count(),
             entries
         );
         let r = rows(&g);
-        let conflict = r.last().unwrap();
+        let conflict = r
+            .iter()
+            .find(|r| r["kind"] == "transaction_outcome_conflict")
+            .unwrap();
         assert_eq!(conflict["kind"], "transaction_outcome_conflict");
         assert_eq!(conflict["first"]["success"], first_success);
         assert_eq!(conflict["conflicting"]["success"], !first_success);
         assert_eq!(conflict["first"]["received_ms"], t + 100);
         assert_eq!(conflict["first"]["slot"], 11);
         assert_eq!(conflict["conflicting"]["slot"], 12);
+        assert_eq!(r.last().unwrap()["reason"], "transaction_outcome_conflict");
+        assert!(r.last().unwrap()["gem"].is_null());
+        // Następny token nadal trafia do snapshotu i zamyka się biznesowo.
+        let m2 = Pubkey::new_unique();
+        let p2 = Pubkey::new_unique();
+        g.on_pool(&pool_event(m2, p2, t + 103, PUMP), t + 103)
+            .unwrap();
+        g.tick(t + 30_103).unwrap();
+        assert_eq!(g.summary.phase_counts[0], 1);
+        assert_eq!(g.summary.terminal_counts["C"], 1);
     }
 }
 
@@ -258,7 +268,7 @@ fn d_and_e_have_distinct_exact_boundaries_and_cannot_wait_for_next_trade() {
 #[test]
 fn unknown_source_is_not_a_negative_label() {
     let (mut g, _, _, t) = setup();
-    assert!(g.fail_source(t + 40_000, "source_gap").is_err());
+    g.fail_source(t + 40_000, "source_gap").unwrap();
     assert_eq!(g.summary.phase_counts, [0; 5]);
     assert!(rows(&g).last().unwrap()["gem"].is_null());
 }
@@ -626,15 +636,12 @@ fn gate0_progress_reaches_session_index_and_gap_requires_fresh_continuity() {
             .read()
             .cross_pool_velocity_index,
     ));
-    // Luka po admission zamyka run; nie wolno odzyskać brakującej historii kohorty.
-    assert!(g
-        .on_progress(&progress(2, ready + 1, true), ready + 1)
-        .is_err());
+    // Luka cenzuruje kohortę, ale pozostawia zbieracz aktywny.
+    g.on_progress(&progress(2, ready + 1, true), ready + 1)
+        .unwrap();
     assert!(!index.is_ready());
     assert_eq!(g.active_tokens(), 0);
-    assert!(rows(&g)
-        .iter()
-        .any(|r| r["reason"] == "source_gap:unspecified"));
+    assert!(rows(&g).iter().any(|r| r["reason"] == "source_gap"));
 }
 
 #[test]
@@ -1006,4 +1013,137 @@ fn ordinary_amm_swap_never_substitutes_for_create_pool_evidence() {
     assert!(g.tokens[&m]
         .label_reasons
         .contains("missing_migration_create"));
+}
+
+#[test]
+fn admission_and_retention_limits_do_not_stop_other_tokens() {
+    let (mut g, m, p, t) = setup();
+    g.config.max_active_tokens = 1;
+    g.on_pool(
+        &pool_event(Pubkey::new_unique(), Pubkey::new_unique(), t + 1, PUMP),
+        t + 1,
+    )
+    .unwrap();
+    assert_eq!(g.active_tokens(), 1);
+    assert_eq!(g.summary.runtime_issues["on_pool_error"], 1);
+    g.config.max_events_per_token = 1;
+    g.on_trade(&trade(m, p, t + 2), t + 2).unwrap();
+    g.on_trade(&trade(m, p, t + 3), t + 3).unwrap();
+    assert_eq!(g.active_tokens(), 0);
+    assert_eq!(g.summary.terminal_counts["on_trade_error"], 1);
+    assert!(rows(&g).last().unwrap()["gem"].is_null());
+    g.on_pool(
+        &pool_event(Pubkey::new_unique(), Pubkey::new_unique(), t + 4, PUMP),
+        t + 4,
+    )
+    .unwrap();
+    assert_eq!(g.active_tokens(), 1);
+}
+
+#[test]
+fn broken_checkpoint_is_local_and_later_checkpoints_continue() {
+    let (mut g, m, p, t) = setup();
+    let m2 = Pubkey::new_unique();
+    let p2 = Pubkey::new_unique();
+    g.on_pool(&pool_event(m2, p2, t + 1, PUMP), t + 1).unwrap();
+    g.sessions.remove_session(&p);
+    g.tick(t + 30_001).unwrap();
+    assert_eq!(g.summary.terminal_counts["materialization_error"], 1);
+    assert_eq!(g.summary.terminal_counts["C"], 1);
+    assert_eq!(g.summary.phase_counts[0], 1);
+    assert!(rows(&g)
+        .iter()
+        .any(|r| r["kind"] == "terminal" && r["mint"] == m.to_string() && r["gem"].is_null()));
+}
+
+#[test]
+fn source_gap_and_clock_error_do_not_end_admission() {
+    let (mut g, _, _, t) = setup();
+    g.tick(t + 1).unwrap();
+    g.tick(t).unwrap();
+    assert_eq!(g.summary.runtime_issues["tick_error"], 1);
+    g.fail_source(t + 2, "fixture_gap").unwrap();
+    let m = Pubkey::new_unique();
+    let p = Pubkey::new_unique();
+    g.on_pool(&pool_event(m, p, t + 3, PUMP), t + 3).unwrap();
+    g.tick(t + 30_003).unwrap();
+    assert_eq!(g.summary.phase_counts[0], 1);
+    assert!(!g.drained(t + 30_003));
+    assert!(g.drained(t + g.config.admission_ms));
+}
+
+#[test]
+fn output_io_error_is_reported_instead_of_fabricating_a_record() {
+    let (mut g, m, _, t) = setup();
+    let result = g.recover(
+        Err(std::io::Error::new(std::io::ErrorKind::StorageFull, "disk full").into()),
+        Some(m),
+        t,
+        "fixture",
+    );
+    assert!(result.is_err());
+    assert!(g.summary.runtime_issues.is_empty());
+}
+
+#[test]
+fn ten_hour_logical_admission_survives_repeated_local_and_source_failures() {
+    let t = 1_000_000;
+    let mut g = Gate0::new(
+        Gate0Config::default(),
+        "ten-hour-faults".into(),
+        t,
+        Vec::new(),
+    )
+    .unwrap();
+    for minute in 0..600u64 {
+        let at = t + minute * 60_000;
+        let m = Pubkey::new_unique();
+        let p = Pubkey::new_unique();
+        g.on_pool(&pool_event(m, p, at, PUMP), at).unwrap();
+        match minute % 4 {
+            0 => {
+                let mut tx = trade(m, p, at + 1);
+                tx.success = false;
+                tx.slot = Some(452249038);
+                g.on_trade(&tx, at + 1).unwrap();
+                tx.success = true;
+                tx.slot = Some(452249034);
+                g.on_trade(&tx, at + 2).unwrap();
+            }
+            1 => {
+                g.sessions.remove_session(&p);
+            }
+            2 => {
+                g.fail_source(at + 2, "injected_source_gap").unwrap();
+            }
+            _ => {}
+        }
+        g.tick(at + 30_000).unwrap();
+        assert_eq!(g.active_tokens(), 0);
+        assert!(!g.drained(at + 30_000));
+    }
+    let end = t + 36_000_000;
+    g.tick(end).unwrap();
+    assert!(g.drained(end));
+    assert_eq!(g.summary.admitted, 600);
+    assert_eq!(g.summary.terminal_counts["C"], 150);
+    assert_eq!(
+        g.summary.terminal_counts["transaction_outcome_conflict"],
+        150
+    );
+    assert_eq!(g.summary.terminal_counts["materialization_error"], 150);
+    assert_eq!(g.summary.terminal_counts["source_gap"], 150);
+    assert_eq!(g.summary.label_unavailable, 450);
+    let bytes = g.close(end, None, None, json!({})).unwrap();
+    let records: Vec<Value> = String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        records.iter().filter(|r| r["kind"] == "run_start").count(),
+        1
+    );
+    assert_eq!(records.iter().filter(|r| r["kind"] == "run_end").count(), 1);
+    assert!(records.last().unwrap()["reason"].is_null());
 }

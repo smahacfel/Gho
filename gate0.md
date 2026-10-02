@@ -1,3 +1,9 @@
+# Aktualizacja 2026-10-02: kontynuacja Gate0 po błędach danych
+
+Run `gate0-1790842067965` zakończył się po około 5317s, exit1: ta sama sygnatura była najpierw failed w slocie452249038, następnie success w slocie452249034. Błąd dev_volume_ratio nie wystąpił. Ten run nie jest ukończonym10h.
+
+Na polecenie operatora: guardy jakości, konfliktów, limitów i źródła nie mają kończyć całego procesu. Błędy tokena dają jawny terminal z gem:null; luki źródła cenzurują aktywną kohortę, a Seer jest ponownie łączony w tym samym procesie i tym samym admission. Skaner rozpoznaje kwarantannę i oznacza jakość zdegradowaną. Szczegóły i walidacja: `docs/ADR/ADR_8D_GATE0_KONTYNUACJA_I_CZYSZCZENIE_TARGET_20261002.md`. Starsze opisy stop-on-error poniżej są historyczne.
+
 # Gate0 — 2026-10-01: naprawa dev_volume_ratio po przerwanym runie10h
 
 Pierwszy run10h gate0-1790810736215 zakończył się po6291s z dev_volume_ratio range. To unieważnia wynik tego runu jako pełnego datasetu; starszy odbiór1800 pozostaje historycznym technicznym PASS.

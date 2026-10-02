@@ -205,8 +205,8 @@ async fn main() -> Result<()> {
         watched_pools_ttl_ms: 660_000,
         watched_pools_cap: 16_384,
         metrics_port: 0,
-        // Bounded burst capacity for primary and full-chain funding. Loss still
-        // invalidates the run instead of silently dropping observations.
+        // Bufory pozostają ograniczone; utrata danych cenzuruje obserwacje,
+        // ale nie kończy czasu zbierania.
         ingress_queue_capacity: 16_384,
         ipc_config: seer::ipc::IpcChannelConfig {
             buffer_size: 100_000,
@@ -221,10 +221,10 @@ async fn main() -> Result<()> {
         ..SeerConfig::default()
     };
     source.program_streams.enabled = false;
-    let (tx, mut rx, ipc_metrics) = create_ipc_channel(source.ipc_config.clone());
-    let ipc_probe = tx.clone();
+    let (tx, mut rx, mut ipc_metrics) = create_ipc_channel(source.ipc_config.clone());
+    let mut ipc_probe = tx.clone();
     let mut gaps = rx.local_coverage_gap_receiver();
-    let seer = Arc::new(Seer::new_with_ipc(source, tx).with_gate0_observation());
+    let mut seer = Arc::new(Seer::new_with_ipc(source.clone(), tx).with_gate0_observation());
     let (funding_tx, mut funding_rx) = tokio::sync::watch::channel(false);
     seer.set_authoritative_funding_stream_availability_sender(funding_tx);
     let file = OpenOptions::new()
@@ -243,6 +243,7 @@ async fn main() -> Result<()> {
         );
         previous_now
     };
+    let config_admission_ms = config.admission_ms;
     let mut gate = Gate0::new(
         config,
         format!("gate0-{epoch}"),
@@ -266,20 +267,33 @@ async fn main() -> Result<()> {
     let mut shutdown_errors = Vec::new();
     let mut funding_open = true;
     let mut progress_key = None;
+    let mut gaps_open = true;
+    let mut ipc_open = true;
+    let mut stale_reported = false;
+    let mut pending_expired_seen = 0;
+    let mut source_restart_after = epoch;
+    let admission_end = epoch.saturating_add(config_admission_ms);
+    let mut source_restarts = 0u64;
     let mut load = LoadTelemetry::default();
     let result:Result<()>=async {
         loop {
             tokio::select! {
                 _=tokio::signal::ctrl_c()=>{end_reason=Some("interrupted".to_string());break;}
-                changed=gaps.changed()=>{
-                    changed.context("IPC gap channel closed")?;
-                    if let Some(reason)=local_gap_reason(&gaps.borrow()) {
-                        anyhow::bail!(reason);
-                    }
+                changed=gaps.changed(), if gaps_open=>{
+                    let reason = if changed.is_err() {
+                        gaps_open = false;
+                        Some("IPC gap channel closed".to_string())
+                    } else { local_gap_reason(&gaps.borrow_and_update()) };
+                    if let Some(reason) = reason { gate.fail_source(now(), &reason)?; }
                 }
                 changed=funding_rx.changed(), if funding_open=>{ if changed.is_ok(){gate.set_funding_available(*funding_rx.borrow_and_update());} else {funding_open=false;gate.set_funding_available(false);} }
-                event=rx.recv()=>{
-                    let event=event.context("Seer IPC closed")?; let at=now();
+                event=rx.recv(), if ipc_open=>{
+                    let at=now();
+                    let Some(event) = event else {
+                        ipc_open = false;
+                        gate.fail_source(at, "Seer IPC closed")?;
+                        continue;
+                    };
                     load.observe_event(&event);
                     match event {
                         SeerEvent::PoolDetected(e)=>{
@@ -298,37 +312,71 @@ async fn main() -> Result<()> {
                             gate.on_progress(&e.progress,at)?;
                             if !e.progress.gap {
                                 let key=(e.progress.epoch,e.progress.event_ms);
-                                if progress_key.is_none_or(|old|key>old) {last_progress=at;progress_count+=1;progress_key=Some(key);}
+                                if progress_key.is_none_or(|old|key>old) {last_progress=at;progress_count+=1;progress_key=Some(key);stale_reported=false;}
                             }
                         }
                         SeerEvent::ExecutionAccountEvidence(_)=>{},
                     }
                 }
                 _=timer.tick()=>{
-                    let at=now(); ensure!(!source_task.is_finished(),"seer_task_ended");
-                    ensure!(at.saturating_sub(last_progress)<if progress_count==0{30_000}else{10_000},"primary progress unavailable/stale");
+                    let at=now();
+                    let stale = at.saturating_sub(last_progress) >= if progress_count==0 {30_000} else {10_000};
+                    if stale && !stale_reported {
+                        gate.fail_source(at, "primary progress unavailable/stale")?;
+                        stale_reported = true;
+                    }
+                    // Próby ogranicza deadline runu; pojedyncza próba nigdy nie
+                    // zastępuje procesu ani nie zeruje czasu admission.
+                    if at < admission_end && at >= source_restart_after
+                        && (source_task.is_finished() || !ipc_open || at.saturating_sub(last_progress) >= 30_000) {
+                        let queues = load.snapshot(&seer,&ipc_probe,&rx,&ipc_metrics);
+                        gate.record_issue(at, "source_restart", None, &queues.to_string())?;
+                        gate.fail_source(at, "source_restart")?;
+                        seer.request_shutdown();
+                        let source_result = match tokio::time::timeout(Duration::from_secs(2), &mut source_task).await {
+                            Ok(result) => format!("{result:?}"),
+                            Err(_) => {source_task.abort(); let _ = (&mut source_task).await; "source stop timeout".to_string()}
+                        };
+                        gate.record_issue(now(), "source_task_result", None, &source_result)?;
+                        let dispatch = tokio::time::timeout(Duration::from_secs(2), seer.shutdown_dispatchers()).await;
+                        if !matches!(dispatch, Ok(Ok(()))) {
+                            gate.record_issue(now(), "dispatcher_restart_shutdown", None, &format!("{dispatch:?}"))?;
+                        }
+                        let (tx, new_rx, metrics) = create_ipc_channel(source.ipc_config.clone());
+                        ipc_probe = tx.clone(); rx = new_rx; ipc_metrics = metrics;
+                        gaps = rx.local_coverage_gap_receiver(); gaps_open = true; ipc_open = true;
+                        seer = Arc::new(Seer::new_with_ipc(source.clone(), tx).with_gate0_observation());
+                        let (funding_tx, new_funding_rx) = tokio::sync::watch::channel(false);
+                        funding_rx = new_funding_rx; funding_open = true;
+                        seer.set_authoritative_funding_stream_availability_sender(funding_tx);
+                        source_task = tokio::spawn(Arc::clone(&seer).run());
+                        source_restarts += 1;
+                        last_progress = now(); progress_key = None; stale_reported = false;
+                        pending_expired_seen = 0;
+                        source_restart_after = last_progress.saturating_add(5_000);
+                    }
                     gate.tick(at)?;
                     load.observe_queues(&seer,&ipc_probe,&rx);
                     let integrity=seer.gate0_queue_snapshot();
-                    ensure!(integrity.pending_trade_expired == 0,
-                        "pending mapping trade expired before authoritative mapping/replay");
+                    if integrity.pending_trade_expired > pending_expired_seen {
+                        pending_expired_seen = integrity.pending_trade_expired;
+                        gate.fail_source(at, "pending mapping trade expired before authoritative mapping/replay")?;
+                    }
                     if at.saturating_sub(heartbeat)>=telemetry_interval_ms {
                         let queues=load.snapshot(&seer,&ipc_probe,&rx,&ipc_metrics);
                         eprintln!("Gate0 load={} admitted={} active={} phases={:?} gems={} trades={} amm_states={}",queues,gate.summary.admitted,gate.active_tokens(),gate.summary.phase_counts,gate.summary.gems,trades,amm_states);
                         heartbeat=at;
                     }
                     if let Some(smoke_seconds) = args.smoke_seconds.filter(|s| at.saturating_sub(epoch) >= s.saturating_mul(1_000)) {
-                        ensure!(progress_count > 0 && trades > 0 && gate.summary.admitted > 0,
-                            "source smoke lacks progress/create/trade evidence");
+                        if !(progress_count > 0 && trades > 0 && gate.summary.admitted > 0) {
+                            gate.record_issue(at, "smoke_missing_evidence", None, "source smoke lacks progress/create/trade evidence")?;
+                        }
                         if smoke_seconds >= 600 {
-                            ensure!(gate.summary.phase_counts[4] > 0,
-                                "lifecycle smoke has no phase-V snapshot");
-                            ensure!(gate.summary.terminal_counts.get("completed").copied().unwrap_or(0) > 0,
-                                "lifecycle smoke has no completed 600s terminal");
-                            ensure!(
-                                gate.summary.completed_with_migration_initial_state > 0,
-                                "lifecycle smoke has no completed token with tracked PumpSwap initial state"
-                            );
+                            if gate.summary.phase_counts[4] == 0
+                                || gate.summary.terminal_counts.get("completed").copied().unwrap_or(0) == 0
+                                || gate.summary.completed_with_migration_initial_state == 0 {
+                                gate.record_issue(at, "smoke_missing_lifecycle", None, "missing phase V/completed/migration evidence")?;
+                            }
                         }
                         end_reason=Some("smoke_only".to_string());break;
                     }
@@ -394,11 +442,12 @@ async fn main() -> Result<()> {
     }
 
     let shutdown_error = (!shutdown_errors.is_empty()).then(|| shutdown_errors.join("; "));
-    if end_reason.is_none() && shutdown_error.is_some() {
-        end_reason = Some("shutdown_error".to_string());
+    if let Some(error) = shutdown_error.as_deref() {
+        gate.record_issue(now(), "shutdown_error", None, error)?;
     }
     load.observe_queues(&seer, &ipc_probe, &rx);
-    let runtime_diagnostics = load.snapshot(&seer, &ipc_probe, &rx, &ipc_metrics);
+    let mut runtime_diagnostics = load.snapshot(&seer, &ipc_probe, &rx, &ipc_metrics);
+    runtime_diagnostics["source_restarts"] = json!(source_restarts);
     let writer = gate.close(
         now(),
         end_reason.as_deref(),
@@ -408,9 +457,6 @@ async fn main() -> Result<()> {
     writer.into_inner()?.sync_all()?;
 
     result?;
-    if let Some(error) = shutdown_error {
-        anyhow::bail!("source shutdown failed: {error}");
-    }
     println!(
         "Gate0 finished: progress={progress_count}, trades={trades}, amm_states={amm_states}, reason={end_reason:?}"
     );
