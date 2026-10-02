@@ -16,6 +16,7 @@ use ghost_core::tx_intelligence::types::{
 use seer::types::ToolchainFingerprintInput;
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashSet};
 
 const DBIA_ACCOUNT_KEYS_WEIGHT: f64 = 0.20;
@@ -634,6 +635,14 @@ fn unique_buyer_samples<'a>(
     buy_txs: &[&'a PoolTransaction],
     qualifies: impl Fn(&PoolTransaction) -> bool,
 ) -> BuyerSelection<'a> {
+    unique_buyer_samples_by(buy_txs, qualifies, |_, _| false)
+}
+
+fn unique_buyer_samples_by<'a>(
+    buy_txs: &[&'a PoolTransaction],
+    qualifies: impl Fn(&PoolTransaction) -> bool,
+    same_input: impl Fn(&PoolTransaction, &PoolTransaction) -> bool,
+) -> BuyerSelection<'a> {
     let mut by_signer = BTreeMap::<&str, Vec<&PoolTransaction>>::new();
     for &tx in buy_txs {
         if qualifies(tx) {
@@ -648,7 +657,29 @@ fn unique_buyer_samples<'a>(
         match first_canonical_sample(candidates) {
             Ok(Some(first)) => selection.samples.push(first),
             Ok(None) => {}
-            Err(()) => selection.order_unavailable = true,
+            Err(()) => {
+                // Obserwator nie zgaduje kolejności. Jeżeli każdy możliwy pierwszy
+                // BUY daje identyczne wejście tej metryki, jej wartość jest jednak
+                // jednoznaczna. Późniejsze znane BUY nie wchodzą do tego zbioru.
+                let possible: Vec<_> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        !candidates.iter().any(|other| {
+                            canonical_buy_order(other, candidate) == Some(Ordering::Less)
+                        })
+                    })
+                    .collect();
+                if let Some(first) = possible
+                    .first()
+                    .copied()
+                    .filter(|first| possible.iter().all(|other| same_input(first, other)))
+                {
+                    selection.samples.push(first);
+                } else {
+                    selection.order_unavailable = true;
+                }
+            }
         }
     }
     selection
@@ -737,6 +768,28 @@ fn ordered_buy_samples<'a>(buy_samples: &[SequencedBuyTx<'a>]) -> Option<Vec<Ord
         .collect()
 }
 
+fn observation_ordered_samples<'a>(
+    samples: &[SequencedBuyTx<'a>],
+) -> Option<(Vec<OrderedBuyTx<'a>>, BTreeSet<u64>)> {
+    let mut slots = BTreeMap::<u64, Vec<SequencedBuyTx<'a>>>::new();
+    for sample in samples {
+        slots.entry(sample.tx.slot?).or_default().push(*sample);
+    }
+    let (mut rows, mut bad_slots) = (Vec::new(), BTreeSet::new());
+    for (slot, group) in slots {
+        if let Some(ordered) = ordered_buy_samples(&group) {
+            rows.extend(ordered);
+        } else {
+            bad_slots.insert(slot);
+            rows.extend(group.iter().map(|sample| OrderedBuyTx {
+                tx: sample.tx,
+                slot,
+            }));
+        }
+    }
+    Some((rows, bad_slots))
+}
+
 /// Jeden potwierdzony rodzaj ceny: surowe rezerwy Pump post-trade.
 /// Jednostka to lamporty / bazowe jednostki tokena; nie zależy od skalowania
 /// znormalizowanych pól i nie korzysta z niezweryfikowanego price_quote.
@@ -820,11 +873,24 @@ fn coordination_hhi_from_counts(counts: impl IntoIterator<Item = u64>) -> Option
 }
 
 fn compute_ftdi_from_buys(buy_txs: &[&PoolTransaction]) -> FtdiComputation {
+    compute_ftdi_from_buys_mode(buy_txs, false)
+}
+fn compute_ftdi_from_buys_mode(
+    buy_txs: &[&PoolTransaction],
+    allow_invariant: bool,
+) -> FtdiComputation {
     let stats = buy_sample_stats(buy_txs);
-    let selection = unique_buyer_samples(buy_txs, |tx| {
-        tx.metadata_availability.has_inner_instructions()
-            && tx.toolchain_fingerprint.fee_topology().is_some()
-    });
+    let selection = unique_buyer_samples_by(
+        buy_txs,
+        |tx| {
+            tx.metadata_availability.has_inner_instructions()
+                && tx.toolchain_fingerprint.fee_topology().is_some()
+        },
+        |a, b| {
+            allow_invariant
+                && a.toolchain_fingerprint.fee_topology() == b.toolchain_fingerprint.fee_topology()
+        },
+    );
     let represented_signer_count = selection.samples.len() as u64;
     let mut topology_counts = BTreeMap::<FeeTopology, u64>::new();
     for tx in &selection.samples {
@@ -898,11 +964,27 @@ fn compute_dbia_from_buys<'a>(
     buy_txs: &[&'a PoolTransaction],
     dev_wallet: Option<&'a str>,
 ) -> DbiaComputation {
+    compute_dbia_from_buys_mode(buy_txs, dev_wallet, false)
+}
+
+fn compute_dbia_from_buys_mode<'a>(
+    buy_txs: &[&'a PoolTransaction],
+    dev_wallet: Option<&'a str>,
+    allow_invariant: bool,
+) -> DbiaComputation {
     let stats = buy_sample_stats(buy_txs);
-    let selection = unique_buyer_samples(buy_txs, |tx| {
-        tx.metadata_availability.has_inner_instructions()
-            && InfrastructureFingerprint::from_input(&tx.toolchain_fingerprint).is_some()
-    });
+    let selection = unique_buyer_samples_by(
+        buy_txs,
+        |tx| {
+            tx.metadata_availability.has_inner_instructions()
+                && InfrastructureFingerprint::from_input(&tx.toolchain_fingerprint).is_some()
+        },
+        |a, b| {
+            allow_invariant
+                && InfrastructureFingerprint::from_input(&a.toolchain_fingerprint)
+                    == InfrastructureFingerprint::from_input(&b.toolchain_fingerprint)
+        },
+    );
     let order_unavailable = selection.order_unavailable;
     let unique_samples = selection.samples;
     let represented_signer_count = unique_samples.len() as u64;
@@ -1107,6 +1189,23 @@ fn empty_des(buy_txs: &[&PoolTransaction]) -> DesComputation {
 }
 
 fn compute_des_from_window(window: &BuyWindow<'_>) -> DesComputation {
+    compute_des_from_window_using(
+        window,
+        curve_price,
+        DesPriceSourceV2::PumpVirtualPostTradeReserves,
+    )
+}
+
+fn verified_market_price(tx: &PoolTransaction) -> Option<f64> {
+    tx.price_quote
+        .filter(|price| price.is_finite() && *price > 0.0)
+}
+
+fn compute_des_from_window_using(
+    window: &BuyWindow<'_>,
+    price: fn(&PoolTransaction) -> Option<f64>,
+    source: DesPriceSourceV2,
+) -> DesComputation {
     let buys = window.buy_refs();
     // Usunięte zdarzenie o niepewnym statusie/tożsamości/kolejności może być
     // następnym BUY. Nie wolno zbudować trójki ponad taką luką w sekwencji.
@@ -1117,13 +1216,23 @@ fn compute_des_from_window(window: &BuyWindow<'_>) -> DesComputation {
     let mut result = if sequence_incomplete {
         empty_des(&buys)
     } else {
-        compute_des_from_transactions(&buys)
+        compute_des_from_transactions_using(
+            &buys,
+            price,
+            source == DesPriceSourceV2::VerifiedMarketPostTradePrice,
+        )
     };
+    result.price_source = source;
+    result.priced_buy_count = buys.iter().filter(|tx| price(tx).is_some()).count() as u64;
     window.append_reasons("DES", &mut result.degraded_reasons);
     result
 }
 
-fn compute_des_from_transactions(transactions: &[&PoolTransaction]) -> DesComputation {
+fn compute_des_from_transactions_using(
+    transactions: &[&PoolTransaction],
+    price: fn(&PoolTransaction) -> Option<f64>,
+    allow_partial_order: bool,
+) -> DesComputation {
     let buy_samples = successful_buy_samples(transactions);
     let buy_txs: Vec<&PoolTransaction> = buy_samples.iter().map(|sample| sample.tx).collect();
     let mut result = empty_des(&buy_txs);
@@ -1133,7 +1242,12 @@ fn compute_des_from_transactions(transactions: &[&PoolTransaction]) -> DesComput
             .push(DES_INSUFFICIENT_TRIPLES_REASON.to_string());
         return result;
     }
-    let Some(ordered) = ordered_buy_samples(&buy_samples) else {
+    let ordered_with_gaps = if allow_partial_order {
+        observation_ordered_samples(&buy_samples)
+    } else {
+        ordered_buy_samples(&buy_samples).map(|rows| (rows, BTreeSet::new()))
+    };
+    let Some((ordered, bad_slots)) = ordered_with_gaps else {
         result
             .degraded_reasons
             .push(DES_SLOT_ORDER_UNAVAILABLE_REASON.to_string());
@@ -1150,8 +1264,19 @@ fn compute_des_from_transactions(transactions: &[&PoolTransaction]) -> DesComput
     }
     let prices: Vec<_> = ordered
         .iter()
-        .map(|sample| curve_price(sample.tx))
+        .map(|sample| {
+            if bad_slots.contains(&sample.slot) {
+                None
+            } else {
+                price(sample.tx)
+            }
+        })
         .collect();
+    if !bad_slots.is_empty() {
+        result
+            .degraded_reasons
+            .push("DES_ORDER_PARTIAL_OBSERVATION".into());
+    }
     let mut changes = Vec::with_capacity(ordered.len().saturating_sub(2));
     let mut next_intervals = Vec::with_capacity(ordered.len().saturating_sub(2));
     // Nie filtrujemy braków przed windows(3): każda luka rozcina trójki.
@@ -1200,7 +1325,7 @@ pub fn compute_sybil_resistance_with_ftdi<'a>(
     transactions: impl IntoIterator<Item = &'a PoolTransaction>,
     dev_wallet: Option<&'a str>,
 ) -> SybilResistanceComputationV1 {
-    compute_sybil_resistance_from_window(BuyWindow::new(transactions, None), dev_wallet)
+    compute_sybil_resistance_from_window(BuyWindow::new(transactions, None), dev_wallet, false)
 }
 
 /// Historyczny odczyt według czasu dostępności epoch; filtr poprzedza deduplikację.
@@ -1212,17 +1337,39 @@ pub fn compute_sybil_resistance_with_ftdi_at_cutoff<'a>(
     compute_sybil_resistance_from_window(
         BuyWindow::new(transactions, Some(cutoff_ingress_wall_ms)),
         dev_wallet,
+        false,
+    )
+}
+
+pub(crate) fn compute_observation_sybil_at_cutoff<'a>(
+    transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+    dev_wallet: Option<&'a str>,
+    cutoff: u64,
+) -> SybilResistanceComputationV1 {
+    compute_sybil_resistance_from_window(
+        BuyWindow::new(transactions, Some(cutoff)),
+        dev_wallet,
+        true,
     )
 }
 
 fn compute_sybil_resistance_from_window<'a>(
     window: BuyWindow<'a>,
     dev_wallet: Option<&'a str>,
+    market_prices: bool,
 ) -> SybilResistanceComputationV1 {
-    let mut ftdi = compute_ftdi_from_buys(&window.buy_refs());
-    let mut dbia = compute_dbia_from_buys(&window.buy_refs(), dev_wallet);
+    let mut ftdi = compute_ftdi_from_buys_mode(&window.buy_refs(), market_prices);
+    let mut dbia = compute_dbia_from_buys_mode(&window.buy_refs(), dev_wallet, market_prices);
     let mut sfd = compute_sfd_from_buys(&window.buy_refs());
-    let des = compute_des_from_window(&window);
+    let des = if market_prices {
+        compute_des_from_window_using(
+            &window,
+            verified_market_price,
+            DesPriceSourceV2::VerifiedMarketPostTradePrice,
+        )
+    } else {
+        compute_des_from_window(&window)
+    };
     window.append_reasons("FTDI", &mut ftdi.degraded_reasons);
     window.append_reasons("DBIA", &mut dbia.degraded_reasons);
     window.append_reasons("SFD", &mut sfd.degraded_reasons);
@@ -1453,6 +1600,70 @@ mod tests {
         tx.signer_pre_balance_lamports = Some(100);
         tx.signer_post_balance_lamports = Some(90);
         tx
+    }
+
+    #[test]
+    fn observation_invariant_first_buy_does_not_guess_order_or_change_default() {
+        let fp = dbia_fingerprint(12, 3, true, true, 2, (1, 2));
+        let mut a = buy_tx("dev", "ambiguous-a", fp.clone());
+        let mut b = buy_tx("dev", "ambiguous-b", fp.clone());
+        a.tx_index = None;
+        b.tx_index = None;
+        let c = buy_tx("buyer", "unique-c", fp.clone());
+        let d = buy_tx("buyer2", "unique-d", fp);
+        let input = [&a, &b, &c, &d];
+        let old = compute_sybil_resistance_with_ftdi_at_cutoff(input, Some("dev"), 1_000);
+        assert!(old.ftdi.fee_topology_diversity_index.is_none());
+        let observed = compute_observation_sybil_at_cutoff(input, Some("dev"), 1_000);
+        assert_eq!(observed.ftdi.fee_topology_diversity_index, Some(0.0));
+        assert_eq!(observed.dbia.dev_buyer_infrastructure_affinity, Some(1.0));
+        b.toolchain_fingerprint.external_fee_transfer_count = Some(99);
+        let conflicting = compute_observation_sybil_at_cutoff([&a, &b, &c, &d], Some("dev"), 1_000);
+        assert!(conflicting.ftdi.fee_topology_diversity_index.is_none());
+        assert!(conflicting.dbia.dev_buyer_infrastructure_affinity.is_none());
+    }
+
+    #[test]
+    fn observation_des_prices_cross_venue_but_unknown_order_splits_triples() {
+        let slots = [1, 2, 4, 5, 5, 7, 10, 14, 19];
+        let mut txs: Vec<_> = slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                let mut tx = des_buy_tx(
+                    &format!("b{i}"),
+                    &format!("sig{i}"),
+                    Some(slot),
+                    Some(0),
+                    None,
+                    None,
+                );
+                tx.price_quote = Some(1.0 + (i * i) as f64 / 10.0);
+                tx
+            })
+            .collect();
+        // The two records of slot5 have no proven order. They must remain a
+        // barrier, not disappear and turn slot4→slot7 into consecutive BUYs.
+        txs[3].tx_index = None;
+        txs[4].tx_index = None;
+        let obs = compute_observation_sybil_at_cutoff(txs.iter(), None, 1_000);
+        assert_eq!(
+            obs.des.price_source,
+            DesPriceSourceV2::VerifiedMarketPostTradePrice
+        );
+        assert_eq!(obs.des.candidate_triple_count, 7);
+        assert_eq!(obs.des.closed_triple_count, 3);
+        assert!(obs.des.demand_elasticity_score.is_some());
+        assert!(!obs.des.has_full_quality());
+        let old = compute_des(txs.iter());
+        assert!(old.demand_elasticity_score.is_none());
+        assert_eq!(
+            old.price_source,
+            DesPriceSourceV2::PumpVirtualPostTradeReserves
+        );
+        let before = compute_observation_sybil_at_cutoff(txs.iter(), None, 999);
+        assert_eq!(before.des.buy_sample_count, 0);
+        assert!(before.des.demand_elasticity_score.is_none());
     }
 
     fn assert_approx_eq(left: f64, right: f64) {

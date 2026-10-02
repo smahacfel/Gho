@@ -184,12 +184,13 @@ fn active_tx_intel_top3_reads_stay_behind_the_single_effective_selector() {
 
 #[test]
 fn pr2a_keeps_one_canonical_producer_per_parity_sensitive_metric() {
-    assert_eq!(
-        read("ghost-launcher/src/tx_intelligence/sybil_metrics.rs")
-            .matches("fn compute_ftdi_from_buys")
-            .count(),
-        1
-    );
+    let sybil = read("ghost-launcher/src/tx_intelligence/sybil_metrics.rs");
+    // Dokładne symbole: adapter domyślnego profilu i wspólny producent
+    // mają wspólny prefiks nazwy, lecz nie są dwiema implementacjami metryki.
+    assert_eq!(sybil.matches("fn compute_ftdi_from_buys(").count(), 1);
+    assert_eq!(sybil.matches("fn compute_ftdi_from_buys_mode(").count(), 1);
+    assert!(sybil.contains("compute_ftdi_from_buys_mode(buy_txs, false)"));
+    assert_eq!(sybil.matches("Some(1.0 - hhi)").count(), 1);
     assert_eq!(
         read("ghost-launcher/src/tx_intelligence/funding_source.rs")
             .matches("1.0 - (distinct_known_sources as f64 / known_sources.len() as f64)")

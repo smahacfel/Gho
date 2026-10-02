@@ -292,6 +292,7 @@ fn trade_carrier(signature: Signature, pool: Pubkey, mint: Pubkey, ordinal: u32)
         curve_data_known: true,
         curve_finality: Default::default(),
         is_pumpswap: false,
+        amm_observation: None,
     }
 }
 

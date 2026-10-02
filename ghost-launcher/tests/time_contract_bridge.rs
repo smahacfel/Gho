@@ -65,6 +65,7 @@ fn make_trade(event_time: EventTimeMetadata, legacy_timestamp_ms: u64) -> TradeE
         curve_data_known: false,
         curve_finality: ghost_core::CurveFinality::Speculative,
         is_pumpswap: false,
+        amm_observation: None,
     }
 }
 

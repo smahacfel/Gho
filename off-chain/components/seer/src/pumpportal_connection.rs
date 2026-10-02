@@ -994,6 +994,7 @@ impl PumpPortalConnection {
                     && new_token.v_sol_in_bonding_curve.is_some(),
             ),
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         events.push(Self::trade_event_to_geyser_event(
@@ -1166,6 +1167,7 @@ impl PumpPortalConnection {
                 trade.v_tokens_in_bonding_curve.is_some() && trade.v_sol_in_bonding_curve.is_some(),
             ),
             is_pumpswap: false,
+            amm_observation: None,
         };
 
         Ok(Some(Self::trade_event_to_geyser_event(

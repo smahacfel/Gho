@@ -111,6 +111,16 @@ impl SessionManager {
         &self,
         request: OpenSessionRequest,
     ) -> Result<SessionId, SessionManagerError> {
+        self.open_session_with_retention(request, None)
+    }
+
+    /// Observation-only callers may retain a longer history without changing
+    /// the trading thresholds or the default runtime retention contract.
+    pub(crate) fn open_session_with_retention(
+        &self,
+        request: OpenSessionRequest,
+        retention: Option<usize>,
+    ) -> Result<SessionId, SessionManagerError> {
         let _lifecycle_guard = self.lifecycle_lock.lock();
         if let Some(existing) = self.sessions.get(&request.pool_amm_id) {
             return Ok(existing.read().session_id);
@@ -134,11 +144,14 @@ impl SessionManager {
         let deadline_wall_ms = request
             .deadline_wall_ms
             .unwrap_or_else(|| request.created_at_wall_ms.saturating_add(default_window_ms));
-        let tx_intelligence_config = TxIntelligenceConfig::from_gatekeeper_config(
+        let mut tx_intelligence_config = TxIntelligenceConfig::from_gatekeeper_config(
             &request.gatekeeper_config,
             request.fingerprint_config.clone(),
         )
         .apply_runtime_defaults(&self.config.tx_intelligence_defaults);
+        if let Some(capacity) = retention {
+            tx_intelligence_config.tx_key_capacity = capacity.max(1);
+        }
         let local_metric_contract_context = if self.metric_contract_effective_config.is_none()
             || self
                 .metric_contract_funding_source_producer_config

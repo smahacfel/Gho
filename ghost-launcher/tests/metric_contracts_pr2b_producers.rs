@@ -535,6 +535,29 @@ fn clean_manipulation_group_with_missing_required_field_downgrades_or_fails_clos
 }
 
 #[test]
+fn manipulation_dev_ratio_rejects_even_one_ulp_outside_contract() {
+    let (profile, effective, _, _, _) = runtime_context();
+    let context = build_context(&profile, &effective);
+    for value in [
+        f64::from_bits(1.0_f64.to_bits() + 1),
+        -f64::EPSILON,
+        f64::NAN,
+        f64::INFINITY,
+    ] {
+        let mut features = measured_manipulation();
+        features.dev_volume_ratio = value;
+        assert!(matches!(
+            build_manipulation_evidence_v2(&frozen_manipulation(features), &context),
+            Err(
+                ghost_launcher::metric_contracts::Pr2bProducerErrorV1::ProducerInvariant(
+                    "manipulation dev_volume_ratio range"
+                )
+            )
+        ));
+    }
+}
+
+#[test]
 fn manipulation_threshold_truth_table_is_strict_for_all_six_flags() {
     let (profile, effective, _, _, _) = runtime_context();
     let context = build_context(&profile, &effective);

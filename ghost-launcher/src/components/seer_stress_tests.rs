@@ -168,6 +168,7 @@ mod stress_tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         }
     }
 
