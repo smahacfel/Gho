@@ -137,6 +137,7 @@ fn generate_synthetic_history(
             curve_data_known: false,
             curve_finality: ghost_core::CurveFinality::Speculative,
             is_pumpswap: false,
+            amm_observation: None,
         });
     }
 

@@ -507,6 +507,8 @@ pub enum DesPriceSourceV2 {
     /// Surowe rezerwy post-trade Pump: lamporty / bazowe jednostki tokena.
     /// Nie obejmuje znormalizowanych rezerw PumpSwap ani price_quote.
     PumpVirtualPostTradeReserves,
+    /// Wspólna jednostka SOL/token; wyłącznie zweryfikowany post-state obserwatora.
+    VerifiedMarketPostTradePrice,
 }
 
 /// Jeden wynik producenta DES, przenoszony bez przeliczania do MFS.

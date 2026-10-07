@@ -833,9 +833,34 @@ pub fn build_manipulation_evidence_v2(
             || (id != ManipulationNumericFieldIdV2::MaxTxPerSigner && !(0.0..=1.0).contains(&value))
             || (id == ManipulationNumericFieldIdV2::MaxTxPerSigner && value < 0.0)
         {
-            return Err(Pr2bProducerErrorV1::ProducerInvariant(
-                "manipulation numeric field range",
-            ));
+            let field = match id {
+                ManipulationNumericFieldIdV2::SameMsTxRatio => {
+                    "manipulation same_ms_tx_ratio range"
+                }
+                ManipulationNumericFieldIdV2::BundleSuspicionRatio => {
+                    "manipulation bundle_suspicion_ratio range"
+                }
+                ManipulationNumericFieldIdV2::Top3SignerVolumeRatio => {
+                    "manipulation top3_signer_volume_ratio range"
+                }
+                ManipulationNumericFieldIdV2::Hhi => "manipulation hhi range",
+                ManipulationNumericFieldIdV2::MaxTxPerSigner => {
+                    "manipulation max_tx_per_signer range"
+                }
+                ManipulationNumericFieldIdV2::DevVolumeRatio => {
+                    "manipulation dev_volume_ratio range"
+                }
+                ManipulationNumericFieldIdV2::ContradictionScore => {
+                    "manipulation contradiction_score range"
+                }
+            };
+            tracing::error!(
+                field,
+                value,
+                value_bits = value.to_bits(),
+                "PR2B_MANIPULATION_VALUE_OUT_OF_RANGE"
+            );
+            return Err(Pr2bProducerErrorV1::ProducerInvariant(field));
         }
     }
     let legacy_available = matches!(

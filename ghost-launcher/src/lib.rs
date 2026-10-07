@@ -39,6 +39,7 @@ pub mod candidate_integrity;
 pub mod components;
 pub mod config;
 pub mod events;
+pub mod gate0;
 pub mod logging;
 pub mod metric_contracts;
 pub mod oracle_metrics;

@@ -1303,6 +1303,11 @@ impl IpcSender {
         self.egress.len()
     }
 
+    #[must_use]
+    pub fn queue_capacity(&self) -> usize {
+        self.egress.total_capacity()
+    }
+
     async fn send_event_with_policy(
         &self,
         event: SeerEvent,
@@ -1540,6 +1545,16 @@ impl IpcReceiver {
                 .handling_latency_ms
                 .observe(duration.as_secs_f64() * 1000.0);
         }
+    }
+
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.receiver.len()
+    }
+
+    #[must_use]
+    pub fn pending_capacity(&self) -> usize {
+        self.receiver.max_capacity()
     }
 
     /// Receive an event from the channel
@@ -2269,6 +2284,7 @@ mod tests {
             curve_data_known: false,
             curve_finality: ghost_core::CurveFinality::Speculative,
             is_pumpswap: false,
+            amm_observation: None,
         }
     }
 
@@ -3039,6 +3055,7 @@ mod tests {
             event_ms: 1000,
             received_ms: 1000,
             gap: false,
+            gap_reason: None,
         };
         sender
             .send_primary_trade_feed_progress(progress)

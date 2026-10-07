@@ -55,6 +55,7 @@
 //! }
 //! ```
 
+pub mod amm_observation;
 pub mod binary_parser;
 pub mod config;
 pub mod curve_parser;
@@ -106,7 +107,7 @@ use errors::{SeerError, SeerResult};
 use futures_util::StreamExt;
 use ghost_core::ObservedPumpMutationV1;
 use grpc_connection::{
-    Bcv2AccountContext, EventStream, GrpcConnection, GrpcSubscriptionProfile,
+    Bcv2AccountContext, EventStream, GrpcConnection, GrpcSubscriptionProfile, IngressQueueSnapshot,
     GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL, GRPC_FUNDING_LANE_PUMP_FILTERED_SOURCE_LABEL,
     GRPC_GLOBAL_STREAM_SOURCE_LABEL, PUMP_FUN_PROGRAM_ID,
 };
@@ -716,6 +717,7 @@ const DEV_BUY_SOL_SANITY_LIMIT: f64 = 5_000.0;
 const COVERAGE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const PARSE_MISS_LOG_EVERY: u64 = 200;
 const PENDING_TRADE_TTL: Duration = Duration::from_millis(30);
+const GATE0_PENDING_TRADE_TTL: Duration = Duration::from_secs(5);
 const PENDING_TRADES_PER_CURVE_MAX: usize = 1_024;
 const RAW_PUMPFUN_INSTRUCTION_EVIDENCE_QUEUE_CAP: usize = 1_024;
 const RAW_PUMPFUN_INSTRUCTION_EVIDENCE_FLUSH_MS: u64 = 1_000;
@@ -1506,6 +1508,7 @@ struct PendingTrade {
     observation: Option<ObservedPumpMutationV1>,
     source_label: String,
     is_coverage_source: bool,
+    coverage_loss_relevant: bool,
     queued_at: Instant,
     reason: PendingTradeReason,
 }
@@ -1524,6 +1527,27 @@ enum TradeForwardDecision {
     ForwardWithReplay(Pubkey, Pubkey),
     BufferedPendingMapping,
     Filtered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TradeHandleOutcome {
+    Emitted,
+    BufferedPendingMapping,
+    CoveredByReplay,
+    Lost,
+}
+
+impl TradeHandleOutcome {
+    const fn emitted_live(self) -> bool {
+        matches!(self, Self::Emitted)
+    }
+
+    const fn coverage_preserved(self) -> bool {
+        matches!(
+            self,
+            Self::Emitted | Self::BufferedPendingMapping | Self::CoveredByReplay
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1981,6 +2005,15 @@ fn geyser_provider_and_boundary(
 }
 
 /// Main Seer component for real-time pool detection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gate0QueueSnapshot {
+    pub primary: Option<IngressQueueSnapshot>,
+    pub funding: Option<IngressQueueSnapshot>,
+    pub ipc_egress_depth: Option<usize>,
+    pub pending_mapping_buffered: u64,
+    pub pending_trade_expired: u64,
+}
+
 pub struct Seer {
     /// Configuration
     config: SeerConfig,
@@ -2048,6 +2081,13 @@ pub struct Seer {
     /// Keyed by `PendingTradeKey` (ByCurve / ByMint / BySignature) so that
     /// unresolved trades never collide under the all-zeros default pubkey.
     pending_trades: Arc<RwLock<HashMap<PendingTradeKey, VecDeque<PendingTrade>>>>,
+    gate0_cohort_pools: Arc<RwLock<HashSet<[u8; 32]>>>,
+    gate0_cohort_mints: Arc<RwLock<HashSet<[u8; 32]>>>,
+    gate0_observation_mode: bool,
+    /// Active runtime keeps the low-latency 30ms contract. Gate 0 is an
+    /// observation-only consumer and tolerates provider CREATE/trade reordering
+    /// long enough to preserve the complete prefix before declaring a gap.
+    pending_trade_ttl: Duration,
 
     /// Rate-limit map for UNSUPPORTED_LAYOUT debug logs (pubkey -> last log Instant).
     /// Max 1 log per pubkey per 60 seconds to avoid log spam.
@@ -2490,6 +2530,10 @@ impl Seer {
             mint_to_curve: Arc::new(RwLock::new(HashMap::new())),
             pending_curve_updates: Arc::new(RwLock::new(HashMap::new())),
             pending_trades: Arc::new(RwLock::new(HashMap::new())),
+            gate0_cohort_pools: Arc::new(RwLock::new(HashSet::new())),
+            gate0_cohort_mints: Arc::new(RwLock::new(HashSet::new())),
+            gate0_observation_mode: false,
+            pending_trade_ttl: PENDING_TRADE_TTL,
             unsupported_layout_last_log: Arc::new(RwLock::new(HashMap::new())),
             coverage: Arc::new(CoverageCounters::default()),
             coverage_last_log: Arc::new(Mutex::new(Instant::now())),
@@ -2517,6 +2561,50 @@ impl Seer {
             grpc.set_health(Arc::clone(&health));
         }
         self.health = Some(health);
+    }
+
+    #[must_use]
+    pub fn gate0_queue_snapshot(&self) -> Gate0QueueSnapshot {
+        Gate0QueueSnapshot {
+            primary: self
+                .grpc_connection
+                .as_ref()
+                .map(GrpcConnection::ingress_queue_snapshot),
+            funding: self
+                .funding_grpc_connection
+                .as_ref()
+                .map(GrpcConnection::ingress_queue_snapshot),
+            ipc_egress_depth: self
+                .ipc_sender
+                .as_ref()
+                .map(IpcSender::current_queue_length),
+            pending_mapping_buffered: self.coverage.pending_mapping_buffered_total.load(Relaxed),
+            pending_trade_expired: self.coverage.trade_events_expired_total.load(Relaxed),
+        }
+    }
+
+    /// Opt in only for the standalone Gate 0 observer, before starting Seer.
+    pub fn with_gate0_observation(mut self) -> Self {
+        self.parser = self.parser.take().map(BinaryParser::with_gate0_observation);
+        self.pending_trade_ttl = GATE0_PENDING_TRADE_TTL;
+        self.gate0_observation_mode = true;
+        self.grpc_connection = self.grpc_connection.take().map(|connection| {
+            connection.with_subscription_profile(GrpcSubscriptionProfile::Gate0Observation)
+        });
+        self
+    }
+
+    pub fn gate0_register_cohort(&self, pool: Pubkey, mint: Pubkey) {
+        self.gate0_cohort_pools.write().insert(pool.to_bytes());
+        self.gate0_cohort_mints.write().insert(mint.to_bytes());
+        let mut pending = self.pending_trades.write();
+        for queue in pending.values_mut() {
+            for trade in queue.iter_mut() {
+                if trade.trade.pool_amm_id == pool || trade.trade.mint == mint {
+                    trade.coverage_loss_relevant = true;
+                }
+            }
+        }
     }
 
     /// Attach a shared WAL handle for raw/parsed ingest durability.
@@ -2955,6 +3043,9 @@ impl Seer {
 
         if let Some(mut progress) = last_primary_progress {
             progress.gap = true;
+            progress
+                .gap_reason
+                .get_or_insert(types::PrimaryTradeFeedGapReasonV1::SourceStreamEnded);
             progress.received_ms = types::ingress_epoch_ms();
             progress.event_ms = progress.received_ms;
             let _ = self
@@ -3259,6 +3350,7 @@ impl Seer {
             coverage,
             curve,
             mint,
+            PENDING_TRADE_TTL,
         )
         .await;
     }
@@ -3375,7 +3467,7 @@ impl Seer {
 
         let queue = pending.entry(key).or_default();
 
-        while matches!(queue.front(), Some(oldest) if now.duration_since(oldest.queued_at) > PENDING_TRADE_TTL)
+        while matches!(queue.front(), Some(oldest) if now.duration_since(oldest.queued_at) > self.pending_trade_ttl)
         {
             if let Some(expired) = queue.pop_front() {
                 Self::record_pending_trade_expired(
@@ -3411,11 +3503,23 @@ impl Seer {
                 Some(reason.as_str()),
             );
         }
+        let coverage_loss_relevant = !self.gate0_observation_mode
+            || (trade.pool_amm_id != Pubkey::default()
+                && self
+                    .gate0_cohort_pools
+                    .read()
+                    .contains(&trade.pool_amm_id.to_bytes()))
+            || (trade.mint != Pubkey::default()
+                && self
+                    .gate0_cohort_mints
+                    .read()
+                    .contains(&trade.mint.to_bytes()));
         queue.push_back(PendingTrade {
             trade,
             observation,
             source_label: source_label.to_string(),
             is_coverage_source,
+            coverage_loss_relevant,
             queued_at: now,
             reason,
         });
@@ -3433,6 +3537,7 @@ impl Seer {
         coverage: &Arc<CoverageCounters>,
         curve: Pubkey,
         mint: Pubkey,
+        pending_trade_ttl: Duration,
     ) -> Vec<PendingTrade> {
         let now = Instant::now();
         let curve_key = PendingTradeKey::ByCurve(curve.to_bytes());
@@ -3460,7 +3565,7 @@ impl Seer {
         let mut ready = Vec::new();
         for queue in queues.iter_mut() {
             while let Some(mut pending) = queue.pop_front() {
-                if now.duration_since(pending.queued_at) > PENDING_TRADE_TTL {
+                if now.duration_since(pending.queued_at) > pending_trade_ttl {
                     Self::record_pending_trade_expired(metrics, coverage, &pending, "replay_drain");
                     continue;
                 }
@@ -3483,18 +3588,25 @@ impl Seer {
         coverage: &Arc<CoverageCounters>,
         curve: Pubkey,
         mint: Pubkey,
-    ) {
-        let pending =
-            Self::take_pending_trades_from_store(pending_trades, metrics, coverage, curve, mint);
+        pending_trade_ttl: Duration,
+    ) -> bool {
+        let pending = Self::take_pending_trades_from_store(
+            pending_trades,
+            metrics,
+            coverage,
+            curve,
+            mint,
+            pending_trade_ttl,
+        );
         if pending.is_empty() {
-            return;
+            return true;
         }
 
         // Fire all replay IPC sends concurrently (was: sequential for+await).
         // Sequential replay held the worker for N*IPC_latency before freeing the
         // slot, starving subsequent CreatePool events of worker capacity.
         let Some(ipc) = ipc_sender else {
-            return;
+            return false;
         };
 
         struct ReplayJob {
@@ -3552,6 +3664,7 @@ impl Seer {
 
         let mut emitted_coverage_signatures = HashSet::new();
         let mut emitted_fallback_signatures = HashSet::new();
+        let mut all_sends_ok = true;
         for (result, job) in send_results {
             match result {
                 Ok(()) => {
@@ -3599,6 +3712,7 @@ impl Seer {
                     ::metrics::increment_counter!("seer_pending_trade_replayed_total", "reason" => job.reason_label);
                 }
                 Err(e) => {
+                    all_sends_ok = false;
                     Self::record_trade_outcome_with_metrics(metrics, TradeOutcome::IpcSendFailed);
                     warn!(
                         "Failed to send replayed trade via IPC: {} outcome={} reason={}",
@@ -3616,9 +3730,10 @@ impl Seer {
                 emitted_coverage_signatures.len() as u64,
             );
         }
+        all_sends_ok
     }
 
-    async fn replay_pending_trades(&self, curve: Pubkey, mint: Pubkey) {
+    async fn replay_pending_trades(&self, curve: Pubkey, mint: Pubkey) -> bool {
         Self::replay_pending_trades_from_state(
             &self.pending_trades,
             self.ipc_sender.clone(),
@@ -3626,8 +3741,9 @@ impl Seer {
             &self.coverage,
             curve,
             mint,
+            self.pending_trade_ttl,
         )
-        .await;
+        .await
     }
 
     /// Drain and replay any buffered AccountUpdate for `curve` now that `mint` is known.
@@ -4186,6 +4302,59 @@ impl Seer {
         }
     }
 
+    fn gate0_trade_candidate_diagnostics(event: &types::GeyserEvent) -> String {
+        let types::GeyserEvent::Transaction {
+            accounts,
+            instructions,
+            inner_instructions,
+            metadata_availability,
+            ..
+        } = event
+        else {
+            return "not_transaction".to_string();
+        };
+        let mut parts = Vec::new();
+        for (index, ix) in instructions.iter().enumerate().take(24) {
+            let disc = ix
+                .data
+                .get(..8)
+                .map(raw_bytes_hex)
+                .unwrap_or_else(|| "short".into());
+            parts.push(format!(
+                "outer#{index}:program={}:disc={disc}:len={}:accounts={}",
+                ix.program_id,
+                ix.data.len(),
+                ix.account_indices.len()
+            ));
+        }
+        for group in inner_instructions {
+            for (index, ix) in group.instructions.iter().enumerate().take(24) {
+                let program = accounts
+                    .get(ix.program_id_index as usize)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("index:{}", ix.program_id_index));
+                let disc = ix
+                    .data
+                    .get(..8)
+                    .map(raw_bytes_hex)
+                    .unwrap_or_else(|| "short".into());
+                parts.push(format!(
+                    "inner{}#{index}:program={program}:disc={disc}:len={}:accounts={}:stack={:?}",
+                    group.index,
+                    ix.data.len(),
+                    ix.accounts.len(),
+                    ix.stack_height
+                ));
+            }
+        }
+        format!(
+            "status_known={} inner_known={} [{}]",
+            metadata_availability.status_known,
+            metadata_availability.inner_instructions_known,
+            parts.join(" | ")
+        )
+    }
+
     fn tx_contains_supported_trade_instruction(event: &types::GeyserEvent) -> bool {
         let (accounts, instructions, inner_instructions): (
             &Vec<Pubkey>,
@@ -4206,22 +4375,13 @@ impl Seer {
                 return false;
             }
 
-            const JUPITER_V6_PROGRAM_ID: Pubkey =
-                solana_sdk::pubkey!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
-            const DFLOW_V4_PROGRAM_ID: Pubkey =
-                solana_sdk::pubkey!("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH");
-
+            // Generic Jupiter / DFlow route wrappers are not by themselves
+            // proof that this transaction contains a Pump/PumpSwap trade.
+            // The parser may intentionally return zero trades for such a route
+            // when no known Pump mapping is available. Router fallbacks count
+            // through parsed_trade_count > 0; direct/inner Pump instructions
+            // remain authoritative candidates below.
             let disc = &data[..8];
-            if *program_id == JUPITER_V6_PROGRAM_ID {
-                return disc == binary_parser::DISC_JUPITER_ROUTE_V2.as_slice()
-                    || disc == binary_parser::DISC_JUPITER_ROUTE.as_slice();
-            }
-            if *program_id == DFLOW_V4_PROGRAM_ID {
-                return disc == binary_parser::DISC_DFLOW_SWAP2.as_slice()
-                    || disc == binary_parser::DISC_DFLOW_SWAP.as_slice()
-                    || disc == binary_parser::DISC_DFLOW_SWAP2_WITH_DESTINATION.as_slice()
-                    || disc == binary_parser::DISC_DFLOW_SWAP2_WITH_DESTINATION_NATIVE.as_slice();
-            }
 
             let amm = match AmmProgram::from_pubkey(program_id) {
                 Some(amm) => amm,
@@ -4238,6 +4398,14 @@ impl Seer {
                     }
                 }
             }
+            if matches!(amm, AmmProgram::PumpSwap)
+                && disc == binary_parser::DISC_SWAP_OUTER_WRAPPER.as_slice()
+            {
+                return data.len() >= 16
+                    && (data[8..16] == binary_parser::DISC_SWAP_EVENT_BUY
+                        || data[8..16] == binary_parser::DISC_SWAP_EVENT_SELL);
+            }
+
             let amm_type = match amm {
                 AmmProgram::PumpFun => ghost_core::AmmType::PumpFun,
                 AmmProgram::PumpSwap => ghost_core::AmmType::PumpSwap,
@@ -4631,7 +4799,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             .pending_trade_expired_while_buffered_total
             .with_label_values(&[pending_trade.reason.as_str()])
             .inc();
-        if pending_trade.is_coverage_source {
+        if pending_trade.is_coverage_source && pending_trade.coverage_loss_relevant {
             coverage.trade_events_expired_total.fetch_add(1, Relaxed);
         }
         info!(
@@ -4881,11 +5049,28 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
 
     async fn handle_trade_event_with_observation(
         &self,
-        mut trade: types::TradeEvent,
+        trade: types::TradeEvent,
         observation: Option<ObservedPumpMutationV1>,
         source_label: &str,
         is_coverage_source: bool,
     ) -> bool {
+        self.handle_trade_event_with_observation_outcome(
+            trade,
+            observation,
+            source_label,
+            is_coverage_source,
+        )
+        .await
+        .emitted_live()
+    }
+
+    async fn handle_trade_event_with_observation_outcome(
+        &self,
+        mut trade: types::TradeEvent,
+        observation: Option<ObservedPumpMutationV1>,
+        source_label: &str,
+        is_coverage_source: bool,
+    ) -> TradeHandleOutcome {
         let inferred_timestamp_quality = infer_trade_timestamp_quality(&trade, source_label);
         trade.semantic = normalize_transaction_semantics(
             source_label,
@@ -4919,7 +5104,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             Some(trade.pool_amm_id).filter(|pool_id| *pool_id != Pubkey::default()),
             parsed_kind,
         ) {
-            return false;
+            return TradeHandleOutcome::Lost;
         }
         if is_coverage_source {
             let pool_id = trade.pool_amm_id.to_string();
@@ -4939,7 +5124,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     source_label,
                     is_coverage_source,
                 );
-                return false;
+                return TradeHandleOutcome::BufferedPendingMapping;
             }
 
             // Only genuinely invalid pools (e.g. WSOL as pool_amm_id) are hard-dropped.
@@ -4958,7 +5143,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 trade.pool_amm_id,
                 trade.mint
             );
-            return false;
+            return TradeHandleOutcome::Lost;
         }
 
         // Race hardening: CREATE may register curve→mint after the first hydrate,
@@ -4983,14 +5168,20 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                         grpc_connection.add_watched_mint(trade.mint);
                     }
                 }
-                self.emit_trade_only_with_observation(
-                    trade,
-                    observation,
-                    source_label,
-                    false,
-                    is_coverage_source,
-                )
-                .await
+                if self
+                    .emit_trade_only_with_observation(
+                        trade,
+                        observation,
+                        source_label,
+                        false,
+                        is_coverage_source,
+                    )
+                    .await
+                {
+                    TradeHandleOutcome::Emitted
+                } else {
+                    TradeHandleOutcome::Lost
+                }
             }
             TradeForwardDecision::ForwardWithReplay(pool, mint) => {
                 // Optimistic self-registration path: mapping was just set in
@@ -5027,7 +5218,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 }
                 self.sync_curve_mapping_to_parser(pool, mint);
                 self.replay_pending_curve_update(pool, mint).await;
-                self.replay_pending_trades(pool, mint).await;
+                let replay_ok = self.replay_pending_trades(pool, mint).await;
 
                 if was_buffered {
                     // Replay already emitted this exact trade; suppress the live copy.
@@ -5039,9 +5230,13 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                         trade.mint,
                         source_label
                     );
-                    false
-                } else {
-                    self.emit_trade_only_with_observation(
+                    if replay_ok {
+                        TradeHandleOutcome::CoveredByReplay
+                    } else {
+                        TradeHandleOutcome::Lost
+                    }
+                } else if self
+                    .emit_trade_only_with_observation(
                         trade,
                         observation,
                         source_label,
@@ -5049,9 +5244,15 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                         is_coverage_source,
                     )
                     .await
+                {
+                    TradeHandleOutcome::Emitted
+                } else {
+                    TradeHandleOutcome::Lost
                 }
             }
-            TradeForwardDecision::BufferedPendingMapping => false,
+            TradeForwardDecision::BufferedPendingMapping => {
+                TradeHandleOutcome::BufferedPendingMapping
+            }
             TradeForwardDecision::Filtered => {
                 if is_coverage_source {
                     self.coverage.trade_filtered_total.fetch_add(1, Relaxed);
@@ -5067,7 +5268,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     source_label,
                     outcome.as_str()
                 );
-                false
+                TradeHandleOutcome::Lost
             }
         }
     }
@@ -5112,11 +5313,28 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                         observations = observations.len(),
                         "Seer parser violated aligned trade-observation bundle invariant"
                     );
-                    self.cpv_primary_input_gap(event).await;
+                    self.cpv_primary_input_gap(
+                        event,
+                        types::PrimaryTradeFeedGapReasonV1::ParserBundleMismatch,
+                    )
+                    .await;
                     return (0, false);
                 }
                 if has_trade_candidate && parsed_trade_count == 0 {
-                    self.cpv_primary_input_gap(event).await;
+                    if self.gate0_observation_mode {
+                        if let types::GeyserEvent::Transaction { signature, .. } = event {
+                            warn!(
+                                signature = %signature,
+                                details = %Self::gate0_trade_candidate_diagnostics(event),
+                                "GATE0_TRADE_CANDIDATE_PARSE_MISS"
+                            );
+                        }
+                    }
+                    self.cpv_primary_input_gap(
+                        event,
+                        types::PrimaryTradeFeedGapReasonV1::TradeCandidateParseMiss,
+                    )
+                    .await;
                 }
                 if is_coverage_source && (has_trade_candidate || parsed_trade_count > 0) {
                     self.coverage.trade_candidate_total.fetch_add(1, Relaxed);
@@ -5151,18 +5369,59 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 for (trade, observation) in trades.into_iter().zip(observations) {
                     let successful_buy = trade.is_buy
                         && (!trade.metadata_availability.status_known || trade.success);
-                    let emitted = self
-                        .handle_trade_event_with_observation(
+                    let buy_diag = successful_buy.then(|| {
+                        (
+                            trade.signature,
+                            trade.pool_amm_id,
+                            trade.mint,
+                            trade.is_pumpswap,
+                            trade.provider_role,
+                            trade.event_ordinal,
+                            Self::is_complete_raw_observation(observation.as_ref()),
+                        )
+                    });
+                    let outcome = self
+                        .handle_trade_event_with_observation_outcome(
                             trade,
                             observation,
                             source_label,
                             is_coverage_source,
                         )
                         .await;
-                    if successful_buy && !emitted {
-                        self.cpv_primary_input_gap(event).await;
+                    if successful_buy && !outcome.coverage_preserved() {
+                        if let Some((
+                            signature,
+                            pool,
+                            mint,
+                            is_pumpswap,
+                            provider_role,
+                            ordinal,
+                            raw_complete,
+                        )) = buy_diag
+                        {
+                            warn!(
+                                signature = %signature,
+                                pool = %pool,
+                                mint = %mint,
+                                is_pumpswap,
+                                ?provider_role,
+                                ?ordinal,
+                                raw_complete,
+                                source = source_label,
+                                invalid_pool = Self::is_invalid_trade_pool(&pool),
+                                mint_is_wsol = mint == *wsol_mint_pubkey(),
+                                pool_equals_mint = pool == mint,
+                                ?outcome,
+                                "SEER_SUCCESSFUL_BUY_NOT_FORWARDED"
+                            );
+                        }
+                        self.cpv_primary_input_gap(
+                            event,
+                            types::PrimaryTradeFeedGapReasonV1::SuccessfulBuyNotForwarded,
+                        )
+                        .await;
                     }
-                    emitted_any |= emitted;
+                    emitted_any |= outcome.emitted_live();
                 }
 
                 if is_coverage_source && emitted_any {
@@ -5196,15 +5455,29 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         mut progress: types::PrimaryTradeFeedProgressV1,
         preceding_worker_gap: &mut bool,
     ) -> types::PrimaryTradeFeedProgressV1 {
-        progress.gap |= *preceding_worker_gap;
+        if *preceding_worker_gap {
+            progress.gap = true;
+            progress
+                .gap_reason
+                .get_or_insert(types::PrimaryTradeFeedGapReasonV1::WorkerProcessingGap);
+        }
         while let Some(joined) = workers.join_next().await {
-            progress.gap |= !matches!(joined, Ok(true));
+            if !matches!(joined, Ok(true)) {
+                progress.gap = true;
+                progress
+                    .gap_reason
+                    .get_or_insert(types::PrimaryTradeFeedGapReasonV1::WorkerProcessingGap);
+            }
         }
         *preceding_worker_gap = false;
         progress
     }
 
-    async fn cpv_primary_input_gap(&self, event: &types::GeyserEvent) {
+    async fn cpv_primary_input_gap(
+        &self,
+        event: &types::GeyserEvent,
+        reason: types::PrimaryTradeFeedGapReasonV1,
+    ) {
         let types::GeyserEvent::Transaction {
             provider_id: Some(provider_id),
             provider_role: Some(ghost_core::RawProviderRoleV1::PrimaryAuthority),
@@ -5231,6 +5504,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                     event_ms: now,
                     received_ms: now,
                     gap: true,
+                    gap_reason: Some(reason),
                 })
                 .await;
         }
@@ -5242,7 +5516,12 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             // na zawsze blokować CPV po pojedynczej stracie: nowe straty Trade
             // docierają niezależnym, licznikowym control-plane, a okno się odbudowuje.
             // Local segment flag pozostaje: ten stan rzeczywiście blokuje parser.
-            progress.gap |= self.local_segment_unreliable.load(Acquire);
+            if self.local_segment_unreliable.load(Acquire) {
+                progress.gap = true;
+                progress
+                    .gap_reason
+                    .get_or_insert(types::PrimaryTradeFeedGapReasonV1::LocalSegmentUnreliable);
+            }
             if let Some(ipc) = self.ipc_sender.as_ref() {
                 ipc.send_primary_trade_feed_progress(progress)
                     .await
@@ -5255,7 +5534,11 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         {
             // Nieznane inner instructions mogą ukrywać inne BUY (np. przez wrapper).
             // To brak pokrycia feedu CPV, nie powód wyłączenia znanych danych M1–M3.
-            self.cpv_primary_input_gap(&event).await;
+            self.cpv_primary_input_gap(
+                &event,
+                types::PrimaryTradeFeedGapReasonV1::MetadataIncomplete,
+            )
+            .await;
         }
         if let types::GeyserEvent::LocalCoverageGap { gap } = &event {
             self.local_segment_unreliable.store(true, Release);
@@ -6600,6 +6883,7 @@ mod tests {
             curve_data_known: true,
             curve_finality: ghost_core::CurveFinality::Provisional,
             is_pumpswap: false,
+            amm_observation: None,
         }
     }
 
@@ -7915,6 +8199,7 @@ mod tests {
             observation: None,
             source_label: "test".to_string(),
             is_coverage_source: true,
+            coverage_loss_relevant: true,
             queued_at: Instant::now() - PENDING_TRADE_TTL - Duration::from_secs(1),
             reason: PendingTradeReason::CurveMappingMissing,
         };
@@ -9551,6 +9836,67 @@ mod tests {
     }
 
     #[test]
+    fn test_tx_contains_supported_trade_instruction_filters_non_trade_pumpswap_event_wrapper() {
+        let pumpswap_program =
+            Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
+        let build_event = |inner_disc: [u8; 8]| {
+            let mut wrapper = binary_parser::DISC_SWAP_OUTER_WRAPPER.to_vec();
+            wrapper.extend_from_slice(&inner_disc);
+            types::GeyserEvent::Transaction {
+                metadata_availability: crate::types::TransactionMetadataAvailability {
+                    status_known: true,
+                    inner_instructions_known: true,
+                },
+                provider_id: None,
+                provider_role: None,
+                observation_provenance: None,
+                slot: Some(1),
+                tx_index: None,
+                event_ts_ms: Some(1_000),
+                arrival_ts_ms: Some(types::arrival_time_ms()),
+                event_time: ghost_core::EventTimeMetadata::default(),
+                signature: Signature::new_unique(),
+                accounts: vec![pumpswap_program],
+                instructions: vec![],
+                logs: vec![],
+                block_time: Some(1),
+                account_data: HashMap::new(),
+                pre_balances: vec![],
+                post_balances: vec![],
+                success: true,
+                error_code: None,
+                compute_units_consumed: None,
+                synthetic: false,
+                source: "grpc_global_stream".to_string(),
+                mpcf_payload_bytes: None,
+                mpcf_payload_missing_reason: types::RawBytesMissingReason::Unknown,
+                inner_instructions: vec![types::InnerInstructionGroup {
+                    index: 0,
+                    instructions: vec![types::InnerIx {
+                        program_id_index: 0,
+                        accounts: vec![0],
+                        data: wrapper,
+                        stack_height: Some(2),
+                    }],
+                }],
+                pre_token_balances: vec![],
+                post_token_balances: vec![],
+            }
+        };
+
+        let close_user_volume_accumulator = [0xf9, 0x45, 0xa4, 0xda, 0x96, 0x67, 0x54, 0x8a];
+        assert!(!Seer::tx_contains_supported_trade_instruction(
+            &build_event(close_user_volume_accumulator)
+        ));
+        assert!(Seer::tx_contains_supported_trade_instruction(&build_event(
+            binary_parser::DISC_SWAP_EVENT_BUY
+        )));
+        assert!(Seer::tx_contains_supported_trade_instruction(&build_event(
+            binary_parser::DISC_SWAP_EVENT_SELL
+        )));
+    }
+
+    #[test]
     fn test_tx_contains_supported_trade_instruction_detects_inner_routed_buy_under_jupiter_v6() {
         let jupiter_program =
             Pubkey::from_str("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4").unwrap();
@@ -9605,7 +9951,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tx_contains_supported_trade_instruction_detects_top_level_jupiter_route_v2() {
+    fn test_tx_contains_supported_trade_instruction_does_not_overclaim_generic_jupiter_route_v2() {
         let jupiter_program =
             Pubkey::from_str("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4").unwrap();
         let event = types::GeyserEvent::Transaction {
@@ -9645,11 +9991,11 @@ mod tests {
             post_token_balances: vec![],
         };
 
-        assert!(Seer::tx_contains_supported_trade_instruction(&event));
+        assert!(!Seer::tx_contains_supported_trade_instruction(&event));
     }
 
     #[test]
-    fn test_tx_contains_supported_trade_instruction_detects_top_level_dflow_swap2() {
+    fn test_tx_contains_supported_trade_instruction_does_not_overclaim_generic_dflow_swap2() {
         let dflow_program =
             Pubkey::from_str("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH").unwrap();
         let event = types::GeyserEvent::Transaction {
@@ -9689,7 +10035,7 @@ mod tests {
             post_token_balances: vec![],
         };
 
-        assert!(Seer::tx_contains_supported_trade_instruction(&event));
+        assert!(!Seer::tx_contains_supported_trade_instruction(&event));
     }
 
     #[test]
@@ -10041,6 +10387,109 @@ mod tests {
     }
 
     #[test]
+    fn gate0_observation_extends_pending_mapping_ttl_without_changing_default() {
+        let default = Seer::new_with_ipc(
+            SeerConfig::default(),
+            create_ipc_channel(IpcChannelConfig::default()).0,
+        );
+        assert_eq!(default.pending_trade_ttl, PENDING_TRADE_TTL);
+        let gate0 = Seer::new_with_ipc(
+            SeerConfig::default(),
+            create_ipc_channel(IpcChannelConfig::default()).0,
+        )
+        .with_gate0_observation();
+        assert_eq!(gate0.pending_trade_ttl, GATE0_PENDING_TRADE_TTL);
+        assert!(gate0.pending_trade_ttl > default.pending_trade_ttl);
+    }
+
+    #[test]
+    fn gate0_preexisting_pending_expiry_is_diagnostic_not_coverage_loss() {
+        let gate0 = Seer::new_with_ipc(
+            SeerConfig::default(),
+            create_ipc_channel(IpcChannelConfig::default()).0,
+        )
+        .with_gate0_observation();
+        let curve = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let expired = PendingTrade {
+            trade: test_trade(curve, Pubkey::default()),
+            observation: None,
+            source_label: "grpc_global_stream".to_string(),
+            is_coverage_source: true,
+            coverage_loss_relevant: false,
+            queued_at: Instant::now() - GATE0_PENDING_TRADE_TTL - Duration::from_secs(1),
+            reason: PendingTradeReason::CurveMappingMissing,
+        };
+        gate0.pending_trades.write().insert(
+            PendingTradeKey::ByCurve(curve.to_bytes()),
+            VecDeque::from([expired]),
+        );
+        let before = gate0.coverage.trade_events_expired_total.load(Relaxed);
+        let ready = Seer::take_pending_trades_from_store(
+            &gate0.pending_trades,
+            &gate0.metrics,
+            &gate0.coverage,
+            curve,
+            mint,
+            GATE0_PENDING_TRADE_TTL,
+        );
+        assert!(ready.is_empty());
+        assert_eq!(
+            gate0.coverage.trade_events_expired_total.load(Relaxed),
+            before
+        );
+        assert_eq!(gate0.gate0_queue_snapshot().pending_trade_expired, before);
+    }
+
+    #[test]
+    fn gate0_birth_marks_buffered_trade_as_coverage_relevant() {
+        let gate0 = Seer::new_with_ipc(
+            SeerConfig::default(),
+            create_ipc_channel(IpcChannelConfig::default()).0,
+        )
+        .with_gate0_observation();
+        let curve = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        gate0.pending_trades.write().insert(
+            PendingTradeKey::ByCurve(curve.to_bytes()),
+            VecDeque::from([PendingTrade {
+                trade: test_trade(curve, Pubkey::default()),
+                observation: None,
+                source_label: "grpc_global_stream".to_string(),
+                is_coverage_source: true,
+                coverage_loss_relevant: false,
+                queued_at: Instant::now() - GATE0_PENDING_TRADE_TTL - Duration::from_secs(1),
+                reason: PendingTradeReason::CurveMappingMissing,
+            }]),
+        );
+        gate0.gate0_register_cohort(curve, mint);
+        assert!(
+            gate0
+                .pending_trades
+                .read()
+                .get(&PendingTradeKey::ByCurve(curve.to_bytes()))
+                .unwrap()
+                .front()
+                .unwrap()
+                .coverage_loss_relevant
+        );
+        let before = gate0.coverage.trade_events_expired_total.load(Relaxed);
+        let ready = Seer::take_pending_trades_from_store(
+            &gate0.pending_trades,
+            &gate0.metrics,
+            &gate0.coverage,
+            curve,
+            mint,
+            GATE0_PENDING_TRADE_TTL,
+        );
+        assert!(ready.is_empty());
+        assert_eq!(
+            gate0.coverage.trade_events_expired_total.load(Relaxed),
+            before + 1
+        );
+    }
+
+    #[test]
     fn test_pending_trade_expiry_records_expired_outcome_not_filtered_invalid_pool() {
         let (tx, _rx) = mpsc::channel(4);
         let seer = Seer::new(SeerConfig::default(), tx);
@@ -10053,6 +10502,7 @@ mod tests {
             observation: None,
             source_label: "test".to_string(),
             is_coverage_source: false,
+            coverage_loss_relevant: true,
             queued_at: Instant::now() - PENDING_TRADE_TTL - Duration::from_secs(1),
             reason: PendingTradeReason::MissingPoolFromMint,
         };
@@ -10076,6 +10526,7 @@ mod tests {
             &seer.coverage,
             curve,
             mint,
+            PENDING_TRADE_TTL,
         );
 
         assert!(
@@ -11582,6 +12033,7 @@ mod tests {
             event_ms: 2000,
             received_ms: 2000,
             gap: false,
+            gap_reason: None,
         };
         ready.notify_one();
         let mut gap = false;

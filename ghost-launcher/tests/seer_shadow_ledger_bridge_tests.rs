@@ -83,6 +83,7 @@ fn make_buy_trade(pool: Pubkey, mint: Pubkey) -> TradeEvent {
         curve_data_known: true,
         curve_finality: ghost_core::CurveFinality::Provisional,
         is_pumpswap: false,
+        amm_observation: None,
     }
 }
 

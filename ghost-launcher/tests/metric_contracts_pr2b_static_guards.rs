@@ -106,7 +106,7 @@ fn terminal_snapshot_has_exactly_one_canonical_producer_call_per_family() {
     let body = &source[start..end];
     for needle in [
         "self.fingerprint_metrics()",
-        "compute_sybil_resistance_with_ftdi(",
+        "self.materialize_sybil_at_cutoff(sybil_cutoff_ingress_wall_ms)",
         "self.materialize_v3_manipulation_contradictions(&materialized)",
         ".metric_contract_snapshot(&materialized.tx_intel_features)",
         ".metric_contract_dev_primary_compatibility_snapshot()",
@@ -117,6 +117,21 @@ fn terminal_snapshot_has_exactly_one_canonical_producer_call_per_family() {
         "build_pr2b_timed_complete_metric_contract_snapshot_from_started_v1(",
     ] {
         assert_eq!(body.matches(needle).count(), 1, "producer call {needle}");
+    }
+    let sybil_start = source.find("fn materialize_sybil_at_cutoff(").unwrap();
+    let sybil_end = source[sybil_start..]
+        .find("fn transaction_admission_capacity(")
+        .map(|offset| sybil_start + offset)
+        .unwrap();
+    let sybil = &source[sybil_start..sybil_end];
+    assert!(sybil.contains("if self.gate0_market_prices {"));
+    assert!(sybil.contains("} else {"));
+    for producer in [
+        "compute_observation_sybil_at_cutoff(",
+        "compute_sybil_resistance_with_ftdi_at_cutoff(",
+    ] {
+        assert_eq!(sybil.matches(producer).count(), 1);
+        assert!(!body.contains(producer));
     }
     assert_eq!(
         body.matches("let fsc = self.funding_source_index.compute_for_transactions(")

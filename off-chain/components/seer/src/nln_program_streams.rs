@@ -397,6 +397,7 @@ impl NlnPumpFunTradeEvent {
                 || self.real_token_reserves.is_some(),
             curve_finality: CurveFinality::Speculative,
             is_pumpswap: false,
+            amm_observation: None,
         }
     }
 }

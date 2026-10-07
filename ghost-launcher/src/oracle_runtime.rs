@@ -42351,6 +42351,7 @@ mod tests {
             curve_data_known: false,
             curve_finality: CurveFinality::Speculative,
             is_pumpswap: true,
+            amm_observation: None,
         };
         let failed_same_sig = TradeEvent {
             success: false,

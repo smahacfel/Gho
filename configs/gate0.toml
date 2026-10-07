@@ -1,0 +1,20 @@
+# Observe-only Gate 0; never a trading configuration.
+# Five cumulative checkpoints: 30 / 90 / 180 / 300 / 600 seconds.
+# C: fewer than 20 unique successful transactions at 30 seconds.
+# D: at most 100 unique successful transactions at 180 seconds.
+# E: fewer than 90 successful swaps in the last 30 seconds, checked
+# every second from age 180 seconds through 600 seconds.
+admission_ms = 36000000
+# Niezmienne snapshoty korzystają z potwierdzonych zdarzeń, bez rollbacku forka.
+source_commitment = "confirmed"
+max_active_tokens = 512
+# Wspólny budżet successful swapów i unikalnych failed signatures.
+# Smoke 2026-09-30: 1231 + 15153 wpisów już w wieku 190 s.
+# Większy limit mieści pełniejsze okno 600 s; globalny limit nadal obowiązuje.
+max_events_per_token = 65536
+max_events_total = 131072
+max_tokens_per_run = 100000
+
+# Błędy danych/limity cenzurują obserwację; zbieracz kontynuuje do deadline.
+# No extra candidates are admitted during the final at-most-600-second drain.
+# Network credentials are environment variables; never put wallets/keys here.
